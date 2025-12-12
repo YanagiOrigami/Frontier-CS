@@ -7,8 +7,6 @@
 [![Website](https://img.shields.io/badge/Website-frontier--cs.org-orange?logo=googlechrome)](https://frontier-cs.org) ![Research Problems](https://img.shields.io/badge/Research_Problems-50-blue) ![Algorithmic Problems](https://img.shields.io/badge/Algorithmic_Problems-110-green)
 
 
-
-
 **Frontier-CS** is an *unsolved*, *verifiable*, *open-ended*, and *diverse* dataset for evaluating frontier models on challenging computer science problems, ranging from optimization problems in real research to competitive programming–style open challenges.
 
 Whether you are benchmarking LLM agents, evaluating code generation models, or stress-testing reasoning capabilities, Frontier-CS provides a comprehensive suite of tasks designed for rigorous and practical evaluation.
@@ -19,10 +17,10 @@ Frontier-CS consists of two categories:
 
 - **Research Problems**: Real-world systems challenges, including GPU kernels, distributed scheduling, ML pipelines, database optimization, and security exploits. For research problems, we release all data and scripts required to fully reproduce the results.
 
+Frontier-CS is continuously expanding with new and increasingly challenging tasks contributed by our community.
 
-Frontier-CS is continuously expanding with new and increasingly challenging tasks contributed by the community.
-
-
+## Submit Your Results
+We currently release partial test cases for algorithmic problems to allow users to test and debug their solutions. To submit your solutions for full evaluation and have it included in the leaderboard, please send your solutions to qmang@berkeley.edu or wenhao.chai@princeton.edu following the instructions in [SUBMIT_RESULTS.md](SUBMIT_RESULTS.md).
 ## Quickstart
 
 ### Installation
@@ -112,44 +110,6 @@ score = judge.evaluate_solution(
 )
 print(f"Score: {score}")
 ```
-
-
-
-## Repository Structure
-
-```
-Frontier-CS/
-├── research/           # Research problems
-│   ├── flash_attn/
-│   ├── gemm_optimization/
-│   ├── cant_be_late/
-│   └── ...
-└── algorithmic/        # Algorithmic problems
-    ├── problems/
-    └── scripts/
-```
-
-## Requirements
-
-- **Python 3.12+**
-- **Docker** (for evaluation environments)
-- **GPU** (optional, required for GPU-specific problems)
-- **SkyPilot** (optional, for cloud-based evaluation)
-- **API Keys** (for LLM solution generation)
-
-## Contribution
-
-We welcome contributions! To contribute new tasks:
-
-1. **Fork the repository** and create a new branch
-2. **Add your task** following the structure of existing problems
-3. **Submit a Pull Request** with your task
-
-For problems, please also send **human reference solutions** and **hidden test cases** to [qmang@berkeley.edu](mailto:qmang@berkeley.edu) to ensure evaluation integrity.
-
-For detailed task creation guidelines, see:
-- [CONTRIBUTING.md](CONTRIBUTING.md)
-- [README (Algorithmic).md](algorithmic/README.md)
 
 ## Citing Us
 

@@ -27,7 +27,7 @@
 //   - Token counts and ranges (R_i, F_i in valid sets)
 //   - After transform, every cell in [0, W) × [0, H)
 //   - No overlapping occupied grid cells between pieces
-// Scoring message: Score = 1e5 * Σk_i / (W*H)
+// Scoring message: Score = Σk_i / (W*H)
 
 #include "testlib.h"
 #include <bits/stdc++.h>
@@ -145,7 +145,8 @@ int main(int argc, char* argv[]) {
         quitf(_wa, "Area overflow: W*H exceeds 64-bit");
     area = (long long)area128;
 
-    // Score = 1e5 * Σk_i / (W*H)
-    double score = 100000.0 * (double)totalCells / (double)area;
-    quitf(_ok, "Score = %.9f  (cells=%lld, W=%lld, H=%lld, area=%lld)", score, totalCells, W, H, area);
+    double score = (double) totalCells / (double) area;
+    // Include "Ratio:" in message so judge system can parse the partial score
+    quitp(score, "Ratio: %.9f (cells=%lld, W=%lld, H=%lld, area=%lld)",
+          score, totalCells, W, H, area);
 }

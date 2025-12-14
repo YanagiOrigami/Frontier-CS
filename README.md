@@ -35,7 +35,9 @@ Current benchmarks are becoming too easy. Models score 90%+ on many existing cod
 
 Browse all problems at [frontier-cs.org](https://frontier-cs.org).
 
-<!-- TODO: Add teaser example image/problem here -->
+<p align="center">
+  <img src="assets/teaser.png" alt="Example Problem" width="800"/>
+</p>
 
 ## Getting Started
 

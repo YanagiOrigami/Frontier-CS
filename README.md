@@ -34,7 +34,7 @@ Current benchmarks are becoming too easy. Models score 90%+ on many existing cod
 | Evaluation | Binary pass/fail                | _Verifiable_ continuous scoring, always room to improve |
 | Scope      | Usually one domain              | _Diverse_: systems, ML, algorithms, security, and more  |
 
-**[Leaderboard →](https://frontier-cs.org/leaderboard)** · Browse all problems at [frontier-cs.org](https://frontier-cs.org)
+**[Leaderboard →](https://frontier-cs.org/leaderboard)** | Browse all problems at [frontier-cs.org](https://frontier-cs.org)
 
 ## Getting Started
 

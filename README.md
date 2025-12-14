@@ -35,10 +35,6 @@ Current benchmarks are becoming too easy. Models score 90%+ on many existing cod
 
 Browse all problems at [frontier-cs.org](https://frontier-cs.org).
 
-<p align="center">
-  <img src="assets/teaser.png" alt="Example Problem" width="800"/>
-</p>
-
 ## Getting Started
 
 ### Installation
@@ -53,6 +49,19 @@ uv sync
 # Or with pip:
 pip install -e .
 ```
+
+**Try it yourself:**
+
+<p align="center">
+  <img src="assets/teaser.png" alt="Example Problem" width="800"/>
+</p>
+
+```bash
+# Run the example solution
+frontier-eval <PROBLEM_ID> examples/<PROBLEM_ID>_solution.py
+```
+
+<!-- TODO: Replace <PROBLEM_ID> with actual problem, add example solution to examples/ -->
 
 ### Research Problems
 

@@ -18,7 +18,7 @@ Evolving Challenges for Evolving Intelligence
 
 **Frontier-CS** is a benchmark for testing how well AI models can solve _hard, unsolved, and *open-ended*_ computer science problems.
 
-Think of it as an "exam" for AI—but instead of easy textbook questions, we give problems that are genuinely difficult: ones that researchers struggle with, that have no known optimal solutions, or that require deep expertise to even attempt.
+Think of it as an "exam" for AI, but instead of easy textbook questions, we give problems that are genuinely difficult: ones that researchers struggle with, that have no known optimal solutions, or that require deep expertise to even attempt.
 
 ## Why Frontier-CS?
 
@@ -28,25 +28,25 @@ Current benchmarks are becoming too easy. Models score 90%+ on many existing cod
 
 |            | Traditional Benchmarks          | Frontier-CS                                   |
 | ---------- | ------------------------------- | --------------------------------------------- |
-| Difficulty | Often saturated (90%+ scores)   | Unsolved—no model has achieved perfect scores |
+| Difficulty | Often saturated (90%+ scores)   | Unsolved: no model has achieved perfect scores |
 | Problems   | Textbook-style, known solutions | Open-ended research & optimization challenges |
-| Evaluation | Binary pass/fail                | Continuous scoring—always room to improve     |
+| Evaluation | Binary pass/fail                | Continuous scoring: always room to improve     |
 | Scope      | Usually one domain              | Systems, ML, algorithms, security, and more   |
 
 ## What Kind of Problems?
 
-### Research Problems (50 problems)
+### Research Problems
 
 Real challenges from systems research. Examples:
 
-- **GPU Kernel Optimization**: Write a faster FlashAttention kernel—beat the baseline implementation
+- **GPU Kernel Optimization**: Write a faster FlashAttention kernel and beat the baseline
 - **Distributed Scheduling**: Schedule ML jobs across spot instances to minimize cost while meeting deadlines
 - **Database Query Optimization**: Rewrite SQL queries to run faster on real-world datasets
 - **Security Exploits**: Find and exploit vulnerabilities in sandboxed systems
 
 Each problem comes with real data, baseline code, and automated evaluation.
 
-### Algorithmic Problems (115 problems)
+### Algorithmic Problems
 
 Competitive programming-style challenges, but harder:
 
@@ -54,7 +54,7 @@ Competitive programming-style challenges, but harder:
 - **Construction problems**: Build objects with specific properties
 - **Interactive problems**: Query a hidden system to deduce information
 
-No known optimal solutions—your score depends on how close you get.
+No known optimal solutions. Your score depends on how close you get.
 
 ## Getting Started
 

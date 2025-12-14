@@ -91,7 +91,7 @@ frontier-eval --algorithmic 1 <your_solution.cpp>
 ```
 
 > **NOTE** 1. We currently support **C++ only** for algorithmic problem solutions.
-> 2. For each problem, we release only the test cases required for **local debugging and preview scoring**. The reference solutiosn and full test cases are deliberately withheld.
+> 2. For each problem, we release only the test cases required for **local debugging and preview scoring**. The reference solutiosn and full test cases are deliberately withheld and thus the final scores may differ. To get the full evaluation and be included in the leaderboard, please submit your solutions following the "Submitting Results" section below.
 
 See [algorithmic/README.md](algorithmic/README.md) for full documentation.
 

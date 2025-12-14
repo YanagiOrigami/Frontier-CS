@@ -50,23 +50,23 @@ def update_readme_badge(readme_path: Path, research_count: int, algo_count: int)
     
     content = readme_path.read_text()
     
-    # Create the research and algorithmic badges
-    research_badge = f"![Research Problems](https://img.shields.io/badge/Research_Problems-{research_count}-blue)"
-    algo_badge = f"![Algorithmic Problems](https://img.shields.io/badge/Algorithmic_Problems-{algo_count}-green)"
+    # Create the research and algorithmic badges (HTML img tag format)
+    research_badge = f'<img src="https://img.shields.io/badge/Research_Problems-{research_count}-blue" alt="Research Problems">'
+    algo_badge = f'<img src="https://img.shields.io/badge/Algorithmic_Problems-{algo_count}-green" alt="Algorithmic Problems">'
     
     # Replace existing badges using regex
     import re
     
-    # Replace Research Problems badge
+    # Replace Research Problems badge (HTML img tag format)
     content = re.sub(
-        r'!\[Research Problems\]\(https://img\.shields\.io/badge/Research_Problems-\d+-blue\)',
+        r'<img src="https://img\.shields\.io/badge/Research_Problems-\d+-blue" alt="Research Problems">',
         research_badge,
         content
     )
     
-    # Replace Algorithmic Problems badge
+    # Replace Algorithmic Problems badge (HTML img tag format)
     content = re.sub(
-        r'!\[Algorithmic Problems\]\(https://img\.shields\.io/badge/Algorithmic_Problems-\d+-green\)',
+        r'<img src="https://img\.shields\.io/badge/Algorithmic_Problems-\d+-green" alt="Algorithmic Problems">',
         algo_badge,
         content
     )

@@ -50,7 +50,7 @@ uv sync
 pip install -e .
 ```
 
-**Try it yourself:**
+### Try it yourself
 
 <p align="center">
   <img src="assets/teaser.png" alt="Example Problem" width="800"/>

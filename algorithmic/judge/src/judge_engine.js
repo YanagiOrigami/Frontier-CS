@@ -322,7 +322,7 @@ export class JudgeEngine {
                 status: caseResult.scoreRatio === 1.0 ? 'Correct' : 'Wrong Answer'
             }));
 
-            const final = { status: 'done', passed, result: overallResult, score: Math.round(finalScore), cases: finalCases };
+            const final = { status: 'done', passed, result: overallResult, score: finalScore, cases: finalCases };
             this.results.set(sid, final);
             await fs.writeFile(path.join(subDir, 'result.json'), JSON.stringify(final, null, 2));
         } catch (e) {

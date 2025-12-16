@@ -46,8 +46,7 @@ berkeley-function-call-leaderboard/**/*.lock
 # Ignore the wandb cache:
 **/wandb/
 
-# Generated solutions and evaluation results
-solutions/
+# Generated evaluation results (solutions are tracked)
 results/
 generation_logs/
 pairs.txt

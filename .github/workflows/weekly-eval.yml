@@ -79,13 +79,17 @@ jobs:
                   except:
                       pass
 
-          # Get list of problem names
+          # Find ALL problem paths that have evaluate.sh (including nested paths)
+          # e.g., 'cross_entropy', 'gemm_optimization/annoying', 'llm_sql/small'
           problems_dir = Path('research/problems')
-          problem_names = set()
+          problem_paths = {}  # underscore_name -> slash_path
           if problems_dir.exists():
-              for p in problems_dir.iterdir():
-                  if p.is_dir():
-                      problem_names.add(p.name)
+              for eval_sh in problems_dir.rglob('evaluate.sh'):
+                  # Get relative path from problems_dir to the directory containing evaluate.sh
+                  rel_path = eval_sh.parent.relative_to(problems_dir)
+                  path_str = str(rel_path)  # e.g., 'gemm_optimization/annoying'
+                  underscore_name = path_str.replace('/', '_')  # e.g., 'gemm_optimization_annoying'
+                  problem_paths[underscore_name] = path_str
 
           # Read all possible pairs from solutions/
           solutions_dir = Path('solutions')
@@ -95,15 +99,17 @@ jobs:
                   if sol_dir.is_dir() and (sol_dir / 'solve.sh').exists():
                       # Extract problem from solution name: {model}_{problem}[_{variant}]
                       name = sol_dir.name
-                      # Find the longest matching problem name
+                      # Find the longest matching problem name (underscore-based)
                       parts = name.split('_')
                       best_problem = None
+                      best_problem_path = None
                       for i in range(1, len(parts) + 1):
                           candidate = '_'.join(parts[1:i])
-                          if candidate in problem_names:
+                          if candidate in problem_paths:
                               best_problem = candidate
-                      if best_problem:
-                          pairs.append(f'{name}:{best_problem}')
+                              best_problem_path = problem_paths[candidate]
+                      if best_problem_path:
+                          pairs.append(f'{name}:{best_problem_path}')
 
           # Filter out already evaluated
           new_pairs = [p for p in pairs if p not in evaluated]
@@ -111,6 +117,7 @@ jobs:
           # Write pairs file
           Path('pairs_to_eval.txt').write_text('\n'.join(new_pairs))
           print(f'Total pairs: {len(pairs)}, New pairs to evaluate: {len(new_pairs)}')
+          print('Sample pairs:', new_pairs[:5] if new_pairs else 'none')
           "
 
       - name: Run batch evaluation

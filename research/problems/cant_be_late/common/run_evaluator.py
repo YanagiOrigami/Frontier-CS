@@ -1,16 +1,24 @@
 #!/usr/bin/env python
 """
 Common run_evaluator for cant-be-late variants.
-Handles solution loading, artifact parsing, and score normalization.
+
+Solution interface:
+    class Solution(Strategy):
+        def solve(self, spec_path: str) -> "Solution":
+            # Optional: read spec for configuration
+            return self
+
+        def _step(self, last_cluster_type, has_spot) -> ClusterType:
+            # Decision logic
+            return ClusterType.SPOT if has_spot else ClusterType.ON_DEMAND
 """
 import argparse
-import importlib.util
+import inspect
 import json
 import os
 import sys
 from pathlib import Path
-from types import ModuleType
-from typing import Any, Optional
+from typing import Optional
 
 # Common directory paths
 COMMON_DIR = Path(__file__).resolve().parent
@@ -31,59 +39,72 @@ ADRS_JOB_CONFIGS = [
 ]
 ADRS_CHANGEOVER_DELAYS = [0.02, 0.05, 0.1]
 
-# Setup path for cbl_evaluator import
+# Setup paths
 if str(COMMON_DIR) not in sys.path:
     sys.path.insert(0, str(COMMON_DIR))
+if str(SIM_ROOT) not in sys.path:
+    sys.path.insert(0, str(SIM_ROOT))
 
 from cbl_evaluator import evaluate_stage1, evaluate_stage2
+from sky_spot.strategies.strategy import Strategy
 
 
-def load_solution_module(solution_path: Path) -> ModuleType:
-    """Load solution.py as a module."""
+def load_and_validate_solution(solution_path: Path, spec_path: Path) -> Path:
+    """
+    Load solution, call solve(), validate it's a Strategy, return the path.
+
+    The solution.py file must define:
+        class Solution(Strategy):
+            def solve(self, spec_path): ...
+            def _step(self, last_cluster_type, has_spot): ...
+    """
+    import importlib.util
+
     if not solution_path.exists():
         raise FileNotFoundError(f"solution.py not found at {solution_path}")
+
     spec = importlib.util.spec_from_file_location("submitted_solution", solution_path)
     if spec is None or spec.loader is None:
         raise ImportError(f"Failed to load spec for {solution_path}")
+
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
-    return module
+
+    if not hasattr(module, "Solution"):
+        raise AttributeError("solution.py must define a 'Solution' class")
+
+    SolutionCls = module.Solution
+
+    # Validate it's a Strategy subclass
+    if not issubclass(SolutionCls, Strategy):
+        raise TypeError("Solution must inherit from sky_spot.strategies.strategy.Strategy")
+
+    # Validate it has _step method
+    if not hasattr(SolutionCls, "_step") or not callable(getattr(SolutionCls, "_step")):
+        raise AttributeError("Solution must implement _step(self, last_cluster_type, has_spot)")
+
+    # Call solve() for initialization if it exists
+    if hasattr(SolutionCls, "solve"):
+        solution_obj = SolutionCls.__new__(SolutionCls)
+        # Don't call __init__ yet - solve() should handle initialization
+        result = solution_obj.solve(str(spec_path))
+        # solve() should return self or the class
+        if result is not None and result is not solution_obj and result is not SolutionCls:
+            # If solve() returns something else, warn but continue
+            pass
+
+    # Return the solution path - workers will load the Solution class directly
+    return solution_path
 
 
-def materialize_artifact(result: Any, artifact_path: Path) -> Path:
-    """Convert solution output to artifact file."""
-    artifact_path.parent.mkdir(parents=True, exist_ok=True)
-    if isinstance(result, dict):
-        with artifact_path.open("w", encoding="utf-8") as fout:
-            json.dump(result, fout)
-        return artifact_path
-    if isinstance(result, str):
-        is_possible_path = len(result) < 4096 and '\n' not in result
-        if is_possible_path:
-            candidate = Path(result)
-            try:
-                if candidate.is_file():
-                    with artifact_path.open("w", encoding="utf-8") as fout:
-                        json.dump({"program_path": str(candidate.resolve())}, fout)
-                    return artifact_path
-            except OSError:
-                pass
-        with artifact_path.open("w", encoding="utf-8") as fout:
-            fout.write(result)
-        return artifact_path
-    raise TypeError(
-        f"Solution.solve() must return dict/path-string/code-string; got {type(result)!r}."
-    )
-
-
-def evaluate_artifact(
-    artifact_path: str,
+def evaluate_solution(
+    solution_path: Path,
     env_paths: Optional[list] = None,
     job_configs: Optional[list] = None,
     changeover_delays: Optional[list] = None,
 ) -> dict:
-    """Evaluate a strategy artifact; return payload with score and metrics."""
-    artifact_path = os.path.abspath(artifact_path)
+    """Evaluate a Solution (Strategy subclass); return payload with score and metrics."""
+    solution_path_str = str(solution_path.resolve())
 
     env_paths = env_paths or ADRS_ENV_PATHS
     job_configs = job_configs or ADRS_JOB_CONFIGS
@@ -97,53 +118,20 @@ def evaluate_artifact(
         )
 
     # Import pricing utils from simulator
-    sys.path.insert(0, str(SIM_ROOT))
     try:
-        from sky_spot.utils import DEVICE_COSTS, COST_K  # type: ignore
+        from sky_spot.utils import DEVICE_COSTS, COST_K
     except Exception as e:
         raise RuntimeError(f"Failed to import simulator pricing utils: {e}") from e
 
-    # Parse artifact to get program path
-    try:
-        with open(artifact_path, "r", encoding="utf-8") as f:
-            content = f.read().strip()
-    except Exception as e:
-        raise RuntimeError(f"Error reading artifact {artifact_path}: {e}") from e
-
-    program_path = None
-    try:
-        obj = json.loads(content)
-        if isinstance(obj, dict):
-            if obj.get("program_path"):
-                pp = obj["program_path"].strip()
-                program_path = pp if os.path.isabs(pp) else os.path.abspath(pp)
-            elif obj.get("code"):
-                code = obj["code"]
-                program_path = os.path.abspath("./solution_env/_submitted_program.py")
-                os.makedirs(os.path.dirname(program_path), exist_ok=True)
-                with open(program_path, "w", encoding="utf-8") as out:
-                    out.write(code)
-    except Exception:
-        pass
-
-    if program_path is None and os.path.exists(content):
-        program_path = content if os.path.isabs(content) else os.path.abspath(content)
-
-    if program_path is None:
-        program_path = os.path.abspath("./solution_env/_submitted_program.py")
-        os.makedirs(os.path.dirname(program_path), exist_ok=True)
-        with open(program_path, "w", encoding="utf-8") as out:
-            out.write(content)
-
-    # Stage 1: syntax check
-    stage1_result = evaluate_stage1(program_path)
+    # Stage 1: syntax/import check
+    stage1_result = evaluate_stage1(solution_path_str)
     if stage1_result.get("runs_successfully", 0) != 1.0:
         return {"score": 0, "avg_cost": 0, "error": stage1_result.get("error", "Stage 1 failed")}
 
     # Stage 2: full evaluation
     try:
         result = evaluate_stage2(
-            program_path,
+            solution_path_str,
             env_paths,
             job_configs,
             changeover_delays,
@@ -220,22 +208,12 @@ def evaluate_artifact(
 
 
 def evaluate(solution_path: Path, spec_path: Path) -> dict:
-    """Full evaluation: load solution, run solve(), evaluate artifact."""
-    # Setup sky_spot path for solution imports
-    if str(SIM_ROOT) not in sys.path:
-        sys.path.insert(0, str(SIM_ROOT))
+    """Full evaluation: load solution, validate, run simulations."""
+    # Validate solution and call solve() for initialization
+    validated_path = load_and_validate_solution(solution_path, spec_path)
 
-    module = load_solution_module(solution_path)
-    if not hasattr(module, "Solution"):
-        raise AttributeError("solution.py must define a 'Solution' class")
-    SolutionCls = module.Solution
-    solution_obj = SolutionCls()
-    if not hasattr(solution_obj, "solve"):
-        raise AttributeError("Solution class must define a 'solve' method")
-    result = solution_obj.solve(str(spec_path))
-    artifact_path = Path("./output_ans").resolve()
-    materialize_artifact(result, artifact_path)
-    return evaluate_artifact(str(artifact_path))
+    # Run evaluation
+    return evaluate_solution(validated_path)
 
 
 def main(resources_dir: str, default_solution: str = "../../execution_env/solution_env/solution.py"):

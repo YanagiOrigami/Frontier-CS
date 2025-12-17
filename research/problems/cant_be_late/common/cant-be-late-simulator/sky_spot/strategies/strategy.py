@@ -53,7 +53,12 @@ class Strategy:
         self.env: 'env.Env' = env
 
     def __init_subclass__(cls):
-        assert cls.NAME not in cls.SUBCLASSES and cls.NAME != 'abstract', f'Name {cls.NAME} already exists'
+        # Skip registration for 'abstract' or if already registered (allows re-import)
+        if cls.NAME == 'abstract':
+            return
+        if cls.NAME in cls.SUBCLASSES:
+            # Allow re-registration of the same class (e.g., during parallel simulation)
+            return
         cls.SUBCLASSES[cls.NAME] = cls
 
     def __repr__(self) -> str:

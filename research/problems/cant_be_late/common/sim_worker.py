@@ -106,6 +106,16 @@ def _load_strategy_class(module_path: str) -> Type[strategy_lib.Strategy]:
 
 
 def _first_strategy_class(module: ModuleType, module_path: str) -> Type[strategy_lib.Strategy]:
+    # Prefer 'Solution' class if it exists and is a Strategy subclass
+    if hasattr(module, "Solution"):
+        solution_cls = module.Solution
+        if (
+            isinstance(solution_cls, type)
+            and issubclass(solution_cls, strategy_lib.Strategy)
+        ):
+            return solution_cls
+
+    # Fallback: find any Strategy subclass
     for attr in module.__dict__.values():
         if (
             isinstance(attr, type)
@@ -113,7 +123,7 @@ def _first_strategy_class(module: ModuleType, module_path: str) -> Type[strategy
             and attr not in {strategy_lib.Strategy, strategy_lib.MultiRegionStrategy}
         ):
             return attr
-    raise SimulationFailure(f"No Strategy subclass found in {module_path}")
+    raise SimulationFailure(f"No Solution or Strategy subclass found in {module_path}")
 
 
 def _build_parser(cli_args: list[str]) -> _PresetArgumentParser:

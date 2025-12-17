@@ -1,14 +1,36 @@
 {
-  "description": "Provide a Strategy implementation for the cant-be-late simulator.",
-  "solution_expectation": {
+  "description": "Implement a scheduling strategy for cloud spot instances.",
+  "solution_interface": {
     "file": "solution.py",
     "class_name": "Solution",
-    "solve_signature": "solve(spec_path: str | None = None) -> str | dict",
-    "return_formats": [
-      {"code": "<python source implementing Strategy>"},
-      {"program_path": "relative/or/absolute/path/to/python_file"}
-    ]
+    "base_class": "sky_spot.strategies.strategy.Strategy",
+    "required_methods": {
+      "solve": {
+        "signature": "solve(self, spec_path: str) -> Solution",
+        "description": "Initialize the solution. Can read spec for configuration. Returns self."
+      },
+      "_step": {
+        "signature": "_step(self, last_cluster_type: ClusterType, has_spot: bool) -> ClusterType",
+        "description": "Decision logic called at each simulation step. Returns SPOT, ON_DEMAND, or NONE."
+      }
+    }
   },
-  "datasets": "Traces are pre-installed under resources/cant-be-late-simulator/data/real/ddl=search+task=48+overhead=...",
-  "notes": "You may ignore the spec_path argument if unused."
+  "available_imports": [
+    "from sky_spot.strategies.strategy import Strategy",
+    "from sky_spot.utils import ClusterType"
+  ],
+  "strategy_context": {
+    "self.env": "Simulation environment with elapsed_seconds, gap_seconds, cluster_type",
+    "self.task_duration": "Total job duration in hours",
+    "self.deadline": "Job deadline in hours",
+    "self.restart_overhead": "Time lost when preempted (hours)",
+    "self.task_done_time": "List of completed work segments"
+  },
+  "cluster_types": {
+    "ClusterType.SPOT": "Cheaper but can be preempted",
+    "ClusterType.ON_DEMAND": "More expensive but guaranteed",
+    "ClusterType.NONE": "No cluster (wait)"
+  },
+  "datasets": "Traces under common/cant-be-late-simulator/data/real/",
+  "notes": "Goal: minimize cost while completing jobs before deadline."
 }

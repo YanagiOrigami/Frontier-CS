@@ -1,14 +1,15 @@
 #!/usr/bin/env python3
 """
 Simple greedy multi-region strategy for evolution starting point.
-Uses basic greedy decisions without RC-CR constraints to allow maximum exploration freedom.
+Uses basic greedy decisions across multiple regions.
 """
 
 import argparse
+import math
 import typing
-from sky_spot.strategies.strategy import MultiRegionStrategy
+
+from sky_spot.strategies.multi_strategy import MultiRegionStrategy
 from sky_spot.utils import ClusterType
-from sky_spot.multi_region_types import TryLaunch, Terminate, Action, LaunchResult
 
 if typing.TYPE_CHECKING:
     from sky_spot import env
@@ -19,68 +20,77 @@ if typing.TYPE_CHECKING:
 class SimpleGreedyMultiRegionStrategy(MultiRegionStrategy):
     """
     Simple greedy multi-region strategy.
-    Always tries SPOT first across all regions, falls back to ON_DEMAND if needed.
-    No complex RC-CR conditions - maximum freedom for evolution to explore.
+    Tries SPOT in current region first, switches regions if SPOT unavailable,
+    falls back to ON_DEMAND when deadline is critical.
     """
-    
+
     NAME = 'evolved_greedy_multi'
-    
+
     def __init__(self, args):
-        args.keep_on_demand = None
         super().__init__(args)
-    
+        self.next_region_to_try = 0
+
     def reset(self, env: 'env.Env', task: 'task.Task'):
         super().reset(env, task)
-    
-    def _step_multi(self) -> typing.Generator[Action, typing.Optional[LaunchResult], None]:
-        """Simple waiting strategy - wait for SPOT, use ON_DEMAND only when deadline critical."""
-        
-        # Check if task is done
-        remaining_task_seconds = self.task_duration - sum(self.task_done_time)
-        if remaining_task_seconds <= 1e-3:
-            # Terminate all active instances
-            active_instances = self.env.get_active_instances()
-            for region in active_instances:
-                yield Terminate(region=region)
-            return
-        
-        # Get current state
-        active_instances = self.env.get_active_instances()
-        
-        # Critical deadline check - only use ON_DEMAND when we absolutely must
-        remaining_time = self.deadline - self.env.elapsed_seconds
-        time_needed = remaining_task_seconds + self.restart_overhead
-        
-        if time_needed >= remaining_time:  # No margin left
-            # Must use ON_DEMAND to meet deadline
-            if ClusterType.ON_DEMAND not in active_instances.values():
-                # Terminate any SPOT instances
-                for region in list(active_instances.keys()):
-                    if active_instances[region] == ClusterType.SPOT:
-                        yield Terminate(region=region)
-                
-                # Launch ON_DEMAND
-                result = yield TryLaunch(region=0, cluster_type=ClusterType.ON_DEMAND)
-                assert result is not None
-                assert result.success, "ON_DEMAND should always succeed"
-            return
-        
-        # If we already have an instance running, keep it
-        if active_instances:
-            return
-        
-        # No instance running - try SPOT in all regions
-        for region in range(self.env.num_regions):
-            result = yield TryLaunch(region=region, cluster_type=ClusterType.SPOT)
-            assert result is not None
-            if result.success:
-                return
-        
-        # No SPOT available anywhere - just wait (do nothing)
-        # Don't fallback to ON_DEMAND unless deadline critical
-        return
-    
+        self.next_region_to_try = 0
+
+    def _step(self, last_cluster_type: ClusterType, has_spot: bool) -> ClusterType:
+        """Simple greedy decision: use SPOT if available, otherwise try other regions."""
+        env = self.env
+
+        # Calculate remaining work
+        remaining_task_time = self.task_duration - sum(self.task_done_time)
+        if remaining_task_time <= 1e-3:
+            return ClusterType.NONE
+
+        # Calculate deadline pressure
+        remaining_time = math.floor(
+            (self.deadline - env.elapsed_seconds) / env.gap_seconds
+        ) * env.gap_seconds
+
+        total_task_remaining = math.ceil(
+            (remaining_task_time + self.restart_overhead) / env.gap_seconds
+        ) * env.gap_seconds
+
+        total_task_remaining_2d = math.ceil(
+            (remaining_task_time + 2 * self.restart_overhead) / env.gap_seconds
+        ) * env.gap_seconds
+
+        # Critical deadline check - must use ON_DEMAND
+        if total_task_remaining >= remaining_time:
+            # If we're on a working SPOT with no overhead remaining, risk staying
+            if last_cluster_type == ClusterType.SPOT and self.remaining_restart_overhead < 1e-3:
+                return ClusterType.SPOT
+            return ClusterType.ON_DEMAND
+
+        # Near deadline - prefer ON_DEMAND unless already on working SPOT
+        if total_task_remaining_2d >= remaining_time:
+            if last_cluster_type == ClusterType.SPOT and has_spot:
+                return ClusterType.SPOT
+            if last_cluster_type == ClusterType.ON_DEMAND:
+                return ClusterType.ON_DEMAND
+            return ClusterType.ON_DEMAND
+
+        # Normal operation - try SPOT
+        if has_spot:
+            return ClusterType.SPOT
+
+        # No SPOT in current region, try switching regions
+        num_regions = env.get_num_regions()
+        current_region = env.get_current_region()
+
+        for i in range(num_regions):
+            next_region = (current_region + 1 + i) % num_regions
+            if next_region != current_region:
+                env.switch_region(next_region)
+                # Return NONE this tick, will try SPOT in new region next tick
+                return ClusterType.NONE
+
+        # No other regions to try, just wait
+        return ClusterType.NONE
+
     @classmethod
     def _from_args(cls, parser: argparse.ArgumentParser) -> 'SimpleGreedyMultiRegionStrategy':
-        return cls(parser.parse_args())
+        args, _ = parser.parse_known_args()
+        return cls(args)
 # EVOLVE-BLOCK END

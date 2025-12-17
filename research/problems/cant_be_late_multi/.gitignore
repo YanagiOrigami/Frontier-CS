@@ -1,0 +1,3 @@
+# Ignore common/ directory - contains large simulator and trace data
+common/
+output_ans

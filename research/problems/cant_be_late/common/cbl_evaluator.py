@@ -86,23 +86,29 @@ def build_trace_pool(
     env_paths: list[str] = None,
     changeover_delays: list[float] = None,
 ) -> dict[float, dict[str, list[str]]]:
-    """Select trace files per overhead/env with coverage ≥ min_required_hours."""
+    """Select trace files per overhead/env with coverage ≥ min_required_hours.
+
+    Note: Trace data is independent of overhead value - we always load from
+    the 0.02 trace directory. The overhead config only affects simulation cost.
+    """
     env_paths = env_paths or ENV_PATHS
     changeover_delays = changeover_delays or CHANGEOVER_DELAYS
+
+    # Always use 0.02 traces - trace data is independent of overhead config
+    TRACE_OVERHEAD = "0.02"
 
     trace_pool: dict[float, dict[str, list[str]]] = {}
     total_selected = 0
 
     for overhead in changeover_delays:
-        over_str = f"{overhead:.2f}"
         env_map: dict[str, list[str]] = {}
         base_dir = os.path.join(
             PROJECT_ROOT,
-            f"data/real/ddl=search+task=48+overhead={over_str}",
+            f"data/real/ddl=search+task=48+overhead={TRACE_OVERHEAD}",
             "real",
         )
         if not os.path.isdir(base_dir):
-            logger.warning("No trace directory for overhead %s at %s", over_str, base_dir)
+            logger.warning("No trace directory at %s", base_dir)
             trace_pool[overhead] = env_map
             continue
 
@@ -111,7 +117,7 @@ def build_trace_pool(
             pattern = os.path.join(trace_dir, "*.json")
             matching = sorted(glob.glob(pattern))
             if not matching:
-                logger.warning("No traces found for %s (overhead %s)", env_path, over_str)
+                logger.warning("No traces found for %s (config overhead %.2f)", env_path, overhead)
                 env_map[env_path] = []
                 continue
 
@@ -133,10 +139,10 @@ def build_trace_pool(
 
             if not eligible:
                 logger.warning(
-                    "No traces ≥ %.2fh for %s (overhead %s)",
+                    "No traces ≥ %.2fh for %s (config overhead %.2f)",
                     min_required_hours,
                     env_path,
-                    over_str,
+                    overhead,
                 )
                 env_map[env_path] = []
                 continue
@@ -156,10 +162,10 @@ def build_trace_pool(
                     prev = raw
                 eligible = [eligible[i] for i in indices]
             logger.info(
-                "Selected %d traces for %s at overhead %s",
+                "Selected %d traces for %s (config overhead %.2f)",
                 len(eligible),
                 env_path,
-                over_str,
+                overhead,
             )
             env_map[env_path] = eligible
             total_selected += len(eligible)

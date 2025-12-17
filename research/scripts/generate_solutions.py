@@ -659,17 +659,42 @@ Examples:
         problems_dir = repo_root / "research" / "problems"
         all_problems = []
         if problems_dir.is_dir():
+            def find_problems_recursive(directory: Path, depth: int = 0, max_depth: int = 3) -> List[Path]:
+                """Recursively find problem directories (those with readme files)."""
+                if depth > max_depth:
+                    return []
+
+                excluded = {'common', 'resources', '__pycache__', 'data'}
+
+                # Check if this directory has a readme
+                has_readme = (directory / "readme").exists() or (directory / "README.md").exists()
+
+                # Find subdirectories (potential variants/categories)
+                subdirs = [sub for sub in directory.iterdir()
+                           if sub.is_dir() and not sub.name.startswith('.')
+                           and sub.name not in excluded]
+
+                # Recursively find problems in subdirs
+                sub_problems = []
+                for sub in subdirs:
+                    sub_problems.extend(find_problems_recursive(sub, depth + 1, max_depth))
+
+                if sub_problems:
+                    # Subdirectories have problems - use those (don't use parent readme)
+                    return sub_problems
+                elif has_readme:
+                    # This directory is a problem (leaf with readme)
+                    return [directory]
+                elif subdirs:
+                    # Has subdirs but no readme anywhere - error
+                    print(f"ERROR: {directory.name}/ has subdirectories but no readme files found")
+                    sys.exit(1)
+                else:
+                    return []
+
             for category in problems_dir.iterdir():
                 if category.is_dir() and not category.name.startswith('.'):
-                    # Check if this is a problem dir (has readme) or a category with sub-problems
-                    if (category / "readme").exists() or (category / "README.md").exists():
-                        all_problems.append(category)
-                    else:
-                        # Look for sub-problems
-                        for sub in category.iterdir():
-                            if sub.is_dir() and not sub.name.startswith('.'):
-                                if (sub / "readme").exists() or (sub / "README.md").exists():
-                                    all_problems.append(sub)
+                    all_problems.extend(find_problems_recursive(category))
 
         for pattern in args.problem_patterns:
             matched = False

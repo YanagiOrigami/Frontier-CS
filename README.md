@@ -137,7 +137,7 @@ print(f"Score (unbounded): {result.score_unbounded}")
 
 ## Submitting Results
 
-We release partial test cases so you can develop and debug locally. For full evaluation and leaderboard inclusion, submit your solutions to qmang@berkeley.edu, or wenhao.chai@princeton.edu, or zhifei.li@berkeley.edu following the instructions in [SUBMIT.md](SUBMIT.md).
+We release partial test cases so you can develop and debug locally. For full evaluation and leaderboard inclusion, please follow the instructions in [SUBMIT.md](SUBMIT.md) and submit your solutions to qmang@berkeley.edu, wenhao.chai@princeton.edu, huanzhimao@berkeley.edu, or zhifei.li@berkeley.edu.
 
 Questions? Join our [Discord](https://discord.gg/k4hd2nU4UE)
 

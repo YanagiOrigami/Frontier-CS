@@ -83,46 +83,6 @@ def ensure_numpy_version(required: str) -> None:
         )
 
 
-def float_or_none(value: str) -> Optional[float]:
-    """Parse a float or return None for 'none'/'null'."""
-    text = str(value).strip()
-    if text.lower() in {"none", "null"}:
-        return None
-    return float(text)
-
-
-def int_or_none(value: str) -> Optional[int]:
-    """Parse an int or return None for 'none'/'null'."""
-    text = str(value).strip()
-    if text.lower() in {"none", "null"}:
-        return None
-    return int(text)
-
-
-def parse_extra_headers(entries: List[str]) -> Dict[str, str]:
-    """Parse extra HTTP headers from command line."""
-    headers: Dict[str, str] = {}
-    for entry in entries:
-        if ":" not in entry:
-            raise ValueError(f"Invalid header format (expected Key: Value): {entry}")
-        key, value = entry.split(":", 1)
-        headers[key.strip()] = value.strip()
-    return headers
-
-
-def load_json_args(payload_str: Optional[str]) -> Optional[Dict[str, Any]]:
-    """Parse JSON payload from command line."""
-    if not payload_str:
-        return None
-    try:
-        data = json.loads(payload_str)
-    except json.JSONDecodeError as exc:
-        raise ValueError(f"Invalid JSON for --payload-extra: {exc}") from exc
-    if not isinstance(data, dict):
-        raise ValueError("--payload-extra must be a JSON object")
-    return data
-
-
 def resolve_api_key(explicit_key: Optional[str], key_env: Optional[str]) -> Optional[str]:
     """Resolve API key from explicit value or environment variable."""
     if explicit_key:
@@ -144,16 +104,8 @@ def generate_code(
     api_key: Optional[str],
     log_file: Path,
     api_base: str,
-    endpoint: str,
-    temperature: Optional[float],
-    max_tokens: Optional[int],
-    max_reasoning_tokens: Optional[int],
     is_reasoning_model: bool,
-    extra_headers: Dict[str, str],
     timeout: float,
-    payload_overrides: Optional[Dict[str, Any]],
-    api_key_header: Optional[str],
-    api_key_prefix: Optional[str],
     problem_name: str = "",
     problem_path: Optional[Path] = None,
     docker_config: Optional[Dict] = None,
@@ -165,8 +117,6 @@ def generate_code(
     else:
         base_url = base_url.rstrip("/")
 
-    endpoint_hint = (endpoint or "").strip() or "auto"
-
     # Get environment-specific system prompt
     system_prompt = get_system_prompt_for_problem(problem_name, problem_path, docker_config)
 
@@ -176,22 +126,6 @@ def generate_code(
 
     # Log request details
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    final_headers: Dict[str, str] = dict(extra_headers)
-    ignored_controls: Dict[str, Any] = {}
-    if final_headers:
-        ignored_controls["extra_headers"] = final_headers
-    if payload_overrides:
-        ignored_controls["payload_overrides"] = payload_overrides
-    if api_key_header:
-        ignored_controls["api_key_header"] = api_key_header
-    if api_key_prefix:
-        ignored_controls["api_key_prefix"] = api_key_prefix
-    if temperature is not None:
-        ignored_controls["temperature"] = temperature
-    if max_tokens is not None and not is_reasoning_model:
-        ignored_controls["max_tokens"] = max_tokens
-    if max_reasoning_tokens is not None and is_reasoning_model:
-        ignored_controls["max_reasoning_tokens"] = max_reasoning_tokens
 
     llm_client, llm_config = instantiate_llm_client(
         model,
@@ -211,14 +145,9 @@ def generate_code(
         f.write(f"INTERFACE CLASS: {llm_client.__class__.__name__}\n")
         for key, value in llm_config.items():
             f.write(f"{key.upper()}: {value}\n")
-        f.write(f"ENDPOINT HINT: {endpoint_hint}\n")
         f.write(f"TIMEOUT: {timeout}s\n")
         f.write(f"REASONING MODEL: {is_reasoning_model}\n")
         f.write(f"API KEY PROVIDED: {'yes' if bool(api_key) else 'no'}\n")
-        if ignored_controls:
-            f.write("IGNORED CONTROLS (not supported by llm_interface):\n")
-            f.write(json.dumps(ignored_controls, indent=2, ensure_ascii=False))
-            f.write("\n")
         f.write("\n" + "=" * 80 + "\n")
         f.write("SYSTEM PROMPT:\n")
         f.write("=" * 80 + "\n")
@@ -534,10 +463,6 @@ Examples:
 
     # Generation parameters
     gen_group = parser.add_argument_group("Generation parameters")
-    gen_group.add_argument("--temperature", type=float_or_none, default=0.7,
-                           help="Sampling temperature or 'none'")
-    gen_group.add_argument("--max-tokens", type=int_or_none, default=65536,
-                           help="Max tokens for standard models")
     gen_group.add_argument("--reasoning-model", dest="reasoning_override", action="store_const",
                            const=True, default=None, help="Force reasoning mode")
     gen_group.add_argument("--no-reasoning-model", dest="reasoning_override", action="store_const",
@@ -556,12 +481,6 @@ Examples:
 
     # Hidden/advanced options
     parser.add_argument("--name", help=argparse.SUPPRESS)  # Solution name override
-    parser.add_argument("--endpoint", default="chat/completions", help=argparse.SUPPRESS)
-    parser.add_argument("--api-key-header", default="Authorization", help=argparse.SUPPRESS)
-    parser.add_argument("--api-key-prefix", default="Bearer", help=argparse.SUPPRESS)
-    parser.add_argument("--header", dest="extra_headers", action="append", default=[], help=argparse.SUPPRESS)
-    parser.add_argument("--max-reasoning-tokens", type=int_or_none, default=65536, help=argparse.SUPPRESS)
-    parser.add_argument("--payload-extra", help=argparse.SUPPRESS)
 
     args = parser.parse_args()
 
@@ -584,31 +503,8 @@ Examples:
             print("ERROR: Provide --problem, --problems-file, --solution, or --solutions-file")
             sys.exit(1)
 
-    # Parse extra headers
-    try:
-        extra_headers = parse_extra_headers(args.extra_headers)
-    except ValueError as exc:
-        print(f"ERROR: {exc}")
-        sys.exit(1)
-
-    # Parse payload overrides
-    try:
-        payload_overrides = load_json_args(args.payload_extra)
-    except ValueError as exc:
-        print(f"ERROR: {exc}")
-        sys.exit(1)
-
     # Resolve API key
     default_api_key = resolve_api_key(args.api_key, args.api_key_env)
-
-    # Normalize API key header/prefix
-    api_key_header = args.api_key_header
-    if api_key_header and api_key_header.lower() == "none":
-        api_key_header = None
-
-    api_key_prefix = args.api_key_prefix
-    if api_key_prefix and api_key_prefix.lower() == "none":
-        api_key_prefix = None
 
     # Validate args
     if args.variants is not None and args.variants < 1:
@@ -924,16 +820,8 @@ Examples:
                 api_key=api_key_for_task,
                 log_file=log_file,
                 api_base=args.api_base,
-                endpoint=args.endpoint,
-                temperature=args.temperature,
-                max_tokens=args.max_tokens,
-                max_reasoning_tokens=args.max_reasoning_tokens,
                 is_reasoning_model=task.reasoning_model,
-                extra_headers=extra_headers,
                 timeout=args.timeout,
-                payload_overrides=payload_overrides,
-                api_key_header=api_key_header,
-                api_key_prefix=api_key_prefix,
                 problem_name=task.problem_name,
                 problem_path=task.problem_path,
                 docker_config=docker_config,

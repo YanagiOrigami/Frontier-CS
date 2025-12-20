@@ -235,7 +235,6 @@ python research/scripts/generate_solutions.py --solution "gpt5_flash*" --force
 | `--dryrun` | Preview without generating |
 | `--concurrency N` | Parallel API calls |
 | `--timeout SECONDS` | API timeout (default: 600s) |
-| `--temperature TEMP` | Sampling temperature (default: 0.7) |
 | `--reasoning-model` | Force reasoning mode (o1/o3 models) |
 
 ### Output

@@ -189,6 +189,53 @@ Check each problem's `readme` for the specific `solve()` signature and return ty
 
 Use `generate_solutions.py` to automatically generate solutions using LLMs like GPT-5, Claude, or Gemini.
 
+### How It Works
+
+The script generates a **Cartesian product** of problems × models:
+
+- **Default behavior**: Uses all problems (from `problems.txt`) and all models (from `models.txt`)
+- **Partial specification**: If you specify `--problem` or `--model`, only that dimension is filtered; the other uses all available options
+- **Skips existing**: Already-generated solutions are skipped (use `--force` to regenerate)
+- **Skips failures**: Failed generations are skipped and logged; run again to retry
+
+**Examples:**
+```bash
+# All problems × all models (from models.txt)
+python research/scripts/generate_solutions.py
+
+# All problems × specific model
+python research/scripts/generate_solutions.py --model gpt-5
+
+# Specific problems × all models
+python research/scripts/generate_solutions.py --problem "flash_attn"
+
+# Specific problems × specific models (Cartesian product)
+python research/scripts/generate_solutions.py --problem "gemm_*" --model gpt-5 claude-sonnet-4-5
+# → generates: gpt5_gemm_squares, gpt5_gemm_rectangles, ..., claude_gemm_squares, ...
+```
+
+### Dry Run
+
+Use `--dryrun` to preview what would be generated without actually calling the API:
+
+```bash
+python research/scripts/generate_solutions.py --problem "cant_be_late*" --model gpt-5 --dryrun
+```
+
+This shows the list of (problem, model) pairs that would be processed.
+
+### Retrying Failed Generations
+
+The script automatically skips failures and continues. To complete all generations:
+
+```bash
+# Run multiple times until all succeed
+python research/scripts/generate_solutions.py --model gpt-5
+python research/scripts/generate_solutions.py --model gpt-5  # retries failed ones
+```
+
+Failed generations are logged in `generation_logs/` for debugging.
+
 ### Basic Usage
 
 ```bash

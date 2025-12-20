@@ -7,6 +7,8 @@ This variant enforces a maximum parameter constraint of 2,500,000.
 Scoring is based on accuracy achievement relative to the baseline.
 """
 
+from __future__ import annotations
+
 import argparse
 import importlib.util
 import json
@@ -62,10 +64,7 @@ def load_score_config() -> Dict:
 
             return merge(default, loaded)
         except (OSError, json.JSONDecodeError) as exc:
-            print(
-                f"[evaluator] WARNING: Failed to load score_config.json ({exc}); using defaults",
-                file=sys.stderr,
-            )
+            print(f"[evaluator] WARNING: Failed to load score_config.json ({exc}); using defaults", file=sys.stderr)
     return default
 
 
@@ -77,18 +76,13 @@ def build_synthetic_dataset() -> Tuple[TensorDataset, TensorDataset, TensorDatas
     prototypes = torch.randn(NUM_CLASSES, FEATURE_DIM, generator=generator)
     prototypes = nn.functional.normalize(prototypes, dim=1) * PROTOTYPE_SCALE
 
-    def sample_split(
-        per_class: int, split_seed: int
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    def sample_split(per_class: int, split_seed: int) -> Tuple[torch.Tensor, torch.Tensor]:
         split_gen = torch.Generator().manual_seed(split_seed)
         features = []
         labels = []
         for cls in range(NUM_CLASSES):
             base = prototypes[cls]
-            noise = (
-                torch.randn(per_class, FEATURE_DIM, generator=split_gen)
-                * DATA_NOISE_STD
-            )
+            noise = torch.randn(per_class, FEATURE_DIM, generator=split_gen) * DATA_NOISE_STD
             samples = base.unsqueeze(0) + noise
             features.append(samples)
             labels.append(torch.full((per_class,), cls, dtype=torch.long))
@@ -150,23 +144,27 @@ def count_trainable_parameters(model: nn.Module) -> int:
     return sum(p.numel() for p in model.parameters() if p.requires_grad)
 
 
-def compute_accuracy_score(accuracy: float, config: Dict = SCORE_CONFIG) -> float:
+def compute_accuracy_score(accuracy: float, config: Dict = SCORE_CONFIG) -> Tuple[float, float]:
     """
     Score based on accuracy relative to baseline using linear scaling.
 
     Scoring formula:
     Score = (accuracy - baseline_accuracy) / (1.0 - baseline_accuracy) × 100.0
-    Clamped to [0, 100] range
+
+    Returns:
+        Tuple of (clamped_score, unbounded_score)
     """
     baseline_acc = float(config.get("baseline_accuracy", 0.65))
     max_score = float(config["scoring"].get("max_score", 100.0))
     min_score = float(config["scoring"].get("min_score", 0.0))
 
     # Linear interpolation from baseline to 100% accuracy
-    score = (accuracy - baseline_acc) / (1.0 - baseline_acc) * 100.0
+    score_unbounded = (accuracy - baseline_acc) / (1.0 - baseline_acc) * 100.0
 
     # Clamp to [min_score, max_score]
-    return float(min(max_score, max(min_score, score)))
+    score_clamped = float(min(max_score, max(min_score, score_unbounded)))
+
+    return score_clamped, float(score_unbounded)
 
 
 class Evaluator:
@@ -175,15 +173,15 @@ class Evaluator:
         self.score_config = load_score_config()
         self.param_limit = float(self.score_config.get("param_limit", PARAM_LIMIT))
         self.baseline_accuracy = float(self.score_config.get("baseline_accuracy", 0.65))
-
+        
         # Load test traces (dataloaders)
         self.train_loader, self.val_loader, self.test_loader = make_dataloaders()
         self.metadata = {
             "num_classes": NUM_CLASSES,
             "input_dim": FEATURE_DIM,
             "train_samples": len(self.train_loader.dataset),  # type: ignore[arg-type]
-            "val_samples": len(self.val_loader.dataset),  # type: ignore[arg-type]
-            "test_samples": len(self.test_loader.dataset),  # type: ignore[arg-type]
+            "val_samples": len(self.val_loader.dataset),      # type: ignore[arg-type]
+            "test_samples": len(self.test_loader.dataset),    # type: ignore[arg-type]
             "device": str(DEVICE),
             "param_limit": self.param_limit,
             "baseline_accuracy": self.baseline_accuracy,
@@ -201,22 +199,17 @@ class Evaluator:
         np.random.seed(2025)
         print("[evaluator] Invoking solution.solve()...", file=sys.stderr)
         start = time.time()
-
+        
         # Call solution.solve() with trace config and traces
         model = solution.solve(self.train_loader, self.val_loader, self.metadata)
         train_time = time.time() - start
 
         if not isinstance(model, nn.Module):
-            raise TypeError(
-                "solution.solve() must return an instance of torch.nn.Module"
-            )
+            raise TypeError("solution.solve() must return an instance of torch.nn.Module")
 
         model.to(DEVICE)
         param_count = count_trainable_parameters(model)
-        print(
-            f"[evaluator] Model has {param_count:,} trainable parameters",
-            file=sys.stderr,
-        )
+        print(f"[evaluator] Model has {param_count:,} trainable parameters", file=sys.stderr)
 
         # Check parameter constraint
         if param_count > self.param_limit:
@@ -230,17 +223,19 @@ class Evaluator:
                     "params": float(param_count),
                     "param_limit": self.param_limit,
                     "violates_constraint": True,
-                },
+                }
             }
 
         accuracy = evaluate_model(model, self.test_loader)
         print(f"[evaluator] Test accuracy: {accuracy:.4f}", file=sys.stderr)
 
-        score = compute_accuracy_score(accuracy, self.score_config)
+        score, score_unbounded = compute_accuracy_score(accuracy, self.score_config)
         print(f"[evaluator] Final score: {score:.2f}", file=sys.stderr)
+        print(f"[evaluator] Unbounded score: {score_unbounded:.2f}", file=sys.stderr)
 
         return {
             "score": score,
+            "score_unbounded": score_unbounded,
             "runs_successfully": 1.0,
             "metrics": {
                 "accuracy": accuracy,
@@ -259,12 +254,8 @@ class Evaluator:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(
-        description="Evaluate ImageNet Pareto 2.5M solution"
-    )
-    parser.add_argument(
-        "--solution", default="../../execution_env/solution_env/solution.py"
-    )
+    parser = argparse.ArgumentParser(description="Evaluate ImageNet Pareto 2.5M solution")
+    parser.add_argument("--solution", default="../../execution_env/solution_env/solution.py")
     parser.add_argument("--out", default="results.json")
     args = parser.parse_args()
 
@@ -273,17 +264,17 @@ def main() -> None:
 
     try:
         module = load_solution_module(solution_path)
-
+        
         # Use new Solution class format
         solution_class = getattr(module, "Solution", None)
         if solution_class is None:
             raise AttributeError("Solution class not found in solution.py")
-
+        
         print("[evaluator] Using Solution class format", file=sys.stderr)
         evaluator = Evaluator()
         solution = solution_class()
         results = evaluator.evaluate(solution)
-
+        
         with output_path.open("w", encoding="utf-8") as fh:
             json.dump(results, fh, indent=2)
         print(f"[evaluator] Results written to {output_path}", file=sys.stderr)

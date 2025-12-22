@@ -9,7 +9,7 @@ int main(int argc, char ** argv){
 	int id = inf.readInt(), t = inf.readInt();
 	println(id, t);
 
-	double ratio = 1;
+	double ratio = 1, unbounded_ratio = INFINITY;
 	while (t--) {
 		i64 p = inf.readLong();
 		int n = inf.readInt();
@@ -35,6 +35,7 @@ int main(int argc, char ** argv){
 					if (q > 100) {
 						ratio = std::min(ratio, 1 - .7 * (q - 100) / 100);
 					}
+					unbounded_ratio = std::min(unbounded_ratio, 1 - .7 * (q - 100) / 100);
 					break;
 				} else {
 					quitp(0., "Wrong guess. Ratio: 0.0000");
@@ -44,7 +45,7 @@ int main(int argc, char ** argv){
 			}
 		}
 	}
-	quitp(ratio, "Correct guess. Ratio: %.4f", ratio);
+	quitp(ratio, "Correct guess. Ratio: %.4f, RatioUnbounded: %.4f", ratio, unbounded_ratio);
 
 	return 0;
 }

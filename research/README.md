@@ -38,14 +38,14 @@ frontier-eval flash_attn <your_solution.py> --skypilot
 Batch evaluation automatically scans `solutions/` and parses problem IDs from filenames:
 
 ```bash
-# Evaluate all solutions in solutions/
+# Evaluate all solutions (auto-skips completed)
 frontier-eval batch
 
-# Resume interrupted evaluation
-frontier-eval batch --resume
-
 # Check status
-frontier-eval batch --status --results-dir results/batch
+frontier-eval batch --status
+
+# Force re-evaluate all
+frontier-eval batch --no-resume
 ```
 
 ## Python API

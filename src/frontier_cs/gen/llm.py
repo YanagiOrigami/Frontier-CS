@@ -4,7 +4,7 @@ import os
 import threading
 from typing import Any, Dict, Optional, Tuple
 
-from llm_interface import (
+from .llm_interface import (
     LLMInterface,
     GPT,
     Gemini,

@@ -1,0 +1,516 @@
+#!/usr/bin/env python3
+"""
+Generate LLM solutions for algorithmic (C++) problems.
+
+Fetches problem statements from the judge server and generates C++ solutions.
+
+Usage:
+    python generate_solutions.py --model gpt-5
+    python generate_solutions.py --problem 1 --model claude-sonnet-4-5
+    python generate_solutions.py --submit --model gpt-5  # Generate and evaluate
+    python generate_solutions.py --dryrun  # Show what would be generated
+"""
+
+import sys
+import os
+import json
+import time
+import argparse
+import re
+from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass
+from typing import Optional, Dict, Any, List, Tuple
+from datetime import datetime
+
+import requests
+
+from frontier_cs.models import get_model_prefix, is_reasoning_model
+from frontier_cs.gen import (
+    build_key_pools, get_fallback_api_key, APIKeyPool,
+    instantiate_llm_client, detect_provider,
+    bold, dim, red, green, yellow, blue, cyan,
+    model_name, problem_name as format_problem_name, solution_name as format_solution_name,
+)
+from frontier_cs.gen.io import read_models_file
+from frontier_cs.gen.solution_format import format_solution_filename
+
+
+# C++ competitive programming prompt
+CPP_SYSTEM_PROMPT = """You are a competitive programmer. You will be given a problem statement, please implement a solution in C++. The execution time and memory limit are also stated in the statement so be aware of the complexity of the program. Please wrap the code in ```cpp and ``` so that it is properly formatted. Your response should ONLY contain the C++ code, with no additional explanation or text."""
+
+
+@dataclass
+class GenerationTask:
+    """Represents a single solution generation task."""
+    problem_id: str
+    statement: str
+    model: str
+    provider: str
+    reasoning_model: bool
+    variant_index: int
+    solution_name: str
+    total_variants: int = 1
+
+
+class AlgorithmicJudgeClient:
+    """Client for interacting with the algorithmic judge server."""
+
+    def __init__(self, judge_url: str = "http://localhost:8081"):
+        self.judge_url = judge_url.rstrip("/")
+        self.session = requests.Session()
+
+    def is_available(self) -> bool:
+        """Check if the judge server is available."""
+        try:
+            response = self.session.get(f"{self.judge_url}/problems", timeout=5)
+            return response.status_code == 200
+        except requests.RequestException:
+            return False
+
+    def get_all_problems(self) -> List[str]:
+        """Get list of all problem IDs."""
+        try:
+            response = self.session.get(f"{self.judge_url}/problems", timeout=10)
+            response.raise_for_status()
+            data = response.json()
+            return [str(p['id']) for p in data.get('problems', [])]
+        except requests.RequestException as e:
+            print(f"Error fetching problems from judge: {e}")
+            return []
+
+    def get_problem_statement(self, problem_id: str) -> Optional[str]:
+        """Get the problem statement for a given problem ID."""
+        try:
+            response = self.session.get(
+                f"{self.judge_url}/problem/{problem_id}/statement",
+                timeout=30
+            )
+            response.raise_for_status()
+            return response.text
+        except requests.RequestException as e:
+            print(f"Error fetching statement for problem {problem_id}: {e}")
+            return None
+
+    def submit_solution(self, problem_id: str, code: str) -> Optional[str]:
+        """Submit a solution and return the submission ID."""
+        try:
+            files = {'code': ('solution.cpp', code)}
+            data = {'pid': problem_id, 'lang': 'cpp'}
+            response = self.session.post(
+                f"{self.judge_url}/submit",
+                files=files,
+                data=data,
+                timeout=30
+            )
+            response.raise_for_status()
+            return response.json().get('sid')
+        except requests.RequestException as e:
+            print(f"Error submitting solution for problem {problem_id}: {e}")
+            return None
+
+    def get_result(self, submission_id: str, poll_interval: float = 2.0, max_wait: float = 300.0) -> Dict[str, Any]:
+        """Poll for submission result."""
+        start_time = time.time()
+        while time.time() - start_time < max_wait:
+            try:
+                response = self.session.get(
+                    f"{self.judge_url}/result/{submission_id}",
+                    timeout=10
+                )
+                if response.status_code == 404:
+                    time.sleep(poll_interval)
+                    continue
+                response.raise_for_status()
+                result = response.json()
+                if result.get('status') in ['done', 'error']:
+                    return result
+                time.sleep(poll_interval)
+            except requests.RequestException:
+                time.sleep(poll_interval)
+        return {"status": "error", "error": "Timeout waiting for result", "score": 0}
+
+
+def extract_cpp_code(response_text: str) -> str:
+    """Extract C++ code from LLM response."""
+    if not response_text:
+        return ""
+
+    code = response_text.strip()
+
+    # Try to extract from ```cpp blocks
+    cpp_pattern = r'```(?:cpp|c\+\+)?\s*\n(.*?)```'
+    matches = re.findall(cpp_pattern, code, re.DOTALL)
+    if matches:
+        return max(matches, key=len).strip()
+
+    # Fallback: strip markdown if present
+    if code.startswith("```cpp"):
+        code = code[6:].strip()
+    elif code.startswith("```c++"):
+        code = code[6:].strip()
+    elif code.startswith("```"):
+        code = code[3:].strip()
+    if code.endswith("```"):
+        code = code[:-3].strip()
+
+    return code
+
+
+def generate_code(
+    statement: str,
+    *,
+    model: str,
+    api_key: Optional[str],
+    log_file: Path,
+    is_reasoning_model: bool,
+    timeout: float,
+) -> str:
+    """Generate C++ solution code using an LLM."""
+    user_prompt = f"Problem:\n\n{statement}\n\nGenerate solution code:"
+    combined_prompt = f"{CPP_SYSTEM_PROMPT}\n\n{user_prompt}"
+
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    llm_client, llm_config = instantiate_llm_client(
+        model,
+        is_reasoning_model=is_reasoning_model,
+        timeout=timeout,
+        base_url=None,
+        api_key=api_key,
+    )
+
+    with open(log_file, 'w', encoding='utf-8') as f:
+        f.write("=" * 80 + "\n")
+        f.write("ALGORITHMIC SOLUTION GENERATION LOG\n")
+        f.write(f"Timestamp: {timestamp}\n")
+        f.write("=" * 80 + "\n\n")
+        f.write(f"MODEL: {model}\n")
+        f.write(f"INTERFACE CLASS: {llm_client.__class__.__name__}\n")
+        for key, value in llm_config.items():
+            f.write(f"{key.upper()}: {value}\n")
+        f.write(f"TIMEOUT: {timeout}s\n")
+        f.write("\n" + "=" * 80 + "\n")
+        f.write("PROMPT:\n")
+        f.write("=" * 80 + "\n")
+        f.write(combined_prompt)
+        f.write("\n\n")
+
+    print(f"  Calling LLM (model: {model})...")
+
+    MAX_RETRIES = 3
+    RETRY_DELAY = 30
+    content: Optional[str] = None
+
+    for attempt in range(1, MAX_RETRIES + 1):
+        response_text, meta = llm_client.call_llm(combined_prompt)
+        if response_text and not response_text.strip().lower().startswith("error:"):
+            content = response_text
+            break
+
+        with open(log_file, 'a', encoding='utf-8') as f:
+            f.write(f"ERROR (attempt {attempt}/{MAX_RETRIES}): {response_text or 'Empty'}\n")
+
+        if attempt < MAX_RETRIES:
+            time.sleep(RETRY_DELAY * attempt)
+
+    if content is None:
+        raise RuntimeError("LLM call failed after retries")
+
+    with open(log_file, 'a', encoding='utf-8') as f:
+        f.write("=" * 80 + "\n")
+        f.write("RAW OUTPUT:\n")
+        f.write("=" * 80 + "\n")
+        f.write(content)
+        f.write("\n\n")
+
+    code = extract_cpp_code(content)
+
+    with open(log_file, 'a', encoding='utf-8') as f:
+        f.write("=" * 80 + "\n")
+        f.write("EXTRACTED C++ CODE:\n")
+        f.write("=" * 80 + "\n")
+        f.write(code)
+        f.write("\n")
+
+    return code
+
+
+def main():
+    script_dir = Path(__file__).parent
+    algo_dir = script_dir.parent
+    repo_root = algo_dir.parent
+
+    parser = argparse.ArgumentParser(
+        description="Generate LLM solutions for algorithmic (C++) problems",
+    )
+
+    # Problem selection
+    parser.add_argument("--problem", dest="problems", nargs="+",
+                        help="Problem ID(s) to generate solutions for")
+    parser.add_argument("--all", action="store_true",
+                        help="Generate solutions for all problems")
+
+    # Model selection
+    model_group = parser.add_mutually_exclusive_group()
+    model_group.add_argument("--model", dest="models", nargs="+",
+                             help="Model identifier(s)")
+    model_group.add_argument("--models-file", help="File with model list")
+
+    # Judge configuration
+    parser.add_argument("--judge-url", default="http://localhost:8081",
+                        help="Judge server URL")
+    parser.add_argument("--submit", action="store_true",
+                        help="Submit solutions to judge for evaluation")
+
+    # Generation parameters
+    parser.add_argument("--timeout", type=float, default=600.0,
+                        help="LLM request timeout in seconds")
+    parser.add_argument("--variants", type=int, default=1,
+                        help="Number of variants per (problem, model)")
+
+    # Execution control
+    parser.add_argument("--force", action="store_true",
+                        help="Regenerate existing solutions")
+    parser.add_argument("--dryrun", action="store_true",
+                        help="Show what would be generated")
+    parser.add_argument("--concurrency", type=int, default=4,
+                        help="Maximum parallel generations")
+
+    # Output
+    parser.add_argument("--output-dir", type=Path,
+                        default=None,
+                        help="Output directory for solutions")
+
+    args = parser.parse_args()
+
+    # Default output directory
+    if args.output_dir is None:
+        args.output_dir = script_dir / "solutions"
+
+    # Initialize judge client
+    judge = AlgorithmicJudgeClient(args.judge_url)
+
+    if not judge.is_available():
+        print(f"{red('ERROR:')} Judge server not available at {args.judge_url}")
+        print("Start the judge with: cd algorithmic && docker compose up -d")
+        sys.exit(1)
+
+    # Get problem list
+    if args.problems:
+        problem_ids = args.problems
+    elif args.all:
+        problem_ids = judge.get_all_problems()
+        if not problem_ids:
+            print(f"{red('ERROR:')} No problems found on judge server")
+            sys.exit(1)
+        print(f"Found {len(problem_ids)} problems on judge server")
+    else:
+        print(f"{red('ERROR:')} Specify --problem <id> or --all")
+        sys.exit(1)
+
+    # Get model list
+    if args.models:
+        models_list = args.models
+    elif args.models_file:
+        models_path = Path(args.models_file)
+        if not models_path.is_absolute():
+            models_path = script_dir / models_path
+        if not models_path.is_file():
+            print(f"{red('ERROR:')} Models file not found: {models_path}")
+            sys.exit(1)
+        models_list = read_models_file(models_path)
+    else:
+        # Try default models.txt
+        models_path = script_dir / "models.txt"
+        if models_path.is_file():
+            models_list = read_models_file(models_path)
+        else:
+            print(f"{red('ERROR:')} No model specified. Use --model or create models.txt")
+            sys.exit(1)
+
+    if not models_list:
+        print(f"{red('ERROR:')} No models specified")
+        sys.exit(1)
+
+    print(f"Using {len(models_list)} model(s): {', '.join(models_list)}")
+
+    # Build key pools
+    provider_key_pools = build_key_pools()
+
+    # Create output and logs directories
+    logs_dir = script_dir / "generation_logs"
+    if not args.dryrun:
+        args.output_dir.mkdir(parents=True, exist_ok=True)
+        logs_dir.mkdir(exist_ok=True)
+
+    # Build tasks
+    tasks: List[GenerationTask] = []
+    skipped: List[str] = []
+
+    for problem_id in problem_ids:
+        statement = judge.get_problem_statement(problem_id)
+        if not statement:
+            print(f"{yellow('WARNING:')} Could not get statement for problem {problem_id}")
+            continue
+
+        for model in models_list:
+            model_prefix = get_model_prefix(model)
+            provider = detect_provider(model)
+            reasoning = is_reasoning_model(model)
+
+            for variant_idx in range(args.variants):
+                # New flat format: {problem}.{model}.cpp or {problem}.{model}_{variant}.cpp
+                variant_suffix = "" if variant_idx == 0 else f"_{variant_idx}"
+                model_with_variant = f"{model_prefix}{variant_suffix}"
+                sol_filename = format_solution_filename(problem_id, model_with_variant, "cpp")
+                sol_path = args.output_dir / sol_filename
+
+                if sol_path.exists() and not args.force:
+                    skipped.append(sol_filename)
+                    continue
+
+                tasks.append(GenerationTask(
+                    problem_id=problem_id,
+                    statement=statement,
+                    model=model,
+                    provider=provider,
+                    reasoning_model=reasoning,
+                    variant_index=variant_idx,
+                    solution_name=sol_filename,
+                    total_variants=args.variants,
+                ))
+
+    # Print plan
+    print(f"\n{'=' * 60}")
+    if args.dryrun:
+        print(yellow(bold("DRYRUN MODE - No changes will be made")))
+    else:
+        print(cyan(bold("GENERATION PLAN")))
+    print(f"{'=' * 60}\n")
+
+    print(f"{bold('Configuration:')}")
+    print(f"  Problems: {blue(str(len(problem_ids)))}")
+    print(f"  Models: {blue(str(len(models_list)))}")
+    print(f"  Variants: {blue(str(args.variants))}")
+    print(f"  Output: {blue(str(args.output_dir))}")
+    print(f"  Submit: {blue(str(args.submit))}")
+    print()
+
+    if tasks:
+        print(f"{green('Will generate')} {green(bold(str(len(tasks))))} solution(s)")
+    else:
+        print(dim("No new solutions to generate."))
+
+    if skipped:
+        print(f"{yellow('Skipping')} {yellow(bold(str(len(skipped))))} existing (use --force)")
+
+    print(f"\n{'=' * 60}\n")
+
+    if args.dryrun:
+        return
+
+    if not tasks:
+        return
+
+    # Execute tasks
+    generated: List[str] = []
+    failed: List[str] = []
+    results: Dict[str, Dict[str, Any]] = {}
+
+    def execute_task(task: GenerationTask) -> Tuple[str, str, Optional[str], str, Optional[int]]:
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        log_file = logs_dir / f"{task.solution_name}_{timestamp}.log"
+
+        print(f"{cyan('▶')} Generating {solution_name(task.solution_name)} "
+              f"({dim('problem:')} {task.problem_id}, {dim('model:')} {model_name(task.model)})")
+
+        pool = provider_key_pools.get(task.provider)
+        api_key: Optional[str] = None
+        pool_token: Optional[int] = None
+
+        if pool:
+            api_key, pool_token = pool.acquire()
+            if api_key is None:
+                return ("failed", task.solution_name, "No API key available", task.provider, None)
+        else:
+            api_key = get_fallback_api_key(task.provider)
+
+        try:
+            code = generate_code(
+                task.statement,
+                model=task.model,
+                api_key=api_key,
+                log_file=log_file,
+                is_reasoning_model=task.reasoning_model,
+                timeout=args.timeout,
+            )
+
+            # Save solution (solution_name is already the full filename)
+            sol_path = args.output_dir / task.solution_name
+            sol_path.write_text(code, encoding="utf-8")
+            print(f"  {green('✓')} Saved: {green(str(sol_path))}")
+
+            # Submit if requested
+            if args.submit:
+                print(f"  Submitting to judge...")
+                sid = judge.submit_solution(task.problem_id, code)
+                if sid:
+                    result = judge.get_result(sid)
+                    score = result.get('score', -1)
+                    results[task.solution_name] = result
+
+                    # Save result (strip .cpp extension)
+                    result_base = task.solution_name.rsplit('.', 1)[0]
+                    result_path = args.output_dir / f"{result_base}_result.json"
+                    result_path.write_text(json.dumps(result, indent=2), encoding="utf-8")
+                    print(f"  {green('✓')} Score: {green(str(score))}")
+                else:
+                    print(f"  {yellow('⚠')} Submission failed")
+
+            return ("generated", task.solution_name, None, task.provider, pool_token)
+
+        except Exception as exc:
+            print(f"  {red('✗')} {red('ERROR:')} {exc}")
+            return ("failed", task.solution_name, str(exc), task.provider, pool_token)
+
+    # Run tasks
+    max_workers = min(args.concurrency, len(tasks))
+    print(f"{cyan('▶')} Starting generation ({bold(str(len(tasks)))} tasks, concurrency={max_workers})...\n")
+
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        future_to_task = {executor.submit(execute_task, task): task for task in tasks}
+        for future in as_completed(future_to_task):
+            status, sol_name, error_text, provider, pool_token = future.result()
+            pool = provider_key_pools.get(provider)
+            if pool and pool_token is not None:
+                if status == "generated":
+                    pool.report_success(pool_token)
+                else:
+                    pool.report_failure(pool_token, error_text)
+            if status == "generated":
+                generated.append(sol_name)
+            else:
+                failed.append(sol_name)
+
+    # Print summary
+    print(f"\n{bold('Summary:')}")
+    print("─" * 40)
+    if generated:
+        print(f"  {green('✓')} Generated: {green(bold(str(len(generated))))} solution(s)")
+    if skipped:
+        print(f"  {yellow('○')} Skipped: {yellow(bold(str(len(skipped))))} existing")
+    if failed:
+        print(f"  {red('✗')} Failed: {red(bold(str(len(failed))))} solution(s)")
+
+    if args.submit and results:
+        scores = [r.get('score', 0) for r in results.values() if r.get('score', -1) >= 0]
+        if scores:
+            avg_score = sum(scores) / len(scores)
+            print(f"\n  Average Score: {bold(f'{avg_score:.2f}')}")
+
+    print("─" * 40)
+
+
+if __name__ == "__main__":
+    main()

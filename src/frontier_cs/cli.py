@@ -34,41 +34,30 @@ from typing import List, Optional
 
 from .evaluator import FrontierCSEvaluator
 from .runner import EvaluationResult
-from .batch.pair import read_solution_config
+from .gen.solution_format import parse_solution_filename
 
 logger = logging.getLogger(__name__)
 
 
-def detect_solution_dir(path: Path) -> tuple[bool, Optional[str], Optional[Path]]:
+def detect_solution_file(path: Path) -> tuple[bool, Optional[str], Optional[Path]]:
     """
-    Detect if a path is a solution directory with config.yaml.
+    Detect if a path is a solution file with format {problem}.{model}.py.
 
     Returns:
-        (is_solution_dir, problem, solution_file)
-        - is_solution_dir: True if path is a directory with config.yaml
-        - problem: Problem ID from config.yaml (or None)
-        - solution_file: Path to solution file in the directory (or None)
+        (is_solution, problem, solution_file)
+        - is_solution: True if path matches the solution file format
+        - problem: Problem ID parsed from filename (or None)
+        - solution_file: The solution file Path (or None)
     """
-    if not path.is_dir():
+    if not path.is_file():
         return False, None, None
 
-    problem = read_solution_config(path)
-    if not problem:
+    parsed = parse_solution_filename(path.name)
+    if not parsed:
         return False, None, None
 
-    # Look for solution file in order of preference:
-    # solve.sh (standard), solution.py, solution.cpp, or any .py file
-    for name in ["solve.sh", "solution.py", "solution.cpp"]:
-        candidate = path / name
-        if candidate.exists():
-            return True, problem, candidate
-
-    # Fallback: any Python file
-    py_files = list(path.glob("*.py"))
-    if py_files:
-        return True, problem, py_files[0]
-
-    return True, problem, None
+    problem, _, _ = parsed
+    return True, problem, path
 
 
 def create_parser() -> argparse.ArgumentParser:
@@ -79,22 +68,19 @@ def create_parser() -> argparse.ArgumentParser:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  # Evaluate a solution directory (auto-detects problem from config.yaml)
-  frontier-eval solutions/gpt5_flash_attn
+  # Evaluate a solution file (auto-detects problem from filename)
+  frontier-eval solutions/flash_attn.gpt5.py
 
-  # Evaluate a research problem with solution file
+  # Evaluate with explicit problem and solution file
   frontier-eval flash_attn solution.py
-
-  # Override problem when evaluating a solution directory
-  frontier-eval solutions/gpt5_flash_attn --problems other_problem
 
   # Evaluate an algorithmic problem
   frontier-eval --algorithmic 1 solution.cpp
 
   # Evaluate with SkyPilot (cloud)
-  frontier-eval flash_attn solution.py --skypilot
+  frontier-eval solutions/flash_attn.gpt5.py --skypilot
 
-  # Evaluate multiple problems
+  # Evaluate multiple problems with one solution
   frontier-eval --problems flash_attn,cross_entropy solution.py
 
   # Evaluate all research problems
@@ -110,7 +96,7 @@ Examples:
         "problem_id",
         nargs="?",
         default=None,
-        help="Problem ID (e.g., flash_attn) or solution directory with config.yaml",
+        help="Problem ID (e.g., flash_attn) or solution file (e.g., flash_attn.gpt5.py)",
     )
     parser.add_argument(
         "solution",
@@ -249,7 +235,7 @@ Examples:
   frontier-eval batch --solutions-dir path/to/solutions
 
   # Evaluate specific pairs
-  frontier-eval batch --pairs "sol1:flash_attn,sol2:cross_entropy"
+  frontier-eval batch --pairs "flash_attn.gpt5.py:flash_attn"
 
   # Resume interrupted evaluation
   frontier-eval batch --resume --results-dir results/batch1
@@ -257,8 +243,7 @@ Examples:
   # Check evaluation status
   frontier-eval batch --status --results-dir results/batch1
 
-Each solution directory should have a config.yaml with:
-  problem: flash_attn
+Solution files use format: {problem}.{model}.py (e.g., flash_attn.gpt5.py)
         """,
     )
 
@@ -582,7 +567,7 @@ def run_batch(args: argparse.Namespace) -> int:
 
         pairs = scan_solutions_dir(solutions_dir)
         if not pairs:
-            print(f"Error: No solutions with config.yaml found in {solutions_dir}", file=sys.stderr)
+            print(f"Error: No solution files found in {solutions_dir}", file=sys.stderr)
             return 1
 
         print(f"\nBatch evaluation: {len(pairs)} solutions from {solutions_dir}")
@@ -692,32 +677,29 @@ def main(argv: Optional[List[str]] = None) -> int:
             return 1
         return 0
 
-    # Auto-detect solution directory mode
-    # If problem_id is a directory with config.yaml, use it as solution directory
-    solution_dir_mode = False
+    # Auto-detect solution file format: {problem}.{model}.py
+    solution_file_mode = False
     detected_problem = None
     detected_solution_file = None
 
     if args.problem_id:
         candidate = Path(args.problem_id)
-        is_sol_dir, detected_problem, detected_solution_file = detect_solution_dir(candidate)
-        if is_sol_dir:
-            solution_dir_mode = True
+        is_solution, detected_problem, detected_solution_file = detect_solution_file(candidate)
+        if is_solution:
+            solution_file_mode = True
             if not args.quiet:
-                print(f"Detected solution directory: {candidate}")
-                print(f"  Problem (from config.yaml): {detected_problem}")
-                if detected_solution_file:
-                    print(f"  Solution file: {detected_solution_file.name}")
+                print(f"Detected solution file: {candidate}")
+                print(f"  Problem (from filename): {detected_problem}")
 
     # Get problem IDs
-    if solution_dir_mode:
-        # Use problem from config.yaml, or override with --problems
+    if solution_file_mode:
+        # Use problem from filename, or override with --problems
         if args.problems:
             problem_ids = [p.strip() for p in args.problems.split(",")]
         elif detected_problem:
             problem_ids = [detected_problem]
         else:
-            print("Error: No problem found in config.yaml", file=sys.stderr)
+            print("Error: Could not parse problem from filename", file=sys.stderr)
             return 1
     else:
         problem_ids = get_problem_ids(args, evaluator, track)
@@ -729,8 +711,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     # Get solution code
     if args.code:
         code = args.code
-    elif solution_dir_mode and detected_solution_file:
-        # Use solution file from detected directory
+    elif solution_file_mode and detected_solution_file:
         code = detected_solution_file.read_text(encoding="utf-8")
     elif args.solution:
         solution_path = Path(args.solution)
@@ -738,9 +719,6 @@ def main(argv: Optional[List[str]] = None) -> int:
             print(f"Error: Solution file not found: {solution_path}", file=sys.stderr)
             return 1
         code = solution_path.read_text(encoding="utf-8")
-    elif solution_dir_mode:
-        print(f"Error: No solution.py found in {args.problem_id}", file=sys.stderr)
-        return 1
     else:
         print("Error: No solution provided. Use --code or provide a file path.", file=sys.stderr)
         return 1

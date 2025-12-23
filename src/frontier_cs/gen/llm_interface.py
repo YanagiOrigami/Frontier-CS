@@ -3,6 +3,7 @@ from typing import Any, Tuple, Optional
 from openai import OpenAI, APITimeoutError
 import google.generativeai as genai
 import os
+import traceback
 from dotenv import load_dotenv
 from anthropic import Anthropic, APITimeoutError as AnthropicAPITimeoutError
 
@@ -74,6 +75,7 @@ class GPT(LLMInterface):
             return "", str(e)
         except Exception as e:
             print(f"An unexpected error occurred while calling the OpenAI API: {e}")
+            traceback.print_exc()
             return "", str(e)
 
 class Gemini(LLMInterface):
@@ -128,6 +130,7 @@ class Gemini(LLMInterface):
             return solution_text, response
         except Exception as e:
             print(f"An error occurred while calling the Gemini API: {e}")
+            traceback.print_exc()
             return f"Error: {e}", None
 
 
@@ -177,9 +180,11 @@ class ClaudeBase(LLMInterface):
 
         except AnthropicAPITimeoutError as e:
             print(f"Anthropic API request timed out: {e}")
+            traceback.print_exc()
             return "", str(e)
         except Exception as e:
             print(f"An unexpected error occurred while calling the Anthropic API: {e}")
+            traceback.print_exc()
             return "", str(e)
 
 
@@ -236,9 +241,11 @@ class DeepSeek(LLMInterface):
             return completion.choices[0].message.content, str(completion)
         except APITimeoutError as e:
             print(f"DeepSeek API request timed out: {e}")
+            traceback.print_exc()
             return "", str(e)
         except Exception as e:
             print(f"An unexpected error occurred while calling the DeepSeek API: {e}")
+            traceback.print_exc()
             return "", str(e)
 
 
@@ -294,7 +301,9 @@ class Grok(LLMInterface):
             return completion.choices[0].message.content, str(completion)
         except APITimeoutError as e:
             print(f"Grok (xAI) API request timed out: {e}")
+            traceback.print_exc()
             return "", str(e)
         except Exception as e:
             print(f"An unexpected error occurred while calling the Grok (xAI) API: {e}")
+            traceback.print_exc()
             return "", str(e)

@@ -25,11 +25,21 @@ from datetime import datetime
 from importlib import metadata
 
 from frontier_cs.models import get_model_prefix, is_reasoning_model
+from frontier_cs.gen import (
+    build_key_pools, get_fallback_api_key, APIKeyPool,
+    instantiate_llm_client, detect_provider,
+    bold, dim, red, green, yellow, blue, cyan, magenta,
+    success, error, warning, info, header, section,
+    model_name, problem_name as format_problem_name, solution_name as format_solution_name,
+    print_header, print_section, print_success, print_error, print_warning, print_info,
+)
+from frontier_cs.gen.solution_format import (
+    format_solution_filename,
+    validate_problem_name,
+)
 
-# Local modules
+# Local modules (research-specific)
 from gen_env import get_system_prompt_for_problem
-from gen_api_keys import build_key_pools, get_fallback_api_key, APIKeyPool
-from gen_llm import instantiate_llm_client, detect_provider
 from gen_io import (
     load_env_file,
     load_solution_targets,
@@ -38,13 +48,6 @@ from gen_io import (
     read_readme,
     load_docker_config,
     get_problem_name,
-)
-from gen_templates import create_solution
-from gen_colors import (
-    bold, dim, red, green, yellow, blue, cyan, magenta,
-    success, error, warning, info, header, section,
-    model_name, problem_name, solution_name,
-    print_header, print_section, print_success, print_error, print_warning, print_info,
 )
 
 
@@ -227,7 +230,8 @@ def build_tasks(
     skipped: List[str] = []
 
     if args.solutions_file:
-        # Solutions file mode
+        # Solutions file mode - for regenerating existing solutions
+        # New format: solution filenames like "flash_attn.gpt5.py:research/problems/flash_attn"
         solutions_path = Path(args.solutions_file)
         if not solutions_path.is_absolute():
             solutions_path = base_dir / solutions_path
@@ -235,12 +239,27 @@ def build_tasks(
         print(f"Loaded {len(solution_targets)} target solution(s) from {solutions_path}.")
 
         problem_cache: Dict[str, Tuple[Path, str, str]] = {}
-        for solution_name, problem_entry in solution_targets:
-            model_prefix = solution_name.split("_", 1)[0]
-            model = prefix_to_model.get(model_prefix)
-            if not model:
-                print(f"WARNING: No model mapping found for solution prefix '{model_prefix}'; skipping {solution_name}.")
+        for sol_filename, problem_entry in solution_targets:
+            # Parse new format: {problem}.{model}.py
+            parts = sol_filename.rsplit('.', 2)
+            if len(parts) != 3:
+                print(f"WARNING: Invalid solution filename format '{sol_filename}'; skipping.")
                 continue
+            _, model_with_variant, _ = parts
+
+            # Extract model prefix (strip variant suffix like _1, _2)
+            model_base = model_with_variant.rsplit("_", 1)[0] if "_" in model_with_variant and model_with_variant.rsplit("_", 1)[1].isdigit() else model_with_variant
+            model = prefix_to_model.get(model_base)
+            if not model:
+                print(f"WARNING: No model mapping for '{model_base}' in '{sol_filename}'; skipping.")
+                continue
+
+            # Parse variant index
+            variant_index = 0
+            if "_" in model_with_variant:
+                variant_parts = model_with_variant.rsplit("_", 1)
+                if len(variant_parts) == 2 and variant_parts[1].isdigit():
+                    variant_index = int(variant_parts[1])
 
             provider = detect_provider(model)
 
@@ -252,11 +271,11 @@ def build_tasks(
             try:
                 problem_path_real = (repo_root / relative_problem_str).resolve()
             except Exception:
-                print(f"WARNING: Invalid problem path '{problem_entry}' for {solution_name}; skipping.")
+                print(f"WARNING: Invalid problem path '{problem_entry}' for {sol_filename}; skipping.")
                 continue
 
             if not problem_path_real.is_dir():
-                print(f"WARNING: Problem path {problem_path_real} not found; skipping {solution_name}.")
+                print(f"WARNING: Problem path {problem_path_real} not found; skipping {sol_filename}.")
                 continue
 
             cache_key = relative_problem_str
@@ -264,35 +283,29 @@ def build_tasks(
                 try:
                     readme_text = read_readme(problem_path_real)
                 except FileNotFoundError as exc:
-                    print(f"WARNING: {exc}; skipping {solution_name}.")
+                    print(f"WARNING: {exc}; skipping {sol_filename}.")
                     continue
                 try:
                     rel_path_for_name = problem_path_real.relative_to(repo_root / "research")
                 except ValueError:
                     rel_path_for_name = Path(problem_path_real.name)
-                problem_name = get_problem_name(rel_path_for_name)
-                problem_cache[cache_key] = (problem_path_real, readme_text, problem_name)
+                inferred_problem_name = get_problem_name(rel_path_for_name)
+                problem_cache[cache_key] = (problem_path_real, readme_text, inferred_problem_name)
 
             problem_path_real, readme_text, inferred_problem_name = problem_cache[cache_key]
 
-            tail_parts = solution_name.rsplit("_", 1)
-            variant_index = 0
-            if len(tail_parts) == 2 and tail_parts[1].isdigit():
-                variant_index = int(tail_parts[1])
-            total_variants_for_task = max(variant_index + 1, 1)
-
-            sol_dir = repo_root / "solutions" / solution_name
-            if sol_dir.exists():
+            sol_file = repo_root / "solutions" / sol_filename
+            if sol_file.exists():
                 if args.force:
                     if not args.dryrun:
                         try:
-                            shutil.rmtree(sol_dir)
+                            sol_file.unlink()
                         except Exception as exc:
-                            print(f"WARNING: Failed to remove {sol_dir}: {exc}; skipping")
-                            skipped.append(solution_name)
+                            print(f"WARNING: Failed to remove {sol_file}: {exc}; skipping")
+                            skipped.append(sol_filename)
                             continue
                 else:
-                    skipped.append(solution_name)
+                    skipped.append(sol_filename)
                     continue
 
             tasks.append(
@@ -306,8 +319,8 @@ def build_tasks(
                     reasoning_model=is_reasoning(model, args.reasoning_override),
                     variant_index=variant_index,
                     variant_position=variant_index,
-                    solution_name=solution_name,
-                    total_variants=total_variants_for_task,
+                    solution_name=sol_filename,
+                    total_variants=max(variant_index + 1, 1),
                 )
             )
     else:
@@ -359,21 +372,23 @@ def build_tasks(
                 provider = detect_provider(model)
 
                 for pos, variant_index in enumerate(variant_indices):
-                    suffix = "" if variant_index == 0 else f"_{variant_index}"
-                    solution_name = f"{model_prefix}_{problem_name}{suffix}"
-                    sol_dir = repo_root / "solutions" / solution_name
+                    # New flat format: {problem}.{model}.py or {problem}.{model}_{variant}.py
+                    variant_suffix = "" if variant_index == 0 else f"_{variant_index}"
+                    model_with_variant = f"{model_prefix}{variant_suffix}"
+                    sol_filename = format_solution_filename(problem_name, model_with_variant, "py")
+                    sol_file = repo_root / "solutions" / sol_filename
 
-                    if sol_dir.exists():
+                    if sol_file.exists():
                         if args.force:
                             if not args.dryrun:
                                 try:
-                                    shutil.rmtree(sol_dir)
+                                    sol_file.unlink()
                                 except Exception as exc:
-                                    print(f"WARNING: Failed to remove {sol_dir}: {exc}; skipping")
-                                    skipped.append(solution_name)
+                                    print(f"WARNING: Failed to remove {sol_file}: {exc}; skipping")
+                                    skipped.append(sol_filename)
                                     continue
                         else:
-                            skipped.append(solution_name)
+                            skipped.append(sol_filename)
                             continue
 
                     tasks.append(
@@ -387,7 +402,7 @@ def build_tasks(
                             reasoning_model=reasoning_model,
                             variant_index=variant_index,
                             variant_position=pos,
-                            solution_name=solution_name,
+                            solution_name=sol_filename,
                             total_variants=len(variant_indices),
                         )
                     )
@@ -498,24 +513,19 @@ Examples:
     # Handle --solution patterns (expands to solutions-file format)
     if args.solution_patterns:
         import fnmatch
+        from frontier_cs.gen.solution_format import parse_solution_filename
 
-        # Scan solutions directory and read config.yaml for problem mapping
+        # Scan solutions directory for flat files
         solutions_dir = repo_root / "solutions"
         solution_to_problem: Dict[str, str] = {}
         if solutions_dir.is_dir():
-            for sol_dir in solutions_dir.iterdir():
-                if sol_dir.is_dir() and not sol_dir.name.startswith('.'):
-                    config_file = sol_dir / "config.yaml"
-                    if config_file.exists():
-                        try:
-                            content = config_file.read_text(encoding="utf-8")
-                            for line in content.splitlines():
-                                if line.strip().startswith("problem:"):
-                                    problem = line.split(":", 1)[1].strip()
-                                    solution_to_problem[sol_dir.name] = problem
-                                    break
-                        except Exception:
-                            pass
+            for sol_file in solutions_dir.iterdir():
+                if sol_file.is_file() and not sol_file.name.startswith('.'):
+                    parsed = parse_solution_filename(sol_file.name)
+                    if parsed:
+                        problem, _, _ = parsed
+                        # Problem name from filename maps to problem path
+                        solution_to_problem[sol_file.name] = f"problems/{problem.replace('_', '/')}"
 
         all_solutions = set(solution_to_problem.keys())
 
@@ -805,14 +815,12 @@ Examples:
                 problem_path=task.problem_path,
                 docker_config=docker_config,
             )
-            # Extract problem path (remove "research/problems/" prefix if present)
-            problem_for_config = task.display_path
-            for prefix in ("research/problems/", "problems/"):
-                if problem_for_config.startswith(prefix):
-                    problem_for_config = problem_for_config[len(prefix):]
-                    break
-            sol_dir = create_solution(repo_root, task.solution_name, code, problem=problem_for_config)
-            print(f"  {green('✓')} Created: {green(str(sol_dir))}")
+            # Write solution to flat file
+            solutions_dir = repo_root / "solutions"
+            solutions_dir.mkdir(exist_ok=True)
+            sol_file = solutions_dir / task.solution_name
+            sol_file.write_text(code, encoding="utf-8")
+            print(f"  {green('✓')} Created: {green(str(sol_file))}")
             print(f"  {dim('Log saved:')} {dim(str(log_file))}")
             return ("generated", task.solution_name, None, task.provider, pool_token)
         except Exception as exc:

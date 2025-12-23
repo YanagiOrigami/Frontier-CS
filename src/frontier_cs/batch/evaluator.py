@@ -370,13 +370,8 @@ class BatchEvaluator:
 
     def _evaluate_pair(self, pair: Pair) -> EvaluationResult:
         """Evaluate a single pair using the configured runner."""
-        # Find solution file
-        solution_dir = self.base_dir / "solutions" / pair.solution / "resources"
-        solution_file = solution_dir / "solution.py"
-
-        if not solution_file.exists():
-            # Try alternate location
-            solution_file = self.base_dir / "solutions" / pair.solution / "solution.py"
+        # New flat format: solution is the filename (e.g., flash_attn.gpt5.py)
+        solution_file = self.base_dir / "solutions" / pair.solution
 
         if not solution_file.exists():
             return EvaluationResult(

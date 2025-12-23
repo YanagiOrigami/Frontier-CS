@@ -35,23 +35,14 @@ frontier-eval flash_attn <your_solution.py> --skypilot
 
 ## Batch Evaluation
 
-For evaluating multiple solutions at once, create a pairs file mapping solutions to problems:
-
-```
-# pairs.txt format: solution_file:problem_id
-flash_attn.gpt5.py:flash_attn
-flash_attn.gpt5_1.py:flash_attn
-cross_entropy.claude.py:cross_entropy
-```
-
-Then run:
+Batch evaluation automatically scans `solutions/` and parses problem IDs from filenames:
 
 ```bash
-# Evaluate all pairs
-frontier-eval batch --pairs-file pairs.txt
+# Evaluate all solutions in solutions/
+frontier-eval batch
 
 # Resume interrupted evaluation
-frontier-eval batch --pairs-file pairs.txt --resume
+frontier-eval batch --resume
 
 # Check status
 frontier-eval batch --status --results-dir results/batch

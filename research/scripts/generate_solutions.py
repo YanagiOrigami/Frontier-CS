@@ -744,9 +744,9 @@ Examples:
                 by_problem[key].append(task)
 
             for problem, problem_tasks in by_problem.items():
-                print(f"  {problem_name(problem)}:")
+                print(f"  {format_problem_name(problem)}:")
                 for task in problem_tasks:
-                    print(f"    {dim('-')} {solution_name(task.solution_name)} "
+                    print(f"    {dim('-')} {format_solution_name(task.solution_name)} "
                           f"({dim('model:')} {model_name(task.model)}, "
                           f"{dim('variant:')} {task.variant_index})")
                 print()
@@ -786,7 +786,7 @@ Examples:
         variant_label = f"{task.variant_position + 1}/{task.total_variants}"
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
         log_file = logs_dir / f"{task.solution_name}_{timestamp}.log"
-        print(f"{cyan('▶')} Generating {solution_name(task.solution_name)} "
+        print(f"{cyan('▶')} Generating {format_solution_name(task.solution_name)} "
               f"({dim('model:')} {model_name(task.model)}, {dim('variant')} {variant_label})...")
         print(f"  {dim('Log:')} {dim(str(log_file))}")
 
@@ -853,7 +853,7 @@ Examples:
     if generated:
         print(f"  {green('✓')} Generated: {green(bold(str(len(generated))))} solution(s)")
         for name in generated[:5]:
-            print(f"    {dim('•')} {solution_name(name)}")
+            print(f"    {dim('•')} {format_solution_name(name)}")
         if len(generated) > 5:
             print(f"    {dim(f'... and {len(generated) - 5} more')}")
     else:

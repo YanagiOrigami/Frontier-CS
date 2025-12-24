@@ -2,13 +2,13 @@
 SkyPilot runner for algorithmic problems.
 
 Automatically launches a go-judge VM on cloud and uses it for evaluation.
-Uses SkyPilot Python API instead of subprocess calls.
+Uses SkyPilot Python API with sky-judge.yaml configuration.
 """
 
-import textwrap
+import subprocess
 import time
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 import requests
 
@@ -26,15 +26,11 @@ class AlgorithmicSkyPilotRunner(AlgorithmicRunner):
 
     CLUSTER_NAME = "algo-judge"
     DEFAULT_IDLE_TIMEOUT = 10  # minutes
-    DEFAULT_CLOUD = "gcp"
-    DEFAULT_CPUS = "4+"
-    DEFAULT_MEMORY = "8+"
-    DEFAULT_DISK_SIZE = 50
 
     def __init__(
         self,
         base_dir: Optional[Path] = None,
-        cloud: str = DEFAULT_CLOUD,
+        cloud: Optional[str] = None,
         region: Optional[str] = None,
         keep_cluster: bool = False,
         idle_timeout: Optional[int] = DEFAULT_IDLE_TIMEOUT,
@@ -44,8 +40,8 @@ class AlgorithmicSkyPilotRunner(AlgorithmicRunner):
 
         Args:
             base_dir: Base directory of Frontier-CS repo (auto-detected if None)
-            cloud: Cloud provider (gcp, aws, azure)
-            region: Cloud region (optional)
+            cloud: Cloud provider override (default: use yaml config)
+            region: Cloud region override (optional)
             keep_cluster: Keep cluster running after evaluation (disables autostop)
             idle_timeout: Minutes of idleness before autostop (default: 10, None to disable)
         """
@@ -72,49 +68,51 @@ class AlgorithmicSkyPilotRunner(AlgorithmicRunner):
                 return candidate
         raise RuntimeError("Could not find Frontier-CS base directory")
 
+    def _get_yaml_path(self) -> Path:
+        """Get path to sky-judge.yaml."""
+        return self.base_dir / "algorithmic" / "sky-judge.yaml"
+
     def _get_cluster_status(self) -> Optional[str]:
-        """Get the status of the algo-judge cluster."""
+        """Get the status of the algo-judge cluster.
+
+        Returns 'UP', 'STOPPED', or None if cluster doesn't exist.
+        """
         import sky
 
         try:
             clusters = sky.status(cluster_names=[self.CLUSTER_NAME])
             if clusters:
-                record = clusters[0]
-                # sky.status returns records with 'status' attribute
+                # sky.status returns list of dicts with 'name', 'status' keys
+                record: Any = clusters[0]
+                if isinstance(record, dict):
+                    status = record.get("status")
+                    return str(status) if status else None
+                # Fallback for object-style access
                 if hasattr(record, "status"):
                     return str(record.status)
-                elif isinstance(record, dict):
-                    return record.get("status")
         except Exception:
             pass
         return None
 
     def _get_cluster_ip(self) -> Optional[str]:
-        """Get the IP of the algo-judge cluster if running."""
-        import sky
+        """Get the IP of the algo-judge cluster if running.
 
+        Uses 'sky status --ip' CLI command which is the recommended way
+        to get cluster IP according to SkyPilot documentation.
+        """
         try:
-            clusters = sky.status(cluster_names=[self.CLUSTER_NAME])
-            if clusters:
-                record = clusters[0]
-                # Check status
-                status = None
-                if hasattr(record, "status"):
-                    status = str(record.status)
-                elif isinstance(record, dict):
-                    status = record.get("status")
-
-                if status == "UP":
-                    # Get handle
-                    handle = None
-                    if hasattr(record, "handle"):
-                        handle = record.handle
-                    elif isinstance(record, dict):
-                        handle = record.get("handle")
-
-                    if handle and hasattr(handle, "head_ip"):
-                        return handle.head_ip
-        except Exception:
+            result = subprocess.run(
+                ["sky", "status", "--ip", self.CLUSTER_NAME],
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+            if result.returncode == 0:
+                ip = result.stdout.strip()
+                # Check it's a valid IP (not an error message)
+                if ip and not ip.startswith("No") and not ip.startswith("Error"):
+                    return ip
+        except (subprocess.TimeoutExpired, Exception):
             pass
         return None
 
@@ -124,29 +122,29 @@ class AlgorithmicSkyPilotRunner(AlgorithmicRunner):
         return status == "UP"
 
     def _launch_cluster(self) -> bool:
-        """Launch the algo-judge cluster using SkyPilot Python API."""
+        """Launch the algo-judge cluster using sky-judge.yaml."""
         import sky
 
-        print(f"Launching cluster {self.CLUSTER_NAME} on {self.cloud}... (this may take a few minutes)")
+        yaml_path = self._get_yaml_path()
+        if not yaml_path.exists():
+            raise FileNotFoundError(f"sky-judge.yaml not found at {yaml_path}")
 
-        # Build resources
-        resources = sky.Resources(
-            cpus=self.DEFAULT_CPUS,
-            memory=self.DEFAULT_MEMORY,
-            disk_size=self.DEFAULT_DISK_SIZE,
-            ports=["8081"],
-        )
-
-        # Build task
-        task = sky.Task(
-            name=self.CLUSTER_NAME,
-            setup=self._get_setup_script(),
-            run=self._get_run_script(),
-            workdir=str(self.base_dir / "algorithmic"),
-        )
-        task.set_resources(resources)
+        print(f"Launching cluster {self.CLUSTER_NAME} from {yaml_path}... (this may take a few minutes)")
 
         try:
+            # Load task from YAML
+            task = sky.Task.from_yaml(str(yaml_path))
+
+            # Override cloud/region if specified
+            if self.cloud or self.region:
+                resources = list(task.resources)[0] if task.resources else sky.Resources()
+                new_resources = resources.copy(
+                    cloud=self.cloud if self.cloud else resources.cloud,
+                    region=self.region if self.region else resources.region,
+                )
+                task.set_resources(new_resources)
+
+            # Launch cluster
             request_id = sky.launch(
                 task,
                 cluster_name=self.CLUSTER_NAME,
@@ -158,56 +156,9 @@ class AlgorithmicSkyPilotRunner(AlgorithmicRunner):
             return True
         except Exception as e:
             print(f"Failed to launch cluster: {e}")
+            import traceback
+            traceback.print_exc()
             return False
-
-    def _get_setup_script(self) -> str:
-        """Get setup script for go-judge cluster."""
-        return textwrap.dedent("""\
-            set -euo pipefail
-
-            # Install Docker
-            if ! command -v docker &>/dev/null; then
-                curl -fsSL https://get.docker.com | sudo sh
-                sudo usermod -aG docker $USER
-                sudo systemctl start docker
-                sudo systemctl enable docker
-            fi
-
-            # Install docker-compose
-            if ! command -v docker-compose &>/dev/null; then
-                sudo curl -L "https://github.com/docker/compose/releases/latest/download/docker-compose-$(uname -s)-$(uname -m)" \\
-                    -o /usr/local/bin/docker-compose
-                sudo chmod +x /usr/local/bin/docker-compose
-            fi
-        """)
-
-    def _get_run_script(self) -> str:
-        """Get run script for go-judge service."""
-        return textwrap.dedent("""\
-            set -euo pipefail
-
-            # Build and start go-judge service
-            echo "Building and starting go-judge..."
-            sudo docker-compose up --build -d
-
-            # Wait for service to be ready
-            echo "Waiting for judge service to be ready..."
-            for i in {1..30}; do
-                if curl -s http://localhost:8081/problems >/dev/null 2>&1; then
-                    echo "Judge service is ready!"
-                    break
-                fi
-                sleep 2
-            done
-
-            # Show status
-            echo ""
-            echo "=========================================="
-            echo "Go-Judge service is running on port 8081"
-            echo "=========================================="
-            echo ""
-            echo "Service started in background. Use 'sudo docker-compose logs -f' to view logs."
-        """)
 
     def _wait_for_service(self, ip: str, timeout: int = 120) -> bool:
         """Wait for the judge service to be ready."""

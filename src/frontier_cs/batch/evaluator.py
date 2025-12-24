@@ -90,6 +90,7 @@ class BatchEvaluator:
         self.max_concurrent = max_concurrent
         self.timeout = timeout
         self.bucket_url = bucket_url
+        self.judge_url = judge_url or "http://localhost:8081"
         self._bucket_storage = None
 
         # Initialize bucket storage if provided
@@ -102,7 +103,6 @@ class BatchEvaluator:
 
         self.state_path = self.results_dir / self.STATE_FILE
         self.state = EvaluationState.load(self.state_path)
-        self.judge_url = judge_url or "http://localhost:8081"
 
         # Initialize runner based on track and backend
         if track == "algorithmic":

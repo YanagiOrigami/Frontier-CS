@@ -150,7 +150,7 @@ def generate_code(
         f.write("CALLING test_scripts.llm_interface...\n")
         f.write("=" * 80 + "\n\n")
 
-    print(f"Calling llm_interface (model: {model})...")
+    print(f"Calling llm_interface (model: {model}, problem: {problem_name})...")
 
     MAX_RETRIES = 5
     RETRY_DELAY = 30
@@ -164,6 +164,7 @@ def generate_code(
             break
 
         error_message = response_text or "Empty response"
+        print(f"  [problem: {problem_name}] Error (attempt {attempt}/{MAX_RETRIES}): {error_message[:200]}")
         with open(log_file, 'a', encoding='utf-8') as f:
             f.write(f"ERROR calling llm_interface (attempt {attempt}/{MAX_RETRIES}): {error_message}\n")
 

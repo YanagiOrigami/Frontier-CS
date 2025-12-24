@@ -1,13 +1,16 @@
-from abc import ABC, abstractmethod
-from typing import Any, Tuple, Optional
-from openai import OpenAI, APITimeoutError
-import google.generativeai as genai
+import logging
 import os
-import traceback
-from dotenv import load_dotenv
+from abc import ABC, abstractmethod
+from typing import Any, Optional, Tuple
+
+import google.generativeai as genai
 from anthropic import Anthropic, APITimeoutError as AnthropicAPITimeoutError
+from dotenv import load_dotenv
+from openai import APITimeoutError, OpenAI
 
 load_dotenv()
+
+logger = logging.getLogger(__name__)
 
 class LLMInterface(ABC):
     """
@@ -71,11 +74,10 @@ class GPT(LLMInterface):
             completion = self.client.chat.completions.create(**request_kwargs)
             return completion.choices[0].message.content, str(completion)
         except APITimeoutError as e:
-            print(f"OpenAI API request timed out: {e}")
+            logger.error(f"OpenAI API timeout: {e}")
             return "", str(e)
         except Exception as e:
-            print(f"An unexpected error occurred while calling the OpenAI API: {e}")
-            traceback.print_exc()
+            logger.exception(f"OpenAI API error: {e}")
             return "", str(e)
 
 class Gemini(LLMInterface):
@@ -95,7 +97,7 @@ class Gemini(LLMInterface):
         try:
             resolved_key = api_key or os.getenv("GOOGLE_API_KEY")
             if not resolved_key:
-                raise ValueError("GOOGLE_API_KEY not found in environment variables.")
+                raise ValueError("GOOGLE_API_KEY not set")
             self.api_key = resolved_key
             genai.configure(api_key=self.api_key)
             # Using a powerful and recent model. You can change this to other available models.
@@ -103,7 +105,7 @@ class Gemini(LLMInterface):
             self.timeout = timeout
             self.model = genai.GenerativeModel(self.model_name)
         except Exception as e:
-            print(f"Error during Gemini initialization: {e}")
+            logger.error(f"Gemini initialization failed: {e}")
             self.model = None
         self.name = 'gemini'
 
@@ -124,8 +126,7 @@ class Gemini(LLMInterface):
             solution_text = response.text
             return solution_text, response
         except Exception as e:
-            print(f"An error occurred while calling the Gemini API: {e}")
-            traceback.print_exc()
+            logger.exception(f"Gemini API error: {e}")
             return f"Error: {e}", None
 
 
@@ -174,12 +175,10 @@ class ClaudeBase(LLMInterface):
             return final_text, str(completion)
 
         except AnthropicAPITimeoutError as e:
-            print(f"Anthropic API request timed out: {e}")
-            traceback.print_exc()
+            logger.error(f"Anthropic API timeout: {e}")
             return "", str(e)
         except Exception as e:
-            print(f"An unexpected error occurred while calling the Anthropic API: {e}")
-            traceback.print_exc()
+            logger.exception(f"Anthropic API error: {e}")
             return "", str(e)
 
 
@@ -235,12 +234,10 @@ class DeepSeek(LLMInterface):
             completion = self.client.chat.completions.create(**request_kwargs)
             return completion.choices[0].message.content, str(completion)
         except APITimeoutError as e:
-            print(f"DeepSeek API request timed out: {e}")
-            traceback.print_exc()
+            logger.error(f"DeepSeek API timeout: {e}")
             return "", str(e)
         except Exception as e:
-            print(f"An unexpected error occurred while calling the DeepSeek API: {e}")
-            traceback.print_exc()
+            logger.exception(f"DeepSeek API error: {e}")
             return "", str(e)
 
 
@@ -295,10 +292,8 @@ class Grok(LLMInterface):
             completion = self.client.chat.completions.create(**request_kwargs)
             return completion.choices[0].message.content, str(completion)
         except APITimeoutError as e:
-            print(f"Grok (xAI) API request timed out: {e}")
-            traceback.print_exc()
+            logger.error(f"Grok API timeout: {e}")
             return "", str(e)
         except Exception as e:
-            print(f"An unexpected error occurred while calling the Grok (xAI) API: {e}")
-            traceback.print_exc()
+            logger.exception(f"Grok API error: {e}")
             return "", str(e)

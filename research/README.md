@@ -239,12 +239,12 @@ solutions/
 
 Set environment variables for the providers you need. Multiple keys per provider are supported for load balancing (e.g., `OPENAI_API_KEY`, `OPENAI_API_KEY2`, `OPENAI_API_KEY_2`).
 
-| Provider | Environment Variables | Models |
-|----------|----------------------|--------|
+| Provider | Environment Variable | Models |
+|----------|---------------------|--------|
 | OpenAI | `OPENAI_API_KEY` | gpt-4o, gpt-5, o1, o3, ... |
 | Anthropic | `ANTHROPIC_API_KEY` | claude-sonnet-4-5, claude-opus-4, ... |
-| Google | `GOOGLE_API_KEY`, `GEMINI_API_KEY` | gemini-2.5-pro, gemini-2.5-flash, ... |
-| xAI | `XAI_API_KEY`, `GROK_API_KEY` | grok-3, grok-3-mini, ... |
+| Google | `GOOGLE_API_KEY` | gemini-2.5-pro, gemini-2.5-flash, ... |
+| xAI | `XAI_API_KEY` | grok-3, grok-3-mini, ... |
 | DeepSeek | `DEEPSEEK_API_KEY` | deepseek-r1, deepseek-chat, ... |
 | OpenRouter | `OPENROUTER_API_KEY` | openrouter/* models |
 

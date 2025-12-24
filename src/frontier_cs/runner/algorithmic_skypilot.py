@@ -5,6 +5,7 @@ Automatically launches a go-judge VM on cloud and uses it for evaluation.
 Uses SkyPilot Python API with sky-judge.yaml configuration.
 """
 
+import logging
 import time
 from pathlib import Path
 from typing import Any, Optional
@@ -13,6 +14,8 @@ import requests
 
 from .algorithmic import AlgorithmicRunner
 from .base import EvaluationResult, EvaluationStatus
+
+logger = logging.getLogger(__name__)
 
 
 class AlgorithmicSkyPilotRunner(AlgorithmicRunner):
@@ -117,13 +120,11 @@ class AlgorithmicSkyPilotRunner(AlgorithmicRunner):
         if not yaml_path.exists():
             raise FileNotFoundError(f"sky-judge.yaml not found at {yaml_path}")
 
-        print(f"Launching cluster {self.CLUSTER_NAME} from {yaml_path}... (this may take a few minutes)")
+        logger.info(f"Launching cluster '{self.CLUSTER_NAME}' from {yaml_path}")
 
         try:
-            # Load task from YAML
             task = sky.Task.from_yaml(str(yaml_path))
 
-            # Override cloud/region if specified
             if self.cloud or self.region:
                 resources = list(task.resources)[0] if task.resources else sky.Resources()
                 new_resources = resources.copy(
@@ -132,20 +133,16 @@ class AlgorithmicSkyPilotRunner(AlgorithmicRunner):
                 )
                 task.set_resources(new_resources)
 
-            # Launch cluster
             request_id = sky.launch(
                 task,
                 cluster_name=self.CLUSTER_NAME,
                 idle_minutes_to_autostop=self.idle_timeout,
             )
-            # Wait for launch to complete
             sky.stream_and_get(request_id)
-            print(f"Cluster {self.CLUSTER_NAME} launched successfully")
+            logger.info(f"Cluster '{self.CLUSTER_NAME}' launched successfully")
             return True
         except Exception as e:
-            print(f"Failed to launch cluster: {e}")
-            import traceback
-            traceback.print_exc()
+            logger.exception(f"Failed to launch cluster: {e}")
             return False
 
     def _wait_for_service(self, ip: str, timeout: int = 120) -> bool:
@@ -175,36 +172,31 @@ class AlgorithmicSkyPilotRunner(AlgorithmicRunner):
                 # Cluster may have stopped, re-check
                 self._initialized = False
 
-        # Check if cluster is running
         ip = self._get_cluster_ip()
 
         if ip:
-            # Cluster exists, check if service is ready
-            print(f"Found existing cluster at {ip}")
+            logger.info(f"Found existing cluster at {ip}")
             if self._wait_for_service(ip, timeout=30):
                 self._judge_url = f"http://{ip}:8081"
                 self._initialized = True
                 return self._judge_url
 
-        # Need to launch cluster
         if not self._launch_cluster():
             raise RuntimeError("Failed to launch algo-judge cluster")
 
-        # Wait a bit for the service to start after launch
         time.sleep(5)
 
-        # Get IP and wait for service
         ip = self._get_cluster_ip()
         if not ip:
             raise RuntimeError("Could not get cluster IP after launch")
 
-        print(f"Waiting for judge service at {ip}:8081...")
+        logger.info(f"Waiting for judge service at {ip}:8081 (timeout: 120s)")
         if not self._wait_for_service(ip, timeout=120):
-            raise RuntimeError("Judge service did not become ready")
+            raise RuntimeError("Judge service did not become ready after 120s")
 
         self._judge_url = f"http://{ip}:8081"
         self._initialized = True
-        print(f"Judge service ready at {self._judge_url}")
+        logger.info(f"Judge service ready at {self._judge_url}")
         return self._judge_url
 
     def evaluate(
@@ -266,13 +258,13 @@ class AlgorithmicSkyPilotRunner(AlgorithmicRunner):
         import sky
 
         try:
-            print(f"Stopping cluster {self.CLUSTER_NAME}...")
+            logger.info(f"Stopping cluster '{self.CLUSTER_NAME}'")
             request_id = sky.down(self.CLUSTER_NAME)
             sky.stream_and_get(request_id)
             self._initialized = False
             self._judge_url = None
-            print(f"Cluster {self.CLUSTER_NAME} stopped")
+            logger.info(f"Cluster '{self.CLUSTER_NAME}' stopped")
             return True
         except Exception as e:
-            print(f"Failed to stop cluster: {e}")
+            logger.exception(f"Failed to stop cluster: {e}")
             return False

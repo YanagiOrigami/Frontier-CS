@@ -2,6 +2,7 @@
 Runner for algorithmic problems using the judge server.
 """
 
+import logging
 import subprocess
 import time
 from pathlib import Path
@@ -10,6 +11,8 @@ from typing import Optional
 import requests
 
 from .base import Runner, EvaluationResult, EvaluationStatus
+
+logger = logging.getLogger(__name__)
 
 
 class AlgorithmicRunner(Runner):
@@ -59,10 +62,10 @@ class AlgorithmicRunner(Runner):
         compose_file = compose_dir / "docker-compose.yml"
 
         if not compose_file.exists():
-            print(f"docker-compose.yml not found at {compose_file}")
+            logger.error(f"docker-compose.yml not found: {compose_file}")
             return False
 
-        print("Starting judge server via docker compose...")
+        logger.info(f"Starting judge server (docker compose up -d) in {compose_dir}")
         try:
             result = subprocess.run(
                 ["docker", "compose", "up", "-d"],
@@ -72,26 +75,28 @@ class AlgorithmicRunner(Runner):
                 timeout=120,
             )
             if result.returncode != 0:
-                print(f"Failed to start judge: {result.stderr}")
+                logger.error(f"docker compose failed: {result.stderr.strip()}")
                 return False
+            logger.info("docker compose started successfully")
             return True
         except subprocess.TimeoutExpired:
-            print("Timeout starting judge server")
+            logger.error("docker compose timed out after 120s")
             return False
         except FileNotFoundError:
-            print("docker not found")
+            logger.error("docker command not found - is Docker installed?")
             return False
 
     def _wait_for_judge(self, timeout: int = 60) -> bool:
         """Wait for judge server to become available."""
-        print(f"Waiting for judge server at {self.judge_url}...")
+        logger.info(f"Waiting for judge server at {self.judge_url} (timeout: {timeout}s)")
         start = time.time()
         while time.time() - start < timeout:
             if self._is_judge_available():
-                print("Judge server is ready")
+                elapsed = time.time() - start
+                logger.info(f"Judge server ready ({elapsed:.1f}s)")
                 return True
             time.sleep(2)
-        print("Judge server did not become ready in time")
+        logger.error(f"Judge server not ready after {timeout}s")
         return False
 
     def _ensure_judge(self) -> bool:
@@ -100,16 +105,22 @@ class AlgorithmicRunner(Runner):
             self._judge_started = True
             return True
 
+        logger.info(f"Judge server not available at {self.judge_url}")
+
         if not self.auto_start:
+            logger.error("auto_start disabled, cannot start judge automatically")
             return False
 
         if not self._start_judge():
+            logger.error("Failed to start judge server")
             return False
 
         if not self._wait_for_judge():
+            logger.error("Judge server failed to become ready")
             return False
 
         self._judge_started = True
+        logger.info("Judge server is now running")
         return True
 
     def evaluate(
@@ -142,7 +153,8 @@ class AlgorithmicRunner(Runner):
             return EvaluationResult(
                 problem_id=pid,
                 status=EvaluationStatus.ERROR,
-                message="Judge server not available and failed to start",
+                message=f"Judge server at {self.judge_url} not available. "
+                        f"Run 'docker compose up -d' in algorithmic/ or use --skypilot",
             )
 
         # Check for empty code
@@ -184,23 +196,19 @@ class AlgorithmicRunner(Runner):
                 duration_seconds=duration,
             )
 
-        # Use unbounded score if requested and available
-        score = result.get("scoreUnbounded" if unbounded else "score", 0.0)
-        
-        # Create result with both scores if available
-        eval_result = EvaluationResult(
+        # Get both bounded and unbounded scores
+        bounded_score = result.get("score", 0.0)
+        unbounded_score = result.get("scoreUnbounded")
+
+        # Return requested score as primary, include both
+        return EvaluationResult(
             problem_id=pid,
-            score=score,
+            score=unbounded_score if unbounded and unbounded_score is not None else bounded_score,
+            score_unbounded=unbounded_score,
             status=EvaluationStatus.SUCCESS,
             duration_seconds=duration,
             metadata=result,
         )
-        
-        # Add unbounded score as attribute if available
-        if "scoreUnbounded" in result:
-            eval_result.score_unbounded = result["scoreUnbounded"]
-        
-        return eval_result
 
     def evaluate_file(
         self,

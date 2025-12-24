@@ -59,9 +59,8 @@ print(f"Score: {result.score}")
 
 # Get unbounded score (without clipping)
 result = evaluator.evaluate("algorithmic", problem_id=1, code=cpp_code, unbounded=True)
-print(f"Score (bounded): {result.score}")
-if hasattr(result, 'score_unbounded'):
-    print(f"Score (unbounded): {result.score_unbounded}")
+print(f"Score: {result.score}")  # Uses unbounded when unbounded=True
+print(f"Score (unbounded): {result.score_unbounded}")
 ```
 
 ### CLI

@@ -43,6 +43,8 @@ Current benchmarks are becoming too easy. Models score 90%+ on many existing cod
 
 ### Installation
 
+**Requirements:** Docker 24+ (for local evaluation)
+
 ```bash
 git clone https://github.com/FrontierCS/Frontier-CS.git
 cd Frontier-CS
@@ -59,16 +61,13 @@ pip install -e .
 Here's [Algorithmic Problem 0](algorithmic/problems/0/statement.txt) - try to beat GPT-5!
 
 ```bash
-# Start the judge server
-cd algorithmic && docker compose up -d
-
 # Run the example solution (Human Expert Solution)
-frontier-eval --algorithmic 0 problems/0/examples/reference.cpp
+frontier-eval --algorithmic 0 algorithmic/problems/0/examples/reference.cpp
 
 # Run the example solution (GPT-5 Thinking Solution)
-frontier-eval --algorithmic 0 problems/0/examples/gpt5.cpp
+frontier-eval --algorithmic 0 algorithmic/problems/0/examples/gpt5.cpp
 
-# Try you own solution!
+# Try your own solution!
 frontier-eval --algorithmic 0 <your_solution.cpp>
 ```
 

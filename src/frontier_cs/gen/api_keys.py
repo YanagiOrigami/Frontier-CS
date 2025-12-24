@@ -1,16 +1,18 @@
 """API key pool management for solution generation."""
 
+import logging
 import os
 import threading
 import time
 from typing import Dict, List, Optional, Tuple
 
+logger = logging.getLogger(__name__)
 
 PROVIDER_ENV_KEY_MAP: Dict[str, List[str]] = {
     "openai": ["OPENAI_API_KEY"],
-    "google": ["GOOGLE_API_KEY", "GEMINI_API_KEY"],
+    "google": ["GOOGLE_API_KEY"],
     "anthropic": ["ANTHROPIC_API_KEY"],
-    "xai": ["XAI_API_KEY", "GROK_API_KEY"],
+    "xai": ["XAI_API_KEY"],
     "deepseek": ["DEEPSEEK_API_KEY"],
     "openrouter": ["OPENROUTER_API_KEY"],
 }
@@ -73,16 +75,14 @@ class APIKeyPool:
             fatal_markers = ("invalid", "unauthorized", "forbidden", "permission", "auth")
             if any(marker in reason for marker in fatal_markers):
                 if not state["disabled"]:
-                    print(f"Disabling API key for {self.name}: appears invalid/unauthorized")
+                    logger.warning(f"Disabling API key for {self.name}: invalid/unauthorized")
                 state["disabled"] = True
                 state["backoff_until"] = float("inf")
                 return
 
             delay: int = min(600, 60 * state["failures"])
             state["backoff_until"] = max(state["backoff_until"], time.time() + delay)
-            print(
-                f"Backing off {delay:.0f}s for {self.name} key due to failure (count={state['failures']})."
-            )
+            logger.info(f"Backing off {delay:.0f}s for {self.name} key (failures={state['failures']})")
 
     def size(self) -> int:
         """Return the number of keys in the pool."""
@@ -132,44 +132,8 @@ def build_key_pools() -> Dict[str, APIKeyPool]:
 
 
 def get_fallback_api_key(provider: str) -> Optional[str]:
-    """Get a fallback API key for a provider from environment variables."""
-    candidate_keys: List[Optional[str]] = []
-
-    if provider == "openai":
-        candidate_keys.extend([
-            os.getenv("OPENAI_API_KEY"),
-            os.getenv("OPENAI_API_KEY2"),
-            os.getenv("OPENAI_API_KEY_2"),
-        ])
-    elif provider == "openrouter":
-        candidate_keys.extend([
-            os.getenv("OPENROUTER_API_KEY"),
-            os.getenv("OPENROUTER_API_KEY2"),
-            os.getenv("OPENROUTER_KEY"),
-        ])
-    elif provider == "google":
-        candidate_keys.extend([
-            os.getenv("GOOGLE_API_KEY"),
-            os.getenv("GOOGLE_API_KEY2"),
-            os.getenv("GEMINI_API_KEY"),
-            os.getenv("GEMINI_API_KEY2"),
-        ])
-    elif provider == "anthropic":
-        candidate_keys.extend([
-            os.getenv("ANTHROPIC_API_KEY"),
-            os.getenv("ANTHROPIC_API_KEY2"),
-        ])
-    elif provider == "xai":
-        candidate_keys.extend([
-            os.getenv("XAI_API_KEY"),
-            os.getenv("XAI_API_KEY2"),
-            os.getenv("GROK_API_KEY"),
-            os.getenv("GROK_API_KEY2"),
-        ])
-    elif provider == "deepseek":
-        candidate_keys.extend([
-            os.getenv("DEEPSEEK_API_KEY"),
-            os.getenv("DEEPSEEK_API_KEY2"),
-        ])
-
-    return next((k for k in candidate_keys if k), None)
+    """Get an API key for a provider from environment variables."""
+    env_var = PROVIDER_ENV_KEY_MAP.get(provider, [None])[0]
+    if env_var:
+        return os.getenv(env_var)
+    return None

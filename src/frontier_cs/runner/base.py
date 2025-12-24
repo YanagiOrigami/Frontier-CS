@@ -23,6 +23,7 @@ class EvaluationResult:
 
     problem_id: str
     score: Optional[float] = None
+    score_unbounded: Optional[float] = None  # For algorithmic problems with unbounded scoring
     status: EvaluationStatus = EvaluationStatus.SUCCESS
     message: Optional[str] = None
     logs: Optional[str] = None

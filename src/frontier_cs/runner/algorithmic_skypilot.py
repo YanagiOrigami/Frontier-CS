@@ -5,7 +5,6 @@ Automatically launches a go-judge VM on cloud and uses it for evaluation.
 Uses SkyPilot Python API with sky-judge.yaml configuration.
 """
 
-import subprocess
 import time
 from pathlib import Path
 from typing import Any, Optional
@@ -72,48 +71,48 @@ class AlgorithmicSkyPilotRunner(AlgorithmicRunner):
         """Get path to sky-judge.yaml."""
         return self.base_dir / "algorithmic" / "sky-judge.yaml"
 
-    def _get_cluster_status(self) -> Optional[str]:
-        """Get the status of the algo-judge cluster.
+    def _get_cluster_info(self) -> tuple[Optional[str], Any]:
+        """Get cluster status and handle.
 
-        Returns 'UP', 'STOPPED', or None if cluster doesn't exist.
+        Returns:
+            Tuple of (status, handle) where status is 'UP', 'STOPPED', etc.
+            and handle contains cluster info including head_ip.
         """
         import sky
 
         try:
             clusters = sky.status(cluster_names=[self.CLUSTER_NAME])
             if clusters:
-                # sky.status returns list of dicts with 'name', 'status' keys
                 record: Any = clusters[0]
+                # sky.status returns list of dicts with 'status', 'handle' keys
                 if isinstance(record, dict):
                     status = record.get("status")
-                    return str(status) if status else None
+                    handle = record.get("handle")
+                    return (str(status) if status else None, handle)
                 # Fallback for object-style access
                 if hasattr(record, "status"):
-                    return str(record.status)
+                    status = str(record.status)
+                    handle = getattr(record, "handle", None)
+                    return (status, handle)
         except Exception:
             pass
-        return None
+        return (None, None)
+
+    def _get_cluster_status(self) -> Optional[str]:
+        """Get the status of the algo-judge cluster."""
+        status, _ = self._get_cluster_info()
+        return status
 
     def _get_cluster_ip(self) -> Optional[str]:
         """Get the IP of the algo-judge cluster if running.
 
-        Uses 'sky status --ip' CLI command which is the recommended way
-        to get cluster IP according to SkyPilot documentation.
+        Uses sky.status() to get cluster handle and extract head_ip.
         """
-        try:
-            result = subprocess.run(
-                ["sky", "status", "--ip", self.CLUSTER_NAME],
-                capture_output=True,
-                text=True,
-                timeout=30,
-            )
-            if result.returncode == 0:
-                ip = result.stdout.strip()
-                # Check it's a valid IP (not an error message)
-                if ip and not ip.startswith("No") and not ip.startswith("Error"):
-                    return ip
-        except (subprocess.TimeoutExpired, Exception):
-            pass
+        status, handle = self._get_cluster_info()
+        if status == "UP" and handle is not None:
+            # Handle has head_ip attribute
+            if hasattr(handle, "head_ip"):
+                return handle.head_ip
         return None
 
     def _is_cluster_running(self) -> bool:

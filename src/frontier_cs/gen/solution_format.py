@@ -22,18 +22,42 @@ def validate_problem_name(problem: str) -> None:
 def parse_solution_filename(filename: str) -> Optional[Tuple[str, str, str]]:
     """Parse a solution filename into (problem, model, ext).
 
+    Format: {problem}.{model}.{ext}
+    - problem: first segment (before first dot)
+    - ext: last segment (after last dot)
+    - model: everything in between (may contain dots like gpt5.1)
+
+    Examples:
+        flash_attn.gpt5.py -> (flash_attn, gpt5, py)
+        0.gpt5.2.cpp -> (0, gpt5.2, cpp)
+        cant_be_late.gemini2.5pro.py -> (cant_be_late, gemini2.5pro, py)
+
     Args:
-        filename: Filename like "flash_attn.gpt5.py"
+        filename: Filename like "flash_attn.gpt5.py" or "0.gpt5.2.cpp"
 
     Returns:
         Tuple of (problem, model, ext) or None if not parseable
     """
-    parts = filename.rsplit('.', 2)
-    if len(parts) != 3:
+    # Must have at least 2 dots: problem.model.ext
+    if filename.count('.') < 2:
         return None
-    problem, model, ext = parts
-    if not problem or not model or not ext:
+
+    # Extension is after the last dot
+    base, ext = filename.rsplit('.', 1)
+    if not ext:
         return None
+
+    # Problem is before the first dot, model is everything in between
+    first_dot = base.find('.')
+    if first_dot == -1:
+        return None
+
+    problem = base[:first_dot]
+    model = base[first_dot + 1:]
+
+    if not problem or not model:
+        return None
+
     return problem, model, ext
 
 

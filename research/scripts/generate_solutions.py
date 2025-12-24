@@ -475,7 +475,7 @@ Examples:
                             help="Number of variants per (problem, model)")
     exec_group.add_argument("--variants-file", default=None,
                             help="File with variant indices (default: num_solutions.txt)")
-    exec_group.add_argument("--concurrency", type=int, default=max(1, min(8, os.cpu_count() or 4)),
+    exec_group.add_argument("--concurrency", type=int, default=4,
                             help="Maximum parallel generations")
 
     # Hidden/advanced options

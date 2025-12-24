@@ -47,15 +47,11 @@ class DockerRunner(Runner):
 
     def _find_base_dir(self) -> Path:
         """Find the Frontier-CS base directory."""
-        candidates = [
-            Path(__file__).parents[4],  # src/frontier_cs/runner/docker.py -> repo root
-            Path.cwd(),
-            Path.cwd().parent,
-        ]
-        for candidate in candidates:
-            if (candidate / "research").is_dir() and (candidate / "pyproject.toml").exists():
-                return candidate
-        raise RuntimeError("Could not find Frontier-CS base directory")
+        # src/frontier_cs/runner/docker.py -> repo root
+        base = Path(__file__).parents[3]
+        if not (base / "research").is_dir():
+            raise RuntimeError(f"research/ not found in {base}")
+        return base
 
     @property
     def has_gpu(self) -> bool:

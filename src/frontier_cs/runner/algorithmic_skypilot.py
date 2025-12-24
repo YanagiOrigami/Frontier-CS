@@ -57,15 +57,11 @@ class AlgorithmicSkyPilotRunner(AlgorithmicRunner):
 
     def _find_base_dir(self) -> Path:
         """Find the Frontier-CS base directory."""
-        candidates = [
-            Path(__file__).parents[3],
-            Path.cwd(),
-            Path.cwd().parent,
-        ]
-        for candidate in candidates:
-            if (candidate / "algorithmic").is_dir() and (candidate / "pyproject.toml").exists():
-                return candidate
-        raise RuntimeError("Could not find Frontier-CS base directory")
+        # src/frontier_cs/runner/algorithmic_skypilot.py -> repo root
+        base = Path(__file__).parents[3]
+        if not (base / "algorithmic").is_dir():
+            raise RuntimeError(f"algorithmic/ not found in {base}")
+        return base
 
     def _get_yaml_path(self) -> Path:
         """Get path to sky-judge.yaml."""
@@ -83,17 +79,10 @@ class AlgorithmicSkyPilotRunner(AlgorithmicRunner):
         try:
             clusters = sky.status(cluster_names=[self.CLUSTER_NAME])
             if clusters:
-                record: Any = clusters[0]
-                # sky.status returns list of dicts with 'status', 'handle' keys
-                if isinstance(record, dict):
-                    status = record.get("status")
-                    handle = record.get("handle")
-                    return (str(status) if status else None, handle)
-                # Fallback for object-style access
-                if hasattr(record, "status"):
-                    status = str(record.status)
-                    handle = getattr(record, "handle", None)
-                    return (status, handle)
+                record: dict[str, Any] = clusters[0]  # type: ignore[assignment]
+                status = record.get("status")
+                handle = record.get("handle")
+                return (str(status) if status else None, handle)
         except Exception:
             pass
         return (None, None)

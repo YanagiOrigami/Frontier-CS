@@ -131,15 +131,11 @@ class BatchEvaluator:
 
     def _find_base_dir(self) -> Path:
         """Find the Frontier-CS base directory."""
-        candidates = [
-            Path(__file__).parents[4],  # src/frontier_cs/batch/evaluator.py -> repo root
-            Path.cwd(),
-            Path.cwd().parent,
-        ]
-        for candidate in candidates:
-            if (candidate / "research").is_dir() and (candidate / "pyproject.toml").exists():
-                return candidate
-        raise RuntimeError("Could not find Frontier-CS base directory")
+        # src/frontier_cs/batch/evaluator.py -> repo root
+        base = Path(__file__).parents[3]
+        if not (base / "pyproject.toml").exists():
+            raise RuntimeError(f"pyproject.toml not found in {base}")
+        return base
 
     def _save_state(self) -> None:
         """Save current state to disk."""
@@ -389,8 +385,12 @@ class BatchEvaluator:
 
     def _evaluate_pair(self, pair: Pair) -> EvaluationResult:
         """Evaluate a single pair using the configured runner."""
-        # New flat format: solution is the filename (e.g., flash_attn.gpt5.py)
-        solution_file = self.base_dir / "solutions" / pair.solution
+        # Solutions are in track-specific directories
+        if self.track == "algorithmic":
+            solutions_dir = self.base_dir / "algorithmic" / "solutions"
+        else:
+            solutions_dir = self.base_dir / "research" / "solutions"
+        solution_file = solutions_dir / pair.solution
 
         if not solution_file.exists():
             return EvaluationResult(
@@ -444,13 +444,19 @@ class BatchEvaluator:
         Returns:
             Final evaluation state
         """
-        solutions_dir = self.base_dir / "solutions"
+        if self.track == "algorithmic":
+            solutions_dir = self.base_dir / "algorithmic" / "solutions"
+            ext = "cpp"
+        else:
+            solutions_dir = self.base_dir / "research" / "solutions"
+            ext = "py"
         pairs = expand_pairs(
             problems,
             [model],
             variants,
             solutions_dir=solutions_dir,
             validate_paths=True,
+            ext=ext,
         )
 
         if not pairs:
@@ -481,13 +487,19 @@ class BatchEvaluator:
         Returns:
             Final evaluation state
         """
-        solutions_dir = self.base_dir / "solutions"
+        if self.track == "algorithmic":
+            solutions_dir = self.base_dir / "algorithmic" / "solutions"
+            ext = "cpp"
+        else:
+            solutions_dir = self.base_dir / "research" / "solutions"
+            ext = "py"
         pairs = expand_pairs(
             [problem],
             models,
             variants,
             solutions_dir=solutions_dir,
             validate_paths=True,
+            ext=ext,
         )
 
         if not pairs:
@@ -543,13 +555,19 @@ class BatchEvaluator:
         models = read_models_file(models_file)
         variants = read_variants_file(variants_file) if variants_file else [0]
 
-        solutions_dir = self.base_dir / "solutions"
+        if self.track == "algorithmic":
+            solutions_dir = self.base_dir / "algorithmic" / "solutions"
+            ext = "cpp"
+        else:
+            solutions_dir = self.base_dir / "research" / "solutions"
+            ext = "py"
         pairs = expand_pairs(
             problems,
             models,
             variants,
             solutions_dir=solutions_dir,
             validate_paths=True,
+            ext=ext,
         )
 
         logger.info(f"Expanded {len(problems)} problems × {len(models)} models × {len(variants)} variants = {len(pairs)} pairs")
@@ -643,13 +661,19 @@ class BatchEvaluator:
         Returns:
             Final evaluation state
         """
-        solutions_dir = self.base_dir / "solutions"
+        if self.track == "algorithmic":
+            solutions_dir = self.base_dir / "algorithmic" / "solutions"
+            ext = "cpp"
+        else:
+            solutions_dir = self.base_dir / "research" / "solutions"
+            ext = "py"
         all_pairs = expand_pairs(
             problems,
             models,
             variants,
             solutions_dir=solutions_dir,
             validate_paths=True,
+            ext=ext,
         )
 
         # Find pairs not in current state

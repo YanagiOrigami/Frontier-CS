@@ -2,6 +2,7 @@
 Runner for algorithmic problems using the judge server.
 """
 
+import subprocess
 import time
 from pathlib import Path
 from typing import Optional
@@ -16,6 +17,7 @@ class AlgorithmicRunner(Runner):
     Runner for algorithmic problems.
 
     Submits solutions to the judge server (go-judge) and polls for results.
+    Automatically starts the judge via docker-compose if not running.
     """
 
     DEFAULT_JUDGE_URL = "http://localhost:8081"
@@ -25,10 +27,90 @@ class AlgorithmicRunner(Runner):
         self,
         judge_url: str = DEFAULT_JUDGE_URL,
         poll_interval: float = DEFAULT_POLL_INTERVAL,
+        base_dir: Optional[Path] = None,
+        auto_start: bool = True,
     ):
         self.judge_url = judge_url.rstrip("/")
         self.poll_interval = poll_interval
         self.session = requests.Session()
+        self.base_dir = base_dir or self._find_base_dir()
+        self.auto_start = auto_start
+        self._judge_started = False
+
+    def _find_base_dir(self) -> Path:
+        """Find the Frontier-CS base directory."""
+        # src/frontier_cs/runner/algorithmic.py -> repo root
+        base = Path(__file__).parents[3]
+        if not (base / "algorithmic").is_dir():
+            raise RuntimeError(f"algorithmic/ not found in {base}")
+        return base
+
+    def _is_judge_available(self) -> bool:
+        """Check if judge server is available."""
+        try:
+            response = self.session.get(f"{self.judge_url}/problems", timeout=5)
+            return response.status_code == 200
+        except requests.RequestException:
+            return False
+
+    def _start_judge(self) -> bool:
+        """Start judge server via docker compose."""
+        compose_dir = self.base_dir / "algorithmic"
+        compose_file = compose_dir / "docker-compose.yml"
+
+        if not compose_file.exists():
+            print(f"docker-compose.yml not found at {compose_file}")
+            return False
+
+        print("Starting judge server via docker compose...")
+        try:
+            result = subprocess.run(
+                ["docker", "compose", "up", "-d"],
+                cwd=compose_dir,
+                capture_output=True,
+                text=True,
+                timeout=120,
+            )
+            if result.returncode != 0:
+                print(f"Failed to start judge: {result.stderr}")
+                return False
+            return True
+        except subprocess.TimeoutExpired:
+            print("Timeout starting judge server")
+            return False
+        except FileNotFoundError:
+            print("docker not found")
+            return False
+
+    def _wait_for_judge(self, timeout: int = 60) -> bool:
+        """Wait for judge server to become available."""
+        print(f"Waiting for judge server at {self.judge_url}...")
+        start = time.time()
+        while time.time() - start < timeout:
+            if self._is_judge_available():
+                print("Judge server is ready")
+                return True
+            time.sleep(2)
+        print("Judge server did not become ready in time")
+        return False
+
+    def _ensure_judge(self) -> bool:
+        """Ensure judge server is running, start if needed."""
+        if self._judge_started or self._is_judge_available():
+            self._judge_started = True
+            return True
+
+        if not self.auto_start:
+            return False
+
+        if not self._start_judge():
+            return False
+
+        if not self._wait_for_judge():
+            return False
+
+        self._judge_started = True
+        return True
 
     def evaluate(
         self,
@@ -54,6 +136,14 @@ class AlgorithmicRunner(Runner):
         """
         pid = str(problem_id)
         start_time = time.time()
+
+        # Ensure judge is running
+        if not self._ensure_judge():
+            return EvaluationResult(
+                problem_id=pid,
+                status=EvaluationStatus.ERROR,
+                message="Judge server not available and failed to start",
+            )
 
         # Check for empty code
         if not solution_code or not solution_code.strip():

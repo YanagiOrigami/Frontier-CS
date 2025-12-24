@@ -837,7 +837,7 @@ Examples:
                 docker_config=docker_config,
             )
             # Write solution to flat file
-            solutions_dir = repo_root / "solutions"
+            solutions_dir = research_dir / "solutions"
             solutions_dir.mkdir(exist_ok=True)
             sol_file = solutions_dir / task.solution_name
             sol_file.write_text(code, encoding="utf-8")

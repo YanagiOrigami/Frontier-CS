@@ -73,6 +73,7 @@ def expand_pairs(
     *,
     solutions_dir: Optional[Path] = None,
     validate_paths: bool = True,
+    ext: str = "py",
 ) -> List[Pair]:
     """
     Expand problems × models × variants into pairs.
@@ -83,6 +84,7 @@ def expand_pairs(
         variants: List of variant indices (default: [0] for no suffix)
         solutions_dir: Directory containing solutions (for validation)
         validate_paths: Whether to validate solution paths exist
+        ext: File extension (default: "py", use "cpp" for algorithmic)
 
     Returns:
         List of Pair objects
@@ -99,10 +101,10 @@ def expand_pairs(
             model_prefix = get_model_prefix(model)
 
             for variant_idx in variants:
-                # New flat format: {problem}.{model}.py or {problem}.{model}_{variant}.py
+                # Flat format: {problem}.{model}.{ext} or {problem}.{model}_{variant}.{ext}
                 variant_suffix = "" if variant_idx == 0 else f"_{variant_idx}"
                 model_with_variant = f"{model_prefix}{variant_suffix}"
-                solution_filename = format_solution_filename(problem_name, model_with_variant, "py")
+                solution_filename = format_solution_filename(problem_name, model_with_variant, ext)
 
                 if validate_paths and solutions_dir:
                     solution_path = solutions_dir / solution_filename

@@ -93,12 +93,7 @@ class Gemini(LLMInterface):
         """
         super().__init__()
         try:
-            key_candidates = [
-                api_key,
-                os.getenv("GOOGLE_API_KEY"),
-                os.getenv("GEMINI_API_KEY"),
-            ]
-            resolved_key = next((k for k in key_candidates if k), None)
+            resolved_key = api_key or os.getenv("GOOGLE_API_KEY")
             if not resolved_key:
                 raise ValueError("GOOGLE_API_KEY not found in environment variables.")
             self.api_key = resolved_key
@@ -267,7 +262,7 @@ class Grok(LLMInterface):
         pointed at the Grok API endpoint.
         """
         super().__init__()
-        resolved_key = api_key or os.getenv("XAI_API_KEY") or os.getenv("GROK_API_KEY")
+        resolved_key = api_key or os.getenv("XAI_API_KEY")
         self.client = OpenAI(
             api_key=resolved_key,
             base_url=base_url,

@@ -62,11 +62,6 @@ print(f"Score: {result.score}")
 # With SkyPilot
 result = evaluator.evaluate("research", problem_id="flash_attn", code=my_code,
                            backend="skypilot")
-
-# Batch evaluation
-results = evaluator.evaluate_batch("research",
-                                  problem_ids=["flash_attn", "cross_entropy"],
-                                  code=my_code)
 ```
 
 ## Problem Structure

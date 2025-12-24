@@ -273,6 +273,19 @@ Solution files use format: {problem}.{model}.py (e.g., flash_attn.gpt5.py)
         help="Directory for results and state (default: results/batch)",
     )
 
+    batch_track = batch_parser.add_argument_group("Track Selection")
+    batch_track.add_argument(
+        "--algorithmic",
+        action="store_true",
+        help="Evaluate algorithmic track (C++ solutions)",
+    )
+    batch_track.add_argument(
+        "--judge-url",
+        type=str,
+        default="http://localhost:8081",
+        help="Judge server URL for algorithmic problems",
+    )
+
     batch_backend = batch_parser.add_argument_group("Backend Options")
     batch_backend.add_argument(
         "--skypilot",
@@ -559,14 +572,15 @@ def run_batch(args: argparse.Namespace) -> int:
 
         solutions_dir = args.solutions_dir
         if solutions_dir is None:
-            # Default to solutions/ in current directory or repo root
-            for candidate in [Path("solutions"), Path("../solutions"), Path("../../solutions")]:
-                if candidate.is_dir():
-                    solutions_dir = candidate.resolve()
-                    break
+            # Use base_dir from batch evaluator
+            base_dir = Path(__file__).parents[2]  # src/frontier_cs/cli.py -> repo root
+            track_dir = "algorithmic" if track == "algorithmic" else "research"
+            solutions_dir = base_dir / track_dir / "solutions"
 
-        if solutions_dir is None or not solutions_dir.is_dir():
-            print("Error: No solutions directory found. Use --solutions-dir or --pairs-file", file=sys.stderr)
+        if not solutions_dir.is_dir():
+            track_dir = "algorithmic" if track == "algorithmic" else "research"
+            print(f"Error: No solutions directory found. Expected {track_dir}/solutions/", file=sys.stderr)
+            print("Use --solutions-dir or --pairs-file to specify", file=sys.stderr)
             return 1
 
         pairs = scan_solutions_dir(solutions_dir)
@@ -574,7 +588,7 @@ def run_batch(args: argparse.Namespace) -> int:
             print(f"Error: No solution files found in {solutions_dir}", file=sys.stderr)
             return 1
 
-        print(f"\nBatch evaluation: {len(pairs)} solutions from {solutions_dir}")
+        print(f"\nBatch evaluation ({track}): {len(pairs)} solutions from {solutions_dir}")
         state = batch.evaluate_pairs(pairs, resume=resume)
 
     # Print summary

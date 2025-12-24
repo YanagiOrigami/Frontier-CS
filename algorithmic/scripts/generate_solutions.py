@@ -7,7 +7,7 @@ Fetches problem statements from the judge server and generates C++ solutions.
 Usage:
     python generate_solutions.py --model gpt-5
     python generate_solutions.py --problem 1 --model claude-sonnet-4-5
-    python generate_solutions.py --all --model gpt-5  # Generate for all problems
+    python generate_solutions.py --problems-file problems.txt --model gpt-5
     python generate_solutions.py --dryrun  # Show what would be generated
 """
 
@@ -247,8 +247,8 @@ def main():
     # Problem selection
     parser.add_argument("--problem", dest="problems", nargs="+",
                         help="Problem ID(s) to generate solutions for")
-    parser.add_argument("--all", action="store_true",
-                        help="Generate solutions for all problems")
+    parser.add_argument("--problems-file", dest="problems_file",
+                        help="File containing problem IDs (one per line)")
 
     # Model selection
     model_group = parser.add_mutually_exclusive_group()
@@ -274,16 +274,10 @@ def main():
     parser.add_argument("--concurrency", type=int, default=4,
                         help="Maximum parallel generations")
 
-    # Output
-    parser.add_argument("--output-dir", type=Path,
-                        default=None,
-                        help="Output directory for solutions")
-
     args = parser.parse_args()
 
-    # Default output directory
-    if args.output_dir is None:
-        args.output_dir = script_dir / "solutions"
+    # Fixed output directory
+    output_dir = script_dir / "solutions"
 
     # Initialize judge client
     judge = AlgorithmicJudgeClient(args.judge_url)
@@ -296,15 +290,34 @@ def main():
     # Get problem list
     if args.problems:
         problem_ids = args.problems
-    elif args.all:
-        problem_ids = judge.get_all_problems()
-        if not problem_ids:
-            print(f"{red('ERROR:')} No problems found on judge server")
+    elif args.problems_file:
+        problems_path = Path(args.problems_file)
+        if not problems_path.is_absolute():
+            problems_path = script_dir / problems_path
+        if not problems_path.is_file():
+            print(f"{red('ERROR:')} Problems file not found: {problems_path}")
             sys.exit(1)
-        print(f"Found {len(problem_ids)} problems on judge server")
+        problem_ids = [
+            line.strip() for line in problems_path.read_text().splitlines()
+            if line.strip() and not line.strip().startswith("#")
+        ]
+        if not problem_ids:
+            print(f"{red('ERROR:')} No problems found in {problems_path}")
+            sys.exit(1)
+        print(f"Loaded {len(problem_ids)} problems from {problems_path}")
     else:
-        print(f"{red('ERROR:')} Specify --problem <id> or --all")
-        sys.exit(1)
+        # Try default problems.txt
+        problems_path = script_dir / "problems.txt"
+        if problems_path.is_file():
+            problem_ids = [
+                line.strip() for line in problems_path.read_text().splitlines()
+                if line.strip() and not line.strip().startswith("#")
+            ]
+            if problem_ids:
+                print(f"Loaded {len(problem_ids)} problems from {problems_path}")
+        else:
+            print(f"{red('ERROR:')} Specify --problem <id> or --problems-file, or create problems.txt")
+            sys.exit(1)
 
     # Get model list
     if args.models:
@@ -338,7 +351,7 @@ def main():
     # Create output and logs directories
     logs_dir = script_dir / "generation_logs"
     if not args.dryrun:
-        args.output_dir.mkdir(parents=True, exist_ok=True)
+        output_dir.mkdir(parents=True, exist_ok=True)
         logs_dir.mkdir(exist_ok=True)
 
     # Build tasks
@@ -361,7 +374,7 @@ def main():
                 variant_suffix = "" if variant_idx == 0 else f"_{variant_idx}"
                 model_with_variant = f"{model_prefix}{variant_suffix}"
                 sol_filename = format_solution_filename(problem_id, model_with_variant, "cpp")
-                sol_path = args.output_dir / sol_filename
+                sol_path = output_dir / sol_filename
 
                 if sol_path.exists() and not args.force:
                     skipped.append(sol_filename)
@@ -390,7 +403,7 @@ def main():
     print(f"  Problems: {blue(str(len(problem_ids)))}")
     print(f"  Models: {blue(str(len(models_list)))}")
     print(f"  Variants: {blue(str(args.variants))}")
-    print(f"  Output: {blue(str(args.output_dir))}")
+    print(f"  Output: {blue(str(output_dir))}")
     print()
 
     if tasks:
@@ -442,7 +455,7 @@ def main():
             )
 
             # Save solution (solution_name is already the full filename)
-            sol_path = args.output_dir / task.solution_name
+            sol_path = output_dir / task.solution_name
             sol_path.write_text(code, encoding="utf-8")
             print(f"  {green('✓')} Saved: {green(str(sol_path))}")
 

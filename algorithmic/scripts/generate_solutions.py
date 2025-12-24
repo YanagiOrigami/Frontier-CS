@@ -7,13 +7,12 @@ Fetches problem statements from the judge server and generates C++ solutions.
 Usage:
     python generate_solutions.py --model gpt-5
     python generate_solutions.py --problem 1 --model claude-sonnet-4-5
-    python generate_solutions.py --submit --model gpt-5  # Generate and evaluate
+    python generate_solutions.py --all --model gpt-5  # Generate for all problems
     python generate_solutions.py --dryrun  # Show what would be generated
 """
 
 import sys
 import os
-import json
 import time
 import argparse
 import re
@@ -260,8 +259,6 @@ def main():
     # Judge configuration
     parser.add_argument("--judge-url", default="http://localhost:8081",
                         help="Judge server URL")
-    parser.add_argument("--submit", action="store_true",
-                        help="Submit solutions to judge for evaluation")
 
     # Generation parameters
     parser.add_argument("--timeout", type=float, default=600.0,
@@ -394,7 +391,6 @@ def main():
     print(f"  Models: {blue(str(len(models_list)))}")
     print(f"  Variants: {blue(str(args.variants))}")
     print(f"  Output: {blue(str(args.output_dir))}")
-    print(f"  Submit: {blue(str(args.submit))}")
     print()
 
     if tasks:
@@ -416,7 +412,6 @@ def main():
     # Execute tasks
     generated: List[str] = []
     failed: List[str] = []
-    results: Dict[str, Dict[str, Any]] = {}
 
     def execute_task(task: GenerationTask) -> Tuple[str, str, Optional[str], str, Optional[int]]:
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -450,23 +445,6 @@ def main():
             sol_path = args.output_dir / task.solution_name
             sol_path.write_text(code, encoding="utf-8")
             print(f"  {green('✓')} Saved: {green(str(sol_path))}")
-
-            # Submit if requested
-            if args.submit:
-                print(f"  Submitting to judge...")
-                sid = judge.submit_solution(task.problem_id, code)
-                if sid:
-                    result = judge.get_result(sid)
-                    score = result.get('score', -1)
-                    results[task.solution_name] = result
-
-                    # Save result (strip .cpp extension)
-                    result_base = task.solution_name.rsplit('.', 1)[0]
-                    result_path = args.output_dir / f"{result_base}_result.json"
-                    result_path.write_text(json.dumps(result, indent=2), encoding="utf-8")
-                    print(f"  {green('✓')} Score: {green(str(score))}")
-                else:
-                    print(f"  {yellow('⚠')} Submission failed")
 
             return ("generated", task.solution_name, None, task.provider, pool_token)
 
@@ -502,12 +480,6 @@ def main():
         print(f"  {yellow('○')} Skipped: {yellow(bold(str(len(skipped))))} existing")
     if failed:
         print(f"  {red('✗')} Failed: {red(bold(str(len(failed))))} solution(s)")
-
-    if args.submit and results:
-        scores = [r.get('score', 0) for r in results.values() if r.get('score', -1) >= 0]
-        if scores:
-            avg_score = sum(scores) / len(scores)
-            print(f"\n  Average Score: {bold(f'{avg_score:.2f}')}")
 
     print("─" * 40)
 

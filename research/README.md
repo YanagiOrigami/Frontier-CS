@@ -6,13 +6,13 @@ Real-world systems challenges requiring domain expertise in GPU computing, distr
 
 ```bash
 # List all problems
-frontier-eval --list
+frontier list
 
 # Evaluate a solution (requires Docker)
-frontier-eval flash_attn <your_solution.py>
+frontier eval flash_attn <your_solution.py>
 
 # Evaluate multiple problems
-frontier-eval --problems flash_attn,cross_entropy <your_solution.py>
+frontier eval --problems flash_attn,cross_entropy <your_solution.py>
 ```
 
 ## Cloud Evaluation with SkyPilot
@@ -30,7 +30,7 @@ See [SkyPilot docs](https://skypilot.readthedocs.io/en/latest/getting-started/in
 **Usage:**
 
 ```bash
-frontier-eval flash_attn <your_solution.py> --skypilot
+frontier eval flash_attn <your_solution.py> --skypilot
 ```
 
 ## Batch Evaluation
@@ -39,13 +39,13 @@ Batch evaluation automatically scans `solutions/` and parses problem IDs from fi
 
 ```bash
 # Evaluate all solutions (auto-skips completed)
-frontier-eval batch
+frontier batch
 
 # Check status
-frontier-eval batch --status
+frontier batch --status
 
 # Force re-evaluate all
-frontier-eval batch --no-resume
+frontier batch --no-resume
 ```
 
 ## Python API
@@ -222,7 +222,6 @@ python research/scripts/generate_solutions.py --solution "flash_attn.gpt5*" --fo
 | `--dryrun`                      | Preview without generating                                                     |
 | `--concurrency N`               | Parallel API calls                                                             |
 | `--timeout SECONDS`             | API timeout (default: 600s)                                                    |
-| `--reasoning-model`             | Force reasoning mode (o1/o3 models)                                            |
 
 ### Output
 

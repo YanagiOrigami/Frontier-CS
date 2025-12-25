@@ -186,20 +186,23 @@ class DockerRunner(Runner):
             # Parse score from output
             score, score_unbounded, error = self._parse_score(logs)
 
-            if error or result.returncode != 0:
+            # If we got a score, treat as success (even if returncode != 0)
+            # This distinguishes "solution failed, got 0" from "infrastructure error"
+            if score is not None:
                 return EvaluationResult(
                     problem_id=problem_id,
-                    status=EvaluationStatus.ERROR,
-                    message=error or f"Docker exited with code {result.returncode}",
+                    score=score,
+                    score_unbounded=score_unbounded,
+                    status=EvaluationStatus.SUCCESS,
                     logs=logs,
                     duration_seconds=duration,
                 )
 
+            # No score parsed - this is an infrastructure/evaluator error
             return EvaluationResult(
                 problem_id=problem_id,
-                score=score,
-                score_unbounded=score_unbounded,
-                status=EvaluationStatus.SUCCESS,
+                status=EvaluationStatus.ERROR,
+                message=error or f"Docker exited with code {result.returncode}",
                 logs=logs,
                 duration_seconds=duration,
             )

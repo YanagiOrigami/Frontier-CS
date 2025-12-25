@@ -256,14 +256,6 @@ class SkyPilotRunner(Runner):
 
                 duration = time.time() - start_time
 
-                if exit_code != 0:
-                    return EvaluationResult(
-                        problem_id=problem_id,
-                        status=EvaluationStatus.ERROR,
-                        message=f"Remote job failed with exit code {exit_code}",
-                        duration_seconds=duration,
-                    )
-
                 # Fetch results (bucket mode writes directly, scp mode fetches after)
                 if self.bucket_url:
                     # Results already written to bucket by run script
@@ -275,13 +267,26 @@ class SkyPilotRunner(Runner):
                         duration_seconds=duration,
                     )
                 else:
-                    # Legacy scp mode
+                    # Legacy scp mode - try to fetch score even if exit_code != 0
                     score, score_unbounded, logs = self._fetch_results(cluster_name, handle)
+
+                    # If we got a score, treat as success (even if exit_code != 0)
+                    # This distinguishes "solution failed, got 0" from "infrastructure error"
+                    if score is not None:
+                        return EvaluationResult(
+                            problem_id=problem_id,
+                            score=score,
+                            score_unbounded=score_unbounded,
+                            status=EvaluationStatus.SUCCESS,
+                            logs=logs,
+                            duration_seconds=duration,
+                        )
+
+                    # No score parsed - this is an infrastructure/evaluator error
                     return EvaluationResult(
                         problem_id=problem_id,
-                        score=score,
-                        score_unbounded=score_unbounded,
-                        status=EvaluationStatus.SUCCESS,
+                        status=EvaluationStatus.ERROR,
+                        message=f"Remote job failed with exit code {exit_code}",
                         logs=logs,
                         duration_seconds=duration,
                     )

@@ -62,13 +62,13 @@ Here's [Algorithmic Problem 0](algorithmic/problems/0/statement.txt) - try to be
 
 ```bash
 # Run the example solution (Human Expert Solution)
-frontier-eval --algorithmic 0 algorithmic/problems/0/examples/reference.cpp
+frontier eval --algorithmic 0 algorithmic/problems/0/examples/reference.cpp
 
 # Run the example solution (GPT-5 Thinking Solution)
-frontier-eval --algorithmic 0 algorithmic/problems/0/examples/gpt5.cpp
+frontier eval --algorithmic 0 algorithmic/problems/0/examples/gpt5.cpp
 
 # Try your own solution!
-frontier-eval --algorithmic 0 <your_solution.cpp>
+frontier eval --algorithmic 0 <your_solution.cpp>
 ```
 
 <p align="center">
@@ -79,13 +79,13 @@ frontier-eval --algorithmic 0 <your_solution.cpp>
 
 ```bash
 # List all problems
-frontier-eval --list
+frontier list
 
 # Evaluate a generated solution locally for flash_attn problem (requires Docker)
-frontier-eval flash_attn <your_solution.py>
+frontier eval flash_attn <your_solution.py>
 
 # Evaluate on cloud (requires SkyPilot)
-frontier-eval flash_attn <your_solution.py> --skypilot
+frontier eval flash_attn <your_solution.py> --skypilot
 ```
 
 See [research/README.md](research/README.md) for full documentation.
@@ -94,10 +94,10 @@ See [research/README.md](research/README.md) for full documentation.
 
 ```bash
 # Evaluate a solution locally (requires Docker)
-frontier-eval --algorithmic 1 <your_solution.cpp>
+frontier eval --algorithmic 1 <your_solution.cpp>
 
 # Evaluate on cloud (requires SkyPilot)
-frontier-eval --algorithmic 1 <your_solution.cpp> --skypilot
+frontier eval --algorithmic 1 <your_solution.cpp> --skypilot
 ```
 
 See [algorithmic/README.md](algorithmic/README.md) for full documentation.
@@ -108,8 +108,8 @@ Frontier-CS supports unbounded scoring, enabling open-ended evaluation compatibl
 
 ```bash
 # Get unbounded score (without clipping to 100)
-frontier-eval --unbounded flash_attn <your_solution.py>
-frontier-eval --algorithmic --unbounded 1 <your_solution.cpp>
+frontier eval --unbounded flash_attn <your_solution.py>
+frontier eval --algorithmic --unbounded 1 <your_solution.cpp>
 ```
 
 ### Python API

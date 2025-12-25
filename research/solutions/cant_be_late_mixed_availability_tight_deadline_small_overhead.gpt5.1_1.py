@@ -1,79 +1,75 @@
-import json
 from sky_spot.strategies.strategy import Strategy
 from sky_spot.utils import ClusterType
 
 
 class Solution(Strategy):
-    NAME = "cant_be_late_v1"
-
-    def __init__(self, *args, **kwargs):
-        # Call parent constructor robustly, regardless of its exact signature.
-        try:
-            super().__init__(*args, **kwargs)
-        except TypeError:
-            try:
-                super().__init__()
-            except TypeError:
-                pass
-
-        # Strategy parameters (in seconds).
-        # Above safe_slack_seconds: we are comfortable waiting when no spot.
-        # At or below critical_slack_seconds: permanently switch to on-demand.
-        self.safe_slack_seconds = 3.0 * 3600.0
-        self.critical_slack_seconds = 1.0 * 3600.0
-
-        # Internal state.
-        self.lock_on_demand = False
-        self.total_steps = 0
-        self.spot_available_steps = 0
-        self.spec = None
+    NAME = "cant_be_late_dynamic_v1"
 
     def solve(self, spec_path: str) -> "Solution":
-        if spec_path:
-            try:
-                with open(spec_path, "r") as f:
-                    self.spec = json.load(f)
-            except Exception:
-                self.spec = None
+        # Optional initialization; we lazily initialize in _step.
+        self._buffer_seconds = None
+        self._work_done_cache = 0.0
+        self._last_task_done_len = 0
         return self
 
-    def _compute_slack(self) -> float:
-        """Compute remaining slack time (seconds)."""
-        try:
-            done = sum(self.task_done_time) if self.task_done_time is not None else 0.0
-        except TypeError:
-            # In case task_done_time is a scalar or otherwise non-iterable.
-            done = float(self.task_done_time) if self.task_done_time else 0.0
-
-        remaining_work = max(self.task_duration - done, 0.0)
-        time_left = max(self.deadline - self.env.elapsed_seconds, 0.0)
-        slack = time_left - remaining_work
-        return slack
-
     def _step(self, last_cluster_type: ClusterType, has_spot: bool) -> ClusterType:
-        self.total_steps += 1
-        if has_spot:
-            self.spot_available_steps += 1
+        # Lazy initialization of buffer based on problem slack.
+        if not hasattr(self, "_buffer_seconds") or self._buffer_seconds is None:
+            # Total slack = deadline - task_duration - one restart_overhead.
+            slack = self.deadline - self.task_duration - self.restart_overhead
+            if slack <= 0:
+                self._buffer_seconds = 0.0
+            else:
+                # Use 25% of available slack as a safety buffer.
+                self._buffer_seconds = 0.25 * slack
 
-        slack = self._compute_slack()
+        # Lazy initialization of work-done cache.
+        if not hasattr(self, "_work_done_cache"):
+            self._work_done_cache = 0.0
+            self._last_task_done_len = 0
 
-        # Once slack falls below the critical threshold, lock into on-demand.
-        if not self.lock_on_demand and slack <= self.critical_slack_seconds:
-            self.lock_on_demand = True
+        # Incrementally maintain total work done.
+        segments = self.task_done_time or []
+        n = len(segments)
+        if n > self._last_task_done_len:
+            total = self._work_done_cache
+            for i in range(self._last_task_done_len, n):
+                total += segments[i]
+            self._work_done_cache = total
+            self._last_task_done_len = n
 
-        if self.lock_on_demand:
-            return ClusterType.ON_DEMAND
-
-        if has_spot:
-            # Prefer spot whenever available while we still have sufficient slack.
-            return ClusterType.SPOT
-
-        # Spot not available and not yet locked into on-demand.
-        # If we still have plenty of slack, we can wait; otherwise, use on-demand.
-        if slack > self.safe_slack_seconds:
+        work_done = self._work_done_cache
+        remaining = self.task_duration - work_done
+        if remaining <= 0:
+            # Task already completed.
             return ClusterType.NONE
 
-        return ClusterType.ON_DEMAND
+        now = self.env.elapsed_seconds
+        dt = self.env.gap_seconds
+        time_left = self.deadline - now
+
+        if time_left <= 0:
+            # Already past deadline; just use on-demand.
+            return ClusterType.ON_DEMAND
+
+        # Slack after accounting for remaining work and a possible restart overhead.
+        S = time_left - (remaining + self.restart_overhead)
+        buffer = self._buffer_seconds
+
+        # It is safe to "risk" (use spot or idle) this step if,
+        # even in the worst case of zero progress this step,
+        # we can still finish on time using only on-demand.
+        safe_to_risk = S > buffer + dt + 1e-9
+
+        if safe_to_risk:
+            if has_spot:
+                return ClusterType.SPOT
+            else:
+                # Wait for cheaper spot while we still have enough slack.
+                return ClusterType.NONE
+        else:
+            # Not enough slack to risk; switch to guaranteed on-demand.
+            return ClusterType.ON_DEMAND
 
     @classmethod
     def _from_args(cls, parser):

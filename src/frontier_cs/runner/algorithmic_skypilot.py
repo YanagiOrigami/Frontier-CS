@@ -112,8 +112,12 @@ class AlgorithmicSkyPilotRunner(AlgorithmicRunner):
         status = self._get_cluster_status()
         return status == "UP"
 
-    def _launch_cluster(self) -> bool:
-        """Launch the algo-judge cluster using sky-judge.yaml."""
+    def _launch_cluster(self) -> Optional[str]:
+        """Launch the algo-judge cluster using sky-judge.yaml.
+
+        Returns:
+            The cluster head IP if successful, None otherwise.
+        """
         import sky
 
         yaml_path = self._get_yaml_path()
@@ -138,12 +142,17 @@ class AlgorithmicSkyPilotRunner(AlgorithmicRunner):
                 cluster_name=self.CLUSTER_NAME,
                 idle_minutes_to_autostop=self.idle_timeout,
             )
-            sky.stream_and_get(request_id)
+            # stream_and_get returns (job_id, handle) where handle has head_ip
+            job_id, handle = sky.stream_and_get(request_id)
             logger.info(f"Cluster '{self.CLUSTER_NAME}' launched successfully")
-            return True
+
+            # Extract IP from handle
+            if handle and hasattr(handle, 'head_ip'):
+                return handle.head_ip
+            return None
         except Exception as e:
             logger.exception(f"Failed to launch cluster: {e}")
-            return False
+            return None
 
     def _wait_for_service(self, ip: str, timeout: int = 120) -> bool:
         """Wait for the judge service to be ready."""
@@ -181,14 +190,12 @@ class AlgorithmicSkyPilotRunner(AlgorithmicRunner):
                 self._initialized = True
                 return self._judge_url
 
-        if not self._launch_cluster():
-            raise RuntimeError("Failed to launch algo-judge cluster")
-
-        time.sleep(5)
-
-        ip = self._get_cluster_ip()
+        ip = self._launch_cluster()
         if not ip:
-            raise RuntimeError("Could not get cluster IP after launch")
+            # Fallback: try to get IP from status if launch didn't return it
+            ip = self._get_cluster_ip()
+        if not ip:
+            raise RuntimeError("Failed to launch algo-judge cluster or get its IP")
 
         logger.info(f"Waiting for judge service at {ip}:8081 (timeout: 120s)")
         if not self._wait_for_service(ip, timeout=120):

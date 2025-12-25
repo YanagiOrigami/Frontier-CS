@@ -1,115 +1,146 @@
-import math
-
-try:
-    from sky_spot.strategies.strategy import Strategy
-    from sky_spot.utils import ClusterType
-except ImportError:  # Fallback definitions for local testing
-    from enum import Enum
-
-    class ClusterType(Enum):
-        SPOT = "spot"
-        ON_DEMAND = "on_demand"
-        NONE = "none"
-
-    class DummyEnv:
-        def __init__(self):
-            self.elapsed_seconds = 0.0
-            self.gap_seconds = 60.0
-            self.cluster_type = ClusterType.NONE
-
-    class Strategy:
-        def __init__(self, args=None):
-            self.args = args
-            self.env = DummyEnv()
-            self.task_duration = 0.0
-            self.task_done_time = []
-            self.deadline = 0.0
-            self.restart_overhead = 0.0
+from typing import Any, Iterable
+from sky_spot.strategies.strategy import Strategy
+from sky_spot.utils import ClusterType
 
 
 class Solution(Strategy):
-    NAME = "my_solution"
-
-    def __init__(self, args=None):
-        super().__init__(args)
-        self.args = args
-
-        # Lazy-initialized scheduling parameters
-        self._init_done = False
-        self._slack_total = 0.0
-        self._commit_slack_threshold = 0.0
-        self._committed_to_od = False
-
-        # Cached sum of task_done_time for efficiency
-        self._cached_task_done_sum = 0.0
-        self._cached_task_done_len = 0
+    NAME = "cant_be_late_threshold_v1"
 
     def solve(self, spec_path: str) -> "Solution":
-        # Optional: could read spec_path here if needed
+        # Optional initialization; not using spec_path for now.
         return self
 
-    def _lazy_init(self):
-        if self._init_done:
-            return
+    def _estimate_progress(self) -> float:
+        """Estimate total completed task duration from self.task_done_time."""
+        segments = getattr(self, "task_done_time", None)
+        if not segments:
+            return 0.0
 
-        # Total slack available if running with no further waste
-        self._slack_total = float(self.deadline - self.task_duration)
-        if self._slack_total < 0.0:
-            # Negative slack: impossible deadline; treat as zero for robustness
-            self._slack_total = 0.0
+        total = 0.0
 
-        # Commit to on-demand when remaining slack becomes small.
-        # Use a fraction of total slack, but at least a multiple of restart_overhead.
-        base_threshold = 0.25 * self._slack_total  # e.g., 1 hour when total slack is 4 hours
-        min_threshold = 2.0 * float(self.restart_overhead)  # at least cover a couple of restarts
-        self._commit_slack_threshold = max(min_threshold, base_threshold)
+        try:
+            # Peek first element to infer structure.
+            first = segments[0]
+        except (IndexError, TypeError):
+            return 0.0
 
-        # Threshold cannot exceed total slack
-        if self._commit_slack_threshold > self._slack_total:
-            self._commit_slack_threshold = self._slack_total
+        try:
+            if isinstance(first, (tuple, list)):
+                # Interpret as (start, end) style segments.
+                for seg in segments:  # type: ignore[assignment]
+                    if not seg:
+                        continue
+                    try:
+                        start = float(seg[0])
+                        end = float(seg[1])
+                        length = end - start
+                        if length > 0.0:
+                            total += length
+                    except (TypeError, ValueError, IndexError):
+                        continue
+            else:
+                # Interpret as list of lengths.
+                for seg in segments:  # type: ignore[assignment]
+                    try:
+                        val = float(seg)
+                        if val > 0.0:
+                            total += val
+                    except (TypeError, ValueError):
+                        continue
+        except TypeError:
+            # segments not iterable
+            return 0.0
 
-        self._init_done = True
+        if total < 0.0:
+            total = 0.0
 
-    def _update_progress_cache(self):
-        # Incrementally update cached sum of task_done_time
-        lst = self.task_done_time
-        n = len(lst)
-        if n > self._cached_task_done_len:
-            for i in range(self._cached_task_done_len, n):
-                self._cached_task_done_sum += float(lst[i])
-            self._cached_task_done_len = n
+        # Cap at task_duration if available.
+        try:
+            duration = float(getattr(self, "task_duration", 0.0) or 0.0)
+            if duration > 0.0 and total > duration:
+                total = duration
+        except (TypeError, ValueError):
+            pass
+
+        return total
 
     def _step(self, last_cluster_type: ClusterType, has_spot: bool) -> ClusterType:
-        self._lazy_init()
-        self._update_progress_cache()
+        # Fallback simple strategy if environment attributes are missing.
+        env = getattr(self, "env", None)
+        if env is None:
+            return ClusterType.SPOT if has_spot else ClusterType.ON_DEMAND
 
-        progress = self._cached_task_done_sum
-        remaining_work = float(self.task_duration) - progress
+        # Basic environment parameters.
+        try:
+            elapsed = float(getattr(env, "elapsed_seconds", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            elapsed = 0.0
 
-        # If job already completed, do nothing to avoid extra cost
+        try:
+            gap = float(getattr(env, "gap_seconds", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            gap = 0.0
+
+        # Core problem parameters.
+        try:
+            deadline = float(getattr(self, "deadline", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            deadline = 0.0
+
+        try:
+            task_duration = float(getattr(self, "task_duration", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            task_duration = 0.0
+
+        try:
+            restart_overhead = float(getattr(self, "restart_overhead", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            restart_overhead = 0.0
+
+        # If parameters are not set, fall back to naive strategy.
+        if deadline <= 0.0 or task_duration <= 0.0 or gap <= 0.0:
+            return ClusterType.SPOT if has_spot else ClusterType.ON_DEMAND
+
+        # Compute current progress and remaining work.
+        progress = self._estimate_progress()
+        remaining_work = max(0.0, task_duration - progress)
+
+        # If job is already completed (or numerically very close), stop.
         if remaining_work <= 0.0:
-            self._committed_to_od = True
             return ClusterType.NONE
 
-        time_remaining = float(self.deadline) - float(self.env.elapsed_seconds)
-        slack_remaining = time_remaining - remaining_work
+        time_remaining = max(0.0, deadline - elapsed)
 
-        # Decide whether to permanently switch to on-demand
-        if not self._committed_to_od:
-            if slack_remaining <= self._commit_slack_threshold:
-                self._committed_to_od = True
-
-        # Once committed, always use on-demand while work remains
-        if self._committed_to_od:
+        # If somehow out of time, best effort is to keep running on-demand.
+        if time_remaining <= 0.0:
             return ClusterType.ON_DEMAND
 
-        # Before commitment: use spot when available, otherwise on-demand
-        if has_spot:
-            return ClusterType.SPOT
+        # Hard feasibility check: even if we switch to on-demand now and pay one
+        # restart overhead, can we finish in time?
+        # Condition for feasibility: time_remaining - restart_overhead >= remaining_work
+        if time_remaining - restart_overhead < remaining_work:
+            # Already in a precarious state; always choose on-demand to maximize chance.
+            return ClusterType.ON_DEMAND
+
+        # Decide whether we can afford to "risk" this step with potentially no progress.
+        #
+        # Worst case if we risk (use SPOT or NONE):
+        #   - We lose `gap` seconds of wall time with zero task progress.
+        #   - After that, we may need one restart_overhead before reliable OD.
+        #
+        # We require that even in this worst case, we can still complete:
+        #   time_remaining - gap - restart_overhead >= remaining_work
+        if time_remaining - gap - restart_overhead >= remaining_work:
+            # Safe to risk this step: prefer cheaper spot if available, else pause.
+            if has_spot:
+                return ClusterType.SPOT
+            else:
+                return ClusterType.NONE
         else:
+            # Cannot afford to lose this gap; must run on reliable on-demand.
             return ClusterType.ON_DEMAND
 
     @classmethod
-    def _from_args(cls, parser):
+    def _from_args(cls, parser: Any) -> "Solution":
         args, _ = parser.parse_known_args()
         return cls(args)

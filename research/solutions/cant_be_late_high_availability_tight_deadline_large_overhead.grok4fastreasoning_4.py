@@ -8,21 +8,13 @@ class Solution(Strategy):
         return self
 
     def _step(self, last_cluster_type: ClusterType, has_spot: bool) -> ClusterType:
-        completed = sum(self.task_done_time)
-        remaining_work = self.task_duration - completed
-        if remaining_work <= 0:
-            return ClusterType.NONE
-        remaining_time = self.deadline - self.env.elapsed_seconds
-        if remaining_time <= 0:
-            return ClusterType.NONE
-        slack = remaining_time - remaining_work
-        use_od = (slack <= self.restart_overhead * 2) or (remaining_work / remaining_time >= 0.95)
-        if use_od:
-            return ClusterType.ON_DEMAND
-        elif has_spot:
+        total_done = sum(self.task_done_time)
+        remaining = self.task_duration - total_done
+        time_left = self.deadline - self.env.elapsed_seconds
+        safe_for_spot = remaining <= time_left - self.restart_overhead
+        if has_spot and safe_for_spot:
             return ClusterType.SPOT
-        else:
-            return ClusterType.ON_DEMAND
+        return ClusterType.ON_DEMAND
 
     @classmethod
     def _from_args(cls, parser):

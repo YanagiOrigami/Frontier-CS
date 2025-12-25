@@ -1,101 +1,99 @@
-from typing import Any, Iterable
+import math
+from typing import Any
 
-from sky_spot.strategies.strategy import Strategy
-from sky_spot.utils import ClusterType
+try:
+    from sky_spot.strategies.strategy import Strategy
+    from sky_spot.utils import ClusterType
+except Exception:  # Fallbacks for non-evaluation environments
+    from enum import Enum
+
+    class ClusterType(Enum):
+        SPOT = 1
+        ON_DEMAND = 2
+        NONE = 3
+
+    class Strategy:
+        NAME = "base_strategy"
+
+        def __init__(self, args: Any = None):
+            self.env = type(
+                "Env",
+                (),
+                {"elapsed_seconds": 0.0, "gap_seconds": 60.0, "cluster_type": ClusterType.NONE},
+            )()
+            self.task_duration = 0.0
+            self.task_done_time = []
+            self.deadline = 0.0
+            self.restart_overhead = 0.0
+
+        def solve(self, spec_path: str) -> "Strategy":
+            return self
 
 
 class Solution(Strategy):
-    NAME = "deadline_safe_spot_first"
-
-    def __init__(self, args: Any = None):
-        try:
-            super().__init__(args)
-        except TypeError:
-            try:
-                super().__init__()
-            except Exception:
-                pass
-        self.args = args
-        self._committed_od = False
+    NAME = "cant_be_late_guard_v2"
 
     def solve(self, spec_path: str) -> "Solution":
+        # Initialization of internal state
+        self._committed_to_od = False
+        self._initialized = True
         return self
 
-    def _sum_task_done(self) -> float:
-        td = getattr(self, "task_done_time", 0.0)
-        try:
-            if isinstance(td, (int, float)):
-                return float(td)
-            s = 0.0
-            if isinstance(td, dict):
-                # In case it's a mapping of segments -> durations
-                for v in td.values():
-                    if isinstance(v, (int, float)):
-                        s += float(v)
-                return s
-            # Assume iterable of numbers
-            for x in td:  # type: ignore
-                if isinstance(x, (int, float)):
-                    s += float(x)
-            return s
-        except Exception:
-            # Fallback if structure is unknown
-            return 0.0
-
     def _remaining_work(self) -> float:
-        done = self._sum_task_done()
-        rem = float(getattr(self, "task_duration", 0.0)) - done
-        return max(0.0, rem)
-
-    def _time_remaining(self) -> float:
-        deadline = float(getattr(self, "deadline", 0.0))
-        elapsed = float(getattr(self.env, "elapsed_seconds", 0.0))
-        return max(0.0, deadline - elapsed)
+        done = 0.0
+        try:
+            done = float(sum(self.task_done_time))
+        except Exception:
+            for seg in self.task_done_time:
+                try:
+                    done += float(seg)
+                except Exception:
+                    try:
+                        if isinstance(seg, (list, tuple)) and len(seg) >= 2:
+                            done += float(seg[1]) - float(seg[0])
+                    except Exception:
+                        continue
+        remaining = float(self.task_duration) - done
+        return max(0.0, remaining)
 
     def _step(self, last_cluster_type: ClusterType, has_spot: bool) -> ClusterType:
-        # Once we run on-demand at any point, latch to on-demand forever
-        if last_cluster_type == ClusterType.ON_DEMAND:
-            self._committed_od = True
-        if self._committed_od:
+        # Ensure internal flags exist even if solve() wasn't called
+        if not hasattr(self, "_committed_to_od"):
+            self._committed_to_od = False
+
+        # If already committed, stay on on-demand until completion
+        if self._committed_to_od:
             return ClusterType.ON_DEMAND
 
-        # Compute remaining work and time
-        work_rem = self._remaining_work()
-        if work_rem <= 0.0:
+        # Compute remaining work and time metrics
+        remaining_work = self._remaining_work()
+        if remaining_work <= 0.0:
             return ClusterType.NONE
 
-        time_rem = self._time_remaining()
-        gap = float(getattr(self.env, "gap_seconds", 0.0))
-        restart = float(getattr(self, "restart_overhead", 0.0))
+        t = float(self.env.elapsed_seconds)
+        gap = float(self.env.gap_seconds)
+        deadline = float(self.deadline)
+        overhead = float(self.restart_overhead)
 
-        # Overhead if we choose to start OD now
-        overhead_now = 0.0 if last_cluster_type == ClusterType.ON_DEMAND else restart
+        # Latest safe time to start OD (accounting for one restart overhead)
+        latest_safe_start = deadline - (remaining_work + overhead)
 
-        # If we must switch to OD now to guarantee deadline, do it and latch
-        if time_rem <= work_rem + overhead_now + 1e-9:
-            self._committed_od = True
-            return ClusterType.ON_DEMAND
+        # Small safety fudge to avoid edge rounding issues
+        fudge = max(1e-6, 1e-3 * gap)
 
-        # Safe-to-risk logic:
-        # If we spend one step not using guaranteed OD (i.e., SPOT if available or NONE if not),
-        # to still guarantee finishing with OD from the next step regardless of progress this step,
-        # we need:
-        # time_rem >= work_rem + restart (to start OD next step) + gap (time spent this step even if zero progress)
-        safe_margin = gap
-        need_if_delay_one_step_then_OD = work_rem + restart + safe_margin
+        # Decide: can we safely wait one more step (using SPOT or NONE) and still finish?
+        can_wait_one_step = (t + gap + fudge) <= latest_safe_start
 
-        if has_spot:
-            if time_rem >= need_if_delay_one_step_then_OD:
+        if can_wait_one_step:
+            # Prefer Spot if available; otherwise wait (NONE)
+            if has_spot:
                 return ClusterType.SPOT
             else:
-                self._committed_od = True
-                return ClusterType.ON_DEMAND
-        else:
-            if time_rem >= need_if_delay_one_step_then_OD:
                 return ClusterType.NONE
-            else:
-                self._committed_od = True
-                return ClusterType.ON_DEMAND
+        else:
+            # Must commit to OD now to meet deadline (or minimize lateness)
+            self._committed_to_od = True
+            return ClusterType.ON_DEMAND
 
     @classmethod
     def _from_args(cls, parser):

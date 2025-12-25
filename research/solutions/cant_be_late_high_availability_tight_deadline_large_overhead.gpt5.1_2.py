@@ -1,124 +1,95 @@
-import math
-from typing import Any
-
 from sky_spot.strategies.strategy import Strategy
 from sky_spot.utils import ClusterType
 
 
 class Solution(Strategy):
-    NAME = "cant_be_late_threshold_v1"
+    NAME = "my_solution"
 
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self._initialized = False
-        self._force_on_demand = False
-        self._total_slack = None
-        self._cached_done_seconds = 0.0
-        self._cached_segments_count = 0
+    def __init__(self, args):
+        super().__init__(args)
+        self._commit_to_od = False
 
     def solve(self, spec_path: str) -> "Solution":
+        # Optional initialization based on spec_path (unused here).
         return self
 
-    def _initialize(self):
-        if self._initialized:
-            return
-        try:
-            deadline = float(self.deadline)
-            task_duration = float(self.task_duration)
-            self._total_slack = max(deadline - task_duration, 0.0)
-        except Exception:
-            self._total_slack = None
-        self._initialized = True
-
-    def _get_restart_overhead(self) -> float:
-        ov = None
-        if hasattr(self, "restart_overhead"):
-            ov = getattr(self, "restart_overhead")
-        if ov is None and hasattr(self, "env") and hasattr(self.env, "restart_overhead"):
-            ov = getattr(self.env, "restart_overhead")
-        try:
-            return float(ov)
-        except Exception:
+    def _compute_work_done(self) -> float:
+        segments = getattr(self, "task_done_time", None)
+        if not segments:
             return 0.0
 
-    def _get_done_seconds(self) -> float:
-        tdt = getattr(self, "task_done_time", 0.0)
+        total = 0.0
+        first = segments[0]
 
-        if isinstance(tdt, (int, float)):
-            return float(tdt)
-
-        try:
-            length = len(tdt)
-        except Exception:
-            try:
-                return float(tdt)
-            except Exception:
-                return 0.0
-
-        if length > self._cached_segments_count:
-            for idx in range(self._cached_segments_count, length):
-                seg = tdt[idx]
+        # Case 1: list of numeric durations
+        if isinstance(first, (int, float)):
+            for v in segments:
                 try:
-                    if isinstance(seg, (tuple, list)) and len(seg) >= 2:
-                        self._cached_done_seconds += float(seg[1]) - float(seg[0])
-                    else:
-                        self._cached_done_seconds += float(seg)
-                except Exception:
-                    try:
-                        self._cached_done_seconds += float(seg)
-                    except Exception:
-                        pass
-            self._cached_segments_count = length
+                    total += float(v)
+                except (TypeError, ValueError):
+                    continue
+            return total
 
-        return self._cached_done_seconds
+        # Case 2: list of (start, end) pairs
+        if isinstance(first, (list, tuple)) and len(first) >= 2:
+            for seg in segments:
+                try:
+                    start = float(seg[0])
+                    end = float(seg[1])
+                    if end > start:
+                        total += end - start
+                except (TypeError, ValueError, IndexError):
+                    continue
+            return total
+
+        # Fallback: try to coerce each element to float
+        for v in segments:
+            try:
+                total += float(v)
+            except (TypeError, ValueError):
+                continue
+        return total
 
     def _step(self, last_cluster_type: ClusterType, has_spot: bool) -> ClusterType:
-        self._initialize()
-
-        env = self.env
-        elapsed = float(getattr(env, "elapsed_seconds", 0.0))
-        gap = float(getattr(env, "gap_seconds", 0.0))
-        deadline = float(self.deadline)
-        task_duration = float(self.task_duration)
-
-        done_seconds = self._get_done_seconds()
-        remaining_work = max(task_duration - done_seconds, 0.0)
-
-        if remaining_work <= 0.0:
+        work_done = self._compute_work_done()
+        remaining = self.task_duration - work_done
+        if remaining <= 0:
             return ClusterType.NONE
 
-        time_left = max(deadline - elapsed, 0.0)
-        slack = time_left - remaining_work
-
-        restart_ov = self._get_restart_overhead()
-
-        spot_risk_slack = 3.0 * restart_ov + 2.0 * gap
-
-        total_slack = self._total_slack
-        if total_slack is None:
-            total_slack = max(deadline - task_duration, 0.0)
-        if total_slack <= 0.0:
-            wait_budget = 0.0
-        else:
-            wait_budget = 0.5 * total_slack
-        wait_slack_threshold = spot_risk_slack + wait_budget
-
-        if slack <= 0.0:
-            self._force_on_demand = True
-        if time_left <= remaining_work + restart_ov:
-            self._force_on_demand = True
-        if slack <= spot_risk_slack:
-            self._force_on_demand = True
-
-        if self._force_on_demand:
+        time_left = self.deadline - self.env.elapsed_seconds
+        if time_left <= 0:
+            # Already at or past deadline; best-effort: finish as quickly as possible.
+            self._commit_to_od = True
             return ClusterType.ON_DEMAND
 
-        if has_spot:
-            return ClusterType.SPOT
+        # Once committed to on-demand, always use it until the task is done.
+        if self._commit_to_od:
+            return ClusterType.ON_DEMAND
 
-        if slack > wait_slack_threshold:
+        # Conservative minimum time needed to finish via on-demand from now:
+        # always include one restart overhead.
+        fallback_need = remaining + self.restart_overhead
+
+        # If fallback_need exceeds available time, or exactly fits, no slack remains:
+        # must switch to on-demand now (though if fallback_need > time_left,
+        # the deadline is already unsalvageable).
+        if fallback_need >= time_left:
+            self._commit_to_od = True
+            return ClusterType.ON_DEMAND
+
+        # Slack we can safely spend on "no progress" time (waiting or unlucky spot).
+        slack = time_left - fallback_need
+        gap = self.env.gap_seconds
+
+        # If we have at least one timestep of slack, we can afford to gamble on spot.
+        if slack >= gap:
+            if has_spot:
+                return ClusterType.SPOT
+            # No spot: wait and preserve money while we still have slack.
             return ClusterType.NONE
 
+        # Slack is less than one timestep: any further delay risks missing deadline.
+        self._commit_to_od = True
         return ClusterType.ON_DEMAND
 
     @classmethod

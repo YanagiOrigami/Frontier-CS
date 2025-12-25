@@ -1,224 +1,150 @@
-import math
-from typing import Any, Optional
+from __future__ import annotations
+
+from collections import deque
+from typing import Optional
 
 from sky_spot.strategies.strategy import Strategy
 from sky_spot.utils import ClusterType
 
 
 class Solution(Strategy):
-    NAME = "cant_be_late_hedge_v1"
+    NAME = "cant_be_late_balanced_v1"
 
-    def __init__(self, args: Optional[Any] = None):
+    def __init__(self, *args, **kwargs):
         try:
-            super().__init__(args)
+            super().__init__(*args, **kwargs)
         except TypeError:
             try:
                 super().__init__()
             except Exception:
                 pass
 
-        self._initialized = False
+        self._hist: deque[int] = deque()
+        self._hist_sum: int = 0
+        self._window_len: Optional[int] = None
 
-        # Spot availability posterior: Beta(a, b)
-        self._spot_a = 3.0
-        self._spot_b = 2.0
+        self._consec_up: int = 0
+        self._consec_down: int = 0
 
-        # Streak stats (in steps)
-        self._last_has_spot: Optional[bool] = None
-        self._down_streak = 0
-        self._up_streak = 0
-        self._ema_down_steps: Optional[float] = None
-        self._ema_up_steps: Optional[float] = None
-        self._ema_alpha = 0.06
-
-        self._od_commit_until = 0.0
+        self._switch_back_k: int = 2
+        self._prior_mean: float = 0.70
+        self._prior_strength: float = 12.0
 
     def solve(self, spec_path: str) -> "Solution":
         return self
 
-    def _get_completed_work_seconds(self) -> float:
-        td = getattr(self, "task_done_time", None)
-        gap = float(getattr(getattr(self, "env", None), "gap_seconds", 0.0) or 0.0)
+    def _ensure_window(self) -> None:
+        if self._window_len is not None:
+            return
+        gap = float(getattr(self.env, "gap_seconds", 300.0) or 300.0)
+        window_seconds = 6.0 * 3600.0
+        self._window_len = max(24, int(window_seconds / max(gap, 1.0)))
 
-        completed = 0.0
-        if td is None:
-            completed = 0.0
-        elif isinstance(td, (int, float)):
-            completed = float(td)
-        elif isinstance(td, (list, tuple)):
-            if len(td) == 0:
-                completed = 0.0
-            else:
-                # If list of tuples (start, end) or (durations)
+    def _update_history(self, has_spot: bool) -> None:
+        self._ensure_window()
+        v = 1 if has_spot else 0
+
+        if v:
+            self._consec_up += 1
+            self._consec_down = 0
+        else:
+            self._consec_down += 1
+            self._consec_up = 0
+
+        if self._window_len is None:
+            return
+
+        if len(self._hist) >= self._window_len:
+            old = self._hist.popleft()
+            self._hist_sum -= old
+        self._hist.append(v)
+        self._hist_sum += v
+
+    def _spot_prob_estimate(self) -> float:
+        n = len(self._hist)
+        if n <= 0:
+            return self._prior_mean
+        p = (self._hist_sum + self._prior_strength * self._prior_mean) / (n + self._prior_strength)
+        if p < 0.01:
+            return 0.01
+        if p > 0.99:
+            return 0.99
+        return p
+
+    def _spot_prob_effective(self) -> float:
+        p = self._spot_prob_estimate()
+        n = len(self._hist)
+        if n <= 1:
+            return max(0.05, p - 0.15)
+        var = p * (1.0 - p) / max(float(n), 1.0)
+        sigma = var ** 0.5
+        risk = 1.7 * sigma + 0.02
+        return max(0.05, p - risk)
+
+    def _work_done(self) -> float:
+        tdt = getattr(self, "task_done_time", None)
+        if not tdt:
+            return 0.0
+        try:
+            return float(sum(tdt))
+        except Exception:
+            s = 0.0
+            for x in tdt:
                 try:
-                    first = td[0]
+                    s += float(x)
                 except Exception:
-                    first = None
-
-                if isinstance(first, (tuple, list)) and len(first) == 2:
-                    s = 0.0
-                    for x in td:
-                        if isinstance(x, (tuple, list)) and len(x) == 2:
-                            try:
-                                s += max(0.0, float(x[1]) - float(x[0]))
-                            except Exception:
-                                pass
-                    completed = s
-                else:
-                    vals = []
-                    for x in td:
-                        if isinstance(x, (int, float)):
-                            vals.append(float(x))
-                    if not vals:
-                        completed = 0.0
-                    else:
-                        mx = max(vals)
-                        if gap > 0.0 and mx > 1.5 * gap:
-                            completed = mx
-                        else:
-                            completed = sum(vals)
-        else:
-            completed = 0.0
-
-        task_duration = float(getattr(self, "task_duration", 0.0) or 0.0)
-        if task_duration > 0.0:
-            if completed < 0.0:
-                completed = 0.0
-            elif completed > task_duration:
-                completed = task_duration
-        else:
-            completed = max(0.0, completed)
-        return completed
-
-    def _update_spot_stats(self, has_spot: bool) -> None:
-        if has_spot:
-            self._spot_a += 1.0
-        else:
-            self._spot_b += 1.0
-
-        if self._last_has_spot is None:
-            self._last_has_spot = has_spot
-            if has_spot:
-                self._up_streak = 1
-                self._down_streak = 0
-            else:
-                self._down_streak = 1
-                self._up_streak = 0
-            return
-
-        if has_spot == self._last_has_spot:
-            if has_spot:
-                self._up_streak += 1
-            else:
-                self._down_streak += 1
-            return
-
-        # State change
-        if self._last_has_spot is False and has_spot is True:
-            # down streak ended
-            d = max(1, self._down_streak)
-            if self._ema_down_steps is None:
-                self._ema_down_steps = float(d)
-            else:
-                self._ema_down_steps = self._ema_alpha * float(d) + (1.0 - self._ema_alpha) * self._ema_down_steps
-            self._down_streak = 0
-            self._up_streak = 1
-        elif self._last_has_spot is True and has_spot is False:
-            # up streak ended
-            u = max(1, self._up_streak)
-            if self._ema_up_steps is None:
-                self._ema_up_steps = float(u)
-            else:
-                self._ema_up_steps = self._ema_alpha * float(u) + (1.0 - self._ema_alpha) * self._ema_up_steps
-            self._up_streak = 0
-            self._down_streak = 1
-
-        self._last_has_spot = has_spot
-
-    def _spot_lower_bound(self) -> float:
-        a, b = self._spot_a, self._spot_b
-        n = a + b
-        mean = a / n
-        var = (a * b) / (n * n * (n + 1.0))
-        std = math.sqrt(max(0.0, var))
-        conf_mult = 1.3
-        return max(0.0, mean - conf_mult * std)
-
-    def _expected_down_seconds(self) -> float:
-        gap = float(getattr(self.env, "gap_seconds", 1.0) or 1.0)
-        if self._ema_down_steps is None:
-            steps = 3.0
-        else:
-            steps = float(self._ema_down_steps)
-        steps = min(max(1.0, steps), 18.0)
-        return steps * gap
+                    pass
+            return s
 
     def _step(self, last_cluster_type: ClusterType, has_spot: bool) -> ClusterType:
-        if not self._initialized:
-            self._initialized = True
-            self._od_commit_until = 0.0
-
-        self._update_spot_stats(has_spot)
+        self._update_history(has_spot)
 
         elapsed = float(getattr(self.env, "elapsed_seconds", 0.0) or 0.0)
-        gap = float(getattr(self.env, "gap_seconds", 1.0) or 1.0)
+        gap = float(getattr(self.env, "gap_seconds", 300.0) or 300.0)
+
         deadline = float(getattr(self, "deadline", 0.0) or 0.0)
         task_duration = float(getattr(self, "task_duration", 0.0) or 0.0)
         restart_overhead = float(getattr(self, "restart_overhead", 0.0) or 0.0)
 
-        completed = self._get_completed_work_seconds()
-        remaining_work = max(0.0, task_duration - completed)
-
-        if remaining_work <= 0.0:
+        time_left = deadline - elapsed
+        done = self._work_done()
+        remaining_work = task_duration - done
+        if remaining_work <= 1e-6:
             return ClusterType.NONE
 
-        remaining_time = max(0.0, deadline - elapsed)
-        if remaining_time <= 0.0:
+        if time_left <= 0.0:
             return ClusterType.ON_DEMAND
 
-        # Buffers / hysteresis
-        safety_buffer = max(2.0 * gap, restart_overhead + gap)
-        hard_deadline_trigger = deadline - remaining_work - safety_buffer
-        if elapsed >= hard_deadline_trigger:
-            return ClusterType.ON_DEMAND
+        slack = time_left - remaining_work
 
-        slack = remaining_time - remaining_work
-        if slack <= safety_buffer:
-            return ClusterType.ON_DEMAND
+        buffer_seconds = max(6.0 * gap, 8.0 * restart_overhead, 900.0)
+        commit_slack = max(2.0 * buffer_seconds, 3600.0)
+        switch_back_slack = max(buffer_seconds, 3600.0)
 
-        required_rate = remaining_work / max(1.0, remaining_time)  # 0..inf, where 1 means full utilization needed on OD
-        if required_rate >= 1.0:
-            return ClusterType.ON_DEMAND
+        if slack <= commit_slack:
+            desired = ClusterType.ON_DEMAND
+        else:
+            p_eff = self._spot_prob_effective()
+            req_wait = remaining_work / max(p_eff, 0.05) + buffer_seconds
+            if req_wait <= time_left:
+                desired = ClusterType.SPOT if has_spot else ClusterType.NONE
+            else:
+                desired = ClusterType.SPOT if has_spot else ClusterType.ON_DEMAND
 
-        # Respect OD commitment to avoid thrashing.
-        if last_cluster_type == ClusterType.ON_DEMAND and elapsed < self._od_commit_until:
-            if not has_spot:
-                return ClusterType.ON_DEMAND
-            # Even if spot returns, keep OD unless we have lots of slack.
-            if slack < max(3.0 * safety_buffer, 6.0 * gap):
-                return ClusterType.ON_DEMAND
+        if desired == ClusterType.SPOT and not has_spot:
+            desired = ClusterType.ON_DEMAND
 
-        p_lb = self._spot_lower_bound()
-        # Conservative adjustment to account for restart/trace variability.
-        p_eff = max(0.0, p_lb - 0.03)
+        if desired == ClusterType.SPOT and last_cluster_type == ClusterType.ON_DEMAND:
+            if slack < switch_back_slack or self._consec_up < self._switch_back_k:
+                desired = ClusterType.ON_DEMAND
 
-        # If spot can't (conservatively) sustain the required rate, use OD.
-        if required_rate > p_eff:
-            self._od_commit_until = max(self._od_commit_until, elapsed + max(3600.0, 12.0 * gap))
-            return ClusterType.ON_DEMAND
+        if desired == ClusterType.NONE and slack < buffer_seconds:
+            desired = ClusterType.SPOT if has_spot else ClusterType.ON_DEMAND
 
-        if has_spot:
-            # If we can afford spot, use it.
-            return ClusterType.SPOT
+        if desired == ClusterType.SPOT and not has_spot:
+            desired = ClusterType.ON_DEMAND
 
-        # No spot available: decide between waiting and OD.
-        expected_down = self._expected_down_seconds()
-        wait_margin = 2.0 * gap + restart_overhead
-        if slack >= expected_down + wait_margin and required_rate < 0.92:
-            return ClusterType.NONE
-
-        self._od_commit_until = max(self._od_commit_until, elapsed + max(3600.0, 12.0 * gap))
-        return ClusterType.ON_DEMAND
+        return desired
 
     @classmethod
     def _from_args(cls, parser):

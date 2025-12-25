@@ -1,134 +1,122 @@
 import argparse
 import math
-from typing import List, Optional, Tuple
+from typing import List, Tuple, Optional
 from sky_spot.strategies.strategy import Strategy
 from sky_spot.utils import ClusterType
 
 class Solution(Strategy):
-    NAME = "adaptive_threshold"
-
-    def solve(self, spec_path: str) -> "Solution":
-        # Initialize state variables
-        self.spot_history = []
+    NAME = "adaptive_hedging"
+    
+    def __init__(self, args=None):
+        super().__init__(args)
+        self.safety_margin = 0
+        self.conservative_threshold = 0
+        self.use_aggressive_spot = False
+        self.last_decision = ClusterType.NONE
         self.consecutive_spot_failures = 0
-        self.remaining_work = self.task_duration
-        self.time_buffer = self.deadline - self.task_duration
+        self.spot_attempts = 0
+        self.total_steps = 0
         
-        # Adaptive parameters
-        self.spot_confidence = 0.7
-        self.min_spot_confidence = 0.3
-        self.max_spot_confidence = 0.9
-        self.emergency_threshold = 0.3  # Use OD if less than 30% of buffer remains
-        
-        # State tracking
-        self.last_spot_available = True
-        self.overhead_timer = 0
-        self.in_overhead = False
-        
+    def solve(self, spec_path: str) -> "Solution":
+        try:
+            with open(spec_path, 'r') as f:
+                content = f.read().strip()
+                if content:
+                    params = eval(content)
+                    self.safety_margin = params.get('safety_margin', 2.0)
+                    self.conservative_threshold = params.get('conservative_threshold', 0.3)
+                    self.use_aggressive_spot = params.get('use_aggressive_spot', False)
+        except:
+            self.safety_margin = 2.0
+            self.conservative_threshold = 0.3
+            self.use_aggressive_spot = False
         return self
-
+    
     def _step(self, last_cluster_type: ClusterType, has_spot: bool) -> ClusterType:
-        # Update spot history
-        self.spot_history.append(has_spot)
-        if len(self.spot_history) > 100:  # Keep recent history
-            self.spot_history.pop(0)
+        self.total_steps += 1
         
-        # Update overhead state
-        if self.in_overhead:
-            self.overhead_timer -= self.env.gap_seconds
-            if self.overhead_timer <= 0:
-                self.in_overhead = False
-                self.overhead_timer = 0
-        
-        # Calculate progress and remaining time
-        elapsed = self.env.elapsed_seconds
-        remaining_time = self.deadline - elapsed
-        work_done = sum(self.task_done_time)
-        self.remaining_work = self.task_duration - work_done
-        
-        # If work is done, stop
-        if self.remaining_work <= 0:
-            return ClusterType.NONE
-        
-        # Emergency check: if we're running out of time, use on-demand
-        if remaining_time < self.remaining_work + self.restart_overhead:
-            return ClusterType.ON_DEMAND
-        
-        # Calculate adaptive threshold based on remaining buffer
-        time_buffer_used = elapsed - work_done
-        buffer_ratio = (self.time_buffer - time_buffer_used) / self.time_buffer
-        
-        # Adjust spot confidence based on recent history
-        if len(self.spot_history) >= 10:
-            recent_availability = sum(self.spot_history[-10:]) / 10.0
-            if recent_availability < 0.5:
-                self.spot_confidence = max(self.min_spot_confidence, self.spot_confidence - 0.1)
-            elif recent_availability > 0.8:
-                self.spot_confidence = min(self.max_spot_confidence, self.spot_confidence + 0.1)
-        
-        # Check if we're in overhead from previous spot restart
-        if self.in_overhead:
-            # During overhead, prefer to wait unless we're behind schedule
-            if buffer_ratio < self.emergency_threshold:
-                return ClusterType.ON_DEMAND
-            return ClusterType.NONE
-        
-        # Update consecutive failures counter
         if last_cluster_type == ClusterType.SPOT and not has_spot:
             self.consecutive_spot_failures += 1
-            if self.consecutive_spot_failures >= 2:
-                # After multiple failures, be more conservative
-                self.spot_confidence = max(self.min_spot_confidence, self.spot_confidence - 0.2)
         else:
-            self.consecutive_spot_failures = 0
+            self.consecutive_spot_failures = max(0, self.consecutive_spot_failures - 1)
         
-        # Decision logic
-        if not has_spot:
-            # Spot not available this step
-            if buffer_ratio < self.emergency_threshold:
-                return ClusterType.ON_DEMAND
+        remaining_work = self.task_duration - sum(self.task_done_time)
+        if remaining_work <= 0:
             return ClusterType.NONE
         
-        # Spot is available - decide whether to use it
-        if last_cluster_type == ClusterType.SPOT and has_spot:
-            # Continue using spot if it's working
-            return ClusterType.SPOT
+        elapsed = self.env.elapsed_seconds
+        time_left = self.deadline - elapsed
+        gap = self.env.gap_seconds
         
-        # Consider switching to spot
-        spot_probability = self.spot_confidence * (1.0 + buffer_ratio) / 2.0
+        if time_left <= 0:
+            return ClusterType.NONE
         
-        # Calculate risk score
-        time_needed = self.remaining_work
-        if last_cluster_type != ClusterType.SPOT:
-            time_needed += self.restart_overhead
+        required_steps = math.ceil(remaining_work / gap)
+        available_steps = math.ceil(time_left / gap)
         
-        risk_score = time_needed / remaining_time
-        
-        if risk_score > 1.0:
-            # We're behind schedule, use on-demand
+        if required_steps > available_steps:
             return ClusterType.ON_DEMAND
         
-        if buffer_ratio < self.emergency_threshold:
-            # Low buffer, be conservative
-            if risk_score > 0.8:
+        if self.consecutive_spot_failures >= 3:
+            safety_buffer = self.restart_overhead * 2
+        else:
+            safety_buffer = self.restart_overhead
+        
+        critical_ratio = required_steps / available_steps if available_steps > 0 else 1.0
+        
+        if self.use_aggressive_spot:
+            if has_spot:
+                self.spot_attempts += 1
+                spot_success_rate = 1.0 - (self.consecutive_spot_failures / max(1, self.spot_attempts))
+                
+                if spot_success_rate > 0.5 or critical_ratio < 0.5:
+                    return ClusterType.SPOT
+                elif critical_ratio < 0.7:
+                    return ClusterType.SPOT if has_spot else ClusterType.ON_DEMAND
+                else:
+                    time_needed_od = remaining_work
+                    time_needed_spot = remaining_work + (safety_buffer * (remaining_work / (gap * 10)))
+                    
+                    if time_left > time_needed_spot * 1.2:
+                        return ClusterType.SPOT
+                    elif time_left > time_needed_od * 1.1:
+                        return ClusterType.SPOT if has_spot else ClusterType.ON_DEMAND
+                    else:
+                        return ClusterType.ON_DEMAND
+            else:
+                if critical_ratio > self.conservative_threshold:
+                    return ClusterType.ON_DEMAND
+                return ClusterType.NONE
+        else:
+            if critical_ratio > self.conservative_threshold:
                 return ClusterType.ON_DEMAND
-        
-        if risk_score < 0.7 and buffer_ratio > 0.4:
-            # Good buffer, try spot with probability
-            import random
-            if random.random() < spot_probability:
-                if last_cluster_type != ClusterType.SPOT:
-                    self.in_overhead = True
-                    self.overhead_timer = self.restart_overhead
-                return ClusterType.SPOT
-        
-        # Default: use on-demand if risk is moderate, else wait
-        if risk_score > 0.6 or buffer_ratio < 0.2:
-            return ClusterType.ON_DEMAND
-        
-        return ClusterType.NONE
-
+            
+            required_time_with_buffer = remaining_work + safety_buffer
+            if time_left < required_time_with_buffer * self.safety_margin:
+                return ClusterType.ON_DEMAND
+            
+            if has_spot:
+                recent_spot_available = self._estimate_spot_availability()
+                if recent_spot_available > 0.6 or critical_ratio < 0.2:
+                    return ClusterType.SPOT
+                elif critical_ratio < 0.4:
+                    return ClusterType.SPOT
+                else:
+                    return ClusterType.NONE
+            else:
+                if critical_ratio < 0.1:
+                    return ClusterType.ON_DEMAND
+                return ClusterType.NONE
+    
+    def _estimate_spot_availability(self) -> float:
+        if self.total_steps < 10:
+            return 0.7
+        return 0.5
+    
     @classmethod
     def _from_args(cls, parser):
+        parser.add_argument('--safety_margin', type=float, default=2.0)
+        parser.add_argument('--conservative_threshold', type=float, default=0.3)
+        parser.add_argument('--use_aggressive_spot', action='store_true')
         args, _ = parser.parse_known_args()
         return cls(args)

@@ -1,74 +1,108 @@
+from typing import Any, Optional, Iterable
 from sky_spot.strategies.strategy import Strategy
 from sky_spot.utils import ClusterType
 
 
+def _sum_done_seconds(task_done_time: Any) -> float:
+    if task_done_time is None:
+        return 0.0
+    # Common cases:
+    # - float/int total seconds
+    # - list of floats (durations)
+    # - list of (start, end) pairs
+    total = 0.0
+    try:
+        if isinstance(task_done_time, (int, float)):
+            return float(task_done_time)
+        if isinstance(task_done_time, dict):
+            # If dict has 'total' or similar
+            for k in ('total', 'sum', 'seconds', 'time'):
+                if k in task_done_time and isinstance(task_done_time[k], (int, float)):
+                    return float(task_done_time[k])
+        if isinstance(task_done_time, Iterable):
+            for seg in task_done_time:
+                if isinstance(seg, (int, float)):
+                    total += float(seg)
+                elif isinstance(seg, (list, tuple)):
+                    if len(seg) == 2 and all(isinstance(x, (int, float)) for x in seg):
+                        s, e = seg
+                        total += max(0.0, float(e) - float(s))
+                    else:
+                        for x in seg:
+                            if isinstance(x, (int, float)):
+                                total += float(x)
+        return float(total)
+    except Exception:
+        return 0.0
+
+
 class Solution(Strategy):
-    NAME = "deadline_threshold_lock"
+    NAME = "cant_be_late_jit_od_v1"
+
+    def __init__(self, args: Optional[Any] = None):
+        try:
+            super().__init__(args)
+        except TypeError:
+            try:
+                super().__init__()
+            except Exception:
+                pass
+        self.args = args
+        self.od_committed: bool = False
+
+        # Optional tuning knobs (seconds). Keep minimal to avoid early OD.
+        self.safety_margin_seconds: float = 0.0
 
     def solve(self, spec_path: str) -> "Solution":
-        # Initialization
-        self._locked_to_od = False
-        self._last_done_len = 0
-        self._done_sum_cache = 0.0
-        # Optional config via args
-        args = getattr(self, "args", None)
-        if args is not None and hasattr(args, "od_margin_factor"):
-            self._od_margin_factor = float(args.od_margin_factor)
-        else:
-            self._od_margin_factor = 1.0
         return self
 
-    def _remaining_work_seconds(self) -> float:
-        # Incremental sum to avoid O(n) per step
-        lst = self.task_done_time
-        current_len = len(lst)
-        if current_len > self._last_done_len:
-            # Sum only new segments
-            inc = 0.0
-            for i in range(self._last_done_len, current_len):
-                inc += lst[i]
-            self._done_sum_cache += inc
-            self._last_done_len = current_len
-        # Remaining work cannot be negative
-        remaining = self.task_duration - self._done_sum_cache
-        return remaining if remaining > 0.0 else 0.0
-
-    def _should_lock_to_od(self) -> bool:
-        remaining = self._remaining_work_seconds()
-        if remaining <= 0.0:
-            return False
-        time_left = self.deadline - self.env.elapsed_seconds
-        if time_left <= 0.0:
-            # Already missed, but ensure OD (defensive)
+    def _must_commit_to_od(self, now: float, remain: float) -> bool:
+        # If we're already on OD, we are committed.
+        if self.od_committed:
             return True
-        overhead = 0.0 if self.env.cluster_type == ClusterType.ON_DEMAND else self.restart_overhead
-        # Margin scaled by the step; keeps safety against discretization effects
-        margin = self._od_margin_factor * self.env.gap_seconds
-        # If we do not start OD now, we risk missing deadline
-        return time_left <= (remaining + overhead + margin)
+
+        # Conservative: assume one restart overhead when starting OD.
+        overhead = float(getattr(self, "restart_overhead", 0.0) or 0.0)
+
+        # Latest time to start OD so that we still finish by deadline:
+        # now_start + overhead + remain <= deadline
+        # now_start <= deadline - (overhead + remain)
+        latest_start = float(getattr(self, "deadline", 0.0)) - (remain + overhead + self.safety_margin_seconds)
+
+        # If current time >= latest start time, we must commit to OD.
+        return now >= latest_start
 
     def _step(self, last_cluster_type: ClusterType, has_spot: bool) -> ClusterType:
-        # If already done, no need to run further
-        if self._remaining_work_seconds() <= 0.0:
+        # If we've already started OD previously, keep using OD to avoid extra overhead/risk.
+        if last_cluster_type == ClusterType.ON_DEMAND:
+            self.od_committed = True
+
+        # Compute remaining work
+        total_duration: float = float(getattr(self, "task_duration", 0.0) or 0.0)
+        done_seconds: float = _sum_done_seconds(getattr(self, "task_done_time", None))
+        remain: float = max(0.0, total_duration - done_seconds)
+
+        if remain <= 0.0:
+            # Finished: do nothing to avoid extra cost
             return ClusterType.NONE
 
-        # Decide whether we must lock to on-demand to meet the deadline
-        if not self._locked_to_od and self._should_lock_to_od():
-            self._locked_to_od = True
+        now: float = float(getattr(self.env, "elapsed_seconds", 0.0) or 0.0)
 
-        if self._locked_to_od:
+        # Commit to OD if necessary to guarantee deadline.
+        if self._must_commit_to_od(now, remain):
+            self.od_committed = True
+
+        if self.od_committed:
             return ClusterType.ON_DEMAND
 
-        # Not locked yet: prefer spot when available, otherwise wait
+        # Not committed to OD yet:
+        # Prefer SPOT when available; otherwise wait (NONE) until we must commit to OD.
         if has_spot:
             return ClusterType.SPOT
-        else:
-            # Wait for spot to return until it's time-critical
-            # The lock condition will trigger when necessary
-            return ClusterType.NONE
+
+        return ClusterType.NONE
 
     @classmethod
     def _from_args(cls, parser):
-        parser.add_argument("--od_margin_factor", type=float, default=1.0)
         args, _ = parser.parse_known_args()
         return cls(args)

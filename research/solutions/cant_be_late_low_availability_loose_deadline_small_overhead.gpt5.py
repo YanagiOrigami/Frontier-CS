@@ -1,127 +1,62 @@
-from typing import Any, List, Tuple, Dict
 from sky_spot.strategies.strategy import Strategy
 from sky_spot.utils import ClusterType
 
 
 class Solution(Strategy):
-    NAME = "my_solution"
-
-    def __init__(self, args: Any = None):
-        super().__init__(args)
-        self._committed_on_demand: bool = False
-        self._last_decision: ClusterType = ClusterType.NONE
+    NAME = "deadline_guard_spot_v2"
 
     def solve(self, spec_path: str) -> "Solution":
+        self._od_committed = False
         return self
 
-    def _sum_done_seconds(self) -> float:
-        total = 0.0
-        segments = getattr(self, "task_done_time", None)
-        if segments is None:
-            return 0.0
-        if isinstance(segments, (int, float)):
-            try:
-                return float(segments)
-            except Exception:
-                return 0.0
-        if isinstance(segments, list):
-            for seg in segments:
-                try:
-                    if isinstance(seg, (list, tuple)) and len(seg) >= 2:
-                        s = float(seg[0])
-                        e = float(seg[1])
-                        total += max(0.0, e - s)
-                    elif isinstance(seg, dict):
-                        s = None
-                        e = None
-                        if "start" in seg or "end" in seg:
-                            s = seg.get("start", None)
-                            e = seg.get("end", None)
-                        elif "s" in seg or "e" in seg:
-                            s = seg.get("s", None)
-                            e = seg.get("e", None)
-                        elif "begin" in seg or "finish" in seg:
-                            s = seg.get("begin", None)
-                            e = seg.get("finish", None)
-                        elif "t0" in seg or "t1" in seg:
-                            s = seg.get("t0", None)
-                            e = seg.get("t1", None)
-                        if s is not None and e is not None:
-                            total += max(0.0, float(e) - float(s))
-                        elif "duration" in seg:
-                            total += max(0.0, float(seg["duration"]))
-                    else:
-                        total += max(0.0, float(seg))
-                except Exception:
-                    continue
-        else:
-            try:
-                total = float(segments)
-            except Exception:
-                total = 0.0
-        return max(0.0, total)
-
-    def _remaining_work_seconds(self) -> float:
-        try:
-            total_needed = float(self.task_duration)
-        except Exception:
-            total_needed = 0.0
-        done = self._sum_done_seconds()
-        remain = max(0.0, total_needed - done)
-        return remain
-
-    def _commit_check(self, remaining_work: float) -> bool:
-        # Time left until deadline
-        try:
-            now = float(self.env.elapsed_seconds)
-            deadline = float(self.deadline)
-            g = float(self.env.gap_seconds)
-        except Exception:
-            return False
-        time_left = max(0.0, deadline - now)
-
-        # Overhead is in seconds
-        try:
-            overhead = float(self.restart_overhead)
-        except Exception:
-            overhead = 0.0
-
-        # Safety margin to account for discretization and scheduling jitter
-        # Aim to start OD slightly earlier than the absolute last moment.
-        margin = max(2.0 * g, 2.0 * overhead)
-
-        # Latest start time criterion:
-        # If we have time_left <= remaining_work + overhead + margin, we should commit to OD.
-        need_time_with_overhead = remaining_work + overhead + margin
-        return time_left <= need_time_with_overhead
-
     def _step(self, last_cluster_type: ClusterType, has_spot: bool) -> ClusterType:
-        # If we were already on On-Demand, keep committed to avoid risk of switching back to Spot.
-        if last_cluster_type == ClusterType.ON_DEMAND:
-            self._committed_on_demand = True
+        if not hasattr(self, "_od_committed"):
+            self._od_committed = False
 
-        remaining_work = self._remaining_work_seconds()
-
-        # If work is finished, do nothing.
-        if remaining_work <= 0:
-            self._last_decision = ClusterType.NONE
-            return ClusterType.NONE
-
-        # Decide if we must commit to On-Demand to guarantee deadline.
-        if not self._committed_on_demand and self._commit_check(remaining_work):
-            self._committed_on_demand = True
-
-        if self._committed_on_demand:
-            self._last_decision = ClusterType.ON_DEMAND
+        # If we've committed to on-demand, keep running on-demand to avoid overheads and risks
+        if self._od_committed:
             return ClusterType.ON_DEMAND
 
-        # Prefer Spot when available
+        # Compute remaining work
+        done = sum(self.task_done_time) if getattr(self, "task_done_time", None) else 0.0
+        remaining = max(0.0, self.task_duration - done)
+
+        # If task is already done, do nothing
+        if remaining <= 0:
+            return ClusterType.NONE
+
+        # Time left to deadline
+        time_left = self.deadline - self.env.elapsed_seconds
+        if time_left <= 0:
+            # Extremely late; attempt to run on-demand anyway
+            self._od_committed = True
+            return ClusterType.ON_DEMAND
+
+        gap = self.env.gap_seconds
+        # Small epsilon to account for discretization and rounding
+        epsilon = 1.0  # seconds
+
+        # If we wait or run spot for one more step and make zero progress (worst-case),
+        # can we still finish by switching to OD next step?
+        # Overhead when switching to OD from SPOT/NONE at next step.
+        overhead_next = self.restart_overhead
+
+        can_wait_one_step = (time_left - gap) >= (remaining + overhead_next + epsilon)
+
+        if not can_wait_one_step:
+            # Not safe to wait; commit to on-demand now
+            self._od_committed = True
+            return ClusterType.ON_DEMAND
+
+        # Safe to wait one more step
         if has_spot:
-            self._last_decision = ClusterType.SPOT
+            # Prefer spot when available
+            # If we were already on OD (shouldn't happen since committed flag), keep OD
+            if last_cluster_type == ClusterType.ON_DEMAND and self._od_committed:
+                return ClusterType.ON_DEMAND
             return ClusterType.SPOT
 
-        # Spot not available and not yet time-critical: wait to save cost
-        self._last_decision = ClusterType.NONE
+        # Spot unavailable; wait to preserve budget
         return ClusterType.NONE
 
     @classmethod

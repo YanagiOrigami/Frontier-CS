@@ -6,9 +6,9 @@ from sky_spot.utils import ClusterType
 
 
 class Solution(MultiRegionStrategy):
-    """Multi-region scheduling strategy focused on meeting deadlines with low cost."""
+    """Safe cost-aware multi-region scheduling strategy."""
 
-    NAME = "cant_be_late_v1"
+    NAME = "safe_spot_ondemand_hybrid"
 
     def solve(self, spec_path: str) -> "Solution":
         with open(spec_path) as f:
@@ -22,70 +22,64 @@ class Solution(MultiRegionStrategy):
         )
         super().__init__(args)
 
-        # Internal state for efficient progress tracking and control.
-        self._committed_to_on_demand = False
-        self._accumulated_work = 0.0
-        self._last_task_done_idx = 0
+        # Internal state initialization
+        self._done_work_sum = 0.0
+        self._task_segments_len = 0
+        self._committed_ondemand = False
+
+        # Precompute a conservative commit margin (seconds).
+        # Ensure it's at least ~2 steps plus two restart overheads.
+        gap = float(getattr(self.env, "gap_seconds", 3600.0))
+        restart_overhead = float(self.restart_overhead)
+        self._commit_margin = max(2.0 * gap, 2.0 * restart_overhead)
 
         return self
 
-    def _update_accumulated_work(self):
-        """Incrementally track total work done to avoid O(n) sum each step."""
-        td = self.task_done_time
-        idx = self._last_task_done_idx
-        if idx < len(td):
-            new_sum = 0.0
-            for v in td[idx:]:
-                new_sum += v
-            self._accumulated_work += new_sum
-            self._last_task_done_idx = len(td)
-
-    def _should_commit_to_on_demand(self, remaining_work: float, time_left: float) -> bool:
-        """Determine if we must switch to on-demand to safely meet the deadline."""
-        # Estimate one-time restart overhead if we commit now.
-        rem_overhead = getattr(self, "remaining_restart_overhead", 0.0)
-        commit_overhead = self.restart_overhead
-        if rem_overhead > commit_overhead:
-            commit_overhead = rem_overhead
-
-        # Time needed with on-demand from now until completion (worst-case).
-        commit_needed = remaining_work + commit_overhead
-
-        # Safety buffer to account for discretization and modeling mismatch.
-        gap = getattr(self.env, "gap_seconds", 0.0)
-        if gap < 0.0:
-            gap = 0.0
-        buffer = commit_overhead + 2.0 * gap
-
-        return time_left <= commit_needed + buffer
+    def _update_done_work_sum(self) -> None:
+        """Incrementally track total completed work to avoid O(N^2) summations."""
+        segments = self.task_done_time
+        current_len = len(segments)
+        if current_len > self._task_segments_len:
+            # Add any new segments since last step.
+            for i in range(self._task_segments_len, current_len):
+                self._done_work_sum += float(segments[i])
+            self._task_segments_len = current_len
 
     def _step(self, last_cluster_type: ClusterType, has_spot: bool) -> ClusterType:
-        # Efficiently update cumulative work done.
-        self._update_accumulated_work()
+        # Update cached total work done.
+        self._update_done_work_sum()
 
-        remaining_work = self.task_duration - self._accumulated_work
+        # Remaining work in seconds.
+        remaining_work = float(self.task_duration) - self._done_work_sum
         if remaining_work <= 0.0:
-            # Task already completed; no need to run further.
+            # Task logically complete; no need to run any more clusters.
+            self._committed_ondemand = True
             return ClusterType.NONE
 
-        time_elapsed = self.env.elapsed_seconds
-        time_left = self.deadline - time_elapsed
-        if time_left <= 0.0:
-            # Deadline has passed or no time left; running more won't help.
-            return ClusterType.NONE
-
-        # Decide whether to commit to on-demand from this point forward.
-        if not self._committed_to_on_demand:
-            if self._should_commit_to_on_demand(remaining_work, time_left):
-                self._committed_to_on_demand = True
-
-        if self._committed_to_on_demand:
-            # Once committed, stay on on-demand to avoid further restart overhead
-            # and eliminate preemption risk.
+        # If we have already committed to on-demand, always stay on it.
+        if self._committed_ondemand:
             return ClusterType.ON_DEMAND
 
-        # Pre-commit phase: use spot when available, otherwise wait (NONE).
+        # Compute slack if we were to switch to pure on-demand now.
+        now = float(self.env.elapsed_seconds)
+        deadline = float(self.deadline)
+        restart_overhead = float(self.restart_overhead)
+
+        # Worst-case additional time to finish if we use only on-demand from now:
+        # restart_overhead (once) + remaining_work
+        finish_time_if_od_now = now + restart_overhead + remaining_work
+        slack_if_od = deadline - finish_time_if_od_now
+
+        # If slack is small, commit to on-demand to guarantee deadline.
+        # We commit as soon as slack_if_od <= commit_margin to ensure we don't
+        # cross into negative slack between steps.
+        if slack_if_od <= self._commit_margin:
+            self._committed_ondemand = True
+            return ClusterType.ON_DEMAND
+
+        # Pre-commit phase: prefer Spot when available, otherwise pause.
         if has_spot:
             return ClusterType.SPOT
 
+        # Spot unavailable and we still have comfortable slack: wait to save cost.
         return ClusterType.NONE

@@ -1,104 +1,85 @@
-from typing import Any
+import argparse
+from typing import Optional
+
 from sky_spot.strategies.strategy import Strategy
 from sky_spot.utils import ClusterType
 
 
 class Solution(Strategy):
-    NAME = "cant_be_late_threshold_v1"
+    NAME = "deadline_guard_threshold_v1"
 
-    def __init__(self, args: Any = None):
+    def __init__(self, args: Optional[argparse.Namespace] = None):
         try:
             super().__init__(args)
-        except Exception:
-            # In case base class doesn't require args or super init signature mismatch
+        except TypeError:
             try:
                 super().__init__()
             except Exception:
                 pass
-        self._committed_to_od = False
+        self._commit_od = False
+        self._od_commit_time = None
+        self._consec_outage_steps = 0
 
     def solve(self, spec_path: str) -> "Solution":
         return self
 
-    def _remaining_work(self) -> float:
+    def _remaining_work_seconds(self) -> float:
+        total = float(getattr(self, "task_duration", 0.0) or 0.0)
+        done_list = getattr(self, "task_done_time", None)
+        if not done_list:
+            return max(total, 0.0)
         try:
-            done = sum(self.task_done_time) if self.task_done_time else 0.0
+            progress = float(sum(done_list))
         except Exception:
-            done = 0.0
-        remaining = max(0.0, float(self.task_duration) - float(done))
-        return remaining
-
-    def _slack(self) -> float:
-        # Slack S = (time left to deadline) - (remaining work)
-        time_left = float(self.deadline) - float(self.env.elapsed_seconds)
-        return time_left - self._remaining_work()
-
-    def _fudge(self) -> float:
-        # Small safety margin to account for discretization and modeling mismatch
-        try:
-            gap = float(self.env.gap_seconds)
-        except Exception:
-            gap = 300.0  # default 5 minutes
-        try:
-            overhead = float(self.restart_overhead)
-        except Exception:
-            overhead = 600.0  # default 10 minutes
-        # Use the smaller of gap and ~60% of overhead, but at least 30 seconds
-        return max(30.0, min(gap, 0.6 * overhead))
+            try:
+                progress = float(sum(float(x) for x in done_list))
+            except Exception:
+                progress = 0.0
+        progress = max(min(progress, total), 0.0)
+        return max(total - progress, 0.0)
 
     def _step(self, last_cluster_type: ClusterType, has_spot: bool) -> ClusterType:
-        # If already finished, do nothing
-        remaining = self._remaining_work()
-        if remaining <= 0.0:
-            return ClusterType.NONE
-
-        # Once committed to on-demand, never switch back (safety-first)
-        if self._committed_to_od:
-            return ClusterType.ON_DEMAND
-
-        # Core parameters
-        try:
-            overhead = float(self.restart_overhead)
-        except Exception:
-            overhead = 600.0
-        try:
-            gap = float(self.env.gap_seconds)
-        except Exception:
-            gap = 300.0
-
-        fudge = self._fudge()
-        slack = self._slack()
-
-        # If we've exhausted safe slack, commit to on-demand
-        if slack <= (overhead + fudge):
-            self._committed_to_od = True
-            return ClusterType.ON_DEMAND
-
-        # Spot available
         if has_spot:
-            # If already on SPOT, keep using it while slack remains sufficient
-            if last_cluster_type == ClusterType.SPOT:
-                return ClusterType.SPOT
+            self._consec_outage_steps = 0
+        else:
+            self._consec_outage_steps += 1
 
-            # Starting SPOT from NONE/ON_DEMAND incurs overhead now; we also
-            # want to retain enough slack for a possible future switch to OD.
-            # Require slack >= overhead(now to start SPOT) + overhead(later to switch to OD) + fudge
-            if slack > (2.0 * overhead + fudge):
-                return ClusterType.SPOT
-            else:
-                # Not enough slack to afford two restarts; commit to OD to guarantee finish
-                self._committed_to_od = True
-                return ClusterType.ON_DEMAND
+        if self._commit_od:
+            return ClusterType.ON_DEMAND
 
-        # Spot unavailable: decide to wait (NONE) or commit to on-demand
-        # Safe to wait for one step only if after waiting we still have enough slack
-        # to immediately switch to OD and finish: slack - gap > overhead + fudge
-        if (slack - gap) > (overhead + fudge):
+        elapsed = float(getattr(self.env, "elapsed_seconds", 0.0) or 0.0)
+        deadline = float(getattr(self, "deadline", 0.0) or 0.0)
+        gap = float(getattr(self.env, "gap_seconds", 1.0) or 1.0)
+        restart_overhead = float(getattr(self, "restart_overhead", 0.0) or 0.0)
+
+        remaining = self._remaining_work_seconds()
+        time_left = max(deadline - elapsed, 0.0)
+
+        # Safety margin: restart overhead + discretization buffer
+        # Slightly conservative to guard against rounding/overhead alignment.
+        fudge_seconds = 2.0 * gap + min(180.0, gap)  # 2 steps + up to 3 minutes
+        safety = restart_overhead + fudge_seconds
+
+        # Commit to OD if cutting it close
+        if time_left <= remaining + safety + 1e-6:
+            self._commit_od = True
+            self._od_commit_time = elapsed
+            return ClusterType.ON_DEMAND
+
+        # Early commit if prolonged outage and we're approaching threshold
+        if not has_spot:
+            early_buffer = 3.0 * gap + 0.5 * restart_overhead
+            outage_threshold_steps = max(int(1800.0 / max(gap, 1.0)), 1)  # ~30 minutes
+            if self._consec_outage_steps >= outage_threshold_steps:
+                if time_left <= remaining + safety + early_buffer:
+                    self._commit_od = True
+                    self._od_commit_time = elapsed
+                    return ClusterType.ON_DEMAND
+
+        if has_spot:
+            return ClusterType.SPOT
+        else:
             return ClusterType.NONE
-
-        # Otherwise, commit to OD to guarantee meeting the deadline
-        self._committed_to_od = True
-        return ClusterType.ON_DEMAND
 
     @classmethod
     def _from_args(cls, parser):

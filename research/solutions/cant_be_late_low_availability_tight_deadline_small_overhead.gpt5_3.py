@@ -1,156 +1,110 @@
-from typing import Any, Optional
+import math
 from sky_spot.strategies.strategy import Strategy
 from sky_spot.utils import ClusterType
 
 
 class Solution(Strategy):
-    NAME = "cant_be_late_guarded_wait"
+    NAME = "my_solution"
 
-    def __init__(self, args: Optional[Any] = None):
-        super().__init__(args)
-        # Configuration with sensible defaults
-        self.min_guard_seconds = 900.0  # 15 minutes
-        self.overhead_guard_multiplier = 4.0
-        self.lock_on_demand_after_threshold = True
-
-        # State variables
-        self._prev_elapsed = -1.0
-        self._od_latched = False
-
-        # Override defaults if args provided
-        if args is not None:
-            if hasattr(args, "guard_minutes") and args.guard_minutes is not None:
-                try:
-                    self.min_guard_seconds = float(args.guard_minutes) * 60.0
-                except Exception:
-                    pass
-            if hasattr(args, "overhead_guard_multiplier") and args.overhead_guard_multiplier is not None:
-                try:
-                    self.overhead_guard_multiplier = float(args.overhead_guard_multiplier)
-                except Exception:
-                    pass
-            if hasattr(args, "lock_on_demand") and args.lock_on_demand is not None:
-                try:
-                    self.lock_on_demand_after_threshold = bool(args.lock_on_demand)
-                except Exception:
-                    pass
+    def __init__(self, args=None):
+        try:
+            super().__init__(args)
+        except TypeError:
+            try:
+                super().__init__()
+            except Exception:
+                pass
+        self.args = args
+        self._committed_to_od = False
 
     def solve(self, spec_path: str) -> "Solution":
-        # Optional: Load external config from spec_path if desired
-        # Keep minimal by default; evaluator calls this once before simulation
         return self
 
-    def _reset_if_new_trace(self):
-        # Detect a new episode/trace by elapsed time moving backward or to zero
-        try:
-            current_elapsed = float(self.env.elapsed_seconds)
-        except Exception:
-            current_elapsed = -1.0
-
-        if self._prev_elapsed < 0 or current_elapsed < self._prev_elapsed or current_elapsed == 0:
-            self._od_latched = False
-
-        self._prev_elapsed = current_elapsed
-
-    def _sum_done_seconds(self) -> float:
+    def _progress_done_seconds(self) -> float:
         total = 0.0
-        try:
-            segments = self.task_done_time or []
-        except Exception:
-            return 0.0
-
-        for seg in segments:
+        iterable = getattr(self, "task_done_time", []) or []
+        for seg in iterable:
             try:
                 if isinstance(seg, (list, tuple)):
                     if len(seg) >= 2:
-                        a, b = seg[0], seg[1]
-                        if a is not None and b is not None:
-                            total += max(0.0, float(b) - float(a))
+                        total += float(seg[1]) - float(seg[0])
                     elif len(seg) == 1:
-                        total += max(0.0, float(seg[0]))
+                        total += float(seg[0])
                 else:
-                    total += max(0.0, float(seg))
+                    total += float(seg)
             except Exception:
-                # Skip malformed entries
                 continue
-        return max(0.0, total)
+        return max(total, 0.0)
 
-    def _guard_time_seconds(self) -> float:
+    def _remaining_work_seconds(self) -> float:
         try:
-            gap = float(self.env.gap_seconds)
+            task_duration = float(self.task_duration)
         except Exception:
-            gap = 60.0  # fallback
+            task_duration = 0.0
+        done = self._progress_done_seconds()
+        rem = task_duration - done
+        return rem if rem > 0 else 0.0
+
+    def _latest_start_time_for_od(self, od_overhead: float) -> float:
         try:
-            ro = float(self.restart_overhead)
+            deadline = float(self.deadline)
         except Exception:
-            ro = 180.0  # 3 minutes default if not provided
+            deadline = float("inf")
+        rem = self._remaining_work_seconds()
+        return deadline - (rem + float(od_overhead))
 
-        # Guard is the max of min_guard, 2 steps, and k * restart_overhead
-        guard = max(self.min_guard_seconds, 2.0 * gap, self.overhead_guard_multiplier * ro)
-        return guard
+    def _compute_margins(self):
+        gap = float(getattr(self.env, "gap_seconds", 60.0) or 60.0)
+        ro = float(getattr(self, "restart_overhead", 180.0) or 180.0)
+        margin_switch = max(2.0 * gap, ro + gap, 300.0)
+        wait_margin = margin_switch + max(2.0 * gap, 0.5 * ro) + 300.0
+        rem = self._remaining_work_seconds()
+        total = float(getattr(self, "task_duration", rem) or rem)
+        frac = 0.0 if total <= 0 else rem / total
+        scale = 0.5 + 0.5 * frac
+        margin_switch *= scale
+        wait_margin *= scale
+        return margin_switch, wait_margin
 
-    def _should_lock_to_on_demand(self, remaining_work: float, time_left: float) -> bool:
-        guard = self._guard_time_seconds()
-        # If we are within the guard window, lock to on-demand
-        if time_left <= remaining_work + guard:
+    def _should_commit_to_od(self, has_spot: bool) -> bool:
+        if self._committed_to_od:
+            return True
+        now = float(getattr(self.env, "elapsed_seconds", 0.0) or 0.0)
+        ro = float(getattr(self, "restart_overhead", 180.0) or 180.0)
+        margin_switch, wait_margin = self._compute_margins()
+        current_cluster = getattr(self.env, "cluster_type", None)
+        od_overhead_future = 0.0 if current_cluster == ClusterType.ON_DEMAND else ro
+        t_latest = self._latest_start_time_for_od(od_overhead_future)
+        slack = t_latest - now
+        if slack <= margin_switch:
+            return True
+        if not has_spot and slack <= wait_margin:
             return True
         return False
 
     def _step(self, last_cluster_type: ClusterType, has_spot: bool) -> ClusterType:
-        # Ensure episode state is correct
-        self._reset_if_new_trace()
-
-        # Compute remaining work and time left
-        try:
-            total_task = float(self.task_duration)
-        except Exception:
-            total_task = 0.0
-        done = self._sum_done_seconds()
-        remaining_work = max(0.0, total_task - done)
-
-        try:
-            elapsed = float(self.env.elapsed_seconds)
-            deadline = float(self.deadline)
-        except Exception:
-            elapsed = 0.0
-            deadline = float("inf")
-
-        time_left = max(0.0, deadline - elapsed)
-
-        # If task is done, do nothing
-        if remaining_work <= 1e-9:
+        if self._remaining_work_seconds() <= 0:
+            self._committed_to_od = False
             return ClusterType.NONE
 
-        # If no time left, choose on-demand to mitigate penalty (best effort)
-        if time_left <= 0.0:
-            self._od_latched = True
+        if self._should_commit_to_od(has_spot):
+            self._committed_to_od = True
             return ClusterType.ON_DEMAND
 
-        # Decide if we need to lock to on-demand to guarantee deadline
-        if self.lock_on_demand_after_threshold and not self._od_latched:
-            if self._should_lock_to_on_demand(remaining_work, time_left):
-                self._od_latched = True
-
-        # If locked to on-demand, stay there
-        if self._od_latched:
-            return ClusterType.ON_DEMAND
-
-        # Otherwise, prefer spot when available
         if has_spot:
             return ClusterType.SPOT
 
-        # Spot unavailable: wait if safe, else switch to on-demand
-        if self._should_lock_to_on_demand(remaining_work, time_left):
-            self._od_latched = True
-            return ClusterType.ON_DEMAND
-
-        return ClusterType.NONE
+        now = float(getattr(self.env, "elapsed_seconds", 0.0) or 0.0)
+        ro = float(getattr(self, "restart_overhead", 180.0) or 180.0)
+        _, wait_margin = self._compute_margins()
+        t_latest = self._latest_start_time_for_od(ro)
+        slack = t_latest - now
+        if slack > wait_margin:
+            return ClusterType.NONE
+        self._committed_to_od = True
+        return ClusterType.ON_DEMAND
 
     @classmethod
     def _from_args(cls, parser):
-        # Optional knobs to tune behavior
-        parser.add_argument("--guard-minutes", type=float, default=15.0)
-        parser.add_argument("--overhead-guard-multiplier", type=float, default=4.0)
-        parser.add_argument("--lock-on-demand", action="store_true", default=True)
         args, _ = parser.parse_known_args()
         return cls(args)

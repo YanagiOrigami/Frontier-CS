@@ -5,23 +5,24 @@ class Solution(Strategy):
     NAME = "my_solution"
 
     def solve(self, spec_path: str) -> "Solution":
+        self.safe_mode = False
         return self
 
     def _step(self, last_cluster_type: ClusterType, has_spot: bool) -> ClusterType:
-        total_done = sum(self.task_done_time)
-        remaining_work = self.task_duration - total_done
-        if remaining_work <= 0:
+        task_done = sum(self.task_done_time)
+        remaining = self.task_duration - task_done
+        elapsed = self.env.elapsed_seconds
+        time_left = self.deadline - elapsed
+        if time_left <= 0 or remaining <= 0:
             return ClusterType.NONE
-        time_left = self.deadline - self.env.elapsed_seconds
-        if time_left <= 0:
-            return ClusterType.NONE
-        slack = time_left - remaining_work
-        threshold = 2 * self.restart_overhead
-        if slack < threshold:
+        buffer_seconds = time_left - remaining
+        safety = 3600.0
+        if buffer_seconds < safety or self.safe_mode:
+            self.safe_mode = True
             return ClusterType.ON_DEMAND
         if has_spot:
             return ClusterType.SPOT
-        return ClusterType.ON_DEMAND
+        return ClusterType.NONE
 
     @classmethod
     def _from_args(cls, parser):

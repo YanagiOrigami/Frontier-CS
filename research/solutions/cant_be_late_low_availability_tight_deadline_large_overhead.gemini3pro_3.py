@@ -2,73 +2,59 @@ from sky_spot.strategies.strategy import Strategy
 from sky_spot.utils import ClusterType
 
 class Solution(Strategy):
-    NAME = "CostOptimizedSafetyFirst"
+    NAME = "CantBeLate"
 
     def solve(self, spec_path: str) -> "Solution":
+        """
+        Optional initialization. Called once before evaluation.
+        """
         return self
 
     def _step(self, last_cluster_type: ClusterType, has_spot: bool) -> ClusterType:
-        # Calculate current state
+        """
+        Decides the cluster type for the next time step.
+        """
+        # Retrieve environment state
         elapsed = self.env.elapsed_seconds
-        done_work = sum(self.task_done_time)
-        needed_work = self.task_duration - done_work
-        
-        # Check if work is already completed
-        if needed_work <= 1e-6:
-            return ClusterType.NONE
-
-        deadline_time = self.deadline
-        overhead = self.restart_overhead
         gap = self.env.gap_seconds
         
-        # Time remaining until deadline
-        time_left = deadline_time - elapsed
+        # Retrieve static constraints
+        deadline = self.deadline
+        duration = self.task_duration
+        overhead = self.restart_overhead
         
-        # Calculate Slack: Time we can afford to not work (wait or incur overhead)
-        # S = T_rem - W_rem
-        slack = time_left - needed_work
+        # Calculate progress
+        work_done = sum(self.task_done_time)
+        work_remaining = duration - work_done
         
-        # Safety margin to handle discrete timesteps and float precision
-        safety_buffer = 2.0 * gap
+        if work_remaining <= 0:
+            return ClusterType.NONE
+
+        # Safety Logic:
+        # We must ensure that if we defer switching to On-Demand until the NEXT step,
+        # we will still have enough time to finish.
+        #
+        # Time available at next step: deadline - (elapsed + gap)
+        # Time required to finish on On-Demand (worst case with overhead): work_remaining + overhead
         
-        # Critical Threshold:
-        # We must reserve enough slack to pay the 'overhead' cost to start an On-Demand instance.
-        # If slack drops below this, we cannot guarantee finishing on time if we are not already running safely.
-        critical_threshold = overhead + safety_buffer
+        time_at_next_step = elapsed + gap
+        time_available_next = deadline - time_at_next_step
+        time_required_od = work_remaining + overhead
         
-        # 1. Critical Safety Check
-        # If we are dangerously close to the deadline relative to work remaining, 
-        # force On-Demand usage to guarantee completion.
-        if slack < critical_threshold:
+        # Add a small buffer for floating point stability
+        safety_buffer = 5.0
+        
+        # If the remaining time is approaching the bare minimum needed for On-Demand,
+        # we must switch to On-Demand immediately to guarantee completion.
+        if time_available_next < (time_required_od + safety_buffer):
             return ClusterType.ON_DEMAND
             
-        # 2. Strategy Logic
+        # If we have slack, prioritize cost optimization
         if has_spot:
-            # Case A: Continuing Spot
-            # If we are already on Spot, we don't pay the entry overhead again.
-            # We only need enough slack to handle the restart overhead if Spot gets preempted (switch to OD).
-            if last_cluster_type == ClusterType.SPOT:
-                if slack > critical_threshold:
-                    return ClusterType.SPOT
-                else:
-                    return ClusterType.ON_DEMAND
+            return ClusterType.SPOT
             
-            # Case B: Switching to Spot (from NONE or OD)
-            # We incur entry overhead now, and risk incurring exit overhead later if Spot dies.
-            # We need a reserve of 2 * overhead to safely attempt this transition.
-            entry_threshold = 2.0 * overhead + safety_buffer
-            
-            if slack > entry_threshold:
-                return ClusterType.SPOT
-            else:
-                # Not enough slack to risk the Spot entry+failure cost.
-                # Running OD preserves our current slack buffer (safe).
-                return ClusterType.ON_DEMAND
-        else:
-            # Case C: No Spot available
-            # We have slack > critical_threshold (checked in step 1).
-            # We can afford to wait (NONE) to save money, hoping Spot returns.
-            return ClusterType.NONE
+        # If no spot is available and we are safe, wait to save money
+        return ClusterType.NONE
 
     @classmethod
     def _from_args(cls, parser):

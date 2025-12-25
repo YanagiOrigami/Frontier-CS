@@ -1,123 +1,57 @@
-from typing import Any, Iterable
 from sky_spot.strategies.strategy import Strategy
 from sky_spot.utils import ClusterType
 
 
 class Solution(Strategy):
-    NAME = "hedged_deadline_spot_v1"
-
-    def __init__(self, args: Any = None):
-        super().__init__(args)
-        self.force_od: bool = False
+    NAME = "my_solution"
 
     def solve(self, spec_path: str) -> "Solution":
+        # Initialize per-run state if needed
+        self.use_on_demand_only = False
         return self
 
-    def _total_done_seconds(self) -> float:
-        td = getattr(self, "task_done_time", None)
-        if td is None:
-            return 0.0
-
-        # If already a numeric value
-        if isinstance(td, (int, float)):
-            return max(float(td), 0.0)
-
-        total = 0.0
-
-        def is_number(x: Any) -> bool:
-            return isinstance(x, (int, float))
-
-        try:
-            iterable: Iterable = td  # type: ignore
-        except TypeError:
-            try:
-                return max(float(td), 0.0)
-            except Exception:
-                return 0.0
-
-        for seg in iterable:
-            try:
-                if is_number(seg):
-                    total += float(seg)
-                else:
-                    # Try segment like (start, end)
-                    try:
-                        length = len(seg)  # type: ignore[arg-type]
-                    except Exception:
-                        continue
-                    if length >= 2:
-                        try:
-                            start = float(seg[0])
-                            end = float(seg[1])
-                            total += max(end - start, 0.0)
-                        except Exception:
-                            continue
-                    elif length == 1:
-                        try:
-                            total += float(seg[0])
-                        except Exception:
-                            continue
-            except Exception:
-                continue
-
-        return max(total, 0.0)
-
-    def _compute_state(self):
-        done = self._total_done_seconds()
-        try:
-            task_duration = float(self.task_duration)
-        except Exception:
-            task_duration = 0.0
-        remaining = max(task_duration - done, 0.0)
-
-        try:
-            elapsed = float(self.env.elapsed_seconds)
-        except Exception:
-            elapsed = 0.0
-        try:
-            deadline = float(self.deadline)
-        except Exception:
-            deadline = elapsed
-
-        time_left = max(deadline - elapsed, 0.0)
-        slack = time_left - remaining
-        return remaining, time_left, slack
-
     def _step(self, last_cluster_type: ClusterType, has_spot: bool) -> ClusterType:
-        remaining, time_left, slack = self._compute_state()
+        env = self.env
 
-        # If task finished or no time left, do nothing.
-        if remaining <= 0.0 or time_left <= 0.0:
-            self.force_od = False
-            return ClusterType.NONE
+        # Detect new episode or uninitialized state
+        if not hasattr(self, "use_on_demand_only") or env.elapsed_seconds == 0:
+            self.use_on_demand_only = False
 
-        # Once we decide to commit to on-demand, never go back to spot.
-        if self.force_od:
+        # If we've already committed to on-demand, stay there
+        if self.use_on_demand_only:
             return ClusterType.ON_DEMAND
 
-        # Time step and restart overhead for safety margin.
-        try:
-            dt = float(getattr(self.env, "gap_seconds", 0.0))
-        except Exception:
-            dt = 0.0
-        try:
-            overhead = float(getattr(self, "restart_overhead", 0.0))
-        except Exception:
-            overhead = 0.0
+        elapsed = env.elapsed_seconds
+        deadline = self.deadline
+        task_duration = self.task_duration
+        restart_overhead = self.restart_overhead
+        gap = env.gap_seconds if env.gap_seconds is not None else 0.0
 
-        # Commit margin: enough to cover one step of no progress plus one restart overhead.
-        commit_slack = max(dt + overhead, 2.0 * dt)
+        remaining_wall = deadline - elapsed
 
-        # If slack is tight, immediately switch to and stick with on-demand.
-        if slack <= commit_slack:
-            self.force_od = True
+        # If we're at or past the deadline, must use on-demand
+        if remaining_wall <= 0:
+            self.use_on_demand_only = True
             return ClusterType.ON_DEMAND
 
-        # Pre-commit regime: prioritize spot when available; otherwise idle to save cost.
+        # Conservative assumption: no progress has been made yet.
+        # Thus remaining compute time upper bound is full task_duration.
+        remaining_compute_upper = task_duration
+
+        # Time needed to safely finish if we switch to pure on-demand now:
+        # remaining_compute_upper + one restart_overhead + one gap for discretization.
+        time_needed_upper = remaining_compute_upper + restart_overhead + max(gap, 0.0)
+
+        # If remaining wall-clock time is at most what we need, commit to on-demand.
+        if remaining_wall <= time_needed_upper:
+            self.use_on_demand_only = True
+            return ClusterType.ON_DEMAND
+
+        # We still have ample slack: use spot when available, otherwise pause.
         if has_spot:
             return ClusterType.SPOT
-        else:
-            return ClusterType.NONE
+
+        return ClusterType.NONE
 
     @classmethod
     def _from_args(cls, parser):

@@ -3,132 +3,49 @@ from sky_spot.utils import ClusterType
 
 
 class Solution(Strategy):
-    NAME = "safe_fallback_v1"
+    NAME = "deadline_buffer_wait_spot"
 
     def __init__(self, args=None):
-        try:
-            super().__init__(args)
-        except TypeError:
-            try:
-                super().__init__()
-            except Exception:
-                pass
-        self.args = args
-        self._commit_to_od = False
-        self._cached_done_sum = 0.0
-        self._cached_done_len = 0
+        super().__init__(args)
+        self._commit_od = False
+        self._progress_cache_sum = 0.0
+        self._progress_cache_len = 0
 
     def solve(self, spec_path: str) -> "Solution":
         return self
 
-    def _segment_duration(self, seg):
-        try:
-            if isinstance(seg, (list, tuple)):
-                if len(seg) >= 2:
-                    a, b = seg[0], seg[1]
-                    try:
-                        return float(b) - float(a)
-                    except Exception:
-                        try:
-                            return float(b)
-                        except Exception:
-                            return 0.0
-                elif len(seg) == 1:
-                    try:
-                        return float(seg[0])
-                    except Exception:
-                        return 0.0
-                else:
-                    return 0.0
-            else:
-                return float(seg)
-        except Exception:
-            return 0.0
-
-    def _get_work_remaining(self) -> float:
-        total = 0.0
-        try:
-            total = float(self.task_duration)
-        except Exception:
-            total = 0.0
-
-        lst = getattr(self, "task_done_time", []) or []
-        # If list shrank or changed type, recompute from scratch
-        if not isinstance(lst, list) or len(lst) < self._cached_done_len:
-            self._cached_done_len = 0
-            self._cached_done_sum = 0.0
-
-        # Accumulate newly added segments
-        n = len(lst)
-        for i in range(self._cached_done_len, n):
-            self._cached_done_sum += self._segment_duration(lst[i])
-
-        self._cached_done_len = n
-        done = max(0.0, min(self._cached_done_sum, total if total > 0 else self._cached_done_sum))
-        remaining = max(0.0, total - done)
-        return remaining
-
     def _step(self, last_cluster_type: ClusterType, has_spot: bool) -> ClusterType:
-        # If already committed to on-demand, keep using it
-        if self._commit_to_od:
-            return ClusterType.ON_DEMAND
+        # Cache progress sum to avoid repeated O(n) summations
+        if self.task_done_time is not None:
+            cur_len = len(self.task_done_time)
+            if cur_len != self._progress_cache_len:
+                self._progress_cache_sum = sum(self.task_done_time)
+                self._progress_cache_len = cur_len
+            progress = self._progress_cache_sum
+        else:
+            progress = 0.0
 
-        # If we're already on on-demand, stick to it
-        if last_cluster_type == ClusterType.ON_DEMAND:
-            self._commit_to_od = True
-            return ClusterType.ON_DEMAND
-
-        remaining = self._get_work_remaining()
-        if remaining <= 0.0:
+        remaining = max(0.0, self.task_duration - progress)
+        if remaining <= 1e-9:
             return ClusterType.NONE
 
-        # Environment parameters
-        try:
-            t = float(self.env.elapsed_seconds)
-        except Exception:
-            t = 0.0
-        try:
-            gap = float(self.env.gap_seconds)
-        except Exception:
-            gap = 0.0
-        try:
-            dl = float(self.deadline)
-        except Exception:
-            dl = t + 1e9
-        try:
-            overhead = float(self.restart_overhead)
-        except Exception:
-            overhead = 0.0
+        time_left = self.deadline - self.env.elapsed_seconds
+        gap = getattr(self.env, "gap_seconds", 0.0) or 0.0
+        overhead = self.restart_overhead or 0.0
 
-        # If even switching to on-demand now cannot meet the deadline, choose OD anyway
-        if t + overhead + remaining > dl:
-            self._commit_to_od = True
+        # Safety buffer to ensure we can switch to OD and still finish on time
+        safe_buffer = overhead + 3.0 * gap + 1e-6
+
+        if time_left <= remaining + safe_buffer:
+            self._commit_od = True
+
+        if self._commit_od:
             return ClusterType.ON_DEMAND
 
-        # Latest safe time to start on-demand
-        fallback_time = dl - (remaining + overhead + gap)
+        if has_spot:
+            return ClusterType.SPOT
 
-        # If we are past fallback time, commit to on-demand
-        if t >= fallback_time:
-            self._commit_to_od = True
-            return ClusterType.ON_DEMAND
-
-        # If spot not available
-        if not has_spot:
-            # If waiting one more step would push us past fallback time, start OD now
-            if t + gap >= fallback_time:
-                self._commit_to_od = True
-                return ClusterType.ON_DEMAND
-            # Otherwise, wait for cheaper spot
-            return ClusterType.NONE
-
-        # Spot is available: decide whether to use it or commit to OD if too close to fallback
-        time_until_fallback = fallback_time - t
-        if time_until_fallback <= max(gap, overhead * 0.5):
-            self._commit_to_od = True
-            return ClusterType.ON_DEMAND
-
-        return ClusterType.SPOT
+        return ClusterType.NONE
 
     @classmethod
     def _from_args(cls, parser):

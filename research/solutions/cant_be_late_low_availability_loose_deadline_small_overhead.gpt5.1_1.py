@@ -3,112 +3,54 @@ from sky_spot.utils import ClusterType
 
 
 class Solution(Strategy):
-    NAME = "cant_be_late_threshold_v1"
+    NAME = "safe_spot_fallback_v1"
+
+    def __init__(self, args):
+        super().__init__(args)
 
     def solve(self, spec_path: str) -> "Solution":
-        # Optional initialization before evaluation.
-        # We keep algorithm parameters fixed and lightweight.
-        self._initialized_custom = False
         return self
 
-    def _init_custom_state(self):
-        if getattr(self, "_initialized_custom", False):
-            return
-        self._initialized_custom = True
-        self._progress_cache_len = 0
-        self._progress_total = 0.0
-        self._committed_to_od = False
-
-    def _update_progress(self) -> float:
-        """Incrementally track total completed work to avoid O(n^2) sums."""
-        task_done_time = getattr(self, "task_done_time", None)
-        if task_done_time is None:
-            return 0.0
-        n = len(task_done_time)
-        if n > self._progress_cache_len:
-            # Sum only new segments.
-            self._progress_total += sum(task_done_time[self._progress_cache_len : n])
-            self._progress_cache_len = n
-        return self._progress_total
-
     def _step(self, last_cluster_type: ClusterType, has_spot: bool) -> ClusterType:
-        self._init_custom_state()
+        env = getattr(self, "env", None)
 
-        # Compute remaining work.
-        total_work = getattr(self, "task_duration", 0.0)
-        progress = self._update_progress()
-        remaining_work = max(0.0, total_work - progress)
+        deadline = getattr(self, "deadline", None)
+        task_duration = getattr(self, "task_duration", None)
+        restart_overhead = getattr(self, "restart_overhead", 0.0)
 
-        # If work is already done (defensive), no need to spend more.
-        if remaining_work <= 0.0:
-            self._committed_to_od = True
-            return ClusterType.NONE
+        gap = getattr(env, "gap_seconds", 60.0) if env is not None else 60.0
+        now = getattr(env, "elapsed_seconds", 0.0) if env is not None else 0.0
 
-        # Access environment parameters.
-        env = self.env
-        t = getattr(env, "elapsed_seconds", 0.0)
-        gap = max(getattr(env, "gap_seconds", 1.0), 1e-6)
-        deadline = getattr(self, "deadline", t + remaining_work)
-        overhead = max(getattr(self, "restart_overhead", 0.0), 0.0)
+        # If we don't know the job specs, be conservative and use on-demand.
+        if deadline is None or task_duration is None:
+            return ClusterType.ON_DEMAND
 
-        # Slack = time left after running remaining_work on perfect on-demand.
-        slack = deadline - t - remaining_work
+        # Total slack time available (seconds).
+        slack = max(0.0, deadline - task_duration)
 
-        # If slack already non-positive, we're in trouble: go full on-demand.
+        # If there is no slack, must always use on-demand.
         if slack <= 0.0:
-            self._committed_to_od = True
             return ClusterType.ON_DEMAND
 
-        # Total initial slack (from problem spec: deadline - task_duration).
-        total_slack = max(0.0, deadline - total_work)
+        # Safety margin to account for restart overhead and discretization.
+        # Cap the safety margin to at most 25% of slack so we still use spot meaningfully.
+        base_margin = max(1800.0, 5.0 * gap, 2.0 * restart_overhead)  # at least 30 min, or based on gap/overhead
+        max_margin = slack * 0.25
+        safety_margin = base_margin if base_margin < max_margin else max_margin
 
-        # Compute conservative thresholds (in seconds).
-        # Base margin: multiple of step size and restart overhead.
-        base_commit_slack = max(4.0 * gap, 8.0 * overhead)
+        # Latest safe time to start a final uninterrupted on-demand run from (worst-case no prior progress).
+        fallback_time = deadline - task_duration - restart_overhead - safety_margin
+        if fallback_time < 0.0:
+            fallback_time = 0.0
 
-        if total_slack > 0.0:
-            # Commit when slack is a small fraction of total slack, but not too early.
-            frac_commit = 0.03 * total_slack  # 3% of total slack.
-            commit_slack = max(base_commit_slack, frac_commit)
-            commit_slack = min(commit_slack, 0.5 * total_slack)  # never more than half the slack.
-        else:
-            commit_slack = base_commit_slack
-
-        # Ensure commit_slack >= gap so we cannot skip over zero-slack in a single step.
-        commit_slack = max(commit_slack, gap)
-
-        # When spot is unavailable, we start using on-demand earlier to avoid falling behind.
-        if total_slack > 0.0:
-            extra_pause = min(0.2 * total_slack, 4.0 * 3600.0)  # up to 4 hours or 20% of slack.
-        else:
-            extra_pause = commit_slack
-        pause_slack = max(commit_slack, commit_slack + extra_pause)
-
-        # Latch thresholds for introspection/debugging if needed.
-        self._commit_slack = commit_slack
-        self._pause_slack = pause_slack
-
-        # Once committed to on-demand, never return to spot or none (until task done).
-        if self._committed_to_od:
+        # After fallback_time, always use on-demand to guarantee completion.
+        if now >= fallback_time:
             return ClusterType.ON_DEMAND
 
-        # Decide whether to commit to ON_DEMAND now (independent of spot availability).
-        # Add a small epsilon to be robust to floating-point noise.
-        if slack <= commit_slack + 1e-6:
-            self._committed_to_od = True
-            return ClusterType.ON_DEMAND
-
-        # Not yet in final on-demand phase.
+        # Before fallback window: use spot when available, otherwise stay idle to save cost.
         if has_spot:
-            # Spot available and we have comfortable slack: use spot.
             return ClusterType.SPOT
 
-        # Spot unavailable: choose between ON_DEMAND and NONE based on slack.
-        if slack <= pause_slack + 1e-6:
-            # Need to maintain progress to avoid eating too much slack.
-            return ClusterType.ON_DEMAND
-
-        # Plenty of slack and no spot: safe (and cheaper) to wait.
         return ClusterType.NONE
 
     @classmethod

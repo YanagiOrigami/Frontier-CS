@@ -1,158 +1,191 @@
-from typing import Optional
+from typing import Any, Optional, Tuple, Union
 from sky_spot.strategies.strategy import Strategy
 from sky_spot.utils import ClusterType
 
 
 class Solution(Strategy):
-    NAME = "deadline_guardrail_heuristic_v2"
+    NAME = "jit_od_guard"
+
+    def __init__(self, args=None):
+        try:
+            super().__init__(args)
+        except TypeError:
+            try:
+                super().__init__()
+            except Exception:
+                pass
+        self.args = args
+        self._committed_to_od = False
+        self._safety_margin_steps = 1.0
+        self._cached_work_done = 0.0
+        self._cached_len = None  # for list-like task_done_time caching
+        self._last_seen_task_done_id = None  # fallback if environment uses identity changes
 
     def solve(self, spec_path: str) -> "Solution":
-        # Initialize persistent state
-        self._initialized = False
         return self
 
-    def _ensure_init(self):
-        if getattr(self, "_initialized", False):
-            return
-        self._initialized = True
-        self.od_committed: bool = False
-        self.wait_start_time: Optional[float] = None
-        self.od_run_started_at: Optional[float] = None
-
-    def _task_done(self) -> float:
-        # Robustly compute completed work seconds
+    def _get_safety_margin_seconds(self) -> float:
+        gap = getattr(self.env, "gap_seconds", 60.0) or 60.0
+        steps = getattr(self.args, "safety_margin_steps", self._safety_margin_steps)
         try:
-            return float(sum(self.task_done_time))
+            steps = float(steps)
         except Exception:
+            steps = self._safety_margin_steps
+        return max(0.0, steps * gap)
+
+    def _sum_task_done(self, obj: Any) -> float:
+        # Fast paths
+        if obj is None:
+            return 0.0
+        if isinstance(obj, (int, float)):
+            return float(obj)
+        total = 0.0
+        # Common expected structure: list of floats
+        if isinstance(obj, (list, tuple)):
+            # caching by length if possible
             try:
-                return float(self.task_done_time)  # type: ignore
+                current_len = len(obj)
             except Exception:
-                return 0.0
+                current_len = None
+            # If it's a list and grew since last read, we can sum incrementally; else recompute
+            if current_len is not None:
+                if self._cached_len is not None and current_len >= self._cached_len and isinstance(obj, list):
+                    # sum only new items if they are numeric; otherwise fall back to full sum
+                    try:
+                        inc = 0.0
+                        for item in obj[self._cached_len:]:
+                            if isinstance(item, (int, float)):
+                                inc += float(item)
+                            elif isinstance(item, dict):
+                                if "duration" in item and isinstance(item["duration"], (int, float)):
+                                    inc += float(item["duration"])
+                                elif "len" in item and isinstance(item["len"], (int, float)):
+                                    inc += float(item["len"])
+                                elif "seconds" in item and isinstance(item["seconds"], (int, float)):
+                                    inc += float(item["seconds"])
+                                elif "end" in item and "start" in item and isinstance(item["end"], (int, float)) and isinstance(item["start"], (int, float)):
+                                    inc += max(0.0, float(item["end"]) - float(item["start"]))
+                            elif isinstance(item, (list, tuple)):
+                                if len(item) >= 2 and isinstance(item[0], (int, float)) and isinstance(item[1], (int, float)):
+                                    a, b = float(item[0]), float(item[1])
+                                    inc += b - a if b >= a else b
+                                elif len(item) >= 1 and isinstance(item[0], (int, float)):
+                                    inc += float(item[0])
+                            # else ignore unrecognized entries
+                        self._cached_work_done += inc
+                        self._cached_len = current_len
+                        return max(0.0, self._cached_work_done)
+                    except Exception:
+                        pass  # fall back to full recompute
+                # full recompute:
+                try:
+                    for item in obj:
+                        if isinstance(item, (int, float)):
+                            total += float(item)
+                        elif isinstance(item, dict):
+                            if "duration" in item and isinstance(item["duration"], (int, float)):
+                                total += float(item["duration"])
+                            elif "len" in item and isinstance(item["len"], (int, float)):
+                                total += float(item["len"])
+                            elif "seconds" in item and isinstance(item["seconds"], (int, float)):
+                                total += float(item["seconds"])
+                            elif "end" in item and "start" in item and isinstance(item["end"], (int, float)) and isinstance(item["start"], (int, float)):
+                                total += max(0.0, float(item["end"]) - float(item["start"]))
+                        elif isinstance(item, (list, tuple)):
+                            if len(item) >= 2 and isinstance(item[0], (int, float)) and isinstance(item[1], (int, float)):
+                                a, b = float(item[0]), float(item[1])
+                                total += b - a if b >= a else b
+                            elif len(item) >= 1 and isinstance(item[0], (int, float)):
+                                total += float(item[0])
+                    self._cached_len = current_len
+                    self._cached_work_done = total
+                    return max(0.0, total)
+                except Exception:
+                    pass  # fall through to generic handling
 
-    def _min_od_run_time(self, gap: float) -> float:
-        # Minimum time to stay on OD before considering switching back to Spot
-        # Aim to amortize two restart overheads (switch to SPOT and later back to OD)
-        # Use at least 30 minutes and a few gaps.
-        base = 30 * 60.0
-        return max(3.0 * gap, base)
+        if isinstance(obj, dict):
+            # try common fields
+            for key in ("duration", "dur", "seconds", "work", "done", "total", "sum"):
+                v = obj.get(key)
+                if isinstance(v, (int, float)):
+                    return max(0.0, float(v))
+            # try nested start/end
+            if "start" in obj and "end" in obj and isinstance(obj["start"], (int, float)) and isinstance(obj["end"], (int, float)):
+                return max(0.0, float(obj["end"]) - float(obj["start"]))
+            # otherwise try sum of numeric values
+            try:
+                for v in obj.values():
+                    if isinstance(v, (int, float)):
+                        total += float(v)
+                if total > 0:
+                    return total
+            except Exception:
+                pass
 
-    def _commit_guard_margin(self, gap: float) -> float:
-        # Safety buffer to avoid tight boundary due to discretization and unknowns
-        return max(2.0 * gap, 180.0)  # at least 3 minutes
+        # As a last resort
+        try:
+            return max(0.0, float(obj))
+        except Exception:
+            return 0.0
 
-    def _slack_guard(self, gap: float) -> float:
-        # Keep some slack reserve for future uncertainty
-        return 0.35 * float(self.restart_overhead) + max(gap, 60.0)
-
-    def _should_commit_to_od(self, last_cluster_type: ClusterType, time_left: float, remain: float, gap: float) -> bool:
-        # Decide if we must commit to OD now to guarantee finish
-        commit_need = remain + (0.0 if last_cluster_type == ClusterType.ON_DEMAND else float(self.restart_overhead))
-        return time_left <= commit_need + self._commit_guard_margin(gap)
+    def _get_work_done(self) -> float:
+        td = getattr(self, "task_done_time", None)
+        wd = self._sum_task_done(td)
+        try:
+            total = float(getattr(self, "task_duration", 0.0) or 0.0)
+            if total > 0.0:
+                return min(total, wd)
+            return wd
+        except Exception:
+            return wd
 
     def _step(self, last_cluster_type: ClusterType, has_spot: bool) -> ClusterType:
-        self._ensure_init()
+        # If already committed to on-demand, stay there
+        if self._committed_to_od:
+            return ClusterType.ON_DEMAND
 
-        now = float(self.env.elapsed_seconds)
-        gap = float(self.env.gap_seconds)
-        deadline = float(self.deadline)
-        restart = float(self.restart_overhead)
-        task_duration = float(self.task_duration)
+        # Gather environment values with safe fallbacks
+        now = float(getattr(self.env, "elapsed_seconds", 0.0) or 0.0)
+        deadline = float(getattr(self, "deadline", 0.0) or 0.0)
+        restart_overhead = float(getattr(self, "restart_overhead", 0.0) or 0.0)
+        total_task = float(getattr(self, "task_duration", 0.0) or 0.0)
+        gap = float(getattr(self.env, "gap_seconds", 60.0) or 60.0)
 
-        done = self._task_done()
-        remain = max(0.0, task_duration - done)
-        if remain <= 0.0:
-            # Task finished
+        work_done = self._get_work_done()
+        remaining_work = max(0.0, total_task - work_done)
+
+        # If task is done, no need to run
+        if remaining_work <= 1e-9:
             return ClusterType.NONE
 
-        time_left = max(0.0, deadline - now)
-        slack_rem = time_left - remain  # may be negative if behind
+        # Compute latest safe OD start time
+        safety_margin = self._get_safety_margin_seconds()
+        latest_safe_start = deadline - (remaining_work + restart_overhead) - safety_margin
 
-        # Enforce commitment if needed
-        if not self.od_committed and self._should_commit_to_od(last_cluster_type, time_left, remain, gap):
-            self.od_committed = True
-            self.wait_start_time = None
-            # When committed, always run OD
-            if last_cluster_type != ClusterType.ON_DEMAND:
-                self.od_run_started_at = now
+        # If we're at or past the latest safe start, switch to OD and stick with it
+        if now >= latest_safe_start:
+            self._committed_to_od = True
             return ClusterType.ON_DEMAND
 
-        # If already committed, always choose ON_DEMAND
-        if self.od_committed:
-            self.wait_start_time = None
-            if last_cluster_type != ClusterType.ON_DEMAND:
-                self.od_run_started_at = now
-            return ClusterType.ON_DEMAND
-
-        # Not committed yet: opportunistically use spot, but guard deadline
-
-        # If on OD already, track start time
-        if last_cluster_type == ClusterType.ON_DEMAND and self.od_run_started_at is None:
-            self.od_run_started_at = now
-
-        # Helper headroom to allow waiting and/or switching costs
-        headroom = time_left - (remain + restart)  # extra time above "switch to OD now" plan
-        commit_guard = self._commit_guard_margin(gap)
-        slack_guard = self._slack_guard(gap)
-
-        # Case: Spot available
+        # Otherwise, prefer SPOT if available; else wait (NONE)
         if has_spot:
-            # If we're not currently on OD, use SPOT
-            if last_cluster_type != ClusterType.ON_DEMAND:
-                self.wait_start_time = None
-                self.od_run_started_at = None
-                return ClusterType.SPOT
+            return ClusterType.SPOT
 
-            # We are currently on OD: decide whether to switch back to SPOT
-            # Require a minimum OD run duration to avoid thrashing
-            od_run_dur = now - (self.od_run_started_at or now)
-            if od_run_dur < self._min_od_run_time(gap):
-                # Continue OD until minimum runtime reached
-                return ClusterType.ON_DEMAND
-
-            # Only switch back to spot if we have ample slack to absorb two restarts
-            # and not too close to commit boundary
-            if (slack_rem > 2.0 * restart + (0.5 * restart + max(gap, 60.0))) and (headroom > commit_guard + restart):
-                # Switch back to spot
-                self.wait_start_time = None
-                self.od_run_started_at = None
-                return ClusterType.SPOT
-            else:
-                # Keep OD to be safe
-                return ClusterType.ON_DEMAND
-
-        # Case: Spot unavailable
-        if last_cluster_type == ClusterType.ON_DEMAND:
-            # Already on OD; keep running
-            self.wait_start_time = None
+        # If SPOT is unavailable and we still have buffer, wait
+        # However, if the buffer left is less than one step worth of time, proactively switch to OD
+        time_left = deadline - now
+        buffer_left = latest_safe_start - now
+        if buffer_left <= gap * 0.5:
+            self._committed_to_od = True
             return ClusterType.ON_DEMAND
 
-        # Not on OD, and spot is unavailable -> decide to wait or switch to OD
-        # Compute dynamic wait limit
-        max_wait_by_commit = max(0.0, headroom - commit_guard)
-        if slack_rem <= slack_guard or max_wait_by_commit <= 0.0:
-            # Insufficient slack or headroom -> must use OD now
-            self.wait_start_time = None
-            self.od_run_started_at = now
-            return ClusterType.ON_DEMAND
-
-        # Final wait cap to avoid waiting too long in a single outage
-        hard_wait_cap = 45.0 * 60.0  # 45 minutes
-        final_wait_limit = min(max_wait_by_commit, max(0.0, slack_rem - slack_guard), hard_wait_cap)
-
-        # Start or continue waiting
-        if self.wait_start_time is None or last_cluster_type != ClusterType.NONE:
-            self.wait_start_time = now
-
-        waited = now - (self.wait_start_time or now)
-        if waited < final_wait_limit:
-            return ClusterType.NONE
-
-        # Wait exceeded -> start OD
-        self.wait_start_time = None
-        self.od_run_started_at = now
-        return ClusterType.ON_DEMAND
+        return ClusterType.NONE
 
     @classmethod
     def _from_args(cls, parser):
+        try:
+            parser.add_argument("--safety_margin_steps", type=float, default=1.0)
+        except Exception:
+            pass
         args, _ = parser.parse_known_args()
         return cls(args)

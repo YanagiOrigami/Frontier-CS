@@ -1,53 +1,124 @@
+from typing import Any
 from sky_spot.strategies.strategy import Strategy
 from sky_spot.utils import ClusterType
 
 
 class Solution(Strategy):
-    NAME = "my_solution"
+    NAME = "cant_be_late_threshold_v1"
 
-    def __init__(self, args):
+    def __init__(self, args: Any = None):
         super().__init__(args)
-        self._force_on_demand = False
+        self.committed_to_od = False
+        self._prog_mode = "unset"  # "unset", "durations", "segments", "unknown"
+        self._prog_index = 0
+        self._prog_value = 0.0
 
     def solve(self, spec_path: str) -> "Solution":
         return self
 
+    def _estimate_progress(self) -> float:
+        """Estimate completed work time in seconds, conservative (never overestimates)."""
+        segs = getattr(self, "task_done_time", None)
+        if not segs:
+            return 0.0
+
+        elapsed = getattr(self.env, "elapsed_seconds", 0.0)
+        total_duration = getattr(self, "task_duration", float("inf"))
+
+        # Determine representation mode on first use
+        if self._prog_mode == "unset":
+            first = segs[0]
+            if isinstance(first, (int, float)):
+                self._prog_mode = "durations"
+            elif (
+                isinstance(first, (list, tuple))
+                and len(first) >= 2
+                and isinstance(first[0], (int, float))
+                and isinstance(first[1], (int, float))
+            ):
+                self._prog_mode = "segments"
+            else:
+                # Unknown structure; fall back to conservative "no progress"
+                self._prog_mode = "unknown"
+                self._prog_index = len(segs)
+                self._prog_value = 0.0
+                return 0.0
+
+        if self._prog_mode == "durations":
+            n = len(segs)
+            for i in range(self._prog_index, n):
+                v = segs[i]
+                if isinstance(v, (int, float)):
+                    self._prog_value += float(v)
+            self._prog_index = n
+            # If representation is suspicious (more work than time), fall back to 0
+            if self._prog_value > elapsed + 1e-6:
+                self._prog_mode = "unknown"
+                self._prog_value = 0.0
+                return 0.0
+
+        elif self._prog_mode == "segments":
+            n = len(segs)
+            for i in range(self._prog_index, n):
+                seg = segs[i]
+                try:
+                    start = float(seg[0])
+                    end = float(seg[1])
+                except Exception:
+                    continue
+                if end > start:
+                    self._prog_value += end - start
+            self._prog_index = n
+            if self._prog_value > elapsed + 1e-6:
+                self._prog_mode = "unknown"
+                self._prog_value = 0.0
+                return 0.0
+        else:  # "unknown"
+            return 0.0
+
+        done = self._prog_value
+        if done < 0.0:
+            done = 0.0
+        if done > elapsed:
+            done = elapsed
+        if done > total_duration:
+            done = total_duration
+        return done
+
     def _step(self, last_cluster_type: ClusterType, has_spot: bool) -> ClusterType:
-        # If we've already committed to on-demand, keep using it.
-        if self._force_on_demand:
-            return ClusterType.ON_DEMAND
+        # Estimate how much work is already done
+        done = self._estimate_progress()
+        remaining = self.task_duration - done
+        if remaining <= 0:
+            return ClusterType.NONE
 
         elapsed = self.env.elapsed_seconds
-        gap = self.env.gap_seconds
+        gap = getattr(self.env, "gap_seconds", 0.0) or 0.0
         deadline = self.deadline
-        task_duration = self.task_duration
-        restart_overhead = getattr(self, "restart_overhead", 0.0)
+        restart_overhead = self.restart_overhead
 
-        time_left = deadline - elapsed
+        # Time (in worst case) to finish if we commit to on-demand starting now
+        # Includes one restart overhead to be conservative.
+        worst_finish_if_start_now = elapsed + remaining + restart_overhead
 
-        # Conservative policy: assume zero progress towards task_duration.
-        # Reserve enough time to run the entire task on on-demand, plus restart
-        # overhead and a safety buffer to account for discretization and small errors.
-        safety_buffer = max(5.0 * gap, 30.0 * 60.0)  # at least 30 minutes or 5 steps
-        required_time_for_safe_fallback = task_duration + restart_overhead + safety_buffer
+        # Decide whether to irrevocably commit to on-demand
+        if not self.committed_to_od:
+            # It is unsafe to delay on-demand by another gap if, in the worst
+            # case of 0 work during that gap, starting OD afterwards would miss
+            # the deadline. So if:
+            #   elapsed + remaining + overhead > deadline - gap
+            # we must start OD now.
+            latest_safe_finish_after_wait = deadline - gap
+            if worst_finish_if_start_now > latest_safe_finish_after_wait:
+                self.committed_to_od = True
 
-        slack = time_left - required_time_for_safe_fallback
-
-        if slack <= 0:
-            # No more room to wait; commit to on-demand for the rest of the job.
-            self._force_on_demand = True
+        if self.committed_to_od:
             return ClusterType.ON_DEMAND
 
-        # Still in the slack region: we can try to exploit spot when available.
+        # Not yet committed: use spot whenever available, otherwise wait.
         if has_spot:
             return ClusterType.SPOT
-
-        # No spot available; decide between idling and temporarily using on-demand.
-        wait_threshold = max(2.0 * gap, 10.0 * 60.0)  # at least 10 minutes or 2 steps
-        if slack > wait_threshold:
-            return ClusterType.NONE
-        else:
-            return ClusterType.ON_DEMAND
+        return ClusterType.NONE
 
     @classmethod
     def _from_args(cls, parser):

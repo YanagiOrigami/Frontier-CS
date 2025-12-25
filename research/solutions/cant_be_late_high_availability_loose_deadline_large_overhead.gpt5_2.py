@@ -6,58 +6,76 @@ class Solution(Strategy):
     NAME = "cant_be_late_v1"
 
     def __init__(self, args=None):
-        super().__init__(args)
-        self.committed_to_od = False
-        self.od_commit_time = None
+        try:
+            super().__init__(args)
+        except TypeError:
+            try:
+                super().__init__()
+            except TypeError:
+                pass
+        self.args = args
+        self.lock_od = False
 
     def solve(self, spec_path: str) -> "Solution":
         return self
 
-    def _remaining_work(self) -> float:
-        done = 0.0
+    def _progress_seconds(self) -> float:
+        gap = getattr(self.env, "gap_seconds", 60.0) or 60.0
+        times = getattr(self, "task_done_time", None)
+        if not times:
+            return 0.0
+        # Use length-based progress as robust estimator; overhead doesn't add to progress.
+        progress_by_len = len(times) * gap
         try:
-            if self.task_done_time:
-                done = sum(self.task_done_time)
+            sum_times = float(sum(times)) if times else 0.0
         except Exception:
-            done = 0.0
-        rem = self.task_duration - done
-        return max(0.0, rem)
+            sum_times = float("inf")
+        progress = min(progress_by_len, sum_times)
+        td = getattr(self, "task_duration", None)
+        if td is None:
+            return progress_by_len
+        return min(progress, td)
+
+    def _remaining_work(self) -> float:
+        td = getattr(self, "task_duration", 0.0) or 0.0
+        done = self._progress_seconds()
+        remain = td - done
+        return remain if remain > 0 else 0.0
+
+    def _time_left(self) -> float:
+        deadline = getattr(self, "deadline", 0.0) or 0.0
+        elapsed = getattr(self.env, "elapsed_seconds", 0.0) or 0.0
+        left = deadline - elapsed
+        return left if left > 0 else 0.0
 
     def _step(self, last_cluster_type: ClusterType, has_spot: bool) -> ClusterType:
-        remaining = self._remaining_work()
-        if remaining <= 0:
+        # If we've already committed to on-demand, keep using it to avoid extra restarts.
+        if self.lock_od:
+            return ClusterType.ON_DEMAND
+
+        gap = getattr(self.env, "gap_seconds", 60.0) or 60.0
+        restart_overhead = getattr(self, "restart_overhead", 0.0) or 0.0
+
+        remaining_work = self._remaining_work()
+        if remaining_work <= 0:
             return ClusterType.NONE
 
-        elapsed = getattr(self.env, "elapsed_seconds", 0.0) or 0.0
-        time_left = (self.deadline or 0.0) - elapsed
-        gap = getattr(self.env, "gap_seconds", 0.0) or 0.0
-        # Safety margin to account for step discretization and action latency
-        safety_margin = max(2 * gap, 600.0)  # 10 minutes minimum
+        time_left = self._time_left()
 
-        # Decide whether to irrevocably commit to On-Demand to guarantee finishing
-        if not self.committed_to_od:
-            # Time needed if we switch to OD exactly once from now until finish
-            od_time_needed = remaining + (self.restart_overhead or 0.0)
-            if time_left <= od_time_needed + safety_margin:
-                self.committed_to_od = True
-                self.od_commit_time = elapsed
+        # Safety buffer to account for discretization and minor uncertainties.
+        safety_fudge = max(gap, 60.0)
 
-        if self.committed_to_od:
+        # Latest time to start OD such that OD finishes within deadline including one restart overhead.
+        # Commit to OD when we reach/past this threshold.
+        must_commit = time_left <= (remaining_work + restart_overhead + safety_fudge)
+
+        if must_commit:
+            self.lock_od = True
             return ClusterType.ON_DEMAND
 
-        # Not committed: prefer Spot when available
+        # Otherwise, we can still try to use spot if available; if not, wait (NONE).
         if has_spot:
             return ClusterType.SPOT
-
-        # Spot not available and not committed: wait if slack allows
-        od_time_needed = remaining + (self.restart_overhead or 0.0)
-        slack_extra = time_left - (od_time_needed + safety_margin)
-
-        # Early switch to OD only if we're within a tiny buffer of the commit threshold
-        early_switch_buffer = 0.0  # set >0 to start OD slightly before hard commit
-        if slack_extra <= early_switch_buffer:
-            return ClusterType.ON_DEMAND
-
         return ClusterType.NONE
 
     @classmethod

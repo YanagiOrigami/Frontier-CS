@@ -1,96 +1,71 @@
-import inspect
 from sky_spot.strategies.strategy import Strategy
 from sky_spot.utils import ClusterType
 
 
 class Solution(Strategy):
-    NAME = "cant_be_late_spot_first_fallback_v1"
+    NAME = "safe_spot_od_deadline_strategy_v1"
 
-    def __init__(self, args=None):
-        # Robustly initialize the base Strategy class.
-        try:
-            sig = inspect.signature(Strategy.__init__)
-            params = list(sig.parameters.values())
-            if len(params) <= 1:
-                Strategy.__init__(self)
-            else:
-                Strategy.__init__(self, args)
-        except Exception:
-            try:
-                Strategy.__init__(self, args)
-            except Exception:
-                pass
-
-        self.args = args
-        self._commit_time = None
-        self._forced_on_demand = False
+    def __init__(self, args):
+        super().__init__(args)
 
     def solve(self, spec_path: str) -> "Solution":
+        # No pre-processing needed; parameters are available via self.env during simulation.
         return self
 
-    def _ensure_initialized(self):
-        if self._commit_time is not None:
-            return
-
-        env = getattr(self, "env", None)
-
-        gap = getattr(env, "gap_seconds", 0.0) if env is not None else 0.0
-        try:
-            gap = float(gap)
-        except Exception:
-            gap = 0.0
-
-        task_duration = getattr(self, "task_duration", 0.0)
-        try:
-            task_duration = float(task_duration)
-        except Exception:
-            task_duration = 0.0
-
-        restart_overhead = getattr(self, "restart_overhead", 0.0)
-        try:
-            restart_overhead = float(restart_overhead)
-        except Exception:
-            restart_overhead = 0.0
-
-        deadline = getattr(self, "deadline", 0.0)
-        try:
-            deadline = float(deadline)
-        except Exception:
-            deadline = 0.0
-
-        # Reserve enough time at the end to complete the entire task on on-demand
-        # from scratch, including one restart overhead and one step of slack to
-        # account for discretization.
-        safety_buffer = gap
-        reserve_time = task_duration + restart_overhead + safety_buffer
-        if reserve_time < 0.0:
-            reserve_time = 0.0
-
-        commit_time = deadline - reserve_time
-        if commit_time < 0.0:
-            commit_time = 0.0
-
-        self._commit_time = commit_time
-
     def _step(self, last_cluster_type: ClusterType, has_spot: bool) -> ClusterType:
-        self._ensure_initialized()
-
-        env = getattr(self, "env", None)
-        elapsed = getattr(env, "elapsed_seconds", 0.0) if env is not None else 0.0
-        try:
-            elapsed = float(elapsed)
-        except Exception:
-            elapsed = 0.0
-
-        if (not self._forced_on_demand) and (elapsed >= self._commit_time):
-            self._forced_on_demand = True
-
-        if self._forced_on_demand:
+        # If environment is not yet fully initialized, default to safest option: ON_DEMAND.
+        # This should practically never happen during evaluation, but keeps code robust.
+        if not hasattr(self, "env") or self.env is None:
             return ClusterType.ON_DEMAND
 
-        # Before we commit to on-demand, use spot when available, otherwise pause.
+        env = self.env
+        gap = getattr(env, "gap_seconds", 0.0)
+        elapsed = getattr(env, "elapsed_seconds", 0.0)
+        deadline = getattr(self, "deadline", float("inf"))
+        task_duration = getattr(self, "task_duration", 0.0)
+        restart_overhead = getattr(self, "restart_overhead", 0.0)
+
+        # Compute how much work has been completed.
+        # We assume each completed work segment corresponds to gap seconds of work.
+        task_done_time = getattr(self, "task_done_time", None)
+        if task_done_time is None:
+            work_done = 0.0
+        else:
+            work_done = len(task_done_time) * gap
+
+        remaining_work = max(task_duration - work_done, 0.0)
+        time_left = deadline - elapsed
+
+        # If the task is done or we're out of time, avoid unnecessary cost.
+        if remaining_work <= 0.0:
+            return ClusterType.NONE
+
+        if time_left <= 0.0:
+            # Already past deadline; run ON_DEMAND to minimize further damage.
+            return ClusterType.ON_DEMAND
+
+        # Safety condition:
+        # We are allowed to "risk" this step on SPOT (or idle) only if,
+        # even in the worst case of:
+        #   - zero useful work this step (loss of `gap` seconds), and
+        #   - up to `restart_overhead` seconds overhead when we finally switch to ON_DEMAND,
+        # we can still finish by the deadline by running ON_DEMAND afterwards.
+        #
+        # That requires:
+        #   remaining_work + restart_overhead <= time_left - gap
+        # <=> remaining_work <= time_left - (gap + restart_overhead)
+        safe_to_wait = remaining_work <= (time_left - (gap + restart_overhead))
+
+        if not safe_to_wait:
+            # We are close enough to the deadline that we must use guaranteed progress.
+            return ClusterType.ON_DEMAND
+
+        # We have sufficient slack.
+        # Prefer SPOT when available (cheaper), otherwise pause to save cost.
         if has_spot:
             return ClusterType.SPOT
+
+        # No spot available and we have slack: pause instead of using expensive ON_DEMAND.
         return ClusterType.NONE
 
     @classmethod

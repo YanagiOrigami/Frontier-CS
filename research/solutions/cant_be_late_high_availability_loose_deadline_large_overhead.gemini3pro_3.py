@@ -2,7 +2,7 @@ from sky_spot.strategies.strategy import Strategy
 from sky_spot.utils import ClusterType
 
 class Solution(Strategy):
-    NAME = "CostOptimizedDeadlineStrategy"
+    NAME = "cant_be_late_solution"
 
     def solve(self, spec_path: str) -> "Solution":
         """
@@ -14,47 +14,40 @@ class Solution(Strategy):
         """
         Called at each time step. Return which cluster type to use next.
         """
-        # Calculate remaining work
+        # Retrieve current state from the environment
+        elapsed = self.env.elapsed_seconds
+        # self.task_done_time is a list of completed segment durations
         work_done = sum(self.task_done_time)
-        work_remaining = self.task_duration - work_done
+        remaining_work = self.task_duration - work_done
         
-        # If the task is already completed (or effectively so), stop.
-        if work_remaining <= 0:
+        # If the task is effectively complete, stop
+        if remaining_work <= 0:
             return ClusterType.NONE
             
-        # Calculate time remaining until the hard deadline
-        time_left = self.deadline - self.env.elapsed_seconds
+        time_remaining = self.deadline - elapsed
         
-        # Get environment parameters
-        overhead = self.restart_overhead
-        gap = self.env.gap_seconds
+        # Calculate the critical threshold time required to finish on On-Demand.
+        # We assume the worst-case scenario where we must switch instance types immediately,
+        # incurring the restart_overhead.
+        # We add a safety buffer of 2 time steps (gap_seconds) to account for discrete time steps
+        # and ensure we switch before it's mathematically impossible to finish.
+        safety_buffer = 2.0 * self.env.gap_seconds
+        required_time_on_od = remaining_work + self.restart_overhead + safety_buffer
         
-        # Calculate Safety Threshold
-        # We must switch to On-Demand (OD) if we are close to running out of time.
-        # The absolute minimum time to finish on OD is: work_remaining + overhead (boot time).
-        # We add a safety buffer consisting of:
-        # 1. Another 'overhead' duration: To account for the worst case where we try Spot, 
-        #    pay the boot penalty, fail immediately, and then have to switch to OD (paying overhead again).
-        # 2. Multiple 'gap' durations: To handle the discrete nature of the simulation steps.
-        #    We ensure we don't cross the point-of-no-return between two steps.
-        
-        safety_buffer = (2.0 * overhead) + (5.0 * gap)
-        panic_threshold = work_remaining + safety_buffer
-        
-        # Decision Logic
-        if time_left < panic_threshold:
-            # Panic Mode: We are too close to the deadline to risk waiting or Spot interruptions.
-            # Use On-Demand to guarantee completion.
+        # Critical Condition: If time remaining is tight, force On-Demand usage.
+        # This guarantees meeting the deadline (assuming On-Demand availability).
+        if time_remaining <= required_time_on_od:
             return ClusterType.ON_DEMAND
-        else:
-            # Normal Mode: We have slack. Prioritize cost savings.
-            if has_spot:
-                # Use Spot instances as they are significantly cheaper.
-                return ClusterType.SPOT
-            else:
-                # Spot is unavailable, but we have enough time to wait.
-                # Pausing (NONE) incurs no cost.
-                return ClusterType.NONE
+            
+        # Optimization Strategy (Slack available):
+        # 1. Prefer Spot instances as they are significantly cheaper.
+        if has_spot:
+            return ClusterType.SPOT
+            
+        # 2. If Spot is unavailable but we still have slack (time_remaining > required_time_on_od),
+        #    choose NONE (pause). This incurs 0 cost while waiting for Spot availability,
+        #    utilizing the slack time to minimize total cost.
+        return ClusterType.NONE
 
     @classmethod
     def _from_args(cls, parser):

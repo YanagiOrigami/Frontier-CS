@@ -1,88 +1,117 @@
+import math
+from typing import Any, Optional, Iterable
+
 from sky_spot.strategies.strategy import Strategy
 from sky_spot.utils import ClusterType
-import argparse
+
 
 class Solution(Strategy):
-    NAME = "wait_spot_last_safe_od"
+    NAME = "safe_spot_then_od_commit_v1"
 
-    def __init__(self, args=None):
-        try:
-            super().__init__(args)
-        except TypeError:
-            super().__init__()
-        # Configurable safety fudge multiplier relative to gap_seconds
-        self._fudge_mult = 0.0
-        if args is not None and hasattr(args, "fudge_mult"):
-            try:
-                self._fudge_mult = float(args.fudge_mult)
-            except Exception:
-                self._fudge_mult = 0.0
-        self._lock_on_demand = False
+    def __init__(self, args: Optional[Any] = None):
+        self.args = args
+        self.committed_to_on_demand = False
+        self._last_done_len = -1
+        self._cached_done = 0.0
 
     def solve(self, spec_path: str) -> "Solution":
         return self
 
-    def _remaining_work(self):
-        done = 0.0
-        try:
-            if self.task_done_time:
-                done = float(sum(self.task_done_time))
-        except Exception:
-            done = 0.0
-        rem = max(0.0, float(self.task_duration) - done)
+    def _sum_done(self, segments: Optional[Iterable]) -> float:
+        if not segments:
+            return 0.0
+        total = 0.0
+        for seg in segments:
+            try:
+                if isinstance(seg, (int, float)):
+                    v = float(seg)
+                    if v > 0:
+                        total += v
+                elif isinstance(seg, (list, tuple)) and len(seg) >= 2:
+                    a, b = seg[0], seg[1]
+                    af = float(a)
+                    bf = float(b)
+                    if bf > af:
+                        total += (bf - af)
+                else:
+                    # Fallback: try to cast to float directly
+                    v = float(seg)
+                    if v > 0:
+                        total += v
+            except Exception:
+                # Ignore malformed segments
+                continue
+        return total
+
+    def _work_done_seconds(self) -> float:
+        segs = getattr(self, "task_done_time", None)
+        # Simple cache based on length; conservative if segments mutate in place
+        if isinstance(segs, list):
+            if len(segs) == self._last_done_len:
+                return self._cached_done
+            done = self._sum_done(segs)
+            self._cached_done = min(done, float(getattr(self, "task_duration", done)))
+            self._last_done_len = len(segs)
+            return self._cached_done
+        # If not list, compute directly
+        done = self._sum_done(segs)
+        return min(done, float(getattr(self, "task_duration", done)))
+
+    def _remaining_work_seconds(self) -> float:
+        total = float(getattr(self, "task_duration", 0.0) or 0.0)
+        done = self._work_done_seconds()
+        rem = total - done
+        if rem < 0:
+            return 0.0
         return rem
 
     def _step(self, last_cluster_type: ClusterType, has_spot: bool) -> ClusterType:
-        # Persist with on-demand once we commit (reduces risk near deadline)
-        if self._lock_on_demand:
-            # If completed, stop
-            if self._remaining_work() <= 0.0:
-                return ClusterType.NONE
-            return ClusterType.ON_DEMAND
+        # Defensive fetches
+        now = float(getattr(self.env, "elapsed_seconds", 0.0) or 0.0)
+        gap = float(getattr(self.env, "gap_seconds", 60.0) or 60.0)
+        deadline = float(getattr(self, "deadline", now + 1e9) or (now + 1e9))
+        restart_overhead = float(getattr(self, "restart_overhead", 0.0) or 0.0)
 
-        t = float(self.env.elapsed_seconds)
-        g = float(self.env.gap_seconds)
-        D = float(self.deadline)
-        O = float(self.restart_overhead)
-        R = self._remaining_work()
+        # Conservative remaining work calculation
+        remaining_work = self._remaining_work_seconds()
 
-        if R <= 0.0:
+        # If nothing remains, do nothing (environment should stop soon)
+        if remaining_work <= 0.0:
             return ClusterType.NONE
 
-        fudge = self._fudge_mult * g
-        # Latest safe time considering an immediate restart overhead if we need to start computing
-        Lprime = D - R - O - fudge
+        # Safety buffer to account for step discretization and modeling mismatch
+        # Choose a small buffer: min(1.5 * gap, 0.3 * overhead)
+        # This keeps us slightly conservative without sacrificing too much cost.
+        safety_buffer = max(0.0, min(1.5 * gap, 0.3 * restart_overhead))
 
-        # If time is beyond safe threshold, immediately switch to on-demand and lock
-        if t > Lprime:
-            self._lock_on_demand = True
+        time_left = deadline - now
+        if time_left <= 0:
+            # Already at/past deadline; best effort is OD
+            self.committed_to_on_demand = True
             return ClusterType.ON_DEMAND
 
-        # If Spot is available and safe to run this step, use Spot
+        # Determine if we must commit to OD to guarantee deadline.
+        # Worst-case assumption from this point forward: no more spot progress.
+        # So to finish, we need: overhead (if switching to OD) + remaining_work <= time_left
+        overhead_if_switching = 0.0
+        if not self.committed_to_on_demand and last_cluster_type != ClusterType.ON_DEMAND:
+            overhead_if_switching = restart_overhead
+
+        must_commit_now = (time_left <= (remaining_work + overhead_if_switching + safety_buffer))
+
+        if must_commit_now:
+            self.committed_to_on_demand = True
+
+        if self.committed_to_on_demand:
+            return ClusterType.ON_DEMAND
+
+        # Opportunistic phase: prefer SPOT when available, otherwise wait (NONE)
         if has_spot:
-            # Safe to spend this step on Spot; even if Spot disappears next step,
-            # we can still switch to OD with overhead and finish by D.
-            # Condition: t + O + R <= D (i.e., t <= Lprime)
-            if t <= Lprime:
-                return ClusterType.SPOT
-            # Otherwise we must secure completion now on OD
-            self._lock_on_demand = True
-            return ClusterType.ON_DEMAND
-
-        # Spot not available: decide to wait or switch to OD
-        # Safe to wait this step only if starting OD next step (with overhead) still finishes
-        # i.e., t + g + O + R <= D  -> t <= Lprime - g
-        if t <= Lprime - g:
+            return ClusterType.SPOT
+        else:
             return ClusterType.NONE
-
-        # Not safe to wait any longer; must switch to OD now and lock
-        self._lock_on_demand = True
-        return ClusterType.ON_DEMAND
 
     @classmethod
     def _from_args(cls, parser):
-        if not isinstance(parser, argparse.ArgumentParser):
-            parser = argparse.ArgumentParser()
-        parser.add_argument("--fudge-mult", type=float, default=0.0, help="Safety margin multiplier on gap_seconds.")
         args, _ = parser.parse_known_args()
         return cls(args)

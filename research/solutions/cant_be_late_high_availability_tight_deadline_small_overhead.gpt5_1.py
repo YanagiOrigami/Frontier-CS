@@ -1,74 +1,132 @@
+from typing import Any, Optional, List, Tuple
 from sky_spot.strategies.strategy import Strategy
 from sky_spot.utils import ClusterType
 
 
 class Solution(Strategy):
-    NAME = "cant_be_late_scheduler_v1"
+    NAME = "safe_hedged_deadline"
 
-    def __init__(self, args=None):
+    def __init__(self, args: Optional[Any] = None):
         super().__init__(args)
-        self.commit_to_od = False
-        self._paused_steps = 0
+        self.args = args
+        self.committed_to_od: bool = False
+        self._cache_reset()
+
+    def _cache_reset(self):
+        self._cached_done_sum: float = 0.0
+        self._cached_len: int = 0
+        self._last_env_start_seen: float = -1.0
 
     def solve(self, spec_path: str) -> "Solution":
         return self
 
-    def _buffer_seconds(self):
-        # Dynamic safety buffer to account for step granularity and restart overhead.
-        gap = getattr(self.env, "gap_seconds", 60.0)
-        ro = getattr(self, "restart_overhead", 0.0)
-        # Ensure buffer covers at least one full step plus overhead, preferably two steps if small
-        return max(2 * gap, ro + gap)
-
-    def _total_done(self):
-        try:
-            return sum(self.task_done_time) if self.task_done_time else 0.0
-        except Exception:
+    def _get_work_done(self) -> float:
+        tdt = self.task_done_time
+        if tdt is None:
             return 0.0
+        try:
+            current_len = len(tdt)
+        except TypeError:
+            # Not iterable, try to cast directly
+            try:
+                return float(tdt)
+            except Exception:
+                return 0.0
 
-    def _need_commit(self, t_left, remaining_work):
-        # Time needed if switching to OD now: remaining work + one restart overhead (if not already on OD)
-        overhead_if_switch = 0.0
-        if self.env.cluster_type != ClusterType.ON_DEMAND:
-            overhead_if_switch = self.restart_overhead
-        needed_if_od = remaining_work + overhead_if_switch
-        return t_left <= (needed_if_od + self._buffer_seconds())
+        # Detect reset/new run by non-monotonic progression in elapsed_seconds
+        # or if list length decreased.
+        if self.env is not None:
+            if self.env.elapsed_seconds is not None:
+                if self._last_env_start_seen > self.env.elapsed_seconds:
+                    # New environment/run started
+                    self._cache_reset()
+                self._last_env_start_seen = self.env.elapsed_seconds
+
+        if current_len < self._cached_len:
+            # List was replaced/trimmed; recompute
+            self._cached_done_sum = 0.0
+            self._cached_len = 0
+
+        # Incrementally add new segments
+        for i in range(self._cached_len, current_len):
+            seg = tdt[i]
+            try:
+                if isinstance(seg, (tuple, list)):
+                    if len(seg) == 2:
+                        a, b = seg
+                        val = float(b) - float(a)
+                        if val > 0:
+                            self._cached_done_sum += val
+                    else:
+                        # Unsupported structure; try to sum contents
+                        try:
+                            self._cached_done_sum += sum(float(x) for x in seg)  # type: ignore
+                        except Exception:
+                            pass
+                elif isinstance(seg, (int, float)):
+                    self._cached_done_sum += float(seg)
+                else:
+                    # Try generic 'duration' attribute
+                    try:
+                        self._cached_done_sum += float(getattr(seg, "duration", 0.0))  # type: ignore
+                    except Exception:
+                        pass
+            except Exception:
+                # Ignore malformed entries
+                pass
+
+        self._cached_len = current_len
+        return max(0.0, min(float(self.task_duration), self._cached_done_sum))
+
+    def _remaining_work_seconds(self) -> float:
+        done = self._get_work_done()
+        rem = float(self.task_duration) - float(done)
+        if rem < 0:
+            rem = 0.0
+        return rem
+
+    def _commit_margin_seconds(self, gap: float) -> float:
+        # Margin to safely wait an additional step considering discrete time.
+        # One step margin is sufficient for worst-case no-progress over the next step.
+        return float(gap)
 
     def _step(self, last_cluster_type: ClusterType, has_spot: bool) -> ClusterType:
-        done = self._total_done()
-        remaining_work = max(self.task_duration - done, 0.0)
+        # Detect fresh run start: reset commitment and caches if at time 0
+        try:
+            if self.env.elapsed_seconds == 0:
+                self.committed_to_od = False
+                self._cache_reset()
+        except Exception:
+            pass
+
+        # If already committed to On-Demand, stay there
+        if self.committed_to_od or last_cluster_type == ClusterType.ON_DEMAND:
+            self.committed_to_od = True
+            return ClusterType.ON_DEMAND
+
+        remaining_work = self._remaining_work_seconds()
         if remaining_work <= 0.0:
-            self.commit_to_od = False
             return ClusterType.NONE
 
-        t_left = max(self.deadline - self.env.elapsed_seconds, 0.0)
-        gap = self.env.gap_seconds
+        elapsed = float(self.env.elapsed_seconds)
+        deadline = float(self.deadline)
+        gap = float(self.env.gap_seconds)
+        time_remaining = max(0.0, deadline - elapsed)
 
-        # Reevaluate commit decision each step
-        if not self.commit_to_od and self._need_commit(t_left, remaining_work):
-            self.commit_to_od = True
+        # Safety check: can we afford to wait one more step (possibly with zero progress)
+        margin = self._commit_margin_seconds(gap)
+        safe_to_wait = (time_remaining - (remaining_work + float(self.restart_overhead))) > margin
 
-        if self.commit_to_od:
-            self._paused_steps = 0
+        if not safe_to_wait:
+            # Commit to On-Demand to ensure completion
+            self.committed_to_od = True
             return ClusterType.ON_DEMAND
 
-        # Not committed: prefer Spot when available
+        # Safe to wait: prefer Spot if available; otherwise pause
         if has_spot:
-            self._paused_steps = 0
             return ClusterType.SPOT
-
-        # Spot unavailable: decide to wait or start OD early
-        # If waiting one step would make us miss the deadline (considering overhead), commit now.
-        overhead_if_switch = self.restart_overhead
-        buffer_sec = self._buffer_seconds()
-        if (t_left - gap) <= (remaining_work + overhead_if_switch + buffer_sec):
-            self.commit_to_od = True
-            self._paused_steps = 0
-            return ClusterType.ON_DEMAND
-
-        # Otherwise wait this step for Spot
-        self._paused_steps += 1
-        return ClusterType.NONE
+        else:
+            return ClusterType.NONE
 
     @classmethod
     def _from_args(cls, parser):

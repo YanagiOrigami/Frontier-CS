@@ -1,82 +1,79 @@
-import numpy as np
+import math
 from sky_spot.strategies.strategy import Strategy
 from sky_spot.utils import ClusterType
 
 class Solution(Strategy):
     NAME = "my_solution"
     
-    def solve(self, spec_path: str) -> "Solution":
-        # Initialize strategy parameters
-        self.spot_price = 0.97
-        self.od_price = 3.06
-        self.spot_od_ratio = self.spot_price / self.od_price
-        
-        # Conservative parameters for safety
-        self.min_safety_margin = 4 * 3600  # 4 hours in seconds
-        self.switch_to_od_threshold = 0.25
-        self.switch_to_spot_threshold = 0.35
-        
-        # State tracking
-        self.current_progress = 0.0
-        self.last_decision = None
+    def __init__(self, args):
+        super().__init__()
+        self.args = args
+        self.price_spot = 0.97
+        self.price_ondemand = 3.06
+        self.safety_buffer = 1.5  # hours of safety buffer
+        self.min_spot_run = 0.5   # minimum hours to run spot before considering switch
+        self.last_spot_start = -1000
         self.consecutive_spot_failures = 0
-        self.spot_availability_history = []
         
+    def solve(self, spec_path: str) -> "Solution":
         return self
     
     def _step(self, last_cluster_type: ClusterType, has_spot: bool) -> ClusterType:
-        # Update progress tracking
-        work_done = sum(self.task_done_time) if self.task_done_time else 0
-        progress = work_done / self.task_duration
-        self.current_progress = progress
+        # Calculate work done and remaining
+        total_done = sum(end - start for start, end in self.task_done_time)
+        remaining_work = max(0, self.task_duration - total_done)
+        current_time = self.env.elapsed_seconds / 3600.0
+        remaining_time = (self.deadline - self.env.elapsed_seconds) / 3600.0
+        restart_hours = self.restart_overhead / 3600.0
         
-        # Update spot availability history
-        self.spot_availability_history.append(has_spot)
-        if len(self.spot_availability_history) > 100:
-            self.spot_availability_history.pop(0)
-        
-        # Calculate remaining time and work
-        remaining_time = self.deadline - self.env.elapsed_seconds
-        remaining_work = self.task_duration - work_done
-        
-        # Calculate conservative time needed
-        time_needed_no_overhead = remaining_work
-        if self.env.cluster_type != last_cluster_type and last_cluster_type != ClusterType.NONE:
-            # Account for potential restart if we just switched
-            time_needed_no_overhead += self.restart_overhead
-        
-        # Calculate urgency factor (0 = plenty of time, 1 = critical)
-        slack_time = remaining_time - time_needed_no_overhead
-        urgency = max(0.0, 1.0 - (slack_time / (self.min_safety_margin * 2)))
-        
-        # Calculate spot reliability from history
-        if self.spot_availability_history:
-            spot_reliability = sum(self.spot_availability_history) / len(self.spot_availability_history)
-        else:
-            spot_reliability = 0.5
-        
-        # Determine decision
-        if urgency > self.switch_to_od_threshold:
-            # High urgency: use on-demand to guarantee completion
-            if has_spot and urgency < self.switch_to_spot_threshold:
-                # Moderate urgency with spot available
-                if spot_reliability > 0.6:
-                    return ClusterType.SPOT
+        # If work is done, stop
+        if remaining_work <= 0:
+            return ClusterType.NONE
+            
+        # If we're at risk of missing deadline, use on-demand
+        time_needed = remaining_work + restart_hours  # worst case with one restart
+        if remaining_time < time_needed * self.safety_buffer:
             return ClusterType.ON_DEMAND
-        else:
-            # Low urgency: prefer spot when available
-            if has_spot:
-                # Use spot if we have good reliability or enough time to recover
-                if spot_reliability > 0.4 or slack_time > 2 * self.restart_overhead:
+        
+        # If spot is available and we haven't had too many failures recently
+        if has_spot:
+            # Check if we should continue with current cluster type
+            if last_cluster_type == ClusterType.SPOT:
+                self.consecutive_spot_failures = 0
+                # Calculate expected completion time if we continue with spot
+                spot_progress_per_hour = self.env.gap_seconds / 3600.0
+                expected_hours = remaining_work / spot_progress_per_hour
+                
+                # If we can finish with spot and have buffer, stay with spot
+                if remaining_time > expected_hours * 1.2:
                     return ClusterType.SPOT
-                else:
-                    return ClusterType.NONE
-            else:
-                # No spot available, wait for it if we have time
-                if slack_time > self.restart_overhead:
-                    return ClusterType.NONE
+                # Otherwise switch to on-demand to be safe
                 else:
                     return ClusterType.ON_DEMAND
+                    
+            # If we're currently on on-demand, check if we should switch back to spot
+            elif last_cluster_type == ClusterType.ON_DEMAND:
+                # Only switch if we have significant time savings and buffer
+                if remaining_time > (remaining_work + restart_hours) * 2.0:
+                    hours_since_spot_start = current_time - self.last_spot_start
+                    if hours_since_spot_start > self.min_spot_run or self.consecutive_spot_failures < 2:
+                        return ClusterType.SPOT
+                        
+            # If we're currently on NONE, start with spot if available
+            else:
+                return ClusterType.SPOT
+        else:
+            # Spot not available
+            if last_cluster_type == ClusterType.SPOT:
+                self.consecutive_spot_failures += 1
+                self.last_spot_start = current_time
+                
+            # Use on-demand if we need to make progress, otherwise wait
+            if remaining_time < remaining_work * 1.5:
+                return ClusterType.ON_DEMAND
+                
+        # Default to on-demand for safety
+        return ClusterType.ON_DEMAND
     
     @classmethod
     def _from_args(cls, parser):

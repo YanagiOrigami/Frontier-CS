@@ -5,25 +5,27 @@ class Solution(Strategy):
     NAME = "my_solution"
 
     def solve(self, spec_path: str) -> "Solution":
-        self.total_completed = 0.0
-        self._last_len = 0
+        self.guarantee_mode = False
         return self
 
     def _step(self, last_cluster_type: ClusterType, has_spot: bool) -> ClusterType:
-        current_len = len(self.task_done_time)
-        if current_len > self._last_len:
-            self.total_completed += sum(self.task_done_time[self._last_len:current_len])
-            self._last_len = current_len
-        remaining_work = self.task_duration - self.total_completed
+        total_done = sum(self.task_done_time)
+        remaining_work = max(0.0, self.task_duration - total_done)
+        remaining_time = max(0.0, self.deadline - self.env.elapsed_seconds)
         if remaining_work <= 0:
             return ClusterType.NONE
-        time_left = self.deadline - self.env.elapsed_seconds
-        if time_left <= 0:
-            return ClusterType.NONE
-        slack = time_left - remaining_work
-        if has_spot and slack >= self.restart_overhead:
+        slack = remaining_time - remaining_work
+        if self.guarantee_mode:
+            return ClusterType.ON_DEMAND
+        if has_spot:
             return ClusterType.SPOT
-        return ClusterType.ON_DEMAND
+        else:
+            threshold = 2 * self.restart_overhead
+            if slack > threshold:
+                return ClusterType.NONE
+            else:
+                self.guarantee_mode = True
+                return ClusterType.ON_DEMAND
 
     @classmethod
     def _from_args(cls, parser):

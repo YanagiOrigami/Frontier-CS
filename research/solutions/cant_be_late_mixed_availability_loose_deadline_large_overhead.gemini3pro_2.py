@@ -2,60 +2,53 @@ from sky_spot.strategies.strategy import Strategy
 from sky_spot.utils import ClusterType
 
 class Solution(Strategy):
-    NAME = "CostAwareDeadlineStrategy"
+    NAME = "CantBeLateStrategy"
+
+    def __init__(self, args):
+        self.args = args
 
     def solve(self, spec_path: str) -> "Solution":
         return self
 
     def _step(self, last_cluster_type: ClusterType, has_spot: bool) -> ClusterType:
-        # Retrieve environment state
+        # Current state
         elapsed = self.env.elapsed_seconds
-        # Calculate total work done (sum of segments)
-        work_done = sum(self.task_done_time)
-        # Remaining work to be done
-        work_rem = max(0.0, self.task_duration - work_done)
-        # Remaining time until deadline
-        time_rem = self.deadline - elapsed
-        
-        # If work is completed, stop using resources
-        if work_rem <= 0:
-            return ClusterType.NONE
-
-        # Parameters for decision boundaries
-        overhead = self.restart_overhead
         gap = self.env.gap_seconds
+        deadline = self.deadline
+        overhead = self.restart_overhead
         
-        # Safety Buffer Calculation:
-        # We need to guarantee completion on On-Demand (OD).
-        # Worst case: we are currently stopped or on Spot, so we must pay overhead to start OD.
-        # Time needed = work_rem + overhead
-        # We add buffers for:
-        # 1. Simulation step size (gap): we might make decision slightly late
-        # 2. Extra safety margin: to prevent failing due to tight tolerances
-        # Using 1.5x overhead as fixed buffer + 2 steps of gap
-        safety_buffer = (overhead * 1.5) + (gap * 2.0)
+        # Calculate progress
+        work_done = sum(self.task_done_time)
+        remaining_work = self.task_duration - work_done
         
-        # The critical time threshold. If remaining time drops below this, we risk missing the deadline.
-        panic_threshold = work_rem + overhead + safety_buffer
+        if remaining_work <= 0:
+            return ClusterType.NONE
+            
+        remaining_time = deadline - elapsed
+        slack = remaining_time - remaining_work
         
-        # 1. Panic Rule: Time is too tight, must use reliable OD
-        if time_rem < panic_threshold:
+        # Panic Threshold:
+        # We need at least 'overhead' time to start/restart an instance.
+        # We add a safety buffer of 4 simulation steps to handle granularity.
+        # If slack falls below this, we must use On-Demand to guarantee the deadline.
+        panic_threshold = overhead + (4.0 * gap)
+        
+        if slack < panic_threshold:
             return ClusterType.ON_DEMAND
             
-        # 2. Hysteresis Rule: If we are already on OD and are reasonably close to the panic threshold,
-        # stay on OD. This prevents oscillating (Spot <-> OD) which incurs multiple overhead penalties.
-        # We define a band above the panic threshold where we "stick" to OD.
-        hysteresis_band = overhead * 2.0
-        if last_cluster_type == ClusterType.ON_DEMAND:
-            if time_rem < panic_threshold + hysteresis_band:
-                return ClusterType.ON_DEMAND
-
-        # 3. Opportunity Rule: If Spot is available and we have slack, use it (Cheapest option)
         if has_spot:
+            # Spot is available and we have slack.
+            # Optimization: If we are currently on OD and the remaining work is very short,
+            # switching to Spot might be more expensive due to the restart overhead cost.
+            # Heuristic: stay on OD if remaining work < 0.5 * overhead.
+            if last_cluster_type == ClusterType.ON_DEMAND and remaining_work < (overhead * 0.5):
+                return ClusterType.ON_DEMAND
+                
             return ClusterType.SPOT
-            
-        # 4. Wait Rule: No Spot, but plenty of slack. Wait for Spot to return to save money.
-        return ClusterType.NONE
+        else:
+            # No Spot available, but we have plenty of slack.
+            # Wait (NONE) to save money.
+            return ClusterType.NONE
 
     @classmethod
     def _from_args(cls, parser):

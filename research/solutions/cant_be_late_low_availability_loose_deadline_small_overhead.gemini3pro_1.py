@@ -1,8 +1,9 @@
+import argparse
 from sky_spot.strategies.strategy import Strategy
 from sky_spot.utils import ClusterType
 
 class Solution(Strategy):
-    NAME = "my_solution"
+    NAME = "CantBeLateSolution"
 
     def __init__(self, args):
         super().__init__(args)
@@ -11,42 +12,45 @@ class Solution(Strategy):
         return self
 
     def _step(self, last_cluster_type: ClusterType, has_spot: bool) -> ClusterType:
-        # Calculate progress and remaining work
-        work_done = sum(self.task_done_time)
-        remaining_work = self.task_duration - work_done
-        
-        if remaining_work <= 0:
-            return ClusterType.NONE
-
-        current_time = self.env.elapsed_seconds
+        # Retrieve environment state (all units in seconds)
+        elapsed = self.env.elapsed_seconds
         deadline = self.deadline
-        overhead = self.restart_overhead
         gap = self.env.gap_seconds
-
-        # Calculate safety margin
-        # We need to account for discrete time steps and potential overheads.
-        # Margin ensures we switch to OD before it's strictly too late.
-        # 3 * gap ensures we don't miss the deadline due to step granularity.
-        # 300s adds a fixed safety buffer.
-        margin = 3 * gap + 300
-
-        # Calculate latest start time for On-Demand to guarantee completion.
-        # We assume worst case: we must restart/incur overhead to run OD.
-        # This provides a hysteresis effect: if we are on OD, we won't switch back
-        # to Spot unless we have enough slack to absorb the overhead and still be safe.
-        time_needed = remaining_work + overhead
-        time_left = deadline - current_time
-
-        # If we are close to the point of no return, force On-Demand
-        if time_left <= time_needed + margin:
-            return ClusterType.ON_DEMAND
-
-        # Otherwise, try to use Spot to save cost
-        if has_spot:
-            return ClusterType.SPOT
+        overhead = self.restart_overhead
         
-        # If Spot is unavailable but we have slack, wait (pause)
-        return ClusterType.NONE
+        # Calculate remaining work
+        # self.task_done_time is a list of completed segment durations
+        done = sum(self.task_done_time)
+        total = self.task_duration
+        remaining_work = max(0.0, total - done)
+        
+        # If work is completed, stop
+        if remaining_work <= 1e-6:
+            return ClusterType.NONE
+            
+        remaining_time = deadline - elapsed
+        
+        # Define a safety buffer (2 time steps) to handle simulation granularity
+        buffer = 2.0 * gap
+        
+        # Calculate the critical threshold.
+        # We must ensure that T_rem >= W_rem + Overhead + Buffer.
+        # The overhead is included to account for the cost of starting an OD instance
+        # if we are not currently on one, or simply as a safety margin against flapping.
+        threshold = remaining_work + overhead + buffer
+        
+        # Criticality check: If we are running out of time, force On-Demand usage.
+        if remaining_time <= threshold:
+            return ClusterType.ON_DEMAND
+            
+        # If we have sufficient slack, prioritize cost optimization.
+        if has_spot:
+            # Use Spot instances when available (cheapest option)
+            return ClusterType.SPOT
+        else:
+            # If Spot is unavailable but we have slack, wait (pause) 
+            # to avoid paying high On-Demand costs unnecessarily.
+            return ClusterType.NONE
 
     @classmethod
     def _from_args(cls, parser):

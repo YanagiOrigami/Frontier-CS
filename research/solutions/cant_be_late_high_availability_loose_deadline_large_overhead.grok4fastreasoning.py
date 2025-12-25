@@ -4,21 +4,24 @@ from sky_spot.utils import ClusterType
 class Solution(Strategy):
     NAME = "my_solution"
 
+    def __init__(self, args):
+        super().__init__(args)
+
     def solve(self, spec_path: str) -> "Solution":
         return self
 
     def _step(self, last_cluster_type: ClusterType, has_spot: bool) -> ClusterType:
         done = sum(self.task_done_time)
-        remaining_work = self.task_duration - done
-        if remaining_work <= 0:
+        if self.task_duration <= done:
             return ClusterType.NONE
-        remaining_time = self.deadline - self.env.elapsed_seconds
-        if remaining_time <= 0:
-            return ClusterType.NONE
-        buffer = 5 * self.restart_overhead
-        if has_spot and remaining_time > remaining_work + buffer:
-            return ClusterType.SPOT
-        return ClusterType.ON_DEMAND
+        remaining = self.task_duration - done
+        elapsed = self.env.elapsed_seconds
+        time_left = self.deadline - elapsed
+        slack = time_left - remaining
+        safety = 3 * self.restart_overhead
+        if not has_spot or slack < safety:
+            return ClusterType.ON_DEMAND
+        return ClusterType.SPOT
 
     @classmethod
     def _from_args(cls, parser):

@@ -1,72 +1,76 @@
+from typing import Any
 from sky_spot.strategies.strategy import Strategy
 from sky_spot.utils import ClusterType
 
 
 class Solution(Strategy):
-    NAME = "cbl_robust_commit"
+    NAME = "cant_be_late_spot_guard"
 
-    def __init__(self, args=None):
-        try:
-            super().__init__(args)
-        except TypeError:
-            try:
-                super().__init__()
-            except Exception:
-                pass
-        self._committed_to_od = False
+    def __init__(self, args: Any = None):
+        super().__init__(args)
+        self._committed_od = False
 
     def solve(self, spec_path: str) -> "Solution":
         return self
 
     def _remaining_work(self) -> float:
-        try:
-            done = sum(self.task_done_time) if self.task_done_time else 0.0
-        except Exception:
-            done = 0.0
-        remaining = self.task_duration - done
-        if remaining < 0:
-            remaining = 0.0
-        return remaining
+        done = sum(self.task_done_time) if self.task_done_time else 0.0
+        return max(0.0, self.task_duration - done)
 
     def _step(self, last_cluster_type: ClusterType, has_spot: bool) -> ClusterType:
-        # If already committed to on-demand, keep using it to avoid overheads and guarantee finish
-        if self._committed_to_od:
-            return ClusterType.ON_DEMAND
+        # If currently on-demand, stick to it to avoid extra overhead or risk.
+        if last_cluster_type == ClusterType.ON_DEMAND:
+            self._committed_od = True
 
-        now = float(getattr(self.env, "elapsed_seconds", 0.0) or 0.0)
-        gap = float(getattr(self.env, "gap_seconds", 0.0) or 0.0)
-        deadline = float(self.deadline)
         remaining_work = self._remaining_work()
-
-        # If task already done (safety), do nothing
         if remaining_work <= 0.0:
             return ClusterType.NONE
 
-        remaining_time = deadline - now
-        # Safety: if out of time, urgently use OD
-        if remaining_time <= 0.0:
-            self._committed_to_od = True
+        time_left = self.deadline - self.env.elapsed_seconds
+        if time_left <= 0.0:
+            # Best effort: choose on-demand
+            self._committed_od = True
             return ClusterType.ON_DEMAND
 
-        # Compose a conservative margin:
-        # - restart_overhead buffer for a single switch
-        # - 2 step gaps to handle discretization and decision latency
-        # - extra 10 minutes safety window
-        restart_overhead = float(getattr(self, "restart_overhead", 0.0) or 0.0)
-        conservative_margin = restart_overhead + 2.0 * gap + 600.0  # seconds
+        gap = self.env.gap_seconds
+        overhead = self.restart_overhead
+        safety_margin = max(gap * 2.0, 60.0)
 
-        slack = remaining_time - remaining_work  # time we can waste before needing OD nonstop
-
-        # If slack is at or below the conservative margin, commit to OD to guarantee finish
-        if slack <= conservative_margin:
-            self._committed_to_od = True
+        if self._committed_od:
             return ClusterType.ON_DEMAND
 
-        # Opportunistic phase: use SPOT when available, otherwise wait
+        # Compute whether we must commit to OD now to meet deadline.
+        od_overhead_if_switch_now = 0.0 if last_cluster_type == ClusterType.ON_DEMAND else overhead
+        must_commit_od = time_left <= (remaining_work + od_overhead_if_switch_now + safety_margin)
+        if must_commit_od:
+            self._committed_od = True
+            return ClusterType.ON_DEMAND
+
+        # Prefer SPOT if available and safe.
         if has_spot:
-            return ClusterType.SPOT
+            # If we are already on SPOT, no new overhead to continue.
+            start_spot_overhead_now = 0.0 if last_cluster_type == ClusterType.SPOT else overhead
+            # Ensure we have slack to pay potential SPOT overhead now and still fall back to OD later if needed.
+            safe_to_start_spot = time_left > (remaining_work + overhead + start_spot_overhead_now + safety_margin)
+            if safe_to_start_spot:
+                return ClusterType.SPOT
+            else:
+                # Not safe to start SPOT. Decide whether to wait a step or commit to OD now.
+                # Safe to wait one step if after waiting we still can finish with OD (including OD overhead).
+                will_be_safe_after_wait = (time_left - gap) > (remaining_work + overhead + safety_margin)
+                if will_be_safe_after_wait:
+                    return ClusterType.NONE
+                else:
+                    self._committed_od = True
+                    return ClusterType.ON_DEMAND
 
-        return ClusterType.NONE
+        # Spot unavailable: consider waiting if safe; else commit to OD.
+        will_be_safe_after_wait = (time_left - gap) > (remaining_work + overhead + safety_margin)
+        if will_be_safe_after_wait:
+            return ClusterType.NONE
+        else:
+            self._committed_od = True
+            return ClusterType.ON_DEMAND
 
     @classmethod
     def _from_args(cls, parser):

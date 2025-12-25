@@ -1,55 +1,58 @@
 import argparse
-
 from sky_spot.strategies.strategy import Strategy
 from sky_spot.utils import ClusterType
-
 
 class Solution(Strategy):
     NAME = "my_solution"
 
-    CRITICAL_SLACK_SECONDS = 180.0 + 10.0
-    COMFORTABLE_SLACK_SECONDS = 2.0 * 3600.0
+    def __init__(self, args):
+        super().__init__(args)
+        self.deadline_cushion = None
+        self.wait_cushion = None
+        self.finish_up_threshold = None
+        self.initialized = False
 
     def solve(self, spec_path: str) -> "Solution":
-        self.last_work_done: float = 0.0
-        self.pending_overhead: float = 0.0
         return self
 
+    def _initialize_params(self):
+        deadline_cushion_multiplier = 4
+        wait_cushion_multiplier = 20
+        finish_up_multiplier = 5
+
+        self.deadline_cushion = deadline_cushion_multiplier * self.restart_overhead
+        self.wait_cushion = wait_cushion_multiplier * self.restart_overhead
+        self.finish_up_threshold = finish_up_multiplier * self.env.gap_seconds
+        
+        self.initialized = True
+
     def _step(self, last_cluster_type: ClusterType, has_spot: bool) -> ClusterType:
-        current_work_done = sum(self.task_done_time)
-        progress = current_work_done - self.last_work_done
+        if not self.initialized:
+            self._initialize_params()
 
-        is_preempted = (last_cluster_type == ClusterType.SPOT and
-                        progress < self.env.gap_seconds * 0.1)
+        work_done = sum(end - start for start, end in self.task_done_time)
+        work_remaining = self.task_duration - work_done
 
-        if is_preempted:
-            self.pending_overhead = self.restart_overhead
-        elif progress > 0:
-            self.pending_overhead = max(0.0, self.pending_overhead - progress)
+        if work_remaining <= 0:
+            return ClusterType.NONE
 
-        base_work_remaining = self.task_duration - current_work_done
-        effective_work_remaining = base_work_remaining + self.pending_overhead
+        if work_remaining < self.finish_up_threshold:
+            return ClusterType.ON_DEMAND
 
-        time_left_to_deadline = self.deadline - self.env.elapsed_seconds
-
-        slack = time_left_to_deadline - effective_work_remaining
-
-        decision: ClusterType
-
-        if slack <= self.CRITICAL_SLACK_SECONDS:
-            decision = ClusterType.ON_DEMAND
+        time_to_deadline = self.deadline - self.env.elapsed_seconds
+        
+        current_slack = time_to_deadline - work_remaining
+        
+        if current_slack <= self.deadline_cushion:
+            return ClusterType.ON_DEMAND
+            
+        if has_spot:
+            return ClusterType.SPOT
+        
+        if current_slack <= self.wait_cushion:
+            return ClusterType.ON_DEMAND
         else:
-            if has_spot:
-                decision = ClusterType.SPOT
-            else:
-                if slack > self.COMFORTABLE_SLACK_SECONDS:
-                    decision = ClusterType.NONE
-                else:
-                    decision = ClusterType.ON_DEMAND
-
-        self.last_work_done = current_work_done
-
-        return decision
+            return ClusterType.NONE
 
     @classmethod
     def _from_args(cls, parser: argparse.ArgumentParser):

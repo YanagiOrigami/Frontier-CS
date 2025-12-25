@@ -2,58 +2,63 @@ from sky_spot.strategies.strategy import Strategy
 from sky_spot.utils import ClusterType
 
 class Solution(Strategy):
-    NAME = "CantBeLateSolution"
+    NAME = "CostOptimizedStrategy"
 
     def solve(self, spec_path: str) -> "Solution":
+        """
+        Initialize strategy. Returns self as per API requirements.
+        """
         return self
 
     def _step(self, last_cluster_type: ClusterType, has_spot: bool) -> ClusterType:
-        # 1. Calculate remaining work and time
-        current_time = self.env.elapsed_seconds
-        work_done = sum(self.task_done_time)
-        work_remaining = self.task_duration - work_done
-        
-        # If work is effectively done, stop
-        if work_remaining <= 1e-6:
+        """
+        Decides the cluster type for the current time step based on deadline constraints
+        and cost minimization.
+        """
+        # Calculate remaining work
+        total_done = sum(self.task_done_time)
+        work_remaining = self.task_duration - total_done
+
+        # If work is complete, do nothing
+        if work_remaining <= 0:
             return ClusterType.NONE
 
-        time_until_deadline = self.deadline - current_time
-        
-        # 2. Calculate Slack
-        # We calculate slack conservatively: "How much extra time do we have 
-        # if we were forced to restart On-Demand right now?"
-        # We include restart_overhead to prevent flapping (switching back and forth)
-        # when close to the buffer threshold.
-        time_required_conservative = work_remaining + self.restart_overhead
-        slack = time_until_deadline - time_required_conservative
-        
-        # 3. Define Safety Buffer
-        # Reserve a buffer to handle simulation time steps and overhead risks.
-        # 1800 seconds (30 mins) is safe given the large total slack (22h).
-        # We also ensure it covers at least 2 simulation steps.
-        gap = self.env.gap_seconds if hasattr(self.env, 'gap_seconds') else 300
-        safety_buffer = max(1800.0, gap * 2.0)
+        # Calculate time remaining until deadline
+        time_remaining = self.deadline - self.env.elapsed_seconds
 
-        # 4. Decision Logic
+        # Determine the "Panic Threshold":
+        # If we wait too long, we won't be able to finish even with guaranteed On-Demand instances.
+        # We must account for:
+        # 1. The actual work remaining.
+        # 2. The restart overhead (incurred if we switch to On-Demand or start from stopped).
+        # 3. A safety buffer to handle the discrete time step granularity (gap_seconds).
+        #
+        # If we switch to OD, we might pay 'restart_overhead'.
+        # We check the condition every 'gap_seconds'.
+        # We need: time_remaining > work_remaining + restart_overhead
+        # To be safe against stepping over the limit between checks, we add a buffer of ~2 gaps.
         
-        # Case A: Panic Mode
-        # If our slack is running out, we must prioritize completion over cost.
-        # We switch to (or stay on) On-Demand to guarantee the deadline is met.
-        if slack < safety_buffer:
+        safety_buffer = 2.5 * self.env.gap_seconds
+        panic_threshold = work_remaining + self.restart_overhead + safety_buffer
+
+        # Critical Condition: If slack is exhausted, force On-Demand to guarantee completion.
+        if time_remaining < panic_threshold:
             return ClusterType.ON_DEMAND
-            
-        # Case B: Standard Mode
-        # If we have sufficient slack, we prioritize cost.
-        # If Spot instances are available, use them.
+
+        # Cost Optimization Strategy:
+        # If we have sufficient slack (above panic threshold):
+        # - Use Spot instances if available (cheapest option).
+        # - If Spot is unavailable, return NONE (pause) to save money and wait for Spot,
+        #   consuming slack rather than paying for expensive On-Demand.
         if has_spot:
             return ClusterType.SPOT
-            
-        # Case C: Wait Mode
-        # If Spot is unavailable but we have plenty of slack, we wait (NONE).
-        # This avoids the high cost of On-Demand, effectively trading slack for potential savings.
-        return ClusterType.NONE
+        else:
+            return ClusterType.NONE
 
     @classmethod
     def _from_args(cls, parser):
+        """
+        Required classmethod for evaluator instantiation.
+        """
         args, _ = parser.parse_known_args()
         return cls(args)

@@ -1,15 +1,47 @@
 import json
 from argparse import Namespace
-import sys
 
 from sky_spot.strategies.multi_strategy import MultiRegionStrategy
 from sky_spot.utils import ClusterType
 
 
 class Solution(MultiRegionStrategy):
-    NAME = "adaptive_deadline_aware_switcher"
+    """
+    An adaptive, multi-region scheduling strategy that balances the low cost of
+    Spot instances with the reliability of On-Demand instances to meet a deadline.
+
+    The core logic is as follows:
+    1.  **Safety First (Panic Mode)**: It continuously calculates the time
+        required to finish the job using only On-Demand instances. If the
+        time remaining to the deadline gets dangerously close to this
+        worst-case completion time, it switches to On-Demand exclusively to
+        guarantee finishing on time and avoid a massive penalty.
+
+    2.  **Cost Optimization (Opportunistic Spot)**: When not in danger of
+        missing the deadline, the strategy aggressively uses Spot instances
+        whenever they are available, as this is the most cost-effective option.
+
+    3.  **Intelligent Recovery (Spot Unavailability)**: When Spot is unavailable
+        in the current region, the strategy employs a two-part recovery mechanism:
+        a.  **Region Hopping**: If Spot has been down for a short period, it
+            assumes the outage might be local and switches to a different region.
+            The choice of the new region is based on historical data, prioritizing
+            regions that have demonstrated higher Spot availability in the past.
+            This prevents wasting time in a region with a prolonged outage.
+        b.  **Adaptive Waiting**: For the current time step (while Spot is
+            unavailable), it decides between waiting (ClusterType.NONE) or
+            making progress with On-Demand. This decision is based on the
+            current "slack" time. If there's ample slack, it waits to save
+            costs. If the schedule is getting tighter, it uses On-Demand to
+            avoid falling behind.
+    """
+    NAME = "AdaptiveHedgingStrategy"
 
     def solve(self, spec_path: str) -> "Solution":
+        """
+        Initializes the solution from a spec file, setting up strategy
+        parameters and state-tracking variables.
+        """
         with open(spec_path) as f:
             config = json.load(f)
 
@@ -21,60 +53,77 @@ class Solution(MultiRegionStrategy):
         )
         super().__init__(args)
 
-        self.initialized = False
+        self.num_regions = self.env.get_num_regions()
+
+        # Track historical spot availability with a neutral Bayesian prior.
+        # Starting with (1 hit / 2 attempts) implies a 50% belief.
+        self.region_spot_hits = [1.0] * self.num_regions
+        self.region_spot_attempts = [2.0] * self.num_regions
+
+        # Tracks consecutive time steps in the current region without spot.
+        self.current_outage_streak = 0
+
+        # --- Heuristic Parameters ---
+        self.OUTAGE_STREAK_SWITCH_THRESHOLD = 1
+        self.WAIT_SLACK_THRESHOLD_MULTIPLIER = 5.0
+        self.PANIC_BUFFER_SECONDS = self.env.gap_seconds * 1.0
+
         return self
 
-    def _initialize(self):
-        if self.initialized:
-            return
-        
-        num_regions = self.env.get_num_regions()
-        
-        self.last_spot_failure_time = [-1.0] * num_regions
-        self.SAFETY_MARGIN_FACTOR = 1.5
-
-        self.initialized = True
-
     def _step(self, last_cluster_type: ClusterType, has_spot: bool) -> ClusterType:
-        self._initialize()
+        """
+        Decides the next action (cluster type and potential region switch)
+        at each time step.
+        """
+        # Calculate current progress and time remaining.
+        work_done = sum(self.task_done_time)
+        work_remaining = self.task_duration - work_done
 
-        remaining_work = self.task_duration - sum(self.task_done_time)
-        if remaining_work <= 0:
+        if work_remaining <= 0:
             return ClusterType.NONE
 
-        elapsed_seconds = self.env.elapsed_seconds
-        time_to_deadline = self.deadline - elapsed_seconds
-
-        min_time_to_finish_reliably = remaining_work + self.remaining_restart_overhead
-        current_slack = time_to_deadline - min_time_to_finish_reliably
-
-        safety_margin = self.SAFETY_MARGIN_FACTOR * self.restart_overhead
-        is_panicking = current_slack <= safety_margin
-
-        if is_panicking:
-            return ClusterType.ON_DEMAND
-
+        time_to_deadline = self.deadline - self.env.elapsed_seconds
         current_region = self.env.get_current_region()
 
+        # Update historical statistics for the current region.
+        self.region_spot_attempts[current_region] += 1.0
         if has_spot:
-            self.last_spot_failure_time[current_region] = -1.0
-            return ClusterType.SPOT
+            self.region_spot_hits[current_region] += 1.0
+            self.current_outage_streak = 0
         else:
-            self.last_spot_failure_time[current_region] = elapsed_seconds
+            self.current_outage_streak += 1
 
-            num_regions = self.env.get_num_regions()
-            if num_regions > 1:
-                best_next_region = -1
-                min_failure_time = float('inf')
+        # Calculate the time needed to finish if we use On-Demand from now on.
+        time_needed_on_demand = work_remaining + self.restart_overhead
 
-                for r in range(num_regions):
-                    if r == current_region:
-                        continue
-                    if self.last_spot_failure_time[r] < min_failure_time:
-                        min_failure_time = self.last_spot_failure_time[r]
-                        best_next_region = r
-                
-                if best_next_region != -1:
-                    self.env.switch_region(best_next_region)
-            
+        # 1. Panic Mode: If deadline is too close, use On-Demand to guarantee completion.
+        if time_to_deadline <= time_needed_on_demand + self.PANIC_BUFFER_SECONDS:
+            return ClusterType.ON_DEMAND
+
+        # 2. Normal Mode: If spot is available, always use it.
+        if has_spot:
+            return ClusterType.SPOT
+
+        # 3. Recovery Mode: Spot is unavailable.
+        # 3a. Decide whether to switch regions for the next step.
+        if self.num_regions > 1 and self.current_outage_streak >= self.OUTAGE_STREAK_SWITCH_THRESHOLD:
+            candidate_regions = [
+                (i, self.region_spot_hits[i] / self.region_spot_attempts[i])
+                for i in range(self.num_regions) if i != current_region
+            ]
+            if candidate_regions:
+                # Pick the region with the best historical spot success rate.
+                best_region_idx, _ = max(candidate_regions, key=lambda item: item[1])
+                self.env.switch_region(best_region_idx)
+                self.current_outage_streak = 0  # Reset streak after switching.
+
+        # 3b. Decide cluster type for the current step (where spot is down).
+        safe_slack_time = time_to_deadline - time_needed_on_demand
+        wait_threshold = self.WAIT_SLACK_THRESHOLD_MULTIPLIER * self.restart_overhead
+
+        if safe_slack_time > wait_threshold:
+            # If slack is plentiful, wait for spot to return (no cost).
+            return ClusterType.NONE
+        else:
+            # If slack is tight, use On-Demand to make progress.
             return ClusterType.ON_DEMAND

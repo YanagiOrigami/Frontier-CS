@@ -1,152 +1,141 @@
-import math
+import time
+from typing import Dict, Any
 from sky_spot.strategies.strategy import Strategy
 from sky_spot.utils import ClusterType
 
 class Solution(Strategy):
-    NAME = "my_solution"
+    NAME = "efficient_hybrid_scheduler"
     
-    def __init__(self, args):
-        super().__init__(args)
-        self.remaining_work = 0.0
-        self.spot_history = []
-        self.consecutive_spot_uptime = 0
-        self.time_since_last_restart = 0
-        self.spot_unavailable_counter = 0
-        self.conservative_mode = False
-        self.urgent_mode = False
-        self.last_decision = ClusterType.NONE
-        
     def solve(self, spec_path: str) -> "Solution":
+        # Initialize state variables
+        self.state = {
+            'spot_availability_history': [],
+            'current_restart_timer': 0,
+            'consecutive_spot_failures': 0,
+            'spot_reliability': 0.6,  # Conservative initial estimate
+            'critical_zone_start': self.deadline - 6 * 3600,  # Last 6 hours
+            'spot_streak': 0,
+            'last_decision': ClusterType.NONE,
+            'progress_rate': 0.0,
+            'work_done': 0.0,
+            'last_work_time': 0.0,
+            'safety_buffer': 2 * self.restart_overhead,
+        }
         return self
     
-    def _calculate_required_progress_rate(self, time_remaining, work_remaining, overhead_buffer=0.0):
-        if time_remaining <= 0:
-            return float('inf')
-        return max(0.0, work_remaining / (time_remaining - overhead_buffer))
-    
-    def _should_use_ondemand_emergency(self, time_remaining, work_remaining):
-        min_time_with_overhead = work_remaining + self.restart_overhead
-        safety_factor = 1.2
-        return time_remaining < min_time_with_overhead * safety_factor
-    
-    def _get_spot_reliability_estimate(self):
-        if len(self.spot_history) < 10:
-            return 0.7
-        recent_history = self.spot_history[-10:]
-        available_count = sum(1 for available in recent_history if available)
-        return available_count / len(recent_history)
-    
     def _step(self, last_cluster_type: ClusterType, has_spot: bool) -> ClusterType:
-        self.spot_history.append(has_spot)
-        if len(self.spot_history) > 100:
-            self.spot_history.pop(0)
+        # Update spot availability history
+        self.state['spot_availability_history'].append(has_spot)
+        if len(self.state['spot_availability_history']) > 100:
+            self.state['spot_availability_history'].pop(0)
         
-        current_time = self.env.elapsed_seconds
-        time_remaining = self.deadline - current_time
+        # Calculate current progress metrics
+        elapsed = self.env.elapsed_seconds
+        gap = self.env.gap_seconds
         
-        if not hasattr(self, 'initial_work_remaining'):
-            self.initial_work_remaining = self.task_duration
-            self.remaining_work = self.task_duration
+        # Update restart timer
+        if self.state['current_restart_timer'] > 0:
+            self.state['current_restart_timer'] = max(0, self.state['current_restart_timer'] - gap)
         
-        total_done = sum(self.task_done_time)
-        self.remaining_work = max(0.0, self.task_duration - total_done)
+        # Calculate work done in last interval if we were running
+        if last_cluster_type != ClusterType.NONE and self.state['current_restart_timer'] == 0:
+            work_done = gap
+            self.state['work_done'] += work_done
+            self.state['last_work_time'] = elapsed
         
-        if self.remaining_work <= 0:
-            return ClusterType.NONE
+        # Calculate remaining work and time
+        total_done = sum(self.task_done_time) if self.task_done_time else 0
+        remaining_work = self.task_duration - total_done
+        time_remaining = self.deadline - elapsed
         
-        if time_remaining <= 0:
-            return ClusterType.ON_DEMAND
+        # Calculate progress rate (work per second)
+        if elapsed > 0:
+            self.state['progress_rate'] = total_done / elapsed
         
-        if last_cluster_type == ClusterType.SPOT:
-            if has_spot:
-                self.consecutive_spot_uptime += self.env.gap_seconds
-                self.time_since_last_restart += self.env.gap_seconds
-                self.spot_unavailable_counter = 0
-            else:
-                self.spot_unavailable_counter += 1
-                self.consecutive_spot_uptime = 0
-        elif last_cluster_type == ClusterType.ON_DEMAND:
-            self.time_since_last_restart += self.env.gap_seconds
-            self.spot_unavailable_counter = 0
+        # Update spot reliability estimate
+        if len(self.state['spot_availability_history']) >= 10:
+            recent = self.state['spot_availability_history'][-10:]
+            self.state['spot_reliability'] = sum(recent) / len(recent)
+        
+        # Update consecutive spot failures
+        if not has_spot and last_cluster_type == ClusterType.SPOT:
+            self.state['consecutive_spot_failures'] += 1
         else:
-            self.time_since_last_restart += self.env.gap_seconds
+            self.state['consecutive_spot_failures'] = 0
         
-        if self.time_since_last_restart > 3600:
-            self.time_since_last_restart = 3600
-        
-        required_rate = self._calculate_required_progress_rate(
-            time_remaining, 
-            self.remaining_work,
-            overhead_buffer=self.restart_overhead * 2
-        )
-        
-        emergency = self._should_use_ondemand_emergency(time_remaining, self.remaining_work)
-        
-        if emergency:
-            return ClusterType.ON_DEMAND
-        
-        spot_reliability = self._get_spot_reliability_estimate()
-        
-        time_until_deadline_ratio = time_remaining / (self.deadline * 0.5)
-        work_ratio = self.remaining_work / self.initial_work_remaining
-        
-        if time_until_deadline_ratio < 0.3 or work_ratio > 0.8:
-            self.conservative_mode = True
+        # Update spot streak
+        if last_cluster_type == ClusterType.SPOT and has_spot:
+            self.state['spot_streak'] += 1
         else:
-            self.conservative_mode = False
-            
-        if time_until_deadline_ratio < 0.15 or work_ratio > 0.95:
-            self.urgent_mode = True
-        else:
-            self.urgent_mode = False
+            self.state['spot_streak'] = 0
         
-        if self.urgent_mode:
-            if has_spot and spot_reliability > 0.8 and self.consecutive_spot_uptime > 1800:
-                return ClusterType.SPOT
-            return ClusterType.ON_DEMAND
-        
-        if self.conservative_mode:
-            if has_spot and spot_reliability > 0.7 and self.consecutive_spot_uptime > 900:
-                return ClusterType.SPOT
-            if not has_spot and time_remaining > self.remaining_work * 1.5:
-                return ClusterType.NONE
-            return ClusterType.ON_DEMAND
-        
-        if has_spot:
-            if spot_reliability < 0.5 and self.spot_unavailable_counter > 3:
-                if time_remaining > self.remaining_work * 2:
-                    return ClusterType.NONE
+        # CRITICAL: If we're in the final stretch and behind schedule, use on-demand
+        if elapsed >= self.state['critical_zone_start']:
+            expected_time_remaining = remaining_work / self.state['progress_rate'] if self.state['progress_rate'] > 0 else float('inf')
+            if expected_time_remaining > time_remaining - self.state['safety_buffer']:
+                self.state['last_decision'] = ClusterType.ON_DEMAND
                 return ClusterType.ON_DEMAND
-            
-            if self.time_since_last_restart < self.restart_overhead * 0.5:
-                if last_cluster_type == ClusterType.NONE:
-                    return ClusterType.NONE
-            
-            time_advantage = time_remaining - self.remaining_work
-            risk_tolerance = min(1.0, time_advantage / (self.restart_overhead * 5))
-            
-            if spot_reliability > 0.6 or risk_tolerance > 0.3:
-                if self.consecutive_spot_uptime > 300 or self.time_since_last_restart > 600:
-                    return ClusterType.SPOT
-            
-            if last_cluster_type == ClusterType.SPOT and self.consecutive_spot_uptime > 60:
-                return ClusterType.SPOT
-            
-            if spot_reliability > 0.4 and risk_tolerance > 0.5:
-                return ClusterType.SPOT
-            
-            if time_remaining > self.remaining_work * 3:
-                return ClusterType.SPOT
         
-        if not has_spot:
-            if time_remaining > self.remaining_work * 1.8:
-                if self.spot_unavailable_counter < 5:
-                    return ClusterType.NONE
-            
-            if time_remaining > self.remaining_work * 1.3 and spot_reliability > 0.4:
-                return ClusterType.NONE
+        # Calculate conservative time estimate with spot
+        spot_success_prob = max(0.01, self.state['spot_reliability'] - 0.1)  # Conservative estimate
+        expected_spot_time = remaining_work / spot_success_prob if spot_success_prob > 0 else float('inf')
+        expected_spot_time += self.state['consecutive_spot_failures'] * self.restart_overhead
         
-        return ClusterType.ON_DEMAND
+        # Calculate on-demand time
+        ondemand_time = remaining_work
+        if last_cluster_type != ClusterType.ON_DEMAND:
+            ondemand_time += self.restart_overhead - self.state['current_restart_timer']
+        
+        # Decision logic
+        decision = ClusterType.NONE
+        
+        # If spot has been reliable recently and we have time, try spot
+        if (has_spot and 
+            self.state['spot_streak'] >= 3 and  # Spot has been stable
+            expected_spot_time < time_remaining - self.state['safety_buffer'] and
+            self.state['consecutive_spot_failures'] < 2):
+            
+            decision = ClusterType.SPOT
+        
+        # If spot is available but we're more cautious
+        elif (has_spot and
+              expected_spot_time < time_remaining - self.state['safety_buffer'] * 2 and
+              remaining_work > gap * 5):  # Enough work left to justify overhead
+            
+            # Only use spot if reliability is decent
+            if self.state['spot_reliability'] > 0.4:
+                decision = ClusterType.SPOT
+        
+        # If we're falling behind or spot is unreliable, use on-demand
+        elif (ondemand_time > time_remaining - self.state['safety_buffer'] or
+              (not has_spot and remaining_work > 0) or
+              self.state['consecutive_spot_failures'] >= 3):
+            
+            decision = ClusterType.ON_DEMAND
+        
+        # If we're ahead of schedule and spot isn't available, wait
+        elif (remaining_work > 0 and 
+              ondemand_time < time_remaining - self.state['safety_buffer'] * 3):
+            
+            decision = ClusterType.NONE
+        
+        # Default to on-demand if we have work to do
+        elif remaining_work > 0:
+            decision = ClusterType.ON_DEMAND
+        
+        # Safety check: don't use spot if unavailable
+        if decision == ClusterType.SPOT and not has_spot:
+            decision = ClusterType.ON_DEMAND if remaining_work > 0 else ClusterType.NONE
+        
+        # Update restart timer if switching to a running state
+        if (decision != ClusterType.NONE and 
+            decision != last_cluster_type and
+            last_cluster_type != ClusterType.NONE):
+            
+            self.state['current_restart_timer'] = self.restart_overhead
+        
+        self.state['last_decision'] = decision
+        return decision
     
     @classmethod
     def _from_args(cls, parser):

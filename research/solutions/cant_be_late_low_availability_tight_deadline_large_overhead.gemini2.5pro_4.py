@@ -1,117 +1,97 @@
 import collections
-import argparse
 
 from sky_spot.strategies.strategy import Strategy
 from sky_spot.utils import ClusterType
 
+
 class Solution(Strategy):
-    """
-    This strategy employs a multi-layered heuristic to balance cost and completion risk.
+    NAME = "my_solution"
 
-    1.  **Panic Mode:** A primary, conservative check determines if the job is at immediate risk of
-        failing to meet the deadline. If the time remaining is less than the work remaining plus
-        the overhead of one potential spot instance preemption, the strategy switches to guaranteed
-        On-Demand instances to ensure completion. This acts as a critical safety net.
-
-    2.  **Availability-Aware Spot Usage:** When not in panic mode, the strategy estimates the recent
-        spot instance availability using a sliding window of past observations. It will only choose
-        to use a spot instance if the estimated availability is above a certain threshold. This
-        threshold is set higher than the simple cost-benefit breakeven point to account for
-        the time cost of restart overheads. If spot is available but the estimated
-        availability is too low, the strategy conservatively uses On-Demand to avoid the high risk
-        of preemption.
-
-    3.  **Slack-Based Waiting:** If spot instances are not available, the strategy must decide between
-        incurring cost to make progress with On-Demand or waiting for spot to become available
-        (at no cost). This decision is based on the current "slack time" (the difference between
-        the time remaining to deadline and the work remaining). If the slack is above a configured
-        threshold, the strategy chooses to wait. If the slack is dwindling, it opts to use On-Demand
-        to avoid falling behind schedule.
-    """
-    NAME = "AdaptiveHybrid"
-
-    # The number of past time steps to consider for estimating spot availability.
-    HISTORY_WINDOW_SIZE = 120
-
-    # The minimum estimated spot availability required to choose SPOT over ON_DEMAND.
-    # Spot/On-Demand price ratio is ~0.32. This is higher to be conservative.
-    AVAILABILITY_THRESHOLD = 0.40
-
-    # Slack threshold for waiting (vs using OD) as a multiple of restart_overhead.
-    WAIT_SLACK_FACTOR = 3.0
+    # --- Hyperparameters ---
+    # If slack is less than this multiple of restart_overhead, force On-Demand.
+    CRITICAL_THRESHOLD_RATIO = 1.2
+    # When deciding to wait, slack must be > (expected_wait * factor) + critical_buffer.
+    WAIT_SAFETY_FACTOR = 1.5
+    # Length of the moving average window for spot availability (in steps).
+    HISTORY_LEN = 720
+    # Minimum number of historical data points before trusting the availability estimate.
+    MIN_HISTORY_FOR_ESTIMATE = 60
+    # If estimated availability is below this, don't bother waiting.
+    MIN_AVAILABILITY_TO_WAIT = 0.02
 
     def solve(self, spec_path: str) -> "Solution":
         """
         Initializes the strategy's state before the simulation begins.
         """
-        self.history = collections.deque(maxlen=self.HISTORY_WINDOW_SIZE)
-        self.spot_seen = 0
-        self.spot_available = 0
-
-        # Pre-calculate the slack threshold in seconds for the waiting decision.
-        self.wait_threshold_seconds = self.WAIT_SLACK_FACTOR * self.restart_overhead
+        self.critical_buffer = self.restart_overhead * self.CRITICAL_THRESHOLD_RATIO
+        
+        # State for maintaining a moving average of spot availability.
+        self.spot_history = collections.deque(maxlen=self.HISTORY_LEN)
+        self.spot_history_sum = 0
+        
+        # Caching for efficient calculation of total work done.
+        self.work_done_cache = 0.0
+        self.last_done_len = 0
         
         return self
 
     def _step(self, last_cluster_type: ClusterType, has_spot: bool) -> ClusterType:
         """
-        Makes a decision at each time step of the simulation.
+        The main decision-making logic, called at each time step.
         """
-        # 1. Update Availability Estimate
-        self.spot_seen += 1
-        self.history.append(1 if has_spot else 0)
-        if has_spot:
-            self.spot_available += 1
-        
-        # Use a cumulative average until the window is full for stability,
-        # then a sliding window for responsiveness.
-        if self.spot_seen < self.HISTORY_WINDOW_SIZE:
-            # Assume 50% availability if we have no data yet.
-            availability = self.spot_available / self.spot_seen if self.spot_seen > 0 else 0.5
-        else:
-            availability = sum(self.history) / self.HISTORY_WINDOW_SIZE
+        # 1. Update the moving average of spot availability.
+        is_spot_available = 1 if has_spot else 0
+        if len(self.spot_history) == self.HISTORY_LEN:
+            self.spot_history_sum -= self.spot_history[0]
+        self.spot_history.append(is_spot_available)
+        self.spot_history_sum += is_spot_available
 
-        # 2. Calculate Current Progress and Time
-        work_done = sum(end - start for start, end in self.task_done_time)
-        work_rem = self.task_duration - work_done
+        # 2. Calculate current work progress and remaining slack.
+        if len(self.task_done_time) > self.last_done_len:
+            for i in range(self.last_done_len, len(self.task_done_time)):
+                self.work_done_cache += self.task_done_time[i]['duration']
+            self.last_done_len = len(self.task_done_time)
+        work_done = self.work_done_cache
         
+        work_rem = self.task_duration - work_done
+
+        # If the task is finished, do nothing.
         if work_rem <= 0:
             return ClusterType.NONE
 
-        time_now = self.env.elapsed_seconds
-        time_rem = self.deadline - time_now
-        
-        if time_rem <= 0:
-             return ClusterType.ON_DEMAND
+        time_rem = self.deadline - self.env.elapsed_seconds
+        current_slack = time_rem - work_rem
 
-        # 3. PANIC MODE: Must use On-Demand to guarantee completion.
-        # This triggers if a single spot preemption would make it impossible to finish.
-        if work_rem >= time_rem - self.restart_overhead:
+        # 3. Core Decision Logic.
+        # 3a. Emergency Mode: If slack is critically low, use On-Demand.
+        if current_slack < self.critical_buffer:
+            return ClusterType.ON_DEMAND
+
+        # 3b. Ideal Case: If spot is available, always use it.
+        if has_spot:
+            return ClusterType.SPOT
+        
+        # 3c. Dilemma: No spot available. Decide between On-Demand and waiting (NONE).
+        if len(self.spot_history) < self.MIN_HISTORY_FOR_ESTIMATE:
             return ClusterType.ON_DEMAND
             
-        # 4. STANDARD DECISION LOGIC
-        if has_spot:
-            # Spot is available. Use if availability is high enough to be worth the risk.
-            if availability >= self.AVAILABILITY_THRESHOLD:
-                return ClusterType.SPOT
-            else:
-                # Availability is too low; use reliable On-Demand.
-                return ClusterType.ON_DEMAND
+        spot_availability = self.spot_history_sum / len(self.spot_history)
+
+        if spot_availability < self.MIN_AVAILABILITY_TO_WAIT:
+            return ClusterType.ON_DEMAND
+            
+        expected_wait_steps = 1.0 / spot_availability
+        expected_wait_time = self.env.gap_seconds * expected_wait_steps
+        
+        required_slack_to_wait = (expected_wait_time * self.WAIT_SAFETY_FACTOR) + self.critical_buffer
+        
+        if current_slack > required_slack_to_wait:
+            return ClusterType.NONE
         else:
-            # Spot not available. Wait (NONE) or work (ON_DEMAND)?
-            # Decision is based on how much slack time we have.
-            total_slack = time_rem - work_rem
-            if total_slack > self.wait_threshold_seconds:
-                # Plenty of slack, can afford to wait.
-                return ClusterType.NONE
-            else:
-                # Slack is low, better make progress with On-Demand.
-                return ClusterType.ON_DEMAND
+            return ClusterType.ON_DEMAND
 
     @classmethod
     def _from_args(cls, parser):
-        """
-        Required classmethod to instantiate the strategy from command-line arguments.
-        """
+        """Required method for evaluator instantiation."""
         args, _ = parser.parse_known_args()
         return cls(args)

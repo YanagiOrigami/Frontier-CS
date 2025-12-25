@@ -2,60 +2,62 @@ from sky_spot.strategies.strategy import Strategy
 from sky_spot.utils import ClusterType
 
 class Solution(Strategy):
-    NAME = "Solution"
+    NAME = "CantBeLateSolution"
 
     def solve(self, spec_path: str) -> "Solution":
+        """
+        Optional initialization. Called once before evaluation.
+        """
         return self
 
     def _step(self, last_cluster_type: ClusterType, has_spot: bool) -> ClusterType:
-        # Retrieve environment state
-        elapsed = self.env.elapsed_seconds
-        gap = self.env.gap_seconds
-        deadline = self.deadline
-        overhead = self.restart_overhead
-        total_duration = self.task_duration
+        """
+        Called at each time step. Return which cluster type to use next.
+        """
+        # Calculate progress and remaining work
+        # task_done_time is a list of completed work segment durations
+        progress = sum(self.task_done_time)
+        remaining_work = self.task_duration - progress
         
-        # Calculate work done and remaining work
-        # task_done_time is a list of durations of completed segments
-        work_done = sum(self.task_done_time)
-        remaining_work = max(0.0, total_duration - work_done)
-        
-        # If task is effectively complete, pause (env usually handles termination)
+        # If the task is effectively done, stop incurring costs
         if remaining_work <= 1e-6:
             return ClusterType.NONE
-            
-        time_left = deadline - elapsed
+
+        elapsed = self.env.elapsed_seconds
+        time_left = self.deadline - elapsed
         
-        # Panic Threshold Calculation
-        # We determine the latest possible time we can switch to On-Demand (OD)
-        # to guarantee finishing before the deadline.
-        #
-        # Components of the required time:
-        # 1. remaining_work: Actual compute time needed.
-        # 2. overhead: Time lost to initialization/restart. We include this even if 
-        #    currently running OD to ensure we don't switch away from OD when close to deadline (hysteresis).
-        # 3. Safety Buffer:
-        #    - 2.0 * gap: Account for the discrete decision interval (we might be 'gap' seconds late in reacting).
-        #    - 0.1 * overhead: Additional margin for simulation variances.
+        overhead = self.restart_overhead
+        gap = self.env.gap_seconds
         
-        safety_buffer = (2.0 * gap) + (0.1 * overhead)
-        must_start_od_time = remaining_work + overhead + safety_buffer
+        # SAFETY CHECK:
+        # We must ensure we finish before the deadline.
+        # Calculate the minimum time required to finish if we switch to On-Demand (OD) now.
+        # This includes the actual work time plus the restart overhead to spin up the OD instance.
+        min_time_required = remaining_work + overhead
         
-        # Decision Logic
+        # Calculate a safety buffer.
+        # We need to account for:
+        # 1. The current time step duration (gap), which might be "wasted" if we choose Spot and it fails.
+        # 2. Additional overhead margin to handle potential transition costs safely.
+        # 3. A robust multiplier to prevent deadline violations (penalty -100,000).
+        # Buffer = 2 * overhead + 5 * gap ensures we can survive a failed Spot attempt and still have time to restart OD.
+        safety_buffer = 2.0 * overhead + 5.0 * gap
         
-        # 1. Deadline Safety Override:
-        # If we are approaching the point of no return, force usage of On-Demand.
-        if time_left <= must_start_od_time:
+        # If we are within the panic threshold, force On-Demand usage.
+        if time_left < (min_time_required + safety_buffer):
             return ClusterType.ON_DEMAND
-            
-        # 2. Cost Optimization:
-        # If we have slack (time_left > must_start_od_time):
+
+        # COST OPTIMIZATION:
+        # If we have plenty of slack (time_left is large), we aim to minimize cost.
+        
         if has_spot:
-            # Prefer Spot instances to minimize cost
+            # If Spot is available, use it (cheapest option).
             return ClusterType.SPOT
         else:
-            # If Spot is unavailable but we have slack, wait (NONE).
-            # Waiting is free; running OD when not necessary is expensive.
+            # If Spot is unavailable but we still have slack, DO NOT use OD yet.
+            # Waiting (NONE) costs $0. Using OD costs ~$3.
+            # By waiting, we preserve the option to use Spot later when it becomes available.
+            # The Safety Check above guarantees we won't wait too long.
             return ClusterType.NONE
 
     @classmethod

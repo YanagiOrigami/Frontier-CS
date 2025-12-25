@@ -1,75 +1,100 @@
 import argparse
-
 from sky_spot.strategies.strategy import Strategy
 from sky_spot.utils import ClusterType
-
 
 class Solution(Strategy):
     NAME = "my_solution"
 
     def solve(self, spec_path: str) -> "Solution":
-        self.total_work_done = 0.0
-        self.last_work_done_len = 0
+        """
+        Optional initialization. Called once before evaluation.
+        Read spec_path for configuration if needed.
+        Must return self.
+        """
+        # This factor determines the safety buffer. A larger factor means switching
+        # to On-Demand earlier, making the strategy safer but potentially more
+        # expensive. The buffer is proportional to the remaining work.
+        # Given the high penalty for failure, a conservative value is chosen.
+        # Max theoretical factor is (deadline - task_duration) / task_duration
+        # For this problem: (70-48)/48 ~= 0.458. We use 0.35.
+        self.BUFFER_FACTOR = 0.35
 
-        # This value represents the "pressure" at which we switch
-        # from waiting (NONE) to using ON_DEMAND when spot is not available.
-        # Pressure = work_remaining / time_to_deadline
-        # Initial pressure = 48h/70h ~= 0.686. A pressure of 1.0 means no slack.
-        # A higher value is more aggressive (waits longer, saves money).
-        # A lower value is more conservative (uses OD earlier, costs more).
-        self.PRESSURE_THRESHOLD = 0.92
+        # State variables to track progress and events across steps
+        self.prev_total_work_done = 0.0
+        self.was_preempted = False
+        self.on_demand_mode = False  # A latch to stay on On-Demand once triggered
+
         return self
 
     def _step(self, last_cluster_type: ClusterType, has_spot: bool) -> ClusterType:
-        # 1. Update progress efficiently
-        if len(self.task_done_time) > self.last_work_done_len:
-            new_work = sum(self.task_done_time[self.last_work_done_len:])
-            self.total_work_done += new_work
-            self.last_work_done_len = len(self.task_done_time)
+        """
+        Called at each time step. Return which cluster type to use next.
 
-        # 2. Calculate current state
-        work_remaining = self.task_duration - self.total_work_done
+        The core logic is to maintain a "safety buffer" of time. If the
+        projected time to finish on reliable On-Demand instances eats into this
+        buffer, we switch to On-Demand permanently. Otherwise, we opportunistically
+        use cheap Spot instances or wait if they are unavailable.
+        """
+        # If we have already latched into On-Demand mode, stay there to guarantee completion.
+        if self.on_demand_mode:
+            return ClusterType.ON_DEMAND
 
-        if work_remaining <= 1e-9:
+        # --- State Update ---
+
+        # Calculate work done since the last step to detect preemptions.
+        current_work_done = sum(seg.duration for seg in self.task_done_time)
+        work_this_step = current_work_done - self.prev_total_work_done
+
+        # A preemption is detected if we used a Spot instance but made no progress.
+        # Conversely, if we made progress, any pending restart overhead is cleared.
+        if last_cluster_type == ClusterType.SPOT and work_this_step == 0 and self.env.elapsed_seconds > 0:
+            self.was_preempted = True
+        elif work_this_step > 0:
+            self.was_preempted = False
+        
+        self.prev_total_work_done = current_work_done
+
+        work_remaining = self.task_duration - current_work_done
+
+        # If the task is finished, do nothing to avoid incurring costs.
+        if work_remaining <= 0:
             return ClusterType.NONE
 
-        time_to_deadline = self.deadline - self.env.elapsed_seconds
+        # --- Decision Logic ---
 
-        # 3. Decision Logic - ordered by criticality
+        # Calculate the total time required to finish if we switch to On-Demand now.
+        # This must include any pending restart overhead from a previous preemption.
+        pending_overhead = self.restart_overhead if self.was_preempted else 0.0
+        on_demand_time_needed = work_remaining + pending_overhead
 
-        # Condition Red: Point of no return for On-Demand.
-        # If time left is less than or equal to work left, we must use the
-        # guaranteed On-Demand instance or we will fail.
-        if time_to_deadline <= work_remaining:
-            return ClusterType.ON_DEMAND
-
-        # Condition Orange: Point of no return for Spot.
-        # If there isn't enough time to absorb a `restart_overhead` from a
-        # preemption, we cannot risk using Spot. Must use On-Demand.
-        if has_spot and time_to_deadline <= work_remaining + self.restart_overhead:
-            return ClusterType.ON_DEMAND
-
-        # Best case: Spot is available and it's safe to use it.
-        if has_spot:
-            return ClusterType.SPOT
-
-        # No spot case: Decide whether to use costly On-Demand or wait (NONE).
+        # The safety buffer is dynamic, shrinking as the task nears completion.
+        safety_buffer = work_remaining * self.BUFFER_FACTOR
         
-        # Failsafe for division by zero.
-        if time_to_deadline <= 1e-9:
-            return ClusterType.ON_DEMAND
-            
-        pressure = work_remaining / time_to_deadline
+        # The estimated wall-clock time when the task would finish if run on On-Demand from now.
+        estimated_on_demand_finish_time = self.env.elapsed_seconds + on_demand_time_needed
         
-        if pressure > self.PRESSURE_THRESHOLD:
-            # Pressure is too high; our slack is too low for the work left.
-            # We must make progress using On-Demand.
+        # The effective deadline, moved earlier by our safety buffer.
+        deadline_with_buffer = self.deadline - safety_buffer
+
+        # The "urgency" condition: if the projected On-Demand finish time crosses our
+        # safety-buffered deadline, we must switch to On-Demand.
+        is_urgent = estimated_on_demand_finish_time >= deadline_with_buffer
+
+        if is_urgent:
+            self.on_demand_mode = True
             return ClusterType.ON_DEMAND
         else:
-            # Pressure is manageable. We can afford to wait for Spot to return.
-            return ClusterType.NONE
+            # We have enough slack time. Be cost-effective:
+            # use Spot if available, otherwise wait (cost-free).
+            if has_spot:
+                return ClusterType.SPOT
+            else:
+                return ClusterType.NONE
 
     @classmethod
-    def _from_args(cls, parser: argparse.ArgumentParser):
+    def _from_args(cls, parser):
+        """
+        Factory method required by the evaluator for instantiation.
+        """
         args, _ = parser.parse_known_args()
         return cls(args)

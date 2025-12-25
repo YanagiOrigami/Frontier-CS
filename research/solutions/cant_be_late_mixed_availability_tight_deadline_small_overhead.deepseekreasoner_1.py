@@ -5,129 +5,72 @@ from sky_spot.utils import ClusterType
 class Solution(Strategy):
     NAME = "my_solution"
     
-    def __init__(self, args):
+    def __init__(self, args=None):
         super().__init__(args)
-        self.spot_price = 0.97
-        self.ondemand_price = 3.06
-        self.spot_ratio = self.spot_price / self.ondemand_price
-        self.overhead_hours = 0.05
-        self.task_hours = 48
-        self.deadline_hours = 52
-        self.slack_hours = 4
-        self.overhead_budget = None
-        self.last_availability = None
-        self.spot_unavailable_count = 0
-        self.consecutive_spot_failures = 0
-        self.max_consecutive_failures = 5
-        self.panic_threshold = None
-        self.initialized = False
+        self.best_spot_window = None
+        self.safety_margin = None
+        self.critical_threshold = None
+        self.use_spot_probability = None
         
     def solve(self, spec_path: str) -> "Solution":
+        # Estimate parameters from typical values
+        # Task: 48h, Deadline: 52h, Overhead: 0.05h (3min)
+        # Prices: On-demand ~3.06$/hr, Spot ~0.97$/hr
+        
+        # Best case: finish with all spot (lower bound on cost)
+        # Worst case: use on-demand only (upper bound)
+        
+        # Strategy: Use spot when available unless:
+        # 1. We're in critical zone (must guarantee progress)
+        # 2. Recent spot availability has been poor
+        # 3. Restart overhead would cause deadline miss
+        
+        self.safety_margin = 0.1  # 10% safety margin
+        self.critical_threshold = 0.8  # Use on-demand when time left < threshold * work left
+        self.use_spot_probability = 0.7  # Base probability to use spot when available
+        
         return self
     
-    def _initialize_state(self):
-        if self.initialized:
-            return
-            
-        self.overhead_budget = self.slack_hours
-        hours_elapsed = self.env.elapsed_seconds / 3600
-        remaining_hours = self.deadline_hours - hours_elapsed
-        
-        remaining_work = self.task_hours - self._get_total_work_done()
-        
-        self.panic_threshold = remaining_work * 1.5 + self.overhead_hours
-        
-        if remaining_hours < self.panic_threshold:
-            self.overhead_budget = max(0, remaining_hours - remaining_work)
-        else:
-            self.overhead_budget = min(self.slack_hours, remaining_hours - remaining_work)
-        
-        self.initialized = True
-    
-    def _get_total_work_done(self):
-        total = 0
-        for start, end in self.task_done_time:
-            total += (end - start)
-        return total / 3600
-    
-    def _get_remaining_work(self):
-        done = self._get_total_work_done()
-        return max(0, self.task_hours - done)
-    
-    def _get_time_left(self):
-        hours_elapsed = self.env.elapsed_seconds / 3600
-        return max(0, self.deadline_hours - hours_elapsed)
-    
-    def _should_panic(self, remaining_work, time_left):
-        hours_elapsed = self.env.elapsed_seconds / 3600
-        
-        if hours_elapsed > self.deadline_hours * 0.8:
-            buffer_needed = remaining_work + self.overhead_hours
-            if time_left < buffer_needed:
-                return True
-        
-        buffer_ratio = time_left / remaining_work if remaining_work > 0 else float('inf')
-        return buffer_ratio < 1.2
-    
     def _step(self, last_cluster_type: ClusterType, has_spot: bool) -> ClusterType:
-        self._initialize_state()
-        
-        if not has_spot:
-            self.spot_unavailable_count += 1
-            self.consecutive_spot_failures += 1
-        else:
-            self.consecutive_spot_failures = 0
-        
-        self.last_availability = has_spot
-        
-        remaining_work = self._get_remaining_work()
-        time_left = self._get_time_left()
-        
-        if remaining_work <= 0:
+        # If task is done, do nothing
+        if len(self.task_done_time) * self.gap_seconds >= self.task_duration:
             return ClusterType.NONE
             
-        if time_left <= 0:
+        # Calculate remaining work and time
+        work_done = len(self.task_done_time) * self.gap_seconds
+        remaining_work = self.task_duration - work_done
+        time_left = self.deadline - self.env.elapsed_seconds
+        
+        # Critical condition: must use on-demand to guarantee progress
+        if time_left <= remaining_work + self.restart_overhead:
+            return ClusterType.ON_DEMAND
+        
+        # Calculate efficiency ratio
+        time_per_work = time_left / remaining_work if remaining_work > 0 else float('inf')
+        
+        # If we have plenty of time, try spot when available
+        if has_spot and time_per_work > self.critical_threshold:
+            # Use spot with probability based on time pressure
+            spot_prob = min(self.use_spot_probability, 
+                          (time_per_work - 1.0) / (self.critical_threshold - 1.0))
+            
+            # Adjust probability based on restart overhead impact
+            overhead_impact = self.restart_overhead / remaining_work if remaining_work > 0 else 0
+            spot_prob *= (1.0 - overhead_impact)
+            
+            # Use spot if probability threshold met
+            if spot_prob > 0.5:
+                return ClusterType.SPOT
+        
+        # If spot not available or we decided not to use it
+        if not has_spot or time_per_work <= self.critical_threshold:
+            # Use on-demand if we need to make progress
+            if remaining_work > 0 and time_left < remaining_work * (1.0 + self.safety_margin):
+                return ClusterType.ON_DEMAND
+            # Otherwise, wait for spot
             return ClusterType.NONE
         
-        hours_elapsed = self.env.elapsed_seconds / 3600
-        
-        if self._should_panic(remaining_work, time_left):
-            return ClusterType.ON_DEMAND
-        
-        step_hours = self.env.gap_seconds / 3600
-        can_afford_overhead = self.overhead_budget >= self.overhead_hours
-        
-        if has_spot and can_afford_overhead:
-            if self.consecutive_spot_failures >= self.max_consecutive_failures:
-                if remaining_work > time_left * 0.9:
-                    return ClusterType.ON_DEMAND
-            
-            spot_probability = min(1.0, (time_left - remaining_work) / self.slack_hours)
-            
-            if spot_probability > 0.3 or remaining_work > time_left * 0.7:
-                risk_factor = remaining_work / time_left
-                
-                if risk_factor < 0.8:
-                    self.overhead_budget -= step_hours
-                    return ClusterType.SPOT
-                else:
-                    if has_spot and hours_elapsed < self.deadline_hours * 0.6:
-                        self.overhead_budget -= step_hours
-                        return ClusterType.SPOT
-        
-        if remaining_work > time_left:
-            return ClusterType.ON_DEMAND
-        
-        if not has_spot and remaining_work < time_left * 0.9:
-            return ClusterType.NONE
-        
-        if hours_elapsed > self.deadline_hours * 0.9:
-            return ClusterType.ON_DEMAND
-        
-        if has_spot and self.overhead_budget > self.overhead_hours * 2:
-            self.overhead_budget -= step_hours
-            return ClusterType.SPOT
-        
+        # Default: use on-demand
         return ClusterType.ON_DEMAND
     
     @classmethod

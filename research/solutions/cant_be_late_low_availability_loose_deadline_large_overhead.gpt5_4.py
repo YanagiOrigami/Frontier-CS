@@ -1,59 +1,67 @@
-from typing import Any
 from sky_spot.strategies.strategy import Strategy
 from sky_spot.utils import ClusterType
 
 
 class Solution(Strategy):
-    NAME = "deadline_safe_threshold"
+    NAME = "just_in_time_od_cbla"
 
-    def __init__(self, args: Any = None):
+    def __init__(self, args=None):
         super().__init__(args)
-        self._commit_to_od = False
+        self._commit_od = False
+        self._sum_done_cache = 0.0
+        self._sum_done_cache_len = -1
 
     def solve(self, spec_path: str) -> "Solution":
         return self
 
+    def _remaining_work(self) -> float:
+        lst = getattr(self, "task_done_time", None)
+        if not lst:
+            return max(self.task_duration, 0.0)
+        n = len(lst)
+        if n != self._sum_done_cache_len:
+            self._sum_done_cache = sum(lst)
+            self._sum_done_cache_len = n
+        done = self._sum_done_cache
+        rem = self.task_duration - done
+        return rem if rem > 0.0 else 0.0
+
     def _step(self, last_cluster_type: ClusterType, has_spot: bool) -> ClusterType:
-        # If we've already started on-demand, stick with it to avoid extra restarts.
-        if self._commit_to_od or last_cluster_type == ClusterType.ON_DEMAND or getattr(self.env, "cluster_type", None) == ClusterType.ON_DEMAND:
-            self._commit_to_od = True
+        # If already committed to OD, stay on OD to avoid overhead and guarantee finish.
+        if self._commit_od:
             return ClusterType.ON_DEMAND
 
-        # Compute remaining work
-        completed = sum(self.task_done_time) if self.task_done_time else 0.0
-        remaining = max(0.0, self.task_duration - completed)
-
-        # If done, do nothing
-        if remaining <= 0:
+        # Compute remaining work and timing
+        remaining_work = self._remaining_work()
+        if remaining_work <= 0.0:
             return ClusterType.NONE
 
-        t = self.env.elapsed_seconds
+        elapsed = self.env.elapsed_seconds
+        ttd = self.deadline - elapsed  # time to deadline
         gap = self.env.gap_seconds
-        deadline = self.deadline
+
+        # If we haven't committed to OD yet, we must budget one restart overhead when switching to OD.
         overhead = self.restart_overhead
 
-        # Safety margin to account for discretization and overhead alignment
-        margin = 0.25 * gap
+        required_time_if_switch_to_od_now = remaining_work + overhead
 
-        # Latest safe time to start OD (including one restart overhead)
-        latest_od_start = deadline - remaining - overhead - margin
-
-        # If we are at/after the latest safe start time for OD, commit to OD
-        if t >= latest_od_start:
-            self._commit_to_od = True
+        # Safety checks and decisions
+        # If even switching to OD now can't finish, still choose OD (best effort).
+        if ttd < required_time_if_switch_to_od_now:
+            self._commit_od = True
             return ClusterType.ON_DEMAND
 
-        # Prefer spot if available while we're safely before the OD deadline
+        # Prefer SPOT when available (cost-efficient) as long as fallback remains feasible.
         if has_spot:
             return ClusterType.SPOT
 
-        # Spot unavailable: decide to wait or switch to OD
-        # Waiting one step is safe only if after waiting we can still start OD and finish
-        if t + gap <= latest_od_start:
+        # Spot unavailable: decide to wait or commit to OD.
+        # Safe to wait one step if after waiting we can still finish with OD (including overhead).
+        if (ttd - gap) >= required_time_if_switch_to_od_now:
             return ClusterType.NONE
 
-        # Not safe to wait any longer; start OD now and stick with it
-        self._commit_to_od = True
+        # Otherwise, must switch to OD now to guarantee finish.
+        self._commit_od = True
         return ClusterType.ON_DEMAND
 
     @classmethod

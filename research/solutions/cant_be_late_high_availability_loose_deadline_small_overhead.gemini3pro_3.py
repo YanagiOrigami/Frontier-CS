@@ -5,60 +5,47 @@ class Solution(Strategy):
     NAME = "CantBeLateSolution"
 
     def solve(self, spec_path: str) -> "Solution":
-        """
-        Optional initialization. Called once before evaluation.
-        """
         return self
 
     def _step(self, last_cluster_type: ClusterType, has_spot: bool) -> ClusterType:
-        """
-        Called at each time step. Return which cluster type to use next.
-        """
-        # Calculate remaining work based on completed segments
-        completed_work = sum(self.task_done_time)
-        remaining_work = self.task_duration - completed_work
+        # Calculate remaining work
+        # self.task_done_time is a list of completed segments
+        work_done = sum(self.task_done_time)
+        work_remaining = self.task_duration - work_done
         
-        # If task is effectively complete, stop
-        if remaining_work <= 1e-6:
+        # If work is effectively done, stop to save cost
+        if work_remaining <= 1e-6:
             return ClusterType.NONE
             
-        # Current environment state
+        # Current time and deadline
         elapsed = self.env.elapsed_seconds
         deadline = self.deadline
+        time_remaining = deadline - elapsed
+        
+        # Constants
         gap = self.env.gap_seconds
         overhead = self.restart_overhead
         
-        # Time remaining until hard deadline
-        time_left = deadline - elapsed
+        # Safety Threshold Calculation (Panic Line)
+        # We must ensure we have enough time to finish using On-Demand (OD) in the worst case.
+        # Time required on OD = Remaining Work + Restart Overhead (to launch/switch to OD)
+        # We add a safety buffer (2 * gap) to account for discrete time stepping and precision.
+        # This condition acts as a "Point of No Return". Once crossed, we switch to OD and stay there.
+        # We include overhead in the check to ensure that if we are NOT on OD, we leave enough room to switch.
+        # If we ARE on OD, this threshold ensures we don't switch back to Spot unless we have gained 
+        # significant slack (unlikely) and can afford the overhead to return to OD later.
         
-        # Safety Logic: Determine if we are close to the "Point of No Return".
-        # We must verify that if we waste the current step (by choosing NONE or getting preempted on SPOT),
-        # we still have enough time to finish the job using guaranteed ON_DEMAND instances.
+        panic_threshold = work_remaining + overhead + (2.0 * gap)
         
-        # Time available at the start of the next step
-        time_available_next = time_left - gap
-        
-        # Time required to finish on ON_DEMAND from a cold start:
-        # 1. Actual work remaining
-        # 2. Restart overhead (assumed needed if we are switching to OD)
-        # 3. Safety margin (2.0 * gap) to account for floating point jitter and step boundaries
-        required_time = remaining_work + overhead + (2.0 * gap)
-        
-        # If we are nearing the threshold, force ON_DEMAND execution
-        if time_available_next < required_time:
+        if time_remaining <= panic_threshold:
             return ClusterType.ON_DEMAND
-            
-        # Cost Optimization Logic:
-        # If we have sufficient slack time:
-        # 1. Prefer SPOT instances as they are significantly cheaper.
-        # 2. If SPOT is unavailable, choose NONE (wait). 
-        #    Waiting is free, whereas using ON_DEMAND is expensive.
-        #    Since we have slack, it is statistically better to wait for SPOT to return.
         
+        # If we have sufficient time buffer, prioritize cost savings
         if has_spot:
             return ClusterType.SPOT
-            
-        return ClusterType.NONE
+        else:
+            # If Spot is unavailable and we have slack, pause (NONE) to wait for Spot
+            return ClusterType.NONE
 
     @classmethod
     def _from_args(cls, parser):

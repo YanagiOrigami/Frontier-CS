@@ -1,4 +1,5 @@
 import json
+import collections
 from argparse import Namespace
 
 from sky_spot.strategies.multi_strategy import MultiRegionStrategy
@@ -8,7 +9,7 @@ from sky_spot.utils import ClusterType
 class Solution(MultiRegionStrategy):
     """Your multi-region scheduling strategy."""
 
-    NAME = "my_strategy"  # REQUIRED: unique identifier
+    NAME = "AdaptiveHedging"  # REQUIRED: unique identifier
 
     def solve(self, spec_path: str) -> "Solution":
         """
@@ -30,108 +31,114 @@ class Solution(MultiRegionStrategy):
             inter_task_overhead=[0.0],
         )
         super().__init__(args)
-
-        # Flag to perform one-time initialization on the first step
-        self.initialized = False
-
-        # Strategy hyperparameters
-        # Prior for region availability (e.g., 80% availability)
-        self.PRIOR_SEEN = 5
-        self.PRIOR_AVAILABLE = 4
-        # Safety buffer: switch to on-demand if slack is less than this * overhead
-        self.SAFETY_BUFFER_FACTOR = 1.5
-        # Required score improvement to consider a region switch
-        self.SWITCH_SCORE_IMPROVEMENT = 0.2
-        # Slack needed to afford a switch: must be > this * overhead
-        self.SWITCH_SLACK_FACTOR = 4.0
-        # Slack threshold to wait (as a fraction of total task duration)
-        self.WAIT_SLACK_DURATION_FRACTION = 0.1
         
+        self.initialized = False
         return self
 
     def _initialize_strategy(self):
         """
-        Performs one-time initialization when environment info is available.
+        Initializes strategy-specific attributes on the first call to _step.
         """
         self.num_regions = self.env.get_num_regions()
-        self.region_stats = [
-            {'seen': self.PRIOR_SEEN, 'available': self.PRIOR_AVAILABLE}
+
+        # --- Hyperparameters ---
+        self.history_len = 12
+        self.switch_score_threshold = 0.7
+        self.switch_hysteresis = 0.15
+        self.switch_slack_factor = 3.0
+        self.wait_slack_threshold_hours = 6.0
+        self.wait_score_threshold = 0.5
+
+        # --- State Tracking ---
+        self.spot_history = [
+            collections.deque(maxlen=self.history_len)
             for _ in range(self.num_regions)
         ]
-        self.wait_slack_threshold = self.task_duration * self.WAIT_SLACK_DURATION_FRACTION
+        self.region_scores = [0.85] * self.num_regions
+
         self.initialized = True
+
+    def _find_best_alternative_region(self):
+        """
+        Finds the region with the highest availability score, excluding the current one.
+        """
+        current_region = self.env.get_current_region()
+        best_alt_score = -1.0
+        best_alt_region = -1
+
+        for i in range(self.num_regions):
+            if i == current_region:
+                continue
+            if self.region_scores[i] > best_alt_score:
+                best_alt_score = self.region_scores[i]
+                best_alt_region = i
+
+        return best_alt_score, best_alt_region
 
     def _step(self, last_cluster_type: ClusterType, has_spot: bool) -> ClusterType:
         """
         Decide next action based on current state.
+
+        Available attributes:
+        - self.env.get_current_region(): Get current region index
+        - self.env.get_num_regions(): Get total number of regions
+        - self.env.switch_region(idx): Switch to region by index
+        - self.env.elapsed_seconds: Current time elapsed
+        - self.task_duration: Total task duration needed (seconds)
+        - self.deadline: Deadline time (seconds)
+        - self.restart_overhead: Restart overhead (seconds)
+        - self.task_done_time: List of completed work segments
+        - self.remaining_restart_overhead: Current pending overhead
+
+        Returns: ClusterType.SPOT, ClusterType.ON_DEMAND, or ClusterType.NONE
         """
         if not self.initialized:
             self._initialize_strategy()
 
-        # 1. Update historical stats for the current region
+        # 1. Update history and score for the current region
         current_region = self.env.get_current_region()
-        stats = self.region_stats[current_region]
-        stats['seen'] += 1
-        if has_spot:
-            stats['available'] += 1
+        self.spot_history[current_region].append(1 if has_spot else 0)
+        if len(self.spot_history[current_region]) > 0:
+            self.region_scores[current_region] = (
+                sum(self.spot_history[current_region]) /
+                len(self.spot_history[current_region]))
 
-        # 2. Calculate current progress and time remaining
-        work_done = sum(self.task_done_time)
-        work_rem = self.task_duration - work_done
+        # 2. Calculate current state variables
+        remaining_work = self.task_duration - sum(self.task_done_time)
 
-        if work_rem <= 0:
-            return ClusterType.NONE  # Task is complete, do nothing
+        if remaining_work <= 0:
+            return ClusterType.NONE
 
-        time_rem = self.deadline - self.env.elapsed_seconds
-        slack = time_rem - work_rem
+        time_to_deadline = self.deadline - self.env.elapsed_seconds
+        
+        slack = time_to_deadline - (remaining_work + self.remaining_restart_overhead)
 
-        # 3. Safety Net: If time is critical, use On-Demand to guarantee completion
-        safety_buffer = self.restart_overhead * self.SAFETY_BUFFER_FACTOR
-        if slack <= safety_buffer:
+        # 3. PANIC MODE: If slack is too low, use On-Demand to guarantee completion.
+        if slack <= self.restart_overhead:
             return ClusterType.ON_DEMAND
 
-        # 4. Main Decision Logic
+        # 4. STANDARD MODE: If spot is available, use it.
         if has_spot:
-            # Spot is available and we are not in a critical situation, so use it.
             return ClusterType.SPOT
-        
-        # --- From here, has_spot is False ---
-        
-        # 4a. Evaluate switching to another region
-        scores = [
-            s['available'] / s['seen'] if s['seen'] > 0 else 0
-            for s in self.region_stats
-        ]
-        current_score = scores[current_region]
 
-        best_alt_region_idx = -1
-        max_score = -1.0
-        # Find the best alternative region based on historical data
-        for i, score in enumerate(scores):
-            if i == current_region:
-                continue
-            if score > max_score:
-                max_score = score
-                best_alt_region_idx = i
+        # 5. NO-SPOT MODE: Decide to Switch, Wait, or use On-Demand.
+        best_alt_score, best_alt_region = self._find_best_alternative_region()
+        current_score = self.region_scores[current_region]
+        time_cost_of_failed_switch = self.restart_overhead + self.env.gap_seconds
 
-        # Conditions for switching:
-        # 1. A significantly better region exists.
-        cond_better_region = (best_alt_region_idx != -1 and
-                              max_score > current_score + self.SWITCH_SCORE_IMPROVEMENT)
-        # 2. There's enough slack to absorb the switching overhead.
-        cond_enough_slack = slack > (self.restart_overhead * self.SWITCH_SLACK_FACTOR)
+        if (best_alt_region != -1 and
+                best_alt_score > current_score + self.switch_hysteresis and
+                best_alt_score > self.switch_score_threshold and
+                slack > self.switch_slack_factor * time_cost_of_failed_switch):
+            
+            self.env.switch_region(best_alt_region)
+            return ClusterType.SPOT
 
-        if cond_better_region and cond_enough_slack:
-            self.env.switch_region(best_alt_region_idx)
-            # After deciding to switch, we incur an overhead. We choose NONE for the
-            # current step's action and let the next step's logic decide what to do
-            # in the new region.
+        raw_slack = time_to_deadline - remaining_work
+        wait_slack_threshold_seconds = self.wait_slack_threshold_hours * 3600.0
+
+        if (raw_slack > wait_slack_threshold_seconds and
+                current_score > self.wait_score_threshold):
             return ClusterType.NONE
-
-        # 4b. If not switching, decide between waiting (NONE) or using On-Demand
-        if slack > self.wait_slack_threshold:
-            # Plenty of slack, so we can afford to wait for Spot to become available.
-            return ClusterType.NONE
-        else:
-            # Not enough slack to wait, must make progress using On-Demand.
-            return ClusterType.ON_DEMAND
+        
+        return ClusterType.ON_DEMAND

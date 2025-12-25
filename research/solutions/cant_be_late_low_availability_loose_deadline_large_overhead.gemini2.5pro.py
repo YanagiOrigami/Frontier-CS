@@ -1,96 +1,128 @@
-import argparse
+import math
+from argparse import ArgumentParser
+
 from sky_spot.strategies.strategy import Strategy
 from sky_spot.utils import ClusterType
 
 class Solution(Strategy):
-    NAME = "my_solution"
+    """
+    This strategy operates on a few core principles to balance cost and completion risk:
+
+    1.  **Safety First (Critical Region):** The primary goal is to never miss the deadline.
+        We calculate a "point of no return" by determining the latest possible moment
+        to switch to a reliable on-demand instance. If our current slack (time remaining
+        minus work remaining) drops below a safety buffer, we enter a "critical region"
+        and use on-demand exclusively to guarantee completion. The safety buffer is set
+        to be a multiple of the restart overhead to account for potential time lost from
+        spot preemptions.
+
+    2.  **Opportunistic Spot Usage:** When not in the critical region, spot instances are
+        always the preferred choice due to their low cost. If a spot instance is
+        available, we will always use it.
+
+    3.  **Adaptive Waiting (Linear Slack Scheduling):** If we are not in the critical
+        region and spot is unavailable, we must decide whether to pay for an expensive
+        on-demand instance or wait (at no cost) for a spot instance to become available.
+        This decision is based on our progress relative to a "target schedule". This
+        schedule is a straight line from the start of the job (0% work at time 0) to
+        the deadline (100% work at deadline).
+        - If our actual progress is *ahead* of this target schedule, we have a surplus of
+          time and can afford to wait for a cheap spot instance, so we choose NONE.
+        - If our progress is *behind* the target schedule, we are at risk of falling
+          too far behind. We must use an on-demand instance to catch up.
+
+    This three-tiered approach ensures we finish on time while aggressively pursuing
+    cost savings when it is safe to do so. The strategy is adaptive, as prolonged
+    periods of spot unavailability will naturally cause progress to fall behind the
+    target, triggering on-demand usage to self-correct.
+    """
+    NAME = "adaptive_scheduler"  # REQUIRED: unique identifier
+
+    def __init__(self, args):
+        super().__init__(args)
+        self.target_progress_rate = 0.0
+        self.safety_buffer = 0.0
+        self.work_done_cache = 0.0
+        self.last_task_done_time_len = 0
 
     def solve(self, spec_path: str) -> "Solution":
         """
-        Optional initialization. Called once before evaluation.
-        We initialize parameters for a Bayesian estimation of spot availability.
+        Initializes the strategy's parameters based on the problem specification.
+        This method is called once before the simulation begins.
         """
-        # A Beta distribution is used to model our belief about spot probability.
-        # The prior Beta(2.0, 8.0) corresponds to a mean probability of 0.2,
-        # which is a reasonable starting point for the specified 4-40% availability range.
-        self.alpha = 2.0
-        self.beta = 8.0
+        # A baseline schedule is a linear completion of the task by the deadline.
+        # This rate determines if we are "ahead" or "behind" schedule.
+        if self.deadline > 0:
+            self.target_progress_rate = self.task_duration / self.deadline
+        else:
+            self.target_progress_rate = 1.0
+
+        # The safety buffer determines when to enter the "critical region".
+        # We set it to twice the restart overhead to be conservative, accounting for
+        # time lost from one preemption plus a margin for subsequent bad luck
+        # (e.g., spot being unavailable immediately after a restart).
+        self.safety_buffer = self.restart_overhead * 2.0
+
+        # Initialize a cache for calculating completed work. This avoids
+        # re-summing the entire list of work segments at every step.
+        self.work_done_cache = 0.0
+        self.last_task_done_time_len = 0
+        
         return self
+
+    def _update_work_done(self) -> float:
+        """
+        Efficiently calculates the total work done by caching the previous sum.
+        """
+        if len(self.task_done_time) > self.last_task_done_time_len:
+            for i in range(self.last_task_done_time_len, len(self.task_done_time)):
+                segment = self.task_done_time[i]
+                self.work_done_cache += segment[1] - segment[0]
+            self.last_task_done_time_len = len(self.task_done_time)
+        return self.work_done_cache
 
     def _step(self, last_cluster_type: ClusterType, has_spot: bool) -> ClusterType:
         """
-        Called at each time step. Return which cluster type to use next.
+        Core decision-making logic, called at each time step.
         """
-        # 1. UPDATE STATE
-        # Update our belief about spot availability based on the new observation.
-        if has_spot:
-            self.alpha += 1.0
-        else:
-            self.beta += 1.0
-
         # Calculate current progress and remaining work/time.
-        work_done = sum(self.task_done_time)
-        work_left = self.task_duration - work_done
+        work_done = self._update_work_done()
+        work_remaining = self.task_duration - work_done
 
-        # If the job is finished, do nothing to minimize cost.
-        if work_left <= 0.0:
+        # If the job is finished, do nothing to avoid further costs.
+        if work_remaining <= 0:
             return ClusterType.NONE
 
-        time_left = self.deadline - self.env.elapsed_seconds
+        elapsed_time = self.env.elapsed_seconds
+        time_remaining = self.deadline - elapsed_time
 
-        # The safety_buffer is the time slack we have if we complete the remaining
-        # work using guaranteed on-demand instances.
-        safety_buffer = time_left - work_left
-
-        # 2. DECISION LOGIC
-        # The strategy is risk-averse due to the high penalty for missing the deadline.
-
-        # Rule A: CRITICAL PATH
-        # If the safety buffer is zero or negative, we are behind schedule.
-        # We must use ON_DEMAND to make guaranteed progress.
-        if safety_buffer <= 0.0:
+        # --- I. CRITICAL REGION (FAIL-SAFE) ---
+        # If the time required to finish on a reliable instance plus a safety margin
+        # exceeds the time remaining, we must use on-demand to guarantee completion.
+        if work_remaining + self.safety_buffer >= time_remaining:
             return ClusterType.ON_DEMAND
 
-        # Rule B: IDEAL CASE
-        # If spot instances are available and it's safe to use them, do so.
-        # "Safe" means that even if the instance is immediately preempted (costing
-        # `restart_overhead` in time), we can still finish by the deadline.
-        if has_spot and (safety_buffer >= self.restart_overhead):
+        # --- II. PREFERRED OPTION (SPOT) ---
+        # If not in the critical region and spot is available, always use it.
+        if has_spot:
             return ClusterType.SPOT
 
-        # Rule C: DELIBERATION
-        # We are in an intermediate state: either spot is unavailable, or it's too
-        # risky to use. We must choose between waiting (NONE) or using ON_DEMAND.
+        # --- III. NO SPOT: TRADE-OFF (WAIT or PAY) ---
+        # Decide between ON_DEMAND (catch up) and NONE (wait for spot).
+        # We compare current progress to our linear target schedule.
+        target_work_done = elapsed_time * self.target_progress_rate
         
-        # We make this choice by estimating the time-cost of waiting for a spot
-        # instance to appear.
-        estimated_spot_prob = self.alpha / (self.alpha + self.beta)
-        
-        # Expected number of steps to wait for the next spot instance.
-        # A small epsilon prevents division by zero if probability is near zero.
-        expected_wait_steps = 1.0 / (estimated_spot_prob + 1e-9)
-        
-        # The expected buffer that will be consumed by waiting.
-        expected_buffer_cost_to_wait = expected_wait_steps * self.env.gap_seconds
-
-        # We should only wait if our current buffer is large enough to absorb
-        # the expected waiting cost AND still leave us in a "safe" position
-        # (i.e., with at least `restart_overhead` buffer) to use spot later.
-        min_buffer_to_wait = expected_buffer_cost_to_wait + self.restart_overhead
-
-        if not has_spot and safety_buffer > min_buffer_to_wait:
-            # We have enough slack to wait for a cheap spot instance.
+        if work_done >= target_work_done:
+            # We are ahead of or on schedule, so we can afford to wait.
             return ClusterType.NONE
         else:
-            # It's either too risky to use an available spot instance, or we don't
-            # have enough buffer to wait for the next one. The prudent choice is
-            # to use ON_DEMAND to make guaranteed progress.
+            # We are behind schedule and must use on-demand to catch up.
             return ClusterType.ON_DEMAND
 
     @classmethod
-    def _from_args(cls, parser):
+    def _from_args(cls, parser: ArgumentParser):  # REQUIRED: For evaluator instantiation
         """
-        Required classmethod for evaluator instantiation.
+        Instantiates the strategy class from command-line arguments.
         """
         args, _ = parser.parse_known_args()
         return cls(args)

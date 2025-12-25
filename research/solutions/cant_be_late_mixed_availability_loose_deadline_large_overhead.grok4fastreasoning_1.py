@@ -2,21 +2,33 @@ from sky_spot.strategies.strategy import Strategy
 from sky_spot.utils import ClusterType
 
 class Solution(Strategy):
-    NAME = "safe_spot_fallback"
+    NAME = "my_solution"  # REQUIRED: unique identifier
 
     def solve(self, spec_path: str) -> "Solution":
+        """
+        Optional initialization. Called once before evaluation.
+        Read spec_path for configuration if needed.
+        Must return self.
+        """
         return self
 
     def _step(self, last_cluster_type: ClusterType, has_spot: bool) -> ClusterType:
-        if self.env.elapsed_seconds == 0:
-            return ClusterType.SPOT if has_spot else ClusterType.ON_DEMAND
-        if last_cluster_type == ClusterType.ON_DEMAND:
-            return ClusterType.ON_DEMAND
-        if last_cluster_type == ClusterType.SPOT:
-            return ClusterType.SPOT if has_spot else ClusterType.ON_DEMAND
-        return ClusterType.NONE
+        """
+        Called at each time step. Return which cluster type to use next.
+
+        Args:
+            last_cluster_type: The cluster type used in the previous step
+            has_spot: Whether spot instances are available this step
+
+        Returns:
+            ClusterType.SPOT, ClusterType.ON_DEMAND, or ClusterType.NONE
+        """
+        # Your decision logic here
+        if has_spot:
+            return ClusterType.SPOT
+        return ClusterType.ON_DEMAND
 
     @classmethod
-    def _from_args(cls, parser):
+    def _from_args(cls, parser):  # REQUIRED: For evaluator instantiation
         args, _ = parser.parse_known_args()
         return cls(args)

@@ -2,74 +2,57 @@ from sky_spot.strategies.strategy import Strategy
 from sky_spot.utils import ClusterType
 
 class Solution(Strategy):
-    NAME = "CostOptimizedSolution"
+    NAME = "cant_be_late_solution"
 
     def solve(self, spec_path: str) -> "Solution":
         return self
 
     def _step(self, last_cluster_type: ClusterType, has_spot: bool) -> ClusterType:
-        # Calculate total work done so far (handle list or scalar)
-        if isinstance(self.task_done_time, (list, tuple)):
-            work_done = sum(self.task_done_time)
-        else:
-            work_done = self.task_done_time
-
-        work_remaining = self.task_duration - work_done
+        # Calculate amount of work already completed
+        work_done = sum(self.task_done_time)
+        remaining_work = self.task_duration - work_done
         
-        # If work is completed, stop
-        if work_remaining <= 0:
+        # If work is essentially complete, do nothing
+        if remaining_work <= 1e-6:
             return ClusterType.NONE
-
-        current_time = self.env.elapsed_seconds
-        deadline = self.deadline
-        gap = self.env.gap_seconds
-        overhead = self.restart_overhead
+            
+        # Calculate time remaining until the hard deadline
+        time_left = self.deadline - self.env.elapsed_seconds
         
-        time_remaining = deadline - current_time
+        # Calculate the time required to finish if we switch to (or stay on) On-Demand NOW.
+        # If we are not currently running On-Demand, we incur a restart overhead.
+        # Note: If we are currently running OD (even if still in overhead phase), 
+        # we don't add a *new* overhead penalty to the estimate.
+        overhead_penalty = 0.0
+        if last_cluster_type != ClusterType.ON_DEMAND:
+            overhead_penalty = self.restart_overhead
+            
+        time_needed_on_od = remaining_work + overhead_penalty
         
-        # Calculate time needed to finish if we start a new instance now.
-        # This includes the work remaining, the restart overhead, and a safety buffer
-        # to account for time step quantization (gap).
-        # We use a safety buffer of 2 steps to ensure we don't miss the deadline due to discrete steps.
-        safety_buffer = 2.0 * gap
-        time_needed_if_start = work_remaining + overhead + safety_buffer
+        # Safety Buffer Calculation:
+        # 1. We need to account for the simulation step size (gap_seconds). If we don't act now,
+        #    our next chance is in `gap_seconds`.
+        # 2. Add a conservative padding (e.g., 600 seconds/10 mins) to handle floating point 
+        #    variations or edge cases, ensuring we don't miss the deadline.
+        #    Better to pay slightly more for OD than to incur the -100,000 penalty.
+        buffer = self.env.gap_seconds + 600.0
         
-        # Slack is the time we can afford to wait/waste
-        slack = time_remaining - time_needed_if_start
-        
+        # Critical Threshold Check
+        # If the time remaining is less than what we need to finish on OD (plus buffer),
+        # we must strictly prioritize the deadline over cost.
+        if time_left < (time_needed_on_od + buffer):
+            return ClusterType.ON_DEMAND
+            
+        # Cost Optimization Strategy
+        # If we are not in the critical "danger zone", we aim to minimize cost.
         if has_spot:
-            # Spot is available
-            
-            # If we are currently running On-Demand, we should be careful about switching back to Spot.
-            # Switching incurs overhead and reliability risk.
-            if last_cluster_type == ClusterType.ON_DEMAND:
-                # Heuristics for switching back to Spot:
-                # 1. We must have significant slack (e.g., > 4x overhead) to absorb the restart cost and risk.
-                # 2. We must have enough work remaining (e.g., > 10x overhead) to make the price difference pay off.
-                
-                safe_slack = slack > (4.0 * overhead)
-                substantial_work = work_remaining > (10.0 * overhead)
-                
-                if safe_slack and substantial_work:
-                    return ClusterType.SPOT
-                else:
-                    # Keep using On-Demand to avoid overhead/risk
-                    return ClusterType.ON_DEMAND
-            else:
-                # If we were paused or using Spot, use Spot
-                return ClusterType.SPOT
-        
+            # Spot is available and cheap (approx 1/3 cost of OD).
+            return ClusterType.SPOT
         else:
-            # Spot is NOT available
-            
-            # If our slack is depleted (or negative), we are in the "danger zone".
-            # We must use On-Demand to guarantee completion before the deadline.
-            if slack <= 0:
-                return ClusterType.ON_DEMAND
-            else:
-                # We have enough slack to wait for Spot to return.
-                # Pausing (NONE) costs $0, whereas OD is expensive.
-                return ClusterType.NONE
+            # Spot is unavailable. Since we have sufficient slack (time_left > needed + buffer),
+            # we can afford to pause (NONE) and wait for Spot to return, 
+            # rather than paying for expensive On-Demand immediately.
+            return ClusterType.NONE
 
     @classmethod
     def _from_args(cls, parser):

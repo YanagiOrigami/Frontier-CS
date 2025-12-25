@@ -1,124 +1,129 @@
-import math
+import os
+import json
+import numpy as np
 from sky_spot.strategies.strategy import Strategy
 from sky_spot.utils import ClusterType
 
 class Solution(Strategy):
-    NAME = "adaptive_spot_strategy"
-
+    NAME = "my_solution"
+    
+    def __init__(self, args):
+        super().__init__(args)
+        self.safety_margin = None
+        self.spot_history = []
+        self.spot_availability = 0.0
+        self.consecutive_spots = 0
+        self.last_switch_time = 0
+        self.min_spot_burst = 0
+        self.use_spot_aggressively = True
+        self.restart_penalty_time = 0
+        self.phase = "initial"
+        
     def solve(self, spec_path: str) -> "Solution":
-        # Initialize tracking variables
-        self.spot_attempts = 0
-        self.spot_failures = 0
-        self.consecutive_spot_steps = 0
-        self.last_decision = ClusterType.NONE
-        self.spot_available_history = []
-        self.work_remaining_history = []
-        self.time_remaining_history = []
+        try:
+            if os.path.exists(spec_path):
+                with open(spec_path, 'r') as f:
+                    spec = json.load(f)
+                    if "safety_margin" in spec:
+                        self.safety_margin = spec["safety_margin"]
+        except:
+            pass
+            
+        if self.safety_margin is None:
+            self.safety_margin = 0.15
+            
+        self.restart_penalty_time = self.restart_overhead
         return self
-
+    
+    def _calculate_remaining_time(self):
+        elapsed = self.env.elapsed_seconds
+        remaining = self.deadline - elapsed
+        work_done = sum(self.task_done_time) if self.task_done_time else 0
+        work_left = self.task_duration - work_done
+        return remaining, work_left, work_done
+    
+    def _should_switch_to_od(self, remaining, work_left):
+        if work_left <= 0:
+            return False
+            
+        time_per_work_unit = 1.0
+        estimated_time_needed = work_left * time_per_work_unit
+        
+        if self.env.cluster_type == ClusterType.SPOT:
+            estimated_time_needed += self.restart_penalty_time
+            
+        buffer = max(self.restart_penalty_time * 2, remaining * self.safety_margin)
+        return estimated_time_needed > (remaining - buffer)
+    
+    def _update_spot_history(self, has_spot):
+        self.spot_history.append(1 if has_spot else 0)
+        if len(self.spot_history) > 100:
+            self.spot_history.pop(0)
+            
+        if has_spot:
+            self.consecutive_spots += 1
+        else:
+            self.consecutive_spots = 0
+            
+        if len(self.spot_history) > 0:
+            self.spot_availability = sum(self.spot_history) / len(self.spot_history)
+    
+    def _calculate_dynamic_min_spot_burst(self):
+        if self.spot_availability > 0.7:
+            return 3
+        elif self.spot_availability > 0.5:
+            return 5
+        else:
+            return 8
+    
     def _step(self, last_cluster_type: ClusterType, has_spot: bool) -> ClusterType:
-        # Track history for adaptive decisions
-        current_time = self.env.elapsed_seconds
-        deadline = self.deadline
+        self._update_spot_history(has_spot)
         
-        # Calculate remaining work
-        total_done = sum(self.task_done_time)
-        work_remaining = self.task_duration - total_done
-        time_remaining = deadline - current_time
+        remaining, work_left, work_done = self._calculate_remaining_time()
         
-        # Safety margin based on restart overhead
-        safety_margin = self.restart_overhead * 2
-        
-        # Emergency mode: must finish soon
-        if work_remaining > 0 and time_remaining <= work_remaining + safety_margin:
-            return ClusterType.ON_DEMAND
-        
-        # Calculate efficiency metrics
-        spot_efficiency = 0.7  # Conservative estimate
-        if self.spot_failures > 0 and self.spot_attempts > 0:
-            spot_efficiency = 1.0 - (self.spot_failures / self.spot_attempts)
-            spot_efficiency = max(0.3, min(0.9, spot_efficiency))
-        
-        # Calculate time needed with different strategies
-        time_needed_ondemand = work_remaining
-        time_needed_spot = work_remaining / spot_efficiency if spot_efficiency > 0 else float('inf')
-        
-        # Can we finish with spot given current efficiency?
-        spot_feasible = time_needed_spot <= time_remaining - safety_margin
-        
-        # Update spot availability history
-        self.spot_available_history.append(has_spot)
-        if len(self.spot_available_history) > 100:
-            self.spot_available_history.pop(0)
-        
-        # Calculate spot availability probability
-        spot_availability = 0.5  # Default
-        if len(self.spot_available_history) > 10:
-            available_count = sum(1 for avail in self.spot_available_history if avail)
-            spot_availability = available_count / len(self.spot_available_history)
-        
-        # Adaptive strategy based on multiple factors
-        use_spot = False
-        use_ondemand = False
-        
-        # Factor 1: Time pressure
-        time_pressure = max(0, 1 - (time_remaining / deadline))
-        
-        # Factor 2: Work progress
-        work_progress = total_done / self.task_duration if self.task_duration > 0 else 0
-        
-        # Factor 3: Spot reliability
-        spot_reliability = spot_availability * spot_efficiency
-        
-        # Decision logic
-        if not has_spot:
-            # Spot not available
-            if time_pressure > 0.7 or not spot_feasible:
-                use_ondemand = True
-            else:
-                # Wait for spot to become available if we have time
-                wait_ok = time_remaining > work_remaining * 1.5 + safety_margin
-                if wait_ok:
-                    return ClusterType.NONE
-                else:
-                    use_ondemand = True
-        else:
-            # Spot is available
-            if spot_reliability > 0.6 and spot_feasible:
-                # Good conditions for spot
-                if time_pressure < 0.8:
-                    use_spot = True
-                elif time_pressure < 0.9 and spot_reliability > 0.7:
-                    use_spot = True
-                else:
-                    use_ondemand = True
-            else:
-                # Poor spot conditions
-                if time_pressure < 0.5:
-                    use_spot = True
-                else:
-                    use_ondemand = True
-        
-        # Update statistics
-        if last_cluster_type == ClusterType.SPOT:
-            self.consecutive_spot_steps += 1
-        else:
-            self.consecutive_spot_steps = 0
-        
-        # Make final decision
-        if use_spot:
-            self.spot_attempts += 1
-            self.last_decision = ClusterType.SPOT
-            return ClusterType.SPOT
-        elif use_ondemand:
-            if last_cluster_type == ClusterType.SPOT:
-                self.spot_failures += 1
-            self.last_decision = ClusterType.ON_DEMAND
-            return ClusterType.ON_DEMAND
-        else:
-            self.last_decision = ClusterType.NONE
+        if work_left <= 0:
             return ClusterType.NONE
-
+        
+        time_since_switch = self.env.elapsed_seconds - self.last_switch_time
+        
+        if self._should_switch_to_od(remaining, work_left):
+            if last_cluster_type != ClusterType.ON_DEMAND:
+                self.last_switch_time = self.env.elapsed_seconds
+            return ClusterType.ON_DEMAND
+        
+        if not has_spot:
+            if last_cluster_type == ClusterType.SPOT:
+                return ClusterType.NONE
+            elif (last_cluster_type == ClusterType.ON_DEMAND and 
+                  remaining > work_left + self.restart_penalty_time * 3):
+                return ClusterType.NONE
+            else:
+                return ClusterType.ON_DEMAND
+        
+        if last_cluster_type == ClusterType.SPOT:
+            if self.consecutive_spots < self._calculate_dynamic_min_spot_burst():
+                return ClusterType.SPOT
+            elif time_since_switch < self.restart_penalty_time * 1.5:
+                return ClusterType.SPOT
+            else:
+                if remaining < work_left * 1.3 + self.restart_penalty_time:
+                    return ClusterType.SPOT
+                else:
+                    return ClusterType.NONE
+        elif last_cluster_type == ClusterType.ON_DEMAND:
+            if remaining > work_left * 1.5 + self.restart_penalty_time * 2:
+                return ClusterType.SPOT
+            else:
+                return ClusterType.ON_DEMAND
+        else:  # NONE
+            if self.consecutive_spots >= 2:
+                self.last_switch_time = self.env.elapsed_seconds
+                return ClusterType.SPOT
+            elif remaining < work_left * 1.2:
+                return ClusterType.ON_DEMAND
+            else:
+                return ClusterType.NONE
+    
     @classmethod
     def _from_args(cls, parser):
         args, _ = parser.parse_known_args()

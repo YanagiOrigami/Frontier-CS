@@ -563,11 +563,11 @@ Examples:
 
     # Build problem sources
     problem_sources: List[Tuple[Path, str]] = []
+    problems_dir = repo_root / "research" / "problems"
 
     # Handle --problem patterns (supports wildcards)
     if args.problem_patterns:
         import fnmatch
-        problems_dir = repo_root / "research" / "problems"
         all_problems = []
         if problems_dir.is_dir():
             def find_problems_recursive(directory: Path, depth: int = 0, max_depth: int = 3) -> List[Path]:

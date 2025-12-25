@@ -1,105 +1,87 @@
-import argparse
-
+import math
 from sky_spot.strategies.strategy import Strategy
 from sky_spot.utils import ClusterType
 
-
 class Solution(Strategy):
     """
-    A strategy that uses a buffer-based, three-tiered approach to decide
-    which cluster type to use. The core idea is to calculate a "safety buffer"
-    which represents the amount of time that can be wasted before the deadline
-    becomes unreachable even when using reliable on-demand instances.
+    A strategy based on maintaining a "slack buffer".
 
-    The strategy operates in three modes based on the size of this buffer:
-    1. PANIC MODE: Buffer is critically low. Force the use of ON_DEMAND to
-       guarantee progress and avoid failing the task.
-    2. RELAXED MODE: Buffer is very large. Prioritize cost savings by using
-       SPOT when available, and waiting (NONE) if it's not.
-    3. CAUTIOUS MODE: Buffer is in between. Use SPOT if available, but if not,
-       use ON_DEMAND to avoid eroding the buffer too much by waiting.
+    Core Idea:
+    The total available slack is the time between the deadline and the time required
+    to finish the remaining work on a non-stop On-Demand instance.
+    This slack is a precious resource that gets consumed by Spot unavailability
+    (when we choose to wait) and Spot preemptions (which incur a restart overhead).
 
-    The thresholds for these modes are defined as multiples of the restart
-    overhead, making the strategy adaptive to the specific penalty of the task.
+    The strategy divides the slack into two conceptual parts:
+    1. A "spending" slack: We are willing to use this portion of slack to wait
+       for cheap Spot instances to become available.
+    2. A "safety buffer": This portion of slack is preserved for handling future
+       preemptions and long unavailability periods.
+
+    Decision Logic:
+    1.  PANIC MODE: If the current slack is less than the time cost of a single
+        preemption (`restart_overhead`), we are at high risk of missing the deadline.
+        In this mode, we use On-Demand exclusively to guarantee completion.
+
+    2.  NORMAL MODE:
+        - If Spot instances are available, we always use them. This is the most
+          cost-effective way to make progress.
+        - If Spot is not available, we look at our current slack:
+            - If slack > safety buffer: We can afford to wait. We choose NONE,
+              saving money and hoping Spot returns soon.
+            - If slack <= safety buffer: Our safety margin is getting thin. We must
+              make progress. We choose On-Demand to complete work and prevent
+              our slack from decreasing further.
+
+    The size of the safety buffer is determined by `SLACK_BUFFER_FACTOR`, a tunable
+    parameter. It's set to a value that aims to preserve a significant portion
+    of the initial total slack to handle uncertainties throughout the job's duration.
     """
-    NAME = "my_solution"
+    NAME = "slack_buffer_strategy"
 
-    # If safety_buffer < RISK_MULTIPLIER * restart_overhead, use ON_DEMAND.
-    # This value is chosen to be enough to withstand a couple of preemptions
-    # without making the deadline unreachable.
-    RISK_MULTIPLIER = 2.5
-
-    # If spot is unavailable and safety_buffer >= WAIT_MULTIPLIER * restart_overhead,
-    # wait (NONE). Otherwise, use ON_DEMAND. This value is based on the
-    # initial slack, representing a significant portion of it (half).
-    WAIT_MULTIPLIER = 10.0
-
-    def solve(self, spec_path: str):
-        """
-        Optional initialization. Called once before evaluation.
-        No pre-computation is needed for this strategy.
-        Must return self.
-        """
+    def solve(self, spec_path: str) -> "Solution":
+        self.SLACK_BUFFER_FACTOR = 10.0
+        self.slack_buffer_seconds = 0.0
+        self._is_initialized = False
         return self
 
+    def _initialize(self):
+        """
+        Initializes strategy constants on the first `_step` call.
+        """
+        self.slack_buffer_seconds = self.SLACK_BUFFER_FACTOR * self.restart_overhead
+        self._is_initialized = True
+
     def _step(self, last_cluster_type: ClusterType, has_spot: bool) -> ClusterType:
-        """
-        Called at each time step. Return which cluster type to use next.
+        if not self._is_initialized:
+            self._initialize()
 
-        Args:
-            last_cluster_type: The cluster type used in the previous step
-            has_spot: Whether spot instances are available this step
-
-        Returns:
-            ClusterType.SPOT, ClusterType.ON_DEMAND, or ClusterType.NONE
-        """
-        # 1. Calculate current state
-        work_done = sum(self.task_done_time)
+        work_done = sum(end - start for start, end in self.task_done_time)
         work_remaining = self.task_duration - work_done
 
-        # If the task is finished, do nothing to save costs.
-        if work_remaining <= 0:
+        if work_remaining <= 1e-9:
             return ClusterType.NONE
 
-        time_left = self.deadline - self.env.elapsed_seconds
+        current_time = self.env.elapsed_seconds
+        time_to_deadline = self.deadline - current_time
 
-        # The safety buffer is the slack time we have if we were to finish all
-        # remaining work using only reliable ON_DEMAND instances.
-        safety_buffer = time_left - work_remaining
-
-        # Define the thresholds based on the restart overhead.
-        risk_threshold = self.RISK_MULTIPLIER * self.restart_overhead
-        wait_threshold = self.WAIT_MULTIPLIER * self.restart_overhead
-
-        # --- Three-tiered decision logic ---
-
-        # 1. PANIC MODE: Buffer is critically low.
-        # We are at risk of missing the deadline. Must use the most reliable
-        # option to guarantee progress.
-        if safety_buffer < risk_threshold:
+        if time_to_deadline < work_remaining:
             return ClusterType.ON_DEMAND
 
-        # 2. DEFAULT CHOICE: If not in panic mode, try to use cheap SPOT.
+        current_slack = time_to_deadline - work_remaining
+
+        if current_slack <= self.restart_overhead:
+            return ClusterType.ON_DEMAND
+
         if has_spot:
             return ClusterType.SPOT
-
-        # 3. SPOT UNAVAILABLE: Decide between waiting (NONE) or paying for
-        # ON_DEMAND. This decision is based on the size of our safety buffer.
-
-        # CAUTIOUS MODE: Buffer is not large enough to wait idly.
-        # Use ON_DEMAND to ensure we keep making progress.
-        if safety_buffer < wait_threshold:
-            return ClusterType.ON_DEMAND
-        
-        # RELAXED MODE: We have a large buffer. We can afford to wait
-        # for SPOT to become available again, saving money.
         else:
-            return ClusterType.NONE
+            if current_slack > self.slack_buffer_seconds:
+                return ClusterType.NONE
+            else:
+                return ClusterType.ON_DEMAND
 
     @classmethod
     def _from_args(cls, parser):
-        """
-        Required classmethod for evaluator instantiation.
-        """
         args, _ = parser.parse_known_args()
         return cls(args)

@@ -1,98 +1,137 @@
-import argparse
+import numpy as np
 from enum import Enum
-import math
-from typing import List, Optional
-
-# These imports would be available in the evaluation environment
 from sky_spot.strategies.strategy import Strategy
 from sky_spot.utils import ClusterType
 
+class State(Enum):
+    START = 0
+    SPOT_RUNNING = 1
+    SPOT_GAP = 2
+    OD_RUNNING = 3
 
 class Solution(Strategy):
     NAME = "my_solution"
-    
+
     def __init__(self, args):
         super().__init__()
         self.args = args
-        self._restart_timer = 0
-        self._current_cluster = None
-        self._work_done = 0.0
-        self._time_elapsed = 0.0
-        self._cost = 0.0
-        self._spot_price = 0.97 / 3600  # $/sec
-        self._od_price = 3.06 / 3600  # $/sec
-        self._last_spot_available = False
-        
+        self.state = State.START
+        self.spot_unavailable_time = 0
+        self.consecutive_spot_failures = 0
+        self.last_spot_check = 0
+        self.work_done = 0
+        self.last_progress = 0
+        self.steps_in_current_state = 0
+        self.initial_slack = None
+        self.spot_available_history = []
+
     def solve(self, spec_path: str) -> "Solution":
         return self
-    
+
     def _step(self, last_cluster_type: ClusterType, has_spot: bool) -> ClusterType:
-        # Update internal state
-        self._time_elapsed += self.env.gap_seconds
-        self._last_spot_available = has_spot
-        self._current_cluster = last_cluster_type
+        current_time = self.env.elapsed_seconds
+        gap = self.env.gap_seconds
         
-        # Track restart overhead
-        if self._restart_timer > 0:
-            self._restart_timer = max(0, self._restart_timer - self.env.gap_seconds)
+        # Track spot availability history
+        self.spot_available_history.append(1 if has_spot else 0)
+        if len(self.spot_available_history) > 100:
+            self.spot_available_history.pop(0)
         
-        # Update work done
-        if last_cluster_type == ClusterType.SPOT and has_spot:
-            if self._restart_timer <= 0:
-                self._work_done += self.env.gap_seconds
-                self._cost += self.env.gap_seconds * self._spot_price
-        elif last_cluster_type == ClusterType.ON_DEMAND:
-            if self._restart_timer <= 0:
-                self._work_done += self.env.gap_seconds
-                self._cost += self.env.gap_seconds * self._od_price
+        # Calculate current progress
+        current_progress = sum(self.task_done_time)
+        progress_made = current_progress - self.last_progress
+        self.last_progress = current_progress
         
-        # Check if we're done
-        if self._work_done >= self.task_duration:
-            return ClusterType.NONE
+        # Update state based on progress
+        if progress_made > 0:
+            self.work_done += progress_made
         
-        # Calculate remaining work and time
-        remaining_work = self.task_duration - self._work_done
-        remaining_time = self.deadline - self._time_elapsed
+        # Calculate time remaining until deadline
+        time_remaining = self.deadline - current_time
+        work_remaining = self.task_duration - current_progress
         
-        # If we can't finish even with OD due to restart overhead, go OD immediately
-        if remaining_time - self.restart_overhead < remaining_work:
-            # In restart overhead period
-            if self._restart_timer > 0:
-                # Wait out restart if we're in middle of it
-                return ClusterType.NONE
+        # Initialize slack on first call
+        if self.initial_slack is None:
+            self.initial_slack = self.deadline - self.task_duration
+        
+        # State machine transitions
+        self.steps_in_current_state += 1
+        
+        if self.state == State.START:
+            if has_spot:
+                self.state = State.SPOT_RUNNING
+                return ClusterType.SPOT
             else:
-                # Switch to OD if we need to
-                if last_cluster_type != ClusterType.ON_DEMAND:
-                    self._restart_timer = self.restart_overhead
+                # If no spot at start, use OD for initial work
+                if work_remaining > 0.3 * self.task_duration:
+                    self.state = State.OD_RUNNING
+                    return ClusterType.ON_DEMAND
+                return ClusterType.NONE
+        
+        elif self.state == State.SPOT_RUNNING:
+            if not has_spot:
+                self.consecutive_spot_failures += 1
+                self.spot_unavailable_time = current_time
+                self.state = State.SPOT_GAP
+                return ClusterType.NONE
+            
+            self.consecutive_spot_failures = 0
+            
+            # Calculate if we should switch to OD to meet deadline
+            time_needed_with_restart = work_remaining
+            if time_needed_with_restart > time_remaining - self.restart_overhead:
+                self.state = State.OD_RUNNING
                 return ClusterType.ON_DEMAND
-        
-        # Calculate safe threshold
-        # Be more conservative as deadline approaches
-        time_safety_margin = max(2.0 * self.restart_overhead, 3600)  # At least 1 hour or 2x restart overhead
-        critical_ratio = remaining_work / max(remaining_time - time_safety_margin, 0.1)
-        
-        # If we're getting close to deadline or work is accumulating, use OD
-        if critical_ratio > 0.8:
-            if last_cluster_type != ClusterType.ON_DEMAND:
-                self._restart_timer = self.restart_overhead
-            return ClusterType.ON_DEMAND
-        
-        # Use spot when available and we're not in restart
-        if has_spot and self._restart_timer <= 0:
-            # Only switch to spot if we were on OD or NONE and it's worth it
-            if last_cluster_type != ClusterType.SPOT:
-                self._restart_timer = self.restart_overhead
+            
+            # If we've been running spot for a while successfully, continue
             return ClusterType.SPOT
         
-        # If spot not available and we're not critical, wait
-        if not has_spot and critical_ratio < 0.6:
+        elif self.state == State.SPOT_GAP:
+            time_in_gap = current_time - self.spot_unavailable_time
+            
+            # If we've waited too long for spot, consider OD
+            max_wait_time = min(3600, time_remaining * 0.2)
+            
+            if time_in_gap > max_wait_time or work_remaining > time_remaining * 0.8:
+                self.state = State.OD_RUNNING
+                return ClusterType.ON_DEMAND
+            
+            # Return to spot if available
+            if has_spot:
+                spot_success_rate = np.mean(self.spot_available_history) if self.spot_available_history else 0
+                
+                # Only return to spot if success rate is reasonable
+                if spot_success_rate > 0.4 or time_remaining > work_remaining * 1.5:
+                    self.state = State.SPOT_RUNNING
+                    return ClusterType.SPOT
+            
             return ClusterType.NONE
         
-        # Otherwise use OD
-        if last_cluster_type != ClusterType.ON_DEMAND:
-            self._restart_timer = self.restart_overhead
-        return ClusterType.ON_DEMAND
-    
+        elif self.state == State.OD_RUNNING:
+            # Check if we can switch back to spot
+            if has_spot:
+                # Calculate if we have enough time to use spot
+                spot_time_needed = work_remaining
+                current_slack = time_remaining - spot_time_needed
+                
+                # Only switch if we have sufficient slack
+                min_slack_for_switch = max(self.restart_overhead * 2, self.initial_slack * 0.3)
+                
+                if current_slack > min_slack_for_switch and work_remaining > self.task_duration * 0.1:
+                    spot_success_rate = np.mean(self.spot_available_history) if self.spot_available_history else 0
+                    
+                    # Be more aggressive with spot if success rate is high
+                    if spot_success_rate > 0.5:
+                        self.state = State.SPOT_RUNNING
+                        return ClusterType.SPOT
+            
+            return ClusterType.ON_DEMAND
+        
+        # Default fallback
+        if has_spot:
+            return ClusterType.SPOT
+        return ClusterType.NONE
+
     @classmethod
     def _from_args(cls, parser):
         args, _ = parser.parse_known_args()

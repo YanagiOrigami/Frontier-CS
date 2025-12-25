@@ -1,106 +1,173 @@
 import json
 import math
-from typing import List, Tuple, Dict
+from enum import Enum
+from typing import List, Optional
+
 from sky_spot.strategies.strategy import Strategy
 from sky_spot.utils import ClusterType
 
-class Solution(Strategy):
-    NAME = "dynamic_threshold"
 
-    def __init__(self, args):
-        super().__init__(args)
-        self.config = {}
-        self.spot_window = 0
-        self.spot_availability_history = []
-        self.consecutive_spot_failures = 0
-        self.safety_margin = 0.05
+class Solution(Strategy):
+    NAME = "my_solution"
+
+    def __init__(self, args=None):
+        super().__init__()
+        self.args = args
+        self.spec = {}
+        self.critical_threshold = 0.0
+        self.spot_history = []
+        self.window_size = 100
+        self.spot_availability = 0.5
+        self.min_spot_availability = 0.05
+        self.restart_penalty_factor = 2.0
+        self.conservative_factor = 1.2
         self.last_action = ClusterType.NONE
-        
+        self.spot_streak = 0
+        self.od_streak = 0
+        self.panic_mode = False
+        self.required_rate = 0.0
+        self.safety_margin = 0.0
+
     def solve(self, spec_path: str) -> "Solution":
         try:
             with open(spec_path, 'r') as f:
-                self.config = json.load(f)
+                self.spec = json.load(f)
         except:
             pass
-        
-        self.spot_window = 0
-        self.spot_availability_history = []
-        self.consecutive_spot_failures = 0
-        self.safety_margin = 0.05
-        self.last_action = ClusterType.NONE
         return self
 
+    def _compute_required_rate(self) -> float:
+        elapsed = self.env.elapsed_seconds
+        remaining_time = max(0.0, self.deadline - elapsed)
+        work_done = sum(self.task_done_time) if self.task_done_time else 0.0
+        work_remaining = max(0.0, self.task_duration - work_done)
+        
+        if remaining_time <= 0:
+            return float('inf')
+        
+        required = work_remaining / remaining_time
+        self.required_rate = required
+        return required
+
+    def _update_spot_history(self, has_spot: bool):
+        self.spot_history.append(1 if has_spot else 0)
+        if len(self.spot_history) > self.window_size:
+            self.spot_history.pop(0)
+        
+        if len(self.spot_history) > 0:
+            self.spot_availability = sum(self.spot_history) / len(self.spot_history)
+        else:
+            self.spot_availability = self.min_spot_availability
+
+    def _should_use_spot(self, has_spot: bool) -> bool:
+        if not has_spot:
+            return False
+            
+        required_rate = self._compute_required_rate()
+        elapsed = self.env.elapsed_seconds
+        remaining_time = max(0.0, self.deadline - elapsed)
+        
+        if remaining_time < self.restart_overhead * self.restart_penalty_factor:
+            return False
+            
+        work_done = sum(self.task_done_time) if self.task_done_time else 0.0
+        work_remaining = max(0.0, self.task_duration - work_done)
+        
+        expected_spot_rate = self.spot_availability * (1.0 - self.restart_overhead / (self.gap_seconds * 10))
+        required_with_safety = required_rate * self.conservative_factor
+        
+        if expected_spot_rate >= required_with_safety and self.spot_availability > self.min_spot_availability:
+            return True
+            
+        time_needed_spot = work_remaining / max(0.01, expected_spot_rate)
+        time_needed_od = work_remaining
+        
+        if time_needed_spot * 0.97 + self.restart_overhead * 2 < time_needed_od:
+            return True
+            
+        return False
+
+    def _should_use_ondemand(self) -> bool:
+        required_rate = self._compute_required_rate()
+        elapsed = self.env.elapsed_seconds
+        remaining_time = max(0.0, self.deadline - elapsed)
+        
+        if remaining_time <= 0:
+            return True
+            
+        work_done = sum(self.task_done_time) if self.task_done_time else 0.0
+        work_remaining = max(0.0, self.task_duration - work_done)
+        
+        time_needed_od = work_remaining
+        critical_threshold = self.restart_overhead * 3
+        
+        if remaining_time - time_needed_od < critical_threshold:
+            return True
+            
+        if required_rate > 0.8:
+            return True
+            
+        if self.panic_mode:
+            return True
+            
+        expected_spot_success = self.spot_availability
+        if expected_spot_success < 0.3 and required_rate > 0.5:
+            return True
+            
+        return False
+
     def _step(self, last_cluster_type: ClusterType, has_spot: bool) -> ClusterType:
+        self._update_spot_history(has_spot)
+        required_rate = self._compute_required_rate()
+        
+        elapsed = self.env.elapsed_seconds
+        remaining_time = max(0.0, self.deadline - elapsed)
+        
+        if remaining_time <= 0:
+            return ClusterType.NONE
+            
+        work_done = sum(self.task_done_time) if self.task_done_time else 0.0
+        work_remaining = max(0.0, self.task_duration - work_done)
+        
+        if work_remaining <= 0:
+            return ClusterType.NONE
+            
+        if last_cluster_type == ClusterType.SPOT:
+            self.spot_streak += 1
+            self.od_streak = 0
+        elif last_cluster_type == ClusterType.ON_DEMAND:
+            self.od_streak += 1
+            self.spot_streak = 0
+        else:
+            self.spot_streak = max(0, self.spot_streak - 1)
+            self.od_streak = max(0, self.od_streak - 1)
+        
         self.last_action = last_cluster_type
         
-        current_time = self.env.elapsed_seconds
-        gap = self.env.gap_seconds
-        deadline = self.deadline
-        task_duration = self.task_duration
-        restart_overhead = self.restart_overhead
-        
-        total_done = sum(self.task_done_time)
-        remaining_work = task_duration - total_done
-        time_left = deadline - current_time
-        
-        if remaining_work <= 0:
-            return ClusterType.NONE
-        
-        self.spot_availability_history.append(1 if has_spot else 0)
-        if len(self.spot_availability_history) > 100:
-            self.spot_availability_history.pop(0)
+        if self._should_use_ondemand():
+            self.panic_mode = remaining_time < self.task_duration * 0.7
+            return ClusterType.ON_DEMAND
             
-        if not has_spot:
-            self.consecutive_spot_failures += 1
-        else:
-            self.consecutive_spot_failures = max(0, self.consecutive_spot_failures - 1)
-        
-        spot_reliability = sum(self.spot_availability_history) / max(1, len(self.spot_availability_history))
-        
-        effective_time_needed = remaining_work
-        if last_cluster_type == ClusterType.SPOT and not has_spot:
-            effective_time_needed += restart_overhead
-        
-        critical_ratio = effective_time_needed / max(0.001, time_left)
-        
-        urgency = max(0, 1 - (time_left / (deadline * 0.8)))
-        
-        time_budget_ratio = time_left / effective_time_needed if effective_time_needed > 0 else float('inf')
-        
-        if time_budget_ratio < 1.1:
-            return ClusterType.ON_DEMAND
-        
-        if time_budget_ratio < 1.3:
-            if has_spot and spot_reliability > 0.6 and self.consecutive_spot_failures < 3:
-                return ClusterType.SPOT
-            return ClusterType.ON_DEMAND
-        
-        if critical_ratio > 0.8:
-            if has_spot and spot_reliability > 0.4 and self.consecutive_spot_failures < 5:
-                return ClusterType.SPOT
-            return ClusterType.ON_DEMAND
-        
-        if critical_ratio > 0.5:
-            if has_spot and spot_reliability > 0.3 and self.consecutive_spot_failures < 8:
-                return ClusterType.SPOT
-            if time_budget_ratio > 1.5 and has_spot:
-                return ClusterType.SPOT
-            return ClusterType.ON_DEMAND if not has_spot else ClusterType.SPOT
-        
-        if time_budget_ratio > 2.0:
-            if has_spot and self.consecutive_spot_failures < 10:
-                self.spot_window += 1
-                if self.spot_window >= 2 or spot_reliability > 0.2:
-                    return ClusterType.SPOT
-                else:
-                    return ClusterType.NONE
-            else:
-                self.spot_window = 0
-                return ClusterType.NONE
-        else:
+        if self._should_use_spot(has_spot):
             if has_spot:
                 return ClusterType.SPOT
-            return ClusterType.NONE
+            else:
+                if remaining_time < work_remaining * 1.1:
+                    return ClusterType.ON_DEMAND
+                return ClusterType.NONE
+        else:
+            if has_spot and self.spot_streak > 5:
+                return ClusterType.SPOT
+            
+            if remaining_time > work_remaining * 1.5:
+                return ClusterType.NONE
+            else:
+                if has_spot:
+                    return ClusterType.SPOT
+                else:
+                    if remaining_time < work_remaining * 1.2:
+                        return ClusterType.ON_DEMAND
+                    return ClusterType.NONE
 
     @classmethod
     def _from_args(cls, parser):

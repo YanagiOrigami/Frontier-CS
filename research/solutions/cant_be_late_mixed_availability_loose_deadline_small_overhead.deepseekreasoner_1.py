@@ -1,129 +1,150 @@
 import argparse
 import math
-from typing import List, Tuple
 from sky_spot.strategies.strategy import Strategy
 from sky_spot.utils import ClusterType
 
-
 class Solution(Strategy):
-    NAME = "my_solution"
+    NAME = "adaptive_deadline_aware"
 
     def __init__(self, args):
-        super().__init__()
-        self.args = args
-        self.spot_price = 0.97
-        self.ondemand_price = 3.06
-        self.spot_available_history = []
-        self.last_spot_decision = False
-        self.safety_margin_factor = 1.2
-        self.min_spot_prob_threshold = 0.3
-        self.consecutive_spot_needed = 0
-        self.last_work_rate = 0.0
-
+        super().__init__(args)
+        self.spec = None
+        self.spot_price = None
+        self.od_price = None
+        self.initialized = False
+        self.spot_availability_est = 0.5
+        self.consecutive_none = 0
+        self.last_decision = None
+        self.in_overhead = False
+        self.overhead_remaining = 0.0
+        
+    def _initialize_from_spec(self):
+        if self.initialized:
+            return
+            
+        try:
+            import json
+            with open(self.spec, 'r') as f:
+                config = json.load(f)
+                self.spot_price = config.get('spot_price', 0.97)
+                self.od_price = config.get('od_price', 3.06)
+                self.spot_availability_est = config.get('avg_availability', 0.5)
+        except:
+            self.spot_price = 0.97
+            self.od_price = 3.06
+            self.spot_availability_est = 0.5
+            
+        self.initialized = True
+    
     def solve(self, spec_path: str) -> "Solution":
+        self.spec = spec_path
         return self
-
-    def _estimate_spot_availability_probability(self, recent_window: int = 100) -> float:
-        if not self.spot_available_history:
-            return 0.5
-        
-        window = min(recent_window, len(self.spot_available_history))
-        recent = self.spot_available_history[-window:]
-        return sum(recent) / window
-
-    def _calculate_required_progress_rate(self) -> float:
-        remaining_work = self.task_duration - sum(self.task_done_time)
-        remaining_time = self.deadline - self.env.elapsed_seconds
-        if remaining_time <= 0:
-            return float('inf')
-        return remaining_work / remaining_time
-
-    def _calculate_conservative_required_rate(self) -> float:
-        remaining_work = self.task_duration - sum(self.task_done_time)
-        remaining_time = self.deadline - self.env.elapsed_seconds - self.restart_overhead * 2
-        if remaining_time <= 0:
-            return float('inf')
-        return remaining_work / remaining_time
-
-    def _calculate_time_safety_factor(self) -> float:
-        elapsed = self.env.elapsed_seconds
-        total_time = self.deadline
-        progress = sum(self.task_done_time) / self.task_duration if self.task_duration > 0 else 0
-        
-        if progress >= 1.0:
-            return 2.0
-        
-        expected_progress = elapsed / total_time
-        if expected_progress <= 0:
-            return 1.0
-        
-        progress_ratio = progress / expected_progress if expected_progress > 0 else 1.0
-        safety = 1.0 + (1.0 - progress_ratio) * 2.0
-        return max(1.0, min(3.0, safety))
-
-    def _should_switch_to_ondemand(self, spot_prob: float, required_rate: float) -> bool:
-        if required_rate > 0.95:
-            return True
-        
-        time_safety = self._calculate_time_safety_factor()
-        conservative_rate = self._calculate_conservative_required_rate()
-        
-        if conservative_rate > 0.8:
-            return True
-        
-        if spot_prob < self.min_spot_prob_threshold:
-            threshold_adjusted = self.min_spot_prob_threshold / time_safety
-            if spot_prob < threshold_adjusted:
-                return True
-        
-        remaining_time = self.deadline - self.env.elapsed_seconds
-        remaining_work = self.task_duration - sum(self.task_done_time)
-        
-        if remaining_time <= 0:
-            return False
-        
-        time_needed_ondemand = remaining_work + self.restart_overhead
-        time_needed_spot = remaining_work / max(spot_prob, 0.01) + self.restart_overhead * 2
-        
-        return time_needed_spot > remaining_time * 0.9 and time_needed_ondemand <= remaining_time * 0.95
-
+    
     def _step(self, last_cluster_type: ClusterType, has_spot: bool) -> ClusterType:
-        self.spot_available_history.append(has_spot)
-        if len(self.spot_available_history) > 1000:
-            self.spot_available_history.pop(0)
+        if not self.initialized:
+            self._initialize_from_spec()
         
-        required_rate = self._calculate_required_progress_rate()
-        spot_prob = self._estimate_spot_availability_probability()
+        current_time = self.env.elapsed_seconds
+        time_step = self.env.gap_seconds
+        work_done = sum(self.task_done_time) if self.task_done_time else 0
+        work_remaining = self.task_duration - work_done
+        deadline = self.deadline
+        overhead = self.restart_overhead
         
-        if last_cluster_type == ClusterType.SPOT:
-            self.consecutive_spot_needed = max(0, self.consecutive_spot_needed - 1)
-        elif last_cluster_type == ClusterType.ON_DEMAND:
-            self.consecutive_spot_needed = 0
+        time_remaining = deadline - current_time
         
-        if required_rate > 0.99:
-            return ClusterType.ON_DEMAND
-        
-        if not has_spot:
-            if required_rate > 0.7:
-                return ClusterType.ON_DEMAND
+        if work_remaining <= 0:
             return ClusterType.NONE
         
-        if self._should_switch_to_ondemand(spot_prob, required_rate):
-            return ClusterType.ON_DEMAND
+        if self.in_overhead:
+            self.overhead_remaining -= time_step
+            if self.overhead_remaining <= 0:
+                self.in_overhead = False
+                self.overhead_remaining = 0
+            return ClusterType.NONE
         
-        remaining_work = self.task_duration - sum(self.task_done_time)
-        remaining_time = self.deadline - self.env.elapsed_seconds
+        if last_cluster_type == ClusterType.SPOT and not has_spot:
+            self.in_overhead = True
+            self.overhead_remaining = overhead
+            return ClusterType.NONE
         
-        if remaining_time > remaining_work * 1.5:
-            if spot_prob > 0.6:
+        if has_spot:
+            if self._should_switch_to_od(last_cluster_type, work_remaining, time_remaining, time_step):
+                return ClusterType.ON_DEMAND
+            else:
                 return ClusterType.SPOT
-            elif spot_prob > 0.3 and remaining_time > remaining_work * 2:
-                return ClusterType.SPOT
+        else:
+            if self._should_use_od_when_no_spot(work_remaining, time_remaining, time_step):
+                return ClusterType.ON_DEMAND
             else:
                 return ClusterType.NONE
+    
+    def _should_switch_to_od(self, last_type, work_remaining, time_remaining, time_step):
+        if last_type == ClusterType.ON_DEMAND:
+            return True
+            
+        if work_remaining <= 0:
+            return False
+            
+        if time_remaining <= 0:
+            return False
+            
+        time_needed_if_od = work_remaining
+        if time_needed_if_od >= time_remaining:
+            return True
+            
+        time_needed_if_spot = work_remaining + (overhead_cost := self._estimate_overhead_cost(time_remaining))
         
-        return ClusterType.SPOT
-
+        safety_margin = max(2.0, work_remaining * 0.1)
+        
+        if time_needed_if_spot + safety_margin >= time_remaining:
+            return True
+            
+        progress_rate_needed = work_remaining / time_remaining
+        spot_success_rate = self.spot_availability_est
+        
+        if spot_success_rate < 0.5 and progress_rate_needed > 0.8:
+            return True
+            
+        return False
+    
+    def _should_use_od_when_no_spot(self, work_remaining, time_remaining, time_step):
+        if work_remaining <= 0:
+            return False
+            
+        if time_remaining <= 0:
+            return True
+            
+        time_needed_if_od = work_remaining
+        
+        if time_needed_if_od >= time_remaining:
+            return True
+            
+        if self.consecutive_none > 3:
+            return True
+            
+        progress_rate_needed = work_remaining / time_remaining
+        
+        if progress_rate_needed > 0.9:
+            return True
+            
+        if time_remaining < work_remaining * 1.2:
+            return True
+            
+        return False
+    
+    def _estimate_overhead_cost(self, time_remaining):
+        total_overhead = 0
+        remaining_time = time_remaining
+        avg_spot_uptime = 3600.0
+        
+        while remaining_time > 0 and avg_spot_uptime > 0:
+            expected_interruptions = remaining_time / avg_spot_uptime
+            total_overhead += expected_interruptions * self.restart_overhead
+            remaining_time = max(0, remaining_time - avg_spot_uptime)
+            
+        return total_overhead * 0.7
+    
     @classmethod
     def _from_args(cls, parser):
         args, _ = parser.parse_known_args()

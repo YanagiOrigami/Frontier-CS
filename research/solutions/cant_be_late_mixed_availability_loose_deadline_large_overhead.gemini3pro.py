@@ -2,58 +2,63 @@ from sky_spot.strategies.strategy import Strategy
 from sky_spot.utils import ClusterType
 
 class Solution(Strategy):
-    NAME = "SafeSlackStrategy"
+    NAME = "CantBeLateStrategy"
 
     def solve(self, spec_path: str) -> "Solution":
         return self
 
     def _step(self, last_cluster_type: ClusterType, has_spot: bool) -> ClusterType:
-        # Retrieve environment parameters
         elapsed = self.env.elapsed_seconds
-        deadline = self.deadline
-        total_duration = self.task_duration
-        work_done = sum(self.task_done_time)
-        restart_overhead = self.restart_overhead
         gap = self.env.gap_seconds
+        deadline = self.deadline
+        overhead = self.restart_overhead
+        total_work = self.task_duration
+        done_work = sum(self.task_done_time)
         
-        # Calculate remaining time and work
-        remaining_time = deadline - elapsed
-        remaining_work = total_duration - work_done
+        rem_work = total_work - done_work
+        rem_time = deadline - elapsed
         
-        # Calculate slack: the amount of time we can afford to not make progress
-        # If slack is 0, we must run continuously on a resource that guarantees progress.
-        slack = remaining_time - remaining_work
-        
-        # Define safety margin
-        # We need to switch to On-Demand before slack runs out.
-        # We add a buffer of 3600s (1 hour) plus 2 timesteps to handle granularity and safety.
-        # The penalty for missing the deadline is severe, so we prioritize safety over squeeze.
-        safety_buffer = 3600.0 + (2.0 * gap)
-        
-        # Determine the time cost required to switch to On-Demand
-        # If we are already running On-Demand, there is no switch cost (overhead).
-        # Otherwise (Spot or None), we must pay the restart overhead to start OD.
-        time_to_start_od = 0.0
-        if last_cluster_type != ClusterType.ON_DEMAND:
-            time_to_start_od = restart_overhead
+        # If work is completed
+        if rem_work <= 1e-6:
+            return ClusterType.NONE
             
-        # Critical threshold: If slack drops below this, we must use On-Demand immediately.
-        threshold = time_to_start_od + safety_buffer
+        # Safety buffer to account for step granularity and float precision
+        buffer = 2.0 * gap
         
-        # Decision Logic
-        if slack < threshold:
-            # We are close to the deadline relative to our buffer.
-            # Must use On-Demand to guarantee completion.
+        # Calculate the "Panic Threshold":
+        # The latest time we must start On-Demand to guarantee finishing.
+        # We assume worst-case: we need to incur restart overhead (delta) + work time.
+        # If rem_time is below this, we must use On-Demand immediately.
+        panic_threshold = rem_work + overhead + buffer
+        
+        if rem_time < panic_threshold:
             return ClusterType.ON_DEMAND
             
-        if has_spot:
-            # We have sufficient slack and Spot is available.
-            # Use Spot to minimize cost.
-            return ClusterType.SPOT
+        # If we are here, we have slack (rem_time >= panic_threshold)
+        
+        if last_cluster_type == ClusterType.ON_DEMAND:
+            # We are currently on OD. To switch back to Spot (or wait), we need extra slack.
+            # Switching incurs overhead. If we switch to Spot and it fails immediately,
+            # we pay overhead to go back to OD.
+            # We enforce a hysteresis buffer to prevent oscillation.
+            hysteresis = overhead + buffer
             
-        # Spot is unavailable, but we have enough slack to wait.
-        # Waiting (NONE) costs $0, preserving budget.
-        return ClusterType.NONE
+            if rem_time > panic_threshold + hysteresis:
+                if has_spot:
+                    return ClusterType.SPOT
+                else:
+                    return ClusterType.NONE
+            else:
+                # Keep holding OD as we are relatively close to the threshold
+                return ClusterType.ON_DEMAND
+        else:
+            # We are not on OD. We have slack.
+            # Use Spot if available to minimize cost.
+            # If not available, wait (NONE) to save money, since we are safe.
+            if has_spot:
+                return ClusterType.SPOT
+            else:
+                return ClusterType.NONE
 
     @classmethod
     def _from_args(cls, parser):

@@ -1,148 +1,238 @@
-import math
-from typing import Any
+import numbers
+from typing import Any, ClassVar
 
-try:
-    from sky_spot.strategies.strategy import Strategy
-    from sky_spot.utils import ClusterType
-except ImportError:  # Fallbacks for local testing without the real package
-    from enum import Enum
-
-    class ClusterType(Enum):
-        SPOT = 1
-        ON_DEMAND = 2
-        NONE = 3
-
-    class DummyEnv:
-        def __init__(self):
-            self.elapsed_seconds = 0.0
-            self.gap_seconds = 300.0
-            self.cluster_type = ClusterType.NONE
-
-    class Strategy:  # type: ignore
-        def __init__(self, *args, **kwargs):
-            self.env = DummyEnv()
-            self.task_duration = 48 * 3600.0
-            self.task_done_time = []
-            self.deadline = 52 * 3600.0
-            self.restart_overhead = 0.05 * 3600.0
-
-        def solve(self, spec_path: str):
-            return self
+from sky_spot.strategies.strategy import Strategy
+from sky_spot.utils import ClusterType
 
 
 class Solution(Strategy):
-    NAME = "cant_be_late_hybrid_v1"
+    NAME: ClassVar[str] = "my_solution"
 
     def __init__(self, args: Any = None):
         super().__init__(args)
-        # Cached total completed task time (seconds)
-        self._done_time_cache = 0.0
-        self._done_time_len = 0
+        # Policy / progress tracking state
+        self._policy_initialized: bool = False
 
-        # Once we commit to on-demand, never go back to spot/none
-        self._committed_to_od = False
+        # Progress representation
+        self._task_rep: str | None = None  # 'scalar', 'segments', 'fallback'
+        self._progress: float = 0.0  # Estimated job progress in seconds
 
-        # Slack thresholds (seconds)
-        # When slack < _commit_slack: always use ON_DEMAND
-        self._commit_slack = 1.0 * 3600.0  # 1 hour
-        # When no spot and slack > _idle_slack: we can afford to wait (NONE)
-        self._idle_slack = 2.0 * 3600.0    # 2 hours
+        # For 'segments' representation incremental update
+        self._prev_task_len: int = 0
+        self._prev_last_seg_length: float = 0.0
+
+        # For fallback progress when task_done_time is unusable
+        self._fallback_progress: float = 0.0
+        self._fallback_prev_elapsed: float | None = None
+
+        # Scheduling thresholds (initialized when env is available)
+        self.total_slack: float = 0.0
+        self.pure_spot_slack: float = 0.0
+        self.commit_margin: float = 0.0
+
+        # Phase control
+        self.lock_in_ondemand: bool = False
 
     def solve(self, spec_path: str) -> "Solution":
-        # Optional: could read spec_path to adjust thresholds.
+        # Optional: could parse spec_path; unused here
         return self
 
-    def _update_progress_cache(self) -> None:
-        """Incrementally update cached completed task time."""
-        task_done_time = getattr(self, "task_done_time", None)
-        if task_done_time is None:
-            return
+    # ---------- Internal helpers ----------
 
-        n = len(task_done_time)
-        if n <= self._done_time_len:
-            return
+    def _init_policy(self) -> None:
+        # Called on first _step, when env and task attributes are available
+        self.total_slack = max(0.0, float(self.deadline) - float(self.task_duration))
 
-        for i in range(self._done_time_len, n):
-            seg = task_done_time[i]
-            dur = 0.0
-            if isinstance(seg, (tuple, list)):
+        # Use up to 50% of slack in pure-spot phase
+        self.pure_spot_slack = 0.5 * self.total_slack
+
+        # Leave some margin before hard deadline when switching permanently to OD
+        if self.total_slack > 0.0:
+            # Commit margin: min(0.5h, 50% of total slack)
+            half_hour = 0.5 * 3600.0
+            self.commit_margin = min(half_hour, 0.5 * self.total_slack)
+        else:
+            self.commit_margin = 0.0
+
+        # Initialize fallback elapsed tracker
+        self._fallback_prev_elapsed = float(self.env.elapsed_seconds)
+
+        self.lock_in_ondemand = False
+        self._policy_initialized = True
+
+    @staticmethod
+    def _seg_len(seg: Any) -> float | None:
+        try:
+            if isinstance(seg, (list, tuple)):
                 if len(seg) >= 2:
-                    try:
-                        dur = float(seg[1]) - float(seg[0])
-                    except Exception:
-                        dur = 0.0
+                    start = float(seg[0])
+                    end = float(seg[1])
+                    return end - start
             else:
-                try:
-                    dur = float(seg)
-                except Exception:
-                    dur = 0.0
+                start = getattr(seg, "start", None)
+                end = getattr(seg, "end", None)
+                if start is not None and end is not None:
+                    return float(end) - float(start)
+        except Exception:
+            return None
+        return None
 
-            if dur > 0.0:
-                self._done_time_cache += dur
+    def _update_fallback_progress(self, last_cluster_type: ClusterType) -> None:
+        if self._fallback_prev_elapsed is None:
+            self._fallback_prev_elapsed = float(self.env.elapsed_seconds)
+            return
 
-        self._done_time_len = n
+        current_elapsed = float(self.env.elapsed_seconds)
+        dt = current_elapsed - self._fallback_prev_elapsed
+        if dt < 0.0:
+            dt = 0.0
 
-        task_duration = float(getattr(self, "task_duration", 0.0) or 0.0)
-        if task_duration > 0.0 and self._done_time_cache > task_duration:
-            self._done_time_cache = task_duration
+        if last_cluster_type is not None and last_cluster_type != ClusterType.NONE:
+            self._fallback_progress += dt
 
-    def _estimate_remaining_work(self) -> float:
-        """Estimate remaining task duration (seconds)."""
-        self._update_progress_cache()
-        task_duration = float(getattr(self, "task_duration", 0.0) or 0.0)
-        done = self._done_time_cache
-        remaining = task_duration - done
-        if remaining < 0.0:
-            remaining = 0.0
-        return remaining
+        self._fallback_prev_elapsed = current_elapsed
+
+    def _update_progress(self, last_cluster_type: ClusterType) -> None:
+        # Try to use env.task_done_time; fall back to runtime estimation if needed.
+        task_done = getattr(self, "task_done_time", None)
+
+        # Always advance fallback estimate in case we need it
+        self._update_fallback_progress(last_cluster_type)
+
+        if task_done is None:
+            # No info; rely on fallback
+            self._task_rep = "fallback"
+            self._progress = self._fallback_progress
+            return
+
+        # Empty list: no work done yet
+        if not task_done:
+            if self._task_rep is None:
+                # Representation not yet known; keep zero or fallback
+                self._progress = max(self._progress, self._fallback_progress)
+            elif self._task_rep == "fallback":
+                self._progress = self._fallback_progress
+            return
+
+        # Infer representation once
+        if self._task_rep is None:
+            first = task_done[0]
+            if isinstance(first, numbers.Number):
+                self._task_rep = "scalar"
+            else:
+                seg_len = self._seg_len(first)
+                if seg_len is not None:
+                    self._task_rep = "segments"
+                    total = 0.0
+                    for seg in task_done:
+                        l = self._seg_len(seg)
+                        if l is not None and l > 0.0:
+                            total += l
+                    self._progress = total
+                    self._prev_task_len = len(task_done)
+                    last_len = self._seg_len(task_done[-1])
+                    self._prev_last_seg_length = last_len if last_len is not None else 0.0
+                    return
+                else:
+                    self._task_rep = "fallback"
+
+        # Update according to representation
+        if self._task_rep == "scalar":
+            try:
+                self._progress = float(task_done[-1])
+            except Exception:
+                # Fall back if unexpected structure
+                self._task_rep = "fallback"
+                self._progress = self._fallback_progress
+        elif self._task_rep == "segments":
+            segs = task_done
+            n = len(segs)
+            if n == 0:
+                return
+
+            last_seg = segs[-1]
+            last_len = self._seg_len(last_seg)
+            if last_len is None:
+                last_len = 0.0
+
+            if n > self._prev_task_len:
+                # New segments appended
+                for i in range(self._prev_task_len, n - 1):
+                    l = self._seg_len(segs[i])
+                    if l is not None and l > 0.0:
+                        self._progress += l
+                inc = max(0.0, last_len)
+            else:
+                # Same count; last segment extended
+                inc = max(0.0, last_len - self._prev_last_seg_length)
+
+            self._progress += inc
+            self._prev_task_len = n
+            self._prev_last_seg_length = last_len
+        else:
+            # Fallback representation
+            self._progress = self._fallback_progress
+
+    # ---------- Core decision logic ----------
 
     def _step(self, last_cluster_type: ClusterType, has_spot: bool) -> ClusterType:
-        # If we've already committed to on-demand, always stay on-demand.
-        if self._committed_to_od:
-            return ClusterType.ON_DEMAND
+        if not self._policy_initialized:
+            self._init_policy()
 
-        remaining_work = self._estimate_remaining_work()
+        # Update progress estimate
+        self._update_progress(last_cluster_type)
 
-        # If task is done (or nearly done), don't spend more.
-        if remaining_work <= 0.0:
+        elapsed = float(self.env.elapsed_seconds)
+        progress = max(0.0, min(float(self.task_duration), float(self._progress)))
+        remaining = max(0.0, float(self.task_duration) - progress)
+        time_to_deadline = float(self.deadline) - elapsed
+
+        # Spent slack = elapsed wall-clock minus progress on job
+        spent_slack = max(0.0, elapsed - progress)
+
+        # If job already effectively done, no need to run more
+        if remaining <= 0.0:
             return ClusterType.NONE
 
-        elapsed = float(getattr(self.env, "elapsed_seconds", 0.0) or 0.0)
-        deadline = float(getattr(self, "deadline", 0.0) or 0.0)
-        time_remaining = deadline - elapsed
-        if time_remaining < 0.0:
-            time_remaining = 0.0
-
-        # Slack = time remaining - work remaining
-        slack = time_remaining - remaining_work
-
-        # If we somehow have no slack left, must go all-in on on-demand.
-        if slack <= 0.0:
-            self._committed_to_od = True
-            return ClusterType.ON_DEMAND
-
-        # Commit to on-demand when slack is small.
-        if slack < self._commit_slack:
-            self._committed_to_od = True
-            return ClusterType.ON_DEMAND
-
-        # Ensure idle slack is at least commit slack.
-        if self._idle_slack < self._commit_slack:
-            self._idle_slack = self._commit_slack
-
-        # If spot is available and we're not in the danger zone, use spot.
-        if has_spot:
-            return ClusterType.SPOT
-
-        # No spot available: decide between waiting and using on-demand.
-        if slack > self._idle_slack:
-            # Plenty of slack: we can wait for cheaper spot.
+        # If time is already past deadline, nothing to do; choose NONE to avoid extra cost
+        if time_to_deadline <= 0.0:
             return ClusterType.NONE
+
+        # If we've already decided to lock into on-demand, always use it
+        if self.lock_in_ondemand:
+            return ClusterType.ON_DEMAND
+
+        # If there is no slack at all, must run on-demand continuously
+        if self.total_slack <= 0.0:
+            self.lock_in_ondemand = True
+            return ClusterType.ON_DEMAND
+
+        # Safety: if even running flat-out from now (no idle) barely makes the deadline, lock into OD
+        # We require a small positive margin (commit_margin) to account for step granularity/overheads.
+        if time_to_deadline <= remaining + self.commit_margin:
+            self.lock_in_ondemand = True
+            return ClusterType.ON_DEMAND
+
+        # Commit to on-demand when consumed slack approaches total slack minus margin
+        if spent_slack >= self.total_slack - self.commit_margin:
+            self.lock_in_ondemand = True
+            return ClusterType.ON_DEMAND
+
+        # Phase selection based on spent slack
+        if spent_slack < self.pure_spot_slack:
+            # Phase 1: pure spot usage, idle when no spot
+            if has_spot:
+                return ClusterType.SPOT
+            else:
+                return ClusterType.NONE
         else:
-            # Slack shrinking: use on-demand to maintain schedule.
-            return ClusterType.ON_DEMAND
+            # Phase 2: hybrid - run continuously; use spot when available, OD otherwise
+            if has_spot:
+                return ClusterType.SPOT
+            else:
+                return ClusterType.ON_DEMAND
 
     @classmethod
-    def _from_args(cls, parser):
+    def _from_args(cls, parser) -> "Solution":
         args, _ = parser.parse_known_args()
         return cls(args)

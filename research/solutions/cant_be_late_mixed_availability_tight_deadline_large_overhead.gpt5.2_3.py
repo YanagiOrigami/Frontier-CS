@@ -1,332 +1,273 @@
+import json
 import math
-from collections import deque
+from typing import Any, Optional
 
 from sky_spot.strategies.strategy import Strategy
 from sky_spot.utils import ClusterType
 
 
 class Solution(Strategy):
-    NAME = "cant_be_late_v1"
+    NAME = "cbll_ewma_v1"
 
-    def __init__(self, args=None):
-        try:
-            super().__init__(args)
-        except TypeError:
-            try:
-                super().__init__()
-            except Exception:
-                pass
+    def __init__(self, args: Any = None):
+        super().__init__(args)
+        self.args = args
 
         self._initialized = False
+        self._last_has_spot: Optional[bool] = None
 
-        self._forced_od = False
-        self._blacklist_spot = False
+        self._beta = 0.06
+        self._p_off_on = 0.25
+        self._p_on_off = 0.10
 
-        self._last_has_spot = None
-        self._spot_streak = 0
-        self._down_streak = 0
+        self._consec_on = 0
+        self._consec_off = 0
 
-        self._prev_decision = None
-        self._od_until = 0.0
+        self._lock_od_until = 0.0
 
-        self._spot_segment_start = None
-        self._spot_segment_durations = deque(maxlen=8)
-
-        self._preemption_times = deque(maxlen=200)
-        self._preemptions = 0
-
-        self._spot_run_seconds = 0.0
-        self._od_run_seconds = 0.0
-
-        self._U_ema = None
-        self._D_ema = None
-        self._cur_up_len = 0.0
-        self._cur_down_len = 0.0
-
-        self._done_mode = "unknown"
-        self._done_cache = 0.0
-        self._done_cache_key = None
+        self._done_cache_kind: Optional[str] = None
+        self._done_cache_len = -1
+        self._done_cache_value = 0.0
 
     def solve(self, spec_path: str) -> "Solution":
+        try:
+            with open(spec_path, "r") as f:
+                spec = json.load(f)
+            if isinstance(spec, dict):
+                beta = spec.get("beta", None)
+                if isinstance(beta, (int, float)) and 0.0 < float(beta) <= 1.0:
+                    self._beta = float(beta)
+        except Exception:
+            pass
         return self
 
     @staticmethod
-    def _is_num(x):
+    def _is_number(x: Any) -> bool:
         return isinstance(x, (int, float)) and not isinstance(x, bool)
 
-    def _compute_done_seconds(self) -> float:
-        # Prefer any direct attributes if available.
-        for attr in ("task_done_seconds", "done_seconds", "completed_seconds"):
-            if hasattr(self, attr):
-                v = getattr(self, attr)
-                if self._is_num(v):
-                    return float(v)
-        if hasattr(self, "env"):
-            for attr in ("task_done_seconds", "done_seconds", "completed_seconds"):
-                if hasattr(self.env, attr):
-                    v = getattr(self.env, attr)
-                    if self._is_num(v):
-                        return float(v)
+    def _get_done_work_seconds(self) -> float:
+        v = getattr(self.env, "task_done_seconds", None)
+        if self._is_number(v):
+            return float(v)
 
-        lst = getattr(self, "task_done_time", None)
-        if not lst:
+        tdt = getattr(self, "task_done_time", None)
+        if tdt is None:
+            return 0.0
+        if self._is_number(tdt):
+            return float(tdt)
+
+        if not isinstance(tdt, (list, tuple)):
             return 0.0
 
-        # If list identity and length unchanged, use cached.
-        cache_key = (id(lst), len(lst))
-        if self._done_cache_key == cache_key and self._done_mode != "unknown":
-            if self._done_mode == "scalar_last":
-                try:
-                    return float(lst[-1]) if lst else 0.0
-                except Exception:
-                    return self._done_cache
-            return self._done_cache
+        n = len(tdt)
+        if n == 0:
+            self._done_cache_len = 0
+            self._done_cache_value = 0.0
+            return 0.0
 
-        # Detect and compute.
-        done = 0.0
-        try:
-            if all(self._is_num(x) for x in lst):
-                # Heuristic: if non-decreasing and bounded by task duration, interpret as cumulative.
-                nondec = True
-                for i in range(len(lst) - 1):
-                    if lst[i] > lst[i + 1]:
-                        nondec = False
-                        break
-                td = float(getattr(self, "task_duration", 0.0) or 0.0)
-                if nondec and len(lst) >= 2 and td > 0 and float(lst[-1]) <= td * 1.10:
-                    done = float(lst[-1])
-                    self._done_mode = "scalar_last"
-                else:
-                    done = float(sum(float(x) for x in lst))
-                    self._done_mode = "scalar_sum"
+        kind = self._done_cache_kind
+        if kind is None:
+            first = tdt[0]
+            if self._is_number(first):
+                kind = "numbers"
+            elif isinstance(first, (list, tuple)) and len(first) >= 2 and self._is_number(first[0]) and self._is_number(first[1]):
+                kind = "intervals"
             else:
-                # Sum segment durations.
-                for seg in lst:
-                    if seg is None:
-                        continue
-                    if self._is_num(seg):
-                        done += float(seg)
-                        continue
-                    if isinstance(seg, (tuple, list)) and len(seg) == 2 and self._is_num(seg[0]) and self._is_num(seg[1]):
-                        done += float(seg[1]) - float(seg[0])
-                        continue
-                    if isinstance(seg, dict):
-                        if "duration" in seg and self._is_num(seg["duration"]):
-                            done += float(seg["duration"])
-                            continue
-                        if "start" in seg and "end" in seg and self._is_num(seg["start"]) and self._is_num(seg["end"]):
-                            done += float(seg["end"]) - float(seg["start"])
-                            continue
-                        if "done" in seg and self._is_num(seg["done"]):
-                            done += float(seg["done"])
-                            continue
-                self._done_mode = "segments_sum"
-        except Exception:
-            # Fallback best effort.
-            try:
-                done = float(self._done_cache)
-            except Exception:
-                done = 0.0
-            self._done_mode = "unknown"
+                kind = "unknown"
+            self._done_cache_kind = kind
 
-        if done < 0:
-            done = 0.0
+        if kind == "numbers":
+            if n >= self._done_cache_len >= 0:
+                inc = 0.0
+                for x in tdt[self._done_cache_len : n]:
+                    if self._is_number(x):
+                        inc += float(x)
+                    else:
+                        self._done_cache_len = -1
+                        self._done_cache_value = 0.0
+                        self._done_cache_kind = "unknown"
+                        return self._get_done_work_seconds()
+                self._done_cache_value += inc
+                self._done_cache_len = n
 
-        self._done_cache = done
-        self._done_cache_key = cache_key
-        return done
+                td = float(getattr(self, "task_duration", 0.0) or 0.0)
+                if td > 0.0 and self._done_cache_value > td * 1.5:
+                    is_mono = True
+                    prev = float(tdt[0]) if self._is_number(tdt[0]) else None
+                    if prev is None:
+                        is_mono = False
+                    else:
+                        for x in tdt[1:]:
+                            if not self._is_number(x):
+                                is_mono = False
+                                break
+                            fx = float(x)
+                            if fx < prev:
+                                is_mono = False
+                                break
+                            prev = fx
+                    if is_mono and self._is_number(tdt[-1]):
+                        lastv = float(tdt[-1])
+                        if 0.0 <= lastv <= td * 1.05:
+                            self._done_cache_value = lastv
+                return self._done_cache_value
+            else:
+                s = 0.0
+                for x in tdt:
+                    if self._is_number(x):
+                        s += float(x)
+                self._done_cache_len = n
+                self._done_cache_value = s
+                return s
 
-    def _ensure_initialized(self):
-        if self._initialized:
-            return
-        gap = float(getattr(self.env, "gap_seconds", 0.0) or 0.0)
-        if gap <= 0:
-            gap = 300.0  # fallback
-        self._gap = gap
+        if kind == "intervals":
+            if n == self._done_cache_len and self._done_cache_len >= 0:
+                return self._done_cache_value
+            s = 0.0
+            for seg in tdt:
+                if isinstance(seg, (list, tuple)) and len(seg) >= 2 and self._is_number(seg[0]) and self._is_number(seg[1]):
+                    a = float(seg[0])
+                    b = float(seg[1])
+                    if b >= a:
+                        s += (b - a)
+                    else:
+                        s += b
+            self._done_cache_len = n
+            self._done_cache_value = s
+            return s
 
-        R = float(getattr(self, "restart_overhead", 0.0) or 0.0)
-        self._R = max(0.0, R)
+        s = 0.0
+        for x in tdt:
+            if self._is_number(x):
+                s += float(x)
+            elif isinstance(x, (list, tuple)) and len(x) >= 2 and self._is_number(x[0]) and self._is_number(x[1]):
+                a = float(x[0])
+                b = float(x[1])
+                s += (b - a) if b >= a else b
+        self._done_cache_len = n
+        self._done_cache_value = s
+        return s
 
-        # Require spot to be continuously available for ~15 minutes before switching from OD->SPOT.
-        confirm_seconds = 900.0
-        self._confirm_steps = max(2, min(30, int(math.ceil(confirm_seconds / self._gap))))
-
-        # Cooldown after a preemption to avoid immediate flip-flopping (approx 30 minutes).
-        self._cooldown_seconds = max(900.0, 2.0 * confirm_seconds)
-
-        # Slack thresholds.
-        self._hard_slack = max(3600.0, 4.0 * self._R)  # force OD when slack gets small
-        self._switch_slack = max(5400.0, 6.0 * self._R)  # need this much slack to consider OD->SPOT
-        self._min_work_to_switch = 4.0 * 3600.0  # don't switch back to spot for small remaining work
-
-        self._U_ema = 2.0 * 3600.0
-        self._D_ema = 1.0 * 3600.0
-        self._cur_up_len = 0.0
-        self._cur_down_len = 0.0
-
-        self._initialized = True
-
-    def _update_availability_stats(self, has_spot: bool):
-        gap = self._gap
-        if has_spot:
-            self._spot_streak += 1
-            self._down_streak = 0
-        else:
-            self._down_streak += 1
-            self._spot_streak = 0
-
+    def _update_spot_model(self, has_spot: bool) -> None:
         if self._last_has_spot is None:
             self._last_has_spot = has_spot
-            self._cur_up_len = gap if has_spot else 0.0
-            self._cur_down_len = gap if not has_spot else 0.0
+            self._consec_on = 1 if has_spot else 0
+            self._consec_off = 0 if has_spot else 1
             return
 
-        if has_spot == self._last_has_spot:
-            if has_spot:
-                self._cur_up_len += gap
-            else:
-                self._cur_down_len += gap
-            return
-
-        # Transition: finalize run length.
-        alpha = 0.15
         if self._last_has_spot:
-            # up -> down
-            if self._cur_up_len <= 0:
-                self._cur_up_len = gap
-            self._U_ema = (1.0 - alpha) * self._U_ema + alpha * self._cur_up_len
-            self._cur_up_len = 0.0
-            self._cur_down_len = gap
+            obs = 1.0 if (not has_spot) else 0.0
+            self._p_on_off = (1.0 - self._beta) * self._p_on_off + self._beta * obs
         else:
-            # down -> up
-            if self._cur_down_len <= 0:
-                self._cur_down_len = gap
-            self._D_ema = (1.0 - alpha) * self._D_ema + alpha * self._cur_down_len
-            self._cur_down_len = 0.0
-            self._cur_up_len = gap
+            obs = 1.0 if has_spot else 0.0
+            self._p_off_on = (1.0 - self._beta) * self._p_off_on + self._beta * obs
 
         self._last_has_spot = has_spot
+        if has_spot:
+            self._consec_on += 1
+            self._consec_off = 0
+        else:
+            self._consec_off += 1
+            self._consec_on = 0
 
-    def _maybe_blacklist_spot(self):
-        # Blacklist if spot segments are consistently too short (restart overhead dominates).
-        if self._blacklist_spot:
-            return
-        if len(self._spot_segment_durations) < 4:
-            return
+        self._p_on_off = min(max(self._p_on_off, 1e-4), 0.999)
+        self._p_off_on = min(max(self._p_off_on, 1e-4), 0.999)
 
-        R = self._R
-        if R <= 0:
-            return
+    def _expected_on_run_seconds(self, dt: float) -> float:
+        steps = 1.0 / max(self._p_on_off, 1e-3)
+        base = steps * dt
+        if self._consec_on > 0:
+            base = max(base, self._consec_on * dt)
+        return min(base, 24.0 * 3600.0)
 
-        segs = list(self._spot_segment_durations)
-        avg = sum(segs) / len(segs)
-        short = sum(1 for d in segs if d < 1.5 * R)
+    def _expected_off_wait_seconds(self, dt: float) -> float:
+        steps = 1.0 / max(self._p_off_on, 1e-3)
+        base = steps * dt
+        if self._consec_off > 0:
+            base = max(base, 0.5 * self._consec_off * dt)
+        return min(base, 24.0 * 3600.0)
 
-        # If typical spot windows don't cover overhead, stop using spot.
-        if avg < 3.0 * R or short >= 2:
-            self._blacklist_spot = True
-            return
-
-        # Also blacklist if preemption rate is extremely high during spot usage.
-        spot_hours = max(self._spot_run_seconds / 3600.0, 0.1)
-        preempt_per_hour = self._preemptions / spot_hours
-        if preempt_per_hour > 2.0:
-            self._blacklist_spot = True
+    def _set_od_lock(self, seconds: float) -> None:
+        now = float(getattr(self.env, "elapsed_seconds", 0.0) or 0.0)
+        self._lock_od_until = max(self._lock_od_until, now + max(0.0, float(seconds)))
 
     def _step(self, last_cluster_type: ClusterType, has_spot: bool) -> ClusterType:
-        self._ensure_initialized()
+        if not self._initialized:
+            self._initialized = True
+            self._last_has_spot = None
+            self._consec_on = 0
+            self._consec_off = 0
 
-        elapsed = float(getattr(self.env, "elapsed_seconds", 0.0) or 0.0)
-        gap = self._gap
-        R = self._R
+        self._update_spot_model(bool(has_spot))
 
-        # Track usage time by last cluster (previous interval).
-        if last_cluster_type == ClusterType.SPOT:
-            self._spot_run_seconds += gap
-        elif last_cluster_type == ClusterType.ON_DEMAND:
-            self._od_run_seconds += gap
+        now = float(getattr(self.env, "elapsed_seconds", 0.0) or 0.0)
+        dt = float(getattr(self.env, "gap_seconds", 0.0) or 0.0)
+        dt = max(dt, 1.0)
 
-        # Update availability stats.
-        self._update_availability_stats(bool(has_spot))
-
-        # Handle preemption and close spot segment if needed.
-        preempted_now = (last_cluster_type == ClusterType.SPOT and not has_spot)
-        if preempted_now:
-            self._preemptions += 1
-            self._preemption_times.append(elapsed)
-            if self._spot_segment_start is not None:
-                dur = max(0.0, elapsed - float(self._spot_segment_start))
-                self._spot_segment_durations.append(dur)
-                self._spot_segment_start = None
-            self._od_until = max(self._od_until, elapsed + self._cooldown_seconds)
-
-        # Work remaining / slack.
-        done = self._compute_done_seconds()
-        task_dur = float(getattr(self, "task_duration", 0.0) or 0.0)
-        remaining_work = max(0.0, task_dur - done)
-
+        done = self._get_done_work_seconds()
+        td = float(getattr(self, "task_duration", 0.0) or 0.0)
         deadline = float(getattr(self, "deadline", 0.0) or 0.0)
-        time_left = deadline - elapsed
-        slack = time_left - remaining_work  # time buffer including future overhead/idle
+        ro = float(getattr(self, "restart_overhead", 0.0) or 0.0)
 
-        if remaining_work <= 0.0:
+        remaining = max(0.0, td - done)
+        if remaining <= 0.0:
             return ClusterType.NONE
 
-        # If already late or close to deadline, force on-demand forever.
-        if time_left <= 0.0 or slack <= self._hard_slack:
-            self._forced_od = True
+        time_left = max(0.0, deadline - now)
+        if time_left <= 0.0:
+            return ClusterType.ON_DEMAND
 
-        # Update blacklist logic based on observed spot segment durations.
-        self._maybe_blacklist_spot()
+        start_od_overhead = 0.0 if (last_cluster_type == ClusterType.ON_DEMAND) else ro
+        min_od_time = remaining + start_od_overhead
 
-        # Decision logic.
-        decision = ClusterType.ON_DEMAND
+        if min_od_time >= time_left - 1e-9:
+            self._set_od_lock(time_left)
+            return ClusterType.ON_DEMAND
 
-        if self._forced_od or self._blacklist_spot:
-            decision = ClusterType.ON_DEMAND
-        else:
-            if last_cluster_type == ClusterType.SPOT:
-                # Stay on spot if available and we have buffer.
-                if has_spot and slack > self._hard_slack:
-                    decision = ClusterType.SPOT
-                else:
-                    decision = ClusterType.ON_DEMAND
-                    self._od_until = max(self._od_until, elapsed + self._cooldown_seconds)
-            else:
-                # Last was OD or NONE.
-                if has_spot:
-                    # Switch to spot only if spot has been stable, enough slack, enough remaining work,
-                    # and expected uptime isn't too tiny relative to restart overhead.
-                    U = max(self._U_ema, gap)
-                    if (
-                        elapsed >= self._od_until
-                        and self._spot_streak >= self._confirm_steps
-                        and slack > self._switch_slack + R
-                        and remaining_work >= self._min_work_to_switch
-                        and U >= max(1800.0, 3.0 * R + 2.0 * gap)
-                    ):
-                        decision = ClusterType.SPOT
-                    else:
-                        decision = ClusterType.ON_DEMAND
-                else:
-                    decision = ClusterType.ON_DEMAND
+        slack_after_start_od = time_left - min_od_time
 
-        # Never return SPOT when unavailable.
-        if decision == ClusterType.SPOT and not has_spot:
-            decision = ClusterType.ON_DEMAND
+        if slack_after_start_od <= max(1.10 * ro, 1.5 * dt):
+            self._set_od_lock(max(3600.0, 6.0 * ro))
 
-        # Maintain spot segment start/end tracking based on the *new* decision.
-        if last_cluster_type == ClusterType.SPOT and decision != ClusterType.SPOT:
-            if self._spot_segment_start is not None:
-                dur = max(0.0, elapsed - float(self._spot_segment_start))
-                self._spot_segment_durations.append(dur)
-                self._spot_segment_start = None
+        if now < self._lock_od_until:
+            return ClusterType.ON_DEMAND
 
-        if decision == ClusterType.SPOT and last_cluster_type != ClusterType.SPOT:
-            self._spot_segment_start = elapsed
+        if not has_spot:
+            if last_cluster_type == ClusterType.ON_DEMAND:
+                return ClusterType.ON_DEMAND
 
-        self._prev_decision = decision
-        return decision
+            exp_wait = self._expected_off_wait_seconds(dt)
+            risk_buf = max(2.0 * ro, 0.5 * 3600.0)
+
+            if slack_after_start_od >= exp_wait + risk_buf:
+                return ClusterType.NONE
+
+            if exp_wait <= 2.0 * dt and slack_after_start_od >= (dt + 1.5 * ro):
+                return ClusterType.NONE
+
+            lock_dur = max(3600.0, 8.0 * ro)
+            if slack_after_start_od < 2.0 * 3600.0:
+                lock_dur = max(lock_dur, 2.0 * 3600.0)
+            self._set_od_lock(lock_dur)
+            return ClusterType.ON_DEMAND
+
+        if slack_after_start_od <= max(1.25 * ro, 2.0 * dt):
+            self._set_od_lock(max(3600.0, 6.0 * ro))
+            return ClusterType.ON_DEMAND
+
+        if last_cluster_type == ClusterType.ON_DEMAND:
+            exp_run = self._expected_on_run_seconds(dt)
+            min_run = max(3.0 * ro, 6.0 * dt)
+
+            if exp_run >= min_run and slack_after_start_od >= (2.0 * ro + dt):
+                return ClusterType.SPOT
+
+            if slack_after_start_od >= 6.0 * ro and exp_run >= 3.0 * dt:
+                return ClusterType.SPOT
+
+            return ClusterType.ON_DEMAND
+
+        return ClusterType.SPOT
 
     @classmethod
     def _from_args(cls, parser):

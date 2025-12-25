@@ -1,69 +1,63 @@
+import argparse
 from sky_spot.strategies.strategy import Strategy
 from sky_spot.utils import ClusterType
 
 class Solution(Strategy):
-    NAME = "Solution"
+    NAME = "CantBeLate_Solution"
 
     def solve(self, spec_path: str) -> "Solution":
         """
-        Optional initialization. Called once before evaluation.
+        Initialize the strategy.
         """
         return self
 
     def _step(self, last_cluster_type: ClusterType, has_spot: bool) -> ClusterType:
         """
-        Called at each time step. Return which cluster type to use next.
+        Decide the cluster type for the next time step.
+        Strategies:
+        1. Calculate Slack (Time Remaining - Work Remaining).
+        2. Determine a safety threshold based on restart overhead.
+        3. If Slack < Threshold, use ON_DEMAND to guarantee deadline.
+        4. If Slack is sufficient:
+           - Use SPOT if available (cheapest).
+           - Use NONE if SPOT unavailable (wait to save money, consuming slack).
         """
-        # Current state
+        # Calculate work remaining
+        # task_done_time is a list of completed segments in seconds
+        work_done = sum(self.task_done_time)
+        work_rem = self.task_duration - work_done
+
+        # If work is effectively done, stop
+        if work_rem <= 1e-6:
+            return ClusterType.NONE
+
+        # Calculate time state
         elapsed = self.env.elapsed_seconds
-        deadline = self.deadline
-        total_duration = self.task_duration
-        overhead = self.restart_overhead
+        time_rem = self.deadline - elapsed
         
-        # Calculate progress
-        # task_done_time is a list of completed segment durations.
-        progress = sum(self.task_done_time) if self.task_done_time else 0.0
+        # Calculate Slack: The amount of time we can afford to not make progress
+        slack = time_rem - work_rem
         
-        remaining_work = max(0.0, total_duration - progress)
-        time_left = deadline - elapsed
+        # Calculate Threshold:
+        # We must switch to On-Demand before (Slack < Restart Overhead).
+        # If we wait longer, the overhead of starting On-Demand will eat the remaining slack 
+        # below zero, making it impossible to finish on time.
+        # We add a padding of 3 time steps to account for discrete simulation steps.
+        padding = 3.0 * self.env.gap_seconds
+        threshold = self.restart_overhead + padding
         
-        # Calculate Slack
-        # Slack represents the amount of time we can afford to waste (waiting or restart overheads).
-        # We subtract one overhead unit to ensure we always have time for at least one start/restart
-        # operation without violating the deadline.
-        slack = time_left - remaining_work - overhead
-        
-        # Strategy Thresholds (in seconds)
-        # CRITICAL_SLACK: 1.2 hours.
-        # If the buffer drops below this, we enter panic mode and use On-Demand
-        # to guarantee the deadline is met. This protects against the severe penalty.
-        CRITICAL_SLACK = 3600.0 * 1.2
-        
-        # WAIT_BUFFER: 2.5 hours.
-        # If slack > WAIT_BUFFER, we have enough time to wait for Spot instances to become
-        # available (ClusterType.NONE), saving money.
-        # If slack <= WAIT_BUFFER, we stop waiting and use On-Demand to prevent the slack
-        # from eroding further, "holding the line" to keep a safety margin for future Spot use.
-        WAIT_BUFFER = 3600.0 * 2.5
-        
-        # Decision Logic
-        
-        # 1. Safety First: If we are close to the deadline relative to work left, use On-Demand.
-        if slack < CRITICAL_SLACK:
+        # Critical Condition: Not enough slack to gamble on Spot or Wait.
+        if slack < threshold:
             return ClusterType.ON_DEMAND
-            
-        # 2. Prefer Spot: If available and we are safe, use Spot (cheapest option).
+        
+        # Safe Condition: Optimize for cost.
         if has_spot:
             return ClusterType.SPOT
-            
-        # 3. Handle Spot unavailability
         else:
-            if slack > WAIT_BUFFER:
-                # We have plenty of slack, wait for Spot to return.
-                return ClusterType.NONE
-            else:
-                # Buffer is shrinking. Use On-Demand to maintain our safety margin.
-                return ClusterType.ON_DEMAND
+            # Spot is unavailable, but we have slack.
+            # Pause (NONE) to save money and wait for Spot availability.
+            # This consumes slack. If slack drops below threshold, we will switch to OD.
+            return ClusterType.NONE
 
     @classmethod
     def _from_args(cls, parser):

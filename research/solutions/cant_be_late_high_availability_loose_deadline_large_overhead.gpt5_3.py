@@ -1,82 +1,86 @@
-from typing import Optional
 from sky_spot.strategies.strategy import Strategy
 from sky_spot.utils import ClusterType
 
 
 class Solution(Strategy):
-    NAME = "deadline_guard_v2"
+    NAME = "never_late_v1"
 
-    def __init__(self, args: Optional[object] = None):
-        super().__init__(args)
-        self._commit_to_on_demand = False
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._committed_od = False
+        self._commit_time = None
+        self._last_reset_t = -1.0
 
     def solve(self, spec_path: str) -> "Solution":
         return self
 
-    def _remaining_work(self) -> float:
-        done = 0.0
-        if getattr(self, "task_done_time", None):
-            try:
-                done = float(sum(self.task_done_time))
-            except Exception:
-                done = 0.0
-        remaining = float(self.task_duration) - done
-        if remaining < 0:
-            remaining = 0.0
-        return remaining
+    def _reset_if_new_run(self):
+        # Detect new run by elapsed time reset
+        try:
+            elapsed = getattr(self.env, "elapsed_seconds", None)
+            if elapsed is None:
+                return
+            if elapsed < 1e-9 or elapsed < self._last_reset_t:
+                self._committed_od = False
+                self._commit_time = None
+                self._last_reset_t = elapsed
+        except Exception:
+            pass
 
-    def _time_left(self) -> float:
-        t_left = float(self.deadline) - float(self.env.elapsed_seconds)
-        if t_left < 0:
-            t_left = 0.0
-        return t_left
+    def _remaining_work(self):
+        try:
+            done = sum(self.task_done_time) if hasattr(self, "task_done_time") and self.task_done_time else 0.0
+            return max(0.0, getattr(self, "task_duration", 0.0) - done)
+        except Exception:
+            return getattr(self, "task_duration", 0.0)
 
-    def _safe_slack_threshold(self) -> float:
-        # Safety threshold to keep a buffer for one step of potential lost time
-        # plus the restart overhead that will be incurred when switching to OD.
-        # Using exactly: overhead + one gap buffer.
-        return float(self.restart_overhead) + float(self.env.gap_seconds)
+    def _time_left(self):
+        try:
+            return max(0.0, getattr(self, "deadline", 0.0) - getattr(self.env, "elapsed_seconds", 0.0))
+        except Exception:
+            return 0.0
 
-    def _must_switch_to_on_demand(self, remaining_work: float, time_left: float) -> bool:
-        # If time left is less than or equal to remaining compute plus required overhead buffer,
-        # we must run on OD now to guarantee finishing.
-        threshold = remaining_work + self._safe_slack_threshold()
-        return time_left <= threshold
+    def _should_commit_now(self):
+        # Commit to on-demand if the time left is just enough (or less) to finish with OD including one restart overhead
+        remaining = self._remaining_work()
+        left = self._time_left()
 
-    def _should_wait_when_no_spot(self, remaining_work: float, time_left: float) -> bool:
-        # Decide whether waiting (NONE) for one step is safe while spot is unavailable.
-        # Safe if we can still, after waiting one gap and paying a restart overhead,
-        # finish on OD: i.e., time_left - gap >= remaining_work + restart_overhead.
-        gap = float(self.env.gap_seconds)
-        return (time_left - gap) > (remaining_work + float(self.restart_overhead))
+        if remaining <= 0.0:
+            return False
+
+        # If already on OD, overhead to continue is zero. Otherwise, pay restart overhead when switching.
+        current = getattr(self.env, "cluster_type", None)
+        overhead_if_switch = 0.0 if current == ClusterType.ON_DEMAND else getattr(self, "restart_overhead", 0.0)
+
+        # Safety buffer to account for step granularity and rounding effects
+        gap = max(0.0, getattr(self.env, "gap_seconds", 0.0))
+        restart_overhead = getattr(self, "restart_overhead", 0.0)
+        buffer = min(restart_overhead, max(gap, 0.0))
+
+        need_time = remaining + overhead_if_switch + buffer
+        return left <= need_time
 
     def _step(self, last_cluster_type: ClusterType, has_spot: bool) -> ClusterType:
-        # If we already committed to OD, stay there
-        if self._commit_to_on_demand:
-            return ClusterType.ON_DEMAND
+        # Reset per run state if new run detected
+        self._reset_if_new_run()
 
-        remaining_work = self._remaining_work()
-        time_left = self._time_left()
-
-        if remaining_work <= 0.0:
+        # If we're already done, do nothing
+        if self._remaining_work() <= 0.0:
             return ClusterType.NONE
 
-        # If we must switch to OD to guarantee finish, commit now
-        if self._must_switch_to_on_demand(remaining_work, time_left):
-            self._commit_to_on_demand = True
+        # Decide whether to commit to OD
+        if not self._committed_od and self._should_commit_now():
+            self._committed_od = True
+            self._commit_time = getattr(self.env, "elapsed_seconds", None)
+
+        # If committed, always use OD to guarantee completion
+        if self._committed_od:
             return ClusterType.ON_DEMAND
 
-        # Otherwise, prefer Spot when available
+        # Otherwise, prefer Spot when available; else wait (NONE)
         if has_spot:
             return ClusterType.SPOT
-
-        # Spot not available: decide to wait or use OD
-        if self._should_wait_when_no_spot(remaining_work, time_left):
-            return ClusterType.NONE
-
-        # Not safe to wait any longer; commit to OD
-        self._commit_to_on_demand = True
-        return ClusterType.ON_DEMAND
+        return ClusterType.NONE
 
     @classmethod
     def _from_args(cls, parser):

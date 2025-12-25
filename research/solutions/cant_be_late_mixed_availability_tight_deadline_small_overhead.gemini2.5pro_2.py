@@ -1,127 +1,125 @@
+import argparse
 from sky_spot.strategies.strategy import Strategy
 from sky_spot.utils import ClusterType
 
 class Solution(Strategy):
+    """
+    A strategy for the Cant-Be-Late Scheduling Problem that balances cost and
+    the risk of missing the deadline.
+
+    The strategy operates in three zones based on the current "slack" time,
+    which is the buffer between the projected finish time (if using reliable
+    On-Demand instances) and the hard deadline.
+
+    - CRITICAL ZONE: If slack is very low (below `critical_slack_threshold`),
+      the strategy exclusively uses On-Demand instances to guarantee completion
+      and avoid the -100000 penalty.
+
+    - CAUTIOUS ZONE: If slack is moderate (below `cautious_slack_threshold`),
+      the strategy uses Spot instances if available, but falls back to
+      On-Demand otherwise. This prevents wasting slack by waiting.
+
+    - SAFE ZONE: If there is ample slack, the strategy is more aggressive in
+      cost-saving. It uses Spot when available and chooses to wait (NONE)
+      if Spot is unavailable, preserving money at the cost of consuming slack.
+
+    Thresholds are calculated once in the `solve` method based on the specific
+    parameters of the task (initial slack, restart overhead).
+    """
     NAME = "my_solution"
 
-    def __init__(self, args=None):
-        super().__init__()
-        # This constructor accepts arguments from _from_args, as required by the API.
-        # This solution uses hardcoded parameters, so `args` is unused.
+    def __init__(self, args: argparse.Namespace):
+        super().__init__(args)
+        # Internal state for tracking progress efficiently
+        self._work_done: float = 0.0
+        self._last_len_task_done_time: int = 0
+        
+        # Thresholds for the three zones, to be initialized in solve()
+        self.critical_slack_threshold: float = 0.0
+        self.cautious_slack_threshold: float = 0.0
 
     def solve(self, spec_path: str) -> "Solution":
         """
-        Initialize strategy-specific state and parameters before the simulation starts.
+        Initializes the strategy's thresholds based on the problem specification.
+        This method is called once before the simulation starts.
         """
-        # --- Tunable Parameters ---
-        # Number of spot attempts to observe before trusting the adaptive buffer.
-        self.warmup_steps = 100
-        # A fixed buffer multiplier to use during the warmup phase for conservative estimation.
-        self.warmup_buffer_multiplier = 3.0
-        # A minimum safety buffer, as a multiplier of restart_overhead, to add to the
-        # adaptive calculation. This ensures we are always robust to at least one failure.
-        self.min_safety_buffer_multiplier = 1.0
-        # The threshold of remaining slack (as a fraction of initial slack) below which
-        # we stop waiting (NONE) for spot and start using ON_DEMAND to make progress.
-        self.wait_for_spot_slack_threshold = 0.75
+        # Calculate the total initial slack time available.
+        initial_slack = self.deadline - self.task_duration
 
-        # --- State for adaptive logic ---
-        # Count of times a spot instance was attempted.
-        self.spot_attempts = 0
-        # Count of times a spot attempt resulted in no progress (a failure).
-        self.preemptions = 0
-        # Total work done at the previous timestep, used to calculate progress delta.
-        self.last_work_done = 0.0
+        # Set the threshold for the "cautious" zone.
+        # We define this as a fraction of the initial slack. If slack falls
+        # below this, we stop waiting and use On-Demand to make progress.
+        self.cautious_slack_threshold = 0.5 * initial_slack
+
+        # Set the threshold for the "critical" zone.
+        # This is a hard safety buffer. It's calculated to be large enough to
+        # withstand a configurable number of consecutive preemptions.
+        # The time cost of one preemption includes the lost work time (gap_seconds)
+        # and the restart overhead.
+        preemption_time_cost = self.restart_overhead + self.env.gap_seconds
+        num_preemptions_buffer = 5
+        self.critical_slack_threshold = num_preemptions_buffer * preemption_time_cost
         
         return self
 
+    def _update_work_done(self) -> None:
+        """
+        Efficiently updates the total work done by only summing new segments
+        from self.task_done_time, avoiding re-computation.
+        """
+        num_done_segments = len(self.task_done_time)
+        if num_done_segments > self._last_len_task_done_time:
+            new_segments = self.task_done_time[self._last_len_task_done_time:]
+            self._work_done += sum(end - start for start, end in new_segments)
+            self._last_len_task_done_time = num_done_segments
+
     def _step(self, last_cluster_type: ClusterType, has_spot: bool) -> ClusterType:
         """
-        Main decision logic, called at each time step of the simulation.
+        The main decision-making logic, called at each time step.
         """
-        # 1. Update statistics based on the outcome of the last step
-        current_work_done = sum(self.task_done_time)
-        work_delta = current_work_done - self.last_work_done
-
-        if last_cluster_type == ClusterType.SPOT:
-            self.spot_attempts += 1
-            # A spot attempt with negligible progress is considered a failure (e.g., preemption).
-            if work_delta < 1e-6:
-                self.preemptions += 1
+        self._update_work_done()
         
-        self.last_work_done = current_work_done
-
-        # 2. Calculate current job state
-        work_remaining = self.task_duration - current_work_done
-
-        # If the job is finished, do nothing to minimize cost.
-        if work_remaining <= 0:
+        work_remaining = self.task_duration - self._work_done
+        # If the job is finished, we don't need any cluster.
+        if work_remaining <= 0.0:
             return ClusterType.NONE
 
-        time_elapsed = self.env.elapsed_seconds
-        time_to_deadline = self.deadline - time_elapsed
+        time_to_deadline = self.deadline - self.env.elapsed_seconds
         
-        # Calculate the time required to finish the rest of the job using only
-        # reliable on-demand instances. This is our "point of no return" baseline.
-        time_needed_for_od = work_remaining
+        # Slack is the time buffer we have. If we ran on On-Demand from now on,
+        # we would finish this many seconds before the deadline.
+        current_slack = time_to_deadline - work_remaining
 
-        # 3. Determine the safety buffer
-        # This buffer is the extra time we want to maintain, beyond the bare
-        # minimum `time_needed_for_od`, before we switch to guaranteed ON_DEMAND.
+        # --- Decision Logic based on three zones ---
         
-        if self.spot_attempts < self.warmup_steps:
-            # During the initial "warmup" period, use a fixed, conservative buffer
-            # as we lack sufficient data to estimate the spot instance failure rate accurately.
-            safety_buffer = self.warmup_buffer_multiplier * self.restart_overhead
-        else:
-            # After warmup, use an adaptive buffer based on the observed spot failure rate.
-            # Laplace smoothing (add-one smoothing) avoids division by zero and extreme values.
-            spot_failure_rate = (self.preemptions + 1.0) / (self.spot_attempts + 2.0)
+        # 1. CRITICAL ZONE: If slack is below the safety buffer, we must use
+        #    On-Demand to ensure we finish. This is the highest priority rule.
+        if current_slack <= self.critical_slack_threshold:
+            return ClusterType.ON_DEMAND
 
-            # Estimate the number of time steps needed to complete the remaining work.
-            if self.env.gap_seconds > 1e-9:
-                steps_remaining = work_remaining / self.env.gap_seconds
-            else:
-                steps_remaining = 0
+        # 2. OPPORTUNISTIC SPOT: If we are not in the critical zone and Spot
+        #    instances are available, always use them for maximum cost savings.
+        if has_spot:
+            return ClusterType.SPOT
 
-            # Estimate the total time we are likely to lose to future spot failures
-            # if we continue to use spot instances for the rest of the job.
-            expected_time_loss = steps_remaining * spot_failure_rate * self.restart_overhead
-            
-            # The buffer is this expected loss, plus a fixed minimum for added safety.
-            min_safety_buffer = self.min_safety_buffer_multiplier * self.restart_overhead
-            safety_buffer = expected_time_loss + min_safety_buffer
-
-        # 4. Make the primary decision: are we in the "danger zone"?
-        # If time left is less than what we need for OD plus our buffer, we must switch
-        # to the reliable On-Demand option to guarantee completion before the deadline.
-        if time_to_deadline <= time_needed_for_od + safety_buffer:
+        # At this point, we are not critical, but Spot is unavailable.
+        # The decision is between waiting (NONE) and paying for On-Demand.
+        
+        # 3. CAUTIOUS ZONE: If slack is below the cautious threshold, we can't
+        #    afford to wait and lose more slack. We use On-Demand to make progress.
+        if current_slack <= self.cautious_slack_threshold:
             return ClusterType.ON_DEMAND
         
-        # 5. If we have sufficient slack, decide between SPOT, ON_DEMAND, and NONE.
-        if has_spot:
-            # Spot is available and we have a comfortable time buffer, so use the cheapest option.
-            return ClusterType.SPOT
+        # 4. SAFE ZONE: If we have plenty of slack, we can afford to wait for a
+        #    cheap Spot instance to become available. We do nothing this step.
         else:
-            # Spot is not available. The choice is between waiting (NONE), which is free but
-            # consumes our time slack, or making progress with ON_DEMAND, which costs more
-            # but preserves our slack.
-            
-            current_slack = time_to_deadline - time_needed_for_od
-            initial_slack = self.deadline - self.task_duration
-
-            # If our initial slack was positive and we still have a large fraction of it,
-            # we can afford to gamble and wait for spot to become available again.
-            if initial_slack > 1e-9 and \
-               (current_slack / initial_slack) > self.wait_for_spot_slack_threshold:
-                 return ClusterType.NONE
-            else:
-                # If slack is diminishing, it's safer to use ON_DEMAND to guarantee
-                # progress and avoid falling into the "danger zone" unexpectedly.
-                return ClusterType.ON_DEMAND
+            return ClusterType.NONE
 
     @classmethod
-    def _from_args(cls, parser):
-        """Required method for evaluator instantiation."""
+    def _from_args(cls, parser: argparse.ArgumentParser) -> "Solution":
+        """
+        Instantiates the strategy from command-line arguments.
+        This strategy does not require any custom arguments.
+        """
         args, _ = parser.parse_known_args()
         return cls(args)

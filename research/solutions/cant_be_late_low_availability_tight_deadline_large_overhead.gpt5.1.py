@@ -3,143 +3,107 @@ from sky_spot.utils import ClusterType
 
 
 class Solution(Strategy):
-    NAME = "cant_be_late_heuristic_v1"
-
-    def __init__(self, args=None):
-        super().__init__(args)
-        self.args = args
-        self._initialized = False
-        self._initial_slack = 0.0
-        self._safety_buffer = 0.0
-        self._force_on_demand = False
-        self._cached_done_segments_count = 0
-        self._cached_done_work = 0.0
+    NAME = "cant_be_late_safe_spot_v1"
 
     def solve(self, spec_path: str) -> "Solution":
+        # No spec-based configuration for now.
         return self
 
-    def _initialize_if_needed(self):
-        if self._initialized:
+    def _initialize_slack_params(self):
+        """Lazy initialization of slack-related parameters."""
+        if hasattr(self, "_slack_params_initialized") and self._slack_params_initialized:
             return
-        self._initialized = True
-        try:
-            task_duration = float(self.task_duration)
-        except Exception:
-            task_duration = 0.0
-        try:
-            deadline = float(self.deadline)
-        except Exception:
-            deadline = task_duration
-        slack = max(0.0, deadline - task_duration)
-        self._initial_slack = slack
-        gap = getattr(self.env, "gap_seconds", 0.0) or 0.0
-        restart_overhead = getattr(self, "restart_overhead", 0.0) or 0.0
-        base_buffer = restart_overhead + gap
-        frac_buffer = 0.1 * slack
-        self._safety_buffer = max(base_buffer, frac_buffer)
 
-    def _segment_duration(self, seg) -> float:
-        if seg is None:
-            return 0.0
-        if isinstance(seg, (int, float)):
-            v = float(seg)
-            return v if v > 0.0 else 0.0
-        if isinstance(seg, dict):
-            if "duration" in seg:
-                try:
-                    v = float(seg["duration"])
-                    return v if v > 0.0 else 0.0
-                except Exception:
-                    pass
-            if "start" in seg and "end" in seg:
-                try:
-                    v = float(seg["end"]) - float(seg["start"])
-                    return v if v > 0.0 else 0.0
-                except Exception:
-                    pass
-        if isinstance(seg, (list, tuple)):
-            if (
-                len(seg) >= 2
-                and isinstance(seg[0], (int, float))
-                and isinstance(seg[1], (int, float))
-            ):
-                v = float(seg[1]) - float(seg[0])
-                return v if v > 0.0 else 0.0
-            if len(seg) == 1 and isinstance(seg[0], (int, float)):
-                v = float(seg[0])
-                return v if v > 0.0 else 0.0
-        if hasattr(seg, "duration"):
-            try:
-                v = float(seg.duration)
-                if v > 0.0:
-                    return v
-            except Exception:
-                pass
-        if hasattr(seg, "start") and hasattr(seg, "end"):
-            try:
-                v = float(seg.end) - float(seg.start)
-                return v if v > 0.0 else 0.0
-            except Exception:
-                pass
-        return 0.0
+        # Total slack allowed for non-work time (idle + overhead)
+        total_slack = self.deadline - self.task_duration
+        self._total_slack = total_slack
 
-    def _compute_done_work(self) -> float:
-        segments = getattr(self, "task_done_time", None)
-        if not segments:
-            return 0.0
-        try:
-            seg_list = list(segments)
-        except TypeError:
-            return 0.0
-        n = len(seg_list)
-        if n < self._cached_done_segments_count:
-            self._cached_done_segments_count = 0
-            self._cached_done_work = 0.0
-        for i in range(self._cached_done_segments_count, n):
-            self._cached_done_work += self._segment_duration(seg_list[i])
-        self._cached_done_segments_count = n
-        try:
-            task_duration = float(self.task_duration)
-        except Exception:
-            task_duration = None
-        if task_duration is not None and task_duration > 0.0:
-            if self._cached_done_work > task_duration:
-                self._cached_done_work = task_duration
-        return self._cached_done_work
+        # Default values
+        self._allow_spot = False
+        self._non_work_limit = 0.0
+        self._idle_limit = 0.0
+
+        # If no slack or unknown overhead, fall back to always on-demand.
+        if total_slack <= 0:
+            self._allow_spot = False
+        else:
+            # Margin after accounting for a possible final restart overhead.
+            # We keep some extra safety margin (<1.0) to be robust.
+            restart_overhead = max(self.restart_overhead, 0.0)
+            margin = total_slack - restart_overhead
+            if margin < 0.0:
+                margin = 0.0
+
+            # Tuning factors:
+            # - threshold_factor: how much of (slack - restart_overhead) we use
+            #   before permanently switching to on-demand.
+            # - idle_factor: how much of that margin we are willing to spend on
+            #   intentional idling while waiting for spot.
+            threshold_factor = 0.9
+            idle_factor = 0.5
+
+            self._non_work_limit = threshold_factor * margin
+            if self._non_work_limit < 0.0:
+                self._non_work_limit = 0.0
+
+            self._idle_limit = idle_factor * margin
+            if self._idle_limit < 0.0:
+                self._idle_limit = 0.0
+            if self._idle_limit > self._non_work_limit:
+                self._idle_limit = self._non_work_limit
+
+            # Allow spot if we have any meaningful slack budget.
+            self._allow_spot = self._non_work_limit > 0.0
+
+        # Once this flag becomes True, we never go back to using spot.
+        self._force_on_demand = not self._allow_spot
+        self._slack_params_initialized = True
 
     def _step(self, last_cluster_type: ClusterType, has_spot: bool) -> ClusterType:
-        self._initialize_if_needed()
-        try:
-            task_duration = float(self.task_duration)
-        except Exception:
-            task_duration = 0.0
-        done = self._compute_done_work()
-        remaining_work = max(0.0, task_duration - done)
-        try:
-            now = float(self.env.elapsed_seconds)
-        except Exception:
-            now = 0.0
-        try:
-            deadline = float(self.deadline)
-        except Exception:
-            deadline = now
-        time_left = deadline - now
-        if remaining_work <= 0.0:
+        # Ensure parameters are initialized once env is available.
+        self._initialize_slack_params()
+
+        # Compute total work done so far.
+        work_segments = getattr(self, "task_done_time", None)
+        if work_segments:
+            work_done = float(sum(work_segments))
+        else:
+            work_done = 0.0
+
+        # If task is already finished, do nothing (no cost).
+        if work_done >= self.task_duration:
             return ClusterType.NONE
-        if time_left <= 0.0:
+
+        current_time = float(self.env.elapsed_seconds)
+
+        # Total non-work time so far (overhead + intentional idling).
+        non_work_so_far = current_time - work_done
+        if non_work_so_far < 0.0:
+            non_work_so_far = 0.0
+
+        # If we previously decided to never use spot again, stick to on-demand.
+        if self._force_on_demand or not self._allow_spot:
+            # Always choose on-demand while work remains.
             return ClusterType.ON_DEMAND
-        restart_overhead = getattr(self, "restart_overhead", 0.0) or 0.0
-        gap = getattr(self.env, "gap_seconds", 0.0) or 0.0
-        safety_buffer = self._safety_buffer if self._safety_buffer is not None else 0.0
-        allowed_waste = time_left - remaining_work - restart_overhead - safety_buffer
-        if allowed_waste <= 0.0:
+
+        # Check if we've exhausted the budget for non-work time.
+        if non_work_so_far >= self._non_work_limit:
+            # Permanently switch to on-demand from now on.
             self._force_on_demand = True
-        if self._force_on_demand:
             return ClusterType.ON_DEMAND
+
+        # We are still within non-work budget and allowed to use spot.
+
+        # If spot is available, always use it (it's significantly cheaper).
         if has_spot:
             return ClusterType.SPOT
-        if allowed_waste >= gap:
+
+        # Spot is unavailable: decide between idling and on-demand.
+        # If we haven't spent much of the non-work budget, we can afford to wait.
+        if non_work_so_far < self._idle_limit:
             return ClusterType.NONE
+
+        # Non-work budget for idling is mostly consumed; use on-demand to keep progress.
         return ClusterType.ON_DEMAND
 
     @classmethod

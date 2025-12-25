@@ -1,225 +1,198 @@
 import math
 from typing import Any, Optional
 
-try:
-    from sky_spot.strategies.strategy import Strategy
-    from sky_spot.utils import ClusterType
-except Exception:  # Fallback stubs for non-eval environments
-    from enum import Enum
-
-    class ClusterType(Enum):
-        SPOT = "spot"
-        ON_DEMAND = "on_demand"
-        NONE = "none"
-
-    class Strategy:
-        def __init__(self, args: Any = None):
-            self.env = type("Env", (), {"elapsed_seconds": 0.0, "gap_seconds": 300.0, "cluster_type": ClusterType.NONE})()
-            self.task_duration = 0.0
-            self.task_done_time = []
-            self.deadline = 0.0
-            self.restart_overhead = 0.0
+from sky_spot.strategies.strategy import Strategy
+from sky_spot.utils import ClusterType
 
 
 class Solution(Strategy):
-    NAME = "cant_be_late_v1"
+    NAME = "cant_be_late_slack_guard_v1"
 
-    def __init__(self, args: Any = None):
-        try:
-            super().__init__(args)
-        except TypeError:
-            super().__init__()
+    def __init__(self, args: Optional[Any] = None):
+        super().__init__(args)
+        self._initialized = False
 
-        self._args = args
+        self._commit_to_od = False
 
-        self._obs_total = 0
-        self._obs_spot = 0
+        self._cooldown_steps = 0
 
-        self._od_accum_unavail = 0.0
-        self._od_accum_avail = 0.0
+        self._idle_buffer = 0.0
+        self._stop_buffer = 0.0
+        self._commit_buffer = 0.0
+        self._cooldown_on_switch_steps = 0
 
-        self._od_lock_steps = 0
-        self._min_od_chunk_steps = 1
-
-        self._cached_gap = None
+        self._tdt_id = None
+        self._tdt_mode = None  # "cumulative" or "sum"
+        self._tdt_sum = 0.0
+        self._tdt_len = 0
 
     def solve(self, spec_path: str) -> "Solution":
         return self
 
-    def _get_done_work_seconds(self) -> float:
+    def _ensure_initialized(self) -> None:
+        if self._initialized:
+            return
+        gap = float(getattr(self.env, "gap_seconds", 60.0) or 60.0)
+        overhead = float(getattr(self, "restart_overhead", 0.0) or 0.0)
+
+        self._idle_buffer = max(3.0 * gap, 4.0 * overhead, 600.0)
+        self._stop_buffer = 2.0 * self._idle_buffer
+        self._commit_buffer = max(12.0 * gap, 8.0 * overhead, 900.0)
+
+        self._cooldown_on_switch_steps = int(math.ceil(overhead / gap)) if overhead > 0.0 else 0
+
+        self._initialized = True
+
+    @staticmethod
+    def _is_number(x: Any) -> bool:
+        return isinstance(x, (int, float)) and not isinstance(x, bool)
+
+    def _segment_duration(self, seg: Any) -> float:
+        if seg is None:
+            return 0.0
+        if self._is_number(seg):
+            return float(seg)
+        if isinstance(seg, (tuple, list)):
+            if len(seg) >= 2 and self._is_number(seg[0]) and self._is_number(seg[1]):
+                return float(seg[1]) - float(seg[0])
+            s = 0.0
+            for v in seg:
+                if self._is_number(v):
+                    s += float(v)
+            return s
+        if isinstance(seg, dict):
+            if "duration" in seg and self._is_number(seg["duration"]):
+                return float(seg["duration"])
+            if "work" in seg and self._is_number(seg["work"]):
+                return float(seg["work"])
+            if "done" in seg and self._is_number(seg["done"]):
+                return float(seg["done"])
+            if "start" in seg and "end" in seg and self._is_number(seg["start"]) and self._is_number(seg["end"]):
+                return float(seg["end"]) - float(seg["start"])
+            return 0.0
+        try:
+            if hasattr(seg, "duration") and self._is_number(seg.duration):
+                return float(seg.duration)
+        except Exception:
+            pass
+        return 0.0
+
+    def _update_done_cache(self) -> float:
         tdt = getattr(self, "task_done_time", None)
         if not tdt:
+            self._tdt_id = tdt
+            self._tdt_mode = None
+            self._tdt_sum = 0.0
+            self._tdt_len = 0
             return 0.0
-        total = 0.0
-        try:
-            for x in tdt:
-                if x is None:
-                    continue
-                if isinstance(x, (int, float)):
-                    total += float(x)
-                elif isinstance(x, (tuple, list)):
-                    if len(x) == 0:
-                        continue
-                    if len(x) == 1:
-                        v = x[0]
-                        if isinstance(v, (int, float)):
-                            total += float(v)
-                    else:
-                        a = x[0]
-                        b = x[1]
-                        if isinstance(a, (int, float)) and isinstance(b, (int, float)):
-                            if b >= a:
-                                total += float(b - a)
-                            else:
-                                total += float(b)
-                elif isinstance(x, dict):
-                    if "duration" in x and isinstance(x["duration"], (int, float)):
-                        total += float(x["duration"])
-                    elif "start" in x and "end" in x and isinstance(x["start"], (int, float)) and isinstance(x["end"], (int, float)):
-                        if x["end"] >= x["start"]:
-                            total += float(x["end"] - x["start"])
-        except Exception:
+
+        if tdt is not self._tdt_id:
+            self._tdt_id = tdt
+            self._tdt_mode = None
+            self._tdt_sum = 0.0
+            self._tdt_len = 0
+
+        ln = len(tdt)
+
+        if self._tdt_mode is None:
+            if ln >= 2 and all(self._is_number(x) for x in tdt):
+                monotone = True
+                prev = float(tdt[0])
+                for i in range(1, ln):
+                    cur = float(tdt[i])
+                    if cur < prev:
+                        monotone = False
+                        break
+                    prev = cur
+                task_dur = float(getattr(self, "task_duration", 0.0) or 0.0)
+                if monotone and (task_dur <= 0.0 or float(tdt[-1]) <= 1.05 * task_dur):
+                    self._tdt_mode = "cumulative"
+                else:
+                    self._tdt_mode = "sum"
+            else:
+                self._tdt_mode = "sum"
+
+        if self._tdt_mode == "cumulative":
+            val = float(tdt[-1]) if ln else 0.0
+            return max(0.0, val)
+
+        if ln == self._tdt_len:
+            return self._tdt_sum
+
+        if ln > self._tdt_len:
+            for i in range(self._tdt_len, ln):
+                self._tdt_sum += self._segment_duration(tdt[i])
+            self._tdt_len = ln
+            return self._tdt_sum
+
+        s = 0.0
+        for seg in tdt:
+            s += self._segment_duration(seg)
+        self._tdt_sum = s
+        self._tdt_len = ln
+        return s
+
+    def _get_remaining_work(self) -> float:
+        done = self._update_done_cache()
+        task_dur = float(getattr(self, "task_duration", 0.0) or 0.0)
+        if task_dur <= 0.0:
             return 0.0
-        return max(0.0, total)
-
-    def _update_chunk_params(self) -> None:
-        gap = float(getattr(self.env, "gap_seconds", 0.0) or 0.0)
-        if gap <= 0:
-            gap = 60.0
-        self._cached_gap = gap
-        oh = float(getattr(self, "restart_overhead", 0.0) or 0.0)
-        self._min_od_chunk_steps = max(1, int(math.ceil(oh / gap)) + 1)
-
-    def _apply_od_lock(self, desired: ClusterType, last_cluster_type: ClusterType) -> ClusterType:
-        if self._od_lock_steps > 0:
-            self._od_lock_steps -= 1
-            return ClusterType.ON_DEMAND
-
-        if desired == ClusterType.ON_DEMAND and last_cluster_type != ClusterType.ON_DEMAND:
-            self._od_lock_steps = self._min_od_chunk_steps - 1
-            return ClusterType.ON_DEMAND
-
-        return desired
-
-    def _posterior_availability(self) -> tuple[float, float]:
-        alpha = 1.0
-        beta = 5.0
-        n = self._obs_total
-        s = self._obs_spot
-        denom = n + alpha + beta
-        p_hat = (s + alpha) / denom if denom > 0 else alpha / (alpha + beta)
-        p_hat = min(0.999, max(0.001, p_hat))
-
-        n_eff = denom
-        std = math.sqrt(max(1e-12, p_hat * (1.0 - p_hat) / max(1.0, n_eff)))
-        k = 1.8
-        p_cons = p_hat - k * std
-        p_cons = min(0.98, max(0.01, p_cons))
-        return p_hat, p_cons
+        rem = task_dur - done
+        if rem < 0.0:
+            rem = 0.0
+        return rem
 
     def _step(self, last_cluster_type: ClusterType, has_spot: bool) -> ClusterType:
-        if self._cached_gap is None:
-            self._update_chunk_params()
+        self._ensure_initialized()
 
-        self._obs_total += 1
-        if has_spot:
-            self._obs_spot += 1
-
+        gap = float(getattr(self.env, "gap_seconds", 60.0) or 60.0)
         elapsed = float(getattr(self.env, "elapsed_seconds", 0.0) or 0.0)
-        gap = float(getattr(self.env, "gap_seconds", self._cached_gap) or self._cached_gap or 60.0)
-        if gap <= 0:
-            gap = 60.0
-        self._cached_gap = gap
-
-        task_duration = float(getattr(self, "task_duration", 0.0) or 0.0)
         deadline = float(getattr(self, "deadline", 0.0) or 0.0)
-        oh = float(getattr(self, "restart_overhead", 0.0) or 0.0)
-
-        done = self._get_done_work_seconds()
-        remaining_work = max(0.0, task_duration - done)
-        if remaining_work <= 0.0:
-            return ClusterType.NONE
 
         time_left = deadline - elapsed
-        if time_left <= 0.0:
-            return ClusterType.ON_DEMAND
+        remaining_work = self._get_remaining_work()
 
-        safety_buffer = max(oh * 4.0, gap * 1.5)
-        hard_buffer = max(oh * 8.0, gap * 2.0)
+        if remaining_work <= 0.0:
+            self._commit_to_od = False
+            self._cooldown_steps = 0
+            return ClusterType.NONE
 
-        slack = time_left - remaining_work
+        if last_cluster_type != ClusterType.NONE and self._cooldown_steps > 0:
+            self._cooldown_steps -= 1
 
-        if time_left <= remaining_work + hard_buffer or slack <= 0.0:
-            desired = ClusterType.ON_DEMAND
-            return self._apply_od_lock(desired, last_cluster_type)
-
-        p_hat, p_cons = self._posterior_availability()
-
-        od_need = max(0.0, remaining_work - p_cons * time_left)
-        if od_need <= 0.0:
-            if has_spot:
-                desired = ClusterType.SPOT
-            else:
-                if slack >= (gap + safety_buffer):
-                    desired = ClusterType.NONE
-                else:
-                    desired = ClusterType.ON_DEMAND
-            if desired == ClusterType.SPOT and not has_spot:
-                desired = ClusterType.NONE
-            return self._apply_od_lock(desired, last_cluster_type)
-
-        unavail_cons = max(0.0, (1.0 - p_cons) * time_left)
-        if slack <= safety_buffer:
-            desired = ClusterType.ON_DEMAND
-            return self._apply_od_lock(desired, last_cluster_type)
-
-        if not has_spot:
-            if unavail_cons <= 1e-9:
-                desired = ClusterType.ON_DEMAND
-                return self._apply_od_lock(desired, last_cluster_type)
-
-            rate = od_need / unavail_cons
-            rate = min(1.0, max(0.0, rate))
-
-            urgency = 1.0 - min(1.0, max(0.0, slack / max(1e-9, 6.0 * safety_buffer)))
-            rate = min(1.0, rate * (1.0 + 0.75 * urgency))
-
-            self._od_accum_unavail += rate
-            if self._od_accum_unavail >= 1.0:
-                self._od_accum_unavail -= 1.0
-                desired = ClusterType.ON_DEMAND
-            else:
-                desired = ClusterType.NONE
-                if slack < (gap + safety_buffer * 0.25):
-                    desired = ClusterType.ON_DEMAND
-
-            return self._apply_od_lock(desired, last_cluster_type)
-
-        extra_od = od_need - unavail_cons
-        if extra_od <= 0.0:
-            desired = ClusterType.SPOT
-            if desired == ClusterType.SPOT and not has_spot:
-                desired = ClusterType.NONE
-            return self._apply_od_lock(desired, last_cluster_type)
-
-        denom = max(1e-9, p_cons * time_left)
-        rate_a = extra_od / denom
-        rate_a = min(1.0, max(0.0, rate_a))
-
-        urgency = 1.0 - min(1.0, max(0.0, slack / max(1e-9, 6.0 * safety_buffer)))
-        rate_a = min(1.0, rate_a * (1.0 + 0.75 * urgency))
-
-        self._od_accum_avail += rate_a
-        if self._od_accum_avail >= 1.0:
-            self._od_accum_avail -= 1.0
-            desired = ClusterType.ON_DEMAND
+        if self._commit_to_od:
+            decision = ClusterType.ON_DEMAND
         else:
-            desired = ClusterType.SPOT
+            if time_left <= remaining_work + self._commit_buffer:
+                self._commit_to_od = True
+                decision = ClusterType.ON_DEMAND
+            else:
+                slack = time_left - remaining_work
 
-        if desired == ClusterType.SPOT and not has_spot:
-            desired = ClusterType.NONE
+                if has_spot:
+                    if last_cluster_type == ClusterType.ON_DEMAND and self._cooldown_steps > 0:
+                        decision = ClusterType.ON_DEMAND
+                    else:
+                        decision = ClusterType.SPOT
+                else:
+                    if slack > self._idle_buffer:
+                        if last_cluster_type == ClusterType.ON_DEMAND and self._cooldown_steps == 0 and slack > self._stop_buffer:
+                            decision = ClusterType.NONE
+                        else:
+                            decision = ClusterType.NONE if last_cluster_type != ClusterType.ON_DEMAND else ClusterType.ON_DEMAND
+                    else:
+                        decision = ClusterType.ON_DEMAND
 
-        return self._apply_od_lock(desired, last_cluster_type)
+        if decision == ClusterType.SPOT and not has_spot:
+            decision = ClusterType.ON_DEMAND
+
+        if decision == ClusterType.NONE:
+            self._cooldown_steps = 0
+        else:
+            if decision != last_cluster_type:
+                self._cooldown_steps = self._cooldown_on_switch_steps
+
+        return decision
 
     @classmethod
     def _from_args(cls, parser):

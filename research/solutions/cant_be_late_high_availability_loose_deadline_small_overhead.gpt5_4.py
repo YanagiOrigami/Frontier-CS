@@ -1,120 +1,111 @@
-from typing import Any, Optional
+from typing import Any
 from sky_spot.strategies.strategy import Strategy
 from sky_spot.utils import ClusterType
 
 
 class Solution(Strategy):
-    NAME = "deadline_guard_threshold_v3"
+    NAME = "cant_be_late_v3"
 
-    def __init__(self, args: Optional[Any] = None):
-        try:
-            super().__init__(args)
-        except TypeError:
-            try:
-                super().__init__()
-            except Exception:
-                pass
-        self.args = args
-        self._reset_internal_state()
-
-    def _reset_internal_state(self):
-        self.lock_on_od: bool = False
-        self._done_sum: float = 0.0
-        self._last_done_len: int = 0
-        self._prev_elapsed: float = -1.0
+    def __init__(self, args: Any = None):
+        super().__init__(args)
+        self._cached_done_sum = 0.0
+        self._last_task_done_len = 0
+        # Configurable safety buffers (in seconds) - can be overridden in solve() from spec if desired
+        self.min_critical_buffer_seconds = 3600  # default: 1 hour safety near deadline
+        self.extra_idle_guard_seconds = 0  # additional buffer for idling decisions
 
     def solve(self, spec_path: str) -> "Solution":
+        # Optionally read config from spec_path; keep defaults if unavailable
+        try:
+            if spec_path:
+                import json
+                with open(spec_path, "r") as f:
+                    cfg = json.load(f)
+                self.min_critical_buffer_seconds = float(
+                    cfg.get("min_critical_buffer_seconds", self.min_critical_buffer_seconds)
+                )
+                self.extra_idle_guard_seconds = float(
+                    cfg.get("extra_idle_guard_seconds", self.extra_idle_guard_seconds)
+                )
+        except Exception:
+            pass
         return self
 
-    def _progress_sum(self) -> float:
-        try:
-            lst = self.task_done_time
-        except Exception:
-            return 0.0
-        if not isinstance(lst, list):
+    def _progress_done_seconds(self) -> float:
+        lst = self.task_done_time
+        if not isinstance(lst, (list, tuple)):
+            # Fallback: try to read a scalar if provided
             try:
-                return float(lst)
+                return float(lst)  # type: ignore
             except Exception:
-                return 0.0
+                return self._cached_done_sum
         n = len(lst)
-        if n == self._last_done_len:
-            return self._done_sum
-        # Incremental update
-        if n > self._last_done_len:
-            add = 0.0
-            for i in range(self._last_done_len, n):
-                try:
-                    add += float(lst[i])
-                except Exception:
-                    continue
-            self._done_sum += add
-            self._last_done_len = n
-            return self._done_sum
-        # If list shrank (new episode), recompute
-        total = 0.0
-        for v in lst:
+        if n > self._last_task_done_len:
+            # Incrementally add only new pieces
             try:
-                total += float(v)
+                delta_sum = sum(lst[self._last_task_done_len:n])
             except Exception:
-                continue
-        self._done_sum = total
-        self._last_done_len = n
-        return self._done_sum
+                # Fallback to recompute full sum if slicing fails
+                delta_sum = sum(lst) - self._cached_done_sum
+            self._cached_done_sum += delta_sum
+            self._last_task_done_len = n
+        elif n < self._last_task_done_len:
+            # In case list resets, recompute
+            try:
+                self._cached_done_sum = sum(lst)
+                self._last_task_done_len = n
+            except Exception:
+                pass
+        return self._cached_done_sum
 
-    def _maybe_reset_for_new_episode(self):
-        # Detect new episode by elapsed time reset or negative time
-        t = getattr(self.env, "elapsed_seconds", 0.0) or 0.0
-        if self._prev_elapsed < 0 or t < self._prev_elapsed or t == 0.0 and self._prev_elapsed != 0.0:
-            self._reset_internal_state()
-        self._prev_elapsed = t
+    def _safe_buffers(self):
+        # Dynamic critical buffer accounts for restart and step granularity
+        gap = float(getattr(self.env, "gap_seconds", 0.0) or 0.0)
+        overhead = float(getattr(self, "restart_overhead", 0.0) or 0.0)
+        dynamic_component = 2.0 * overhead + 4.0 * gap
+        critical = max(self.min_critical_buffer_seconds, dynamic_component)
+        idle_guard = critical + self.extra_idle_guard_seconds
+        return critical, idle_guard
 
     def _step(self, last_cluster_type: ClusterType, has_spot: bool) -> ClusterType:
-        self._maybe_reset_for_new_episode()
-
-        # If we already decided to lock on OD, stick to it
-        if self.lock_on_od:
-            return ClusterType.ON_DEMAND
-
-        # Gather environment parameters with safe fallbacks
-        dt = float(getattr(self.env, "gap_seconds", 0.0) or 0.0)
-        t = float(getattr(self.env, "elapsed_seconds", 0.0) or 0.0)
+        now = float(getattr(self.env, "elapsed_seconds", 0.0) or 0.0)
+        gap = float(getattr(self.env, "gap_seconds", 0.0) or 0.0)
         deadline = float(getattr(self, "deadline", 0.0) or 0.0)
-        task_duration = float(getattr(self, "task_duration", 0.0) or 0.0)
-        restart_overhead = float(getattr(self, "restart_overhead", 0.0) or 0.0)
+        duration = float(getattr(self, "task_duration", 0.0) or 0.0)
 
-        # Remaining work
-        done = self._progress_sum()
-        remaining = max(0.0, task_duration - done)
+        done = self._progress_done_seconds()
+        remaining_work = max(duration - done, 0.0)
+        time_remaining = max(deadline - now, 0.0)
 
-        # If already done, no need to spend more
-        if remaining <= 1e-9:
+        # If already done, no need to run anything
+        if remaining_work <= 0.0:
             return ClusterType.NONE
 
-        slack = deadline - t
+        # Slack budget: how much non-progress time we can still afford
+        slack = time_remaining - remaining_work
 
-        # Safety overhead cushion to guarantee we can switch to OD later and still finish
-        safety_overhead = restart_overhead
+        # Buffers
+        critical_buffer, idle_guard = self._safe_buffers()
 
-        # If we cannot even afford the overhead to switch at all later, start OD now
-        if slack <= remaining + safety_overhead + 1e-9:
-            self.lock_on_od = True
+        # If slack is negative, we're behind; choose OD to salvage as much as possible
+        if slack <= 0.0:
             return ClusterType.ON_DEMAND
 
-        # Can we afford to wait exactly one step (dt) before switching to OD and still finish?
-        can_wait_one_step = slack >= remaining + dt + safety_overhead - 1e-9
+        # Enter critical mode: always OD to avoid any further interruptions
+        if slack <= critical_buffer:
+            return ClusterType.ON_DEMAND
 
+        # Outside of critical mode:
         if has_spot:
-            if can_wait_one_step:
-                return ClusterType.SPOT
-            else:
-                self.lock_on_od = True
-                return ClusterType.ON_DEMAND
+            # Use Spot while it's available to minimize cost
+            return ClusterType.SPOT
+
+        # No spot available:
+        # Idle only if we can afford to lose one step without entering critical territory
+        if slack - gap > idle_guard:
+            return ClusterType.NONE
         else:
-            if can_wait_one_step:
-                return ClusterType.NONE
-            else:
-                self.lock_on_od = True
-                return ClusterType.ON_DEMAND
+            return ClusterType.ON_DEMAND
 
     @classmethod
     def _from_args(cls, parser):

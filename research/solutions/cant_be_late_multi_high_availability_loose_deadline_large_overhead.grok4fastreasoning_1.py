@@ -1,6 +1,5 @@
 import json
 from argparse import Namespace
-
 from sky_spot.strategies.multi_strategy import MultiRegionStrategy
 from sky_spot.utils import ClusterType
 
@@ -30,6 +29,16 @@ class Solution(MultiRegionStrategy):
             inter_task_overhead=[0.0],
         )
         super().__init__(args)
+
+        # Load availability traces
+        self.gap = self.env.gap_seconds
+        self.num_regions = self.env.get_num_regions()
+        trace_files = config["trace_files"]
+        self.availability = []
+        for path in trace_files:
+            with open(path, 'r') as f:
+                trace = json.load(f)
+                self.availability.append([bool(x) for x in trace])
         return self
 
     def _step(self, last_cluster_type: ClusterType, has_spot: bool) -> ClusterType:
@@ -49,7 +58,38 @@ class Solution(MultiRegionStrategy):
 
         Returns: ClusterType.SPOT, ClusterType.ON_DEMAND, or ClusterType.NONE
         """
-        # Your decision logic here
-        if has_spot:
+        current_region = self.env.get_current_region()
+        step_idx = int(self.env.elapsed_seconds // self.gap)
+        done_work = sum(self.task_done_time)
+        remaining_work = self.task_duration - done_work
+        time_left = self.deadline - self.env.elapsed_seconds
+
+        # Safety check: if not enough time even for on-demand, use it
+        if time_left < remaining_work + self.restart_overhead * 2 + self.gap:
+            return ClusterType.ON_DEMAND
+
+        # Find best region with longest spot streak starting from now
+        best_region = None
+        best_streak = -1
+        max_lookahead = min(10, int(time_left // self.gap))
+        for r in range(self.num_regions):
+            if step_idx >= len(self.availability[r]):
+                continue
+            if not self.availability[r][step_idx]:
+                continue  # not available now
+            streak = 0
+            for s in range(step_idx, step_idx + max_lookahead):
+                if s >= len(self.availability[r]) or not self.availability[r][s]:
+                    break
+                streak += 1
+            if streak > best_streak:
+                best_streak = streak
+                best_region = r
+
+        if best_region is not None:
+            if best_region != current_region:
+                self.env.switch_region(best_region)
             return ClusterType.SPOT
-        return ClusterType.ON_DEMAND
+        else:
+            # No spot available anywhere now, use on-demand
+            return ClusterType.ON_DEMAND

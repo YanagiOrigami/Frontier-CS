@@ -2,60 +2,59 @@ from sky_spot.strategies.strategy import Strategy
 from sky_spot.utils import ClusterType
 
 class Solution(Strategy):
-    NAME = "CantBeLateSolution"
-
-    def __init__(self, args):
-        self.args = args
+    NAME = "CantBeLateStrategy"
 
     def solve(self, spec_path: str) -> "Solution":
         return self
 
     def _step(self, last_cluster_type: ClusterType, has_spot: bool) -> ClusterType:
-        # Calculate the amount of work completed so far
-        work_done = sum(self.task_done_time) if self.task_done_time else 0.0
-        
-        # Calculate work remaining
-        work_remaining = self.task_duration - work_done
-        if work_remaining <= 1e-6:
-            return ClusterType.NONE
-
-        # Calculate time remaining until the hard deadline
-        time_elapsed = self.env.elapsed_seconds
-        time_remaining = self.deadline - time_elapsed
-
-        # Determine restart overhead if we switch to On-Demand now.
-        # We assume On-Demand is reliable (rate 1.0).
-        # If we are already on On-Demand, no overhead. Otherwise, we pay overhead to switch/start.
-        overhead = 0.0
-        if last_cluster_type != ClusterType.ON_DEMAND:
-            overhead = self.restart_overhead
-        
-        # Total time required to finish if we commit to On-Demand immediately
-        time_needed_on_demand = work_remaining + overhead
-
-        # Calculate Safety Buffer
-        # We must ensure that if we choose NOT to use On-Demand in this step,
-        # we still have enough time to finish using On-Demand starting from the NEXT step.
-        # If we return NONE or SPOT, we consume 'gap_seconds' of time.
-        # Condition for next step: (time_remaining - gap) >= time_needed_on_demand
-        # Therefore, we need: time_remaining >= time_needed_on_demand + gap
-        # We add a small multiplier (10%) and constant (5s) to the gap for robustness against floating point noise.
+        elapsed = self.env.elapsed_seconds
         gap = self.env.gap_seconds
-        buffer = gap * 1.1 + 5.0
-
-        # Panic Threshold Check
-        # If time remaining is dangerously close to the minimum needed for On-Demand, force On-Demand.
-        if time_remaining < (time_needed_on_demand + buffer):
-            return ClusterType.ON_DEMAND
-
-        # Strategy when we have slack:
-        # 1. Prefer Spot instances to minimize cost.
-        if has_spot:
-            return ClusterType.SPOT
+        deadline = self.deadline
+        duration = self.task_duration
+        overhead = self.restart_overhead
         
-        # 2. If Spot is unavailable but we have plenty of slack, wait (NONE).
-        #    This avoids paying the high On-Demand price while waiting for Spot availability.
-        return ClusterType.NONE
+        work_done = sum(self.task_done_time) if self.task_done_time else 0.0
+        work_rem = duration - work_done
+        time_rem = deadline - elapsed
+        
+        # If task is completed
+        if work_rem <= 1e-6:
+            return ClusterType.NONE
+            
+        slack = time_rem - work_rem
+        
+        # Calculate critical slack threshold.
+        # We must maintain enough slack to:
+        # 1. Absorb a failed step (gap) if Spot is preempted/unavailable
+        # 2. Pay the restart overhead to switch to On-Demand
+        # 3. Include a small safety margin
+        critical_slack = overhead + gap + (overhead * 0.2)
+        
+        # Threshold to switch from On-Demand back to Spot.
+        # We require significantly more slack to justify the switch cost/risk.
+        spot_entry_slack = critical_slack + (overhead * 4.0)
+        
+        # 1. Safety Constraint: If slack is too low, force On-Demand to guarantee completion.
+        if slack < critical_slack:
+            return ClusterType.ON_DEMAND
+            
+        # 2. Availability Constraint: If Spot is unavailable, use On-Demand.
+        # Waiting (NONE) is too risky given the strict deadline and high penalty.
+        if not has_spot:
+            return ClusterType.ON_DEMAND
+            
+        # 3. Cost Minimization
+        # Spot is available and we have sufficient slack.
+        if last_cluster_type == ClusterType.ON_DEMAND:
+            # Hysteresis: Only switch back to Spot if we have ample slack
+            if slack > spot_entry_slack:
+                return ClusterType.SPOT
+            else:
+                return ClusterType.ON_DEMAND
+        else:
+            # Currently on Spot or None, and safe to proceed with Spot
+            return ClusterType.SPOT
 
     @classmethod
     def _from_args(cls, parser):

@@ -1,200 +1,197 @@
-import json
+import math
 from typing import Any, Optional
 
-try:
-    from sky_spot.strategies.strategy import Strategy
-    from sky_spot.utils import ClusterType
-except Exception:  # pragma: no cover
-    class ClusterType:  # type: ignore
-        SPOT = "spot"
-        ON_DEMAND = "on_demand"
-        NONE = "none"
-
-    class Strategy:  # type: ignore
-        def __init__(self, *args, **kwargs):
-            pass
+from sky_spot.strategies.strategy import Strategy
+from sky_spot.utils import ClusterType
 
 
 class Solution(Strategy):
-    NAME = "deadline_guard_v1"
+    NAME = "cbl_adaptive_v1"
 
-    def __init__(self, args: Optional[Any] = None):
-        try:
-            super().__init__(args)
-        except TypeError:
-            try:
-                super().__init__()
-            except Exception:
-                pass
-
-        self.args = args
-        self._committed_od = False
-
-        self._steps_seen = 0
-        self._spot_seen = 0
-
-        self._done_cache = 0.0
-        self._done_list_id = None
-        self._done_list_pos = 0
-        self._done_mode = None  # "numbers" or "pairs" or "unknown"
-
-        self._guard_gap_multiplier = 2.0
-        self._guard_overhead_multiplier = 1.0
+    def __init__(self, args: Any = None):
+        super().__init__(args)
+        self._mode = "spot"  # "spot" or "od"
+        self._history = []
+        self._window_steps: Optional[int] = None
+        self._current_down_steps = 0
+        self._mean_down_steps: Optional[float] = None
 
     def solve(self, spec_path: str) -> "Solution":
-        try:
-            with open(spec_path, "r") as f:
-                spec = json.load(f)
-            if isinstance(spec, dict):
-                gg = spec.get("guard_gap_multiplier", None)
-                go = spec.get("guard_overhead_multiplier", None)
-                if isinstance(gg, (int, float)) and gg >= 0:
-                    self._guard_gap_multiplier = float(gg)
-                if isinstance(go, (int, float)) and go >= 0:
-                    self._guard_overhead_multiplier = float(go)
-        except Exception:
-            pass
+        self._mode = "spot"
+        self._history = []
+        self._window_steps = None
+        self._current_down_steps = 0
+        self._mean_down_steps = None
         return self
 
-    def _infer_done_mode(self, lst) -> str:
-        for x in lst:
-            if isinstance(x, (int, float)):
-                continue
-            if isinstance(x, (tuple, list)) and len(x) >= 2 and isinstance(x[0], (int, float)) and isinstance(x[1], (int, float)):
-                continue
-            if isinstance(x, dict) and "start" in x and "end" in x and isinstance(x["start"], (int, float)) and isinstance(x["end"], (int, float)):
-                continue
-            return "unknown"
-        if not lst:
-            return "numbers"
-        if all(isinstance(x, (int, float)) for x in lst):
-            return "numbers"
-        if all(
-            (isinstance(x, (tuple, list)) and len(x) >= 2 and isinstance(x[0], (int, float)) and isinstance(x[1], (int, float)))
-            or (isinstance(x, dict) and "start" in x and "end" in x and isinstance(x["start"], (int, float)) and isinstance(x["end"], (int, float)))
-            for x in lst
-        ):
-            return "pairs"
-        return "unknown"
-
-    def _get_done_work_seconds(self) -> float:
+    def _work_done_seconds(self) -> float:
         tdt = getattr(self, "task_done_time", None)
         if tdt is None:
-            for attr in ("task_done_seconds", "task_done", "done_seconds", "work_done_seconds"):
-                v = getattr(self, attr, None)
-                if isinstance(v, (int, float)):
-                    return float(v)
             return 0.0
-
         if isinstance(tdt, (int, float)):
             return float(tdt)
-
-        if not isinstance(tdt, list):
+        if not isinstance(tdt, (list, tuple)) or len(tdt) == 0:
             return 0.0
 
-        lst = tdt
-        lid = id(lst)
-        if self._done_list_id != lid:
-            self._done_list_id = lid
-            self._done_list_pos = 0
-            self._done_cache = 0.0
-            self._done_mode = self._infer_done_mode(lst)
+        try:
+            all_num = True
+            for x in tdt:
+                if not isinstance(x, (int, float)):
+                    all_num = False
+                    break
 
-        n = len(lst)
-        if self._done_list_pos > n:
-            self._done_list_pos = 0
-            self._done_cache = 0.0
-            self._done_mode = self._infer_done_mode(lst)
+            if all_num:
+                mono = True
+                prev = float(tdt[0])
+                for x in tdt[1:]:
+                    fx = float(x)
+                    if fx + 1e-9 < prev:
+                        mono = False
+                        break
+                    prev = fx
+                return float(tdt[-1]) if mono else float(sum(float(x) for x in tdt))
 
-        mode = self._done_mode or "unknown"
-
-        if mode == "numbers":
-            if self._done_list_pos == 0 and n <= 64:
-                self._done_cache = float(sum(float(x) for x in lst if isinstance(x, (int, float))))
-                self._done_list_pos = n
-                return self._done_cache
-            for i in range(self._done_list_pos, n):
-                x = lst[i]
+            total = 0.0
+            for x in tdt:
                 if isinstance(x, (int, float)):
-                    self._done_cache += float(x)
-                else:
-                    self._done_mode = "unknown"
-                    return self._get_done_work_seconds()
-            self._done_list_pos = n
-            return self._done_cache
-
-        if mode == "pairs":
-            for i in range(self._done_list_pos, n):
-                x = lst[i]
-                if isinstance(x, (tuple, list)) and len(x) >= 2 and isinstance(x[0], (int, float)) and isinstance(x[1], (int, float)):
-                    self._done_cache += float(x[1]) - float(x[0])
-                elif isinstance(x, dict) and "start" in x and "end" in x and isinstance(x["start"], (int, float)) and isinstance(x["end"], (int, float)):
-                    self._done_cache += float(x["end"]) - float(x["start"])
-                else:
-                    self._done_mode = "unknown"
-                    return self._get_done_work_seconds()
-            self._done_list_pos = n
-            return self._done_cache
-
-        done = 0.0
-        for x in lst:
-            if isinstance(x, (int, float)):
-                done += float(x)
-            elif isinstance(x, (tuple, list)) and len(x) >= 2 and isinstance(x[0], (int, float)) and isinstance(x[1], (int, float)):
-                done += float(x[1]) - float(x[0])
-            elif isinstance(x, dict) and "start" in x and "end" in x and isinstance(x["start"], (int, float)) and isinstance(x["end"], (int, float)):
-                done += float(x["end"]) - float(x["start"])
-        self._done_cache = done
-        self._done_list_pos = n
-        self._done_mode = "unknown"
-        return done
-
-    def _remaining_work_seconds(self) -> float:
-        td = getattr(self, "task_duration", 0.0)
-        if not isinstance(td, (int, float)):
+                    total += float(x)
+                elif isinstance(x, (list, tuple)) and len(x) > 0:
+                    v = x[-1]
+                    if isinstance(v, (int, float)):
+                        total += float(v)
+            return total
+        except Exception:
             return 0.0
-        done = self._get_done_work_seconds()
-        rem = float(td) - float(done)
-        return rem if rem > 0.0 else 0.0
 
-    def _should_commit_on_demand(self, elapsed: float, remaining_work: float, gap: float, restart_overhead: float, deadline: float) -> bool:
-        guard = (self._guard_gap_multiplier * gap) + (self._guard_overhead_multiplier * restart_overhead)
-        latest_start = deadline - (remaining_work + restart_overhead + guard)
-        return elapsed >= latest_start
+    def _compute_mean_down_steps(self) -> Optional[float]:
+        h = self._history
+        n = len(h)
+        if n < 6:
+            return None
+
+        lengths = []
+        in_down = not h[0]
+        cur = 1 if in_down else 0
+
+        for b in h[1:]:
+            if not b:
+                if in_down:
+                    cur += 1
+                else:
+                    in_down = True
+                    cur = 1
+            else:
+                if in_down:
+                    lengths.append(cur)
+                    in_down = False
+                    cur = 0
+
+        if in_down:
+            lengths.append(cur)
+
+        if not lengths:
+            return 0.0
+        return float(sum(lengths)) / float(len(lengths))
+
+    def _estimate_effective_spot_rate(self) -> float:
+        h = self._history
+        n = len(h)
+        if n <= 0:
+            return 0.2
+
+        true_count = 0
+        for b in h:
+            if b:
+                true_count += 1
+
+        trans = 0
+        prev = h[0]
+        for b in h[1:]:
+            if (not prev) and b:
+                trans += 1
+            prev = b
+
+        # Conservative priors (low availability regions common).
+        alpha_p, beta_p = 2.0, 8.0  # mean=0.2
+        p = (true_count + alpha_p) / (n + alpha_p + beta_p)
+
+        alpha_t, beta_t = 1.0, 20.0  # small transition rate prior
+        t = (trans + alpha_t) / (n + alpha_t + beta_t)
+
+        gap = float(getattr(self.env, "gap_seconds", 60.0))
+        restart = float(getattr(self, "restart_overhead", 0.0))
+        oh_frac = (restart / gap) if gap > 1e-9 else 0.0
+
+        eff = p - t * oh_frac
+        if eff < 0.01:
+            eff = 0.01
+        elif eff > 1.0:
+            eff = 1.0
+        return eff
+
+    def _update_history(self, has_spot: bool) -> None:
+        gap = float(getattr(self.env, "gap_seconds", 60.0))
+        if self._window_steps is None:
+            window_seconds = 6.0 * 3600.0
+            self._window_steps = max(12, int(window_seconds / max(gap, 1e-9)))
+
+        b = bool(has_spot)
+        self._history.append(b)
+        if len(self._history) > self._window_steps:
+            self._history.pop(0)
+
+        if b:
+            self._current_down_steps = 0
+        else:
+            self._current_down_steps += 1
+
+        self._mean_down_steps = self._compute_mean_down_steps()
 
     def _step(self, last_cluster_type: ClusterType, has_spot: bool) -> ClusterType:
-        self._steps_seen += 1
-        if has_spot:
-            self._spot_seen += 1
+        self._update_history(has_spot)
 
-        if last_cluster_type == ClusterType.ON_DEMAND:
-            self._committed_od = True
-
-        elapsed = float(getattr(getattr(self, "env", None), "elapsed_seconds", 0.0) or 0.0)
-        gap = float(getattr(getattr(self, "env", None), "gap_seconds", 0.0) or 0.0)
-        deadline = float(getattr(self, "deadline", 0.0) or 0.0)
-        restart_overhead = float(getattr(self, "restart_overhead", 0.0) or 0.0)
-
-        if deadline > 0.0 and elapsed >= deadline:
+        work_done = self._work_done_seconds()
+        task_duration = float(getattr(self, "task_duration", 0.0))
+        work_left = max(0.0, task_duration - work_done)
+        if work_left <= 1e-6:
             return ClusterType.NONE
 
-        remaining_work = self._remaining_work_seconds()
-        if remaining_work <= 0.0:
-            return ClusterType.NONE
+        elapsed = float(getattr(self.env, "elapsed_seconds", 0.0))
+        deadline = float(getattr(self, "deadline", 0.0))
+        time_left = max(0.0, deadline - elapsed)
 
-        if self._committed_od:
+        gap = float(getattr(self.env, "gap_seconds", 60.0))
+        restart = float(getattr(self, "restart_overhead", 0.0))
+        buffer = max(2.0 * gap, restart)
+
+        # If we switch to on-demand now, we may pay one restart overhead (worst-case).
+        extra_if_switch_to_od = 0.0 if last_cluster_type == ClusterType.ON_DEMAND else restart
+        need_if_od_now = work_left + extra_if_switch_to_od + buffer
+        if time_left <= need_if_od_now:
+            self._mode = "od"
+
+        if self._mode != "od":
+            eff = self._estimate_effective_spot_rate()
+            required = (work_left / time_left) if time_left > 1e-9 else 10.0
+
+            # If required progress rate is close to or above expected spot progress, commit to OD.
+            if required >= eff * 0.92:
+                self._mode = "od"
+            else:
+                # If currently in a spot-down period, estimate whether we can afford to keep waiting.
+                if not has_spot:
+                    slack = time_left - work_left
+                    md = self._mean_down_steps
+                    if md is not None:
+                        expected_wait = max(0.0, md - float(self._current_down_steps)) * gap
+                        if slack <= expected_wait + restart + buffer:
+                            self._mode = "od"
+
+        if self._mode == "od":
             return ClusterType.ON_DEMAND
-
-        if gap <= 0.0:
-            gap = 1.0
 
         if has_spot:
             return ClusterType.SPOT
-
-        if self._should_commit_on_demand(elapsed, remaining_work, gap, restart_overhead, deadline):
-            self._committed_od = True
-            return ClusterType.ON_DEMAND
-
         return ClusterType.NONE
 
     @classmethod

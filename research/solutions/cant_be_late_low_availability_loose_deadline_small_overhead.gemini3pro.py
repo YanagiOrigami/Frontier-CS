@@ -1,74 +1,64 @@
+import argparse
 from sky_spot.strategies.strategy import Strategy
 from sky_spot.utils import ClusterType
 
 class Solution(Strategy):
-    NAME = "CantBeLateSolution"
+    NAME = "CostOptimizedSolution"
+
+    def __init__(self, args=None):
+        super().__init__()
+        # Safety buffer of 1 hour (3600 seconds) to ensure we don't miss the deadline
+        # due to step granularity or minor overhead miscalculations.
+        self.safety_buffer = 3600.0
 
     def solve(self, spec_path: str) -> "Solution":
-        """
-        Optional initialization. Called once before evaluation.
-        Read spec_path for configuration if needed.
-        Must return self.
-        """
         return self
 
     def _step(self, last_cluster_type: ClusterType, has_spot: bool) -> ClusterType:
-        """
-        Called at each time step. Return which cluster type to use next.
-
-        Args:
-            last_cluster_type: The cluster type used in the previous step
-            has_spot: Whether spot instances are available this step
-
-        Returns:
-            ClusterType.SPOT, ClusterType.ON_DEMAND, or ClusterType.NONE
-        """
-        # Calculate current progress
+        # Calculate remaining work
+        # task_done_time is a list of completed work segments in seconds
         work_done = sum(self.task_done_time)
         work_remaining = self.task_duration - work_done
         
-        # If task is complete, stop
         if work_remaining <= 0:
             return ClusterType.NONE
-            
-        elapsed = self.env.elapsed_seconds
-        time_remaining = self.deadline - elapsed
-        gap = self.env.gap_seconds
 
-        # Calculate the slack time (buffer).
-        # We need to preserve enough time to finish the work on On-Demand instances
-        # even in the worst case where we have to restart (paying the overhead).
-        # worst_case_time_needed = work_remaining + restart_overhead
-        # buffer = time_available - worst_case_time_needed
-        # We subtract overhead regardless of current state to prevent flapping 
-        # (switching OD->NONE->OD) near the threshold and to be conservative.
-        buffer = time_remaining - (work_remaining + self.restart_overhead)
+        time_elapsed = self.env.elapsed_seconds
+        time_remaining = self.deadline - time_elapsed
         
-        # Define a safety threshold.
-        # If we choose NONE or SPOT this step, and make no progress (wait or spot dies),
-        # we lose 'gap' seconds of buffer. We must ensure buffer remains non-negative 
-        # for the next step decision.
-        # Using 2.0 * gap adds a small robustness margin against floating point jitter.
-        safety_threshold = 2.0 * gap
-
-        # Critical Zone Strategy:
-        # If our buffer drops below the safety threshold, we cannot risk waiting 
-        # or relying on unreliable Spot instances. Force On-Demand to guarantee deadline.
-        if buffer < safety_threshold:
-            return ClusterType.ON_DEMAND
-
-        # Cost Optimization Strategy:
-        # We have sufficient slack. We should prioritize cost.
+        # Priority 1: Always prefer Spot instances when available
         if has_spot:
-            # Spot is available and is the cheapest option.
+            # Optimization: If we are already running On-Demand and the remaining work 
+            # is extremely short, switching to Spot might be more expensive due to restart overhead.
+            # Assuming Price_OD (~3) vs Price_Spot (~1), break-even is roughly when
+            # remaining work < overhead / 2.
+            if last_cluster_type == ClusterType.ON_DEMAND:
+                if work_remaining < (self.restart_overhead * 0.5):
+                    return ClusterType.ON_DEMAND
             return ClusterType.SPOT
-        else:
-            # Spot is unavailable. Since we have slack, we wait (NONE) for Spot to return
-            # rather than paying the high cost of On-Demand immediately.
-            # This consumes buffer but minimizes cost.
-            return ClusterType.NONE
+
+        # Priority 2: Use On-Demand if we are running out of time (Slack check)
+        # Calculate how much time we need to finish if we start On-Demand now.
+        
+        # If we are not currently running On-Demand, we will incur a restart overhead penalty.
+        overhead_penalty = 0.0
+        if last_cluster_type != ClusterType.ON_DEMAND:
+            overhead_penalty = self.restart_overhead
+            
+        time_needed_on_od = work_remaining + overhead_penalty
+        slack = time_remaining - time_needed_on_od
+        
+        # We need a buffer to ensure we react in time (at least one step size).
+        # We also add the safety_buffer to handle any unforeseen delays or granularities.
+        current_threshold = self.safety_buffer + self.env.gap_seconds
+        
+        if slack < current_threshold:
+            return ClusterType.ON_DEMAND
+            
+        # Priority 3: Wait to save money (consume slack)
+        return ClusterType.NONE
 
     @classmethod
-    def _from_args(cls, parser):  # REQUIRED: For evaluator instantiation
+    def _from_args(cls, parser):
         args, _ = parser.parse_known_args()
         return cls(args)

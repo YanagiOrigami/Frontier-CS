@@ -1,134 +1,178 @@
-from typing import Any, Dict, List, Sequence
-
 from sky_spot.strategies.strategy import Strategy
 from sky_spot.utils import ClusterType
 
 
 class Solution(Strategy):
-    NAME = "my_solution"
+    NAME = "cant_be_late_heuristic_v1"
+
+    def __init__(self, args=None):
+        super().__init__(args)
+        self._policy_initialized = False
+        self._total_done = 0.0
+        self._last_task_done_len = 0
+        self._segments_id = None
+        self.initial_slack = 0.0
+        self.commit_threshold = 0.0
+        self.wait_threshold = 0.0
+        self.gap_seconds = 0.0
+        self._final_od_commit = False
 
     def solve(self, spec_path: str) -> "Solution":
-        # Optional pre-evaluation initialization. We keep it simple.
+        # Optional pre-processing; not used in this heuristic.
         return self
 
-    def _compute_work_done(self) -> float:
-        """Best-effort computation of total work done based on task_done_time."""
-        segments = getattr(self, "task_done_time", None)
-        if not segments:
+    def _init_policy(self):
+        # Initialize thresholds based on environment and task parameters.
+        try:
+            self.gap_seconds = float(getattr(self.env, "gap_seconds", 1.0))
+        except Exception:
+            self.gap_seconds = 1.0
+
+        try:
+            task_duration = float(self.task_duration)
+        except Exception:
+            task_duration = 0.0
+
+        try:
+            deadline = float(self.deadline)
+        except Exception:
+            deadline = task_duration
+
+        try:
+            overhead = float(self.restart_overhead)
+        except Exception:
+            overhead = 0.0
+            self.restart_overhead = overhead
+
+        self.initial_slack = max(0.0, deadline - task_duration)
+
+        # We must not risk missing deadline: require at least one gap of slack
+        # (plus restart_overhead which is included in F) before we consider spot/none.
+        self.commit_threshold = max(self.gap_seconds, 0.0)
+
+        # Allow waiting (NONE) only when we have comfortable slack.
+        # Use 50% of initial slack as high-slack region; ensure >= commit_threshold.
+        if self.initial_slack > 0.0:
+            base_wait = 0.5 * self.initial_slack
+        else:
+            base_wait = 0.0
+        self.wait_threshold = max(base_wait, self.commit_threshold)
+
+        self._policy_initialized = True
+
+    def _segment_duration(self, seg) -> float:
+        # Robustly compute duration from a segment representation.
+        try:
+            if isinstance(seg, (list, tuple)):
+                if len(seg) >= 2:
+                    # Assume (start, end) or (start, duration)
+                    start = seg[0]
+                    end = seg[1]
+                    return max(0.0, float(end) - float(start))
+                elif len(seg) == 1:
+                    return max(0.0, float(seg[0]))
+                else:
+                    return 0.0
+            else:
+                return max(0.0, float(seg))
+        except Exception:
             return 0.0
 
-        total = 0.0
-        for seg in segments:
-            # Dict-based segment
-            if isinstance(seg, dict):
-                if "duration" in seg:
-                    try:
-                        total += float(seg["duration"])
-                    except (TypeError, ValueError):
-                        continue
-                elif "start" in seg and "end" in seg:
-                    try:
-                        total += float(seg["end"]) - float(seg["start"])
-                    except (TypeError, ValueError):
-                        continue
-                else:
-                    # Fallback: try to interpret whole dict as a number
-                    try:
-                        total += float(seg)  # type: ignore[arg-type]
-                    except (TypeError, ValueError):
-                        continue
-            # Sequence-based segment (e.g., (start, end))
-            elif isinstance(seg, (list, tuple)):
-                if len(seg) >= 2:
-                    try:
-                        total += float(seg[1]) - float(seg[0])
-                    except (TypeError, ValueError):
-                        continue
-                elif len(seg) == 1:
-                    try:
-                        total += float(seg[0])
-                    except (TypeError, ValueError):
-                        continue
-            else:
-                # Plain numeric
-                try:
-                    total += float(seg)  # type: ignore[arg-type]
-                except (TypeError, ValueError):
-                    continue
+    def _update_progress(self):
+        # Update self._total_done from self.task_done_time.
+        segments = getattr(self, "task_done_time", None)
+        if segments is None:
+            return
 
-        if hasattr(self, "task_duration"):
+        # If it's not a sequence, treat it as scalar total.
+        try:
+            n = len(segments)
+        except TypeError:
             try:
-                task_duration = float(self.task_duration)
-                if total < 0.0:
-                    total = 0.0
-                elif total > task_duration:
-                    total = task_duration
-            except (TypeError, ValueError):
-                pass
-        return total
+                self._total_done = max(0.0, float(segments))
+            except Exception:
+                self._total_done = 0.0
+            self._last_task_done_len = 0
+            self._segments_id = None
+            return
 
-    def _ensure_internal_state(self) -> None:
-        if not hasattr(self, "_committed_to_on_demand"):
-            self._committed_to_on_demand = False  # type: ignore[attr-defined]
+        # If the underlying object changed or shrank, recompute from scratch.
+        if (
+            self._segments_id is None
+            or id(segments) != self._segments_id
+            or n < self._last_task_done_len
+        ):
+            self._segments_id = id(segments)
+            self._last_task_done_len = n
+            total = 0.0
+            for seg in segments:
+                total += self._segment_duration(seg)
+            self._total_done = total
+        elif n > self._last_task_done_len:
+            # Incremental update for appended segments.
+            for idx in range(self._last_task_done_len, n):
+                self._total_done += self._segment_duration(segments[idx])
+            self._last_task_done_len = n
 
     def _step(self, last_cluster_type: ClusterType, has_spot: bool) -> ClusterType:
-        self._ensure_internal_state()
+        if not self._policy_initialized:
+            self._init_policy()
 
-        # If we've already decided to stick with on-demand, do so.
-        if self._committed_to_on_demand:  # type: ignore[attr-defined]
-            return ClusterType.ON_DEMAND
+        self._update_progress()
 
-        # Basic safety checks on environment attributes.
-        elapsed = float(getattr(self.env, "elapsed_seconds", 0.0))
-        gap = float(getattr(self.env, "gap_seconds", 0.0))
-        deadline = float(getattr(self, "deadline", elapsed))
-        restart_overhead = float(getattr(self, "restart_overhead", 0.0))
-        task_duration = float(getattr(self, "task_duration", 0.0))
-
-        # Compute remaining work.
-        work_done = self._compute_work_done()
-        remaining_work = task_duration - work_done
-        if remaining_work <= 0.0:
-            # Task is (or should be) finished; no need to run more.
+        try:
+            remaining = float(self.task_duration) - float(self._total_done)
+        except Exception:
+            remaining = 0.0
+        if remaining <= 0.0:
+            # Task already completed: don't spend more.
             return ClusterType.NONE
 
-        # Remaining wall-clock time to deadline.
-        remaining_time = deadline - elapsed
+        try:
+            elapsed = float(self.env.elapsed_seconds)
+        except Exception:
+            elapsed = 0.0
+        try:
+            deadline = float(self.deadline)
+        except Exception:
+            deadline = elapsed
 
-        # If we are already out of time, best-effort: run on-demand.
-        if remaining_time <= 0.0:
-            self._committed_to_on_demand = True  # type: ignore[attr-defined]
+        time_left = deadline - elapsed
+        if time_left <= 0.0:
+            # Already at/after deadline; still try to make progress as fast as possible.
             return ClusterType.ON_DEMAND
 
-        # Decide whether it's safe to delay committing to on-demand by one step.
-        # If we delay for one gap, worst case:
-        #   - we make no additional progress during this gap
-        #   - we later pay one restart_overhead, then run entirely on on-demand
-        #
-        # So it's safe to delay iff:
-        #   remaining_time - gap >= remaining_work + restart_overhead
-        #
-        # We clamp remaining_time - gap at <0 to handle edge cases.
-        can_delay = (remaining_time - gap) >= (remaining_work + restart_overhead)
+        try:
+            overhead = float(self.restart_overhead)
+        except Exception:
+            overhead = 0.0
 
+        # F is the slack if we were to immediately switch to OD (including one restart_overhead).
+        F = time_left - (remaining + overhead)
+
+        # If we've committed to on-demand for the rest of the run, always use it.
+        if self._final_od_commit:
+            return ClusterType.ON_DEMAND
+
+        # If slack is too small, permanently switch to on-demand to guarantee finish.
+        if F <= self.commit_threshold:
+            self._final_od_commit = True
+            return ClusterType.ON_DEMAND
+
+        # Pre-commit phase: still have comfortable slack.
         if has_spot:
-            if can_delay:
-                # Use spot while it's safe to delay committing to on-demand.
-                return ClusterType.SPOT
-            else:
-                # Not safe to delay further; commit to on-demand from now on.
-                self._committed_to_on_demand = True  # type: ignore[attr-defined]
-                return ClusterType.ON_DEMAND
-        else:
-            if can_delay:
-                # Safely wait for spot to (maybe) return.
-                return ClusterType.NONE
-            else:
-                # Need to start on-demand now to avoid missing the deadline.
-                self._committed_to_on_demand = True  # type: ignore[attr-defined]
-                return ClusterType.ON_DEMAND
+            # Prefer cheap spot instances whenever available in non-critical regime.
+            return ClusterType.SPOT
+
+        # No spot available this step.
+        # If we have plenty of slack, we can afford to wait for spot.
+        if F > self.wait_threshold:
+            return ClusterType.NONE
+
+        # Slack is moderate: use on-demand to maintain sufficient progress.
+        return ClusterType.ON_DEMAND
 
     @classmethod
-    def _from_args(cls, parser: Any) -> "Solution":
+    def _from_args(cls, parser):
         args, _ = parser.parse_known_args()
         return cls(args)

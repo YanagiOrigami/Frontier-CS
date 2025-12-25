@@ -1,88 +1,121 @@
-import collections
+import argparse
 from sky_spot.strategies.strategy import Strategy
 from sky_spot.utils import ClusterType
 
 class Solution(Strategy):
-    """
-    A strategy that balances cost and completion risk by maintaining a time buffer.
+    NAME = "adaptive_slack_strategy"
 
-    The core idea is to maintain a "slack" time, defined as the time remaining
-    until the deadline minus the time required to complete the rest of the job on
-    On-Demand instances.
+    # --- Hyperparameters (in hours) ---
+    # Total initial slack is 70h deadline - 48h task = 22 hours.
 
-    - If this slack falls below a critical buffer (CRITICAL_BUFFER_SECONDS),
-      it switches to On-Demand to guarantee completion.
-    - Otherwise, it prefers using Spot instances for their low cost.
-    - If Spot is unavailable, it decides whether to wait (NONE) or use On-Demand
-      based on the recent historical availability of Spot instances. A moving
-      average of availability is used to adapt to long outages.
-    """
-    NAME = "expert_programmer_solution"
+    # C_DANGER_HOURS: If slack (scaled by work remaining) drops below this,
+    # we are in the "danger zone" and must use ON_DEMAND. This value
+    # represents the safety buffer we want to maintain against preemptions.
+    C_DANGER_HOURS = 12.0
 
-    # A safety buffer. If slack falls below this, always use On-Demand.
-    CRITICAL_BUFFER_SECONDS: int = 2 * 3600  # 2 hours
-    # Window size for calculating moving average of spot availability (in steps).
-    AVAILABILITY_WINDOW_SIZE: int = 20
-    # If recent spot availability is below this threshold, use On-Demand instead of waiting.
-    AVAILABILITY_THRESHOLD: float = 0.25
+    # C_WAIT_HOURS: If slack (scaled by work remaining) is above this,
+    # we are in the "safe zone" and can afford to wait (NONE) for SPOT to
+    # become available. The gap between C_DANGER_HOURS and C_WAIT_HOURS
+    # defines the "caution zone".
+    C_WAIT_HOURS = 20.0
 
     def solve(self, spec_path: str) -> "Solution":
-        """Initializes the strategy's state before the simulation begins."""
-        self.availability_history = collections.deque(
-            [True] * self.AVAILABILITY_WINDOW_SIZE,
-            maxlen=self.AVAILABILITY_WINDOW_SIZE
-        )
-        self._work_done_cache: float = 0.0
-        self._last_task_done_len: int = 0
+        """
+        Optional initialization. Called once before evaluation.
+        Read spec_path for configuration if needed.
+        Must return self.
+        """
+        # Store initial task duration for calculating work ratio.
+        self.initial_task_duration = self.task_duration
+
+        # Convert hyperparameters from hours to seconds for internal calculations.
+        self.max_danger_slack = self.C_DANGER_HOURS * 3600.0
+        self.max_wait_slack = self.C_WAIT_HOURS * 3600.0
+
+        # Initialize a cache for the work done calculation to ensure
+        # _step remains efficient.
+        self.cached_work_done = 0.0
+        self.cached_task_done_len = 0
+
         return self
 
-    def _get_work_done_cached(self) -> float:
+    def _get_work_done(self) -> float:
         """
-        Returns the total work done, using a cache to avoid re-computing the sum
-        at every step.
+        Calculates the total amount of work completed so far.
+        Uses a cache to avoid re-calculating the sum over the entire
+        history at each step, making the operation efficient.
         """
-        if len(self.task_done_time) > self._last_task_done_len:
-            self._work_done_cache = sum(end - start for start, end in self.task_done_time)
-            self._last_task_done_len = len(self.task_done_time)
-        return self._work_done_cache
+        current_len = len(self.task_done_time)
+        if current_len == self.cached_task_done_len:
+            return self.cached_work_done
+
+        # Sum up the work from new segments since the last calculation.
+        new_segments = self.task_done_time[self.cached_task_done_len:]
+        new_work = sum(end - start for start, end in new_segments)
+
+        # Update the cache.
+        self.cached_work_done += new_work
+        self.cached_task_done_len = current_len
+
+        return self.cached_work_done
 
     def _step(self, last_cluster_type: ClusterType, has_spot: bool) -> ClusterType:
-        """Makes a decision at each time step on which cluster type to use."""
-        self.availability_history.append(has_spot)
+        """
+        Called at each time step. Return which cluster type to use next.
 
-        work_done = self._get_work_done_cached()
-        work_rem = self.task_duration - work_done
-        
-        if work_rem <= 0:
+        Args:
+            last_cluster_type: The cluster type used in the previous step
+            has_spot: Whether spot instances are available this step
+
+        Returns:
+            ClusterType.SPOT, ClusterType.ON_DEMAND, or ClusterType.NONE
+        """
+        work_done = self._get_work_done()
+        work_remaining = self.initial_task_duration - work_done
+
+        # If the task is finished, do nothing to minimize cost.
+        if work_remaining <= 1e-9:
             return ClusterType.NONE
 
-        time_rem_until_deadline = self.deadline - self.env.elapsed_seconds
+        # Calculate current slack: the time buffer we have if we were to switch
+        # to on-demand for the rest of the task.
+        time_to_deadline = self.deadline - self.env.elapsed_seconds
+        time_needed_for_od = work_remaining
+        current_slack = time_to_deadline - time_needed_for_od
 
-        # This is the time required to finish if we only use On-Demand from now on,
-        # plus a safety buffer.
-        critical_time_needed = work_rem + self.CRITICAL_BUFFER_SECONDS
-        
-        # If remaining time is less than this critical value, we must use On-Demand.
-        if time_rem_until_deadline <= critical_time_needed:
+        # Scale thresholds by the proportion of work remaining. This makes the
+        # strategy more cautious at the beginning (more risk) and more
+        # flexible towards the end.
+        work_ratio = max(0.0, work_remaining / self.initial_task_duration)
+        danger_slack_threshold = self.max_danger_slack * work_ratio
+        wait_slack_threshold = self.max_wait_slack * work_ratio
+
+        # --- Decision Logic ---
+
+        # 1. Danger Zone: If current slack is below the danger threshold,
+        # we must use the reliable ON_DEMAND cluster to avoid failing.
+        if current_slack < danger_slack_threshold:
             return ClusterType.ON_DEMAND
 
-        # If we have enough slack, we can be opportunistic.
+        # From here, slack is sufficient to consider SPOT.
         if has_spot:
             return ClusterType.SPOT
-        else:
-            # Spot is not available. Decide based on recent availability.
-            # Using sum() on a deque of booleans is efficient.
-            recent_availability = sum(self.availability_history) / self.AVAILABILITY_WINDOW_SIZE
 
-            if recent_availability < self.AVAILABILITY_THRESHOLD:
-                # Outlook is poor, don't waste slack waiting.
-                return ClusterType.ON_DEMAND
-            else:
-                # Outlook is good, wait for Spot to return.
-                return ClusterType.NONE
+        # If SPOT is not available, choose between waiting or using ON_DEMAND.
+
+        # 2. Safe Zone: If slack is very high (above the wait threshold),
+        # we can afford to wait (NONE) for a SPOT instance to become available.
+        if current_slack >= wait_slack_threshold:
+            return ClusterType.NONE
+
+        # 3. Caution Zone: Slack is between the danger and wait thresholds.
+        # It's not worth spending slack by waiting. Use ON_DEMAND to
+        # make progress and preserve our buffer.
+        else:
+            return ClusterType.ON_DEMAND
+
 
     @classmethod
-    def _from_args(cls, parser):
-        """Required classmethod for evaluator instantiation."""
+    def _from_args(cls, parser: argparse.ArgumentParser):  # REQUIRED: For evaluator instantiation
         args, _ = parser.parse_known_args()
         return cls(args)

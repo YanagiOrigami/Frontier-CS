@@ -3,97 +3,88 @@ from sky_spot.strategies.strategy import Strategy
 from sky_spot.utils import ClusterType
 
 class Solution(Strategy):
-    NAME = "my_solution"
+    NAME = "AdaptiveCapacityStrategy"
 
     def solve(self, spec_path: str) -> "Solution":
         """
-        Initialize the strategy with hyperparameters.
+        Initialize the strategy's hyperparameters and state.
+        This method is called once before the simulation starts.
         """
-        # N_BUFFER: Number of future preemptions to budget for in our safety buffer.
-        # A larger value makes the strategy more conservative.
-        self.N_BUFFER = 7.0
-
-        # P_SPOT_ESTIMATE: Estimated average availability of Spot instances.
-        # Used to decide whether to wait for Spot or use On-Demand.
-        self.P_SPOT_ESTIMATE = 0.60
-
-        # PROACTIVE_BUFFER_FACTOR: Multiplier for restart_overhead to make
-        # the decision to switch from NONE to ON_DEMAND more proactive.
-        self.PROACTIVE_BUFFER_FACTOR = 1.0
-
-        # Caching for performance
-        self._total_work_done_cache = 0.0
-        self._last_task_done_time_len = 0
-
+        # Hyperparameters
+        self.ema_alpha = 0.05
+        self.gamma = 1.15
+        self.critical_slack_hours = 3.0
+        
+        # Initial state
+        self.initial_p_avail_estimate = 0.70
+        self.p_avail_estimate = self.initial_p_avail_estimate
+        self.critical_slack_seconds = self.critical_slack_hours * 3600.0
+        
         return self
-
-    def _get_total_work_done(self) -> float:
-        """
-        Calculates the total work done, with caching to avoid re-summing a
-        potentially long list at every step.
-        """
-        if len(self.task_done_time) > self._last_task_done_time_len:
-            self._total_work_done_cache = sum(
-                end - start for start, end in self.task_done_time
-            )
-            self._last_task_done_time_len = len(self.task_done_time)
-        return self._total_work_done_cache
 
     def _step(self, last_cluster_type: ClusterType, has_spot: bool) -> ClusterType:
         """
-        The main decision-making logic, called at each time step.
+        Decision-making function called at each time step.
         """
-        # 1. Calculate current progress and remaining work.
-        total_work_done = self._get_total_work_done()
-        work_remaining = self.task_duration - total_work_done
+        # 1. Update internal state: Estimate spot availability using an EMA
+        is_spot_available_now = 1.0 if has_spot else 0.0
+        self.p_avail_estimate = (
+            (1 - self.ema_alpha) * self.p_avail_estimate + 
+            self.ema_alpha * is_spot_available_now
+        )
 
-        # If the job is finished, do nothing to save costs.
-        if work_remaining <= 0:
+        # 2. Calculate current progress and remaining work/time
+        work_done_seconds = sum(end - start for start, end in self.task_done_time)
+        work_remaining_seconds = self.task_duration - work_done_seconds
+
+        if work_remaining_seconds <= 0:
             return ClusterType.NONE
 
-        # 2. Calculate time remaining until the deadline.
-        elapsed_time = self.env.elapsed_seconds
-        time_left = self.deadline - elapsed_time
-
-        # If we've passed the deadline, this is a failure state.
-        if time_left <= 0:
-            return ClusterType.ON_DEMAND
-
-        # 3. Primary Safety Check: The "Point of No Return".
-        # If the time left is less than the work remaining plus a safety buffer
-        # for N_BUFFER future preemptions, we must use ON_DEMAND to guarantee completion.
-        safety_buffer = self.N_BUFFER * self.restart_overhead
-        buffered_work_remaining = work_remaining + safety_buffer
-
-        if buffered_work_remaining >= time_left:
-            return ClusterType.ON_DEMAND
-
-        # 4. Main Strategy: If we are not in the danger zone.
-        # If Spot is available, it's always the cheapest way to make progress.
-        if has_spot:
-            return ClusterType.SPOT
-
-        # If Spot is not available, choose between expensive progress (ON_DEMAND)
-        # or consuming our time buffer (NONE).
-        # We calculate a "required progress rate" to make this decision.
-        proactive_buffer = self.PROACTIVE_BUFFER_FACTOR * self.restart_overhead
-        proactive_work_remaining = work_remaining + proactive_buffer
+        time_remaining_seconds = self.deadline - self.env.elapsed_seconds
         
-        required_rate = proactive_work_remaining / time_left
-
-        if required_rate > self.P_SPOT_ESTIMATE:
-            # If the rate needed to finish on time is higher than what we expect
-            # Spot to provide, we must use ON_DEMAND to avoid falling behind.
+        if time_remaining_seconds <= 0:
             return ClusterType.ON_DEMAND
+
+        # 3. Emergency Mode: If slack is critically low, use On-Demand.
+        # This is a safety net to prevent deadline misses at all costs.
+        slack_seconds = time_remaining_seconds - work_remaining_seconds
+        if slack_seconds <= self.critical_slack_seconds:
+            return ClusterType.ON_DEMAND
+
+        # 4. Core Logic: Compare projected spot capacity vs. required work.
+        # This determines whether to be cost-saving (and wait for spot) or
+        # progress-focused (and use on-demand as a fallback).
+
+        # Use a floor for the availability estimate to handle the initial warm-up period
+        # and prevent extreme decisions if availability drops to near zero.
+        safe_p_avail_estimate = max(0.2, self.p_avail_estimate)
+
+        # Estimate the total work we can accomplish using only spot instances.
+        projected_spot_work_capacity = safe_p_avail_estimate * time_remaining_seconds
+        
+        # Multiply remaining work by a safety factor `gamma` to account for
+        # estimation errors and un-modeled costs like preemption overheads.
+        required_work_capacity_with_buffer = self.gamma * work_remaining_seconds
+
+        if projected_spot_work_capacity > required_work_capacity_with_buffer:
+            # "Comfortable" zone: Projected capacity is high. We can afford
+            # to wait for spot to save costs.
+            if has_spot:
+                return ClusterType.SPOT
+            else:
+                return ClusterType.NONE
         else:
-            # We have enough slack to wait for Spot to become available again.
-            # This is the primary cost-saving action.
-            return ClusterType.NONE
+            # "Prudent" zone: Time buffer is shrinking. We must make progress.
+            # Use Spot if available, but fall back to On-Demand otherwise.
+            if has_spot:
+                return ClusterType.SPOT
+            else:
+                return ClusterType.ON_DEMAND
 
     @classmethod
-    def _from_args(cls, parser):
+    def _from_args(cls, parser: argparse.ArgumentParser):
         """
-        Required classmethod for evaluator instantiation.
+        Required boilerplate for the evaluator to instantiate the class.
         """
         args, _ = parser.parse_known_args()
         return cls(args)

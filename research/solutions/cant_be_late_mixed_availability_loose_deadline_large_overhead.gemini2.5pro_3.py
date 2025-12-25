@@ -1,75 +1,52 @@
 import argparse
+
 from sky_spot.strategies.strategy import Strategy
 from sky_spot.utils import ClusterType
 
+
 class Solution(Strategy):
-    NAME = "adaptive_slack"
-
-    MIN_COMFORTABLE_SLACK_PCT = 0.25
-    MAX_COMFORTABLE_SLACK_PCT = 0.80
-
-    def __init__(self, args):
-        super().__init__(args)
-        self._initialized = False
-        self.critical_slack_threshold = 0.0
-        self.min_comfortable_threshold = 0.0
-        self.max_comfortable_threshold = 0.0
-        self.spot_seen_available = 0
-        self.total_steps = 0
+    NAME = "my_solution"
 
     def solve(self, spec_path: str) -> "Solution":
+        self.base_safety_margin = 1.1
+        self.preemption_rate_factor_margin = 2.0
+        self.wait_threshold_factor = 4.0
+        self.preemptions = 0
+        self.total_spot_steps_chosen = 0
         return self
 
-    def _initialize_strategy(self):
-        if self._initialized:
-            return
-
-        self.critical_slack_threshold = self.restart_overhead + self.env.gap_seconds
-
-        initial_slack = self.deadline - self.task_duration
-        
-        if initial_slack <= self.critical_slack_threshold:
-            initial_slack = self.critical_slack_threshold * 5.0
-
-        min_thresh = initial_slack * self.MIN_COMFORTABLE_SLACK_PCT
-        max_thresh = initial_slack * self.MAX_COMFORTABLE_SLACK_PCT
-        
-        self.min_comfortable_threshold = max(min_thresh, self.critical_slack_threshold * 1.1)
-        self.max_comfortable_threshold = max(max_thresh, self.min_comfortable_threshold * 1.1)
-
-        self._initialized = True
-
     def _step(self, last_cluster_type: ClusterType, has_spot: bool) -> ClusterType:
-        self._initialize_strategy()
+        if last_cluster_type == ClusterType.SPOT:
+            self.total_spot_steps_chosen += 1
+            if self.env.cluster_type == ClusterType.NONE:
+                self.preemptions += 1
 
-        self.total_steps += 1
-        if has_spot:
-            self.spot_seen_available += 1
+        work_done = sum(self.task_done_time)
+        work_rem = self.task_duration - work_done
 
-        work_done = sum(end - start for start, end in self.task_done_time)
-        work_remaining = self.task_duration - work_done
-
-        if work_remaining <= 0:
+        if work_rem <= 0:
             return ClusterType.NONE
 
-        time_left_to_deadline = self.deadline - self.env.elapsed_seconds
-        current_slack = time_left_to_deadline - work_remaining
+        time_left = self.deadline - self.env.elapsed_seconds
 
-        if current_slack < self.critical_slack_threshold:
+        if self.total_spot_steps_chosen > 5:
+            preemption_rate = self.preemptions / self.total_spot_steps_chosen
+        else:
+            preemption_rate = 0.0
+
+        safety_margin = self.base_safety_margin + preemption_rate * self.preemption_rate_factor_margin
+        
+        critical_time_needed = work_rem + self.restart_overhead * safety_margin
+        if critical_time_needed >= time_left:
             return ClusterType.ON_DEMAND
 
         if has_spot:
             return ClusterType.SPOT
 
-        if self.total_steps > 0:
-            availability_estimate = self.spot_seen_available / self.total_steps
-        else:
-            availability_estimate = 0.5
+        current_slack = time_left - work_rem
+        wait_threshold = self.restart_overhead * self.wait_threshold_factor
 
-        comfortable_slack_threshold = self.max_comfortable_threshold - \
-            (availability_estimate * (self.max_comfortable_threshold - self.min_comfortable_threshold))
-
-        if current_slack > comfortable_slack_threshold:
+        if current_slack > wait_threshold:
             return ClusterType.NONE
         else:
             return ClusterType.ON_DEMAND

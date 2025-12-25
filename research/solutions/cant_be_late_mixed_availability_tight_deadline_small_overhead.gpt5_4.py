@@ -3,73 +3,82 @@ from sky_spot.utils import ClusterType
 
 
 class Solution(Strategy):
-    NAME = "cant_be_late_threshold"
+    NAME = "deadline_guard_plus"
 
     def __init__(self, args=None):
-        self.args = args
+        super().__init__(args)
         self._commit_to_od = False
-        self.extra_buffer_seconds = 0.0
-        if args is not None and hasattr(args, "extra_buffer_seconds") and args.extra_buffer_seconds is not None:
-            try:
-                self.extra_buffer_seconds = float(args.extra_buffer_seconds)
-            except Exception:
-                self.extra_buffer_seconds = 0.0
+        self._work_done_sum = 0.0
+        self._last_task_index = 0
 
     def solve(self, spec_path: str) -> "Solution":
         return self
 
-    def _remaining_work(self) -> float:
+    def _update_work_done(self):
+        lst = self.task_done_time
         try:
-            done = sum(self.task_done_time) if hasattr(self, "task_done_time") and self.task_done_time is not None else 0.0
-        except Exception:
-            done = 0.0
-        total = float(getattr(self, "task_duration", 0.0) or 0.0)
-        remaining = max(0.0, total - float(done))
-        return remaining
+            n = len(lst)
+            if n > self._last_task_index:
+                # Sum new segments only
+                added = 0.0
+                for v in lst[self._last_task_index:]:
+                    added += float(v)
+                self._work_done_sum += added
+                self._last_task_index = n
+        except TypeError:
+            # Fallback if task_done_time is not a list
+            try:
+                self._work_done_sum = float(lst) if lst is not None else 0.0
+                self._last_task_index = 1
+            except Exception:
+                pass
+
+    def _remaining_work(self) -> float:
+        self._update_work_done()
+        remain = self.task_duration - self._work_done_sum
+        if remain < 0.0:
+            remain = 0.0
+        return remain
 
     def _step(self, last_cluster_type: ClusterType, has_spot: bool) -> ClusterType:
-        # If already committed to on-demand, stick with it to avoid extra overhead/risk
-        if self._commit_to_od or last_cluster_type == ClusterType.ON_DEMAND:
-            self._commit_to_od = True
-            # If task is already done, don't keep paying
-            if self._remaining_work() <= 1e-9:
+        # If already committed to on-demand, keep it to avoid extra overhead/risk
+        if self._commit_to_od:
+            remaining = self._remaining_work()
+            if remaining <= 0.0:
                 return ClusterType.NONE
             return ClusterType.ON_DEMAND
 
-        # Compute remaining work and basic parameters
-        remain = self._remaining_work()
-        if remain <= 1e-9:
+        # Calculate remaining work and time left
+        remaining = self._remaining_work()
+        if remaining <= 0.0:
             return ClusterType.NONE
 
-        e = float(self.env.elapsed_seconds)
-        dt = float(self.env.gap_seconds)
-        deadline = float(self.deadline)
-        oh = float(self.restart_overhead) + float(self.extra_buffer_seconds)
-
-        # If we can finish on spot within this step safely, do it (cheaper)
-        if has_spot:
-            if last_cluster_type == ClusterType.SPOT:
-                step_work_spot = dt
-            else:
-                step_work_spot = max(0.0, dt - oh)
-            if remain <= step_work_spot + 1e-12:
-                return ClusterType.SPOT
-
-        # Latest time to start OD (including a single restart overhead) to finish by deadline
-        latest_start_od = deadline - (remain + oh)
-
-        # If postponing OD by one more step risks missing the deadline, commit to OD now
-        if e + dt > latest_start_od + 1e-12:
+        now = self.env.elapsed_seconds
+        time_left = self.deadline - now
+        if time_left <= 0.0:
+            # Out of time: best-effort is on-demand
             self._commit_to_od = True
             return ClusterType.ON_DEMAND
 
-        # Otherwise, it's safe to wait: prefer spot if available; else pause to save cost
+        # Overhead if we switch to on-demand from current state
+        switch_overhead = 0.0 if last_cluster_type == ClusterType.ON_DEMAND else self.restart_overhead
+
+        # Buffer to account for step discretization (commit one step early)
+        margin = float(getattr(self.env, 'gap_seconds', 0.0) or 0.0)
+
+        # If we can no longer delay and still guarantee completion with OD, commit now
+        if time_left <= remaining + switch_overhead + margin:
+            self._commit_to_od = True
+            return ClusterType.ON_DEMAND
+
+        # Otherwise, prefer spot if available; else wait (NONE)
         if has_spot:
             return ClusterType.SPOT
+
+        # If spot is unavailable, we can pause as long as we maintain the deadline guard above
         return ClusterType.NONE
 
     @classmethod
     def _from_args(cls, parser):
-        parser.add_argument("--extra_buffer_seconds", type=float, default=0.0)
         args, _ = parser.parse_known_args()
         return cls(args)

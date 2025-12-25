@@ -1,9 +1,10 @@
-import os
+import argparse
 from sky_spot.strategies.strategy import Strategy
 from sky_spot.utils import ClusterType
 
+
 class Solution(Strategy):
-    NAME = "buffer_based_strategy"
+    NAME = "my_solution"
 
     def solve(self, spec_path: str) -> "Solution":
         """
@@ -11,11 +12,6 @@ class Solution(Strategy):
         Read spec_path for configuration if needed.
         Must return self.
         """
-        self.DANGER_THRESHOLD_MULTIPLIER = 1.1
-        self.WAIT_THRESHOLD_MULTIPLIER = 3.0
-
-        self.cached_work_done = 0.0
-        self.cached_len_task_done_time = 0
         return self
 
     def _step(self, last_cluster_type: ClusterType, has_spot: bool) -> ClusterType:
@@ -29,42 +25,46 @@ class Solution(Strategy):
         Returns:
             ClusterType.SPOT, ClusterType.ON_DEMAND, or ClusterType.NONE
         """
-        # --- 1. Calculate current state ---
-        if len(self.task_done_time) > self.cached_len_task_done_time:
-            new_segments = self.task_done_time[self.cached_len_task_done_time:]
-            self.cached_work_done += sum(end - start for start, end in new_segments)
-            self.cached_len_task_done_time = len(self.task_done_time)
-        work_done = self.cached_work_done
-
+        work_done = sum(end - start for start, end in self.task_done_time)
         work_remaining = self.task_duration - work_done
 
         if work_remaining <= 1e-9:
             return ClusterType.NONE
 
-        time_to_deadline = self.deadline - self.env.elapsed_seconds
+        time_left_to_deadline = self.deadline - self.env.elapsed_seconds
 
-        # --- 2. Handle the absolute deadline constraint ---
-        if time_to_deadline <= work_remaining:
+        # This is the "Point of No Return" (PNR) check.
+        # We calculate the worst-case time required to finish the job from this
+        # point forward. The worst-case assumes we try to use a spot instance,
+        # it gets immediately preempted, and we have to finish the rest of the
+        # job on a reliable on-demand instance.
+        # The total time required in this scenario is:
+        # (the current time step duration) + (one restart overhead) + (all remaining work)
+        worst_case_time_needed = (
+            work_remaining + self.restart_overhead + self.env.gap_seconds
+        )
+
+        # If the time we have left until the deadline is not enough to cover this
+        # worst-case scenario, we have no more safety buffer. We must switch to
+        # the reliable on-demand instance to guarantee finishing on time.
+        is_in_danger_zone = time_left_to_deadline <= worst_case_time_needed
+
+        if is_in_danger_zone:
             return ClusterType.ON_DEMAND
-
-        # --- 3. Implement the buffer-based strategy ---
-        buffer = time_to_deadline - work_remaining
-        preemption_time_cost = self.restart_overhead + self.env.gap_seconds
-
-        danger_threshold = preemption_time_cost * self.DANGER_THRESHOLD_MULTIPLIER
-        if buffer <= danger_threshold:
-            return ClusterType.ON_DEMAND
-
-        if has_spot:
-            return ClusterType.SPOT
-
-        wait_threshold = preemption_time_cost * self.WAIT_THRESHOLD_MULTIPLIER
-        if buffer > wait_threshold:
-            return ClusterType.NONE
         else:
-            return ClusterType.ON_DEMAND
+            # If we have a safety buffer, we can afford to be cost-conscious.
+            if has_spot:
+                # Use the cheap spot instance if it's available.
+                return ClusterType.SPOT
+            else:
+                # If spot is not available, we fall back to on-demand. This is a
+                # conservative strategy. Instead of pausing (NONE) and "spending"
+                # our valuable time buffer, we make progress on the task, thus
+                # preserving the buffer for future spot unavailability or preemptions.
+                return ClusterType.ON_DEMAND
 
     @classmethod
-    def _from_args(cls, parser):  # REQUIRED: For evaluator instantiation
+    def _from_args(cls, parser: argparse.ArgumentParser):
+        """REQUIRED: For evaluator instantiation"""
         args, _ = parser.parse_known_args()
         return cls(args)

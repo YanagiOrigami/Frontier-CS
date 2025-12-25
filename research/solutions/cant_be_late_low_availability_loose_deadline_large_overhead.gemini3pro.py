@@ -2,45 +2,64 @@ from sky_spot.strategies.strategy import Strategy
 from sky_spot.utils import ClusterType
 
 class Solution(Strategy):
-    NAME = "CantBeLateSolution"
+    NAME = "Lazy_Deadline_Constraint"
 
     def solve(self, spec_path: str) -> "Solution":
+        """
+        No initialization required for this strategy.
+        """
         return self
 
     def _step(self, last_cluster_type: ClusterType, has_spot: bool) -> ClusterType:
-        # Calculate remaining work
-        work_done = sum(self.task_done_time)
-        work_remaining = self.task_duration - work_done
+        """
+        Decides the cluster type for the next step based on deadlines and cost.
+        """
+        # Current state
+        elapsed = self.env.elapsed_seconds
+        deadline = self.deadline
+        total_work = self.task_duration
+        done_work = sum(self.task_done_time)
+        work_rem = max(0.0, total_work - done_work)
         
-        # If work is completed, stop
-        if work_remaining <= 0:
+        # If task is complete, do nothing
+        if work_rem <= 0:
             return ClusterType.NONE
 
-        # Get environment parameters
-        current_time = self.env.elapsed_seconds
-        time_left = self.deadline - current_time
+        time_rem = deadline - elapsed
+        R = self.restart_overhead
         gap = self.env.gap_seconds
-        overhead = self.restart_overhead
         
-        # Calculate Panic Threshold
-        # We must switch to On-Demand if the time remaining approaches the minimum time 
-        # required to finish with On-Demand (Work + Overhead).
-        # We add a safety buffer (2 * gap) to ensure we can survive the current step 
-        # if we choose to wait or if Spot fails, plus a margin for simulation granularity.
-        # Threshold logic: Time needed to recover if we waste the current step.
-        min_time_required = work_remaining + overhead + (gap * 2.0)
+        # Safety buffer: 2 time steps to account for discrete simulation boundaries
+        buffer = 2.0 * gap
         
-        # If time is critical, force On-Demand
-        if time_left <= min_time_required:
+        # Check Criticality: Do we HAVE to run On-Demand to meet the deadline?
+        # If we are currently On-Demand, we don't pay overhead to continue.
+        # If we are Spot or None, we must pay 'R' to switch to On-Demand.
+        is_od = (last_cluster_type == ClusterType.ON_DEMAND)
+        
+        threshold = work_rem + buffer
+        if not is_od:
+            threshold += R
+            
+        # If remaining time is tight, force On-Demand to guarantee completion
+        if time_rem <= threshold:
             return ClusterType.ON_DEMAND
             
-        # If we have slack time available
+        # Not Critical: Optimize for Cost
         if has_spot:
-            # Prefer Spot instances to minimize cost
+            # Spot is available.
+            # If we are currently On-Demand, switching to Spot incurs overhead R.
+            # It's only worth switching if the remaining work is long enough to offset the overhead cost.
+            # Heuristic: Price_OD ~ 3 * Price_Spot. 
+            # Break-even: 1*(Work + R) < 3*Work => R < 2*Work => Work > R/2.
+            # We use 0.55 * R as a conservative threshold.
+            if is_od and work_rem < (R * 0.55):
+                return ClusterType.ON_DEMAND
+            
             return ClusterType.SPOT
         else:
-            # If Spot is unavailable but we have slack, wait (NONE) 
-            # to save money instead of running expensive On-Demand
+            # Spot is unavailable, but we have slack (not critical).
+            # Wait (NONE) to save money.
             return ClusterType.NONE
 
     @classmethod

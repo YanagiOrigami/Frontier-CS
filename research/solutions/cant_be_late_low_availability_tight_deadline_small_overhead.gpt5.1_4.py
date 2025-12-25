@@ -3,110 +3,87 @@ from sky_spot.utils import ClusterType
 
 
 class Solution(Strategy):
-    NAME = "my_solution"
+    NAME = "cant_be_late_safe_v1"
 
-    def __init__(self, args):
-        super().__init__(args)
-        self._safety_margin_seconds = None
+    def __init__(self, *init_args, **init_kwargs):
+        super().__init__(*init_args, **init_kwargs)
+        self._reset_internal_state()
+
+    def _reset_internal_state(self):
+        self.committed_to_on_demand = False
+        self._cached_task_done_sum = 0.0
+        self._cached_task_done_len = 0
+        self._last_elapsed_seconds = None
 
     def solve(self, spec_path: str) -> "Solution":
+        # Optional: load configuration from spec_path.
+        # For now, we use a fixed strategy independent of spec.
         return self
 
-    def _initialize_if_needed(self):
-        if self._safety_margin_seconds is not None:
-            return
+    def _update_cached_progress(self):
+        # Incrementally cache the sum of task_done_time to avoid O(n^2) over many steps
+        task_done_time = getattr(self, "task_done_time", [])
+        current_len = len(task_done_time)
+        if current_len != self._cached_task_done_len:
+            # Recompute sum when list length changes
+            self._cached_task_done_sum = float(sum(task_done_time)) if task_done_time else 0.0
+            self._cached_task_done_len = current_len
 
-        env = getattr(self, "env", None)
-        if env is None:
-            self._safety_margin_seconds = 3600.0
-            return
-
-        try:
-            gap = float(getattr(env, "gap_seconds", 60.0) or 60.0)
-        except Exception:
-            gap = 60.0
-
-        try:
-            deadline = float(getattr(self, "deadline", 0.0) or 0.0)
-        except Exception:
-            deadline = 0.0
-
-        try:
-            duration = float(getattr(self, "task_duration", 0.0) or 0.0)
-        except Exception:
-            duration = 0.0
-
-        try:
-            overhead = float(getattr(self, "restart_overhead", 0.0) or 0.0)
-        except Exception:
-            overhead = 0.0
-
-        slack0 = max(deadline - duration, 0.0)
-        min_margin = max(3.0 * overhead, 4.0 * gap, 1e-6)
-        base_margin = max(min_margin, 0.5 * 3600.0)
-
-        if slack0 > 0.0:
-            max_margin = 0.9 * slack0
-            margin = min(base_margin, max_margin)
-            if margin < 4.0 * gap:
-                margin = 4.0 * gap
-        else:
-            margin = base_margin
-
-        self._safety_margin_seconds = margin
-
-    def _compute_remaining_work(self) -> float:
-        try:
-            done_list = getattr(self, "task_done_time", None)
-            if not done_list:
-                work_done = 0.0
-            else:
-                work_done = float(sum(done_list))
-        except Exception:
-            work_done = 0.0
-
-        try:
-            duration = float(getattr(self, "task_duration", 0.0) or 0.0)
-        except Exception:
-            duration = 0.0
-
-        remaining = duration - work_done
-        if remaining < 0.0:
-            remaining = 0.0
-        return remaining
+    def _detect_new_episode(self):
+        # Detect environment reset by elapsed_seconds going backwards or first call
+        elapsed = getattr(self.env, "elapsed_seconds", 0.0)
+        if self._last_elapsed_seconds is None or elapsed < self._last_elapsed_seconds:
+            self._reset_internal_state()
+        self._last_elapsed_seconds = elapsed
 
     def _step(self, last_cluster_type: ClusterType, has_spot: bool) -> ClusterType:
-        self._initialize_if_needed()
+        # Detect new episode and reset per-episode state if needed
+        self._detect_new_episode()
 
-        remaining = self._compute_remaining_work()
-        if remaining <= 0.0:
+        # Update cached progress
+        self._update_cached_progress()
+
+        # Compute remaining work (in seconds)
+        task_duration = float(self.task_duration)
+        work_done = self._cached_task_done_sum
+        remaining_work = max(task_duration - work_done, 0.0)
+
+        # If task is already complete, do nothing to avoid extra cost
+        if remaining_work <= 0.0:
             return ClusterType.NONE
 
-        try:
-            elapsed = float(getattr(self.env, "elapsed_seconds", 0.0) or 0.0)
-        except Exception:
-            elapsed = 0.0
+        # If we've already committed to on-demand, stick with it until completion
+        if self.committed_to_on_demand:
+            return ClusterType.ON_DEMAND
 
-        try:
-            deadline = float(getattr(self, "deadline", 0.0) or 0.0)
-        except Exception:
-            deadline = 0.0
+        # Retrieve timing parameters
+        t = float(self.env.elapsed_seconds)
+        gap = float(self.env.gap_seconds)
+        overhead = float(self.restart_overhead)
+        deadline = float(self.deadline)
 
-        TL = deadline - elapsed
-        if TL <= 0.0:
+        # Safety buffer to account for discretization / alignment (2 steps)
+        buffer = 2.0 * gap
+
+        # Decide if it's safe to delay committing to on-demand by one more step,
+        # under pessimistic assumption of no useful progress during this step.
+        # Condition: even if we wait one gap now and then switch to on-demand,
+        # we can still finish before the deadline, considering overhead + buffer.
+        can_delay_one_step = (
+            t + gap + overhead + remaining_work + buffer
+        ) <= deadline
+
+        if can_delay_one_step:
+            # Still have enough slack to "gamble" on spot or wait for it
             if has_spot:
                 return ClusterType.SPOT
+            else:
+                # Spot unavailable and we have slack: wait without incurring cost
+                return ClusterType.NONE
+        else:
+            # No longer safe to delay: commit to on-demand from now on
+            self.committed_to_on_demand = True
             return ClusterType.ON_DEMAND
-
-        margin = self._safety_margin_seconds
-
-        if TL <= remaining + margin:
-            return ClusterType.ON_DEMAND
-
-        if has_spot:
-            return ClusterType.SPOT
-
-        return ClusterType.NONE
 
     @classmethod
     def _from_args(cls, parser):

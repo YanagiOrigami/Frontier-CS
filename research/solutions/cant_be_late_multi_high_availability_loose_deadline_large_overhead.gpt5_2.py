@@ -6,7 +6,7 @@ from sky_spot.utils import ClusterType
 
 
 class Solution(MultiRegionStrategy):
-    NAME = "cant_late_multi"
+    NAME = "cant_be_late_rr_guard"
 
     def solve(self, spec_path: str) -> "Solution":
         with open(spec_path) as f:
@@ -20,65 +20,82 @@ class Solution(MultiRegionStrategy):
         )
         super().__init__(args)
 
-        # Strategy state
-        self._commit_on_demand = False
-        self._no_spot_streak = 0
+        # Internal state
+        self._od_lock = False
+        self._acc_done = 0.0
+        self._last_done_len = 0
+        self._rr_initialized = False
         return self
 
-    def _remaining_work(self) -> float:
-        done = sum(self.task_done_time)
-        remaining = max(0.0, self.task_duration - done)
-        return remaining
+    def _update_acc_done(self):
+        l = len(self.task_done_time)
+        if l > self._last_done_len:
+            # Incremental sum of new segments only
+            add = 0.0
+            for i in range(self._last_done_len, l):
+                add += self.task_done_time[i]
+            self._acc_done += add
+            self._last_done_len = l
+
+    def _must_use_on_demand(self, last_cluster_type: ClusterType, time_left: float, remaining_work: float) -> bool:
+        # Overhead we need if we choose ON_DEMAND now and keep it
+        if self._od_lock or last_cluster_type == ClusterType.ON_DEMAND:
+            od_overhead = self.remaining_restart_overhead
+        else:
+            od_overhead = self.restart_overhead
+
+        # Add small safety to guard discretization/edge cases
+        gap = getattr(self.env, "gap_seconds", 0.0) or 0.0
+        safety = min(gap, self.restart_overhead)
+
+        required = od_overhead + remaining_work
+        return time_left <= required + safety
 
     def _step(self, last_cluster_type: ClusterType, has_spot: bool) -> ClusterType:
-        # If already finished, no need to run
-        remaining_work = self._remaining_work()
+        # Initialize round-robin region starting point
+        if not self._rr_initialized:
+            try:
+                self._rr_initialized = True
+                self._rr_last_region = self.env.get_current_region()
+            except Exception:
+                self._rr_initialized = True
+                self._rr_last_region = 0
+
+        # Update accumulated work done efficiently
+        self._update_acc_done()
+
+        # Remaining work and time left
+        remaining_work = max(0.0, self.task_duration - self._acc_done)
+        time_left = self.deadline - self.env.elapsed_seconds
+
         if remaining_work <= 0.0:
-            self._commit_on_demand = False
+            # Already finished; no more actions needed
             return ClusterType.NONE
 
-        elapsed = self.env.elapsed_seconds
-        time_left = self.deadline - elapsed
-        gap = float(self.env.gap_seconds)
-        # Conservative safety margin: allow for one lost step and an extra overhead
-        safety_margin = gap + self.restart_overhead
-
-        # Track streak of no-spot in current region
-        if has_spot:
-            self._no_spot_streak = 0
-        else:
-            self._no_spot_streak = min(self._no_spot_streak + 1, 10**9)
-
-        # If we are already on ON_DEMAND and have pending overhead, keep ON_DEMAND to avoid resetting overhead.
-        if last_cluster_type == ClusterType.ON_DEMAND and getattr(self, "remaining_restart_overhead", 0.0) > 0.0:
-            self._commit_on_demand = True
+        # If already locked into on-demand, keep it to avoid extra restarts
+        if self._od_lock:
             return ClusterType.ON_DEMAND
 
-        # Time required to finish if we commit to ON_DEMAND now.
-        # If already on ON_DEMAND, no new overhead; otherwise, we will incur a restart overhead.
-        commit_overhead = self.restart_overhead if last_cluster_type != ClusterType.ON_DEMAND else getattr(self, "remaining_restart_overhead", 0.0)
-        commit_required = remaining_work + commit_overhead
-
-        # Enter commit mode if we're close to deadline with limited slack
-        if time_left <= commit_required + safety_margin:
-            self._commit_on_demand = True
-
-        # If we have committed to ON_DEMAND, stick to it to avoid additional overheads.
-        if self._commit_on_demand:
+        # Decide if we must switch to (or stay on) on-demand to guarantee finish
+        if self._must_use_on_demand(last_cluster_type, time_left, remaining_work):
+            self._od_lock = True
             return ClusterType.ON_DEMAND
 
-        # If Spot is available and we are not committed, prefer Spot to minimize cost.
+        # Not yet forced to use on-demand; prefer spot to minimize cost
         if has_spot:
             return ClusterType.SPOT
 
-        # Spot not available. Decide to wait (NONE) or switch to ON_DEMAND.
-        # Compute safe wait time before we must commit to ON_DEMAND (including margin).
-        # If we can afford to wait at least one step, wait; otherwise switch to ON_DEMAND.
-        safe_wait_time = time_left - (remaining_work + self.restart_overhead + safety_margin)
+        # Spot not available here; we can wait (NONE) as we still have slack.
+        # Opportunistically round-robin to another region to increase chance of spot next step.
+        try:
+            n = self.env.get_num_regions()
+            if n and n > 1:
+                current = self.env.get_current_region()
+                nxt = (current + 1) % n
+                if nxt != current:
+                    self.env.switch_region(nxt)
+                    self._rr_last_region = nxt
+        except Exception:
+            pass
 
-        if safe_wait_time >= gap:
-            return ClusterType.NONE
-
-        # Otherwise, use ON_DEMAND to ensure we do not miss the deadline.
-        self._commit_on_demand = True
-        return ClusterType.ON_DEMAND
+        return ClusterType.NONE

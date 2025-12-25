@@ -1,121 +1,121 @@
+import heapq
 import math
+from typing import List, Dict, Tuple
 from sky_spot.strategies.strategy import Strategy
 from sky_spot.utils import ClusterType
 
 
 class Solution(Strategy):
-    NAME = "adaptive_threshold"
-
+    NAME = "my_solution"
+    
     def __init__(self, args):
-        super().__init__(args)
-        self.spot_history = []
-        self.spot_availability_rate = 0.5  # Initial guess
-        self.conservative_threshold = 0.7
-        self.aggressive_threshold = 0.3
-        self.switch_to_od_buffer = 0
-        self.remaining_work = 0.0
-        self.last_action = None
-        self.od_only_time = 0.0
-        self.switch_count = 0
-
+        super().__init__()
+        self.spot_price = 0.97  # $/hr
+        self.ondemand_price = 3.06  # $/hr
+        self.price_ratio = self.spot_price / self.ondemand_price
+        self.safety_multiplier = 2.5
+        self.min_safety_time = 3600  # 1 hour minimum
+        self.max_safety_time = 14400  # 4 hours maximum
+        self.spot_available_history = []
+        self.spot_unavailable_streak = 0
+        self.max_unacceptable_streak = 10
+        self.work_done = 0.0
+        self.consecutive_none_steps = 0
+        self.max_none_steps = 15
+        
     def solve(self, spec_path: str) -> "Solution":
+        # Could read config from spec_path if needed
         return self
-
-    def _calculate_remaining_time(self, remaining_work: float) -> float:
-        """Calculate remaining time needed considering restart overhead."""
-        if self.last_action == ClusterType.NONE:
-            return remaining_work
-        # Estimate potential restart overheads
-        estimated_restarts = max(0, (remaining_work / (self.env.gap_seconds * 10)) - 1)
-        return remaining_work + estimated_restarts * self.restart_overhead
-
-    def _should_switch_to_od(self, remaining_work: float, has_spot: bool) -> bool:
-        """Determine if we should switch to on-demand."""
-        current_time = self.env.elapsed_seconds
-        time_remaining = self.deadline - current_time
-        
-        if time_remaining <= 0:
-            return True
-        
-        # Calculate safe threshold
-        time_needed = self._calculate_remaining_time(remaining_work)
-        
-        # If we're critically behind, switch to OD immediately
-        if time_needed > time_remaining * 0.9:
-            return True
-        
-        # If we have little slack time, be more conservative
-        slack_ratio = time_remaining / max(1.0, time_needed)
-        
-        if slack_ratio < 1.5:  # Less than 50% slack
-            threshold = self.conservative_threshold
-        else:
-            threshold = self.aggressive_threshold
-        
-        # Dynamic threshold based on spot availability
-        if len(self.spot_history) > 10:
-            recent_availability = sum(self.spot_history[-10:]) / 10.0
-            if recent_availability < 0.3:
-                threshold = 0.8  # Very conservative if spot is unreliable
-            elif recent_availability > 0.7:
-                threshold = max(0.2, threshold - 0.1)  # More aggressive
-        
-        # If spot is currently unavailable and we're above threshold, use OD
-        if not has_spot and self.spot_availability_rate < threshold:
-            return True
-            
-        return False
-
+    
+    def _compute_safety_margin(self, work_remaining: float) -> float:
+        base_margin = self.restart_overhead * self.safety_multiplier
+        dynamic_margin = work_remaining * 0.15  # 15% of remaining work
+        safety = max(base_margin, dynamic_margin)
+        safety = min(safety, self.max_safety_time)
+        safety = max(safety, self.min_safety_time)
+        return safety
+    
     def _step(self, last_cluster_type: ClusterType, has_spot: bool) -> ClusterType:
-        # Update spot history and availability rate
-        self.spot_history.append(1 if has_spot else 0)
-        if len(self.spot_history) > 100:
-            self.spot_history.pop(0)
-        if self.spot_history:
-            self.spot_availability_rate = sum(self.spot_history) / len(self.spot_history)
+        # Update history
+        self.spot_available_history.append(1 if has_spot else 0)
+        if len(self.spot_available_history) > 50:
+            self.spot_available_history.pop(0)
         
-        # Calculate remaining work
-        work_done = sum(end - start for start, end in self.task_done_time)
-        self.remaining_work = max(0.0, self.task_duration - work_done)
+        # Update streak counter
+        if not has_spot:
+            self.spot_unavailable_streak += 1
+        else:
+            self.spot_unavailable_streak = 0
         
-        # Check if we're done
-        if self.remaining_work <= 0:
+        # Calculate work completed so far
+        work_completed = sum(self.task_done_time) if self.task_done_time else 0.0
+        self.work_done = work_completed
+        
+        # Remaining work and time
+        work_remaining = max(0.0, self.task_duration - work_completed)
+        time_remaining = max(0.0, self.deadline - self.env.elapsed_seconds)
+        
+        # If work is done, use NONE
+        if work_remaining <= 0:
             return ClusterType.NONE
         
-        # Track last action for restart overhead estimation
-        if last_cluster_type != self.last_action and last_cluster_type != ClusterType.NONE:
-            self.switch_count += 1
-        self.last_action = last_cluster_type
-        
-        # Emergency mode: if very close to deadline, use OD
-        time_remaining = self.deadline - self.env.elapsed_seconds
-        if time_remaining < 3600:  # Less than 1 hour remaining
-            if has_spot and time_remaining > 1800:  # If >30 min, can try spot
-                return ClusterType.SPOT
+        # If we're out of time, must use on-demand
+        if time_remaining <= 0:
             return ClusterType.ON_DEMAND
         
-        # Determine if we should switch to OD
-        if self._should_switch_to_od(self.remaining_work, has_spot):
-            self.od_only_time = min(self.od_only_time + self.env.gap_seconds, 3600.0)
+        # Calculate time needed at different rates
+        time_needed_on_demand = work_remaining
+        safety_margin = self._compute_safety_margin(work_remaining)
+        time_needed_with_buffer = time_needed_on_demand + safety_margin
+        
+        # Check if we must switch to on-demand to meet deadline
+        if time_remaining <= time_needed_with_buffer:
+            return ClusterType.ON_DEMAND
+        
+        # Calculate spot availability metrics
+        spot_availability = (sum(self.spot_available_history) / len(self.spot_available_history) 
+                            if self.spot_available_history else 0.0)
+        
+        # If spot is consistently unavailable, consider switching
+        if (self.spot_unavailable_streak > self.max_unacceptable_streak and 
+            time_needed_on_demand < time_remaining * 0.9):
+            return ClusterType.ON_DEMAND
+        
+        # Decide based on availability and risk
+        if has_spot:
+            # Calculate expected time with spot including overhead
+            expected_efficiency = max(0.5, spot_availability * 0.9)
+            expected_spot_time = work_remaining / expected_efficiency
+            
+            # If we can comfortably finish with spot
+            if (expected_spot_time * 1.2 < time_remaining and 
+                spot_availability > 0.4):
+                return ClusterType.SPOT
+            
+            # If moderately risky but worth it
+            if (expected_spot_time * 1.5 < time_remaining and 
+                spot_availability > 0.3 and 
+                self.consecutive_none_steps < self.max_none_steps):
+                return ClusterType.SPOT
+            
+            # If we have plenty of time, use spot
+            if time_remaining > work_remaining * 3:
+                return ClusterType.SPOT
+            
+            # Otherwise be conservative
             return ClusterType.ON_DEMAND
         else:
-            # Reset OD timer if using spot
-            self.od_only_time = max(0.0, self.od_only_time - self.env.gap_seconds)
-        
-        # Use spot if available
-        if has_spot:
-            return ClusterType.SPOT
-        
-        # Spot not available - decide whether to wait or use OD
-        time_needed = self._calculate_remaining_time(self.remaining_work)
-        
-        # If waiting would risk missing deadline, use OD
-        if time_needed > time_remaining * 0.95:
-            return ClusterType.ON_DEMAND
-        
-        # Otherwise wait for spot to become available
-        return ClusterType.NONE
-
+            # Spot not available
+            self.consecutive_none_steps += 1
+            
+            # If we can afford to wait
+            if (time_remaining > time_needed_on_demand * 1.5 and 
+                self.consecutive_none_steps < self.max_none_steps):
+                return ClusterType.NONE
+            else:
+                self.consecutive_none_steps = 0
+                return ClusterType.ON_DEMAND
+    
     @classmethod
     def _from_args(cls, parser):
         args, _ = parser.parse_known_args()

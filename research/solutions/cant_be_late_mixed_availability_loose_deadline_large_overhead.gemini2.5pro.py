@@ -2,123 +2,98 @@ import argparse
 from sky_spot.strategies.strategy import Strategy
 from sky_spot.utils import ClusterType
 
+
 class Solution(Strategy):
-    """
-    An adaptive strategy that balances cost-saving on SPOT instances with the risk
-    of missing the deadline. It continuously estimates SPOT availability and
-    preemption rates to calculate a "point of no return" time. If the current
-    time is past this point, it switches to reliable ON_DEMAND instances to
-    guarantee completion. Otherwise, it aggressively uses SPOT when available
-    or waits if not.
-    """
     NAME = "my_solution"
 
     def solve(self, spec_path: str) -> "Solution":
         """
-        Initializes the strategy's state and hyperparameters.
+        Optional initialization. Called once before evaluation.
         """
         # --- Hyperparameters ---
-        # Initial guess for SPOT availability (fraction of time available).
-        self.INITIAL_AVAILABILITY = 0.75
-        # Initial guess for preemption rate (per SPOT time step).
-        self.INITIAL_PREEMPTION_RATE = 0.01
-        # Smoothing factor for Exponential Moving Average (EMA) of availability.
-        self.AVAILABILITY_ALPHA = 0.005
-        # Smoothing factor for EMA of preemption rate.
-        self.PREEMPTION_ALPHA = 0.01
-        # Minimum assumed availability to prevent division by zero and over-pessimism.
-        self.AVAILABILITY_FLOOR = 0.05
-        # A safety buffer for the risk of preemption in the immediate next step.
-        # Expressed as a factor of restart_overhead.
-        self.IMMEDIATE_RISK_BUFFER_FACTOR = 1.0
+        
+        # Multiplier for the panic threshold. If slack is less than this times
+        # the restart overhead, we switch to ON_DEMAND unconditionally.
+        self.PANIC_MULTIPLIER = 1.05
 
-        # --- State Variables ---
-        self.ema_availability = self.INITIAL_AVAILABILITY
-        self.ema_preemption_rate = self.INITIAL_PREEMPTION_RATE
-        self.last_task_done_len = 0
-        self.work_done_so_far = 0.0
+        # Base constant for the adaptive wait threshold. This value is scaled
+        # by the estimated spot availability to decide when to wait for spot.
+        self.BASE_WAIT_K = 1.5
+
+        # Alpha for the Exponential Moving Average (EWMA) used to estimate
+        # spot instance availability.
+        self.EWMA_ALPHA = 0.001
+
+        # Initial belief about spot availability before observing data.
+        self.PRIOR_SPOT_AVAILABILITY = 0.5
+
+        # --- State ---
+        self.spot_availability_estimate = self.PRIOR_SPOT_AVAILABILITY
         
         return self
 
     def _step(self, last_cluster_type: ClusterType, has_spot: bool) -> ClusterType:
         """
-        Decision-making logic for each time step.
+        Called at each time step. Return which cluster type to use next.
         """
-        # 1. Update progress state
-        current_len = len(self.task_done_time)
-        if current_len > self.last_task_done_len:
-            # Aggregate newly completed work segments.
-            self.work_done_so_far += sum(self.task_done_time[self.last_task_done_len:])
-        
-        work_remaining = self.task_duration - self.work_done_so_far
+        # 1. Update our estimate of spot availability using EWMA.
+        current_spot_signal = 1.0 if has_spot else 0.0
+        self.spot_availability_estimate = (
+            (1 - self.EWMA_ALPHA) * self.spot_availability_estimate +
+            self.EWMA_ALPHA * current_spot_signal
+        )
 
-        # If the task is complete, do nothing.
-        if work_remaining <= 1e-9:
+        # 2. Calculate current job and time status.
+        work_done = self.get_task_done_time()
+        work_left = self.task_duration - work_done
+        
+        # If the job is finished, we don't need any resources.
+        if work_left <= 0:
             return ClusterType.NONE
 
-        # 2. Update risk estimators (preemption and availability) based on last step's outcome
-        # a) Preemption Rate Estimation
-        if last_cluster_type == ClusterType.SPOT:
-            work_was_done = (current_len > self.last_task_done_len)
-            is_preempted = 1.0 if not work_was_done else 0.0
-            self.ema_preemption_rate = (self.PREEMPTION_ALPHA * is_preempted + 
-                                       (1 - self.PREEMPTION_ALPHA) * self.ema_preemption_rate)
+        time_now = self.env.elapsed_seconds
+        time_to_deadline = self.deadline - time_now
         
-        # b) Availability Estimation
-        has_spot_int = 1.0 if has_spot else 0.0
-        self.ema_availability = (self.AVAILABILITY_ALPHA * has_spot_int +
-                                 (1 - self.AVAILABILITY_ALPHA) * self.ema_availability)
+        # Total time cost to finish the job on a reliable instance.
+        on_demand_time_needed = work_left + self.env.remaining_restart_overhead
         
-        # Update state for the next step
-        self.last_task_done_len = current_len
+        # Slack is the extra time we have before the deadline, assuming
+        # we run on on-demand instances from now until completion.
+        slack = time_to_deadline - on_demand_time_needed
 
-        # 3. Calculate the "point of no return"
-        time_to_deadline = self.deadline - self.env.elapsed_seconds
+        # 3. Apply the decision-making strategy.
 
-        # Use the estimated availability, with a floor to remain robust.
-        effective_availability = max(self.ema_availability, self.AVAILABILITY_FLOOR)
-        
-        # Estimate the total wall-clock time required to finish on SPOT, accounting for
-        # expected periods of unavailability.
-        expected_spot_runtime = work_remaining / effective_availability
-        
-        # From the expected runtime, estimate the number of future SPOT steps.
-        # Add epsilon to prevent division by zero.
-        num_expected_spot_steps = expected_spot_runtime / (self.env.gap_seconds + 1e-9)
-
-        # Estimate the total time that will be lost to restart overheads from future preemptions.
-        expected_preemption_overhead = (num_expected_spot_steps *
-                                        self.ema_preemption_rate *
-                                        self.restart_overhead)
-                                        
-        # Add a fixed buffer for the immediate risk of being preempted in the next step.
-        immediate_risk_buffer = self.IMMEDIATE_RISK_BUFFER_FACTOR * self.restart_overhead
-
-        # This is the total time we must have left to safely continue with the SPOT strategy.
-        critical_time_needed = (expected_spot_runtime + 
-                                expected_preemption_overhead + 
-                                immediate_risk_buffer)
-
-        # 4. Make the final decision
-        if time_to_deadline <= critical_time_needed:
-            # We are past the point of no return. The risk of using SPOT is too high.
-            # We must switch to the reliable ON_DEMAND to guarantee finishing on time.
+        # PANIC MODE: If slack is critically low, use ON_DEMAND to guarantee progress.
+        panic_threshold = self.PANIC_MULTIPLIER * self.restart_overhead
+        if slack <= panic_threshold:
             return ClusterType.ON_DEMAND
+
+        # NORMAL MODE: We have enough slack to tolerate at least one preemption.
+        if has_spot:
+            # Spot is available and cheaper. Since we are not in panic mode, use it.
+            return ClusterType.SPOT
         else:
-            # We have sufficient slack. We can afford to pursue the cheaper SPOT option.
-            if has_spot:
-                # Use SPOT if it's available.
-                return ClusterType.SPOT
-            else:
-                # Wait for SPOT to become available again.
+            # Spot is not available. Decide between waiting (NONE) or making progress (ON_DEMAND).
+            # The decision depends on an adaptive "wait threshold".
+            epsilon = 1e-6
+            wait_threshold = (
+                (self.BASE_WAIT_K * self.restart_overhead) / 
+                (self.spot_availability_estimate + epsilon)
+            )
+            
+            wait_threshold = max(wait_threshold, panic_threshold)
+
+            if slack > wait_threshold:
+                # Slack is high enough to justify waiting for a spot instance.
                 return ClusterType.NONE
+            else:
+                # Slack is getting low. Pay for on-demand to make guaranteed progress.
+                return ClusterType.ON_DEMAND
 
     @classmethod
-    def _from_args(cls, parser: argparse.ArgumentParser):
+    def _from_args(cls, parser):
         """
         Instantiates the strategy from command-line arguments.
         """
-        # This implementation does not use command-line arguments for hyperparameters,
-        # but this method is required by the evaluator.
         args, _ = parser.parse_known_args()
         return cls(args)

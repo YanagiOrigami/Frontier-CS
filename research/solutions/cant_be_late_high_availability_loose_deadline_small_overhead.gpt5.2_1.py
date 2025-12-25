@@ -1,5 +1,4 @@
-import json
-import os
+import math
 from typing import Any, Optional
 
 from sky_spot.strategies.strategy import Strategy
@@ -9,124 +8,174 @@ from sky_spot.utils import ClusterType
 class Solution(Strategy):
     NAME = "cant_be_late_v1"
 
-    def __init__(self, args: Any):
-        super().__init__(args)
-        self._committed_od = False
-        self._seen_steps = 0
-        self._spot_steps = 0
+    def __init__(self, args: Optional[Any] = None):
+        try:
+            super().__init__(args)
+        except TypeError:
+            try:
+                super().__init__()
+            except Exception:
+                pass
+
+        self._initialized = False
+        self._commit_od = False
+
         self._spot_ema = 0.65
         self._ema_alpha = 0.06
-        self._base_safety_seconds = 2.0 * 3600.0
-        self._max_safety_seconds = 4.0 * 3600.0
-        self._min_safety_seconds = 0.5 * 3600.0
-        self._spec_overrides_applied = False
+
+        self._current_outage_s = 0.0
+        self._max_outage_s = 0.0
+
+        self._last_choice: Optional[ClusterType] = None
+
+        self._min_outage_buffer_s = 2.0 * 3600.0
+        self._pause_hysteresis_s = 1.0 * 3600.0
 
     def solve(self, spec_path: str) -> "Solution":
-        if spec_path and os.path.exists(spec_path):
-            cfg = None
-            try:
-                with open(spec_path, "r", encoding="utf-8") as f:
-                    cfg = json.load(f)
-            except Exception:
-                cfg = None
-            if cfg is None:
-                try:
-                    import yaml  # type: ignore
-
-                    with open(spec_path, "r", encoding="utf-8") as f:
-                        cfg = yaml.safe_load(f)
-                except Exception:
-                    cfg = None
-
-            if isinstance(cfg, dict):
-                safety_hours = cfg.get("safety_margin_hours", None)
-                if isinstance(safety_hours, (int, float)) and safety_hours > 0:
-                    self._base_safety_seconds = float(safety_hours) * 3600.0
-
-                ema_alpha = cfg.get("spot_ema_alpha", None)
-                if isinstance(ema_alpha, (int, float)) and 0 < float(ema_alpha) <= 1:
-                    self._ema_alpha = float(ema_alpha)
-
-                min_safety_hours = cfg.get("min_safety_hours", None)
-                if isinstance(min_safety_hours, (int, float)) and float(min_safety_hours) >= 0:
-                    self._min_safety_seconds = float(min_safety_hours) * 3600.0
-
-                max_safety_hours = cfg.get("max_safety_hours", None)
-                if isinstance(max_safety_hours, (int, float)) and float(max_safety_hours) > 0:
-                    self._max_safety_seconds = float(max_safety_hours) * 3600.0
-
-        self._spec_overrides_applied = True
+        self._initialized = True
         return self
 
+    @staticmethod
+    def _safe_float(x: Any, default: float = 0.0) -> float:
+        try:
+            if x is None:
+                return default
+            v = float(x)
+            if math.isnan(v) or math.isinf(v):
+                return default
+            return v
+        except Exception:
+            return default
+
     def _work_done_seconds(self) -> float:
+        # Best-effort extraction from task_done_time, with multiple possible encodings.
         tdt = getattr(self, "task_done_time", None)
         if tdt is None:
+            for attr in ("task_progress", "progress_seconds", "completed_seconds"):
+                if hasattr(self, attr):
+                    return max(0.0, self._safe_float(getattr(self, attr), 0.0))
             return 0.0
+
         if isinstance(tdt, (int, float)):
-            return float(tdt)
-        if isinstance(tdt, (list, tuple)):
-            total = 0.0
-            for x in tdt:
-                if isinstance(x, (int, float)):
-                    total += float(x)
-                elif isinstance(x, (list, tuple)) and x:
-                    v = x[-1]
-                    if isinstance(v, (int, float)):
-                        total += float(v)
-            return total
-        return 0.0
+            return max(0.0, self._safe_float(tdt, 0.0))
 
-    def _safety_seconds(self, remaining_work: float, gap_seconds: float, restart_overhead: float) -> float:
-        p = max(0.05, min(0.95, float(self._spot_ema)))
-        if p >= 0.75:
-            base = min(self._base_safety_seconds, 1.25 * 3600.0)
-        elif p >= 0.60:
-            base = min(self._base_safety_seconds, 1.75 * 3600.0)
-        else:
-            base = max(self._base_safety_seconds, 2.25 * 3600.0)
+        if not isinstance(tdt, (list, tuple)):
+            return 0.0
 
-        extra = 0.02 * remaining_work
-        extra = min(extra, 1.25 * 3600.0)
+        if len(tdt) == 0:
+            return 0.0
 
-        overhead_buffer = max(0.0, 10.0 * float(restart_overhead))
-        step_buffer = 2.0 * float(gap_seconds)
+        # If looks like monotonic timestamps of cumulative work done.
+        try:
+            if all(isinstance(x, (int, float)) for x in tdt):
+                vals = [self._safe_float(x, 0.0) for x in tdt]
+                # If non-decreasing and within plausible bounds, take last as cumulative.
+                nondecreasing = all(vals[i] <= vals[i + 1] + 1e-9 for i in range(len(vals) - 1))
+                if nondecreasing:
+                    last = vals[-1]
+                    # Heuristic: if last doesn't exceed task_duration too much, treat as cumulative.
+                    td = self._safe_float(getattr(self, "task_duration", 0.0), 0.0)
+                    if td <= 0 or last <= td * 1.2 + 1e-6:
+                        return max(0.0, last)
+                # Else treat as per-step segments; sum.
+                return max(0.0, sum(max(0.0, v) for v in vals))
+        except Exception:
+            pass
 
-        safety = base + extra + overhead_buffer + step_buffer
-        safety = max(self._min_safety_seconds, min(self._max_safety_seconds, safety))
-        return safety
+        done = 0.0
+        for seg in tdt:
+            if isinstance(seg, (int, float)):
+                done += max(0.0, self._safe_float(seg, 0.0))
+            elif isinstance(seg, (list, tuple)) and len(seg) >= 2:
+                a = self._safe_float(seg[0], 0.0)
+                b = self._safe_float(seg[1], 0.0)
+                if b >= a:
+                    done += (b - a)
+                else:
+                    done += max(0.0, a - b)
+        return max(0.0, done)
 
     def _step(self, last_cluster_type: ClusterType, has_spot: bool) -> ClusterType:
-        self._seen_steps += 1
+        env = getattr(self, "env", None)
+        elapsed = self._safe_float(getattr(env, "elapsed_seconds", 0.0), 0.0)
+        gap = self._safe_float(getattr(env, "gap_seconds", 60.0), 60.0)
+        deadline = self._safe_float(getattr(self, "deadline", 0.0), 0.0)
+        task_duration = self._safe_float(getattr(self, "task_duration", 0.0), 0.0)
+        restart_overhead = self._safe_float(getattr(self, "restart_overhead", 0.0), 0.0)
+
+        if not self._initialized:
+            self._initialized = True
+            self._last_choice = last_cluster_type
+
+        # Update spot availability stats
         if has_spot:
-            self._spot_steps += 1
+            self._current_outage_s = 0.0
+        else:
+            self._current_outage_s += max(0.0, gap)
+            if self._current_outage_s > self._max_outage_s:
+                self._max_outage_s = self._current_outage_s
+
         x = 1.0 if has_spot else 0.0
-        self._spot_ema = (1.0 - self._ema_alpha) * self._spot_ema + self._ema_alpha * x
+        self._spot_ema = self._ema_alpha * x + (1.0 - self._ema_alpha) * self._spot_ema
+        self._spot_ema = min(0.99, max(0.01, self._spot_ema))
 
-        elapsed = float(getattr(self.env, "elapsed_seconds", 0.0))
-        gap = float(getattr(self.env, "gap_seconds", 0.0))
-        deadline = float(getattr(self, "deadline", 0.0))
-        task_duration = float(getattr(self, "task_duration", 0.0))
-        restart_overhead = float(getattr(self, "restart_overhead", 0.0))
+        done = self._work_done_seconds()
+        remaining_work = max(0.0, task_duration - done)
 
-        work_done = self._work_done_seconds()
-        remaining_work = max(0.0, task_duration - work_done)
-        if remaining_work <= 0.0:
+        if remaining_work <= 1e-9:
+            self._last_choice = ClusterType.NONE
             return ClusterType.NONE
 
-        remaining_time = deadline - elapsed
-        if remaining_time <= 0.0:
-            return ClusterType.NONE
+        time_left = deadline - elapsed
+        if time_left <= 0.0:
+            self._commit_od = True
+            self._last_choice = ClusterType.ON_DEMAND
+            return ClusterType.ON_DEMAND
 
-        safety = self._safety_seconds(remaining_work=remaining_work, gap_seconds=gap, restart_overhead=restart_overhead)
-        slack = remaining_time - remaining_work
+        slack = time_left - remaining_work
 
-        if self._committed_od or slack <= safety or remaining_time <= remaining_work + (2.0 * gap):
-            self._committed_od = True
+        min_outage_buf = self._min_outage_buffer_s
+        learned_outage_buf = max(min_outage_buf, 1.2 * self._max_outage_s)
+
+        # Extra risk buffer inversely proportional to observed spot availability.
+        extra_risk_buf = (1.0 - self._spot_ema) * 3.0 * 3600.0
+
+        risk_buf = learned_outage_buf + extra_risk_buf
+        # Account for one likely restart and decision granularity.
+        switch_to_od_buf = risk_buf + 2.0 * restart_overhead + 2.0 * gap
+        wait_buf = risk_buf + 1.0 * restart_overhead + 2.0 * gap
+        must_finish_buf = 1.0 * restart_overhead + 2.0 * gap
+
+        if time_left <= remaining_work + must_finish_buf:
+            self._commit_od = True
+
+        if self._commit_od:
+            self._last_choice = ClusterType.ON_DEMAND
             return ClusterType.ON_DEMAND
 
         if has_spot:
+            if slack <= switch_to_od_buf:
+                self._commit_od = True
+                self._last_choice = ClusterType.ON_DEMAND
+                return ClusterType.ON_DEMAND
+            self._last_choice = ClusterType.SPOT
             return ClusterType.SPOT
-        return ClusterType.NONE
+
+        # No spot available: either pause or run on-demand based on slack.
+        # Add hysteresis to avoid toggling OD <-> NONE.
+        if self._last_choice == ClusterType.ON_DEMAND:
+            if slack > wait_buf + self._pause_hysteresis_s:
+                self._last_choice = ClusterType.NONE
+                return ClusterType.NONE
+            self._last_choice = ClusterType.ON_DEMAND
+            return ClusterType.ON_DEMAND
+
+        if slack > wait_buf:
+            self._last_choice = ClusterType.NONE
+            return ClusterType.NONE
+
+        self._last_choice = ClusterType.ON_DEMAND
+        return ClusterType.ON_DEMAND
 
     @classmethod
     def _from_args(cls, parser):

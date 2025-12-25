@@ -2,66 +2,57 @@ from sky_spot.strategies.strategy import Strategy
 from sky_spot.utils import ClusterType
 
 class Solution(Strategy):
-    NAME = "cant_be_late_robust"
+    NAME = "CantBeLateStrategy"
 
     def solve(self, spec_path: str) -> "Solution":
-        """
-        Initialize strategy.
-        """
         return self
 
     def _step(self, last_cluster_type: ClusterType, has_spot: bool) -> ClusterType:
-        """
-        Decide the cluster type for the next time step.
-        """
-        # Retrieve environment state
+        # Access environment and task parameters
         elapsed = self.env.elapsed_seconds
         gap = self.env.gap_seconds
         deadline = self.deadline
         overhead = self.restart_overhead
         
-        # Calculate remaining work
+        # Calculate progress
         work_done = sum(self.task_done_time)
         work_remaining = self.task_duration - work_done
         
-        # If work is finished, do nothing
-        if work_remaining <= 0:
+        # Check if task is complete
+        if work_remaining <= 1e-6:
             return ClusterType.NONE
-            
-        # Calculate time remaining until deadline
+
         time_remaining = deadline - elapsed
         
-        # Determine strict safety threshold.
-        # We must finish the task before the deadline. 
-        # The most reliable way is On-Demand (OD).
-        # We calculate the latest possible moment we must be on OD to guarantee completion.
-        # We account for:
-        # 1. Remaining work duration
-        # 2. Restart overhead (in case we need to switch/boot OD)
-        # 3. Safety buffer (multiple of gap) to handle discrete time steps and margin of error
+        # Safety buffer: ensure we have at least 2 steps of margin
+        # before the absolute latest start time for On-Demand.
+        safety_buffer = 2.0 * gap
         
-        # If we skip OD this step (return SPOT or NONE), we consume 'gap' seconds.
-        # We must ensure that at (elapsed + gap), we still have enough time to finish using OD.
-        # Required time on OD = work_remaining + restart_overhead
-        # We add a buffer of 3 * gap for robustness.
+        # Calculate the threshold time where we MUST be on On-Demand to guarantee completion.
+        # Logic: To finish on OD, we need `work_remaining` time.
+        # If we are not currently on OD (or if we switch), we incur `overhead`.
+        # We use `work_remaining + overhead` as the threshold for all states to prevent flapping:
+        # - If on Spot/None: We must switch to OD if time < work + overhead.
+        # - If on OD: We should not switch to Spot if time < work + overhead, because if Spot 
+        #   fails immediately, we would need to pay overhead to return to OD, which we can't afford.
+        safe_threshold = work_remaining + overhead + safety_buffer
         
-        safety_buffer = 3.0 * gap
-        required_time_on_od = work_remaining + overhead + safety_buffer
-        
-        # Check if we are approaching the point of no return
-        # If remaining time at the NEXT step is too close to required time, force OD now.
-        if (time_remaining - gap) < required_time_on_od:
+        # Panic Logic: If time is running out, use reliable On-Demand
+        if time_remaining <= safe_threshold:
             return ClusterType.ON_DEMAND
             
-        # If we are safely within the deadline slack:
-        # Prioritize cost savings.
+        # Strategy Logic: If safe, minimize cost
         if has_spot:
-            # Spot is available and we have time to risk preemption/overheads
+            # Optimization: If currently on OD, avoid switching to Spot if remaining work 
+            # is too small to justify the overhead cost/risk.
+            # Heuristic: If work_remaining is very small compared to overhead, staying on OD is better.
+            if last_cluster_type == ClusterType.ON_DEMAND and work_remaining < 0.5 * overhead:
+                return ClusterType.ON_DEMAND
+                
             return ClusterType.SPOT
-        else:
-            # Spot is unavailable, but we have plenty of slack.
-            # Pause (NONE) to save money rather than burning expensive OD budget needlessly.
-            return ClusterType.NONE
+        
+        # If no Spot available and we have slack, wait (NONE) to save money
+        return ClusterType.NONE
 
     @classmethod
     def _from_args(cls, parser):

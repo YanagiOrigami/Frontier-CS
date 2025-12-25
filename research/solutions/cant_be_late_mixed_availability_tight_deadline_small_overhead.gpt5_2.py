@@ -1,78 +1,74 @@
-from typing import Optional
 from sky_spot.strategies.strategy import Strategy
 from sky_spot.utils import ClusterType
 
 
 class Solution(Strategy):
-    NAME = "jit_od_fallback_solution"
+    NAME = "safety_fallback_wait_v1"
 
     def __init__(self, args=None):
         super().__init__(args)
-        self.commit_to_od: bool = False
-        self._last_reset_marker: Optional[int] = None
+        self._fallback_active = False
 
     def solve(self, spec_path: str) -> "Solution":
         return self
 
-    def _sum_done(self) -> float:
+    def _remaining_work(self) -> float:
         try:
-            return float(sum(self.task_done_time))
+            done = float(sum(self.task_done_time))
         except Exception:
-            return 0.0
-
-    def _reset_check(self):
-        # Reset state at the start of each new episode/run
-        # Detect new run by checking if elapsed_seconds is 0 or decreasing (environment reset)
-        if self._last_reset_marker is None or self.env.elapsed_seconds < (self._last_reset_marker or 0) or self.env.elapsed_seconds <= 0:
-            self.commit_to_od = False
-        self._last_reset_marker = self.env.elapsed_seconds
+            done = 0.0
+            for seg in self.task_done_time or []:
+                try:
+                    done += float(seg)
+                except Exception:
+                    try:
+                        done += float(seg[1]) - float(seg[0])
+                    except Exception:
+                        pass
+        remaining = self.task_duration - done
+        if remaining < 0.0:
+            remaining = 0.0
+        return remaining
 
     def _step(self, last_cluster_type: ClusterType, has_spot: bool) -> ClusterType:
-        self._reset_check()
+        # If we've already committed to on-demand fallback, keep it to avoid extra overhead/risk
+        if self._fallback_active:
+            return ClusterType.ON_DEMAND
 
-        # If we are already on OD, commit to stay on OD to avoid unnecessary switches.
-        if self.env.cluster_type == ClusterType.ON_DEMAND:
-            self.commit_to_od = True
-
-        remaining = max(0.0, self.task_duration - self._sum_done())
+        # Compute remaining work and slack
+        remaining = self._remaining_work()
         if remaining <= 0.0:
             return ClusterType.NONE
 
-        if self.commit_to_od:
+        slack = self.deadline - self.env.elapsed_seconds
+        gap = max(float(self.env.gap_seconds), 0.0)
+        # Safety buffer to account for discretization and timing uncertainties
+        safety_buffer = max(0.5 * gap, 1.0)
+        # Use worst-case overhead when switching to OD
+        od_overhead = float(self.restart_overhead)
+
+        # Determine if we must switch to On-Demand now to guarantee finish
+        must_switch_to_od_now = slack <= (remaining + od_overhead + safety_buffer)
+
+        # Decision rules:
+        # 1) If we must switch to OD now, do it and lock in OD until completion.
+        if must_switch_to_od_now:
+            self._fallback_active = True
             return ClusterType.ON_DEMAND
 
-        t = float(self.env.elapsed_seconds)
-        g = float(self.env.gap_seconds)
-        d = float(self.deadline)
-        overhead = float(self.restart_overhead)
-
-        # Latest safe time to start OD to finish on time (including restart overhead)
-        latest_start_od = d - (remaining + overhead)
-
-        # Small safety margin to avoid off-by-one timestep rounding issues
-        fudge = min(max(g * 0.5, 0.0), 30.0)
-
-        # If we're at or past the latest time to safely switch (with margin), switch to OD now.
-        if t + fudge >= latest_start_od:
-            self.commit_to_od = True
-            return ClusterType.ON_DEMAND
-
-        # Spot unavailable: wait if still safe; otherwise switch to OD
-        if not has_spot:
-            if t + g + fudge <= latest_start_od:
-                return ClusterType.NONE
-            else:
-                self.commit_to_od = True
-                return ClusterType.ON_DEMAND
-
-        # Spot is available:
-        # Use spot if we can safely wait one more step and still be able to fall back to OD next step.
-        if t + g + fudge <= latest_start_od:
+        # 2) If spot is available and we are safe, use spot.
+        if has_spot:
             return ClusterType.SPOT
-        else:
-            # Not safe to rely on spot for another step; switch to OD now.
-            self.commit_to_od = True
-            return ClusterType.ON_DEMAND
+
+        # 3) Spot not available: can we afford to wait this step?
+        # Safe to wait if after one gap of waiting we still have enough time for OD completion.
+        can_wait = (slack - gap) > (remaining + od_overhead + safety_buffer)
+        if can_wait:
+            return ClusterType.NONE
+
+        # Otherwise, switch to OD now and lock it
+        self._fallback_active = True
+        return ClusterType.ON_DEMAND
 
     @classmethod
     def _from_args(cls, parser):

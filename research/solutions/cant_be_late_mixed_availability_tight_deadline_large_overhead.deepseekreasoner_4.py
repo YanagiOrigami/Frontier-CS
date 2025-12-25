@@ -1,143 +1,100 @@
-import argparse
-import math
-from enum import Enum
-from typing import List, Tuple
-
-class ClusterType(Enum):
-    SPOT = "SPOT"
-    ON_DEMAND = "ON_DEMAND"
-    NONE = "NONE"
-
-class Strategy:
-    pass
+import numpy as np
+from sky_spot.strategies.strategy import Strategy
+from sky_spot.utils import ClusterType
 
 class Solution(Strategy):
-    NAME = "my_solution"
+    NAME = "adaptive_threshold"
     
-    def __init__(self, args=None):
-        super().__init__()
-        self.args = args
-        self.task_duration = None
-        self.deadline = None
-        self.restart_overhead = None
-        self.env = None
-        self.task_done_time = None
-        
-        # Internal state
-        self.work_remaining = 0.0
-        self.time_remaining = 0.0
-        self.last_spot_work_time = 0.0
-        self.spot_available_history = []
-        self.consecutive_spot_available = 0
-        self.consecutive_spot_unavailable = 0
-        self.last_action = None
-        self.restart_pending = 0.0
-        
     def solve(self, spec_path: str) -> "Solution":
-        # Read configuration if needed
-        # For now, just return self
+        # Initialize adaptive thresholds and state tracking
+        self.spot_price = 0.97  # $/hr
+        self.ondemand_price = 3.06  # $/hr
+        self.price_ratio = self.spot_price / self.ondemand_price
+        
+        # Adaptive parameters
+        self.min_spot_confidence = 0.6  # Minimum confidence to use spot
+        self.spot_streak_threshold = 5  # Consecutive spot availability to lower threshold
+        self.emergency_threshold = 0.9  # When to panic and use on-demand
+        
+        # State tracking
+        self.spot_streak = 0
+        self.work_remaining = self.task_duration
+        self.critical_time = None
+        
         return self
     
     def _step(self, last_cluster_type: ClusterType, has_spot: bool) -> ClusterType:
-        # Update internal state from environment
-        current_time = self.env.elapsed_seconds
-        time_step = self.env.gap_seconds
+        # Update work remaining
+        if last_cluster_type != ClusterType.NONE:
+            work_done = self.env.gap_seconds
+            self.work_remaining = max(0, self.work_remaining - work_done)
         
-        # Track spot availability history
-        self.spot_available_history.append(1 if has_spot else 0)
-        if len(self.spot_available_history) > 100:
-            self.spot_available_history.pop(0)
-            
-        # Update consecutive counters
-        if has_spot:
-            self.consecutive_spot_available += 1
-            self.consecutive_spot_unavailable = 0
-        else:
-            self.consecutive_spot_unavailable += 1
-            self.consecutive_spot_available = 0
-        
-        # Calculate work remaining
-        total_done = 0.0
-        for start, end in self.task_done_time:
-            total_done += end - start
-        self.work_remaining = self.task_duration - total_done
-        
-        # Calculate time remaining
-        self.time_remaining = self.deadline - current_time
-        
-        # Update restart pending counter
-        if last_cluster_type == ClusterType.SPOT:
-            if self.restart_pending > 0:
-                self.restart_pending -= time_step
-                if self.restart_pending < 0:
-                    self.restart_pending = 0
-        else:
-            # Reset restart counter when not using spot
-            self.restart_pending = 0
-        
-        # Emergency mode: switch to on-demand if we're running out of time
-        safety_margin = self.restart_overhead * 2.0  # 24 minutes buffer
-        time_needed_for_remaining_work = self.work_remaining
-        
-        # If we're in restart overhead, add that time
-        if self.restart_pending > 0:
-            time_needed_for_remaining_work += self.restart_pending
-            
-        if self.time_remaining - time_needed_for_remaining_work < safety_margin:
-            # We're getting too close to deadline, use on-demand
-            if self.work_remaining > 0:
-                return ClusterType.ON_DEMAND
-            else:
-                return ClusterType.NONE
-        
-        # Early completion check
+        # Check if we're done
         if self.work_remaining <= 0:
             return ClusterType.NONE
-            
-        # Check if we should wait due to restart overhead
-        if self.restart_pending > 0:
-            # If restart overhead is small compared to time remaining, wait
-            if self.restart_pending < time_step * 2:
-                return ClusterType.NONE
-            # Otherwise switch to on-demand to avoid waiting too long
+        
+        # Calculate time pressure
+        time_elapsed = self.env.elapsed_seconds
+        time_left = self.deadline - time_elapsed
+        
+        # Calculate remaining work including potential overhead
+        effective_work = self.work_remaining
+        
+        # If we need to restart, add overhead (worst case)
+        if last_cluster_type == ClusterType.NONE:
+            effective_work += self.restart_overhead
+        
+        # Calculate minimum time needed (if using only on-demand)
+        min_time_needed = effective_work
+        
+        # Time pressure ratio: how tight is our schedule
+        time_pressure = min_time_needed / time_left if time_left > 0 else float('inf')
+        
+        # Update spot streak counter
+        if has_spot:
+            self.spot_streak = min(self.spot_streak + 1, self.spot_streak_threshold * 2)
+        else:
+            self.spot_streak = max(self.spot_streak - 2, 0)
+        
+        # Adaptive confidence threshold based on streak and time pressure
+        base_confidence = self.min_spot_confidence
+        streak_bonus = min(self.spot_streak / self.spot_streak_threshold * 0.3, 0.3)
+        adaptive_confidence = base_confidence + streak_bonus
+        
+        # Emergency mode: if we're running out of time
+        if time_pressure > self.emergency_threshold:
+            # Critical time - must use on-demand to guarantee completion
+            if has_spot and time_pressure < 0.95:  # Slight buffer
+                return ClusterType.SPOT
             return ClusterType.ON_DEMAND
         
-        # Calculate spot reliability score
-        spot_reliability = 0.0
-        if len(self.spot_available_history) > 0:
-            spot_reliability = sum(self.spot_available_history) / len(self.spot_available_history)
-        
-        # Determine if we should use spot
+        # Strategic decision making
         if has_spot:
-            # Use spot if reliability is decent and we have time buffer
-            time_buffer_needed = self.restart_overhead * 2.0
+            # Calculate cost-benefit ratio
+            spot_benefit = self.ondemand_price - self.spot_price
             
-            # Calculate risk factor based on current progress
-            progress_ratio = 1.0 - (self.work_remaining / self.task_duration)
-            completion_ratio = 1.0 - (self.time_remaining / (self.deadline - 0))
+            # Adjust threshold based on time pressure
+            time_risk = min(time_pressure * 2, 1.0)  # Scale time pressure
+            required_confidence = adaptive_confidence * (1 + time_risk * 0.5)
             
-            # More conservative as we approach deadline
-            risk_tolerance = min(1.0, self.time_remaining / (self.deadline * 0.3))
+            # Estimate probability of successful spot usage
+            # Use streak as proxy for reliability
+            spot_reliability = min(self.spot_streak / 10, 0.9)
             
-            # Use spot if:
-            # 1. We have good spot availability recently
-            # 2. We have time buffer for potential restart
-            # 3. We're not too close to deadline
-            use_spot_threshold = 0.3 + 0.4 * risk_tolerance
-            
-            recent_reliability = spot_reliability
-            if self.consecutive_spot_available > 5:
-                recent_reliability = 1.0
-            
-            if (recent_reliability > use_spot_threshold and 
-                self.time_remaining - time_needed_for_remaining_work > time_buffer_needed and
-                self.consecutive_spot_unavailable < 3):
-                
-                # Mark that we're using spot, which may trigger restart overhead later
-                self.last_spot_work_time = current_time
+            # Expected value calculation
+            if spot_reliability > required_confidence:
                 return ClusterType.SPOT
         
-        # Default to on-demand
+        # Fallback strategies
+        if time_pressure > 0.7:
+            # Moderate time pressure - use on-demand
+            return ClusterType.ON_DEMAND
+        elif time_pressure < 0.3:
+            # Plenty of time - pause to save money if spot unavailable
+            if not has_spot:
+                return ClusterType.NONE
+        
+        # Default to on-demand for safety
         return ClusterType.ON_DEMAND
     
     @classmethod

@@ -2,33 +2,25 @@ from sky_spot.strategies.strategy import Strategy
 from sky_spot.utils import ClusterType
 
 class Solution(Strategy):
-    NAME = "my_solution"  # REQUIRED: unique identifier
+    NAME = "my_solution"
 
     def solve(self, spec_path: str) -> "Solution":
-        """
-        Optional initialization. Called once before evaluation.
-        Read spec_path for configuration if needed.
-        Must return self.
-        """
         return self
 
     def _step(self, last_cluster_type: ClusterType, has_spot: bool) -> ClusterType:
-        """
-        Called at each time step. Return which cluster type to use next.
-
-        Args:
-            last_cluster_type: The cluster type used in the previous step
-            has_spot: Whether spot instances are available this step
-
-        Returns:
-            ClusterType.SPOT, ClusterType.ON_DEMAND, or ClusterType.NONE
-        """
-        # Your decision logic here
+        total_done = sum(self.task_done_time)
+        remaining = max(0, self.task_duration - total_done)
+        time_left = self.deadline - self.env.elapsed_seconds
+        slack_left = time_left - remaining
+        if remaining == 0:
+            return ClusterType.NONE
+        if slack_left < 3600:
+            return ClusterType.ON_DEMAND
         if has_spot:
             return ClusterType.SPOT
         return ClusterType.ON_DEMAND
 
     @classmethod
-    def _from_args(cls, parser):  # REQUIRED: For evaluator instantiation
+    def _from_args(cls, parser):
         args, _ = parser.parse_known_args()
         return cls(args)

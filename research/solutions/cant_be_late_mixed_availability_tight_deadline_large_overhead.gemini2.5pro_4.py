@@ -1,95 +1,83 @@
 import argparse
+
 from sky_spot.strategies.strategy import Strategy
 from sky_spot.utils import ClusterType
 
+
 class Solution(Strategy):
-    NAME = "my_solution"
+    NAME = "slack_heuristic"
 
     def solve(self, spec_path: str) -> "Solution":
         """
-        Optional initialization. Called once before evaluation.
-        Read spec_path for configuration if needed.
-        Must return self.
+        Initializes strategy-specific parameters and state.
         """
-        # A simple, robust strategy is to define behavior based on the
-        # remaining "slack". Slack is the amount of time we can afford to
-        # waste (e.g., waiting for Spot) and still meet the deadline if we
-        # switch to a guaranteed On-Demand instance.
-        #
-        # slack = (time_to_deadline) - (work_remaining_on_on_demand)
-        #
-        # We define two thresholds for slack to create three operating modes:
-        # 1. Normal Mode (high slack): Prioritize cost. Use Spot if available,
-        #    otherwise wait (NONE).
-        # 2. Cautious Mode (low slack): Prioritize progress. Use Spot if
-        #    available, but use On-Demand if not. Don't wait.
-        # 3. Critical Mode (very low slack): Prioritize deadline. Use On-Demand
-        #    unconditionally to guarantee completion.
-        #
-        # Thresholds are tuned based on the restart_overhead, which is the
-        # primary penalty for using Spot.
-        # restart_overhead = 0.20 hours = 720 seconds.
-        # total_slack = 4 hours = 14400 seconds.
+        # When slack drops below this, use ON_DEMAND if SPOT is unavailable.
+        self.SLACK_BUFFER_SECONDS = 1.0 * 3600  # 1 hour
 
-        # Critical Threshold: set to 1.5x the overhead. If slack is less than
-        # this, a single preemption could cause us to miss the deadline.
-        # 1.5 * 720s = 1080s (18 minutes)
-        self.CRITICAL_SLACK_THRESHOLD = 1.5 * self.restart_overhead
+        # Extra slack required to switch from ON_DEMAND back to SPOT for hysteresis.
+        self.OD_TO_SPOT_HYSTERESIS_SECONDS = 1.0 * 3600  # 1 hour
 
-        # Cautious Threshold: set to 5x the overhead. This means we start
-        # being cautious when our slack drops to 3600s (1 hour), having
-        # used up ~75% of our initial slack.
-        self.CAUTIOUS_SLACK_THRESHOLD = 5.0 * self.restart_overhead
-
+        # State variable to lock into ON_DEMAND if deadline is imminent.
+        self.on_critical_path = False
         return self
 
     def _step(self, last_cluster_type: ClusterType, has_spot: bool) -> ClusterType:
         """
-        Called at each time step. Return which cluster type to use next.
-
-        Args:
-            last_cluster_type: The cluster type used in the previous step
-            has_spot: Whether spot instances are available this step
-
-        Returns:
-            ClusterType.SPOT, ClusterType.ON_DEMAND, or ClusterType.NONE
+        Makes a decision at each timestep based on a slack-based heuristic.
         """
-        # 1. Calculate current progress and remaining work.
         work_done = sum(end - start for start, end in self.task_done_time)
-        work_rem = self.task_duration - work_done
+        work_remaining = self.task_duration - work_done
 
-        # If the job is complete, do nothing to avoid unnecessary costs.
-        if work_rem <= 0:
+        if work_remaining <= 1e-9:
             return ClusterType.NONE
 
-        # 2. Calculate current slack.
-        # This is the key metric for our decision-making.
-        time_needed_on_demand = work_rem
-        time_until_deadline = self.deadline - self.env.elapsed_seconds
-        slack = time_until_deadline - time_needed_on_demand
+        elapsed_time = self.env.elapsed_seconds
+        time_left_to_deadline = self.deadline - elapsed_time
 
-        # 3. Apply the slack-based, three-mode policy.
+        # --- Critical Path Safety Net ---
+        # Calculate time needed to finish if we use On-Demand from this point.
+        time_needed_for_od_finish = work_remaining
+        if last_cluster_type != ClusterType.ON_DEMAND:
+            time_needed_for_od_finish += self.restart_overhead
 
-        # Critical Mode: Slack is dangerously low.
-        if slack < self.CRITICAL_SLACK_THRESHOLD:
+        # If time needed is >= time left, we must use On-Demand.
+        if time_needed_for_od_finish >= time_left_to_deadline:
+            self.on_critical_path = True
+        
+        # Once on the critical path, stay on On-Demand.
+        if self.on_critical_path:
             return ClusterType.ON_DEMAND
 
-        # Cautious Mode: Slack is low, prioritize making progress.
-        elif slack < self.CAUTIOUS_SLACK_THRESHOLD:
-            if has_spot:
+        # --- Main Heuristic Logic ---
+        current_slack = time_left_to_deadline - work_remaining
+
+        # Case A: We were on ON_DEMAND in the last step.
+        if last_cluster_type == ClusterType.ON_DEMAND:
+            if not has_spot:
+                return ClusterType.ON_DEMAND
+
+            # Spot is available. Check if it's worth switching back from stable OD.
+            od_to_spot_slack_threshold = self.SLACK_BUFFER_SECONDS + self.OD_TO_SPOT_HYSTERESIS_SECONDS
+            if current_slack > od_to_spot_slack_threshold:
                 return ClusterType.SPOT
             else:
                 return ClusterType.ON_DEMAND
-
-        # Normal Mode: Plenty of slack, prioritize saving cost.
-        else: # slack >= self.CAUTIOUS_SLACK_THRESHOLD
+        
+        # Case B: We were on SPOT or NONE in the last step.
+        else:
             if has_spot:
                 return ClusterType.SPOT
+            
+            # Spot is unavailable. Decide between waiting (NONE) or using ON_DEMAND.
+            if current_slack < self.SLACK_BUFFER_SECONDS:
+                return ClusterType.ON_DEMAND
             else:
                 return ClusterType.NONE
 
     @classmethod
-    def _from_args(cls, parser):
-        """REQUIRED: For evaluator instantiation"""
+    def _from_args(cls, parser: argparse.ArgumentParser):
+        """
+        Required factory method for evaluator instantiation.
+        """
         args, _ = parser.parse_known_args()
         return cls(args)

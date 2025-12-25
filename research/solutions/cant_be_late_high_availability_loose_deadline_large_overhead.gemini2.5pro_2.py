@@ -2,106 +2,76 @@ from sky_spot.strategies.strategy import Strategy
 from sky_spot.utils import ClusterType
 
 class Solution(Strategy):
-    """
-    This strategy uses a slack-based heuristic to decide which cluster type to use.
-    The core idea is to calculate the "slack" time, which is the amount of time
-    the job can afford to be idle or spend on restart overheads without missing
-    the deadline.
-
-    The strategy operates in three zones based on the current slack:
-
-    1. SAFE ZONE: If the slack is large, the strategy is patient and cost-conscious.
-       It uses Spot instances when available and waits (NONE) when they are not.
-
-    2. URGENT ZONE: If the slack is critically low, the strategy prioritizes meeting
-       the deadline above all else. It uses On-Demand instances to guarantee
-       progress, as it cannot afford the risk of a Spot preemption.
-
-    3. MIDDLE ZONE: Between the safe and urgent zones, the strategy balances cost
-       and risk. It uses Spot when available but switches to On-Demand if Spot
-       is unavailable, ensuring the job always makes progress.
-
-    The thresholds for these zones are calculated once in the `solve` method based
-    on the total initial slack and the restart overhead.
-    """
-    NAME = "slack_based_heuristic"
+    NAME = "my_solution"
 
     def solve(self, spec_path: str) -> "Solution":
         """
-        Initializes the strategy's parameters and thresholds before evaluation starts.
+        Optional initialization. Called once before evaluation.
+        Read spec_path for configuration if needed.
+        Must return self.
         """
-        # --- Tunable Parameters ---
-        # The multiplier for restart_overhead to define the urgent threshold.
-        # A value of 2.5 means we switch to mandatory On-Demand when we cannot
-        # afford to survive approximately 2.5 more preemptions.
-        self.urgent_preemption_buffer = 2.5
-
-        # The fraction of the initial slack that defines the safe zone.
-        # A value of 0.6 means we are in the "safe" zone as long as we have
-        # more than 60% of our initial slack remaining.
-        self.safe_slack_fraction = 0.6
-
-        # --- Threshold Calculation ---
-        self.initial_slack = self.deadline - self.task_duration
-
-        # URGENT_THRESHOLD: If slack drops below this, we must use On-Demand.
-        self.urgent_threshold = self.restart_overhead * self.urgent_preemption_buffer
-
-        # SAFE_THRESHOLD: If slack is above this, we can afford to wait for Spot.
-        self.safe_threshold = self.initial_slack * self.safe_slack_fraction
-
-        # Edge case: If the initial slack is very small, the urgent threshold might
-        # be larger than the safe threshold. This ensures a valid zone ordering.
-        if self.urgent_threshold >= self.safe_threshold:
-            self.safe_threshold = self.urgent_threshold * 1.01
-
+        self._cached_total_work_done = 0.0
+        self._cached_task_done_len = 0
         return self
+
+    def _get_total_work_done(self) -> float:
+        """
+        Calculates the total work done so far, using a cache to avoid
+        re-summing the entire list of completed work segments at every step.
+        """
+        if self._cached_task_done_len < len(self.task_done_time):
+            new_segments = self.task_done_time[self._cached_task_done_len:]
+            new_work = sum(end - start for start, end in new_segments)
+            self._cached_total_work_done += new_work
+            self._cached_task_done_len = len(self.task_done_time)
+        return self._cached_total_work_done
 
     def _step(self, last_cluster_type: ClusterType, has_spot: bool) -> ClusterType:
         """
-        Makes a decision at each time step based on the current job state.
+        Called at each time step. Return which cluster type to use next.
         """
-        work_done = self.get_work_done()
-        remaining_work = self.task_duration - work_done
-
-        # If the task is completed, do nothing to save cost.
-        if remaining_work <= 0:
+        total_work_done = self._get_total_work_done()
+        work_remaining = self.task_duration - total_work_done
+        
+        if work_remaining <= 0:
             return ClusterType.NONE
 
-        current_time = self.env.elapsed_seconds
-        time_to_deadline = self.deadline - current_time
+        time_to_deadline = self.deadline - self.env.elapsed_seconds
+        
+        effective_work_rem = work_remaining + self.env.restart_overhead_pending
+        
+        effective_slack = time_to_deadline - effective_work_rem
 
-        # If we are past the deadline, we have already failed. Stop incurring costs.
-        if time_to_deadline < 0:
-            return ClusterType.NONE
-
-        # Slack = (time left to deadline) - (time needed for remaining work)
-        slack = time_to_deadline - remaining_work
-
-        # --- Decision Logic based on Slack Zones ---
-
-        # 1. URGENT ZONE: Critically low slack.
-        if slack <= self.urgent_threshold:
+        # This is the Point of No Return (PNR) threshold. It represents the
+        # minimum slack required to survive a worst-case scenario (a spot
+        # preemption at the next step) and still be able to finish by the
+        # deadline using on-demand instances.
+        # The logic is:
+        # effective_slack >= required_buffer_for_preemption
+        # effective_slack >= (restart_overhead - current_pending_overhead + gap_seconds)
+        pnr_threshold = (self.restart_overhead -
+                         self.env.restart_overhead_pending +
+                         self.env.gap_seconds)
+        
+        if effective_slack < pnr_threshold:
+            # We are in the "critical zone". The slack is insufficient to absorb
+            # another preemption. We must use On-Demand to guarantee completion.
             return ClusterType.ON_DEMAND
-
-        # 2. SAFE ZONE: Ample slack.
-        if slack > self.safe_threshold:
-            if has_spot:
-                return ClusterType.SPOT
-            else:
-                return ClusterType.NONE
-
-        # 3. MIDDLE ZONE: Must make progress, but can risk Spot.
         else:
+            # We are in the "safe zone", with enough slack to tolerate at least
+            # one more preemption.
             if has_spot:
+                # Spot is available, so we use the cheaper option.
                 return ClusterType.SPOT
             else:
-                return ClusterType.ON_DEMAND
+                # Spot is not available. Since we have sufficient slack, we can
+                # afford to wait for it to become available again, saving costs.
+                return ClusterType.NONE
 
     @classmethod
     def _from_args(cls, parser):
         """
-        Required method for the evaluator to instantiate the class.
+        For evaluator instantiation.
         """
         args, _ = parser.parse_known_args()
         return cls(args)

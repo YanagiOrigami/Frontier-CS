@@ -2,61 +2,53 @@ from sky_spot.strategies.strategy import Strategy
 from sky_spot.utils import ClusterType
 
 class Solution(Strategy):
-    NAME = "AdaptiveThresholdStrategy"
+    NAME = "my_solution"
 
     def solve(self, spec_path: str) -> "Solution":
         return self
 
     def _step(self, last_cluster_type: ClusterType, has_spot: bool) -> ClusterType:
-        # Retrieve current state
         elapsed = self.env.elapsed_seconds
-        deadline = self.deadline
-        duration = self.task_duration
-        done_work = sum(self.task_done_time)
-        overhead = self.restart_overhead
         gap = self.env.gap_seconds
-
-        # Calculate remaining requirements
-        work_remaining = duration - done_work
-        time_remaining = deadline - elapsed
         
-        # Slack is the amount of time we can afford to waste (wait or restart)
-        # before we must run continuously to meet the deadline.
-        slack = time_remaining - work_remaining
-
-        # Safety Threshold:
-        # We must switch to On-Demand if slack gets dangerously low.
-        # We need enough buffer to cover the restart overhead (if we are currently
-        # paused or need to switch types) plus some margin for time step granularity.
-        # 3.0x overhead + 2.0x gap is a conservative safety margin.
-        safety_threshold = 3.0 * overhead + 2.0 * gap
-
-        # 1. Panic Logic:
-        # If slack is below the threshold, we risk missing the deadline.
-        # Switch to On-Demand immediately to guarantee progress.
-        if slack < safety_threshold:
-            return ClusterType.ON_DEMAND
-
-        # 2. Spot Availability Logic:
-        if has_spot:
-            # Hysteresis Check:
-            # If we are currently on On-Demand (likely due to previous low slack or
-            # lack of Spot), switching to Spot incurs a restart overhead.
-            # This overhead consumes slack. We should only switch if the remaining
-            # slack *after* the switch is still comfortably above the safety threshold.
-            if last_cluster_type == ClusterType.ON_DEMAND:
-                if slack > safety_threshold + overhead + gap:
-                    return ClusterType.SPOT
-                else:
-                    # Not enough buffer to pay the switch cost; stay safe on OD.
-                    return ClusterType.ON_DEMAND
+        # Calculate remaining work
+        # task_done_time is a list of segments completed
+        done = sum(self.task_done_time) if self.task_done_time else 0.0
+        remaining_work = self.task_duration - done
+        
+        if remaining_work <= 1e-6:
+            return ClusterType.NONE
             
-            # If we are not on OD (e.g., NONE or SPOT), and Spot is available, use it.
+        # Calculate time left until the hard deadline
+        time_left = self.deadline - elapsed
+        
+        # Calculate the time required if we commit to ON_DEMAND right now.
+        # If we are not currently on ON_DEMAND, we incur a restart overhead to switch/start it.
+        # Even if we are on SPOT, switching to ON_DEMAND is treated as a new instance.
+        switch_cost = 0.0
+        if last_cluster_type != ClusterType.ON_DEMAND:
+            switch_cost = self.restart_overhead
+            
+        needed_on_od = remaining_work + switch_cost
+        
+        # Slack is the buffer we have before we MUST run on ON_DEMAND to finish in time.
+        slack = time_left - needed_on_od
+        
+        # Determine a safety margin.
+        # We need to ensure that if we wait/use Spot this step, we can still switch to OD 
+        # in the next step (elapsed + gap) without violating the deadline.
+        # We use a robust buffer of 15 minutes or 3 time steps.
+        buffer = max(15 * 60, 3 * gap)
+        
+        # Critical Path: If slack is running out, we must switch to reliable ON_DEMAND.
+        if slack < buffer:
+            return ClusterType.ON_DEMAND
+            
+        # Cost Optimization: Use Spot if available.
+        if has_spot:
             return ClusterType.SPOT
-
-        # 3. Wait Logic:
-        # If Spot is unavailable but we have plenty of slack, it is cheaper to 
-        # wait (return NONE) than to burn money on On-Demand.
+            
+        # If Spot is unavailable but we have plenty of slack, wait (NONE) to save money.
         return ClusterType.NONE
 
     @classmethod

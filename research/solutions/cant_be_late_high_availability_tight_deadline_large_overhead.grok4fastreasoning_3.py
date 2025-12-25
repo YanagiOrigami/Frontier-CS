@@ -2,46 +2,55 @@ from sky_spot.strategies.strategy import Strategy
 from sky_spot.utils import ClusterType
 
 class Solution(Strategy):
-    NAME = "smart_scheduler"
+    NAME = "my_solution"  # REQUIRED: unique identifier
 
     def solve(self, spec_path: str) -> "Solution":
-        self.spot_count = 0
-        self.total_steps = 0
-        self.initial_p = 0.6
+        """
+        Optional initialization. Called once before evaluation.
+        Read spec_path for configuration if needed.
+        Must return self.
+        """
         return self
 
     def _step(self, last_cluster_type: ClusterType, has_spot: bool) -> ClusterType:
-        total_done = sum(self.task_done_time)
-        remaining_work = self.task_duration - total_done
-        time_left = self.deadline - self.env.elapsed_seconds
-        gap = self.env.gap_seconds
+        """
+        Called at each time step. Return which cluster type to use next.
 
-        self.total_steps += 1
+        Args:
+            last_cluster_type: The cluster type used in the previous step
+            has_spot: Whether spot instances are available this step
 
-        if remaining_work <= 0:
+        Returns:
+            ClusterType.SPOT, ClusterType.ON_DEMAND, or ClusterType.NONE
+        """
+        done = sum(self.task_done_time)
+        remaining_work = max(0, self.task_duration - done)
+        if remaining_work == 0:
             return ClusterType.NONE
-
+        elapsed = self.env.elapsed_seconds
+        remaining_time = self.deadline - elapsed
+        if remaining_time <= 0:
+            return ClusterType.NONE
+        gap = self.env.gap_seconds
+        buffer = self.restart_overhead
         if has_spot:
-            self.spot_count += 1
-            return ClusterType.SPOT
+            if last_cluster_type == ClusterType.ON_DEMAND:
+                if remaining_time >= remaining_work + buffer:
+                    return ClusterType.SPOT
+                else:
+                    return ClusterType.ON_DEMAND
+            else:
+                return ClusterType.SPOT
         else:
-            time_left_after = time_left - gap
-            if time_left_after <= 0:
+            if last_cluster_type == ClusterType.ON_DEMAND:
                 return ClusterType.ON_DEMAND
-
-            if self.total_steps == 1:
-                estimated_p = self.initial_p
             else:
-                estimated_p = self.spot_count / (self.total_steps - 1)
-
-            required_p = remaining_work / time_left_after if time_left_after > 0 else float('inf')
-
-            if estimated_p >= required_p:
-                return ClusterType.NONE
-            else:
-                return ClusterType.ON_DEMAND
+                if remaining_time - gap >= remaining_work + buffer:
+                    return ClusterType.NONE
+                else:
+                    return ClusterType.ON_DEMAND
 
     @classmethod
-    def _from_args(cls, parser):
+    def _from_args(cls, parser):  # REQUIRED: For evaluator instantiation
         args, _ = parser.parse_known_args()
         return cls(args)

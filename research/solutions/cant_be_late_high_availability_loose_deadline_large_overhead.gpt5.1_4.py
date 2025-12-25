@@ -1,133 +1,91 @@
-import math
 from sky_spot.strategies.strategy import Strategy
 from sky_spot.utils import ClusterType
 
 
 class Solution(Strategy):
-    NAME = "my_solution"
-
-    def __init__(self, args=None):
-        super().__init__(args)
-        self._committed_on_demand = False
-        self._safety_buffer_seconds = None
-        self._initialized_runtime = False
-        self._last_elapsed = None
+    NAME = "cant_be_late_smart_v1"
 
     def solve(self, spec_path: str) -> "Solution":
-        self.spec_path = spec_path
-        # Runtime-related fields will be initialized on first _step call
-        self._committed_on_demand = False
-        self._safety_buffer_seconds = None
-        self._initialized_runtime = False
-        self._last_elapsed = None
         return self
 
-    def _initialize_runtime(self):
-        # Called on first _step when env is available
-        # Choose a conservative safety buffer in seconds.
-        # Based on provided values: deadline slack 22h, restart_overhead ~0.2h.
-        # We keep at least ~4h margin plus multiple restart_overheads.
-        gap = getattr(self.env, "gap_seconds", 0.0) or 0.0
-        overhead = getattr(self, "restart_overhead", 0.0) or 0.0
-
-        base_margin = 4.0 * 3600.0  # 4 hours in seconds
-        overhead_based = 6.0 * overhead + 2.0 * gap
-        self._safety_buffer_seconds = max(base_margin, overhead_based)
-
-        self._committed_on_demand = False
-        self._initialized_runtime = True
-        self._last_elapsed = self.env.elapsed_seconds
-
-    def _compute_work_remaining(self) -> float:
-        # task_duration and task_done_time are in seconds
-        done = 0.0
-        if getattr(self, "task_done_time", None):
-            # Sum of completed work segments
-            done = float(sum(self.task_done_time))
-        remaining = float(self.task_duration) - done
-        if remaining < 0.0:
-            remaining = 0.0
-        return remaining
-
     def _step(self, last_cluster_type: ClusterType, has_spot: bool) -> ClusterType:
-        if not self._initialized_runtime:
-            self._initialize_runtime()
+        # Lazy initialization of internal state
+        if not hasattr(self, "_internal_state_initialized"):
+            self._internal_state_initialized = True
+            self.committed_to_od = False
+            self._last_seen_elapsed = -1.0
 
-        # Basic environment info
-        t = float(self.env.elapsed_seconds)
-        dt = float(self.env.gap_seconds)
+        elapsed = getattr(self.env, "elapsed_seconds", 0.0)
+
+        # Detect new run (elapsed time reset)
+        if elapsed < self._last_seen_elapsed:
+            self.committed_to_od = False
+        self._last_seen_elapsed = elapsed
+
+        duration = float(self.task_duration)
         deadline = float(self.deadline)
+        restart_overhead = float(self.restart_overhead)
+        gap = float(self.env.gap_seconds)
 
-        # Remaining required work (in seconds)
-        remaining_work = self._compute_work_remaining()
+        # Compute completed work
+        segments = getattr(self, "task_done_time", None)
+        if segments:
+            completed = float(sum(segments))
+        else:
+            completed = 0.0
 
-        # If work is fully done, no need to run more
-        if remaining_work <= 0.0:
+        remaining = max(duration - completed, 0.0)
+        if remaining <= 0.0:
+            # Task already finished
             return ClusterType.NONE
 
-        # Time until deadline
-        time_to_deadline = deadline - t
+        time_left = deadline - elapsed
+        total_slack = max(deadline - duration, 0.0)
 
-        # If already at/after deadline, just run OD to minimize additional delay
-        if time_to_deadline <= 0.0:
+        # Thresholds based on environment parameters
+        # How far behind ideal schedule we allow before using OD when no spot (seconds of work)
+        max_lag = 0.05 * total_slack
+        if max_lag < max(restart_overhead, gap):
+            max_lag = max(restart_overhead, gap)
+
+        # Slack threshold at which we fully commit to on-demand (seconds of wall time)
+        commit_slack = 0.1 * total_slack
+        min_commit_slack = 2.0 * restart_overhead + 2.0 * gap
+        if commit_slack < min_commit_slack:
+            commit_slack = min_commit_slack
+
+        slack_now = time_left - remaining
+
+        # Commit to full on-demand when slack becomes small
+        if not self.committed_to_od and slack_now <= commit_slack:
+            self.committed_to_od = True
+
+        if self.committed_to_od:
             return ClusterType.ON_DEMAND
 
-        # Slack in wall-clock time if we were to run remaining_work immediately
-        # on on-demand without further interruptions.
-        # slack_total = (deadline - current_time) - remaining_work
-        slack_total = time_to_deadline - remaining_work
+        # Ideal schedule: linear progress to finish exactly at deadline
+        if deadline > 0.0:
+            required_rate = duration / deadline
+        else:
+            required_rate = 1.0
 
-        # Initialize safety buffer if needed
-        if self._safety_buffer_seconds is None:
-            gap = dt
-            overhead = getattr(self, "restart_overhead", 0.0) or 0.0
-            base_margin = 4.0 * 3600.0
-            overhead_based = 6.0 * overhead + 2.0 * gap
-            self._safety_buffer_seconds = max(base_margin, overhead_based)
+        required_done = required_rate * elapsed
+        if required_done > duration:
+            required_done = duration
 
-        safety_buffer = self._safety_buffer_seconds
-        overhead = getattr(self, "restart_overhead", 0.0) or 0.0
-
-        # If, even now, pure on-demand from this moment cannot finish before
-        # deadline with safety buffer, we still choose ON_DEMAND to try to catch up.
-        # This situation should be rare; missing deadline is very penalized.
-        if slack_total <= 0.0:
-            self._committed_on_demand = True
-            return ClusterType.ON_DEMAND
-
-        # Decide whether to permanently commit to on-demand only.
-        if not self._committed_on_demand:
-            # If remaining slack is at or below safety_buffer, commit to OD.
-            if slack_total <= safety_buffer:
-                self._committed_on_demand = True
-
-        if self._committed_on_demand:
-            # Once committed, always use on-demand until task completion.
-            return ClusterType.ON_DEMAND
-
-        # We have ample slack left (slack_total > safety_buffer).
-        # Further restrict use of spot to times when we have enough extra slack
-        # beyond safety buffer to tolerate a worst-case immediate restart_overhead.
-        min_slack_for_spot = safety_buffer + overhead
-        if slack_total <= min_slack_for_spot:
-            # Too little slack to risk another spot interruption; switch to OD.
-            self._committed_on_demand = True
-            return ClusterType.ON_DEMAND
-
-        # We are still in the "flexible" region where spot is allowed.
+        # Positive lag = behind schedule (in seconds of work)
+        lag = required_done - completed
 
         if has_spot:
-            # Prefer cheap spot when available and safe.
+            # Prefer spot when available unless very close to needing full OD
+            if slack_now < 0.5 * commit_slack:
+                return ClusterType.ON_DEMAND
             return ClusterType.SPOT
 
-        # No spot available. Decide between waiting (NONE) and using expensive OD.
-        # If waiting this step (duration dt) would push slack down to/below
-        # safety_buffer, start on-demand instead.
-        if slack_total - dt <= safety_buffer:
-            # Not enough slack to afford waiting; use OD now.
+        # No spot available: decide between on-demand and idling
+        # Use on-demand if significantly behind or close enough to deadline that idling is risky
+        if lag > max_lag or slack_now <= 3.0 * commit_slack:
             return ClusterType.ON_DEMAND
-
-        # We can safely wait for spot without jeopardizing deadline.
         return ClusterType.NONE
 
     @classmethod

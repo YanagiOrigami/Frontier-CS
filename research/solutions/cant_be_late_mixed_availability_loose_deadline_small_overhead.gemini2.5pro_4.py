@@ -1,92 +1,99 @@
-import argparse
-
+import collections
 from sky_spot.strategies.strategy import Strategy
 from sky_spot.utils import ClusterType
 
+
 class Solution(Strategy):
-    NAME = "my_solution"
+    """
+    An adaptive strategy that makes decisions based on the remaining "slack".
+    Slack is the time buffer beyond the minimum time required to finish the
+    job using reliable on-demand instances.
+
+    The core logic is a three-tiered approach:
+    1. High Slack: Aggressively use Spot instances. If unavailable, wait (NONE)
+       to minimize cost, betting on Spot becoming available soon. This behavior
+       is modulated by recent spot availability history.
+    2. Medium Slack: Cautiously use Spot. If unavailable, switch to On-Demand to
+       ensure progress, as waiting becomes too risky.
+    3. Low Slack (Emergency): Exclusively use On-Demand to guarantee completion
+       before the deadline.
+    """
+    NAME = "adaptive_slack_strategy"
 
     def solve(self, spec_path: str) -> "Solution":
-        """
-        Optional initialization. Called once before evaluation.
-        Read spec_path for configuration if needed.
-        Must return self.
-        """
-        # Set hyperparameters from parsed arguments, with sane defaults.
-        # self.args is populated by the base Strategy class's __init__
-        self.max_expected_preemptions = getattr(self.args, 'max_preemptions', 150)
-        self.wait_slack_threshold_hours = getattr(self.args, 'wait_slack_hours', 11.0)
+        # --- Strategy Parameters ---
 
-        # Initialize state variables for the simulation.
-        self.last_completed_work = 0.0
-        self.last_tdt_len = 0
-        self.wait_slack_threshold_seconds = self.wait_slack_threshold_hours * 3600.0
+        # Safety buffer is slack we reserve for emergencies (e.g., preemptions).
+        # If current_slack falls below this, we switch to ON_DEMAND exclusively.
+        # It's dynamic: a fraction of remaining work + a constant minimum.
+        self.SAFETY_SLACK_FACTOR = 0.1
+        self.MIN_SAFETY_RESTARTS = 2.0
 
+        # When spot is unavailable, we decide whether to wait (NONE) or use ON_DEMAND.
+        # This threshold is based on slack, measured in hours.
+        self.WAIT_SLACK_BASE_H = 8.0
+        # If spot has been highly available recently, we are more willing to wait.
+        self.WAIT_SLACK_BONUS_H = 4.0
+        
+        # History tracking parameters to measure recent spot availability.
+        self.HISTORY_WINDOW = 120
+        self.HIGH_AVAIL_THRESHOLD = 0.8
+
+        # --- Internal State ---
+        self.spot_history = collections.deque(maxlen=self.HISTORY_WINDOW)
+        self.work_done_cache = {'time': -1, 'value': 0.0}
+        
         return self
 
+    def _get_work_done(self) -> float:
+        """Calculates and caches the total work completed to avoid re-summing."""
+        current_time = self.env.elapsed_seconds
+        if self.work_done_cache['time'] != current_time:
+            work_done = sum(end - start for start, end in self.task_done_time)
+            self.work_done_cache = {'time': current_time, 'value': work_done}
+        return self.work_done_cache['value']
+
     def _step(self, last_cluster_type: ClusterType, has_spot: bool) -> ClusterType:
-        """
-        Called at each time step. Return which cluster type to use next.
-
-        Args:
-            last_cluster_type: The cluster type used in the previous step
-            has_spot: Whether spot instances are available this step
-
-        Returns:
-            ClusterType.SPOT, ClusterType.ON_DEMAND, or ClusterType.NONE
-        """
-        # --- 1. Calculate current work progress efficiently ---
-        if len(self.task_done_time) > self.last_tdt_len:
-            new_segments = self.task_done_time[self.last_tdt_len:]
-            self.last_completed_work += sum(end - start for start, end in new_segments)
-            self.last_tdt_len = len(self.task_done_time)
-
-        completed_work = self.last_completed_work
-        work_remaining = max(0.0, self.task_duration - completed_work)
+        """Main decision logic for each time step."""
+        self.spot_history.append(1 if has_spot else 0)
         
-        if work_remaining <= 1e-6: # Using a small epsilon for float comparison
-            return ClusterType.NONE
+        work_done = self._get_work_done()
+        work_remaining = self.task_duration - work_done
 
-        # --- 2. Calculate time metrics ---
-        time_to_deadline = self.deadline - self.env.elapsed_seconds
+        if work_remaining <= 1e-9:
+            return ClusterType.NONE  # Job is finished
 
-        # --- 3. Define a dynamic safety buffer ---
-        if self.task_duration > 0:
-            work_progress_ratio = work_remaining / self.task_duration
-        else:
-            work_progress_ratio = 0.0
+        time_remaining_to_deadline = self.deadline - self.env.elapsed_seconds
+        current_slack = time_remaining_to_deadline - work_remaining
 
-        budgeted_preemptions = self.max_expected_preemptions * work_progress_ratio
-        safety_buffer = budgeted_preemptions * self.restart_overhead
-
-        # --- 4. Core Decision Logic ---
-        
-        # Criticality Check: Must we use On-Demand to guarantee completion?
-        time_needed_on_demand = work_remaining
-        if time_to_deadline <= time_needed_on_demand + safety_buffer:
+        # 1. Safety Check: If slack is critically low, use On-Demand.
+        safety_slack_threshold = (work_remaining * self.SAFETY_SLACK_FACTOR +
+                                  self.MIN_SAFETY_RESTARTS * self.restart_overhead)
+        if current_slack <= safety_slack_threshold:
             return ClusterType.ON_DEMAND
 
-        # Cost-Optimization: If not in a critical state, prioritize low cost.
+        # 2. Primary Choice: Use cheap Spot instances if available.
         if has_spot:
             return ClusterType.SPOT
+
+        # 3. Fallback: Spot is unavailable. Decide whether to wait or use On-Demand.
+        wait_slack_threshold_h = self.WAIT_SLACK_BASE_H
+        if len(self.spot_history) == self.HISTORY_WINDOW:
+            recent_availability = sum(self.spot_history) / self.HISTORY_WINDOW
+            if recent_availability >= self.HIGH_AVAIL_THRESHOLD:
+                # If spot has been reliable, we're willing to wait longer for it.
+                wait_slack_threshold_h += self.WAIT_SLACK_BONUS_H
+        
+        wait_slack_threshold_s = wait_slack_threshold_h * 3600.0
+
+        if current_slack > wait_slack_threshold_s:
+            # Plenty of slack, we can afford to wait for Spot.
+            return ClusterType.NONE
         else:
-            # Spot is unavailable. Decide whether to wait or use On-Demand.
-            current_slack = time_to_deadline - work_remaining
-            if current_slack < self.wait_slack_threshold_seconds:
-                return ClusterType.ON_DEMAND
-            else:
-                return ClusterType.NONE
+            # Slack is shrinking, we must make progress with On-Demand.
+            return ClusterType.ON_DEMAND
 
     @classmethod
-    def _from_args(cls, parser: argparse.ArgumentParser):
-        """
-        Add custom command-line arguments to the parser and instantiate the class.
-        """
-        parser.add_argument('--max-preemptions', type=int, default=150,
-                            help='Estimated maximum number of preemptions to budget for '
-                                 'in the safety buffer calculation.')
-        parser.add_argument('--wait-slack-hours', type=float, default=11.0,
-                            help='Slack threshold in hours. If Spot is unavailable and '
-                                 'current slack is below this, use On-Demand instead of waiting.')
+    def _from_args(cls, parser):
         args, _ = parser.parse_known_args()
         return cls(args)

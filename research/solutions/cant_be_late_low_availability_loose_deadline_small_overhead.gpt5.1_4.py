@@ -3,71 +3,76 @@ from sky_spot.utils import ClusterType
 
 
 class Solution(Strategy):
-    NAME = "cant_be_late_heuristic_v1"
-
-    def __init__(self, args):
-        super().__init__(args)
-        self._margin_seconds = None
-        self._cached_done_len = 0
-        self._cached_done_sum = 0.0
+    NAME = "cant_be_late_safe_threshold_v1"
 
     def solve(self, spec_path: str) -> "Solution":
+        # Optional initialization hook; spec_path can be used if needed.
+        # Initialize strategy state here.
+        self.force_on_demand = False
+        self.commit_time = None
+        self._safety_margin = None
         return self
 
-    def _compute_margin(self) -> float:
-        if self._margin_seconds is not None:
-            return self._margin_seconds
-
-        # Fallbacks in case attributes are not yet set (defensive)
+    def _initialize_policy_params(self):
+        # Ensure attributes exist with safe fallbacks.
+        deadline = getattr(self, "deadline", None)
+        task_duration = getattr(self, "task_duration", None)
         restart_overhead = float(getattr(self, "restart_overhead", 0.0))
-        gap_seconds = float(getattr(self.env, "gap_seconds", 0.0))
 
-        # Margin ensures we never "waste" more than one gap interval of slack
-        # beyond the restart overhead before committing to on-demand.
-        self._margin_seconds = max(0.0, restart_overhead + gap_seconds)
-        return self._margin_seconds
+        # If critical parameters are missing, fall back to safest behavior:
+        # always run on-demand.
+        if deadline is None or task_duration is None:
+            self.commit_time = 0.0
+            self._safety_margin = 0.0
+            return
 
-    def _remaining_work_seconds(self) -> float:
-        task_duration = float(getattr(self, "task_duration", 0.0))
-        done_list = getattr(self, "task_done_time", None)
+        gap = float(getattr(self.env, "gap_seconds", 0.0))
 
-        if not done_list:
-            done_sum = 0.0
-        else:
-            cur_len = len(done_list)
-            if cur_len != self._cached_done_len:
-                # Recompute sum only when new segments are added
-                done_sum = float(sum(done_list))
-                self._cached_done_len = cur_len
-                self._cached_done_sum = done_sum
-            else:
-                done_sum = self._cached_done_sum
+        # Safety margin to account for discretization and any model mismatch.
+        # Use:
+        #   - 2 * step size
+        #   - at least one restart_overhead
+        #   - at least 10 minutes
+        extra_safety = max(2.0 * gap, restart_overhead, 600.0)
 
-        remaining = task_duration - done_sum
-        if remaining < 0.0:
-            return 0.0
-        return remaining
+        # Worst-case planning: assume zero progress before commit_time.
+        # We require that, starting at commit_time, we can run a full job
+        # with one restart_overhead and still finish before the deadline.
+        commit_time = float(deadline) - float(task_duration) - restart_overhead - extra_safety
+
+        # If this is negative, we must commit to on-demand immediately.
+        if commit_time < 0.0:
+            commit_time = 0.0
+
+        self.commit_time = commit_time
+        self._safety_margin = extra_safety
 
     def _step(self, last_cluster_type: ClusterType, has_spot: bool) -> ClusterType:
-        margin = self._compute_margin()
-        remaining = self._remaining_work_seconds()
+        # Ensure state attributes exist even if solve() was not called.
+        if not hasattr(self, "force_on_demand"):
+            self.force_on_demand = False
+        if not hasattr(self, "commit_time"):
+            self.commit_time = None
 
-        # If job is already done (defensive), do nothing.
-        if remaining <= 0.0:
-            return ClusterType.NONE
+        # Lazy initialization once environment/task parameters are available.
+        if self.commit_time is None:
+            self._initialize_policy_params()
 
-        now = float(getattr(self.env, "elapsed_seconds", 0.0))
-        deadline = float(getattr(self, "deadline", 0.0))
+        # Current elapsed time.
+        current_time = float(getattr(self.env, "elapsed_seconds", 0.0))
 
-        slack = deadline - now - remaining
+        # Decide if we must irrevocably switch to on-demand to guarantee deadline.
+        if (not self.force_on_demand) and (current_time >= float(self.commit_time)):
+            self.force_on_demand = True
 
-        # If slack is small, commit to on-demand to guarantee completion.
-        if slack <= margin:
+        # Once committed, always use on-demand to avoid any further risk.
+        if self.force_on_demand:
             return ClusterType.ON_DEMAND
 
-        # Otherwise, use spot when available; pause when not, to save cost.
+        # Before commit time: use spot when available, else pause to save cost.
         if has_spot:
             return ClusterType.SPOT
+
         return ClusterType.NONE
 
     @classmethod

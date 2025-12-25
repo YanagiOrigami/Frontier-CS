@@ -1,157 +1,100 @@
 import argparse
-from collections import deque
-from typing import Deque, Optional, List, Tuple
-
-# Assuming these are provided by the evaluation environment's packages
-# In a real scenario, these would be `from sky_spot.strategies.strategy import Strategy`
-# and `from sky_spot.utils import ClusterType`. For standalone execution, we define placeholders.
-try:
-    from sky_spot.strategies.strategy import Strategy
-    from sky_spot.utils import ClusterType
-except ImportError:
-    # --- Placeholder classes for standalone testing ---
-    class ClusterType:
-        SPOT = "SPOT"
-        ON_DEMAND = "ON_DEMAND"
-        NONE = "NONE"
-
-    class Env:
-        def __init__(self):
-            self.elapsed_seconds = 0.0
-            self.gap_seconds = 60.0
-            self.cluster_type = ClusterType.NONE
-
-    class Strategy:
-        def __init__(self, args):
-            self.env = Env()
-            self.task_duration: float = 48 * 3600
-            self.task_done_time: List[Tuple[float, float]] = []
-            self.deadline: float = 52 * 3600
-            self.restart_overhead: float = 0.05 * 3600
-
-        def solve(self, spec_path: str) -> "Strategy":
-            raise NotImplementedError
-
-        def _step(self, last_cluster_type: str, has_spot: bool) -> str:
-            raise NotImplementedError
-
-        @classmethod
-        def _from_args(cls, parser: argparse.ArgumentParser):
-            raise NotImplementedError
-    # --- End of placeholder classes ---
+from sky_spot.strategies.strategy import Strategy
+from sky_spot.utils import ClusterType
 
 
 class Solution(Strategy):
-    """
-    This strategy uses a dynamic safety buffer based on recent spot availability
-    to decide when to switch from cost-effective Spot instances to reliable
-    On-Demand instances. The core idea is to calculate the 'slack' time: the
-    difference between the time remaining until the deadline and the time
-    required to finish the remaining work on an On-Demand instance.
-    If this slack falls below a dynamically calculated `safety_buffer`, the
-    strategy switches to On-Demand to guarantee progress. Otherwise, it
-    aggressively uses Spot instances when available to minimize cost, or waits
-    (NONE) if Spot is unavailable, conserving money while it has sufficient slack.
-    The `safety_buffer` adapts to observed spot availability over a rolling
-    window. If spot availability has been high, the buffer is small, allowing for
-    more risk-taking. If availability has been low, the buffer increases, making
-    the strategy more conservative.
-    """
-    NAME = "adaptive_buffer_strategy"
+    NAME = "my_solution"  # REQUIRED: unique identifier
+
+    def __init__(self, args):
+        super().__init__(args)
+        self._initialized = False
+        self.THRESHOLD_OD = 0.0
+        self.THRESHOLD_WAIT_FOR_SPOT = 0.0
 
     def solve(self, spec_path: str) -> "Solution":
-        # --- Hyperparameters ---
-        # Duration for the sliding window to calculate recent spot availability.
-        self.WINDOW_DURATION_S: float = 2 * 3600  # 2 hours
-
-        # Min/max safety buffer bounds, interpolated based on availability.
-        # MIN_BUFFER: Used when spot availability is 100%. A non-zero floor
-        # accounts for unexpected long outages. Set to 10x restart overhead.
-        self.MIN_BUFFER_S: float = 10 * (0.05 * 3600)  # 30 minutes
-
-        # MAX_BUFFER: Used when spot availability is 0%. Capped at a portion of
-        # the initial slack to ensure some attempt at using Spot is always made.
-        self.MAX_BUFFER_S: float = 2.5 * 3600  # 2.5 hours
-
-        # DEFAULT_BUFFER: Used at the beginning before enough data is collected.
-        self.DEFAULT_BUFFER_S: float = 1.5 * 3600  # 1.5 hours
-
-        # --- State Variables ---
-        self.spot_availability_history: Optional[Deque[int]] = None
-        self.history_sum: float = 0.0
-        self.window_size_steps: Optional[int] = None
-
+        """
+        Optional initialization. Called once before evaluation.
+        Read spec_path for configuration if needed.
+        Must return self.
+        """
         return self
 
-    def _get_work_done(self) -> float:
-        """Calculates the total work completed so far."""
-        if not self.task_done_time:
-            return 0.0
-        return sum(end - start for start, end in self.task_done_time)
+    def _initialize_constants(self):
+        """
+        Lazy initializer for strategy constants.
+        This is called on the first step to ensure environment attributes
+        like `self.deadline` are available.
+        """
+        self.THRESHOLD_OD = self.restart_overhead
+
+        initial_slack = self.deadline - self.task_duration
+        # Heuristic: Partition the initial slack. We are willing to "spend"
+        # half of it on waiting for spot instances (using NONE). The other half
+        # is reserved as a buffer for preemptions and mandatory on-demand usage.
+        self.THRESHOLD_WAIT_FOR_SPOT = initial_slack / 2.0
+
+        self._initialized = True
 
     def _step(self, last_cluster_type: ClusterType, has_spot: bool) -> ClusterType:
         """
-        Decision logic for each time step.
+        Called at each time step. Return which cluster type to use next.
+
+        Args:
+            last_cluster_type: The cluster type used in the previous step
+            has_spot: Whether spot instances are available this step
+
+        Returns:
+            ClusterType.SPOT, ClusterType.ON_DEMAND, or ClusterType.NONE
         """
-        # 1. Initialization on the first call to determine window size in steps.
-        if self.spot_availability_history is None:
-            if self.env.gap_seconds > 0:
-                self.window_size_steps = int(self.WINDOW_DURATION_S / self.env.gap_seconds)
-                # Ensure window size is at least 1 for the deque.
-                self.window_size_steps = max(1, self.window_size_steps)
-            else:
-                # Safeguard for an unlikely gap_seconds of 0.
-                self.window_size_steps = 1
-            self.spot_availability_history = deque(maxlen=self.window_size_steps)
+        if not self._initialized:
+            self._initialize_constants()
 
-        # 2. Update state with current spot availability using an O(1) running sum.
-        current_spot_status = 1 if has_spot else 0
-        if len(self.spot_availability_history) == self.window_size_steps:
-            self.history_sum -= self.spot_availability_history[0]
-        self.spot_availability_history.append(current_spot_status)
-        self.history_sum += current_spot_status
-
-        # 3. Calculate the adaptive safety buffer.
-        # Wait until we have a minimum amount of data to avoid noisy estimates.
-        min_history_len = max(1, self.window_size_steps / 10)
-        if len(self.spot_availability_history) < min_history_len:
-            safety_buffer = self.DEFAULT_BUFFER_S
+        # 1. Calculate remaining work.
+        if not self.task_done_time:
+            work_done = 0.0
         else:
-            avg_availability = self.history_sum / len(self.spot_availability_history)
-            # Linearly interpolate buffer based on unavailability (1 - avg_availability)
-            unavailability_factor = 1.0 - avg_availability
-            safety_buffer = self.MIN_BUFFER_S + (self.MAX_BUFFER_S - self.MIN_BUFFER_S) * unavailability_factor
+            work_done = sum(end - start for start, end in self.task_done_time)
 
-        # 4. Core decision logic based on slack.
-        work_done = self._get_work_done()
         work_rem = self.task_duration - work_done
 
-        # If the job is done, do nothing to save cost.
-        if work_rem <= 0:
+        # If the job is finished, do nothing to save costs.
+        if work_rem <= 1e-9:
             return ClusterType.NONE
 
-        time_now = self.env.elapsed_seconds
-        time_rem_until_deadline = self.deadline - time_now
+        # 2. Calculate the time cushion.
+        # The cushion represents the available slack if we were to complete the
+        # rest of the job using a guaranteed on-demand instance.
+        #   cushion = time_remaining_to_deadline - work_remaining_on_demand
+        time_available = self.deadline - self.env.elapsed_seconds
+        cushion = time_available - work_rem
 
-        # Slack is the extra time we have if we were to finish the rest of the
-        # job using only On-Demand instances from now on.
-        slack = time_rem_until_deadline - work_rem
+        # 3. Decision logic based on the cushion.
+        # The strategy uses two thresholds on the cushion to decide the action.
 
-        if slack < safety_buffer:
-            # Slack is below our safety threshold; we must be conservative.
-            # Use On-Demand to guarantee progress.
+        # If cushion is critically low (less than a potential restart overhead),
+        # we must use On-Demand to guarantee finishing on time. A single spot
+        # preemption at this stage would cause us to miss the deadline.
+        if cushion <= self.THRESHOLD_OD:
+            return ClusterType.ON_DEMAND
+
+        # If spot is available and we are not in the critical zone, always use it
+        # as it's the most cost-effective way to make progress.
+        if has_spot:
+            return ClusterType.SPOT
+
+        # If spot is not available, the choice is between ON_DEMAND (costly,
+        # but preserves cushion) and NONE (free, but spends cushion).
+        if cushion <= self.THRESHOLD_WAIT_FOR_SPOT:
+            # The cushion is getting low. We can't afford to wait for spot.
+            # Use On-Demand to make progress and preserve our remaining cushion.
             return ClusterType.ON_DEMAND
         else:
-            # We have enough slack; we can be aggressive to save cost.
-            if has_spot:
-                # Use cheap Spot instances when available.
-                return ClusterType.SPOT
-            else:
-                # Wait for Spot to become available again, since we have time.
-                return ClusterType.NONE
+            # We have a healthy cushion. We can afford to wait for cheaper
+            # spot instances to become available, saving costs by using NONE.
+            return ClusterType.NONE
 
     @classmethod
-    def _from_args(cls, parser: argparse.ArgumentParser):
-        """Required method for evaluator instantiation."""
+    def _from_args(cls, parser):  # REQUIRED: For evaluator instantiation
         args, _ = parser.parse_known_args()
         return cls(args)

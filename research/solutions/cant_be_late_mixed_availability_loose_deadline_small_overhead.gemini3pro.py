@@ -2,66 +2,60 @@ from sky_spot.strategies.strategy import Strategy
 from sky_spot.utils import ClusterType
 
 class Solution(Strategy):
-    NAME = "CantBeLateStrategy"
+    NAME = "cant_be_late_optimized_v1"
 
     def solve(self, spec_path: str) -> "Solution":
         return self
 
     def _step(self, last_cluster_type: ClusterType, has_spot: bool) -> ClusterType:
-        # Calculate remaining work
-        completed_work = sum(self.task_done_time)
-        remaining_work = self.task_duration - completed_work
-        
-        # If work is effectively done, stop (safety check)
-        if remaining_work <= 1e-6:
-            return ClusterType.NONE
-
-        # Time parameters
         elapsed = self.env.elapsed_seconds
-        remaining_time = self.deadline - elapsed
+        deadline = self.deadline
+        duration = self.task_duration
+        done = sum(self.task_done_time) if self.task_done_time else 0.0
+        rem_work = max(0.0, duration - done)
+        gap = self.env.gap_seconds
+        overhead = self.restart_overhead
         
-        # Calculate time overhead to switch/start On-Demand.
-        # If we are not currently running OD, we assume we must pay the overhead 
-        # to switch to it in a worst-case scenario.
-        if last_cluster_type == ClusterType.ON_DEMAND:
-            transition_overhead = 0.0
-        else:
-            transition_overhead = self.restart_overhead
-            
-        # Slack is the time buffer available beyond the strict minimum needed to finish via On-Demand.
-        # We subtract the potential transition overhead to be conservative.
-        slack = remaining_time - (remaining_work + transition_overhead)
+        time_left = deadline - elapsed
         
-        # Safety Buffers (in seconds)
-        # MIN_BUFFER: If slack drops below this, we panic and switch to On-Demand.
-        # set to 30 minutes + 1 step gap to handle simulation granularity and safety.
-        MIN_BUFFER = 1800.0 + self.env.gap_seconds
-        
-        # HYSTERESIS: If we are on On-Demand, we only switch back to Spot if slack is large.
-        # This prevents thrashing (rapid switching) which incurs overhead cost and time loss.
-        # Set to 1 hour.
-        HYSTERESIS = 3600.0
+        # Buffer to ensure we don't miss deadline due to discrete steps or floating point
+        BUFFER = 120.0
 
-        # 1. Critical Deadline Protection (Panic Mode)
-        if slack < MIN_BUFFER:
-            return ClusterType.ON_DEMAND
-
-        # 2. Spot Instance Utilization
         if has_spot:
-            # If currently on OD, check hysteresis before switching back to Spot
+            # Spot is available. Default preference is SPOT to save cost.
+            
+            # Optimization: If we are currently on OD, switching to Spot incurs overhead.
+            # We should only switch if we have enough slack to absorb the overhead and potential risks.
             if last_cluster_type == ClusterType.ON_DEMAND:
-                if slack > HYSTERESIS:
-                    return ClusterType.SPOT
-                else:
+                # Calculate slack if we switch now (paying overhead)
+                # We need rem_work + overhead time to finish
+                slack_if_switch = time_left - (rem_work + overhead)
+                
+                # If switching puts us too close to the edge, stay on OD
+                if slack_if_switch < BUFFER:
                     return ClusterType.ON_DEMAND
             
-            # If not on OD, use Spot immediately
+            # Otherwise, use Spot
             return ClusterType.SPOT
-
-        # 3. Cost Saving Wait
-        # If Spot is unavailable but we have plenty of slack, wait (NONE).
-        # This consumes slack (time) but saves money compared to OD.
-        return ClusterType.NONE
+            
+        else:
+            # Spot unavailable. Choice is between ON_DEMAND (expensive) and NONE (wait).
+            # We prefer to wait (NONE) to save money, as long as it's safe.
+            
+            # Calculate the slack if we wait for this time step.
+            # If we wait:
+            #   We lose 'gap' time.
+            #   Our state becomes NONE (or stays NONE).
+            #   To finish later, we will need to start OD, which costs 'overhead' + 'rem_work'.
+            
+            slack_after_wait = (time_left - gap) - (rem_work + overhead)
+            
+            if slack_after_wait < BUFFER:
+                # Waiting is unsafe; we might miss the deadline. Must use OD.
+                return ClusterType.ON_DEMAND
+            else:
+                # Safe to wait.
+                return ClusterType.NONE
 
     @classmethod
     def _from_args(cls, parser):

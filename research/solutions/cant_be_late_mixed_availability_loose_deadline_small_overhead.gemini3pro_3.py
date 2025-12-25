@@ -2,54 +2,60 @@ from sky_spot.strategies.strategy import Strategy
 from sky_spot.utils import ClusterType
 
 class Solution(Strategy):
-    NAME = "CantBeLate_Optimized"
+    NAME = "CantBeLateStrategy"
 
     def solve(self, spec_path: str) -> "Solution":
+        """
+        Optional initialization. Called once before evaluation.
+        """
         return self
 
     def _step(self, last_cluster_type: ClusterType, has_spot: bool) -> ClusterType:
-        # Retrieve current state
+        """
+        Called at each time step. Return which cluster type to use next.
+        """
+        # Retrieve current environment state
         elapsed = self.env.elapsed_seconds
-        completed_work = sum(self.task_done_time)
-        remaining_work = self.task_duration - completed_work
-        
-        # If the task is effectively complete, stop incurring costs
-        if remaining_work <= 1e-4:
-            return ClusterType.NONE
-
         deadline = self.deadline
-        time_left = deadline - elapsed
-        
-        # Parameters for decision making
-        overhead = self.restart_overhead
+        duration = self.task_duration
+        done = sum(self.task_done_time)
+        restart_overhead = self.restart_overhead
         gap = self.env.gap_seconds
         
-        # Calculate the "Panic Threshold"
-        # We must ensure that if we delay switching to reliable On-Demand resources,
-        # we still have enough time to finish the job later.
-        #
-        # Required Time = Remaining Work + Restart Overhead
-        # (Overhead is added because we might need to switch instance types or restart)
-        #
-        # We check if we will be safe at the START of the NEXT step.
-        # If we choose SPOT or NONE now, we consume 'gap' seconds.
-        # At next step, time_left will be (current_time_left - gap).
-        # We need: (current_time_left - gap) >= (remaining_work + overhead)
-        # So: current_time_left >= remaining_work + overhead + gap
-        #
-        # We use a safety multiplier (2.0 * gap) to account for jitter or boundary conditions.
+        # Calculate work remaining
+        work_remaining = max(0.0, duration - done)
         
-        panic_threshold = remaining_work + overhead + (2.0 * gap)
+        # If work is effectively done, stop using resources
+        if work_remaining <= 1e-6:
+            return ClusterType.NONE
+
+        time_remaining = deadline - elapsed
         
-        # Priority 1: Meet the Deadline
-        if time_left < panic_threshold:
+        # Define a safety buffer to prevent missing deadline due to discrete time steps or overheads.
+        # 600 seconds (10 minutes) is a safe margin relative to the -100k penalty.
+        # We also ensure it covers at least 2 simulation time steps.
+        buffer = max(600.0, 2.0 * gap)
+        
+        # Determine effective overhead if we need to switch to On-Demand now.
+        # If we are already on On-Demand, overhead is 0 (continuation).
+        # If we are on Spot or None, we incur restart overhead to switch.
+        switch_overhead = 0.0
+        if last_cluster_type != ClusterType.ON_DEMAND:
+            switch_overhead = restart_overhead
+            
+        # Calculate the panic threshold:
+        # If time_remaining drops below this, we MUST use On-Demand to guarantee completion.
+        required_time = work_remaining + switch_overhead + buffer
+        
+        # Panic Mode: Hard deadline constraint
+        if time_remaining <= required_time:
             return ClusterType.ON_DEMAND
             
-        # Priority 2: Minimize Cost (Use Spot if available)
+        # Cost Minimization Mode: Use Spot if available
         if has_spot:
             return ClusterType.SPOT
             
-        # Priority 3: Save Money (Wait if Spot is unavailable and we have slack)
+        # If Spot unavailable and we have slack, wait (NONE) to save money
         return ClusterType.NONE
 
     @classmethod

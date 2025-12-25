@@ -5,17 +5,18 @@ class Solution(Strategy):
     NAME = "my_solution"
 
     def solve(self, spec_path: str) -> "Solution":
-        self.on_demand_committed = False
         return self
 
     def _step(self, last_cluster_type: ClusterType, has_spot: bool) -> ClusterType:
-        if self.on_demand_committed:
+        remaining_work = self.task_duration - sum(self.task_done_time)
+        remaining_time = self.deadline - self.env.elapsed_seconds
+        slack = remaining_time - remaining_work
+        safety_margin = self.restart_overhead * 3
+        if slack < safety_margin:
             return ClusterType.ON_DEMAND
         if has_spot:
             return ClusterType.SPOT
-        else:
-            self.on_demand_committed = True
-            return ClusterType.ON_DEMAND
+        return ClusterType.ON_DEMAND
 
     @classmethod
     def _from_args(cls, parser):

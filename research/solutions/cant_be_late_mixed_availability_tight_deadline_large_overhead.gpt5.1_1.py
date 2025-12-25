@@ -1,136 +1,158 @@
-from typing import Any
 from sky_spot.strategies.strategy import Strategy
 from sky_spot.utils import ClusterType
 
 
 class Solution(Strategy):
-    NAME = "cant_be_late_heuristic_v1"
+    NAME = "my_solution"
 
-    def __init__(self, args: Any = None):
+    # Slack thresholds in hours (converted to seconds in __init__)
+    SLACK_IDLE_TO_OD_HOURS = 2.0       # When remaining slack <= 2h, stop idling; use OD when no spot
+    SLACK_COMMIT_OD_ONLY_HOURS = 1.0   # When remaining slack <= 1h, commit to OD only
+
+    def __init__(self, args):
         super().__init__(args)
-        self._force_on_demand = False
+        # Progress tracking
+        self._progress_seconds = 0.0
+        self._last_task_done_len = 0
+
+        # Control flags
+        self._committed_to_od = False
+
+        # Cached thresholds in seconds (initialized lazily when env is available)
+        self._slack_idle_to_od = None
+        self._slack_commit_od_only = None
+
+        # Step statistics (optional, could be used for adaptation)
+        self._total_steps = 0
+        self._spot_available_steps = 0
 
     def solve(self, spec_path: str) -> "Solution":
-        # Optional: could parse spec_path; not needed for this heuristic.
+        # No offline preprocessing needed for now.
         return self
 
-    def _estimate_task_done(self) -> float:
-        """Best-effort estimation of completed task duration in seconds."""
-        tdt = getattr(self, "task_done_time", None)
-        if not tdt:
-            return 0.0
+    # --- Internal helpers -------------------------------------------------
 
-        task_dur = getattr(self, "task_duration", None)
+    def _init_thresholds_if_needed(self):
+        if self._slack_idle_to_od is None or self._slack_commit_od_only is None:
+            hour = 3600.0
+            self._slack_idle_to_od = self.SLACK_IDLE_TO_OD_HOURS * hour
+            self._slack_commit_od_only = self.SLACK_COMMIT_OD_ONLY_HOURS * hour
+
+    def _segment_duration(self, seg) -> float:
+        """Best-effort extraction of compute duration from a segment object."""
         try:
-            td = float(task_dur) if task_dur is not None else None
+            # Numeric duration directly
+            if isinstance(seg, (int, float)):
+                v = float(seg)
+                return v if v > 0.0 else 0.0
+
+            # Tuple/list: likely [start, end]
+            if isinstance(seg, (list, tuple)) and len(seg) >= 2:
+                s = float(seg[0])
+                e = float(seg[1])
+                return (e - s) if e > s else 0.0
+
+            # Object with attributes start/end or similar
+            start = None
+            end = None
+            if hasattr(seg, "start") and hasattr(seg, "end"):
+                start = getattr(seg, "start")
+                end = getattr(seg, "end")
+            elif hasattr(seg, "t_start") and hasattr(seg, "t_end"):
+                start = getattr(seg, "t_start")
+                end = getattr(seg, "t_end")
+
+            if start is not None and end is not None:
+                s = float(start)
+                e = float(end)
+                return (e - s) if e > s else 0.0
         except Exception:
-            td = None
+            pass
 
-        first = tdt[0]
+        return 0.0
 
-        # Case 1: list of (start, end) segments
-        if isinstance(first, (list, tuple)) and len(first) >= 2:
-            total = 0.0
-            for seg in tdt:
-                try:
-                    if not (isinstance(seg, (list, tuple)) and len(seg) >= 2):
-                        continue
-                    start = float(seg[0])
-                    end = float(seg[1])
-                    if end > start:
-                        total += end - start
-                except Exception:
-                    continue
-            if td is not None:
-                total = min(total, td)
-            return max(0.0, total)
+    def _update_progress(self):
+        """Incrementally update total compute progress from new task_done_time segments."""
+        segments = getattr(self, "task_done_time", None)
+        if not segments:
+            return
 
-        # Case 2: list of numeric values: either cumulative or segment durations
-        try:
-            values = [float(x) for x in tdt]
-        except Exception:
-            return 0.0
+        n = len(segments)
+        if n <= self._last_task_done_len:
+            return
 
-        if not values:
-            return 0.0
+        for i in range(self._last_task_done_len, n):
+            self._progress_seconds += self._segment_duration(segments[i])
+        self._last_task_done_len = n
 
-        maxv = max(values)
-        is_non_decreasing = all(
-            values[i] <= values[i + 1] + 1e-6 for i in range(len(values) - 1)
-        )
+        # Never exceed declared task duration
+        if hasattr(self, "task_duration"):
+            if self._progress_seconds > self.task_duration:
+                self._progress_seconds = float(self.task_duration)
 
-        # Heuristic:
-        # - If values are non-decreasing and bounded by task_duration, treat as cumulative
-        # - Otherwise, treat as segment durations and sum them
-        if td is not None and maxv <= td + 1e-6 and is_non_decreasing:
-            done = values[-1]
-        else:
-            done = sum(v for v in values if v > 0.0)
-            if td is not None:
-                done = min(done, td)
-
-        return max(0.0, done)
+    # --- Core decision logic ----------------------------------------------
 
     def _step(self, last_cluster_type: ClusterType, has_spot: bool) -> ClusterType:
-        # If we've already decided to stick with on-demand, keep doing so.
-        if self._force_on_demand:
-            return ClusterType.ON_DEMAND
+        self._init_thresholds_if_needed()
+        self._update_progress()
 
-        # Ensure required attributes exist; if not, default safe behavior (on-demand).
-        if not hasattr(self, "env") or self.env is None:
-            return ClusterType.ON_DEMAND
-        if not hasattr(self.env, "elapsed_seconds") or not hasattr(
-            self.env, "gap_seconds"
-        ):
-            return ClusterType.ON_DEMAND
-        if not hasattr(self, "task_duration") or not hasattr(self, "deadline"):
-            return ClusterType.ON_DEMAND
-        if not hasattr(self, "restart_overhead"):
-            return ClusterType.ON_DEMAND
+        self._total_steps += 1
+        if has_spot:
+            self._spot_available_steps += 1
 
+        # Basic environment quantities
         elapsed = float(self.env.elapsed_seconds)
         gap = float(self.env.gap_seconds)
-        deadline = float(self.deadline)
-        restart_overhead = float(self.restart_overhead)
-        task_duration = float(self.task_duration)
+        time_left = float(self.deadline) - elapsed
+        if time_left < 0.0:
+            time_left = 0.0
 
-        # Compute progress and remaining work.
-        done = self._estimate_task_done()
-        done = max(0.0, min(done, task_duration))
-        remaining = max(0.0, task_duration - done)
+        remaining_work = max(float(self.task_duration) - self._progress_seconds, 0.0)
 
-        time_left = max(0.0, deadline - elapsed)
+        # Remaining slack = time we can still "waste" (idle + overhead) and still finish on time
+        slack = time_left - remaining_work
 
-        # Time needed if we switch to on-demand and never leave it:
-        # restart_overhead (single restart) + remaining work.
-        required_od_time = remaining + restart_overhead
-
-        # Safety buffer to account for discretization and modeling mismatches.
-        # Units are seconds.
-        time_buffer = max(2.0 * gap, 0.5 * restart_overhead)
-
-        # If even with immediate switch to on-demand we are too tight, force on-demand now.
-        if time_left <= required_od_time + time_buffer:
-            self._force_on_demand = True
+        # If we've already decided to commit to OD, keep using it.
+        if self._committed_to_od:
             return ClusterType.ON_DEMAND
 
-        # We are in the "safe zone": can still afford to rely on spot instances.
+        # If slack is negative, we're already late; best we can do is use OD.
+        if slack <= 0.0:
+            self._committed_to_od = True
+            return ClusterType.ON_DEMAND
 
+        # Hard safety condition: if we are close enough to the deadline that only OD
+        # can possibly save us, commit to OD now.
+        required_time_if_commit_now = float(self.restart_overhead) + remaining_work
+        # Add a small safety margin of a few steps
+        safety_margin = 3.0 * gap
+        if time_left <= required_time_if_commit_now + safety_margin:
+            self._committed_to_od = True
+            return ClusterType.ON_DEMAND
+
+        # Soft slack-based thresholds
+        slack_idle_to_od = self._slack_idle_to_od
+        slack_commit_od_only = self._slack_commit_od_only
+
+        # Commit to OD-only when slack is low enough; avoid any further spot risk.
+        if slack <= slack_commit_od_only:
+            self._committed_to_od = True
+            return ClusterType.ON_DEMAND
+
+        # When slack is moderate or low but above commit threshold,
+        # ensure we don't idle: use OD if spot is unavailable.
+        if slack <= slack_idle_to_od:
+            if has_spot:
+                return ClusterType.SPOT
+            else:
+                return ClusterType.ON_DEMAND
+
+        # High-slack regime: we can afford to wait for spot.
         if has_spot:
-            # Prefer spot when available and we're safely ahead of the deadline.
             return ClusterType.SPOT
 
-        # Spot not available this step.
-        # Decide between idling and starting on-demand early.
-        # Check if idling for one more step is still safe.
-        projected_time_left = max(0.0, time_left - gap)
-        if projected_time_left > required_od_time + time_buffer:
-            # Still safe to wait for spot; do nothing this step.
-            return ClusterType.NONE
-
-        # We can't afford to wait; start on-demand now.
-        self._force_on_demand = True
-        return ClusterType.ON_DEMAND
+        # Plenty of slack and no spot: pause to save cost.
+        return ClusterType.NONE
 
     @classmethod
     def _from_args(cls, parser):

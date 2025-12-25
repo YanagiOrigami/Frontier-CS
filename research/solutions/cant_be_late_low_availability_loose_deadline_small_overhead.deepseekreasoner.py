@@ -1,104 +1,87 @@
-import numpy as np
+import heapq
+import math
 from sky_spot.strategies.strategy import Strategy
 from sky_spot.utils import ClusterType
 
 class Solution(Strategy):
     NAME = "my_solution"
 
-    def __init__(self, args=None):
-        super().__init__(args)
-        self.spec = None
-        self.remaining_work = 0.0
-        self.current_time = 0.0
-        self.last_spot_available = False
-        self.spot_availability_history = []
-        self.spot_unavailable_duration = 0
-        self.on_demand_used = 0.0
-        self.spot_used = 0.0
-        self.restart_pending = 0.0
-        self.switch_to_od_time = None
-        self.safety_margin_factor = 1.5
-
     def solve(self, spec_path: str) -> "Solution":
-        self.spec = spec_path
+        self.buffer_hours = 3.0
+        self.spot_history = []
+        self.spot_availability_threshold = 0.3
+        self.consecutive_spot_failures = 0
+        self.max_consecutive_failures = 2
+        self.last_decision = ClusterType.NONE
+        self.restart_pending = False
+        self.restart_timer = 0.0
+        self.total_spot_time = 0.0
+        self.total_od_time = 0.0
         return self
 
     def _step(self, last_cluster_type: ClusterType, has_spot: bool) -> ClusterType:
-        current_time = self.env.elapsed_seconds
+        elapsed = self.env.elapsed_seconds
         gap = self.env.gap_seconds
+        deadline = self.deadline
+        restart_overhead = self.restart_overhead
         
-        # Update work tracking
-        if last_cluster_type != ClusterType.NONE:
-            work_done = min(gap, self.remaining_work)
-            self.remaining_work = max(0, self.remaining_work - work_done)
+        remaining_work = self.task_duration - sum(self.task_done_time)
+        time_left = deadline - elapsed
         
-        # Initialize remaining work if first call
-        if current_time == 0:
-            self.remaining_work = self.task_duration
-        
-        # Update availability tracking
-        self.spot_availability_history.append(has_spot)
-        if len(self.spot_availability_history) > 100:
-            self.spot_availability_history.pop(0)
-        
-        # Calculate availability metrics
-        availability_rate = np.mean(self.spot_availability_history) if self.spot_availability_history else 0
-        
-        # Calculate time to deadline
-        time_to_deadline = self.deadline - current_time
-        
-        # Calculate effective remaining time considering restart overhead
-        if self.restart_pending > 0:
-            effective_remaining_time = time_to_deadline - self.restart_pending
-        else:
-            effective_remaining_time = time_to_deadline
-        
-        # Base required rate to finish on time
-        required_rate = self.remaining_work / max(1e-6, effective_remaining_time)
-        
-        # Conservative safety margin
-        safety_margin = self.restart_overhead * self.safety_margin_factor
-        
-        # Decision logic
-        if self.restart_pending > 0:
-            # We're in restart overhead period
-            self.restart_pending = max(0, self.restart_pending - gap)
+        if remaining_work <= 0:
+            return ClusterType.NONE
+            
+        if self.restart_pending:
+            self.restart_timer -= gap
+            if self.restart_timer <= 0:
+                self.restart_pending = False
             return ClusterType.NONE
         
-        # Emergency mode: if we're running out of time, use on-demand
-        if effective_remaining_time < self.remaining_work + safety_margin:
-            if has_spot and availability_rate > 0.3 and self.remaining_work > self.restart_overhead * 2:
-                # Still try spot if good availability and enough work to justify restart risk
-                self.spot_used += gap
-                return ClusterType.SPOT
-            else:
-                self.on_demand_used += gap
+        urgent = remaining_work > time_left - self.buffer_hours * 3600
+        
+        if last_cluster_type == ClusterType.SPOT and not has_spot:
+            self.consecutive_spot_failures += 1
+            if urgent:
                 return ClusterType.ON_DEMAND
+            self.restart_pending = True
+            self.restart_timer = restart_overhead
+            return ClusterType.NONE
         
-        # Normal operation: use spot when available if we have time buffer
-        if has_spot:
-            # Check if we have enough buffer to risk spot
-            time_buffer = effective_remaining_time - self.remaining_work
-            if time_buffer > self.restart_overhead * 3 or availability_rate > 0.7:
-                self.spot_used += gap
-                return ClusterType.SPOT
+        self.spot_history.append(has_spot)
+        if len(self.spot_history) > 10:
+            self.spot_history.pop(0)
         
-        # If spot unavailable, decide between waiting or using on-demand
-        if self.last_spot_available and not has_spot:
-            # Spot just became unavailable, check if we should wait
-            expected_wait_time = min(10 * gap, time_to_deadline * 0.1)
-            if time_buffer > expected_wait_time + self.restart_overhead:
+        spot_reliability = sum(self.spot_history) / len(self.spot_history) if self.spot_history else 0
+        
+        if last_cluster_type == ClusterType.ON_DEMAND:
+            self.consecutive_spot_failures = 0
+            if not urgent and spot_reliability > self.spot_availability_threshold:
+                if has_spot:
+                    return ClusterType.SPOT
                 return ClusterType.NONE
-            elif availability_rate < 0.3:
-                self.on_demand_used += gap
-                return ClusterType.ON_DEMAND
-        
-        # Default to on-demand when spot is unavailable and we can't wait
-        if not has_spot:
-            self.on_demand_used += gap
             return ClusterType.ON_DEMAND
         
-        self.last_spot_available = has_spot
+        if last_cluster_type == ClusterType.SPOT:
+            self.consecutive_spot_failures = 0
+            if has_spot and not urgent:
+                return ClusterType.SPOT
+            if urgent:
+                return ClusterType.ON_DEMAND
+            if has_spot:
+                return ClusterType.SPOT
+            return ClusterType.NONE
+        
+        if self.consecutive_spot_failures >= self.max_consecutive_failures:
+            if urgent:
+                return ClusterType.ON_DEMAND
+            return ClusterType.NONE
+        
+        if has_spot and spot_reliability > self.spot_availability_threshold:
+            return ClusterType.SPOT
+        
+        if urgent:
+            return ClusterType.ON_DEMAND
+        
         return ClusterType.NONE
 
     @classmethod

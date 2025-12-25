@@ -1,94 +1,104 @@
-import math
-import json
-from typing import List
+import numpy as np
 from sky_spot.strategies.strategy import Strategy
 from sky_spot.utils import ClusterType
 
 class Solution(Strategy):
     NAME = "my_solution"
     
-    def __init__(self, args):
-        super().__init__(args)
-        self.config = None
-        self.spot_price = 0.97
-        self.ondemand_price = 3.06
-        self.restart_penalty = 0.05 * 3600  # 0.05 hours to seconds
-        self.critical_threshold = 0.2
-        self.conservative_threshold = 0.4
-        
     def solve(self, spec_path: str) -> "Solution":
-        try:
-            with open(spec_path, 'r') as f:
-                self.config = json.load(f)
-        except:
-            pass
+        self.work_done = 0.0
+        self.spot_available_history = []
+        self.decision_history = []
+        self.consecutive_spot_failures = 0
+        self.max_consecutive_failures = 0
+        self.switch_to_od_threshold = 0
+        self.safety_margin = 0.1
+        self.last_work_time = 0.0
+        self.pause_count = 0
+        self.od_usage = 0
+        
         return self
     
-    def _get_remaining_work(self) -> float:
-        if not self.task_done_time:
-            return self.task_duration
-        return max(0.0, self.task_duration - sum(self.task_done_time))
-    
-    def _get_time_to_deadline(self) -> float:
-        return max(0.0, self.deadline - self.env.elapsed_seconds)
-    
-    def _get_required_rate(self) -> float:
-        remaining_work = self._get_remaining_work()
-        time_left = self._get_time_to_deadline()
-        if time_left <= 0:
-            return float('inf')
-        return remaining_work / time_left
-    
-    def _is_critical(self) -> bool:
-        remaining_work = self._get_remaining_work()
-        time_left = self._get_time_to_deadline()
+    def _compute_progress_rate(self):
+        if len(self.decision_history) == 0:
+            return 0.0
         
-        if time_left <= 0:
-            return True
-            
-        required_rate = remaining_work / time_left
+        work_periods = 0
+        for i, decision in enumerate(self.decision_history[-100:]):
+            if decision in [ClusterType.SPOT, ClusterType.ON_DEMAND]:
+                work_periods += 1
         
-        safety_margin = self.restart_overhead * 2
-        conservative_needed = remaining_work / (time_left - safety_margin)
+        return work_periods / min(100, len(self.decision_history))
+    
+    def _estimate_remaining_time(self, remaining_work):
+        progress_rate = self._compute_progress_rate()
+        if progress_rate > 0:
+            estimated_steps = remaining_work / (self.env.gap_seconds * progress_rate)
+        else:
+            estimated_steps = remaining_work / self.env.gap_seconds
         
-        return required_rate > self.critical_threshold or conservative_needed > self.conservative_threshold
+        return estimated_steps * self.env.gap_seconds
     
     def _step(self, last_cluster_type: ClusterType, has_spot: bool) -> ClusterType:
-        remaining_work = self._get_remaining_work()
-        time_left = self._get_time_to_deadline()
+        current_time = self.env.elapsed_seconds
+        time_left = self.deadline - current_time
+        
+        remaining_work = self.task_duration - sum(self.task_done_time)
         
         if remaining_work <= 0:
             return ClusterType.NONE
+        
+        self.spot_available_history.append(has_spot)
+        if len(self.spot_available_history) > 100:
+            self.spot_available_history.pop(0)
+        
+        spot_availability = np.mean(self.spot_available_history) if self.spot_available_history else 0.5
+        
+        if has_spot:
+            self.consecutive_spot_failures = 0
+        else:
+            self.consecutive_spot_failures += 1
+            self.max_consecutive_failures = max(self.max_consecutive_failures, 
+                                              self.consecutive_spot_failures)
+        
+        if self.switch_to_od_threshold == 0 and len(self.spot_available_history) >= 20:
+            self.switch_to_od_threshold = max(3, int(self.max_consecutive_failures * 0.8))
+        
+        estimated_remaining_time = self._estimate_remaining_time(remaining_work)
+        
+        critical_phase = time_left < estimated_remaining_time * (1.0 + self.safety_margin)
+        
+        if critical_phase:
+            self.od_usage += 1
             
-        if time_left <= 0:
-            return ClusterType.ON_DEMAND
+        use_od = (
+            critical_phase or
+            (not has_spot and self.consecutive_spot_failures >= self.switch_to_od_threshold) or
+            (remaining_work / self.env.gap_seconds > time_left / self.env.gap_seconds - 5) or
+            (self.od_usage < 5 and time_left < 3600)
+        )
         
-        required_rate = self._get_required_rate()
+        if use_od:
+            decision = ClusterType.ON_DEMAND
+        elif has_spot:
+            if last_cluster_type == ClusterType.NONE:
+                self.pause_count += 1
+            
+            if self.pause_count > 2 and not critical_phase:
+                decision = ClusterType.SPOT
+            else:
+                decision = ClusterType.SPOT
+        else:
+            if time_left > estimated_remaining_time * 1.2 and not critical_phase:
+                decision = ClusterType.NONE
+            else:
+                decision = ClusterType.ON_DEMAND
         
-        critical = self._is_critical()
+        self.decision_history.append(decision)
+        if len(self.decision_history) > 1000:
+            self.decision_history.pop(0)
         
-        if critical:
-            if last_cluster_type == ClusterType.SPOT and not has_spot:
-                return ClusterType.ON_DEMAND
-            return ClusterType.ON_DEMAND
-        
-        if not has_spot:
-            if required_rate > 0.1:
-                return ClusterType.ON_DEMAND
-            return ClusterType.NONE
-        
-        if last_cluster_type == ClusterType.SPOT and not has_spot:
-            if required_rate > 0.15:
-                return ClusterType.ON_DEMAND
-            return ClusterType.NONE
-        
-        if time_left - remaining_work > self.restart_overhead * 5:
-            return ClusterType.SPOT
-        
-        if required_rate < 0.05:
-            return ClusterType.NONE
-        
-        return ClusterType.SPOT
+        return decision
     
     @classmethod
     def _from_args(cls, parser):

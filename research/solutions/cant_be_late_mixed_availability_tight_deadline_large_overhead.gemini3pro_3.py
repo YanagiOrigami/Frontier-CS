@@ -1,59 +1,53 @@
 from sky_spot.strategies.strategy import Strategy
 from sky_spot.utils import ClusterType
-import math
 
 class Solution(Strategy):
-    NAME = "SafeSlackConsumer"
+    NAME = "CantBeLateSolution"
 
     def solve(self, spec_path: str) -> "Solution":
         return self
 
     def _step(self, last_cluster_type: ClusterType, has_spot: bool) -> ClusterType:
-        # 1. Calculate work status
-        completed_work = sum(self.task_done_time)
-        remaining_work = self.task_duration - completed_work
-        
-        if remaining_work <= 1e-6:
+        # Calculate remaining work
+        current_progress = sum(self.task_done_time)
+        remaining_work = self.task_duration - current_progress
+
+        # If task is effectively complete, stop
+        if remaining_work <= 0:
             return ClusterType.NONE
 
-        # 2. Calculate time status
-        current_time = self.env.elapsed_seconds
-        time_left = self.deadline - current_time
-        
-        # 3. Define Safety Threshold
-        # We calculate the "Panic Point": the latest possible moment to switch to On-Demand
-        # to guarantee finishing the task, assuming we incur a restart overhead.
-        
-        overhead = self.restart_overhead
+        # Current simulation state
+        elapsed = self.env.elapsed_seconds
+        deadline = self.deadline
+        time_left = deadline - elapsed
         gap = self.env.gap_seconds
+        restart_overhead = self.restart_overhead
+
+        # Safety Logic:
+        # Determine the latest point we must switch to On-Demand to guarantee completion.
+        # We assume that if we are not running effectively on OD, we will incur overhead to start it.
+        # Even if we are currently on OD, checking against the overhead-included threshold
+        # ensures we don't switch off OD unless we have enough slack to pay the overhead to come back.
         
-        # Buffer calculation:
-        # - overhead * 1.1: Accounts for the restart time needed to spin up OD, plus 10% safety margin.
-        # - gap * 2.0: Ensures we don't overshoot the deadline due to step granularity.
-        # We must ensure that even if we wait one full 'gap' (waiting for this step to end),
-        # we still have enough time (remaining_work + overhead) to finish.
-        safety_buffer = (overhead * 1.1) + (gap * 2.0)
+        # We need to ensure that at the NEXT time step (elapsed + gap), we still have enough time.
+        # Time required to finish reliably = remaining_work + restart_overhead
+        # We add a buffer (2.0 * gap) to handle simulation discretization and floating point margins.
         
-        required_time_for_od = remaining_work + overhead + safety_buffer
-        
-        # 4. Decision Logic
-        
-        # Priority 1: Guarantee Deadline
-        # If we are approaching the point of no return, force On-Demand.
-        if time_left < required_time_for_od:
+        safe_threshold = remaining_work + restart_overhead + gap + (2.0 * gap)
+
+        # 1. Critical Phase: If we are close to the deadline, force On-Demand.
+        # This takes precedence over everything to avoid the -100,000 penalty.
+        if time_left <= safe_threshold:
             return ClusterType.ON_DEMAND
-            
-        # Priority 2: Minimize Cost using Slack
-        # If we have buffer time:
+
+        # 2. Economic Phase: We have slack. Optimize for cost.
         if has_spot:
-            # If Spot is available, use it (cheapest option).
-            # Even if we switch from OD to Spot, the savings usually outweigh the overhead 
-            # given the ~3x price difference and long task duration.
+            # Spot is available and we have time to handle interruptions.
             return ClusterType.SPOT
         else:
-            # If Spot is unavailable but we still have buffer time:
-            # Wait (NONE). This consumes slack but costs $0.
-            # We bet on Spot coming back before we hit the panic threshold.
+            # Spot is unavailable, but we have slack.
+            # We choose to wait (NONE) rather than burn expensive On-Demand hours.
+            # The safety threshold ensures we will switch to OD before it's too late.
             return ClusterType.NONE
 
     @classmethod

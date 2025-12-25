@@ -2,62 +2,54 @@ from sky_spot.strategies.strategy import Strategy
 from sky_spot.utils import ClusterType
 
 class Solution(Strategy):
-    NAME = "CantBeLateStrategy"
+    NAME = "CostOptimizedDeadlineAware"
 
     def __init__(self, args):
-        self.args = args
+        super().__init__(args)
 
     def solve(self, spec_path: str) -> "Solution":
         return self
 
     def _step(self, last_cluster_type: ClusterType, has_spot: bool) -> ClusterType:
-        # Calculate remaining work based on completed segments
-        done_work = sum(self.task_done_time)
-        remaining_work = max(0.0, self.task_duration - done_work)
+        # Retrieve environment state
+        elapsed = self.env.elapsed_seconds
+        deadline = self.deadline
+        total_work = self.task_duration
+        gap = self.env.gap_seconds
+        overhead = self.restart_overhead
         
-        # If the task is effectively complete, stop incurring costs
-        if remaining_work <= 1e-6:
+        # Calculate progress
+        # task_done_time is a list of durations of completed segments
+        done_work = sum(self.task_done_time)
+        remaining_work = total_work - done_work
+
+        # If task is completed
+        if remaining_work <= 0:
             return ClusterType.NONE
 
-        # Current status
-        current_time = self.env.elapsed_seconds
-        time_remaining = self.deadline - current_time
-        gap = self.env.gap_seconds
+        time_until_deadline = deadline - elapsed
 
-        # Calculate Safety Threshold for Panic Mode
-        # We must switch to On-Demand (OD) if we are approaching the point where 
-        # completion is at risk. OD is reliable but expensive.
-        #
-        # Required Time Calculation:
-        # 1. remaining_work: Actual compute time needed.
-        # 2. restart_overhead: Time to spin up the OD instance.
-        # 3. Buffer: Safety margin for discrete time steps, simulation jitter, 
-        #    and to ensure we don't cut it too close.
-        #
-        # Buffer choice: 
-        # - 1x restart_overhead (0.2h) to allow for safe switching
-        # - 3600s (1h) constant cushion (Given 22h slack, this cost is negligible for safety)
-        # - 2x gap_seconds to handle step boundaries
-        
-        safety_buffer = self.restart_overhead + 3600.0 + (2.0 * gap)
-        
-        # Total time required to guarantee finish on OD
-        required_time_on_od = remaining_work + self.restart_overhead + safety_buffer
+        # Safety Threshold Calculation
+        # We must switch to On-Demand if the remaining time allows just enough 
+        # to finish the work plus necessary overheads.
+        # We add a safety buffer:
+        # - 2 * overhead: Covers the transition cost to OD + margin
+        # - 5 * gap: Handles discrete time step granularity and small delays
+        safety_buffer = (2.0 * overhead) + (5.0 * gap)
+        panic_threshold = remaining_work + safety_buffer
 
-        # Decision Logic:
-        # 1. Panic Mode: If time is running out, force OD immediately.
-        if time_remaining < required_time_on_od:
+        # Panic Mode: Approaching the point of no return
+        if time_until_deadline <= panic_threshold:
             return ClusterType.ON_DEMAND
 
-        # 2. Standard Mode:
-        # - If Spot is available, use it (cheapest option).
-        # - If Spot is unavailable, wait (ClusterType.NONE).
-        #   Waiting is free, whereas running OD is expensive. Since we are not in 
-        #   Panic Mode, we have slack to burn in exchange for cost savings.
+        # Cost Optimization Mode:
+        # Prioritize Spot instances (cheaper).
+        # If Spot is unavailable, wait (NONE) rather than burning money on OD,
+        # as long as we have slack (time_until_deadline > panic_threshold).
         if has_spot:
             return ClusterType.SPOT
-        
-        return ClusterType.NONE
+        else:
+            return ClusterType.NONE
 
     @classmethod
     def _from_args(cls, parser):

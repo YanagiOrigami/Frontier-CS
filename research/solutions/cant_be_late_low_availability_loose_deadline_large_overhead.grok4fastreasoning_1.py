@@ -11,15 +11,10 @@ class Solution(Strategy):
         total_done = sum(self.task_done_time)
         remaining = self.task_duration - total_done
         time_left = self.deadline - self.env.elapsed_seconds
-        if remaining <= 0 or time_left <= 0:
-            return ClusterType.NONE
-        if not has_spot:
+        slack = time_left - remaining
+        if not has_spot or slack < 3 * self.restart_overhead or remaining <= 0 or time_left <= 0:
             return ClusterType.ON_DEMAND
-        slack_ratio = time_left / remaining if remaining > 0 else float('inf')
-        if slack_ratio > 1.1:
-            return ClusterType.SPOT
-        else:
-            return ClusterType.ON_DEMAND
+        return ClusterType.SPOT
 
     @classmethod
     def _from_args(cls, parser):

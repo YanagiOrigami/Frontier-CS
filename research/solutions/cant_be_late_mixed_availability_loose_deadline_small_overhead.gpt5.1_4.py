@@ -3,182 +3,107 @@ from sky_spot.utils import ClusterType
 
 
 class Solution(Strategy):
-    NAME = "my_solution"
+    NAME = "cant_be_late_heuristic_v1"
+
+    def __init__(self, args):
+        super().__init__(args)
+        # Internal state for caching and control
+        self._cached_done_total = 0.0
+        self._cached_done_len = 0
+        self._committed_on_demand = False
 
     def solve(self, spec_path: str) -> "Solution":
-        self._force_on_demand = False
+        # Optional: read spec_path if needed. Not used here.
         return self
 
-    def _get_task_duration(self) -> float:
-        val = getattr(self, "task_duration", None)
-        try:
-            td = float(val)
-            if td > 0.0:
-                return td
-        except (TypeError, ValueError):
-            pass
-        deadline_val = getattr(self, "deadline", None)
-        try:
-            dl = float(deadline_val)
-            if dl > 0.0:
-                return dl
-        except (TypeError, ValueError):
-            pass
-        return 0.0
+    @classmethod
+    def _from_args(cls, parser):  # REQUIRED
+        args, _ = parser.parse_known_args()
+        return cls(args)
 
-    def _estimate_work_done(self) -> float:
-        td = self._get_task_duration()
+    def _compute_total_done(self) -> float:
+        """Compute total work done so far from task_done_time."""
         segments = getattr(self, "task_done_time", None)
         if not segments:
+            self._cached_done_total = 0.0
+            self._cached_done_len = 0
             return 0.0
-        done = 0.0
-        for seg in segments:
-            if seg is None:
-                continue
-            cand_list = []
-            try:
-                if isinstance(seg, (int, float)):
-                    v = float(seg)
-                    if v >= 0.0:
-                        cand_list.append(v)
-                elif isinstance(seg, (list, tuple)):
-                    if len(seg) >= 1:
-                        try:
-                            v0 = float(seg[0])
-                            if v0 >= 0.0:
-                                cand_list.append(v0)
-                        except (TypeError, ValueError):
-                            v0 = None
-                        else:
-                            v0 = float(seg[0])
-                    else:
-                        v0 = None
-                    v1 = None
-                    if len(seg) >= 2:
-                        try:
-                            v1 = float(seg[1])
-                            if v1 >= 0.0:
-                                cand_list.append(v1)
-                        except (TypeError, ValueError):
-                            v1 = None
-                    if v0 is not None and v1 is not None:
-                        diff = v1 - v0
-                        if diff >= 0.0:
-                            cand_list.append(diff)
+
+        n = len(segments)
+        # Reset cache if length shrank or cache uninitialized
+        if self._cached_done_len > n:
+            self._cached_done_total = 0.0
+            self._cached_done_len = 0
+
+        total = self._cached_done_total
+        for i in range(self._cached_done_len, n):
+            seg = segments[i]
+            val = 0.0
+            if isinstance(seg, (int, float)):
+                val = float(seg)
+            elif isinstance(seg, (tuple, list)):
+                if len(seg) >= 2 and isinstance(seg[0], (int, float)) and isinstance(seg[1], (int, float)):
+                    val = float(seg[1] - seg[0])
                 else:
-                    start_attr = getattr(seg, "start", None)
-                    end_attr = getattr(seg, "end", None)
-                    if end_attr is not None:
-                        try:
-                            ve = float(end_attr)
-                            if ve >= 0.0:
-                                cand_list.append(ve)
-                        except (TypeError, ValueError):
-                            pass
-                    if start_attr is not None and end_attr is not None:
-                        try:
-                            vs = float(start_attr)
-                            ve = float(end_attr)
-                            diff = ve - vs
-                            if diff >= 0.0:
-                                cand_list.append(diff)
-                        except (TypeError, ValueError):
-                            pass
-                    if not cand_list:
-                        try:
-                            v = float(seg)
-                            if v >= 0.0:
-                                cand_list.append(v)
-                        except (TypeError, ValueError):
-                            pass
-            except Exception:
-                cand_list = []
+                    try:
+                        val = float(seg)
+                    except (TypeError, ValueError):
+                        val = 0.0
+            else:
+                try:
+                    val = float(seg)
+                except (TypeError, ValueError):
+                    val = 0.0
+            total += val
 
-            if not cand_list:
-                continue
-
-            v = min(cand_list)
-            if td > 0.0 and v > td:
-                v = td
-            if v > done:
-                done = v
-
-        if td > 0.0 and done > td:
-            done = td
-        if done < 0.0:
-            done = 0.0
-        return done
-
-    def _estimate_remaining_work(self) -> float:
-        td = self._get_task_duration()
-        if td <= 0.0:
-            # Unknown duration: be conservative and assume full remaining equals deadline.
-            deadline_val = getattr(self, "deadline", None)
-            try:
-                dl = float(deadline_val)
-                if dl > 0.0:
-                    return dl
-            except (TypeError, ValueError):
-                return 0.0
-        progress = self._estimate_work_done()
-        rem = td - progress
-        if rem < 0.0:
-            rem = 0.0
-        return rem
+        self._cached_done_total = total
+        self._cached_done_len = n
+        return total
 
     def _step(self, last_cluster_type: ClusterType, has_spot: bool) -> ClusterType:
-        if not hasattr(self, "_force_on_demand"):
-            self._force_on_demand = False
+        # Compute remaining work and slack
+        work_done = self._compute_total_done()
+        total_duration = float(self.task_duration)
+        remaining = max(0.0, total_duration - work_done)
 
-        remaining_work = self._estimate_remaining_work()
-        if remaining_work <= 0.0:
+        if remaining <= 0.0:
+            # Task finished: no need to spend more
             return ClusterType.NONE
 
-        elapsed = getattr(self.env, "elapsed_seconds", 0.0)
-        try:
-            elapsed = float(elapsed)
-        except (TypeError, ValueError):
-            elapsed = 0.0
+        now = float(self.env.elapsed_seconds)
+        deadline = float(self.deadline)
+        time_left = max(0.0, deadline - now)
 
-        gap = getattr(self.env, "gap_seconds", 0.0)
-        try:
-            gap = float(gap)
-        except (TypeError, ValueError):
-            gap = 0.0
-        if gap < 0.0:
-            gap = 0.0
+        slack = time_left - remaining  # in seconds
 
-        ro_val = getattr(self, "restart_overhead", 0.0)
-        try:
-            ro = float(ro_val)
-        except (TypeError, ValueError):
-            ro = 0.0
-        if ro < 0.0:
-            ro = 0.0
+        # Compute dynamic thresholds
+        gap = float(self.env.gap_seconds)
+        overhead = float(self.restart_overhead)
 
-        deadline_val = getattr(self, "deadline", None)
-        try:
-            deadline = float(deadline_val)
-        except (TypeError, ValueError):
-            # Unknown deadline: always run on-demand to minimize failure risk.
-            self._force_on_demand = True
+        # Guard time before deadline to fully switch to on-demand.
+        # Large enough to cover restart/step granularity under worst case.
+        base_guard = 4.0 * 3600.0  # 4 hours
+        dynamic_guard = 5.0 * (gap + overhead)
+        guard = max(base_guard, dynamic_guard)
+
+        # Extra slack above guard during which we allow idling when no spot
+        idle_extra = 2.0 * max(3600.0, gap)
+        idle_threshold = guard + idle_extra
+
+        # Once committed to on-demand, never go back to spot
+        if not self._committed_on_demand:
+            if slack <= guard:
+                self._committed_on_demand = True
+
+        if self._committed_on_demand:
             return ClusterType.ON_DEMAND
 
-        reserve_time = remaining_work + ro + gap
-        latest_safe_start = deadline - reserve_time
-
-        if elapsed >= latest_safe_start:
-            self._force_on_demand = True
-
-        if self._force_on_demand:
-            return ClusterType.ON_DEMAND
-
+        # Not yet committed: use spot when available
         if has_spot:
             return ClusterType.SPOT
 
-        return ClusterType.NONE
-
-    @classmethod
-    def _from_args(cls, parser):
-        args, _ = parser.parse_known_args()
-        return cls(args)
+        # No spot: decide whether to idle or use on-demand based on slack
+        if slack > idle_threshold:
+            return ClusterType.NONE
+        else:
+            return ClusterType.ON_DEMAND

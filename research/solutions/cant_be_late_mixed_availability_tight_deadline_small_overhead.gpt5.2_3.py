@@ -1,16 +1,14 @@
-import argparse
-import json
-import os
-from typing import Any, Optional
+import math
+from typing import Any
 
 from sky_spot.strategies.strategy import Strategy
 from sky_spot.utils import ClusterType
 
 
 class Solution(Strategy):
-    NAME = "slack_guard_v1"
+    NAME = "cant_be_late_v1"
 
-    def __init__(self, args: Optional[Any] = None):
+    def __init__(self, args=None):
         try:
             super().__init__(args)
         except TypeError:
@@ -18,234 +16,122 @@ class Solution(Strategy):
                 super().__init__()
             except Exception:
                 pass
-        self._cfg = {
-            "min_buffer_seconds": 600.0,
-        }
-        self._reset_runtime_state()
 
-    def _reset_runtime_state(self):
-        self._initialized = False
-        self._committed_od = False
-        self._steps = 0
-        self._spot_available_steps = 0
-        self._interruptions = 0
-        self._spot_available_streak = 0
-        self._spot_unavailable_streak = 0
-        self._last_elapsed = None
-        self._last_done = None
-        self._min_start_streak = 1
+        self._total_steps = 0
+        self._spot_up_steps = 0
+        self._prev_has_spot = None
+        self._spot_down_transitions = 0
+
+        self._commit_on_demand = False
 
     def solve(self, spec_path: str) -> "Solution":
-        # Optional: read JSON config if provided.
-        try:
-            if spec_path and os.path.isfile(spec_path):
-                with open(spec_path, "r", encoding="utf-8") as f:
-                    txt = f.read().strip()
-                if txt:
-                    try:
-                        cfg = json.loads(txt)
-                        if isinstance(cfg, dict):
-                            mb = cfg.get("min_buffer_seconds", None)
-                            if isinstance(mb, (int, float)) and mb > 0:
-                                self._cfg["min_buffer_seconds"] = float(mb)
-                    except Exception:
-                        pass
-        except Exception:
-            pass
-        self._reset_runtime_state()
         return self
 
     @staticmethod
-    def _is_non_decreasing(seq) -> bool:
-        try:
-            prev = None
-            for x in seq:
-                xv = float(x)
-                if prev is not None and xv < prev - 1e-12:
-                    return False
-                prev = xv
-            return True
-        except Exception:
-            return False
-
-    def _get_done_work_seconds(self) -> float:
-        td = float(getattr(self, "task_duration", 0.0) or 0.0)
-        tdt = getattr(self, "task_done_time", None)
-        if not tdt:
+    def _done_work_seconds(task_done_time: Any) -> float:
+        if not task_done_time:
             return 0.0
-
-        # Case: list of segments (start, end)
+        done = 0.0
         try:
-            first = tdt[0]
-            if isinstance(first, (tuple, list)) and len(first) == 2:
-                s = 0.0
-                for seg in tdt:
-                    if isinstance(seg, (tuple, list)) and len(seg) == 2:
-                        a = float(seg[0])
-                        b = float(seg[1])
-                        if b > a:
-                            s += (b - a)
-                if s < 0:
-                    s = 0.0
-                return min(td, s)
+            for x in task_done_time:
+                if isinstance(x, (int, float)):
+                    done += float(x)
+                elif isinstance(x, (tuple, list)) and len(x) >= 2:
+                    a, b = x[0], x[1]
+                    if isinstance(a, (int, float)) and isinstance(b, (int, float)):
+                        done += max(0.0, float(b) - float(a))
+                elif isinstance(x, dict):
+                    if "duration" in x and isinstance(x["duration"], (int, float)):
+                        done += float(x["duration"])
+                    elif "start" in x and "end" in x and isinstance(x["start"], (int, float)) and isinstance(
+                        x["end"], (int, float)
+                    ):
+                        done += max(0.0, float(x["end"]) - float(x["start"]))
         except Exception:
-            pass
-
-        gap = float(getattr(getattr(self, "env", None), "gap_seconds", 0.0) or 0.0)
-
-        # Case: numeric list
-        s = None
-        try:
-            s = float(sum(float(x) for x in tdt))
-        except Exception:
-            s = None
-
-        c = None
-        if gap > 0:
             try:
-                c = float(len(tdt)) * gap
+                done = float(sum(task_done_time))
             except Exception:
-                c = None
+                done = 0.0
+        return max(0.0, done)
 
-        candidates = []
-        for v in (s, c):
-            if isinstance(v, (int, float)) and v >= 0.0 and v <= td * 1.2:
-                candidates.append(float(v))
-
-        # Case: cumulative done-work series
-        try:
-            last = float(tdt[-1])
-            if last >= 0.0 and last <= td * 1.2 and self._is_non_decreasing(tdt):
-                candidates.append(last)
-        except Exception:
-            pass
-
-        if candidates:
-            return min(td, max(candidates))
-
-        # Fallback
-        best = 0.0
-        for v in (s, c):
-            if isinstance(v, (int, float)) and v > best:
-                best = float(v)
-        if best < 0.0:
-            best = 0.0
-        return min(td, best)
-
-    def _critical_buffer_seconds(self) -> float:
-        env = getattr(self, "env", None)
-        gap = float(getattr(env, "gap_seconds", 0.0) or 0.0)
-        ro = float(getattr(self, "restart_overhead", 0.0) or 0.0)
-
-        base = max(
-            float(self._cfg.get("min_buffer_seconds", 600.0)),
-            3.0 * ro,
-            3.0 * gap,
-        )
-
-        # Add a little extra to account for step discretization and any immediate transition.
-        base += 2.0 * gap
-
-        # Never exceed total slack (if known) by too much; but keep at least base.
-        try:
-            slack_total = float(getattr(self, "deadline", 0.0) or 0.0) - float(getattr(self, "task_duration", 0.0) or 0.0)
-            if slack_total > 0:
-                base = min(base, max(0.75 * slack_total, base))
-        except Exception:
-            pass
-
-        return float(base)
-
-    def _maybe_init(self):
-        if self._initialized:
-            return
-        env = getattr(self, "env", None)
-        gap = float(getattr(env, "gap_seconds", 0.0) or 0.0)
-        ro = float(getattr(self, "restart_overhead", 0.0) or 0.0)
-        if gap > 0 and ro / gap > 0.55:
-            self._min_start_streak = 2
-        else:
-            self._min_start_streak = 1
-        self._initialized = True
+    @staticmethod
+    def _wilson_lower_bound(p: float, n: int, z: float) -> float:
+        if n <= 0:
+            return 0.0
+        denom = 1.0 + (z * z) / n
+        center = p + (z * z) / (2.0 * n)
+        rad = z * math.sqrt(max(0.0, (p * (1.0 - p)) / n + (z * z) / (4.0 * n * n)))
+        return max(0.0, (center - rad) / denom)
 
     def _step(self, last_cluster_type: ClusterType, has_spot: bool) -> ClusterType:
-        self._maybe_init()
+        self._total_steps += 1
+        if has_spot:
+            self._spot_up_steps += 1
 
-        env = self.env
-        elapsed = float(getattr(env, "elapsed_seconds", 0.0) or 0.0)
-        gap = float(getattr(env, "gap_seconds", 0.0) or 0.0)
+        if self._prev_has_spot is not None and self._prev_has_spot and (not has_spot):
+            self._spot_down_transitions += 1
+        self._prev_has_spot = has_spot
+
+        elapsed = float(getattr(self.env, "elapsed_seconds", 0.0) or 0.0)
+        gap = float(getattr(self.env, "gap_seconds", 0.0) or 0.0)
         deadline = float(getattr(self, "deadline", 0.0) or 0.0)
-        ro = float(getattr(self, "restart_overhead", 0.0) or 0.0)
+        task_duration = float(getattr(self, "task_duration", 0.0) or 0.0)
+        restart_overhead = float(getattr(self, "restart_overhead", 0.0) or 0.0)
 
-        done = self._get_done_work_seconds()
-        if self._last_elapsed is not None:
-            # Detect new episode/reset.
-            if elapsed + 1e-9 < float(self._last_elapsed):
-                self._reset_runtime_state()
-                self._maybe_init()
-                elapsed = float(getattr(env, "elapsed_seconds", 0.0) or 0.0)
-                done = self._get_done_work_seconds()
-            else:
-                # Also reset if done decreases significantly.
-                if self._last_done is not None and done + 1e-6 < float(self._last_done):
-                    self._reset_runtime_state()
-                    self._maybe_init()
-                    elapsed = float(getattr(env, "elapsed_seconds", 0.0) or 0.0)
-                    done = self._get_done_work_seconds()
+        done = self._done_work_seconds(getattr(self, "task_done_time", None))
+        work_left = max(0.0, task_duration - done)
+        time_left = max(0.0, deadline - elapsed)
 
-        self._last_elapsed = elapsed
-        self._last_done = done
-
-        td = float(getattr(self, "task_duration", 0.0) or 0.0)
-        remaining_work = max(0.0, td - done)
-
-        # If finished (or extremely close), stop spending.
-        if remaining_work <= max(1e-6, 0.1 * gap):
+        if work_left <= 1e-9:
             return ClusterType.NONE
 
-        remaining_time = max(0.0, deadline - elapsed)
-        slack_remaining = remaining_time - remaining_work
+        if time_left <= 1e-9:
+            return ClusterType.NONE
 
-        self._steps += 1
-        if has_spot:
-            self._spot_available_steps += 1
-            self._spot_available_streak += 1
-            self._spot_unavailable_streak = 0
-        else:
-            self._spot_unavailable_streak += 1
-            self._spot_available_streak = 0
+        slack_if_od = time_left - work_left
 
-        if last_cluster_type == ClusterType.SPOT and not has_spot:
-            self._interruptions += 1
+        n = self._total_steps
+        p_hat = self._spot_up_steps / n if n > 0 else 0.5
+        p_low = self._wilson_lower_bound(p_hat, n, z=1.28) if n > 0 else 0.5
 
-        buffer = self._critical_buffer_seconds()
+        p_low = min(0.98, max(0.05, p_low))
 
-        # Hard feasibility guard: if we cannot afford any more non-progress time, commit to on-demand.
-        # Include a bit for (re)start overhead and discretization.
-        if slack_remaining <= buffer or remaining_time <= remaining_work + ro + 2.0 * gap:
-            self._committed_od = True
+        denom_t = max(elapsed, max(gap, 1.0))
+        trans_rate = self._spot_down_transitions / denom_t
+        expected_restarts_remaining = trans_rate * time_left
+        expected_overhead_remaining = expected_restarts_remaining * restart_overhead
 
-        if self._committed_od:
+        overhead_buffer = min(2.0 * 3600.0, 1.5 * expected_overhead_remaining + 2.0 * restart_overhead + max(gap, 0.0))
+
+        commit_slack = max(0.5 * 3600.0, 10.0 * restart_overhead + 2.0 * max(gap, 0.0))
+        hard_commit_slack = max(0.15 * 3600.0, 4.0 * restart_overhead + 2.0 * max(gap, 0.0))
+
+        if not self._commit_on_demand:
+            if slack_if_od <= hard_commit_slack:
+                self._commit_on_demand = True
+            else:
+                if slack_if_od <= (overhead_buffer + commit_slack) and p_hat < 0.25 and n > 24:
+                    self._commit_on_demand = True
+
+        if self._commit_on_demand:
             return ClusterType.ON_DEMAND
 
+        required_fraction = work_left / time_left if time_left > 0 else 1.0
+        need_progress_when_no_spot = (work_left + overhead_buffer) > (p_low * time_left)
+
         if has_spot:
-            # If we're already on spot, keep running.
-            if last_cluster_type == ClusterType.SPOT:
-                return ClusterType.SPOT
-
-            # Optional: avoid starting on the very first step of a new availability burst when overhead is large,
-            # unless slack is tight enough that we must take any opportunity.
-            if self._min_start_streak > 1 and self._spot_available_streak < self._min_start_streak and slack_remaining > 2.0 * buffer:
-                return ClusterType.NONE
-
+            if last_cluster_type == ClusterType.ON_DEMAND:
+                switch_back_slack = max(1.5 * 3600.0, 20.0 * restart_overhead + 3.0 * max(gap, 0.0))
+                if slack_if_od <= switch_back_slack:
+                    return ClusterType.ON_DEMAND
             return ClusterType.SPOT
-
-        # No spot: wait for spot while slack permits.
-        return ClusterType.NONE
+        else:
+            if need_progress_when_no_spot or required_fraction > (p_low + 0.02):
+                return ClusterType.ON_DEMAND
+            else:
+                return ClusterType.NONE
 
     @classmethod
     def _from_args(cls, parser):
-        if parser is None:
-            parser = argparse.ArgumentParser(add_help=False)
         args, _ = parser.parse_known_args()
         return cls(args)

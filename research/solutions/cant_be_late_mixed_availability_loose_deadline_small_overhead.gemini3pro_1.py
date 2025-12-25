@@ -1,55 +1,61 @@
-import argparse
 from sky_spot.strategies.strategy import Strategy
 from sky_spot.utils import ClusterType
 
 class Solution(Strategy):
-    NAME = "CantBeLateSolution"
+    NAME = "CantBeLate_CostOptimized"
 
     def solve(self, spec_path: str) -> "Solution":
         return self
 
     def _step(self, last_cluster_type: ClusterType, has_spot: bool) -> ClusterType:
-        # Get environment state
+        # Gather current state
         elapsed = self.env.elapsed_seconds
-        gap = self.env.gap_seconds
         deadline = self.deadline
-        task_duration = self.task_duration
-        overhead = self.restart_overhead
-        
-        # Calculate remaining work
-        # task_done_time is a list of durations of completed segments
-        done_work = sum(self.task_done_time)
-        work_remaining = task_duration - done_work
-        
-        # If work is effectively done, stop
-        if work_remaining <= 1e-6:
+        work_done = sum(self.task_done_time)
+        work_remaining = self.task_duration - work_done
+        gap = self.env.gap_seconds
+
+        # If task is completed (allow for small float epsilon)
+        if work_remaining <= 1e-7:
             return ClusterType.NONE
-            
+
         time_remaining = deadline - elapsed
-        
-        # Safety Logic ("Panic Mode"):
-        # We must ensure we have enough time to finish the remaining work using On-Demand instances.
-        # We assume the worst case: we might need to pay the restart overhead to switch/start OD.
-        # We add a safety buffer of 2 * gap_seconds to account for the discrete time steps
-        # and ensure we don't cross the point of no return between steps.
-        
-        safety_buffer = 2.0 * gap
-        min_time_needed_od = work_remaining + overhead + safety_buffer
-        
-        # If we are within the danger zone, we must use On-Demand to guarantee completion.
-        if time_remaining < min_time_needed_od:
-            return ClusterType.ON_DEMAND
+
+        # Calculate the "Latest Start Time" logic for On-Demand (OD)
+        # We must ensure we have enough time to finish using OD, which is reliable.
+        # If we switch to OD from another type, we pay restart overhead.
+        overhead_if_od = 0.0
+        if last_cluster_type != ClusterType.ON_DEMAND:
+            overhead_if_od = self.restart_overhead
             
-        # Cost Optimization Logic:
-        # If we are not in danger (we have slack), we try to minimize cost.
-        
+        time_needed_od = work_remaining + overhead_if_od
+        slack = time_remaining - time_needed_od
+
+        # Safety buffer definition:
+        # We must survive the current step (gap_seconds) without the slack dropping below zero.
+        # If we choose NONE or if SPOT fails, slack decreases by 'gap'.
+        # We use a multiplier (2.5x) to handle discrete time steps and provide a safety margin.
+        safety_buffer = 2.5 * gap
+
+        # Critical Condition: If slack is running out, force On-Demand
+        if slack < safety_buffer:
+            # "Desperate Mode" Optimization:
+            # If switching to OD is impossible (slack < 0) because of the restart overhead,
+            # but we are currently on a SPOT instance (overhead = 0 to continue) and it is available,
+            # we stick with SPOT as the only path to potentially finish.
+            if slack < 0:
+                overhead_if_spot = 0.0 if last_cluster_type == ClusterType.SPOT else self.restart_overhead
+                if has_spot and time_remaining > (work_remaining + overhead_if_spot):
+                    return ClusterType.SPOT
+            
+            # Default safe action in critical zone
+            return ClusterType.ON_DEMAND
+
+        # Safe Condition: Optimize for cost
         if has_spot:
-            # Spot is significantly cheaper (~$0.97 vs ~$3.06), so use it if available.
             return ClusterType.SPOT
         else:
-            # If Spot is unavailable but we still have slack, we choose NONE (wait).
-            # This incurs $0 cost. Running OD here would be a waste of money since
-            # we are not yet forced to do so by the deadline constraint.
+            # If Spot is unavailable but we have plenty of slack, wait (NONE) to save money.
             return ClusterType.NONE
 
     @classmethod

@@ -1,215 +1,382 @@
 import math
-from typing import Optional
+from typing import Any, Optional
 
 try:
     from sky_spot.strategies.strategy import Strategy
     from sky_spot.utils import ClusterType
 except Exception:  # pragma: no cover
-    from enum import Enum
-
-    class ClusterType(Enum):
-        SPOT = "SPOT"
-        ON_DEMAND = "ON_DEMAND"
-        NONE = "NONE"
-
-    class _DummyEnv:
-        elapsed_seconds = 0.0
-        gap_seconds = 60.0
-        cluster_type = ClusterType.NONE
-
-    class Strategy:
-        def __init__(self, *args, **kwargs):
-            self.env = _DummyEnv()
+    class Strategy:  # minimal fallback
+        def __init__(self, args=None):
+            self.args = args
+            self.env = type("Env", (), {"elapsed_seconds": 0.0, "gap_seconds": 1.0, "cluster_type": None})()
             self.task_duration = 0.0
             self.task_done_time = []
             self.deadline = 0.0
             self.restart_overhead = 0.0
 
+    class ClusterType:
+        SPOT = "SPOT"
+        ON_DEMAND = "ON_DEMAND"
+        NONE = "NONE"
+
 
 class Solution(Strategy):
-    NAME = "cant_be_late_adaptive_v1"
+    NAME = "cant_be_late_v1"
 
-    def __init__(self, *args, **kwargs):
+    def __init__(self, args=None):
         try:
-            super().__init__(*args, **kwargs)
+            super().__init__(args)
         except TypeError:
             try:
                 super().__init__()
             except Exception:
                 pass
-        self._reset_state()
 
-    def _reset_state(self):
-        self._last_has_spot_seen: Optional[bool] = None
-        self._streak_is_up: Optional[bool] = None
-        self._streak_len_steps: int = 0
+        self._prev_elapsed_raw: Optional[float] = None
+        self._time_scale: float = 1.0
 
-        self._total_steps: int = 0
-        self._up_steps: int = 0
-        self._down_steps: int = 0
-        self._up_to_down: int = 0
-        self._down_to_up: int = 0
+        # Availability statistics
+        self._steps: int = 0
+        self._spot_steps: int = 0
+        self._p_ewma: float = 0.5
+        self._p_ewma_alpha: float = 0.05
+        self._last_has_spot: Optional[bool] = None
+        self._tf_transitions: int = 0
+        self._true_steps_for_hazard: int = 0
+        self._avail_streak: int = 0
+        self._unavail_streak: int = 0
 
-        self._ema_up_steps: Optional[float] = None
-        self._ema_down_steps: Optional[float] = None
-        self._ema_alpha: float = 0.08
+        # Run streak of chosen cluster type
+        self._run_type: Optional[ClusterType] = None
+        self._run_len: int = 0
 
-        self._done_sum: float = 0.0
-        self._done_len: int = 0
+        # OD pacing
+        self._od_debt: float = 0.0
+
+        # Deadline safety mode
+        self._od_lock: bool = False
+
+        # Switching commitment (avoid thrashing during restart overhead)
+        self._commit_type: Optional[ClusterType] = None
+        self._commit_remaining: int = 0
+        self._overhead_steps: int = 1
+
+        # task_done_time cache
+        self._tdt_cache_len: int = 0
+        self._tdt_cache_done: float = 0.0
+        self._tdt_cache_kind: str = "unknown"  # "segments", "cumulative", "increments", "unknown"
 
     def solve(self, spec_path: str) -> "Solution":
         return self
 
-    def _update_trace_stats(self, has_spot: bool):
-        self._total_steps += 1
-        if has_spot:
-            self._up_steps += 1
-        else:
-            self._down_steps += 1
+    @staticmethod
+    def _is_number(x: Any) -> bool:
+        return isinstance(x, (int, float)) and not isinstance(x, bool)
 
-        if self._last_has_spot_seen is None:
-            self._last_has_spot_seen = has_spot
-            self._streak_is_up = has_spot
-            self._streak_len_steps = 1
-            return
+    def _reset_run_state(self) -> None:
+        self._steps = 0
+        self._spot_steps = 0
+        self._p_ewma = 0.5
+        self._last_has_spot = None
+        self._tf_transitions = 0
+        self._true_steps_for_hazard = 0
+        self._avail_streak = 0
+        self._unavail_streak = 0
 
-        if has_spot == self._last_has_spot_seen:
-            self._streak_len_steps += 1
-        else:
-            # close previous streak
-            prev_len = self._streak_len_steps
-            if self._streak_is_up:
-                if self._ema_up_steps is None:
-                    self._ema_up_steps = float(prev_len)
-                else:
-                    self._ema_up_steps = (1.0 - self._ema_alpha) * self._ema_up_steps + self._ema_alpha * float(prev_len)
-                self._up_to_down += 1
+        self._run_type = None
+        self._run_len = 0
+
+        self._od_debt = 0.0
+        self._od_lock = False
+
+        self._commit_type = None
+        self._commit_remaining = 0
+        self._overhead_steps = 1
+
+        self._tdt_cache_len = 0
+        self._tdt_cache_done = 0.0
+        self._tdt_cache_kind = "unknown"
+
+    def _maybe_reset_episode(self) -> None:
+        elapsed_raw = float(getattr(self.env, "elapsed_seconds", 0.0) or 0.0)
+        if self._prev_elapsed_raw is None or elapsed_raw + 1e-12 < self._prev_elapsed_raw:
+            self._reset_run_state()
+
+            gap_raw = float(getattr(self.env, "gap_seconds", 1.0) or 1.0)
+            deadline_raw = float(getattr(self, "deadline", 0.0) or 0.0)
+            task_raw = float(getattr(self, "task_duration", 0.0) or 0.0)
+
+            # Heuristic unit normalization: if values look like hours (gap < 5, horizon < 200)
+            if gap_raw < 5.0 and max(deadline_raw, task_raw) <= 200.0:
+                self._time_scale = 3600.0
             else:
-                if self._ema_down_steps is None:
-                    self._ema_down_steps = float(prev_len)
-                else:
-                    self._ema_down_steps = (1.0 - self._ema_alpha) * self._ema_down_steps + self._ema_alpha * float(prev_len)
-                self._down_to_up += 1
+                self._time_scale = 1.0
 
-            self._last_has_spot_seen = has_spot
-            self._streak_is_up = has_spot
-            self._streak_len_steps = 1
+            overhead_raw = float(getattr(self, "restart_overhead", 0.0) or 0.0)
+            overhead = overhead_raw * self._time_scale
+            gap = gap_raw * self._time_scale
+            if gap <= 1e-9:
+                self._overhead_steps = 1
+            else:
+                self._overhead_steps = max(1, int(math.ceil(max(0.0, overhead) / gap)))
 
-    def _get_done_work(self) -> float:
-        td = getattr(self, "task_done_time", None)
-        if not td:
-            self._done_sum = 0.0
-            self._done_len = 0
+        self._prev_elapsed_raw = elapsed_raw
+
+    def _seg_to_duration(self, seg: Any) -> float:
+        if seg is None:
             return 0.0
+        if self._is_number(seg):
+            return float(seg)
+        if isinstance(seg, (tuple, list)) and len(seg) >= 2 and self._is_number(seg[0]) and self._is_number(seg[1]):
+            return max(0.0, float(seg[1]) - float(seg[0]))
+        if isinstance(seg, dict):
+            if "duration" in seg and self._is_number(seg["duration"]):
+                return max(0.0, float(seg["duration"]))
+            if "start" in seg and "end" in seg and self._is_number(seg["start"]) and self._is_number(seg["end"]):
+                return max(0.0, float(seg["end"]) - float(seg["start"]))
+        return 0.0
 
-        try:
-            n = len(td)
-        except Exception:
-            try:
-                return float(sum(td))
-            except Exception:
+    def _work_done_raw(self) -> float:
+        tdt = getattr(self, "task_done_time", None)
+        if tdt is None:
+            return 0.0
+        if self._is_number(tdt):
+            return max(0.0, float(tdt))
+
+        if isinstance(tdt, list):
+            n = len(tdt)
+            if n == 0:
+                self._tdt_cache_len = 0
+                self._tdt_cache_done = 0.0
+                self._tdt_cache_kind = "unknown"
                 return 0.0
 
-        if n < self._done_len:
-            try:
-                self._done_sum = float(sum(td))
-            except Exception:
-                self._done_sum = 0.0
-            self._done_len = n
-            return self._done_sum
+            # Detect if it's a list of numbers
+            all_nums = all(self._is_number(x) for x in tdt)
+            if all_nums:
+                # Check if it looks cumulative (non-decreasing)
+                k = min(n - 1, 10)
+                nondecreasing = True
+                for i in range(n - k, n - 1):
+                    if float(tdt[i]) > float(tdt[i + 1]) + 1e-12:
+                        nondecreasing = False
+                        break
+                if nondecreasing:
+                    self._tdt_cache_kind = "cumulative"
+                    return max(0.0, float(tdt[-1]))
+                # Otherwise treat as increments
+                if self._tdt_cache_kind != "increments":
+                    self._tdt_cache_kind = "increments"
+                    self._tdt_cache_len = 0
+                    self._tdt_cache_done = 0.0
+                if n < self._tdt_cache_len:
+                    self._tdt_cache_len = 0
+                    self._tdt_cache_done = 0.0
+                for x in tdt[self._tdt_cache_len :]:
+                    self._tdt_cache_done += max(0.0, float(x))
+                self._tdt_cache_len = n
+                return self._tdt_cache_done
 
-        if n > self._done_len:
-            try:
-                self._done_sum += float(sum(td[self._done_len :]))
-            except Exception:
-                try:
-                    self._done_sum = float(sum(td))
-                except Exception:
-                    self._done_sum = 0.0
-            self._done_len = n
+            # Segments or mixed; assume append-only segments
+            if self._tdt_cache_kind != "segments":
+                self._tdt_cache_kind = "segments"
+                self._tdt_cache_len = 0
+                self._tdt_cache_done = 0.0
+            if n < self._tdt_cache_len:
+                self._tdt_cache_len = 0
+                self._tdt_cache_done = 0.0
+            for seg in tdt[self._tdt_cache_len :]:
+                self._tdt_cache_done += self._seg_to_duration(seg)
+            self._tdt_cache_len = n
+            return max(0.0, self._tdt_cache_done)
 
-        return self._done_sum
+        return 0.0
 
-    def _hazard_up_to_down(self) -> float:
-        # Probability that an "up" step ends (up->down) at the next boundary.
-        # Smoothed to avoid early extreme estimates.
-        return (self._up_to_down + 1.0) / (self._up_steps + 2.0)
+    def _update_stats(self, has_spot: bool) -> None:
+        self._steps += 1
+        if has_spot:
+            self._spot_steps += 1
 
-    def _expected_up_seconds(self, gap: float) -> float:
-        h = self._hazard_up_to_down()
-        h = min(0.999, max(0.001, h))
-        exp_up_steps = (1.0 - h) / h
-        return exp_up_steps * gap
+        x = 1.0 if has_spot else 0.0
+        self._p_ewma = (1.0 - self._p_ewma_alpha) * self._p_ewma + self._p_ewma_alpha * x
 
-    def _buffers(self, remaining: float, gap: float, overhead: float) -> tuple[float, float, float, float]:
-        # base_buffer: always keep some headroom for at least a few restarts + discretization
-        base_buffer = max(2.0 * gap, 6.0 * overhead, 120.0)
+        if self._last_has_spot is True:
+            self._true_steps_for_hazard += 1
+            if not has_spot:
+                self._tf_transitions += 1
 
-        h = self._hazard_up_to_down()
-        steps_needed = remaining / max(gap, 1e-9)
-        expected_restarts = h * steps_needed
-        expected_overhead = expected_restarts * overhead
+        if has_spot:
+            self._avail_streak = self._avail_streak + 1
+            self._unavail_streak = 0
+        else:
+            self._unavail_streak = self._unavail_streak + 1
+            self._avail_streak = 0
 
-        min_slack_needed = expected_overhead + base_buffer
+        self._last_has_spot = has_spot
 
-        reserve_wait = max(gap, 2.0 * overhead, 60.0)
-        urgent_slack = max(4.0 * overhead + gap, base_buffer * 0.75)
+    def _update_run_streak(self, last_cluster_type: ClusterType) -> None:
+        if self._run_type is None:
+            self._run_type = last_cluster_type
+            self._run_len = 1
+            return
+        if last_cluster_type == self._run_type:
+            self._run_len += 1
+        else:
+            self._run_type = last_cluster_type
+            self._run_len = 1
 
-        return min_slack_needed, reserve_wait, urgent_slack, expected_overhead
+    def _maybe_force_commitment(self, has_spot: bool) -> Optional[ClusterType]:
+        if self._od_lock and self._commit_type is not None and self._commit_type != ClusterType.ON_DEMAND:
+            self._commit_type = None
+            self._commit_remaining = 0
+
+        if self._commit_remaining <= 0 or self._commit_type is None:
+            return None
+
+        if self._commit_type == ClusterType.ON_DEMAND:
+            self._commit_remaining -= 1
+            return ClusterType.ON_DEMAND
+
+        if self._commit_type == ClusterType.SPOT:
+            if has_spot:
+                self._commit_remaining -= 1
+                return ClusterType.SPOT
+            self._commit_type = None
+            self._commit_remaining = 0
+            return None
+
+        self._commit_type = None
+        self._commit_remaining = 0
+        return None
+
+    def _set_commitment_if_switch(self, last_cluster_type: ClusterType, new_type: ClusterType) -> None:
+        if new_type in (ClusterType.SPOT, ClusterType.ON_DEMAND) and new_type != last_cluster_type:
+            self._commit_type = new_type
+            self._commit_remaining = max(0, self._overhead_steps)
 
     def _step(self, last_cluster_type: ClusterType, has_spot: bool) -> ClusterType:
-        self._update_trace_stats(has_spot)
+        self._maybe_reset_episode()
+        self._update_stats(has_spot)
+        self._update_run_streak(last_cluster_type)
 
-        elapsed = float(getattr(self.env, "elapsed_seconds", 0.0))
-        gap = float(getattr(self.env, "gap_seconds", 60.0))
-        overhead = float(getattr(self, "restart_overhead", 0.0))
-        deadline = float(getattr(self, "deadline", 0.0))
-        task_duration = float(getattr(self, "task_duration", 0.0))
+        forced = self._maybe_force_commitment(has_spot)
+        if forced is not None:
+            return forced
 
-        done = self._get_done_work()
+        scale = self._time_scale
+        elapsed = float(getattr(self.env, "elapsed_seconds", 0.0) or 0.0) * scale
+        gap = float(getattr(self.env, "gap_seconds", 1.0) or 1.0) * scale
+
+        deadline = float(getattr(self, "deadline", 0.0) or 0.0) * scale
+        task_duration = float(getattr(self, "task_duration", 0.0) or 0.0) * scale
+        overhead = float(getattr(self, "restart_overhead", 0.0) or 0.0) * scale
+
+        done = self._work_done_raw() * scale
         remaining = max(0.0, task_duration - done)
-        if remaining <= 0.0:
+        if remaining <= 1e-9:
             return ClusterType.NONE
 
-        time_left = deadline - elapsed
-        if time_left <= 0.0:
-            return ClusterType.NONE
-
-        slack = time_left - remaining
-
-        min_slack_needed, reserve_wait, urgent_slack, _ = self._buffers(remaining, gap, overhead)
-
-        # Absolute "don't miss" guard: if we cannot afford any extra overhead from a switch,
-        # avoid switching away from a currently-working spot when it is available.
-        if slack <= overhead + gap:
-            if has_spot and last_cluster_type == ClusterType.SPOT:
-                return ClusterType.SPOT
+        time_left = max(0.0, deadline - elapsed)
+        if time_left <= 1e-9:
             return ClusterType.ON_DEMAND
 
-        # Spot unavailable: decide between waiting and on-demand
-        if not has_spot:
+        # Spot availability probability estimate (smoothed + EWMA)
+        alpha = 3.0
+        p_long = (self._spot_steps + alpha) / (self._steps + 2.0 * alpha)
+        p = 0.35 * p_long + 0.65 * self._p_ewma
+        p = min(0.995, max(0.005, p))
+
+        # Hazard of losing spot between steps (based on observed True->False transitions)
+        hazard = (self._tf_transitions + 1.0) / (self._true_steps_for_hazard + 2.0)
+        hazard = min(1.0, max(0.0, hazard))
+
+        # Expected future overhead time due to spot interruptions if we keep using spot when available
+        expected_spot_steps_remaining = (p * time_left) / max(gap, 1e-9)
+        expected_preemptions = hazard * expected_spot_steps_remaining
+        expected_overhead = expected_preemptions * overhead
+
+        safe_remaining = remaining + expected_overhead + overhead  # add one extra restart for safety
+        slack = time_left - safe_remaining
+
+        # Trigger OD lock near deadline (keep running OD to avoid interruption risk)
+        if not self._od_lock:
+            if time_left <= remaining + 6.0 * overhead + 2.0 * gap:
+                self._od_lock = True
+            elif slack <= max(0.0, 2.0 * overhead):
+                self._od_lock = True
+
+        # Hard deadline safety: if too tight, run OD regardless
+        if time_left <= remaining + 2.0 * overhead + gap:
+            if not self._od_lock:
+                self._od_lock = True
+            self._set_commitment_if_switch(last_cluster_type, ClusterType.ON_DEMAND)
+            return ClusterType.ON_DEMAND
+
+        if self._od_lock:
+            self._set_commitment_if_switch(last_cluster_type, ClusterType.ON_DEMAND)
+            return ClusterType.ON_DEMAND
+
+        # Required average work rate from now to finish
+        r = safe_remaining / max(time_left, 1e-9)
+        r = min(2.0, max(0.0, r))
+
+        # Fraction of non-spot time we should cover with OD to meet expected rate
+        denom = max(1e-6, 1.0 - p)
+        f_od_when_no_spot = (r - p) / denom
+        if f_od_when_no_spot < 0.0:
+            f_od_when_no_spot = 0.0
+        elif f_od_when_no_spot > 1.0:
+            f_od_when_no_spot = 1.0
+
+        # Cap OD debt by expected deficit (avoid over-accumulating)
+        expected_spot_work = max(0.0, p * time_left - expected_overhead)
+        max_od_needed = max(0.0, safe_remaining - expected_spot_work)
+        if self._od_debt > max_od_needed:
+            self._od_debt = max_od_needed
+
+        # Decision
+        decision: ClusterType
+
+        if has_spot:
+            # If currently on OD, avoid switching to a very brief spot window.
             if last_cluster_type == ClusterType.ON_DEMAND:
-                return ClusterType.ON_DEMAND
+                # Switch to spot if the window seems stable, else wait 1 step.
+                if self._avail_streak >= 2 or p >= 0.55:
+                    decision = ClusterType.SPOT
+                else:
+                    decision = ClusterType.ON_DEMAND
+            else:
+                decision = ClusterType.SPOT
 
-            # Spend slack only if we are above a conservative overhead budget.
-            if slack > (min_slack_needed + reserve_wait):
-                return ClusterType.NONE
-            return ClusterType.ON_DEMAND
+            # Slightly decay debt during spot time (conditions improved)
+            self._od_debt *= 0.98
 
-        # Spot available: decide between spot and on-demand
-        # When slack is very small, prioritize reliability unless switching would itself be too costly.
-        if slack <= urgent_slack:
-            if last_cluster_type == ClusterType.SPOT:
-                return ClusterType.SPOT
-            return ClusterType.ON_DEMAND
+        else:
+            # If we are already on OD, keep it for a minimum run to reduce thrash.
+            min_od_run = max(1, self._overhead_steps)
+            if last_cluster_type == ClusterType.ON_DEMAND and self._run_len < min_od_run:
+                decision = ClusterType.ON_DEMAND
+            else:
+                # Update debt and decide OD vs NONE during no-spot time
+                debt_if_none = self._od_debt + f_od_when_no_spot * gap
+                # If slack is getting smaller, be more aggressive.
+                threshold = 0.5 * gap
+                if slack <= 2.0 * 3600.0:  # 2 hours, in seconds scale (or scaled from hours)
+                    threshold = 0.2 * gap
 
-        # If we are on-demand and spot seems extremely unstable, avoid flip-flopping.
-        if last_cluster_type == ClusterType.ON_DEMAND:
-            exp_up = self._expected_up_seconds(gap)
-            if exp_up < 2.0 * overhead and slack <= (min_slack_needed + 2.0 * reserve_wait):
-                return ClusterType.ON_DEMAND
+                if debt_if_none >= threshold:
+                    decision = ClusterType.ON_DEMAND
+                    self._od_debt = max(0.0, debt_if_none - gap)
+                else:
+                    decision = ClusterType.NONE
+                    self._od_debt = debt_if_none
 
-        return ClusterType.SPOT
+        # Enforce API constraint
+        if decision == ClusterType.SPOT and not has_spot:
+            decision = ClusterType.ON_DEMAND
+
+        self._set_commitment_if_switch(last_cluster_type, decision)
+        return decision
 
     @classmethod
     def _from_args(cls, parser):

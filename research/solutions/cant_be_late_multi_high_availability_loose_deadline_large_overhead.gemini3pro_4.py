@@ -6,8 +6,7 @@ from sky_spot.utils import ClusterType
 
 
 class Solution(MultiRegionStrategy):
-    """Multi-region scheduling strategy that prioritizes Spot instances but 
-    falls back to On-Demand to guarantee meeting the deadline."""
+    """Your multi-region scheduling strategy."""
 
     NAME = "cant_be_late_strategy"
 
@@ -25,37 +24,89 @@ class Solution(MultiRegionStrategy):
         return self
 
     def _step(self, last_cluster_type: ClusterType, has_spot: bool) -> ClusterType:
-        # Calculate current progress and constraints
-        done_time = sum(self.task_done_time)
-        work_remaining = self.task_duration - done_time
-        time_remaining = self.deadline - self.env.elapsed_seconds
-
-        # Panic Threshold Calculation
-        # We switch to On-Demand if the remaining time is close to the minimum time required.
-        # min_time_needed includes:
-        # 1. Actual work remaining
-        # 2. Restart overhead (assumed incurred if we switch to OD)
-        # 3. Safety buffer (2.5x step size) to handle discrete timesteps and ensure we don't 
-        #    miss the deadline due to off-by-one errors or minor delays.
+        """
+        Decide next action based on current state.
+        """
+        elapsed = self.env.elapsed_seconds
+        work_done = sum(self.task_done_time)
+        work_remaining = self.task_duration - work_done
         
-        safety_buffer = 2.5 * self.env.gap_seconds
-        min_time_needed = work_remaining + self.restart_overhead + safety_buffer
+        # If task is practically completed
+        if work_remaining <= 1e-6:
+            return ClusterType.NONE
 
-        if time_remaining < min_time_needed:
+        time_remaining = self.deadline - elapsed
+        gap = self.env.gap_seconds
+        
+        # Determine overhead cost if we were to switch to OD right now.
+        # If already OD, no new overhead to continue OD.
+        # If SPOT or NONE, we would pay overhead to start OD.
+        overhead_cost = 0.0
+        if last_cluster_type != ClusterType.ON_DEMAND:
+            overhead_cost = self.restart_overhead
+
+        # Calculate safety buffer
+        # We need:
+        # 1. Time to do the work (work_remaining)
+        # 2. Time for overhead (if we switch)
+        # 3. Buffer for step granularity (we commit for 'gap')
+        # 4. Extra margin for safety to avoid missing deadline
+        # Buffer = 2 steps + margin relative to overhead
+        safety_margin = 2.0 * gap + max(overhead_cost * 2, gap)
+        
+        # The threshold of remaining time below which we must run On-Demand to be safe
+        panic_threshold = work_remaining + overhead_cost + safety_margin
+        
+        # Priority 1: Meet Deadline (Panic Mode)
+        # If we are close to the point of no return, force On-Demand
+        if time_remaining < panic_threshold:
             return ClusterType.ON_DEMAND
 
-        # If we have sufficient slack, we prioritize Spot instances to save cost.
+        # Priority 2: Use Spot if available
         if has_spot:
+            # If we are currently ON_DEMAND, check if it's safe to switch back to SPOT
+            if last_cluster_type == ClusterType.ON_DEMAND:
+                # Switching OD -> Spot incurs overhead and risk.
+                # Only switch if we have substantial slack.
+                # Threshold: panic_threshold + extra buffer (e.g., 4x overhead)
+                switch_back_buffer = 4.0 * self.restart_overhead
+                if time_remaining > panic_threshold + switch_back_buffer:
+                    return ClusterType.SPOT
+                else:
+                    return ClusterType.ON_DEMAND
+            
+            # If not OD, definitely use Spot
             return ClusterType.SPOT
 
-        # If Spot is unavailable in the current region, we switch to the next region.
-        # We iterate through regions in a round-robin fashion.
-        num_regions = self.env.get_num_regions()
-        current_region = self.env.get_current_region()
-        next_region = (current_region + 1) % num_regions
-        
-        self.env.switch_region(next_region)
+        # Priority 3: Spot unavailable in current region -> Search Strategy
+        else:
+            # If we are currently ON_DEMAND, we are safe but paying high cost.
+            # Only search for Spot if we have very high slack to justify switching costs/risks.
+            if last_cluster_type == ClusterType.ON_DEMAND:
+                # Search implies: Switch Region (overhead reset) -> Wait Gap -> Try Spot
+                # This wastes time. We need lots of slack.
+                search_buffer = 10.0 * gap
+                if time_remaining > panic_threshold + search_buffer:
+                    # High slack, try to find Spot elsewhere
+                    pass # Proceed to switch logic below
+                else:
+                    return ClusterType.ON_DEMAND
 
-        # After switching, we don't know the Spot status of the new region for the current 
-        # timestep. We return NONE to avoid errors and check status in the next step.
-        return ClusterType.NONE
+            # Switch Logic: Move to next region and wait
+            # We assume round-robin search.
+            
+            # Check if we have enough time to search
+            # Searching costs at least 1 gap (waiting in new region to check spot) + eventual overhead
+            min_search_cost = 2.0 * gap + self.restart_overhead
+            
+            if time_remaining > panic_threshold + min_search_cost:
+                current_region = self.env.get_current_region()
+                num_regions = self.env.get_num_regions()
+                next_region = (current_region + 1) % num_regions
+                self.env.switch_region(next_region)
+                # We switched region, so we must return NONE (or OD) for this step.
+                # We return NONE to wait and check has_spot in the next step.
+                return ClusterType.NONE
+            else:
+                # Not enough time to search, fallback to OD
+                return ClusterType.ON_DEMAND

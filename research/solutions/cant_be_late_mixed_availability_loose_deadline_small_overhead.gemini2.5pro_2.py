@@ -2,56 +2,53 @@ import argparse
 from sky_spot.strategies.strategy import Strategy
 from sky_spot.utils import ClusterType
 
-
 class Solution(Strategy):
-    NAME = "adaptive_rate_scheduler"
+    NAME = "my_solution"
 
     def solve(self, spec_path: str) -> "Solution":
-        self.last_work_done: float = 0.0
-        self.spot_time_chosen: float = 0.0
-        self.spot_progress_total: float = 0.0
-        
-        # Optimistic prior: 10 minutes of trial, 9 minutes of progress
-        # Effective rate starts at 0.9
-        self.prior_spot_time: float = 600.0
-        self.prior_spot_progress: float = 540.0
-        
+        self._work_done_cache: float = 0.0
+        self._last_len_task_done_time: int = 0
+        self._constant_safety_buffer: float = 120.0
         return self
 
+    def _get_work_done(self) -> float:
+        num_segments = len(self.task_done_time)
+        if num_segments > self._last_len_task_done_time:
+            new_segments = self.task_done_time[self._last_len_task_done_time:]
+            self._work_done_cache += sum(end - start for start, end in new_segments)
+            self._last_len_task_done_time = num_segments
+        return self._work_done_cache
+
     def _step(self, last_cluster_type: ClusterType, has_spot: bool) -> ClusterType:
-        current_work_done = sum(end - start for start, end in self.task_done_time)
-        progress_last_step = current_work_done - self.last_work_done
+        work_done = self._get_work_done()
+        work_remaining = self.task_duration - work_done
 
-        if last_cluster_type == ClusterType.SPOT:
-            self.spot_time_chosen += self.env.gap_seconds
-            if progress_last_step > 0:
-                self.spot_progress_total += progress_last_step
-
-        work_rem = self.task_duration - current_work_done
-        if work_rem <= 0:
+        if work_remaining <= 1e-9:
             return ClusterType.NONE
 
-        current_time = self.env.elapsed_seconds
-        time_to_deadline = self.deadline - current_time
+        time_to_deadline = self.deadline - self.env.elapsed_seconds
 
-        numerator = self.spot_progress_total + self.prior_spot_progress
-        denominator = self.spot_time_chosen + self.prior_spot_time
-        
-        effective_spot_rate = numerator / denominator if denominator > 0 else 0
+        # The safety margin represents the time lost in a worst-case failure
+        # (a preemption), which includes the wasted time step and the subsequent
+        # restart overhead period.
+        safety_margin = (self.restart_overhead +
+                         self.env.gap_seconds +
+                         self._constant_safety_buffer)
 
-        if time_to_deadline <= 1e-6: # Avoid division by zero or tiny numbers
-            required_rate = float('inf')
+        # If the remaining work requires more time than we have left before the
+        # deadline (minus our safety margin), we must use the reliable
+        # On-Demand instance to guarantee progress.
+        if work_remaining >= time_to_deadline - safety_margin:
+            return ClusterType.ON_DEMAND
         else:
-            required_rate = work_rem / time_to_deadline
-
-        if has_spot and effective_spot_rate >= required_rate:
-            decision = ClusterType.SPOT
-        else:
-            decision = ClusterType.ON_DEMAND
-        
-        self.last_work_done = current_work_done
-
-        return decision
+            # We have enough slack. We can afford to use cheaper options.
+            if has_spot:
+                # Spot is available and is the cheapest way to make progress.
+                return ClusterType.SPOT
+            else:
+                # Spot is unavailable. Waiting (NONE) is cheaper than On-Demand,
+                # and our safety check ensures we have enough slack to wait.
+                return ClusterType.NONE
 
     @classmethod
     def _from_args(cls, parser):

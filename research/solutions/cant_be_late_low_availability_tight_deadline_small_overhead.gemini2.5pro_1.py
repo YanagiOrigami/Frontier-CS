@@ -1,96 +1,102 @@
-import argparse
-
+import collections
 from sky_spot.strategies.strategy import Strategy
 from sky_spot.utils import ClusterType
 
-
 class Solution(Strategy):
-    NAME = "my_solution"
+    NAME = "AdaptiveJIT"
+
+    def __init__(self, args):
+        super().__init__(args)
+        self.args = args
+        self.history = None
+        self.p_hat = 0.0
 
     def solve(self, spec_path: str) -> "Solution":
         """
-        Optional initialization. Called once before evaluation.
-        Read spec_path for configuration if needed.
-        Must return self.
+        Initializes the strategy's parameters and state.
         """
-        # This multiplier determines how much slack we need before we are willing
-        # to wait for a spot instance (using NONE) rather than using a costly
-        # on-demand instance. A higher value means we are more patient, saving
-        # money at the risk of running out of time. Given the high cost of
-        # on-demand (~3x spot), a relatively high patience level is beneficial.
-        self.WAIT_BUFFER_MULTIPLIER = 15.0
+        # Tunable parameters from command-line arguments or defaults
+        self.HISTORY_WINDOW_SIZE = getattr(self.args, 'history_window_size', 120)
+        self.BUFFER_WAIT_MULTIPLIER = getattr(self.args, 'buffer_wait_multiplier', 2.0)
+        self.BUFFER_RESTART_MULTIPLIER = getattr(self.args, 'buffer_restart_multiplier', 3.0)
+        self.MIN_BUFFER_S = getattr(self.args, 'min_buffer_s', 600)
+        self.INITIAL_P_HAT = getattr(self.args, 'initial_p_hat', 0.22)
+
+        # State variables
+        self.history = collections.deque(maxlen=self.HISTORY_WINDOW_SIZE)
+        self.p_hat = self.INITIAL_P_HAT
         return self
 
     def _step(self, last_cluster_type: ClusterType, has_spot: bool) -> ClusterType:
         """
-        Called at each time step. Return which cluster type to use next.
-
-        Args:
-            last_cluster_type: The cluster type used in the previous step
-            has_spot: Whether spot instances are available this step
-
-        Returns:
-            ClusterType.SPOT, ClusterType.ON_DEMAND, or ClusterType.NONE
+        Implements the decision logic for each timestep.
+        The strategy is a "Just-In-Time" approach with an adaptive safety buffer.
         """
-        # Calculate the total work completed so far and the work remaining.
-        work_done = sum(self.task_done_time)
-        work_remaining = self.task_duration - work_done
-
-        # If the job is finished, we don't need any resources.
+        # 1. Check for task completion
+        work_remaining = self.get_work_remaining_seconds()
         if work_remaining <= 0:
             return ClusterType.NONE
 
-        # Calculate the time remaining until the hard deadline.
-        time_to_deadline = self.deadline - self.env.elapsed_seconds
+        # 2. Update state: estimate spot availability
+        self.history.append(1 if has_spot else 0)
+        if len(self.history) > 10:  # Wait for sufficient data before updating
+            self.p_hat = sum(self.history) / len(self.history)
 
-        # If the remaining work is more than the time left, we cannot possibly
-        # finish. The best we can do is run on-demand to minimize how much we
-        # miss the deadline by.
-        if time_to_deadline < work_remaining:
-            return ClusterType.ON_DEMAND
+        # 3. Calculate current situation
+        time_elapsed = self.env.elapsed_seconds
+        time_left_to_deadline = self.deadline - time_elapsed
 
-        # Slack is the critical metric: it's the extra time we have beyond the
-        # bare minimum required to finish the job using on-demand instances.
-        slack = time_to_deadline - work_remaining
+        # Slack: The time we can afford to idle and still finish by the deadline
+        # using On-Demand instances exclusively from that point on.
+        slack = time_left_to_deadline - work_remaining
 
-        # The cost of a spot preemption is the time lost from the failed step
-        # plus the restart overhead. This forms our "panic" threshold.
-        cost_of_preemption = self.restart_overhead + self.env.gap_seconds
+        # 4. Calculate adaptive safety buffer
+        # This buffer represents the minimum slack we want to maintain.
 
-        # PANIC MODE: If our slack is less than the cost of a single preemption,
-        # we cannot afford the risk of using a spot instance. We must use the
-        # guaranteed on-demand instance to ensure progress.
-        if slack < cost_of_preemption:
-            return ClusterType.ON_DEMAND
+        # a) Buffer for potential future restart overheads
+        restart_buffer = self.BUFFER_RESTART_MULTIPLIER * self.restart_overhead
 
-        # If we reach here, we have enough slack to tolerate at least one preemption.
-
-        if has_spot:
-            # Spot is available and we have a sufficient safety margin.
-            # This is the most cost-effective choice.
-            return ClusterType.SPOT
+        # b) Buffer for expected wait time until a Spot instance is available
+        wait_buffer = 0
+        if self.p_hat > 0.01: # Avoid division by zero or near-zero
+            expected_wait_time = (1.0 / self.p_hat) * self.env.gap_seconds
+            wait_buffer = self.BUFFER_WAIT_MULTIPLIER * expected_wait_time
         else:
-            # Spot is not available. The choice is between waiting (NONE) and
-            # making expensive progress (ON_DEMAND).
+            # If observed availability is very low, use a large fixed buffer
+            wait_buffer = 3600
 
-            # We define a "wait buffer," a larger slack threshold. If our slack
-            # is above this, we can afford to wait for spot to become available.
-            wait_buffer = self.WAIT_BUFFER_MULTIPLIER * cost_of_preemption
+        # c) The total buffer is a combination of the above, with a minimum floor
+        buffer = max(self.MIN_BUFFER_S, restart_buffer + wait_buffer)
 
-            if slack > wait_buffer:
-                # We have ample slack. It's better to wait for a cheap spot
-                # instance than to pay for an expensive on-demand one.
-                return ClusterType.NONE
+        # 5. Make decision based on slack vs. buffer
+        if slack <= buffer:
+            # Slack has depleted into our safety margin.
+            # Switch to On-Demand for guaranteed progress.
+            return ClusterType.ON_DEMAND
+        else:
+            # We have enough slack to take risks for cost savings.
+            if has_spot:
+                # Use the cheap Spot instance when available.
+                return ClusterType.SPOT
             else:
-                # Our slack is no longer large enough to wait comfortably.
-                # The risk of burning too much time is high, so we must make
-                # progress using an on-demand instance.
-                return ClusterType.ON_DEMAND
+                # Wait (idle) for a Spot instance to become available.
+                return ClusterType.NONE
 
     @classmethod
-    def _from_args(cls, parser: argparse.ArgumentParser):  # REQUIRED: For evaluator instantiation
+    def _from_args(cls, parser):
         """
-        Instantiates the strategy from command-line arguments.
+        Defines command-line arguments for tuning the strategy.
         """
+        parser.add_argument("--history-window-size", type=int, default=120,
+                            help="Number of past steps to estimate spot availability.")
+        parser.add_argument("--buffer-wait-multiplier", type=float, default=2.0,
+                            help="Multiplier for expected spot wait time in buffer calc.")
+        parser.add_argument("--buffer-restart-multiplier", type=float, default=3.0,
+                            help="Multiplier for restart overhead in buffer calc.")
+        parser.add_argument("--min-buffer-s", type=int, default=600,
+                            help="Minimum safety buffer in seconds.")
+        parser.add_argument("--initial-p-hat", type=float, default=0.22,
+                            help="Initial guess for spot availability probability.")
+
         args, _ = parser.parse_known_args()
         return cls(args)

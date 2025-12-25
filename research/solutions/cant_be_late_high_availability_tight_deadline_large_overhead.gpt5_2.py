@@ -1,90 +1,75 @@
-import sys
-from typing import Any
-
-try:
-    from sky_spot.strategies.strategy import Strategy
-    from sky_spot.utils import ClusterType
-except Exception:  # Fallback stubs for non-eval environments
-    from enum import Enum
-
-    class ClusterType(Enum):
-        SPOT = 1
-        ON_DEMAND = 2
-        NONE = 3
-
-    class Strategy:  # type: ignore
-        def __init__(self, *args, **kwargs) -> None:
-            pass
-
-        def solve(self, spec_path: str):
-            return self
+from sky_spot.strategies.strategy import Strategy
+from sky_spot.utils import ClusterType
 
 
 class Solution(Strategy):
-    NAME = "lazy_fallback_to_od_v1"
-
-    def __init__(self, args: Any = None) -> None:
-        try:
-            super().__init__(args)
-        except Exception:
-            try:
-                super().__init__()
-            except Exception:
-                pass
-        self.args = args
-        self._committed_to_on_demand = False
+    NAME = "slack_guard_wait_spot"
 
     def solve(self, spec_path: str) -> "Solution":
         return self
 
+    def _reset_episode_state(self):
+        self._committed_on_demand = False
+
     def _remaining_work(self) -> float:
-        total = getattr(self, "task_duration", 0.0) or 0.0
-        done_list = getattr(self, "task_done_time", None)
         done = 0.0
-        if done_list:
+        if hasattr(self, "task_done_time") and self.task_done_time:
             try:
-                done = float(sum(done_list))
+                done = float(sum(self.task_done_time))
             except Exception:
-                try:
-                    done = float(done_list)  # fallback if provided as scalar
-                except Exception:
-                    done = 0.0
-        return max(total - done, 0.0)
-
-    def _should_commit_to_on_demand(self) -> bool:
-        if self._committed_to_on_demand:
-            return True
-
-        # Gather environment info safely
-        now = getattr(self.env, "elapsed_seconds", 0.0) if hasattr(self, "env") else 0.0
-        gap = getattr(self.env, "gap_seconds", 0.0) if hasattr(self, "env") else 0.0
-        deadline = getattr(self, "deadline", 0.0) or 0.0
-        restart = getattr(self, "restart_overhead", 0.0) or 0.0
-
-        remaining = self._remaining_work()
-        slack = deadline - now
-
-        # Safety margin: at least one gap to account for step discretization.
-        # This keeps us from switching too late and missing the deadline by a rounding step.
-        fudge = max(gap, 0.0)
-
-        # If time remaining (slack) is less than or equal to the time needed to complete the job
-        # on on-demand (remaining work + one restart overhead) plus a small fudge, commit to OD.
-        need_on_demand = remaining + restart + fudge
-        return slack <= need_on_demand
+                done = 0.0
+        remaining = max(0.0, float(self.task_duration) - done)
+        return remaining
 
     def _step(self, last_cluster_type: ClusterType, has_spot: bool) -> ClusterType:
-        # Once on on-demand, never switch back (avoid overhead and risk).
-        if self._committed_to_on_demand or self._should_commit_to_on_demand():
-            self._committed_to_on_demand = True
+        # Initialize/reset episode state at the beginning of each episode
+        if not hasattr(self, "_committed_on_demand"):
+            self._reset_episode_state()
+        # Detect new episode by elapsed time near zero
+        if getattr(self.env, "elapsed_seconds", 0.0) <= 1e-9:
+            self._reset_episode_state()
+
+        # If already committed to OD, always continue OD
+        if self._committed_on_demand or last_cluster_type == ClusterType.ON_DEMAND:
+            self._committed_on_demand = True
             return ClusterType.ON_DEMAND
 
-        # Prefer spot when available until we must commit to on-demand.
+        # If task already done, do nothing
+        remaining = self._remaining_work()
+        if remaining <= 0.0:
+            return ClusterType.NONE
+
+        # Core decision logic
+        t = float(self.env.elapsed_seconds)
+        deadline = float(self.deadline)
+        L = max(0.0, deadline - t)  # time left
+        O = float(self.restart_overhead)
+
+        # Safety margins
+        gap = max(1.0, float(self.env.gap_seconds))  # ensure >= 1s
+        switch_margin = max(gap, 300.0)  # at least one step or 5 minutes
+
+        # If we switch to OD now (from not-OD), time needed = overhead + remaining
+        needed_if_switch_now = O + remaining
+        M = L - needed_if_switch_now  # slack if we switch to OD now
+
+        # If we are too close to the deadline, switch to OD immediately
+        if M <= switch_margin:
+            self._committed_on_demand = True
+            return ClusterType.ON_DEMAND
+
+        # Prefer SPOT if available; this maintains slack (R and L decrease together)
         if has_spot:
             return ClusterType.SPOT
 
-        # Spot unavailable; wait if we still have sufficient buffer before needing OD.
-        return ClusterType.NONE
+        # Spot not available: decide to wait or switch to OD
+        # Wait only if we retain at least one more step of cushion beyond switch margin
+        if M >= switch_margin + gap:
+            return ClusterType.NONE
+
+        # Otherwise, commit to OD to ensure completion
+        self._committed_on_demand = True
+        return ClusterType.ON_DEMAND
 
     @classmethod
     def _from_args(cls, parser):

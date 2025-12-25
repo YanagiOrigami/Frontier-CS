@@ -1,77 +1,86 @@
+from typing import Any
 from sky_spot.strategies.strategy import Strategy
 from sky_spot.utils import ClusterType
 
 
 class Solution(Strategy):
-    NAME = "jit_fallback_robust_v1"
+    NAME = "deadline_hedge_v1"
+
+    def __init__(self, args: Any = None):
+        try:
+            super().__init__(args)
+        except TypeError:
+            try:
+                super().__init__()
+            except Exception:
+                pass
+        self.args = args
+        self._locked_to_od = False
 
     def solve(self, spec_path: str) -> "Solution":
-        # Initialize per-episode state
-        self._commit_on_demand = False
-        self._episode_id_marker = None
         return self
 
-    def _reset_episode_if_needed(self):
-        # Reset commit flag at the start of each episode/run
-        # Using elapsed_seconds to detect new episode (assumed to reset to 0)
-        if not hasattr(self, "_episode_id_marker"):
-            self._episode_id_marker = 0
-        # When a new env/run starts, elapsed_seconds should be 0 at the first step
-        if getattr(self.env, "elapsed_seconds", None) is not None and self.env.elapsed_seconds == 0:
-            self._commit_on_demand = False
-            self._episode_id_marker += 1
-
-    def _compute_remaining(self):
-        completed = sum(self.task_done_time) if getattr(self, "task_done_time", None) else 0.0
-        remaining = max(0.0, self.task_duration - completed)
+    def _remaining_work_seconds(self) -> float:
+        done = 0.0
+        try:
+            if self.task_done_time:
+                for seg in self.task_done_time:
+                    done += float(seg)
+        except Exception:
+            try:
+                done = float(self.task_done_time)  # fallback if scalar
+            except Exception:
+                done = 0.0
+        remaining = float(self.task_duration) - done
+        if remaining < 0.0:
+            remaining = 0.0
         return remaining
 
-    def _should_commit_now(self, time_remaining_s, remaining_s, gap_s, overhead_s):
-        # Safety margin to account for discrete steps and any small uncertainties.
-        # Use a conservative margin: at least twice the step, or the overhead (whichever is larger).
-        margin_s = max(2.0 * gap_s, overhead_s)
-        critical_s = remaining_s + overhead_s + margin_s
-        return time_remaining_s <= critical_s
+    def _time_left_seconds(self) -> float:
+        left = float(self.deadline) - float(self.env.elapsed_seconds)
+        return left if left > 0.0 else 0.0
 
     def _step(self, last_cluster_type: ClusterType, has_spot: bool) -> ClusterType:
-        self._reset_episode_if_needed()
+        # If already committed to on-demand, continue to ensure deadline.
+        if self._locked_to_od:
+            return ClusterType.ON_DEMAND
 
-        # If task already complete, do nothing
-        remaining_s = self._compute_remaining()
-        if remaining_s <= 0:
+        rem = self._remaining_work_seconds()
+        if rem <= 0.0:
             return ClusterType.NONE
 
-        # Gather environment parameters
-        gap_s = getattr(self.env, "gap_seconds", 60.0)
-        time_now_s = getattr(self.env, "elapsed_seconds", 0.0)
-        deadline_s = getattr(self, "deadline", time_now_s + remaining_s)
-        time_remaining_s = max(0.0, deadline_s - time_now_s)
-        overhead_s = float(getattr(self, "restart_overhead", 0.0))
+        time_left = self._time_left_seconds()
+        gap = float(self.env.gap_seconds)
+        if gap <= 0.0:
+            gap = 60.0  # sensible default fallback
+        oh = float(self.restart_overhead)
 
-        # If already committed to on-demand, keep using it
-        if getattr(self, "_commit_on_demand", False):
-            return ClusterType.ON_DEMAND
+        # Safety buffers to account for discretization and unseen micro-effects.
+        buffer_spot = max(1.5 * gap, 1.0)  # when choosing SPOT
+        buffer_wait = max(1.2 * gap, 1.0)  # when choosing to wait (NONE)
 
-        # If we must commit now to guarantee finishing on OD (with buffer), do it
-        if self._should_commit_now(time_remaining_s, remaining_s, gap_s, overhead_s):
-            self._commit_on_demand = True
-            return ClusterType.ON_DEMAND
+        # If choosing SPOT now, and last type isn't SPOT, we'll pay overhead for starting SPOT this step,
+        # which reduces progress this step by 'oh'. To ensure we can switch to OD next step and still finish,
+        # we need enough time: time_left > rem + oh(OD switch later) + oh(if switching to spot now) + buffer.
+        oh_spot_now = oh if last_cluster_type != ClusterType.SPOT else 0.0
+        safe_to_use_spot_now = time_left > (rem + oh + oh_spot_now + buffer_spot)
 
-        # Opportunistic use of spot if available and not at commit threshold
+        # If choosing to wait (NONE) this step (spot unavailable), to still guarantee finishing by switching
+        # to OD next step, we require: time_left - gap >= rem + oh -> time_left > rem + oh + gap (+ buffer).
+        safe_to_wait = time_left > (rem + oh + gap + buffer_wait)
+
         if has_spot:
-            return ClusterType.SPOT
-
-        # Spot not available: decide whether to wait or switch to OD now.
-        # If waiting one more step would force an immediate commit next step, commit now.
-        would_force_commit_next = self._should_commit_now(
-            max(0.0, time_remaining_s - gap_s), remaining_s, gap_s, overhead_s
-        )
-        if would_force_commit_next:
-            self._commit_on_demand = True
+            if safe_to_use_spot_now:
+                return ClusterType.SPOT
+            # Not safe to keep using SPOT -> commit to On-Demand now.
+            self._locked_to_od = True
             return ClusterType.ON_DEMAND
-
-        # Otherwise, wait for spot to return (pause to save cost)
-        return ClusterType.NONE
+        else:
+            if safe_to_wait:
+                return ClusterType.NONE
+            # Not safe to wait -> commit to On-Demand now.
+            self._locked_to_od = True
+            return ClusterType.ON_DEMAND
 
     @classmethod
     def _from_args(cls, parser):

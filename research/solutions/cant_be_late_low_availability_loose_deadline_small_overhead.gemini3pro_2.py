@@ -2,50 +2,61 @@ from sky_spot.strategies.strategy import Strategy
 from sky_spot.utils import ClusterType
 
 class Solution(Strategy):
-    NAME = "lazy_deadline_solver"
+    NAME = "cant_be_late_solution"
 
     def solve(self, spec_path: str) -> "Solution":
         return self
 
     def _step(self, last_cluster_type: ClusterType, has_spot: bool) -> ClusterType:
-        # Calculate current progress and time budget
-        # self.task_done_time contains durations of completed segments
-        completed_work = sum(self.task_done_time)
-        remaining_work = max(0.0, self.task_duration - completed_work)
+        """
+        Decides the cluster type for the next time step.
+        Strategy:
+        1. Calculate the latest possible moment we must start On-Demand to meet the deadline (Slack).
+        2. If we are close to that threshold, force On-Demand to guarantee completion.
+        3. If we have slack:
+           - Use Spot if available (cheapest).
+           - If Spot is unavailable, return NONE (wait) to save money, assuming Spot might return 
+             or we can switch to On-Demand later before the deadline.
+        """
+        # Current state
+        elapsed_time = self.env.elapsed_seconds
+        step_gap = self.env.gap_seconds
         
-        current_time = self.env.elapsed_seconds
-        time_until_deadline = self.deadline - current_time
+        # Calculate progress
+        work_done = sum(self.task_done_time)
+        work_remaining = max(0.0, self.task_duration - work_done)
         
-        # Safety margin calculations
-        # overhead: Time lost when starting a new instance or switching
-        overhead = self.restart_overhead
-        # gap: The simulation step size. We need at least one gap buffer.
-        gap = self.env.gap_seconds
+        # If job is finished
+        if work_remaining <= 1e-6:
+            return ClusterType.NONE
+            
+        time_until_deadline = self.deadline - elapsed_time
         
-        # Buffer: A safety margin to ensure we don't miss the deadline due to 
-        # discrete time steps or overhead transitions. 
-        # 30 minutes (1800s) is selected as a safe balance between cost and reliability
-        # given the 22-hour slack in the problem setting.
-        safety_buffer = 1800.0 + gap
+        # Calculate time required to finish if we commit to On-Demand now.
+        # If we are not currently on On-Demand, we incur restart overhead.
+        # If we are already on On-Demand, we don't incur new overhead (continuing).
+        required_time_od = work_remaining
+        if last_cluster_type != ClusterType.ON_DEMAND:
+            required_time_od += self.restart_overhead
+            
+        # Safety Buffer Calculation:
+        # If we choose NONE (wait) this step, we consume 'step_gap' time.
+        # We must ensure that at (elapsed_time + step_gap), we still have enough time to finish.
+        # i.e., (time_until_deadline - step_gap) >= required_time_od
+        # We use a multiplier (2.0) and a small constant for float safety/robustness.
+        safety_buffer = (2.0 * step_gap) + 30.0
         
-        # Determine the "Must Run OD" threshold.
-        # If the remaining time drops below (work needed + overhead + buffer),
-        # we must switch to On-Demand to guarantee completion.
-        # We include overhead in the check even if currently running to maintain a safe latch.
-        time_needed_for_od_finish = remaining_work + overhead + safety_buffer
-        
-        # 1. Critical Mode: Deadline approaching
-        if time_until_deadline <= time_needed_for_od_finish:
+        # Critical Condition: Check if we are approaching the point of no return
+        if time_until_deadline <= required_time_od + safety_buffer:
             return ClusterType.ON_DEMAND
             
-        # 2. Economic Mode: Plenty of slack
-        # If Spot is available, use it (cheapest option).
+        # Flexible Zone: prioritize cost
         if has_spot:
             return ClusterType.SPOT
-            
-        # 3. Waiting Mode: No Spot, but plenty of slack
-        # Wait for Spot to become available rather than burning money on OD.
-        return ClusterType.NONE
+        else:
+            # Spot is unavailable, but we have slack. 
+            # Wait (NONE) to avoid paying for On-Demand prematurely.
+            return ClusterType.NONE
 
     @classmethod
     def _from_args(cls, parser):

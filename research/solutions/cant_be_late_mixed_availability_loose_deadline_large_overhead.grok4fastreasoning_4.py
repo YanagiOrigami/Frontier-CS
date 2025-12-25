@@ -1,5 +1,6 @@
 from sky_spot.strategies.strategy import Strategy
 from sky_spot.utils import ClusterType
+import sum
 
 class Solution(Strategy):
     NAME = "my_solution"
@@ -8,18 +9,15 @@ class Solution(Strategy):
         return self
 
     def _step(self, last_cluster_type: ClusterType, has_spot: bool) -> ClusterType:
-        done = sum(self.task_done_time)
-        remaining = self.task_duration - done
+        progress = sum(self.task_done_time)
+        remaining = self.task_duration - progress
+        time_left = self.deadline - self.env.elapsed_seconds
         if remaining <= 0:
             return ClusterType.NONE
-        t_left = self.deadline - self.env.elapsed_seconds
-        if t_left <= 0:
-            return ClusterType.NONE
-        use_spot = has_spot and (t_left >= remaining + self.restart_overhead)
-        if use_spot:
+        slack = time_left - remaining
+        if has_spot and slack > self.restart_overhead:
             return ClusterType.SPOT
-        else:
-            return ClusterType.ON_DEMAND
+        return ClusterType.ON_DEMAND
 
     @classmethod
     def _from_args(cls, parser):

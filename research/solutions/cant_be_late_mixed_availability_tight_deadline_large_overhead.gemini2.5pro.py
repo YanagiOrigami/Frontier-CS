@@ -1,91 +1,96 @@
-import collections
 from sky_spot.strategies.strategy import Strategy
 from sky_spot.utils import ClusterType
 
 class Solution(Strategy):
-    NAME = "adaptive_slack_v1"
+    """
+    This strategy uses an adaptive safety buffer to decide when to switch
+    from cheap Spot instances to reliable On-Demand instances.
 
-    # --- Hyperparameters ---
-    # The size of the rolling window for observing spot availability.
-    HISTORY_SIZE = 240
-    # Minimum assumed spot availability probability to avoid division by zero.
-    P_MIN = 0.05
-    # Slack threshold for "panic mode" as a multiple of restart overhead.
-    PANIC_SLACK_OVERHEAD_FACTOR = 1.5
-    # Base slack threshold for waiting, as a multiple of restart overhead.
-    BASE_WAIT_SLACK_OVERHEAD_FACTOR = 3.0
-    # Safety multiplier for the adaptive part of the wait threshold.
-    ADAPTIVE_WAIT_SAFETY_FACTOR = 2.0
-    
+    The core idea is to calculate the available "slack" time: the amount of
+    time that can be wasted before the deadline becomes unreachable even with
+    On-Demand instances.
+
+    If this slack falls below a dynamically calculated safety buffer, the
+    strategy switches to On-Demand to guarantee completion. Otherwise, it
+    greedily chooses Spot if available, or waits (NONE) if Spot is unavailable,
+    to minimize costs.
+
+    The safety buffer is a multiple of the restart_overhead. This multiplier
+    decreases as the job progresses, making the strategy more conservative at
+    the start (when there is more uncertainty and time for failures to accumulate)
+    and more aggressive towards the end.
+    """
+    NAME = "my_solution"
+
     def solve(self, spec_path: str) -> "Solution":
         """
-        Initializes the strategy. Called once before each evaluation trace.
+        Initializes the strategy's parameters. Called once before evaluation.
         """
-        # Initialize a deque to store the recent history of spot availability.
-        self.spot_history = collections.deque(maxlen=self.HISTORY_SIZE)
-        
-        # Pre-populate history with a neutral 50% availability assumption.
-        half_history = self.HISTORY_SIZE // 2
-        self.spot_history.extend([1] * half_history)
-        self.spot_history.extend([0] * (self.HISTORY_SIZE - half_history))
-        
-        # Pre-calculate the static panic threshold in seconds.
-        self._panic_slack_threshold_seconds = self.restart_overhead * self.PANIC_SLACK_OVERHEAD_FACTOR
-        
+        # --- Tunable Parameters ---
+        # These control the size of the safety buffer, which is a multiple (N)
+        # of the restart_overhead. A larger N is more conservative (safer, but
+        # potentially more expensive).
+
+        # N when the job starts (0% progress). A value of 5 means the initial
+        # buffer is 5 * 12 minutes = 1 hour, out of a 4-hour total slack.
+        self.N_START = 5.0
+
+        # N when the job is about to finish (100% progress). A smaller value
+        # reflects less time for future risks. 1.5 * 12 = 18 minutes.
+        self.N_END = 1.5
+
+        # --- State Variables ---
+        # We cache the total work required at the beginning to calculate
+        # job progress reliably. It is initialized on the first call to _step.
+        self._initial_task_duration = -1.0
+
         return self
 
     def _step(self, last_cluster_type: ClusterType, has_spot: bool) -> ClusterType:
         """
-        Main decision-making function, called at each time step.
+        Called at each time step to decide which cluster type to use next.
         """
-        # 1. Update State: Record current spot availability.
-        self.spot_history.append(1 if has_spot else 0)
-        
-        # 2. Calculate Key Metrics
-        work_left = self.remaining_work_seconds
+        # One-time initialization of the total task duration.
+        if self._initial_task_duration < 0:
+            self._initial_task_duration = self.task_duration
+            # Handle edge case of a zero-duration task to avoid division by zero.
+            if self._initial_task_duration <= 0:
+                self._initial_task_duration = 1.0
 
-        # If the task is completed, do nothing.
-        if work_left <= 0:
+        # 1. Calculate remaining work and job progress
+        work_done = sum(self.task_done_time)
+        work_rem = self._initial_task_duration - work_done
+
+        # If the job is finished, do nothing to save costs.
+        if work_rem <= 0:
             return ClusterType.NONE
 
-        time_left = self.deadline - self.env.elapsed_seconds
-        current_slack = time_left - work_left
+        progress = min(1.0, work_done / self._initial_task_duration)
 
-        # 3. Decision Logic
-        # Panic Zone: If slack is critically low, use On-Demand to guarantee progress.
-        if current_slack <= self._panic_slack_threshold_seconds:
+        # 2. Calculate the adaptive safety buffer
+        # Linearly interpolate the buffer multiplier 'N' based on job progress.
+        current_n_multiplier = self.N_START * (1.0 - progress) + self.N_END * progress
+        safety_buffer = current_n_multiplier * self.restart_overhead
+
+        # 3. Calculate current slack time
+        time_rem_to_deadline = self.deadline - self.env.elapsed_seconds
+        # Slack is the time left until the deadline minus the time absolutely
+        # required to finish the remaining work using On-Demand.
+        slack = time_rem_to_deadline - work_rem
+
+        # 4. Make the scheduling decision
+        if slack < safety_buffer:
+            # Slack is below our safety margin. It's too risky to use Spot
+            # or wait. We must make guaranteed progress with On-Demand.
             return ClusterType.ON_DEMAND
-
-        # Not in panic mode, so we have some slack.
-        if has_spot:
-            # Always prefer the cheaper Spot instance when available.
-            return ClusterType.SPOT
         else:
-            # Spot not available. Decide between On-Demand (costly) or None (spends slack).
-            # This choice is based on an adaptive threshold.
-            
-            # Estimate spot availability from recent history.
-            p_spot = sum(self.spot_history) / len(self.spot_history)
-            p_safe = max(p_spot, self.P_MIN)
-
-            # The adaptive component is based on the expected wait time for a spot instance.
-            adaptive_wait_component = (
-                (1 / p_safe - 1) * 
-                self.env.gap_seconds * 
-                self.ADAPTIVE_WAIT_SAFETY_FACTOR
-            )
-            
-            # The base component is a fixed buffer for absorbing preemptions.
-            base_wait_component = self.restart_overhead * self.BASE_WAIT_SLACK_OVERHEAD_FACTOR
-            
-            wait_threshold_seconds = base_wait_component + adaptive_wait_component
-
-            if current_slack > wait_threshold_seconds:
-                # Comfort Zone: Slack is high enough to wait for a Spot instance.
-                return ClusterType.NONE
+            # We have sufficient slack to be cost-effective.
+            if has_spot:
+                # Spot is available, use the cheapest option.
+                return ClusterType.SPOT
             else:
-                # Buffer Zone: Slack is too low to risk waiting. Use On-Demand.
-                return ClusterType.ON_DEMAND
+                # Spot is not available. Wait for it, as we can afford the delay.
+                return ClusterType.NONE
 
     @classmethod
     def _from_args(cls, parser):

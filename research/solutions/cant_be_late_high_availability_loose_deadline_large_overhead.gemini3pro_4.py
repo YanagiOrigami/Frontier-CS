@@ -2,71 +2,53 @@ from sky_spot.strategies.strategy import Strategy
 from sky_spot.utils import ClusterType
 
 class Solution(Strategy):
-    NAME = "Safe_Threshold_Strategy"
+    NAME = "CantBeLateStrategy"
 
     def solve(self, spec_path: str) -> "Solution":
         return self
 
     def _step(self, last_cluster_type: ClusterType, has_spot: bool) -> ClusterType:
-        # Retrieve environment state
-        elapsed = self.env.elapsed_seconds
-        gap = self.env.gap_seconds
-        deadline = self.deadline
-        overhead = self.restart_overhead
-        total_duration = self.task_duration
-        
-        # Calculate remaining work
-        if self.task_done_time:
-            done = sum(self.task_done_time)
-        else:
-            done = 0.0
-        remaining = total_duration - done
+        # Calculate total work completed so far
+        # Assuming task_done_time is a list of duration floats
+        completed_work = sum(self.task_done_time) if self.task_done_time else 0.0
+        remaining_work = self.task_duration - completed_work
 
-        # If task is complete, stop
-        if remaining <= 0:
+        # If work is effectively complete, stop
+        if remaining_work <= 1e-6:
             return ClusterType.NONE
 
-        time_left = deadline - elapsed
+        current_time = self.env.elapsed_seconds
+        time_until_deadline = self.deadline - current_time
 
-        # Thresholds
-        # 1. Panic Threshold: The absolute latest we can switch to On-Demand (OD)
-        #    We need enough time to pay the restart overhead (to boot OD) + time to do the work.
-        #    Added 2*gap for safety against discrete time steps.
-        threshold_panic = remaining + overhead + (2.0 * gap)
-
-        # 2. Safe Spot Threshold: The minimum time needed to safely *start* a new Spot instance.
-        #    If we start Spot, we pay 'overhead'. If it finishes booting and then fails,
-        #    we must still be above 'threshold_panic' to safely switch to OD.
-        #    So we need: time_left - overhead >= threshold_panic
-        #    Implies: time_left >= remaining + 2*overhead + 2*gap
-        threshold_safe_spot = remaining + (2.0 * overhead) + (2.0 * gap)
-
-        # Logic
+        # Safety buffer calculation
+        # We define a "panic threshold" to switch to On-Demand.
+        # We must allow enough time for:
+        # 1. The actual remaining work
+        # 2. The restart overhead (in case we are not currently running or need to switch)
+        # 3. A safety buffer to handle granular time steps and potential simulation jitter
+        # Buffer chosen: 4x restart overhead + 5x time step gap
+        safety_buffer = (4.0 * self.restart_overhead) + (5.0 * self.env.gap_seconds)
         
-        # 1. If we are critically close to the deadline, force OD.
-        #    This condition overrides everything to ensure we don't violate the deadline.
-        if time_left <= threshold_panic:
+        required_time_for_od = remaining_work + self.restart_overhead + safety_buffer
+
+        # Strategy Logic:
+
+        # 1. Panic Mode: If we are close to the deadline, force On-Demand to guarantee completion.
+        if time_until_deadline <= required_time_for_od:
             return ClusterType.ON_DEMAND
 
-        # 2. If Spot is available, try to use it
+        # 2. Standard Mode: Prefer Spot instances to save cost.
         if has_spot:
-            # If we are already on Spot, we continue until the panic threshold.
-            # We don't pay overhead to continue, so we don't need the extra buffer.
-            if last_cluster_type == ClusterType.SPOT:
-                return ClusterType.SPOT
-            
-            # If we are NOT on Spot (NONE or OD), we are starting a new Spot instance.
-            # We must check if we have enough buffer to pay the boot cost and still be safe.
-            if time_left > threshold_safe_spot:
-                return ClusterType.SPOT
-            else:
-                # We are in the "Yellow Zone": Safe for OD, but unsafe to start Spot.
-                # Use OD to guarantee completion.
+            # Optimization: If we are already on On-Demand and the remaining work is very small 
+            # (less than the time it takes to restart Spot), stay on On-Demand.
+            # Switching would incur overhead that exceeds the remaining work time.
+            if last_cluster_type == ClusterType.ON_DEMAND and remaining_work < self.restart_overhead:
                 return ClusterType.ON_DEMAND
+                
+            return ClusterType.SPOT
 
-        # 3. If Spot is unavailable
-        #    We have slack (time_left > threshold_panic).
-        #    Waiting (NONE) is free and safe until we hit the panic threshold.
+        # 3. Wait Mode: Spot is unavailable, but we have plenty of slack.
+        # Waiting costs 0, whereas running On-Demand is expensive.
         return ClusterType.NONE
 
     @classmethod

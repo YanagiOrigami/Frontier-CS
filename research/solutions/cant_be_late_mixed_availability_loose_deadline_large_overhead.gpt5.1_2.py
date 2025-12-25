@@ -3,68 +3,84 @@ from sky_spot.utils import ClusterType
 
 
 class Solution(Strategy):
-    NAME = "cant_be_late_dynamic_v1"
+    NAME = "cb_late_v1"
 
-    def __init__(self, args=None):
+    def __init__(self, args):
         super().__init__(args)
-        self.args = args
-        self.force_on_demand = False
+        self._reset_internal_state()
+
+    def _reset_internal_state(self):
+        self._last_done_list_len = 0
+        self._total_work_done = 0.0
+        self._prev_elapsed = None
 
     def solve(self, spec_path: str) -> "Solution":
-        # No special initialization needed; return self as required.
+        # Optional: could read spec_path for configuration; unused here.
+        self._reset_internal_state()
         return self
 
+    def _update_progress_cache(self):
+        """Incrementally track total work done from task_done_time list."""
+        task_done = getattr(self, "task_done_time", None)
+        if task_done is None:
+            return
+        n = len(task_done)
+        if n > self._last_done_list_len:
+            incremental = 0.0
+            # Sum only newly added segments
+            for v in task_done[self._last_done_list_len:]:
+                try:
+                    incremental += float(v)
+                except Exception:
+                    # Fallback: assume one gap of work if entry is malformed
+                    incremental += float(self.env.gap_seconds)
+            self._total_work_done += incremental
+            self._last_done_list_len = n
+
+    def _maybe_reset_for_new_episode(self):
+        """Detect environment reset by checking elapsed_seconds rollback."""
+        elapsed = getattr(self.env, "elapsed_seconds", 0.0)
+        if self._prev_elapsed is None or elapsed < self._prev_elapsed:
+            # New episode detected
+            self._reset_internal_state()
+        self._prev_elapsed = elapsed
+
     def _step(self, last_cluster_type: ClusterType, has_spot: bool) -> ClusterType:
-        # Compute completed work so far.
-        done_segments = getattr(self, "task_done_time", None)
-        if done_segments is None:
-            completed = 0.0
-        else:
-            completed = float(sum(done_segments))
+        # Detect new episode and reset internal state if needed
+        self._maybe_reset_for_new_episode()
 
-        total_duration = float(getattr(self, "task_duration", 0.0) or 0.0)
-        remaining_work = max(total_duration - completed, 0.0)
+        # Update cached total work done
+        self._update_progress_cache()
 
-        # If task already done, stop using any instances.
-        if remaining_work <= 0.0:
+        # Retrieve environment parameters
+        elapsed = getattr(self.env, "elapsed_seconds", 0.0)
+        gap = getattr(self.env, "gap_seconds", 0.0)
+        deadline = getattr(self, "deadline", 0.0)
+        restart_overhead = getattr(self, "restart_overhead", 0.0)
+        task_duration = getattr(self, "task_duration", 0.0)
+
+        # Pessimistic upper bound on remaining work (seconds)
+        remaining = max(task_duration - self._total_work_done, 0.0)
+
+        time_left = deadline - elapsed
+
+        # If no time left or no remaining work (defensive), do nothing.
+        if time_left <= 0 or remaining <= 0:
             return ClusterType.NONE
 
-        # Time until deadline.
-        elapsed = float(getattr(self.env, "elapsed_seconds", 0.0) or 0.0)
-        deadline = float(getattr(self, "deadline", 0.0) or 0.0)
-        time_to_deadline = deadline - elapsed
+        # Safety margin: at least one gap of slack to account for discretization.
+        margin = gap
 
-        # If somehow past deadline, just use on-demand (can't fix lateness, but obey API).
-        if time_to_deadline <= 0.0:
-            self.force_on_demand = True
+        # If we're close to deadline, always switch to ON_DEMAND to guarantee completion.
+        # We require enough time_left to cover remaining work plus one restart overhead.
+        if time_left <= remaining + restart_overhead + margin:
             return ClusterType.ON_DEMAND
 
-        # If we've already entered the guaranteed-completion phase, stay on on-demand.
-        if self.force_on_demand:
-            return ClusterType.ON_DEMAND
-
-        # Compute safety margin for when to switch permanently to on-demand.
-        gap = float(getattr(self.env, "gap_seconds", 0.0) or 0.0)
-        restart_overhead = float(getattr(self, "restart_overhead", 0.0) or 0.0)
-
-        # Extra safety to account for discretization and any uncertainty.
-        # Ensure safety_extra > gap so we switch before it's too late even with step granularity.
-        safety_extra = max(restart_overhead, 2.0 * gap)
-
-        # Minimum remaining time needed from *now* to safely finish if we switch to on-demand:
-        #   restart_overhead (once) + remaining_work + safety_extra
-        critical_time_needed = remaining_work + restart_overhead + safety_extra
-
-        # If remaining time is at or below this, we must switch to on-demand permanently.
-        if time_to_deadline <= critical_time_needed:
-            self.force_on_demand = True
-            return ClusterType.ON_DEMAND
-
-        # Risk-accepting phase: prefer spot when available, otherwise idle (NONE).
+        # We have enough slack to use cheaper spot instances opportunistically.
         if has_spot:
             return ClusterType.SPOT
 
-        # No spot available and not yet in the must-finish phase: wait to save cost.
+        # Spot unavailable and we still have slack: wait (NONE) rather than pay for OD now.
         return ClusterType.NONE
 
     @classmethod

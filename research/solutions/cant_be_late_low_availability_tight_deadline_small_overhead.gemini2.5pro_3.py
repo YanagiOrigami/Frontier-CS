@@ -1,84 +1,80 @@
 import argparse
+
 from sky_spot.strategies.strategy import Strategy
 from sky_spot.utils import ClusterType
 
+
 class Solution(Strategy):
-    NAME = "pressure_and_slack_strategy"
+    NAME = "my_solution"
+
+    def __init__(self, args):
+        super().__init__(args)
+        # This multiplier determines the size of our safety time buffer.
+        # A higher value means we are more conservative, switching to On-Demand
+        # earlier when Spot is unavailable.
+        # Total initial slack is 4h (14400s). Restart overhead is 3m (180s).
+        # A multiplier of 40 yields a safety buffer of 40 * 180s = 7200s = 2h.
+        # This means we are willing to "spend" up to 2h of our 4h slack
+        # waiting for Spot instances to become available.
+        self.SAFETY_BUFFER_OVERHEAD_MULTIPLIER = 40
+
+        # State variables to be initialized in solve()
+        self.safety_buffer_seconds = None
+        self.work_done_cached = 0.0
+        self.processed_segments_count = 0
 
     def solve(self, spec_path: str) -> "Solution":
         """
-        Initialize the strategy with tuned parameters.
+        Initialize the strategy based on the problem specification.
         """
-        # Threshold for schedule pressure. If (work_left / time_left) > threshold, use OD.
-        # Initial pressure for the given problem is 48/52 ~= 0.923.
-        self.pressure_threshold = 0.98
-
-        # Threshold for absolute slack. If (time_left - work_left) < threshold, use OD.
-        # Set as a multiple of restart_overhead to handle preemptions/unavailability.
-        slack_overhead_multiplier = 20
-        # self.restart_overhead is initialized in the base Strategy class.
-        self.slack_threshold_s = slack_overhead_multiplier * self.restart_overhead
-
-        # Caching variables for performance.
-        self._work_done_cache = 0.0
-        self._task_done_len_cache = 0
-
+        self.safety_buffer_seconds = self.SAFETY_BUFFER_OVERHEAD_MULTIPLIER * self.restart_overhead
+        self.work_done_cached = 0.0
+        self.processed_segments_count = 0
         return self
 
     def _step(self, last_cluster_type: ClusterType, has_spot: bool) -> ClusterType:
         """
-        Main decision-making logic, called at each time step.
+        Decision logic for each time step.
         """
-        # --- 1. Calculate current job progress ---
-        if len(self.task_done_time) > self._task_done_len_cache:
-            new_segments = self.task_done_time[self._task_done_len_cache:]
-            self._work_done_cache += sum(end - start for start, end in new_segments)
-            self._task_done_len_cache = len(self.task_done_time)
-        
-        work_left = self.task_duration - self._work_done_cache
+        # Incrementally update the cached value of total work done for efficiency.
+        if len(self.task_done_time) > self.processed_segments_count:
+            for i in range(self.processed_segments_count, len(self.task_done_time)):
+                start, end = self.task_done_time[i]
+                self.work_done_cached += (end - start)
+            self.processed_segments_count = len(self.task_done_time)
 
-        if work_left <= 1e-9:
+        work_remaining = self.task_duration - self.work_done_cached
+
+        # If the task is finished, do nothing.
+        if work_remaining <= 0:
             return ClusterType.NONE
 
-        # --- 2. Calculate time and risk metrics ---
-        time_to_deadline = self.deadline - self.env.elapsed_seconds
-        
-        if time_to_deadline <= 0:
-            return ClusterType.ON_DEMAND
-
-        time_needed_for_od = work_left + self.env.remaining_overhead
-
-        # --- 3. Make a decision based on the strategy ---
-
-        # PANIC MODE: If there's not enough time left even with full on-demand,
-        # we must use on-demand.
-        if time_needed_for_od >= time_to_deadline:
-            return ClusterType.ON_DEMAND
-
-        # GREEDY SPOT: If spot is available and we're not in panic mode, always take it.
-        # The cost savings are high, and the risk is managed by the thresholds below.
+        # Always use Spot instances if they are available, as it's the
+        # most cost-effective way to make progress.
         if has_spot:
             return ClusterType.SPOT
 
-        # NO SPOT: Decide between ON_DEMAND (safe, expensive) and NONE (risky, free).
+        # If Spot is not available, decide between waiting (NONE) or using
+        # a guaranteed On-Demand instance.
         
-        # Metric 1: Absolute slack buffer
-        slack_seconds = time_to_deadline - time_needed_for_od
-        is_slack_low = slack_seconds < self.slack_threshold_s
+        # Calculate the current time slack:
+        # Slack = (Time left until deadline) - (Time needed to finish on On-Demand)
+        time_until_deadline = self.deadline - self.env.elapsed_seconds
+        current_slack_seconds = time_until_deadline - work_remaining
 
-        # Metric 2: Schedule pressure
-        pressure = time_needed_for_od / time_to_deadline
-        is_pressure_high = pressure > self.pressure_threshold
-
-        if is_slack_low or is_pressure_high:
-            # Safety buffer is eroding. Use On-Demand for guaranteed progress.
-            return ClusterType.ON_DEMAND
-        else:
-            # We have a comfortable buffer. Wait for a cheap Spot instance.
+        # Compare current slack to our pre-defined safety buffer.
+        if current_slack_seconds > self.safety_buffer_seconds:
+            # We have more slack than our safety buffer. We can afford to wait
+            # for Spot to become available again to save costs.
             return ClusterType.NONE
+        else:
+            # Our time slack has fallen below the safety threshold. It's too
+            # risky to wait. We must use an On-Demand instance to guarantee
+            # progress and avoid missing the deadline.
+            return ClusterType.ON_DEMAND
 
     @classmethod
-    def _from_args(cls, parser: argparse.ArgumentParser) -> "Solution":
+    def _from_args(cls, parser):
         """
         Required classmethod for evaluator instantiation.
         """

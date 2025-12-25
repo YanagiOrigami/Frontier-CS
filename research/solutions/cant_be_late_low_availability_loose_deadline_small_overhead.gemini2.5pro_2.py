@@ -1,107 +1,102 @@
 import argparse
+
 from sky_spot.strategies.strategy import Strategy
 from sky_spot.utils import ClusterType
 
+
 class Solution(Strategy):
-    NAME = "my_solution"
-
-    # --- Hyperparameters ---
-    # This factor determines how aggressively we preserve our time cushion.
-    # Higher value = more conservative (uses OD earlier), lower cost risk.
-    # Lower value = more aggressive (waits for Spot longer), higher deadline risk.
-    # A value of 5.0 means we want our time cushion to be at least 5x the
-    # expected wait time for the next Spot instance.
-    SAFETY_FACTOR = 5.0
-
-    # Bayesian prior for estimating Spot availability. We assume a 20%
-    # availability rate before observing any data, based on the problem's
-    # [4%, 40%] range. This is a weak prior that is quickly updated by data.
-    # Prior mean = P_SPOT_ALPHA_0 / (P_SPOT_ALPHA_0 + P_SPOT_BETA_0)
-    P_SPOT_ALPHA_0 = 1.0
-    P_SPOT_BETA_0 = 4.0
+    NAME = "adaptive_rate_controller"
 
     def solve(self, spec_path: str) -> "Solution":
         """
-        Initialize strategy state. Called once before evaluation.
+        Initialize strategy parameters. This method is called once before the
+        simulation starts.
         """
-        self.spot_avail_count = 0
-        self.total_steps = 0
+        # We use a Bayesian approach to estimate spot availability probability (p).
+        # The prior is a Beta distribution, Beta(alpha, beta).
+        # We start with a prior belief that p is around 0.2 (mean = 3 / (3+12)).
+        # self.posterior_alpha tracks observed 'spot available' counts.
+        # self.posterior_beta tracks observed 'spot unavailable' counts.
+        self.posterior_alpha = 3.0
+        self.posterior_beta = 12.0
+
+        # This factor tunes the strategy's risk aversion.
+        # A value < 1.0 makes the strategy more pessimistic about spot,
+        # leading it to use On-Demand more readily to ensure it meets the deadline.
+        # A value > 1.0 is more optimistic, waiting longer for spot instances,
+        # which saves cost but increases the risk of missing the deadline.
+        # Given the severe penalty for failure, a risk-averse setting is safer.
+        self.urgency_factor = 0.95
+
         return self
 
     def _step(self, last_cluster_type: ClusterType, has_spot: bool) -> ClusterType:
         """
-        Core decision logic, called at each time step.
+        This method is called at each timestep to decide which cluster type to use.
         """
-        # 1. Update state for estimating spot availability
-        self.total_steps += 1
+        # 1. Update our estimate of spot availability based on the current observation.
         if has_spot:
-            self.spot_avail_count += 1
+            self.posterior_alpha += 1
+        else:
+            self.posterior_beta += 1
+        
+        p_estimate = self.posterior_alpha / (self.posterior_alpha + self.posterior_beta)
 
-        # 2. Calculate current progress and time metrics
-        work_completed = sum(self.task_done_time)
-        work_remaining = self.task_duration - work_completed
+        # 2. Calculate the current state of the job.
+        work_done = sum(end - start for start, end in self.task_done_time)
+        work_remaining = self.task_duration - work_done
+        
+        if work_remaining <= 0:
+            return ClusterType.NONE  # Job is finished.
 
-        # If the job is done, switch to NONE to minimize cost.
-        if work_remaining <= 1e-9:
-            return ClusterType.NONE
+        time_to_deadline = self.deadline - self.env.elapsed_seconds
 
-        current_time = self.env.elapsed_seconds
-        time_to_deadline = self.deadline - current_time
-
-        # 3. PANIC MODE: Absolute deadline check
-        # If the remaining work plus a buffer for one potential preemption is more
-        # than the time left, we have no choice but to use On-Demand.
-        # This is the critical backstop to guarantee finishing on time.
-        if work_remaining + self.restart_overhead >= time_to_deadline:
+        if time_to_deadline <= 0:
+            # We are at or past the deadline. We must use the guaranteed resource.
             return ClusterType.ON_DEMAND
 
-        # 4. Main Decision Logic: Prefer Spot > Wait > On-Demand
+        # 3. Apply the decision logic hierarchy.
+
+        # PRIORITY 1: SAFETY NET
+        # Check if we have entered the "point of no return", where we must use
+        # On-Demand to guarantee completion. This is when the time left is less
+        # than the work remaining plus a buffer for a potential restart.
+        critical_time_needed = work_remaining + self.restart_overhead
+        if time_to_deadline <= critical_time_needed:
+            return ClusterType.ON_DEMAND
+            
+        # PRIORITY 2: GREEDY CHOICE
+        # If spot instances are available, always use them. It's the most
+        # cost-effective way to make progress.
         if has_spot:
-            # Spot is available, cheap, and makes progress. It's the best option.
             return ClusterType.SPOT
-
-        # If Spot is not available, the choice is between waiting (NONE) and
-        # paying for progress (ON_DEMAND).
-
-        # Estimate spot availability probability using our Bayesian tracker.
-        alpha = self.P_SPOT_ALPHA_0 + self.spot_avail_count
-        beta = self.P_SPOT_BETA_0 + (self.total_steps - self.spot_avail_count)
-        p_spot_est = alpha / (alpha + beta)
+            
+        # PRIORITY 3: CORE TRADE-OFF
+        # If spot is not available, we must decide between paying for On-Demand
+        # or waiting (and incurring no cost).
         
-        # Safeguard against division by zero if alpha_0 was 0 and no spot seen.
-        if p_spot_est < 1e-9:
-             p_spot_est = 1e-9
-
-        # "Cushion" is our time slack: how long we can afford to do nothing
-        # and still complete the job using On-Demand if necessary.
-        cushion = time_to_deadline - work_remaining
-
-        # We define a dynamic threshold for this cushion. If our cushion drops
-        # below this threshold, the risk of waiting is too high, so we use OD.
-        # The threshold is based on the expected wait time for a Spot instance.
-        expected_wait_time = (1.0 / p_spot_est) * self.env.gap_seconds
-        cushion_threshold = self.SAFETY_FACTOR * expected_wait_time
+        # We calculate the required progress rate to finish exactly at the deadline.
+        required_rate = work_remaining / time_to_deadline
         
-        # Enforce a minimum absolute cushion to be safe, especially in the beginning
-        # when the spot probability estimate is not yet reliable. Two restart
-        # overheads is a reasonable minimum buffer.
-        min_cushion = 2.0 * self.restart_overhead
+        # We compare this required rate to our estimate of what spot can provide.
+        # The urgency_factor makes us act more conservatively.
+        urgency_threshold = self.urgency_factor * p_estimate
         
-        final_threshold = max(cushion_threshold, min_cushion)
-        
-        if cushion < final_threshold:
-            # Our slack is getting dangerously low. It's time to pay for the
-            # guaranteed progress of an On-Demand instance.
+        if required_rate > urgency_threshold:
+            # The required rate is higher than what we can expect from spot.
+            # The situation is becoming urgent, so we use On-Demand to make
+            # guaranteed progress and reduce the future required rate.
             return ClusterType.ON_DEMAND
         else:
-            # We have a healthy amount of slack. We can afford to wait for a
-            # cheaper Spot instance to become available.
+            # The required rate is low enough that we can afford to wait.
+            # We bet that spot instances will become available soon enough.
             return ClusterType.NONE
 
     @classmethod
     def _from_args(cls, parser: argparse.ArgumentParser):
         """
-        Required classmethod for the evaluator to instantiate the solution.
+        Required classmethod for the evaluation environment to instantiate the
+        strategy.
         """
         args, _ = parser.parse_known_args()
         return cls(args)

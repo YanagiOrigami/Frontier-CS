@@ -5,24 +5,17 @@ class Solution(Strategy):
     NAME = "my_solution"
 
     def __init__(self, args):
-        super().__init__(args)
+        super().__init__()
 
     def solve(self, spec_path: str) -> "Solution":
         return self
 
     def _step(self, last_cluster_type: ClusterType, has_spot: bool) -> ClusterType:
-        progress = sum(self.task_done_time)
-        remaining_work = self.task_duration - progress
-        if remaining_work <= 0:
-            return ClusterType.NONE
-        remaining_wall = self.deadline - self.env.elapsed_seconds
-        if remaining_wall <= 0:
-            return ClusterType.NONE
-        buffer = remaining_wall - remaining_work
-        threshold = 2 * self.restart_overhead
-        if buffer < threshold:
-            return ClusterType.ON_DEMAND
-        if has_spot:
+        completed = sum(self.task_done_time)
+        remaining = self.task_duration - completed
+        time_left = self.deadline - self.env.elapsed_seconds
+        buffer = time_left - remaining
+        if has_spot and buffer > self.restart_overhead:
             return ClusterType.SPOT
         return ClusterType.ON_DEMAND
 

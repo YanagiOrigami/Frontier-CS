@@ -1,3 +1,4 @@
+import argparse
 from sky_spot.strategies.strategy import Strategy
 from sky_spot.utils import ClusterType
 
@@ -5,89 +6,62 @@ class Solution(Strategy):
     NAME = "my_solution"
 
     def solve(self, spec_path: str) -> "Solution":
-        """
-        Optional initialization. Called once before evaluation.
-        Read spec_path for configuration if needed.
-        Must return self.
-        """
-        # A factor to determine the caution threshold. We enter "caution mode"
-        # when the slack is less than this factor times the restart overhead.
-        # This buffer should be able to absorb a few unlucky preemptions.
-        caution_factor = 5.0
-        self.caution_slack_threshold = caution_factor * self.restart_overhead
+        # Total initial slack is deadline (52h) - task_duration (48h) = 4 hours.
+        # We partition this 4-hour slack into decision zones.
 
-        # A factor to determine the panic threshold. We enter "panic mode"
-        # when the slack is less than this factor times the restart overhead.
-        # At this point, any further time loss is critical.
-        panic_factor = 1.0
-        self.panic_slack_threshold = panic_factor * self.restart_overhead
+        # Enter CAUTION zone when slack drops below this value (2 hours).
+        self.CAUTION_SLACK_SECONDS = 2.0 * 3600
 
-        # Cache for calculating total work done efficiently
-        self.cached_work_done = 0.0
-        self.cached_len_task_done_time = 0
+        # Enter DANGER zone when slack drops below this value (30 minutes).
+        self.DANGER_SLACK_SECONDS = 0.5 * 3600
         
         return self
 
     def _step(self, last_cluster_type: ClusterType, has_spot: bool) -> ClusterType:
-        """
-        Called at each time step. Return which cluster type to use next.
+        # 1. Calculate work remaining.
+        work_done_seconds = sum(end - start for start, end in self.task_done_time)
+        work_remaining_seconds = self.task_duration - work_done_seconds
 
-        Args:
-            last_cluster_type: The cluster type used in the previous step
-            has_spot: Whether spot instances are available this step
-
-        Returns:
-            ClusterType.SPOT, ClusterType.ON_DEMAND, or ClusterType.NONE
-        """
-        # Incrementally update the total work done for efficiency.
-        # This assumes self.task_done_time is an append-only list.
-        if len(self.task_done_time) > self.cached_len_task_done_time:
-            new_segments = self.task_done_time[self.cached_len_task_done_time:]
-            self.cached_work_done += sum(end - start for start, end in new_segments)
-            self.cached_len_task_done_time = len(self.task_done_time)
-
-        work_remaining = self.task_duration - self.cached_work_done
-
-        if work_remaining <= 0:
+        # If the job is finished, do nothing.
+        if work_remaining_seconds <= 0:
             return ClusterType.NONE
 
-        wall_time_remaining = self.deadline - self.env.elapsed_seconds
+        # 2. Calculate current slack.
+        # Slack is the time we can be idle and still finish by the deadline
+        # using on-demand instances for all remaining work.
+        time_now = self.env.elapsed_seconds
+        time_to_deadline = self.deadline - time_now
         
-        # Slack is the time buffer we have if we were to complete the rest of the
-        # job using only on-demand instances.
-        slack = wall_time_remaining - work_remaining
-
-        # --- Three-Zone Decision Logic ---
-
-        # 1. Panic Zone: Slack is critically low.
-        # We must use the guaranteed on-demand option to make progress.
-        if slack <= self.panic_slack_threshold:
+        # As a safeguard, if we're past the deadline, try to finish.
+        if time_to_deadline <= 0:
             return ClusterType.ON_DEMAND
 
-        # If spot instances are available and we are not in panic mode,
-        # it is always the optimal choice. It is cheaper than on-demand and
-        # makes progress, thus preserving slack (barring preemptions which
-        # our slack buffer is designed to handle).
-        if has_spot:
-            return ClusterType.SPOT
+        slack_seconds = time_to_deadline - work_remaining_seconds
 
-        # At this point, spot is not available. The choice is between waiting
-        # (NONE) or using on-demand to make progress.
-
-        # 2. Caution Zone: Slack is positive but below our comfort level.
-        # We cannot afford to wait and burn through our remaining slack.
-        # We choose to pay for on-demand to preserve the slack we have left.
-        if slack <= self.caution_slack_threshold:
+        # 3. Make a decision based on the current slack zone.
+        if slack_seconds < self.DANGER_SLACK_SECONDS:
+            # Danger Zone: Critically low on time. Must use On-Demand to guarantee progress.
             return ClusterType.ON_DEMAND
-
-        # 3. Safe Zone: We have ample slack.
-        # We can afford to wait for the cheaper spot instances to become
-        # available. Waiting costs nothing but consumes slack, which is an
-        # acceptable trade-off when we have a large buffer.
+        
+        elif slack_seconds < self.CAUTION_SLACK_SECONDS:
+            # Caution Zone: Time is getting tight. Can't afford to wait.
+            # Use SPOT if available for cost savings, but fall back to ON_DEMAND
+            # to ensure continuous progress.
+            if has_spot:
+                return ClusterType.SPOT
+            else:
+                return ClusterType.ON_DEMAND
+        
         else:
-            return ClusterType.NONE
+            # Safe Zone: Plenty of slack. Prioritize maximum cost savings.
+            # Use SPOT or wait if it's unavailable.
+            if has_spot:
+                return ClusterType.SPOT
+            else:
+                return ClusterType.NONE
 
     @classmethod
-    def _from_args(cls, parser):  # REQUIRED: For evaluator instantiation
+    def _from_args(cls, parser: argparse.ArgumentParser):
+        # Required method for evaluator instantiation.
         args, _ = parser.parse_known_args()
         return cls(args)

@@ -3,99 +3,88 @@ from sky_spot.utils import ClusterType
 
 
 class Solution(Strategy):
-    NAME = "cant_be_late_strategy"
-
-    def __init__(self, args=None):
-        try:
-            super().__init__(args)
-        except TypeError:
-            try:
-                super().__init__()
-            except TypeError:
-                pass
-        self.args = args
-        self._policy_initialized = False
-        self._buffer_seconds = 0.0
-        self._lock_to_od = False
+    NAME = "cant_be_late_safety_margin"
 
     def solve(self, spec_path: str) -> "Solution":
+        # Initialize per-episode state
+        self.force_on_demand = False
+        self.commit_threshold = None
+        self._last_elapsed = None
         return self
 
-    def _initialize_policy(self):
-        if self._policy_initialized:
-            return
-        restart_overhead = float(getattr(self, "restart_overhead", 0.0) or 0.0)
-        deadline = float(getattr(self, "deadline", 0.0) or 0.0)
-        task_duration = float(getattr(self, "task_duration", 0.0) or 0.0)
-        slack = max(0.0, deadline - task_duration)
-        gap = float(getattr(self.env, "gap_seconds", 60.0) or 60.0)
-
-        # Reserve some time buffer to absorb at least one restart and discretization.
-        fraction = 0.05  # 5% of total slack if available
-        buffer = max(
-            2.0 * restart_overhead,  # at least one full restart + margin
-            5.0 * gap,               # a few steps for discretization
-            fraction * slack,        # fraction of slack for uncertainty
-        )
-        self._buffer_seconds = buffer
-        self._policy_initialized = True
-
-    def _compute_completed_work(self) -> float:
+    def _compute_work_done(self) -> float:
+        """Robustly compute total work done from task_done_time."""
         segments = getattr(self, "task_done_time", None)
         if not segments:
             return 0.0
+
         total = 0.0
         first = segments[0]
-        if isinstance(first, (list, tuple)) and len(first) >= 2:
+        if isinstance(first, (int, float)):
+            for x in segments:
+                total += float(x)
+        elif isinstance(first, (list, tuple)) and len(first) >= 2:
             for seg in segments:
                 try:
-                    start, end = seg[0], seg[1]
-                    if end > start:
-                        total += float(end - start)
+                    total += float(seg[1]) - float(seg[0])
                 except Exception:
                     continue
         else:
-            for v in segments:
+            # Fallback: best effort sum if elements are numeric-like
+            for x in segments:
                 try:
-                    total += float(v)
+                    total += float(x)
                 except Exception:
                     continue
         return total
 
+    def _maybe_reset_episode(self):
+        """Detect new episode by elapsed_seconds reset and reinitialize state."""
+        elapsed = getattr(self.env, "elapsed_seconds", 0.0)
+        if not hasattr(self, "_last_elapsed") or self._last_elapsed is None or elapsed < self._last_elapsed:
+            # New episode detected
+            self.force_on_demand = False
+            self.commit_threshold = None
+        self._last_elapsed = elapsed
+
     def _step(self, last_cluster_type: ClusterType, has_spot: bool) -> ClusterType:
-        elapsed = float(getattr(self.env, "elapsed_seconds", 0.0) or 0.0)
-        if elapsed == 0.0:
-            # New episode: reset run-specific state.
-            self._lock_to_od = False
-            self._policy_initialized = False
+        self._maybe_reset_episode()
 
-        if not self._policy_initialized:
-            self._initialize_policy()
+        # Initialize commit_threshold once per episode when env is ready
+        gap = float(self.env.gap_seconds)
+        if self.commit_threshold is None:
+            # Commit threshold must be at least one gap for safety against discretization
+            self.commit_threshold = max(gap, float(self.restart_overhead))
 
-        task_duration = float(getattr(self, "task_duration", 0.0) or 0.0)
-        done = self._compute_completed_work()
-        remaining = max(0.0, task_duration - done)
+        elapsed = float(self.env.elapsed_seconds)
+        deadline = float(self.deadline)
+        restart_overhead = float(self.restart_overhead)
+
+        work_done = self._compute_work_done()
+        remaining = max(0.0, float(self.task_duration) - work_done)
+        time_left = max(0.0, deadline - elapsed)
 
         if remaining <= 0.0:
+            # Task is done (or effectively done); no need to pay for more compute
             return ClusterType.NONE
 
-        deadline = float(getattr(self, "deadline", elapsed) or elapsed)
-        time_left = deadline - elapsed
+        # Margin: extra wall-clock time beyond what is needed to finish
+        margin = time_left - (remaining + restart_overhead)
 
-        if time_left <= 0.0:
-            self._lock_to_od = True
-
-        if not self._lock_to_od:
-            if time_left <= remaining + self._buffer_seconds:
-                self._lock_to_od = True
-
-        if self._lock_to_od:
+        # If we've already decided to stick with on-demand, keep doing so
+        if getattr(self, "force_on_demand", False):
             return ClusterType.ON_DEMAND
 
+        # If margin is small (or negative), we must switch to On-Demand to avoid missing deadline
+        if margin <= self.commit_threshold:
+            self.force_on_demand = True
+            return ClusterType.ON_DEMAND
+
+        # Spot-favoring phase: use Spot when available, otherwise wait (NONE)
         if has_spot:
             return ClusterType.SPOT
-
-        return ClusterType.NONE
+        else:
+            return ClusterType.NONE
 
     @classmethod
     def _from_args(cls, parser):

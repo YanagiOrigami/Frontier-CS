@@ -2,22 +2,23 @@ from sky_spot.strategies.strategy import Strategy
 from sky_spot.utils import ClusterType
 
 class Solution(Strategy):
-    NAME = "safe_spot_strategy"
+    NAME = "conservative_spot"
 
     def solve(self, spec_path: str) -> "Solution":
         return self
 
     def _step(self, last_cluster_type: ClusterType, has_spot: bool) -> ClusterType:
-        done = sum(self.task_done_time)
-        remaining = self.task_duration - done
-        time_left = self.deadline - self.env.elapsed_seconds
-        buffer = 3 * self.restart_overhead
-        if remaining + buffer > time_left:
+        completed = sum(self.task_done_time)
+        remaining_work = max(0.0, self.task_duration - completed)
+        elapsed = self.env.elapsed_seconds
+        time_left = max(0.0, self.deadline - elapsed)
+        if remaining_work == 0:
+            return ClusterType.NONE
+        slack = time_left - remaining_work
+        if slack < self.restart_overhead or not has_spot:
             return ClusterType.ON_DEMAND
-        elif has_spot:
-            return ClusterType.SPOT
         else:
-            return ClusterType.ON_DEMAND
+            return ClusterType.SPOT
 
     @classmethod
     def _from_args(cls, parser):

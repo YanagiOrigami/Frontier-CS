@@ -2,49 +2,65 @@ from sky_spot.strategies.strategy import Strategy
 from sky_spot.utils import ClusterType
 
 class Solution(Strategy):
-    NAME = "AdaptiveThresholdStrategy"
+    NAME = "TargetSlackStrategy"
 
     def solve(self, spec_path: str) -> "Solution":
         return self
 
     def _step(self, last_cluster_type: ClusterType, has_spot: bool) -> ClusterType:
-        completed_work = sum(self.task_done_time)
-        remaining_work = self.task_duration - completed_work
+        # Calculate remaining work
+        work_done = sum(self.task_done_time)
+        remaining_work = self.task_duration - work_done
         
         if remaining_work <= 1e-6:
             return ClusterType.NONE
 
-        current_time = self.env.elapsed_seconds
-        time_left = self.deadline - current_time
-        
+        elapsed = self.env.elapsed_seconds
+        time_left = self.deadline - elapsed
         overhead = self.restart_overhead
-        gap = self.env.gap_seconds
         
-        # Calculate panic threshold
-        # We need enough time to finish on On-Demand (OD) if Spot becomes unavailable.
-        # Minimum time = remaining_work + overhead (to start OD)
-        # Safety buffer = 2 * overhead (resilience against spot fail + OD start) + 2 * gap + 15 mins padding
-        safety_buffer = 2 * overhead + 2 * gap + 900
-        panic_threshold = remaining_work + overhead + safety_buffer
-        
-        # 1. Panic Mode: If time is tight, force On-Demand
-        if time_left < panic_threshold:
-            return ClusterType.ON_DEMAND
-
-        # 2. Opportunistic Spot Usage
-        if has_spot:
-            # Hysteresis: If currently on OD, only switch to Spot if we have significant slack
-            # This prevents flapping and paying overheads when close to the critical path
-            if last_cluster_type == ClusterType.ON_DEMAND:
-                switch_buffer = 2 * overhead
-                if time_left > panic_threshold + switch_buffer:
-                    return ClusterType.SPOT
-                else:
-                    return ClusterType.ON_DEMAND
+        # Calculate slack: the extra time we have available beyond what is strictly 
+        # needed to finish using On-Demand (the safe baseline).
+        # If we are not currently running On-Demand, we must account for the overhead 
+        # time to switch/start an instance.
+        switch_cost = 0.0
+        if last_cluster_type != ClusterType.ON_DEMAND:
+            switch_cost = overhead
             
-            return ClusterType.SPOT
+        time_needed_od = remaining_work + switch_cost
+        slack = time_left - time_needed_od
 
-        # 3. Cost Saving: Wait if Spot is unavailable and we have slack
+        # Thresholds
+        # 1. Critical Buffer: Account for discrete time steps and small delays.
+        #    If slack is below this, we are in danger of missing the deadline.
+        CRITICAL_BUFFER = max(900, 3 * self.env.gap_seconds)
+        
+        # 2. Safe Buffer: Reserve a block of slack (4 hours) to handle future uncertainties.
+        #    While slack > SAFE_BUFFER, we can afford to wait for Spot or risk interruptions.
+        #    When slack < SAFE_BUFFER, we prioritize finishing the task over cost savings.
+        SAFE_BUFFER = 4 * 3600
+
+        # Decision Logic
+        if slack < CRITICAL_BUFFER:
+            return ClusterType.ON_DEMAND
+            
+        if slack < SAFE_BUFFER:
+            # Conservative Mode:
+            # We are getting close to the deadline.
+            # If we are already comfortably running on Spot, keep doing so (cheapest path).
+            # However, if we are interrupted or not on Spot, do not risk the startup overhead 
+            # or waiting time for Spot. Switch to On-Demand to guarantee completion.
+            if has_spot and last_cluster_type == ClusterType.SPOT:
+                return ClusterType.SPOT
+            return ClusterType.ON_DEMAND
+            
+        # Aggressive Mode (High Slack):
+        # We have plenty of time. Prioritize using Spot instances.
+        if has_spot:
+            return ClusterType.SPOT
+            
+        # If Spot is unavailable, wait (return NONE) to save money.
+        # We can afford to burn slack here because we have a large buffer.
         return ClusterType.NONE
 
     @classmethod

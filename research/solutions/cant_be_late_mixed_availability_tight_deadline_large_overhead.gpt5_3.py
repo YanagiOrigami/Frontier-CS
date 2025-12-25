@@ -3,74 +3,102 @@ from sky_spot.utils import ClusterType
 
 
 class Solution(Strategy):
-    NAME = "my_solution"
+    NAME = "cant_be_late_v1"
 
     def __init__(self, args=None):
-        super().__init__(args)
-        self._commit_od = False
-        self._last_elapsed = -1.0
+        try:
+            super().__init__(args)
+        except TypeError:
+            try:
+                super().__init__()
+            except Exception:
+                pass
+        self.args = args
+        self.committed_to_od = False
 
     def solve(self, spec_path: str) -> "Solution":
         return self
 
-    def _reset_run_state_if_needed(self):
-        # Detect a new run by a reset in elapsed time
-        current_elapsed = getattr(self.env, "elapsed_seconds", 0.0) or 0.0
-        if self._last_elapsed < 0 or current_elapsed < self._last_elapsed:
-            self._commit_od = False
-        self._last_elapsed = current_elapsed
+    def _total_done(self) -> float:
+        done = getattr(self, "task_done_time", 0.0)
+        if isinstance(done, (int, float)):
+            try:
+                return float(done)
+            except Exception:
+                return 0.0
+        try:
+            return float(sum(done))
+        except Exception:
+            return 0.0
 
     def _remaining_work(self) -> float:
-        done = 0.0
-        if getattr(self, "task_done_time", None):
-            try:
-                done = float(sum(self.task_done_time))
-            except Exception:
-                # Fallback in case of unexpected structure
-                done = 0.0
-        total = float(getattr(self, "task_duration", 0.0) or 0.0)
-        rem = total - done
-        return rem if rem > 0 else 0.0
+        try:
+            duration = float(self.task_duration)
+        except Exception:
+            duration = 0.0
+        done = self._total_done()
+        rem = duration - done
+        return rem if rem > 0.0 else 0.0
 
     def _time_left(self) -> float:
-        elapsed = float(getattr(self.env, "elapsed_seconds", 0.0) or 0.0)
-        deadline = float(getattr(self, "deadline", 0.0) or 0.0)
-        tl = deadline - elapsed
-        return tl if tl > 0 else 0.0
-
-    def _should_commit_to_od(self) -> bool:
-        # Robust bail-out rule:
-        # Continue on spot/wait only if even in the worst case of losing one step (gap)
-        # plus paying one restart overhead, we can still finish on OD.
-        gap = float(getattr(self.env, "gap_seconds", 0.0) or 0.0)
-        time_left = self._time_left()
-        remaining = self._remaining_work()
-        overhead = float(getattr(self, "restart_overhead", 0.0) or 0.0)
-        # Required buffer to safely risk one more step:
-        buffer_needed = overhead + gap
-        # RBC = time_left - remaining
-        rbc = time_left - remaining
-        return rbc < buffer_needed
+        try:
+            return max(float(self.deadline) - float(self.env.elapsed_seconds), 0.0)
+        except Exception:
+            return 0.0
 
     def _step(self, last_cluster_type: ClusterType, has_spot: bool) -> ClusterType:
-        self._reset_run_state_if_needed()
-
-        # If task is already completed, stop spending
-        if self._remaining_work() <= 0.0:
-            return ClusterType.NONE
-
-        # Commit to OD if safety condition is breached
-        if not self._commit_od and self._should_commit_to_od():
-            self._commit_od = True
-
-        if self._commit_od:
+        # If already committed to OD, keep using OD
+        if self.committed_to_od:
             return ClusterType.ON_DEMAND
 
-        # Prefer spot when available and safe; otherwise wait; commit-to-OD handled above
-        if has_spot:
-            return ClusterType.SPOT
-        else:
+        remaining_work = self._remaining_work()
+        if remaining_work <= 0.0:
             return ClusterType.NONE
+
+        try:
+            gap = float(self.env.gap_seconds)
+        except Exception:
+            gap = 60.0
+        try:
+            R = float(self.restart_overhead)
+        except Exception:
+            R = 0.0
+
+        time_left = self._time_left()
+
+        # Overhead if we switch to OD now (0 if already on OD)
+        od_overhead = 0.0 if last_cluster_type == ClusterType.ON_DEMAND else R
+        od_time_needed = remaining_work + od_overhead
+
+        # Safety margin: cover one decision step latency + small cushion on overhead
+        margin = gap + 0.25 * R + 60.0
+
+        # If we don't have enough time to gamble anymore, commit to OD
+        if time_left <= od_time_needed + margin:
+            self.committed_to_od = True
+            return ClusterType.ON_DEMAND
+
+        # If spot is available, prefer spot, but avoid starting a brand new spot too close to deadline
+        if has_spot:
+            if last_cluster_type == ClusterType.SPOT:
+                return ClusterType.SPOT
+            else:
+                # Guard against starting SPOT when near OD-commit boundary.
+                # Require extra slack approximately equal to paying one extra spot restart overhead.
+                start_spot_guard = R + gap
+                if time_left > od_time_needed + margin + start_spot_guard:
+                    return ClusterType.SPOT
+                else:
+                    self.committed_to_od = True
+                    return ClusterType.ON_DEMAND
+
+        # Spot unavailable: decide to wait or switch to OD
+        slack = time_left - (od_time_needed + margin)
+        if slack > 0.0:
+            return ClusterType.NONE
+        else:
+            self.committed_to_od = True
+            return ClusterType.ON_DEMAND
 
     @classmethod
     def _from_args(cls, parser):

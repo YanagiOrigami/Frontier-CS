@@ -1,94 +1,87 @@
 import argparse
-
 from sky_spot.strategies.strategy import Strategy
 from sky_spot.utils import ClusterType
 
-
 class Solution(Strategy):
-    NAME = "my_solution"
+    NAME = "dynamic_slack_strategy"
+
+    def __init__(self, args):
+        super().__init__(args)
+        # Hyperparameter: Assumes an average spot instance lifetime of 2 hours,
+        # which corresponds to 0.5 preemptions per hour of spot compute.
+        self.exp_preemptions_per_hour = 0.5
 
     def solve(self, spec_path: str) -> "Solution":
-        self.spot_seen_count = 0.0
-        self.no_spot_count = 0.0
-
-        # --- Tunable Heuristic Parameters ---
-        # Multiplier for the safety buffer. 1.0 means the buffer is exactly
-        # one restart_overhead.
-        self.SAFETY_BUFFER_MULTIPLIER = 1.0
-
-        # A risk factor determining how long we're willing to wait for a Spot
-        # instance relative to the expected wait time. A higher value means
-        # we are more patient and take more risk to save costs.
-        self.RISK_FACTOR_K = 3.0
-
-        # A minimum floor for the "wait slack". We will switch to On-Demand
-        # if slack drops below this value (plus the safety buffer), regardless
-        # of how high spot availability seems. 3600s = 1 hour.
-        self.MIN_WAIT_SLACK_SECONDS = 3600.0
-
-        # --- Derived Constants ---
-        self.safety_buffer = (
-            self.restart_overhead * self.SAFETY_BUFFER_MULTIPLIER
-        )
+        """
+        Optional initialization. Called once before evaluation.
+        Read spec_path for configuration if needed.
+        Must return self.
+        """
         return self
 
     def _step(self, last_cluster_type: ClusterType, has_spot: bool) -> ClusterType:
-        # 1. Update observations to refine our estimate of spot availability.
-        if has_spot:
-            self.spot_seen_count += 1.0
-        else:
-            self.no_spot_count += 1.0
-        total_steps = self.spot_seen_count + self.no_spot_count
+        """
+        Called at each time step. Return which cluster type to use next.
 
-        # 2. Calculate current state variables.
-        work_done = self.get_task_done()
+        Args:
+            last_cluster_type: The cluster type used in the previous step
+            has_spot: Whether spot instances are available this step
+
+        Returns:
+            ClusterType.SPOT, ClusterType.ON_DEMAND, or ClusterType.NONE
+        """
+        try:
+            work_done = sum(self.task_done_time)
+        except (TypeError, IndexError):
+            work_done = 0.0
+
         work_remaining = self.task_duration - work_done
 
-        if work_remaining <= 0:
+        if work_remaining <= 1e-6:
             return ClusterType.NONE
 
-        current_time = self.env.elapsed_seconds
-        
-        # 'current_slack' is the amount of time we have left until the deadline,
-        # minus the time it would take to finish the remaining work purely on
-        # an On-Demand instance.
-        current_slack = (self.deadline - current_time) - work_remaining
+        time_left = self.deadline - self.env.elapsed_seconds
 
-        # 3. Apply the decision logic.
+        # current_slack is the buffer we have if we run on-demand from now on.
+        # A positive value means we are ahead of the on-demand-only schedule.
+        current_slack = time_left - work_remaining
 
-        # Case 1: Critical Zone. Slack is too low to risk a preemption.
-        if current_slack <= self.safety_buffer:
+        # 1. Panic Mode:
+        # If slack is non-positive, we are behind schedule even for a pure
+        # on-demand strategy. We must use on-demand to have any chance of finishing.
+        if current_slack <= 0:
             return ClusterType.ON_DEMAND
 
-        # Case 2: Opportunity Zone. We have slack, and Spot is available.
+        # 2. Optimal Path:
+        # If spot is available, it's always the most cost-effective choice for making
+        # progress. The risk of preemption is managed by other logic branches.
         if has_spot:
             return ClusterType.SPOT
 
-        # Case 3: Decision Zone. We have slack, but Spot is not available.
-        # Decide whether to wait (NONE) or make progress (ON_DEMAND).
-        
-        # Estimate spot availability using Laplace smoothing.
-        estimated_availability = (self.spot_seen_count + 1.0) / (total_steps + 2.0)
-        
-        # Estimate the average time we'd have to wait.
-        expected_wait_time = (1.0 / estimated_availability) * self.env.gap_seconds
+        # 3. No Spot Available - The Core Trade-off:
+        # Decide whether to wait for spot (NONE) or pay for guaranteed progress (ON_DEMAND).
+        # We maintain a dynamic "reserve" of slack to absorb future preemption overheads.
+        # We only wait if our current slack exceeds this reserve.
 
-        # Determine the 'wait_threshold': the slack level below which we are no
-        # longer willing to wait.
-        adaptive_wait_buffer = self.RISK_FACTOR_K * expected_wait_time
-        wait_threshold = self.safety_buffer + max(
-            self.MIN_WAIT_SLACK_SECONDS, adaptive_wait_buffer
-        )
+        work_remaining_hours = work_remaining / 3600.0
+        expected_future_preemptions = work_remaining_hours * self.exp_preemptions_per_hour
+        
+        dynamic_reserve_slack = expected_future_preemptions * self.restart_overhead
 
-        if current_slack > wait_threshold:
-            # We have plenty of slack, worth waiting for cheaper Spot.
+        if current_slack > dynamic_reserve_slack:
+            # We have more slack than needed for our preemption buffer.
+            # We can afford to spend this excess slack waiting for a cheap spot instance.
             return ClusterType.NONE
         else:
-            # Slack is below the adaptive threshold. Use On-Demand to make
-            # guaranteed progress.
+            # Our slack has dropped into the reserve buffer. We cannot afford
+            # to wait any longer. Use on-demand to make progress while
+            # preserving the remaining slack for potential future preemptions.
             return ClusterType.ON_DEMAND
 
     @classmethod
     def _from_args(cls, parser: argparse.ArgumentParser):
+        """
+        REQUIRED: For evaluator instantiation.
+        """
         args, _ = parser.parse_known_args()
         return cls(args)

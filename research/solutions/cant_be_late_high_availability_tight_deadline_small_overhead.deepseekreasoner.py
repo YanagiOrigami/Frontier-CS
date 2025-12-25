@@ -1,137 +1,89 @@
-import math
-from typing import List
+import json
+import os
 from sky_spot.strategies.strategy import Strategy
 from sky_spot.utils import ClusterType
 
 class Solution(Strategy):
     NAME = "my_solution"
-    
-    def __init__(self, args):
+
+    def __init__(self, args=None):
         super().__init__(args)
-        self.initialized = False
-        self.conservative_mode = False
-        self.spot_availability_history = []
-        self.last_decision = None
-        self.consecutive_spot_failures = 0
-        
+        self.preempted = False
+        self.restart_timer = 0
+        self.conservative_threshold = 1.1
+        self.min_spot_ratio = 0.3
+        self.time_step = 0
+        self.use_on_demand_count = 0
+        self.total_steps_estimated = 0
+        self.safety_factor = 1.2
+
     def solve(self, spec_path: str) -> "Solution":
+        if os.path.exists(spec_path):
+            try:
+                with open(spec_path) as f:
+                    config = json.load(f)
+                self.conservative_threshold = config.get("conservative_threshold", 1.1)
+                self.min_spot_ratio = config.get("min_spot_ratio", 0.3)
+                self.safety_factor = config.get("safety_factor", 1.2)
+            except:
+                pass
+        self.time_step = 0
+        self.use_on_demand_count = 0
         return self
-        
+
     def _step(self, last_cluster_type: ClusterType, has_spot: bool) -> ClusterType:
-        # Initialize on first step
-        if not self.initialized:
-            self.initialized = True
-            self.remaining_work = self.task_duration
-            self.spot_available_percentage = 0.6  # initial estimate (between 43-78%)
-            self.spot_history_weight = 0.1
+        self.time_step += 1
         
-        # Track spot availability history
-        self.spot_availability_history.append(1 if has_spot else 0)
-        if len(self.spot_availability_history) > 100:
-            self.spot_availability_history.pop(0)
+        work_done = sum(self.task_done_time)
+        work_remaining = self.task_duration - work_done
+        time_remaining = self.deadline - self.env.elapsed_seconds
         
-        # Calculate remaining work and time
-        work_done = sum(segment.length for segment in self.task_done_time)
-        self.remaining_work = self.task_duration - work_done
-        time_left = self.deadline - self.env.elapsed_seconds
-        
-        # Update spot availability estimate based on history
-        if len(self.spot_availability_history) > 0:
-            recent_availability = sum(self.spot_availability_history[-20:]) / min(20, len(self.spot_availability_history))
-            self.spot_available_percentage = (0.7 * self.spot_available_percentage + 
-                                            0.3 * recent_availability)
-        
-        # Check if we should be conservative (safety first)
-        self.conservative_mode = self._should_be_conservative(time_left)
-        
-        # Decide next action
-        decision = self._make_decision(last_cluster_type, has_spot, time_left)
-        self.last_decision = decision
-        
-        # Update spot failure tracking
-        if has_spot and decision == ClusterType.SPOT:
-            self.consecutive_spot_failures = 0
-        elif not has_spot and decision == ClusterType.SPOT:
-            self.consecutive_spot_failures += 1
-        
-        return decision
-    
-    def _should_be_conservative(self, time_left: float) -> bool:
-        """Determine if we need to be conservative to meet deadline"""
-        # Calculate expected completion time with current strategy
-        if self.remaining_work <= 0:
-            return False
-            
-        # Conservative factors
-        safety_factor = 1.2  # 20% safety margin
-        min_safety_time = 2 * self.restart_overhead  # at least 2 restarts worth of safety
-        
-        # Calculate effective work rate
-        effective_spot_rate = self.spot_available_percentage
-        spot_time_needed = self.remaining_work / effective_spot_rate
-        
-        # If we're getting close to deadline, be conservative
-        if time_left < spot_time_needed * safety_factor + min_safety_time:
-            return True
-            
-        # If we've had recent spot failures
-        if self.consecutive_spot_failures > 3:
-            return True
-            
-        return False
-    
-    def _make_decision(self, last_cluster_type: ClusterType, has_spot: bool, time_left: float) -> ClusterType:
-        """Make the decision based on current state"""
-        
-        # If no work left, do nothing
-        if self.remaining_work <= 0:
+        if work_remaining <= 0:
             return ClusterType.NONE
-            
-        # In conservative mode, prefer on-demand
-        if self.conservative_mode:
-            if self.remaining_work <= time_left:
-                # We have enough time even with conservative approach
-                if has_spot and self._should_use_spot_conservative(time_left):
-                    return ClusterType.SPOT
-                else:
-                    return ClusterType.ON_DEMAND
-            else:
-                # We're behind schedule - must use on-demand
-                return ClusterType.ON_DEMAND
         
-        # Regular decision making
-        if has_spot:
-            # Use spot if we have enough time buffer
-            time_needed_with_spot = self.remaining_work / self.spot_available_percentage
-            time_needed_with_ondemand = self.remaining_work
-            
-            # Consider restart overhead
-            if last_cluster_type != ClusterType.SPOT and last_cluster_type != ClusterType.NONE:
-                time_needed_with_spot += self.restart_overhead
-            
-            # Decision: use spot if we have enough buffer
-            buffer_needed = 2 * self.restart_overhead
-            if time_left > time_needed_with_spot + buffer_needed:
-                return ClusterType.SPOT
-            else:
-                return ClusterType.ON_DEMAND
-        else:
-            # Spot not available
-            if time_left > self.remaining_work + self.restart_overhead:
-                # We can afford to wait for spot
-                return ClusterType.NONE
-            else:
-                # Need to use on-demand to meet deadline
-                return ClusterType.ON_DEMAND
-    
-    def _should_use_spot_conservative(self, time_left: float) -> bool:
-        """Decide whether to use spot in conservative mode"""
-        # Only use spot if we have significant time buffer
-        min_buffer = 4 * self.restart_overhead
-        expected_spot_time = self.remaining_work / max(self.spot_available_percentage, 0.5)
+        if last_cluster_type == ClusterType.SPOT and not has_spot:
+            self.preempted = True
         
-        return time_left > expected_spot_time + min_buffer
-    
+        if self.restart_timer > 0:
+            self.restart_timer -= self.env.gap_seconds
+        
+        progress_per_step = self.env.gap_seconds
+        if last_cluster_type == ClusterType.SPOT and self.restart_timer > 0:
+            progress_per_step = 0
+        
+        required_steps = work_remaining / progress_per_step if progress_per_step > 0 else float('inf')
+        available_steps = time_remaining / self.env.gap_seconds
+        
+        if self.total_steps_estimated == 0:
+            self.total_steps_estimated = required_steps
+        
+        spot_ratio = self.min_spot_ratio
+        if available_steps > 0:
+            required_ratio = required_steps / available_steps
+            spot_ratio = max(self.min_spot_ratio, 
+                           1.0 - (required_ratio * self.conservative_threshold))
+        
+        use_spot = (has_spot and not self.preempted and 
+                   self.restart_timer <= 0 and
+                   self.time_step % 100 < spot_ratio * 100)
+        
+        if use_spot:
+            if self.preempted:
+                self.restart_timer = self.restart_overhead
+                self.preempted = False
+            return ClusterType.SPOT
+        
+        if work_remaining > 0 and time_remaining <= work_remaining * self.safety_factor:
+            return ClusterType.ON_DEMAND
+        
+        if time_remaining <= self.restart_overhead * 2:
+            return ClusterType.ON_DEMAND
+        
+        if not has_spot:
+            return ClusterType.ON_DEMAND if work_remaining > 0 else ClusterType.NONE
+        
+        return ClusterType.NONE
+
     @classmethod
     def _from_args(cls, parser):
         args, _ = parser.parse_known_args()

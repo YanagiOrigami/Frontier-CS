@@ -1,67 +1,97 @@
-import json
-import os
-from sky_spot.strategies.strategy import Strategy
-from sky_spot.utils import ClusterType
+import math
+from typing import Any
+
+try:
+    from sky_spot.strategies.strategy import Strategy
+    from sky_spot.utils import ClusterType
+except Exception:  # Fallback stubs for non-evaluation environments
+    from enum import Enum
+
+    class ClusterType(Enum):
+        SPOT = 1
+        ON_DEMAND = 2
+        NONE = 3
+
+    class _DummyEnv:
+        elapsed_seconds = 0.0
+        gap_seconds = 60.0
+        cluster_type = ClusterType.NONE
+
+    class Strategy:
+        def __init__(self, args=None):
+            self.env = _DummyEnv()
+            self.task_duration = 0.0
+            self.task_done_time = 0.0
+            self.deadline = 0.0
+            self.restart_overhead = 0.0
+
+        def solve(self, spec_path: str):
+            return self
 
 
 class Solution(Strategy):
-    NAME = "cant_be_late_barrier"
+    NAME = "lazy_commit_v2"
 
-    def __init__(self, args=None):
+    def __init__(self, args: Any = None):
         super().__init__(args)
-        self._committed_od = False
-        self._extra_commit_margin_seconds = 0.0
+        self._committed_to_od = False
 
     def solve(self, spec_path: str) -> "Solution":
-        try:
-            if spec_path and os.path.isfile(spec_path):
-                with open(spec_path, "r") as f:
-                    cfg = json.load(f)
-                self._extra_commit_margin_seconds = float(cfg.get("commit_margin_seconds", 0.0))
-        except Exception:
-            pass
         return self
 
-    def _step(self, last_cluster_type: ClusterType, has_spot: bool) -> ClusterType:
-        dt = float(getattr(self.env, "gap_seconds", 0.0) or 0.0)
-        elapsed = float(getattr(self.env, "elapsed_seconds", 0.0) or 0.0)
-        oh = float(self.restart_overhead or 0.0)
-        deadline = float(self.deadline or 0.0)
-        total = float(self.task_duration or 0.0)
-
-        # Compute completed work
-        done_list = self.task_done_time
+    def _compute_done_time(self) -> float:
+        tdt = getattr(self, "task_done_time", 0.0)
+        if isinstance(tdt, (list, tuple)):
+            total = 0.0
+            for v in tdt:
+                try:
+                    total += float(v)
+                except Exception:
+                    try:
+                        # If segment represented as (start, end)
+                        if isinstance(v, (list, tuple)) and len(v) >= 2:
+                            total += float(v[1]) - float(v[0])
+                    except Exception:
+                        continue
+            return max(total, 0.0)
         try:
-            if isinstance(done_list, (list, tuple)):
-                done = float(sum(done_list))
-            else:
-                done = float(done_list or 0.0)
+            return max(float(tdt), 0.0)
         except Exception:
-            done = 0.0
+            return 0.0
 
-        remaining_work = max(0.0, total - done)
-        if remaining_work <= 0.0:
+    def _remaining_work(self) -> float:
+        done = self._compute_done_time()
+        return max(float(self.task_duration) - done, 0.0)
+
+    def _should_commit_to_od(self, remaining: float) -> bool:
+        t = float(getattr(self.env, "elapsed_seconds", 0.0))
+        deadline = float(self.deadline)
+        slack = max(deadline - t, 0.0)
+        gap = max(float(getattr(self.env, "gap_seconds", 0.0)), 0.0)
+        oh = float(self.restart_overhead)
+
+        # Margin accounts for discrete step size and potential scheduling overheads
+        # Using 2 gaps and a 60-second cushion
+        margin = max(2.0 * gap, 60.0)
+        required_if_commit_later = remaining + oh + margin
+        return slack <= required_if_commit_later
+
+    def _step(self, last_cluster_type: ClusterType, has_spot: bool) -> ClusterType:
+        remaining = self._remaining_work()
+        if remaining <= 0.0:
+            self._committed_to_od = True
             return ClusterType.NONE
 
-        time_left = max(0.0, deadline - elapsed)
+        if not self._committed_to_od and self._should_commit_to_od(remaining):
+            self._committed_to_od = True
 
-        if self._committed_od:
+        if self._committed_to_od:
             return ClusterType.ON_DEMAND
-
-        # Slack beyond "finish on OD after one overhead"
-        s = time_left - (remaining_work + oh + self._extra_commit_margin_seconds)
 
         if has_spot:
-            if s > 0.0:
-                return ClusterType.SPOT
-            else:
-                self._committed_od = True
-                return ClusterType.ON_DEMAND
-        else:
-            if s >= dt:
-                return ClusterType.NONE
-            self._committed_od = True
-            return ClusterType.ON_DEMAND
+            return ClusterType.SPOT
+
+        return ClusterType.NONE
 
     @classmethod
     def _from_args(cls, parser):

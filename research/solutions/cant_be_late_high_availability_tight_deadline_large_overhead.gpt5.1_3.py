@@ -5,67 +5,95 @@ from sky_spot.utils import ClusterType
 class Solution(Strategy):
     NAME = "my_solution"
 
-    def __init__(self, args=None):
-        super().__init__(args)
-        self._policy_initialized = False
-        self._commit_slack = None
-        self._committed = False
+    def __init__(self, args=None, *extra_args, **kwargs):
+        # Be robust to different Strategy.__init__ signatures.
+        try:
+            super().__init__(args, *extra_args, **kwargs)
+        except TypeError:
+            try:
+                super().__init__()
+            except TypeError:
+                pass
+        self.args = args
+        self.od_only = False
+        self._work_done_cache = 0.0
+        self._last_done_len = 0
 
     def solve(self, spec_path: str) -> "Solution":
         return self
 
-    def _initialize_policy(self):
-        # Called on first _step when env is available.
-        initial_slack = self.deadline - self.task_duration  # seconds
-        gap = getattr(self.env, "gap_seconds", 0.0)
-        # Margin to safely cover one worst-case wasted step plus a restart
-        commit_margin = self.restart_overhead + 2.0 * gap
-
-        if initial_slack <= 0:
-            # No slack at all: must use on-demand from the beginning.
-            self._commit_slack = 0.0
-        elif initial_slack <= commit_margin:
-            # Not enough slack to risk spot usage.
-            self._commit_slack = initial_slack
-        else:
-            # Use the larger of half the slack or the safety margin.
-            self._commit_slack = max(0.5 * initial_slack, commit_margin)
-
-        self._policy_initialized = True
+    def _update_work_done_cache(self):
+        tdt = getattr(self, "task_done_time", None)
+        if tdt is None:
+            self._work_done_cache = 0.0
+            self._last_done_len = 0
+            return
+        try:
+            length = len(tdt)
+        except TypeError:
+            self._work_done_cache = 0.0
+            self._last_done_len = 0
+            return
+        if length != self._last_done_len:
+            try:
+                self._work_done_cache = float(sum(tdt))
+            except TypeError:
+                self._work_done_cache = 0.0
+            self._last_done_len = length
 
     def _step(self, last_cluster_type: ClusterType, has_spot: bool) -> ClusterType:
-        if not self._policy_initialized:
-            self._initialize_policy()
+        # Update cached completed work
+        self._update_work_done_cache()
 
-        # Compute remaining work and slack
-        elapsed = self.env.elapsed_seconds
-        remaining_time = self.deadline - elapsed
+        env = self.env
+        gap = float(getattr(env, "gap_seconds", 0.0))
+        elapsed = float(getattr(env, "elapsed_seconds", 0.0))
 
-        work_done = 0.0
-        if self.task_done_time:
-            work_done = sum(self.task_done_time)
+        deadline = float(self.deadline)
+        task_duration = float(self.task_duration)
+        restart_overhead = float(self.restart_overhead)
 
-        remaining_work = max(0.0, self.task_duration - work_done)
+        work_done = self._work_done_cache
+        remaining_work = max(task_duration - work_done, 0.0)
+        time_left = deadline - elapsed
 
-        # If task is done (or overshot due to numerical issues), do nothing.
-        if remaining_work <= 0.0:
-            self._committed = True
+        # If no work remaining or no time left, do nothing
+        if remaining_work <= 0.0 or time_left <= 0.0:
             return ClusterType.NONE
 
-        slack = remaining_time - remaining_work
+        # Slack = extra time beyond required compute if we ran at full speed
+        slack = time_left - remaining_work
+        total_slack = max(deadline - task_duration, 0.0)
 
-        # Commit to on-demand if slack is at or below threshold.
-        if (not self._committed) and (slack <= self._commit_slack):
-            self._committed = True
+        # Buffer to account for discrete step size
+        buffer = gap
 
-        if self._committed:
-            # From this point on, always use on-demand to guarantee completion.
+        # Threshold for switching permanently to on-demand
+        commit_slack = restart_overhead + buffer
+
+        # Enter on-demand-only mode once slack is small
+        if (not self.od_only) and slack <= commit_slack:
+            self.od_only = True
+
+        # Once committed, always use on-demand while work remains
+        if self.od_only:
             return ClusterType.ON_DEMAND
 
-        # Not yet committed: prefer spot when available; otherwise wait.
+        # Pre-commit phase
+        # Allow idling (NONE) when slack is high and spot is unavailable
+        idle_slack_threshold = max(commit_slack + 2.0 * gap, 0.5 * total_slack)
+
+        # Use spot whenever available in pre-commit phase
         if has_spot:
             return ClusterType.SPOT
-        return ClusterType.NONE
+
+        # Spot not available
+        if slack > idle_slack_threshold:
+            # Plenty of slack: wait for spot
+            return ClusterType.NONE
+
+        # Moderate slack: fall back to on-demand when spot is unavailable
+        return ClusterType.ON_DEMAND
 
     @classmethod
     def _from_args(cls, parser):

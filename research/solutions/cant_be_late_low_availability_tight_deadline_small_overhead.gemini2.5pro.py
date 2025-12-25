@@ -1,9 +1,9 @@
-import argparse
 from sky_spot.strategies.strategy import Strategy
 from sky_spot.utils import ClusterType
+import math
 
 class Solution(Strategy):
-    NAME = "adaptive_buffer_v1"
+    NAME = "my_solution"
 
     def solve(self, spec_path: str) -> "Solution":
         """
@@ -11,96 +11,80 @@ class Solution(Strategy):
         Read spec_path for configuration if needed.
         Must return self.
         """
-        # --- Tunable Parameters ---
-        # Base safety buffer in seconds. This is the minimum slack we want to maintain.
-        # It provides a cushion for unexpected events like preemptions.
-        # A value of 30 minutes (1800s) is chosen as a starting point.
-        self.BASE_BUFFER = 1800.0
+        # Factor for the critical slack buffer, as a multiple of restart_overhead.
+        # If slack is below this, we must use on-demand.
+        self.critical_buffer_factor = 1.5
 
-        # A multiplier for the longest observed spot unavailability period ("drought").
-        # This makes the buffer adaptive. A higher factor means the strategy
-        # becomes conservative more quickly in response to poor spot availability.
-        self.DROUGHT_FACTOR = 1.2
+        # Factor for willingness to wait. Higher means more patient.
+        # Comfortable slack threshold = T_critical + factor * expected_wait_time.
+        self.wait_aggressiveness = 2.0
 
-        # --- State Variables ---
-        # Tracks the duration of the current, ongoing spot unavailability period.
-        self.current_drought_seconds = 0.0
+        # State for online estimation of spot availability (p).
+        # Start with a Beta(2,2) prior, corresponding to 1 success and 1 failure.
+        # This gives an initial p_estimate of 0.5 and avoids division by zero.
+        self.spot_seen_count = 1
+        self.total_steps = 2
         
-        # Tracks the longest spot unavailability period seen so far.
-        self.max_drought_seen_seconds = 0.0
-
-        # Caching for total work done to avoid re-computation on every step.
-        self._total_work_done_cache = 0.0
-        self._task_done_time_len_cache = 0
-
         return self
-
-    def _get_total_work_done(self) -> float:
-        """
-        Calculates and caches the total amount of work completed.
-        This is a micro-optimization to avoid re-summing a potentially long list.
-        """
-        if len(self.task_done_time) == self._task_done_time_len_cache:
-            return self._total_work_done_cache
-
-        self._total_work_done_cache = sum(end - start for start, end in self.task_done_time)
-        self._task_done_time_len_cache = len(self.task_done_time)
-        return self._total_work_done_cache
 
     def _step(self, last_cluster_type: ClusterType, has_spot: bool) -> ClusterType:
         """
         Called at each time step. Return which cluster type to use next.
 
-        The core logic is to maintain a "slack" time, which is the amount of
-        time we can afford to be idle before risking the deadline. This slack is
-        compared against an adaptive safety buffer. If slack falls below the
-        buffer, we switch to reliable On-Demand instances. Otherwise, we use
-        Spot if available or wait if not. The buffer grows based on the longest
-        observed period of Spot unavailability, making the strategy more
-        conservative in low-availability environments.
-        """
-        # 1. Update state: Track spot unavailability "droughts".
-        if has_spot:
-            self.current_drought_seconds = 0.0
-        else:
-            self.current_drought_seconds += self.env.gap_seconds
-        
-        self.max_drought_seen_seconds = max(
-            self.max_drought_seen_seconds, self.current_drought_seconds
-        )
+        Args:
+            last_cluster_type: The cluster type used in the previous step
+            has_spot: Whether spot instances are available this step
 
-        # 2. Calculate current progress and available time slack.
-        work_done = self._get_total_work_done()
+        Returns:
+            ClusterType.SPOT, ClusterType.ON_DEMAND, or ClusterType.NONE
+        """
+        # 1. Update online estimate of spot availability
+        self.total_steps += 1
+        if has_spot:
+            self.spot_seen_count += 1
+        p_estimate = self.spot_seen_count / self.total_steps
+
+        # 2. Calculate current job state
+        work_done = sum(end - start for start, end in self.task_done_time)
         work_remaining = self.task_duration - work_done
 
-        if work_remaining <= 1e-9:  # Floating point comparison for job completion.
+        if work_remaining <= 0:
             return ClusterType.NONE
 
-        time_remaining_to_deadline = self.deadline - self.env.elapsed_seconds
+        current_time = self.env.elapsed_seconds
+        time_to_deadline = self.deadline - current_time
         
-        # Slack = Time left until deadline - Time needed to finish work.
-        slack = time_remaining_to_deadline - work_remaining
-        
-        # 3. Calculate the adaptive safety buffer.
-        adaptive_buffer = self.BASE_BUFFER + self.max_drought_seen_seconds * self.DROUGHT_FACTOR
+        # Slack: time buffer if we switch to on-demand for all remaining work.
+        slack = time_to_deadline - work_remaining
 
-        # 4. Make the decision based on the slack vs. buffer comparison.
-        if slack < adaptive_buffer:
-            # Not enough slack, must use the reliable option to guarantee progress.
-            return ClusterType.ON_DEMAND
+        # 3. Define adaptive thresholds for decision-making
+        t_critical = self.critical_buffer_factor * self.restart_overhead
+
+        if p_estimate > 1e-9:
+            expected_wait_time = self.env.gap_seconds / p_estimate
         else:
-            # Plenty of slack, we can afford to use cheaper options or wait.
-            if has_spot:
-                # Use the cheapest option when available.
-                return ClusterType.SPOT
-            else:
-                # Wait for Spot to become available to save costs.
-                return ClusterType.NONE
+            expected_wait_time = float('inf')
+        
+        t_comfortable = t_critical + self.wait_aggressiveness * expected_wait_time
+
+        # 4. Decision logic
+        # If slack is critically low, we must use on-demand to guarantee progress.
+        if slack <= t_critical:
+            return ClusterType.ON_DEMAND
+
+        # If spot is available and we're not in a critical state, always use it.
+        if has_spot:
+            return ClusterType.SPOT
+
+        # Spot is unavailable. Decide whether to wait (NONE) or use on-demand.
+        # If we have a comfortable amount of slack, we can afford to wait.
+        if slack >= t_comfortable:
+            return ClusterType.NONE
+        else:
+            # Otherwise, it's too risky to wait. Use on-demand to make progress.
+            return ClusterType.ON_DEMAND
 
     @classmethod
-    def _from_args(cls, parser: argparse.ArgumentParser):
-        """
-        Required classmethod for evaluator instantiation.
-        """
+    def _from_args(cls, parser):  # REQUIRED: For evaluator instantiation
         args, _ = parser.parse_known_args()
         return cls(args)

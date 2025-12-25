@@ -3,112 +3,150 @@ from sky_spot.strategies.strategy import Strategy
 from sky_spot.utils import ClusterType
 
 class Solution(Strategy):
-    NAME = "my_solution"
-    
+    NAME = "adaptive_threshold_solver"
+
     def __init__(self, args):
         super().__init__(args)
-        self.spot_availability_history = []
-        self.spot_price = 0.97
-        self.ondemand_price = 3.06
-        self.remaining_work = 0.0
-        self.time_remaining = 0.0
-        self.safety_factor = 2.0
-        self.min_spot_confidence = 0.3
-        self.consecutive_spot_runs = 0
-        self.consecutive_ondemand_runs = 0
-        
+        self.initialized = False
+        self.spot_price = 0.97  # per hour
+        self.od_price = 3.06    # per hour
+        self.time_step_hours = 0.0
+        self.total_work_hours = 0.0
+        self.deadline_hours = 0.0
+        self.restart_hours = 0.0
+        self.safety_factor = 1.2
+        self.spot_history = []
+        self.consecutive_spot_failures = 0
+        self.last_decision = ClusterType.NONE
+        self.remaining_work_hours = 0.0
+        self.restart_timer = 0.0
+        self.currently_in_restart = False
+
     def solve(self, spec_path: str) -> "Solution":
+        # Read configuration if needed
+        # For this implementation, we'll use fixed parameters from problem description
+        self.time_step_hours = 1.0 / 3600  # Assuming 1-second steps in hours
+        self.total_work_hours = 48.0
+        self.deadline_hours = 70.0
+        self.restart_hours = 0.20
+        self.remaining_work_hours = self.total_work_hours
+        self.initialized = True
         return self
-    
-    def _update_state(self, has_spot: bool):
-        self.spot_availability_history.append(1 if has_spot else 0)
-        if len(self.spot_availability_history) > 100:
-            self.spot_availability_history.pop(0)
-            
-        self.remaining_work = self.task_duration - sum(self.task_done_time)
-        self.time_remaining = self.deadline - self.env.elapsed_seconds
+
+    def _calculate_work_remaining(self) -> float:
+        """Calculate remaining work in hours"""
+        if not self.task_done_time:
+            return self.total_work_hours
         
-    def _spot_availability_probability(self, lookback: int = 20) -> float:
-        if not self.spot_availability_history:
-            return 0.0
-        recent = self.spot_availability_history[-lookback:]
-        return sum(recent) / len(recent) if recent else 0.0
-    
-    def _compute_aggressiveness(self) -> float:
-        time_needed_with_overhead = self.remaining_work + self.restart_overhead
-        slack_ratio = (self.time_remaining - time_needed_with_overhead) / self.time_remaining
+        total_done = 0.0
+        for start, end in self.task_done_time:
+            total_done += (end - start) / 3600  # Convert seconds to hours
         
-        if slack_ratio > 0.3:
-            return 0.9
-        elif slack_ratio > 0.1:
-            return 0.7
-        elif slack_ratio > -0.1:
-            return 0.4
-        else:
-            return 0.1
-    
-    def _should_use_spot(self, has_spot: bool, spot_prob: float) -> bool:
-        if not has_spot:
-            return False
-            
-        min_work_for_spot = self.restart_overhead * 2.0
-        if self.remaining_work < min_work_for_spot:
-            return False
-            
-        if self.time_remaining < self.remaining_work + self.restart_overhead * 3:
-            return False
-            
-        if spot_prob < self.min_spot_confidence:
-            return False
-            
-        aggressiveness = self._compute_aggressiveness()
-        required_confidence = 1.0 - aggressiveness
-        
-        return spot_prob > required_confidence
-    
+        remaining = max(0.0, self.total_work_hours - total_done)
+        self.remaining_work_hours = remaining
+        return remaining
+
+    def _calculate_time_remaining(self) -> float:
+        """Calculate time remaining until deadline in hours"""
+        elapsed_hours = self.env.elapsed_seconds / 3600
+        return max(0.0, self.deadline_hours - elapsed_hours)
+
+    def _calculate_required_od_time(self, work_remaining: float) -> float:
+        """Calculate minimum on-demand time needed to finish work"""
+        return work_remaining
+
+    def _calculate_required_spot_time(self, work_remaining: float) -> float:
+        """Calculate expected spot time needed including restart overhead"""
+        # Assuming 30% spot availability on average
+        avg_availability = 0.3
+        effective_rate = avg_availability * (1 - 0.1)  # 10% time lost to restarts
+        if effective_rate > 0:
+            return work_remaining / effective_rate
+        return float('inf')
+
     def _step(self, last_cluster_type: ClusterType, has_spot: bool) -> ClusterType:
-        self._update_state(has_spot)
-        spot_prob = self._spot_availability_probability()
-        
-        if self.remaining_work <= 0:
-            return ClusterType.NONE
-            
-        if self.time_remaining <= 0:
-            return ClusterType.NONE
-            
-        time_needed_with_overhead = self.remaining_work + self.restart_overhead
-        
-        if self.time_remaining < time_needed_with_overhead * 0.8:
-            if last_cluster_type == ClusterType.ON_DEMAND:
-                self.consecutive_ondemand_runs += 1
-                return ClusterType.ON_DEMAND
+        if not self.initialized:
             return ClusterType.ON_DEMAND
         
-        if self.time_remaining < self.remaining_work * 1.2:
-            return ClusterType.ON_DEMAND
+        # Update restart timer
+        if self.currently_in_restart:
+            self.restart_timer -= self.time_step_hours
+            if self.restart_timer <= 0:
+                self.currently_in_restart = False
         
-        if self._should_use_spot(has_spot, spot_prob):
+        # Calculate current state
+        work_remaining = self._calculate_work_remaining()
+        time_remaining = self._calculate_time_remaining()
+        elapsed_hours = self.env.elapsed_seconds / 3600
+        
+        # If no work left, do nothing
+        if work_remaining <= 0:
+            return ClusterType.NONE
+        
+        # If we're in restart overhead, wait
+        if self.currently_in_restart:
+            return ClusterType.NONE
+        
+        # Calculate critical threshold
+        required_od_time = self._calculate_required_od_time(work_remaining)
+        buffer_needed = self.restart_hours * 2  # Safety buffer for restarts
+        
+        # Emergency mode: must use on-demand to meet deadline
+        if time_remaining <= required_od_time * self.safety_factor:
+            # Start restart overhead if switching from spot
             if last_cluster_type == ClusterType.SPOT:
-                self.consecutive_spot_runs += 1
-                if self.consecutive_spot_runs > 5:
-                    self.consecutive_spot_runs = 0
-                    self.consecutive_ondemand_runs = 0
-                    return ClusterType.ON_DEMAND
-            else:
-                self.consecutive_spot_runs = 1
-                self.consecutive_ondemand_runs = 0
-            return ClusterType.SPOT
-        else:
-            if last_cluster_type == ClusterType.ON_DEMAND:
-                self.consecutive_ondemand_runs += 1
-                if self.consecutive_ondemand_runs > 3 and has_spot:
-                    self.consecutive_ondemand_runs = 0
-                    return ClusterType.SPOT
-            else:
-                self.consecutive_ondemand_runs = 1
-                self.consecutive_spot_runs = 0
+                self.currently_in_restart = True
+                self.restart_timer = self.restart_hours
+                return ClusterType.NONE
             return ClusterType.ON_DEMAND
-    
+        
+        # Try to use spot when available
+        if has_spot:
+            # Calculate if we have enough time for spot
+            expected_spot_time = self._calculate_required_spot_time(work_remaining)
+            time_for_spot = time_remaining - buffer_needed
+            
+            if expected_spot_time <= time_for_spot:
+                # Start restart overhead if switching from non-spot
+                if last_cluster_type != ClusterType.SPOT and last_cluster_type != ClusterType.NONE:
+                    self.currently_in_restart = True
+                    self.restart_timer = self.restart_hours
+                    return ClusterType.NONE
+                self.consecutive_spot_failures = 0
+                return ClusterType.SPOT
+            else:
+                # Not enough time for spot, use on-demand
+                if last_cluster_type == ClusterType.SPOT:
+                    self.currently_in_restart = True
+                    self.restart_timer = self.restart_hours
+                    return ClusterType.NONE
+                return ClusterType.ON_DEMAND
+        else:
+            # No spot available
+            self.consecutive_spot_failures += 1
+            
+            # If we've had many spot failures, be more aggressive with on-demand
+            if self.consecutive_spot_failures > 10:
+                if last_cluster_type == ClusterType.SPOT:
+                    self.currently_in_restart = True
+                    self.restart_timer = self.restart_hours
+                    return ClusterType.NONE
+                return ClusterType.ON_DEMAND
+            
+            # Check if we should wait for spot or use on-demand
+            time_needed_with_od = required_od_time * 1.1  # 10% buffer
+            
+            if time_remaining > time_needed_with_od * 1.5:
+                # We have time to wait for spot
+                return ClusterType.NONE
+            else:
+                # Getting tight, use on-demand
+                if last_cluster_type == ClusterType.SPOT:
+                    self.currently_in_restart = True
+                    self.restart_timer = self.restart_hours
+                    return ClusterType.NONE
+                return ClusterType.ON_DEMAND
+
     @classmethod
     def _from_args(cls, parser):
         args, _ = parser.parse_known_args()

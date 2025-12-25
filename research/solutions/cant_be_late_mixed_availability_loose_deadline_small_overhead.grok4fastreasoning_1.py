@@ -23,8 +23,13 @@ class Solution(Strategy):
         Returns:
             ClusterType.SPOT, ClusterType.ON_DEMAND, or ClusterType.NONE
         """
-        # Your decision logic here
-        if has_spot:
+        total_done = sum(self.task_done_time)
+        remaining = self.task_duration - total_done
+        time_left = self.deadline - self.env.elapsed_seconds
+        if remaining <= 0:
+            return ClusterType.NONE
+        buffer_needed = 2 * self.restart_overhead
+        if has_spot and time_left > remaining + buffer_needed:
             return ClusterType.SPOT
         return ClusterType.ON_DEMAND
 

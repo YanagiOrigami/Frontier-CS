@@ -1,13 +1,12 @@
 import json
 from argparse import Namespace
-from typing import List, Optional
 
 from sky_spot.strategies.multi_strategy import MultiRegionStrategy
 from sky_spot.utils import ClusterType
 
 
 class Solution(MultiRegionStrategy):
-    NAME = "cant_be_late_v1"
+    NAME = "cant_be_late_mr"
 
     def solve(self, spec_path: str) -> "Solution":
         with open(spec_path) as f:
@@ -22,105 +21,111 @@ class Solution(MultiRegionStrategy):
         super().__init__(args)
 
         # Internal state
-        self._initialized = False
-        self._od_committed = False
-        self._region_scores: Optional[List[float]] = None
-        self._region_counts: Optional[List[int]] = None
-        self._no_spot_streak: Optional[List[int]] = None
-        self._last_switch_step = -10**9
-        self._step_idx = 0
-
-        # Params for heuristics
-        self._score_alpha = 0.1  # EMA smoothing for region availability
-        self._switch_cooldown_steps = 1  # avoid switching too frequently
-        # Safety margin: one step plus a fraction of overhead
-        self._safety_margin = (getattr(self.env, "gap_seconds", 3600.0)) + 0.5 * self.restart_overhead
-
+        self._committed_to_od = False
+        self._done_acc = 0.0
+        self._last_done_len = 0
+        self._rr_initialized = False
+        self._rr_next_region = 0
         return self
 
-    def _ensure_initialized(self):
-        if self._initialized:
+    def _init_rr(self):
+        if not self._rr_initialized:
+            try:
+                n = self.env.get_num_regions()
+            except Exception:
+                n = 1
+            if n <= 0:
+                n = 1
+            try:
+                cur = self.env.get_current_region()
+            except Exception:
+                cur = 0
+            self._rr_next_region = (cur + 1) % n
+            self._rr_initialized = True
+
+    def _update_done_acc(self):
+        # Incremental sum of task_done_time to avoid O(n) sum per step
+        tlist = self.task_done_time
+        if tlist is None:
             return
-        num_regions = self.env.get_num_regions()
-        # Initialize with reasonably high belief because traces have high availability
-        self._region_scores = [0.8 for _ in range(num_regions)]
-        self._region_counts = [0 for _ in range(num_regions)]
-        self._no_spot_streak = [0 for _ in range(num_regions)]
-        self._initialized = True
+        if len(tlist) > self._last_done_len:
+            # Typically only 0 or 1 new segment per step
+            for i in range(self._last_done_len, len(tlist)):
+                self._done_acc += tlist[i]
+            self._last_done_len = len(tlist)
 
-    def _latest_od_start_time_left(self) -> float:
-        # Time left in seconds when we must start OD to finish safely
-        # Returns threshold time = remaining_work + OD start overhead (if not already on OD) + safety margin
-        done = sum(self.task_done_time) if self.task_done_time else 0.0
-        remaining = max(0.0, self.task_duration - done)
-        od_start_overhead = 0.0 if self.env.cluster_type == ClusterType.ON_DEMAND else self.restart_overhead
-        return remaining + od_start_overhead + self._safety_margin
+    def _get_remaining_work(self):
+        self._update_done_acc()
+        remaining = self.task_duration - self._done_acc
+        if remaining < 0.0:
+            remaining = 0.0
+        return remaining
 
-    def _update_region_stats(self, has_spot: bool):
-        # Update EMA score for current region based on observed has_spot
-        self._ensure_initialized()
-        r = self.env.get_current_region()
-        val = 1.0 if has_spot else 0.0
-        # EMA update
-        self._region_scores[r] = (1.0 - self._score_alpha) * self._region_scores[r] + self._score_alpha * val
-        self._region_counts[r] += 1
-        if has_spot:
-            self._no_spot_streak[r] = 0
-        else:
-            self._no_spot_streak[r] += 1
+    def _time_left(self):
+        tl = self.deadline - self.env.elapsed_seconds
+        if tl < 0.0:
+            tl = 0.0
+        return tl
 
-    def _pick_best_region(self, avoid_idx: int) -> int:
-        # Choose the best region based on highest EMA score; break ties by favoring next index
-        self._ensure_initialized()
-        scores = self._region_scores
-        n = len(scores)
-        best_idx = avoid_idx
-        best_score = scores[avoid_idx]
-        # Prefer another region only if it has a strictly higher score
-        for i in range(n):
-            if i == avoid_idx:
-                continue
-            s = scores[i]
-            if s > best_score:
-                best_score = s
-                best_idx = i
-        return best_idx
+    def _next_region_rr(self):
+        self._init_rr()
+        try:
+            n = self.env.get_num_regions()
+        except Exception:
+            n = 1
+        if n <= 1:
+            return self.env.get_current_region() if hasattr(self.env, "get_current_region") else 0
+        nxt = self._rr_next_region
+        self._rr_next_region = (nxt + 1) % n
+        return nxt
 
     def _step(self, last_cluster_type: ClusterType, has_spot: bool) -> ClusterType:
-        self._ensure_initialized()
-        self._step_idx += 1
+        # Ensure round-robin state initialized
+        self._init_rr()
 
-        # If task already completed, ensure we don't run anything
-        done = sum(self.task_done_time) if self.task_done_time else 0.0
-        if done >= self.task_duration - 1e-6:
-            return ClusterType.NONE
-
-        # Update region stats with current observation
-        self._update_region_stats(has_spot)
-
-        # Decide whether we must commit to On-Demand to meet deadline
-        time_left = self.deadline - self.env.elapsed_seconds
-        od_threshold = self._latest_od_start_time_left()
-        if time_left <= od_threshold:
-            self._od_committed = True
-
-        # If committed to OD, always use OD to guarantee finishing
-        if self._od_committed:
+        # If already committed to on-demand, keep running OD
+        if self._committed_to_od:
             return ClusterType.ON_DEMAND
 
-        # Not yet committed: use SPOT if available
+        # Compute remaining work and time
+        rem_work = self._get_remaining_work()
+        if rem_work <= 0.0:
+            return ClusterType.NONE
+        time_left = self._time_left()
+        if time_left <= 0.0:
+            # Out of time; return NONE to avoid errors
+            return ClusterType.NONE
+
+        step = self.env.gap_seconds
+        overhead = self.restart_overhead
+
+        # Slack is extra wall time beyond required work
+        slack = time_left - rem_work
+
+        # If slack is at or below overhead, we must commit to OD now to guarantee finish
+        if slack <= overhead:
+            self._committed_to_od = True
+            return ClusterType.ON_DEMAND
+
+        # If spot is available, use it to minimize cost
         if has_spot:
             return ClusterType.SPOT
 
-        # Spot not available in current region and we still have slack:
-        # Consider switching to the best region for the next step
-        current_region = self.env.get_current_region()
-        if self._no_spot_streak[current_region] >= 1:
-            if (self._step_idx - self._last_switch_step) >= self._switch_cooldown_steps:
-                best_region = self._pick_best_region(current_region)
-                if best_region != current_region:
-                    self.env.switch_region(best_region)
-                    self._last_switch_step = self._step_idx
+        # Spot unavailable:
+        # Decide whether it's safe to wait one step (NONE) while switching region, or commit to OD now.
+        # It's safe to wait if after wasting one step, we still have at least overhead slack.
+        # i.e., (time_left - step) - rem_work >= overhead  => slack - step >= overhead
+        if slack - step >= overhead:
+            # Wait and try another region next step
+            try:
+                nxt = self._next_region_rr()
+                curr = self.env.get_current_region()
+                if nxt != curr:
+                    self.env.switch_region(nxt)
+            except Exception:
+                pass
+            return ClusterType.NONE
 
-        # Wait this step to save cost; OD will be used later if needed by the commit rule
-        return ClusterType.NONE
+        # Not safe to wait; commit to OD now
+        self._committed_to_od = True
+        return ClusterType.ON_DEMAND

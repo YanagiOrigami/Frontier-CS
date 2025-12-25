@@ -8,7 +8,7 @@ from sky_spot.utils import ClusterType
 class Solution(MultiRegionStrategy):
     """Your multi-region scheduling strategy."""
 
-    NAME = "cant_be_late_strategy"
+    NAME = "AdaptiveSpotStrategy"
 
     def solve(self, spec_path: str) -> "Solution":
         """
@@ -29,49 +29,46 @@ class Solution(MultiRegionStrategy):
     def _step(self, last_cluster_type: ClusterType, has_spot: bool) -> ClusterType:
         """
         Decide next action based on current state.
-        
         Strategy:
-        1. Calculate the latest possible time we must start On-Demand to meet the deadline ("Panic Mode").
-           If we are close to this threshold, force On-Demand to guarantee success.
-        2. If we have slack, prioritize Spot instances to minimize cost.
-        3. If Spot is unavailable in the current region, switch to a new region (Round-Robin) and wait.
+        1. Check if we are close to the deadline. If so, force On-Demand to guarantee completion.
+        2. If we have slack, prefer Spot instances.
+        3. If Spot is unavailable in the current region, switch to the next region and wait (NONE).
         """
-        # --- State Retrieval ---
+        # Current state variables
         elapsed = self.env.elapsed_seconds
         done_work = sum(self.task_done_time)
-        remaining_work = self.task_duration - done_work
+        needed_work = self.task_duration - done_work
         remaining_time = self.deadline - elapsed
-        
         gap = self.env.gap_seconds
-        overhead = self.restart_overhead
-        
-        # --- Panic Mode Calculation ---
-        # We must ensure we can finish the task using On-Demand (OD) even if we waste the current step.
-        # Time required to finish on OD = remaining_work + overhead (assuming a restart is needed).
-        # We need a safety buffer because decisions are made in discrete 'gap' steps.
-        # If we try Spot and fail, we lose 'gap' seconds.
-        # Therefore, we must switch to OD if:
-        # remaining_time - gap < remaining_work + overhead
-        # Using a 1.5x gap buffer for safety against floating point issues and tight bounds.
-        panic_threshold = remaining_work + overhead + (gap * 1.5)
-        
-        if remaining_time < panic_threshold:
-            return ClusterType.ON_DEMAND
-            
-        # --- Cost Optimization (Spot) ---
-        if has_spot:
-            # Spot is available and we have slack. Use it.
-            return ClusterType.SPOT
+
+        # 1. Deadline Safety Check
+        # Calculate time required to finish if we use On-Demand starting now.
+        # If we are already on On-Demand, we just need to finish the pending overhead + work.
+        # If we switch to On-Demand, we incur the full restart overhead.
+        if last_cluster_type == ClusterType.ON_DEMAND:
+            time_to_finish_od = needed_work + self.remaining_restart_overhead
         else:
-            # Spot is unavailable in current region.
-            # Strategy: Switch to the next region to explore availability.
-            # We use Round-Robin to cycle through all regions.
-            current_region_idx = self.env.get_current_region()
-            num_regions = self.env.get_num_regions()
-            next_region_idx = (current_region_idx + 1) % num_regions
-            
-            self.env.switch_region(next_region_idx)
-            
-            # We cannot run Spot immediately in the new region in this step 
-            # (state reflects old region). Return NONE to process the switch.
-            return ClusterType.NONE
+            time_to_finish_od = needed_work + self.restart_overhead
+
+        # Safety buffer to account for step granularity and potential edge cases.
+        # 2.0 * gap_seconds ensures we switch to OD with at least 2 steps of wiggle room.
+        safety_buffer = 2.0 * gap
+
+        if remaining_time < (time_to_finish_od + safety_buffer):
+            return ClusterType.ON_DEMAND
+
+        # 2. Cost Optimization (Spot Usage)
+        if has_spot:
+            return ClusterType.SPOT
+
+        # 3. Spot Unavailable Strategy
+        # If Spot is not available in the current region, we switch to another region.
+        # We use a round-robin approach to cycle through regions.
+        # We return NONE for this step because we cannot verify Spot availability
+        # in the new region until the next step.
+        curr_region = self.env.get_current_region()
+        num_regions = self.env.get_num_regions()
+        next_region = (curr_region + 1) % num_regions
+
+        self.env.switch_region(next_region)
+        return ClusterType.NONE

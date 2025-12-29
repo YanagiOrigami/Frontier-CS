@@ -8,7 +8,7 @@ from sky_spot.utils import ClusterType
 class Solution(MultiRegionStrategy):
     """Your multi-region scheduling strategy."""
 
-    NAME = "my_strategy"  # REQUIRED: unique identifier
+    NAME = "switching_strategy"
 
     def solve(self, spec_path: str) -> "Solution":
         """
@@ -30,7 +30,7 @@ class Solution(MultiRegionStrategy):
             inter_task_overhead=[0.0],
         )
         super().__init__(args)
-        self.consecutive_no_spot = 0
+        self.no_spot_count = 0
         return self
 
     def _step(self, last_cluster_type: ClusterType, has_spot: bool) -> ClusterType:
@@ -50,26 +50,32 @@ class Solution(MultiRegionStrategy):
 
         Returns: ClusterType.SPOT, ClusterType.ON_DEMAND, or ClusterType.NONE
         """
-        # Your decision logic here
-        total_done = sum(self.task_done_time)
-        rem_work = self.task_duration - total_done
-        rem_wall = self.deadline - self.env.elapsed_seconds
-        pending_overhead = getattr(self, 'remaining_restart_overhead', 0.0)
-        effective_rem_time = rem_wall - pending_overhead
-        is_tight = rem_work > effective_rem_time * 0.95
+        done_work = sum(self.task_done_time)
+        remaining_work = self.task_duration - done_work
+        remaining_time = self.deadline - self.env.elapsed_seconds
+
+        if remaining_work <= 0:
+            return ClusterType.NONE
+
+        urgent = remaining_work > remaining_time - self.remaining_restart_overhead
 
         if has_spot:
-            self.consecutive_no_spot = 0
+            self.no_spot_count = 0
             return ClusterType.SPOT
 
-        self.consecutive_no_spot += 1
-        current_region = self.env.get_current_region()
-        num_regions = self.env.get_num_regions()
+        self.no_spot_count += 1
+
         do_switch = False
-        if not is_tight and self.consecutive_no_spot >= 3 and num_regions > 1:
-            next_region = (current_region + 1) % num_regions
-            self.env.switch_region(next_region)
-            self.consecutive_no_spot = 0
+        if (self.no_spot_count >= 3 and
+            not urgent and
+            self.env.get_num_regions() > 1 and
+            remaining_time > remaining_work + self.restart_overhead + self.remaining_restart_overhead):
             do_switch = True
+
+        if do_switch:
+            current = self.env.get_current_region()
+            new_region = (current + 1) % self.env.get_num_regions()
+            self.env.switch_region(new_region)
+            self.no_spot_count = 0
 
         return ClusterType.ON_DEMAND

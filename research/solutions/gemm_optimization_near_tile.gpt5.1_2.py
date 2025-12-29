@@ -1,11 +1,10 @@
-import torch
-import triton
-import triton.language as tl
+import textwrap
 
 
 class Solution:
     def solve(self, spec_path: str = None) -> dict:
-        code = '''
+        kernel_code = textwrap.dedent(
+            """
 import torch
 import triton
 import triton.language as tl
@@ -16,231 +15,106 @@ def gelu(x):
     return x * 0.5 * (1.0 + tl.extra.cuda.libdevice.erf(x * 0.7071067811865476))
 
 
-mm_configs = [
-    triton.Config(
-        {
-            "BLOCK_M": 64,
-            "BLOCK_N": 64,
-            "BLOCK_K": 32,
-            "GROUP_M": 8,
-        },
-        num_stages=2,
-        num_warps=4,
-    ),
-    triton.Config(
-        {
-            "BLOCK_M": 128,
-            "BLOCK_N": 64,
-            "BLOCK_K": 32,
-            "GROUP_M": 8,
-        },
-        num_stages=2,
-        num_warps=4,
-    ),
-    triton.Config(
-        {
-            "BLOCK_M": 64,
-            "BLOCK_N": 128,
-            "BLOCK_K": 32,
-            "GROUP_M": 8,
-        },
-        num_stages=2,
-        num_warps=4,
-    ),
-    triton.Config(
-        {
-            "BLOCK_M": 128,
-            "BLOCK_N": 128,
-            "BLOCK_K": 32,
-            "GROUP_M": 8,
-        },
-        num_stages=3,
-        num_warps=8,
-    ),
-    triton.Config(
-        {
-            "BLOCK_M": 64,
-            "BLOCK_N": 64,
-            "BLOCK_K": 64,
-            "GROUP_M": 8,
-        },
-        num_stages=3,
-        num_warps=4,
-    ),
-    triton.Config(
-        {
-            "BLOCK_M": 128,
-            "BLOCK_N": 64,
-            "BLOCK_K": 64,
-            "GROUP_M": 8,
-        },
-        num_stages=3,
-        num_warps=4,
-    ),
-    triton.Config(
-        {
-            "BLOCK_M": 64,
-            "BLOCK_N": 128,
-            "BLOCK_K": 64,
-            "GROUP_M": 8,
-        },
-        num_stages=3,
-        num_warps=4,
-    ),
-    triton.Config(
-        {
-            "BLOCK_M": 128,
-            "BLOCK_N": 128,
-            "BLOCK_K": 64,
-            "GROUP_M": 8,
-        },
-        num_stages=4,
-        num_warps=8,
-    ),
-]
-
-
 @triton.autotune(
-    configs=mm_configs,
-    key=[
-        "M",
-        "N",
-        "K",
-        "a_stride_am",
-        "a_stride_ak",
-        "b_stride_bk",
-        "b_stride_bn",
-        "c_stride_cm",
-        "c_stride_cn",
+    configs=[
+        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 64, 'BLOCK_K': 32}, num_stages=3, num_warps=4),
+        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 128, 'BLOCK_K': 32}, num_stages=3, num_warps=4),
+        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 64, 'BLOCK_K': 32}, num_stages=3, num_warps=4),
+        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 64}, num_stages=4, num_warps=8),
+        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 256, 'BLOCK_K': 64}, num_stages=4, num_warps=8),
+        triton.Config({'BLOCK_M': 256, 'BLOCK_N': 64, 'BLOCK_K': 64}, num_stages=4, num_warps=8),
     ],
+    key=['M', 'N', 'K', 'a_stride_am', 'a_stride_ak', 'b_stride_bk', 'b_stride_bn'],
 )
 @triton.jit
 def _matmul_kernel(
-    A_ptr,
-    B_ptr,
-    C_ptr,
-    M,
-    N,
-    K,
-    a_stride_am,
-    a_stride_ak,
-    b_stride_bk,
-    b_stride_bn,
-    c_stride_cm,
-    c_stride_cn,
-    BLOCK_M: tl.constexpr,
-    BLOCK_N: tl.constexpr,
-    BLOCK_K: tl.constexpr,
-    GROUP_M: tl.constexpr,
+    a_ptr, b_ptr, c_ptr,
+    M, N, K,
+    a_stride_am, a_stride_ak,
+    b_stride_bk, b_stride_bn,
+    c_stride_cm, c_stride_cn,
+    out_dtype_id: tl.constexpr,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
 ):
-    pid = tl.program_id(axis=0)
-    num_pid_m = tl.cdiv(M, BLOCK_M)
-    num_pid_n = tl.cdiv(N, BLOCK_N)
-    group_size_m = GROUP_M
-
-    group_id = pid // (group_size_m * num_pid_n)
-    group_size_m = tl.minimum(num_pid_m - group_id * group_size_m, group_size_m)
-    pid_m = group_id * group_size_m + (pid % group_size_m)
-    pid_n = (pid // group_size_m) % num_pid_n
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
 
     offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
     offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
     offs_k = tl.arange(0, BLOCK_K)
 
-    a_ptrs = A_ptr + offs_m[:, None] * a_stride_am + offs_k[None, :] * a_stride_ak
-    b_ptrs = B_ptr + offs_k[:, None] * b_stride_bk + offs_n[None, :] * b_stride_bn
+    a_ptrs = a_ptr + (offs_m[:, None] * a_stride_am + offs_k[None, :] * a_stride_ak)
+    b_ptrs = b_ptr + (offs_k[:, None] * b_stride_bk + offs_n[None, :] * b_stride_bn)
 
     acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
 
-    k = 0
-    while k < K:
-        k_remaining = K - k
-        k_mask = offs_k < k_remaining
+    for k in range(0, K, BLOCK_K):
+        k_offsets = k + offs_k
+        a_mask = (offs_m[:, None] < M) & (k_offsets[None, :] < K)
+        b_mask = (k_offsets[:, None] < K) & (offs_n[None, :] < N)
 
-        a_mask = (offs_m[:, None] < M) & k_mask[None, :]
-        b_mask = k_mask[:, None] & (offs_n[None, :] < N)
+        a = tl.load(a_ptrs, mask=a_mask, other=0.0)
+        b = tl.load(b_ptrs, mask=b_mask, other=0.0)
 
-        A = tl.load(a_ptrs, mask=a_mask, other=0.0)
-        B = tl.load(b_ptrs, mask=b_mask, other=0.0)
+        acc += tl.dot(a, b)
 
-        acc += tl.dot(A, B)
-
-        k += BLOCK_K
         a_ptrs += BLOCK_K * a_stride_ak
         b_ptrs += BLOCK_K * b_stride_bk
 
     acc = gelu(acc)
 
-    c_ptrs = C_ptr + offs_m[:, None] * c_stride_cm + offs_n[None, :] * c_stride_cn
+    if out_dtype_id == 0:
+        acc = acc.to(tl.float16)
+    elif out_dtype_id == 1:
+        acc = acc.to(tl.bfloat16)
+    else:
+        acc = acc.to(tl.float32)
+
+    c_ptrs = c_ptr + (offs_m[:, None] * c_stride_cm + offs_n[None, :] * c_stride_cn)
     c_mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
     tl.store(c_ptrs, acc, mask=c_mask)
 
 
-def _get_grid(M, N, **meta):
-    return (
-        triton.cdiv(M, meta["BLOCK_M"]) * triton.cdiv(N, meta["BLOCK_N"]),
-    )
-
-
 def matmul(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
-    """
-    Matrix multiplication with GELU activation using Triton.
-
-    Args:
-        a: Tensor of shape (M, K)
-        b: Tensor of shape (K, N)
-
-    Returns:
-        Tensor of shape (M, N) with GELU applied.
-    """
     if a.ndim != 2 or b.ndim != 2:
-        raise ValueError("Input tensors must be 2D")
+        raise ValueError("matmul expects 2D tensors")
     if a.shape[1] != b.shape[0]:
-        raise ValueError("Incompatible matrix shapes for matmul")
-
-    M, K = a.shape
-    Kb, N = b.shape
-
-    if M == 0 or N == 0 or K == 0:
-        # Handle degenerate shapes without launching kernels
-        out = torch.empty((M, N), device=a.device, dtype=a.dtype)
-        if K == 0:
-            out.zero_()
-        return out
-
-    if not a.is_cuda or not b.is_cuda:
-        c = a @ b
-        return c * 0.5 * (1.0 + torch.erf(c * 0.7071067811865476))
-
+        raise ValueError("Incompatible matrix shapes")
     if a.dtype != b.dtype:
         raise ValueError("Input tensors must have the same dtype")
 
-    if a.device != b.device:
-        raise ValueError("Input tensors must be on the same device")
+    M, K = a.shape
+    Kb, N = b.shape  # noqa: F841
+
+    if not a.is_cuda or not b.is_cuda:
+        return torch.nn.functional.gelu(a @ b)
+
+    if a.dtype == torch.float16:
+        out_dtype_id = 0
+    elif a.dtype == torch.bfloat16:
+        out_dtype_id = 1
+    elif a.dtype == torch.float32:
+        out_dtype_id = 2
+    else:
+        return torch.nn.functional.gelu(a @ b)
 
     c = torch.empty((M, N), device=a.device, dtype=a.dtype)
 
-    a_stride_am, a_stride_ak = a.stride()
-    b_stride_bk, b_stride_bn = b.stride()
-    c_stride_cm, c_stride_cn = c.stride()
+    grid = lambda META: (
+        triton.cdiv(M, META['BLOCK_M']),
+        triton.cdiv(N, META['BLOCK_N']),
+    )
 
-    _matmul_kernel[
-        _get_grid
-    ](
-        a,
-        b,
-        c,
-        M,
-        N,
-        K,
-        a_stride_am,
-        a_stride_ak,
-        b_stride_bk,
-        b_stride_bn,
-        c_stride_cm,
-        c_stride_cn,
+    _matmul_kernel[grid](
+        a, b, c,
+        M, N, K,
+        a.stride(0), a.stride(1),
+        b.stride(0), b.stride(1),
+        c.stride(0), c.stride(1),
+        out_dtype_id,
     )
 
     return c
-'''
-        return {"code": code}
+"""
+        )
+        return {"code": kernel_code}

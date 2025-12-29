@@ -2,304 +2,315 @@ import torch
 import flashinfer
 import triton
 import triton.language as tl
-from typing import Tuple
+from typing import Optional, Tuple
 
 @triton.jit
-def _qknorm_kernel(
-    q_ptr, k_ptr, norm_weight_ptr, q_out_ptr, k_out_ptr,
-    q_stride_batch, q_stride_head, q_stride_seq, q_stride_feat,
-    k_stride_batch, k_stride_head, k_stride_seq, k_stride_feat,
-    hidden_dim, eps, BLOCK_SIZE: tl.constexpr,
-    QKV_SEPARATE: tl.constexpr,
-    HAS_BATCH: tl.constexpr, HAS_HEAD: tl.constexpr,
-    q_is_contiguous: tl.constexpr, k_is_contiguous: tl.constexpr
+def _rmsnorm_kernel(
+    x_ptr,
+    weight_ptr,
+    output_ptr,
+    N: tl.constexpr,
+    eps: tl.constexpr,
+    stride_x_batch,
+    stride_x_n,
+    stride_output_batch,
+    stride_output_n,
+    BLOCK_SIZE_N: tl.constexpr,
+    USE_VECTOR_LOAD: tl.constexpr,
+    RESIDUAL_OUT: tl.constexpr,
 ):
-    pid = tl.program_id(0)
+    pid_batch = tl.program_id(0)
     
-    if QKV_SEPARATE:
-        off_features = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
-        off_features_mask = off_features < hidden_dim
+    if USE_VECTOR_LOAD:
+        vec_size = 4 if x_ptr.dtype.element_ty == tl.float32 else 8
+        offs_n = tl.arange(0, BLOCK_SIZE_N // vec_size)
+        offs_n = offs_n * vec_size
         
-        weight = tl.load(norm_weight_ptr + off_features, mask=off_features_mask)
+        x_ptrs = x_ptr + pid_batch * stride_x_batch + offs_n[:, None] * stride_x_n + tl.arange(0, vec_size)[None, :]
+        weight_ptrs = weight_ptr + offs_n[:, None] * stride_x_n + tl.arange(0, vec_size)[None, :]
         
-        q_rs_sum = tl.zeros([BLOCK_SIZE], dtype=tl.float32)
-        k_rs_sum = tl.zeros([BLOCK_SIZE], dtype=tl.float32)
+        x = tl.load(x_ptrs, mask=offs_n[:, None] * vec_size + tl.arange(0, vec_size)[None, :] < N, other=0.0)
+        weight = tl.load(weight_ptrs, mask=offs_n[:, None] * vec_size + tl.arange(0, vec_size)[None, :] < N, other=0.0)
         
-        if HAS_BATCH and HAS_HEAD:
-            batch_size = tl.num_program_ids(1)
-            head_size = tl.num_program_ids(2)
-            batch_idx = tl.program_id(1)
-            head_idx = tl.program_id(2)
-            
-            for seq_idx in range(tl.num_program_ids(3)):
-                q_offset = batch_idx * q_stride_batch + head_idx * q_stride_head + seq_idx * q_stride_seq
-                k_offset = batch_idx * k_stride_batch + head_idx * k_stride_head + seq_idx * k_stride_seq
-                
-                q_val = tl.load(q_ptr + q_offset + off_features, mask=off_features_mask, other=0.0)
-                k_val = tl.load(k_ptr + k_offset + off_features, mask=off_features_mask, other=0.0)
-                
-                q_rs_sum += q_val * q_val
-                k_rs_sum += k_val * k_val
-                
-                q_norm = q_val * tl.rsqrt(q_rs_sum / (seq_idx + 1) + eps) * weight
-                k_norm = k_val * tl.rsqrt(k_rs_sum / (seq_idx + 1) + eps) * weight
-                
-                tl.store(q_out_ptr + q_offset + off_features, q_norm, mask=off_features_mask)
-                tl.store(k_out_ptr + k_offset + off_features, k_norm, mask=off_features_mask)
-        else:
-            total_elements = tl.num_program_ids(1)
-            elem_idx = tl.program_id(1)
-            
-            if q_is_contiguous and k_is_contiguous:
-                q_offset = elem_idx * hidden_dim
-                k_offset = elem_idx * hidden_dim
-            else:
-                q_offset = elem_idx * q_stride_seq
-                k_offset = elem_idx * k_stride_seq
-            
-            q_val = tl.load(q_ptr + q_offset + off_features, mask=off_features_mask, other=0.0)
-            k_val = tl.load(k_ptr + k_offset + off_features, mask=off_features_mask, other=0.0)
-            
-            q_norm = q_val * tl.rsqrt(tl.sum(q_val * q_val) / hidden_dim + eps) * weight
-            k_norm = k_val * tl.rsqrt(tl.sum(k_val * k_val) / hidden_dim + eps) * weight
-            
-            tl.store(q_out_ptr + q_offset + off_features, q_norm, mask=off_features_mask)
-            tl.store(k_out_ptr + k_offset + off_features, k_norm, mask=off_features_mask)
-
-def qknorm(q: torch.Tensor, k: torch.Tensor, norm_weight: torch.Tensor, eps: float = 1e-6):
-    device = q.device
-    dtype = q.dtype
-    
-    if q.dim() == 2:
-        q_2d = q
-        k_2d = k
-        q_out = torch.empty_like(q_2d)
-        k_out = torch.empty_like(k_2d)
+        x_flat = tl.reshape(x, (BLOCK_SIZE_N,))
+        weight_flat = tl.reshape(weight, (BLOCK_SIZE_N,))
         
-        n_elements = q_2d.shape[0]
-        hidden_dim = q_2d.shape[1]
-        
-        BLOCK_SIZE = 128 if hidden_dim % 128 == 0 else 64
-        
-        grid = (triton.cdiv(hidden_dim, BLOCK_SIZE), n_elements)
-        
-        q_is_contiguous = q_2d.is_contiguous()
-        k_is_contiguous = k_2d.is_contiguous()
-        
-        _qknorm_kernel[grid](
-            q_2d, k_2d, norm_weight, q_out, k_out,
-            0, 0, q_2d.stride(0), q_2d.stride(1),
-            0, 0, k_2d.stride(0), k_2d.stride(1),
-            hidden_dim, eps, BLOCK_SIZE,
-            True, False, False, q_is_contiguous, k_is_contiguous
-        )
-        
-        return q_out.view(q.shape), k_out.view(k.shape)
-    
-    elif q.dim() == 4:
-        batch_size, num_heads, seq_len, hidden_dim = q.shape
-        
-        q_out = torch.empty_like(q)
-        k_out = torch.empty_like(k)
-        
-        BLOCK_SIZE = 128 if hidden_dim % 128 == 0 else 64
-        
-        grid = (
-            triton.cdiv(hidden_dim, BLOCK_SIZE),
-            batch_size,
-            num_heads,
-            seq_len
-        )
-        
-        _qknorm_kernel[grid](
-            q, k, norm_weight, q_out, k_out,
-            q.stride(0), q.stride(1), q.stride(2), q.stride(3),
-            k.stride(0), k.stride(1), k.stride(2), k.stride(3),
-            hidden_dim, eps, BLOCK_SIZE,
-            False, True, True, True, True
-        )
-        
-        return q_out, k_out
-    
+        x_masked = tl.where(tl.arange(0, BLOCK_SIZE_N) < N, x_flat, 0.0)
+        weight_masked = tl.where(tl.arange(0, BLOCK_SIZE_N) < N, weight_flat, 0.0)
     else:
-        q_2d = q.reshape(-1, q.shape[-1])
-        k_2d = k.reshape(-1, k.shape[-1])
-        q_out = torch.empty_like(q_2d)
-        k_out = torch.empty_like(k_2d)
+        offs_n = tl.arange(0, BLOCK_SIZE_N)
+        x_ptrs = x_ptr + pid_batch * stride_x_batch + offs_n * stride_x_n
+        weight_ptrs = weight_ptr + offs_n * stride_x_n
         
-        n_elements = q_2d.shape[0]
-        hidden_dim = q_2d.shape[1]
+        x_masked = tl.load(x_ptrs, mask=offs_n < N, other=0.0)
+        weight_masked = tl.load(weight_ptrs, mask=offs_n < N, other=0.0)
+    
+    x_float = x_masked.to(tl.float32)
+    mean_sq = tl.sum(x_float * x_float, axis=0) / N
+    rms = tl.sqrt(mean_sq + eps)
+    
+    normalized = x_float / rms
+    output = normalized * weight_masked.to(tl.float32)
+    
+    if USE_VECTOR_LOAD:
+        output_stored = tl.reshape(output, (BLOCK_SIZE_N // vec_size, vec_size))
+        output_ptrs = output_ptr + pid_batch * stride_output_batch + offs_n[:, None] * stride_output_n + tl.arange(0, vec_size)[None, :]
+        tl.store(output_ptrs, output_stored, mask=offs_n[:, None] * vec_size + tl.arange(0, vec_size)[None, :] < N)
+    else:
+        output_ptrs = output_ptr + pid_batch * stride_output_batch + offs_n * stride_output_n
+        tl.store(output_ptrs, output, mask=offs_n < N)
+
+class QKNormTriton:
+    @staticmethod
+    def forward(q, k, norm_weight, eps=1e-6):
+        assert q.dim() >= 2 and k.dim() >= 2
+        assert q.shape[-1] == k.shape[-1] == norm_weight.shape[0]
         
-        BLOCK_SIZE = 128 if hidden_dim % 128 == 0 else 64
+        q_orig_shape = q.shape
+        k_orig_shape = k.shape
+        hidden_dim = norm_weight.shape[0]
         
-        grid = (triton.cdiv(hidden_dim, BLOCK_SIZE), n_elements)
+        q_2d = q.view(-1, hidden_dim)
+        k_2d = k.view(-1, hidden_dim)
         
-        q_is_contiguous = q_2d.is_contiguous()
-        k_is_contiguous = k_2d.is_contiguous()
+        batch_size_q = q_2d.shape[0]
+        batch_size_k = k_2d.shape[0]
         
-        _qknorm_kernel[grid](
-            q_2d, k_2d, norm_weight, q_out, k_out,
-            0, 0, q_2d.stride(0), q_2d.stride(1),
-            0, 0, k_2d.stride(0), k_2d.stride(1),
-            hidden_dim, eps, BLOCK_SIZE,
-            True, False, False, q_is_contiguous, k_is_contiguous
-        )
+        dtype = q.dtype
+        device = q.device
         
-        return q_out.view(q.shape), k_out.view(k.shape)
+        q_output = torch.empty_like(q_2d)
+        k_output = torch.empty_like(k_2d)
+        
+        def get_config(N):
+            if N % 256 == 0 and dtype in [torch.float16, torch.bfloat16]:
+                return 256, True
+            elif N % 128 == 0:
+                return 128, dtype in [torch.float16, torch.bfloat16]
+            elif N % 64 == 0:
+                return 64, dtype in [torch.float16, torch.bfloat16]
+            else:
+                return 64, False
+        
+        block_n, use_vector_load = get_config(hidden_dim)
+        
+        grid_q = (batch_size_q,)
+        grid_k = (batch_size_k,)
+        
+        if batch_size_q > 0:
+            _rmsnorm_kernel[grid_q](
+                q_2d,
+                norm_weight,
+                q_output,
+                hidden_dim,
+                eps,
+                q_2d.stride(0),
+                q_2d.stride(1),
+                q_output.stride(0),
+                q_output.stride(1),
+                BLOCK_SIZE_N=block_n,
+                USE_VECTOR_LOAD=use_vector_load,
+                RESIDUAL_OUT=False,
+            )
+        
+        if batch_size_k > 0:
+            _rmsnorm_kernel[grid_k](
+                k_2d,
+                norm_weight,
+                k_output,
+                hidden_dim,
+                eps,
+                k_2d.stride(0),
+                k_2d.stride(1),
+                k_output.stride(0),
+                k_output.stride(1),
+                BLOCK_SIZE_N=block_n,
+                USE_VECTOR_LOAD=use_vector_load,
+                RESIDUAL_OUT=False,
+            )
+        
+        return q_output.view(q_orig_shape), k_output.view(k_orig_shape)
+
+def qknorm(q: torch.Tensor, k: torch.Tensor, norm_weight: torch.Tensor):
+    if q.device.type == 'cuda' and q.dim() >= 2 and k.dim() >= 2:
+        try:
+            return QKNormTriton.forward(q, k, norm_weight)
+        except Exception:
+            pass
+    
+    q_2d = q.view(-1, q.shape[-1])
+    k_2d = k.view(-1, k.shape[-1])
+    
+    if q_2d.is_contiguous() and k_2d.is_contiguous():
+        q_o = torch.empty_like(q_2d)
+        k_o = torch.empty_like(k_2d)
+        flashinfer.norm.rmsnorm(q_2d, norm_weight, out=q_o)
+        flashinfer.norm.rmsnorm(k_2d, norm_weight, out=k_o)
+    else:
+        q_o = torch.empty_like(q)
+        k_o = torch.empty_like(k)
+        flashinfer.norm.rmsnorm(q, norm_weight, out=q_o)
+        flashinfer.norm.rmsnorm(k, norm_weight, out=k_o)
+    
+    return q_o.view(q.shape), k_o.view(k.shape)
 
 class Solution:
     def solve(self, spec_path: str = None) -> dict:
-        return {"code": """
+        code = '''
 import torch
 import flashinfer
 import triton
 import triton.language as tl
-from typing import Tuple
+from typing import Optional, Tuple
 
 @triton.jit
-def _qknorm_kernel(
-    q_ptr, k_ptr, norm_weight_ptr, q_out_ptr, k_out_ptr,
-    q_stride_batch, q_stride_head, q_stride_seq, q_stride_feat,
-    k_stride_batch, k_stride_head, k_stride_seq, k_stride_feat,
-    hidden_dim, eps, BLOCK_SIZE: tl.constexpr,
-    QKV_SEPARATE: tl.constexpr,
-    HAS_BATCH: tl.constexpr, HAS_HEAD: tl.constexpr,
-    q_is_contiguous: tl.constexpr, k_is_contiguous: tl.constexpr
+def _rmsnorm_kernel(
+    x_ptr,
+    weight_ptr,
+    output_ptr,
+    N: tl.constexpr,
+    eps: tl.constexpr,
+    stride_x_batch,
+    stride_x_n,
+    stride_output_batch,
+    stride_output_n,
+    BLOCK_SIZE_N: tl.constexpr,
+    USE_VECTOR_LOAD: tl.constexpr,
+    RESIDUAL_OUT: tl.constexpr,
 ):
-    pid = tl.program_id(0)
+    pid_batch = tl.program_id(0)
     
-    if QKV_SEPARATE:
-        off_features = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
-        off_features_mask = off_features < hidden_dim
+    if USE_VECTOR_LOAD:
+        vec_size = 4 if x_ptr.dtype.element_ty == tl.float32 else 8
+        offs_n = tl.arange(0, BLOCK_SIZE_N // vec_size)
+        offs_n = offs_n * vec_size
         
-        weight = tl.load(norm_weight_ptr + off_features, mask=off_features_mask)
+        x_ptrs = x_ptr + pid_batch * stride_x_batch + offs_n[:, None] * stride_x_n + tl.arange(0, vec_size)[None, :]
+        weight_ptrs = weight_ptr + offs_n[:, None] * stride_x_n + tl.arange(0, vec_size)[None, :]
         
-        if HAS_BATCH and HAS_HEAD:
-            batch_size = tl.num_program_ids(1)
-            head_size = tl.num_program_ids(2)
-            batch_idx = tl.program_id(1)
-            head_idx = tl.program_id(2)
-            
-            for seq_idx in range(tl.num_program_ids(3)):
-                q_offset = batch_idx * q_stride_batch + head_idx * q_stride_head + seq_idx * q_stride_seq
-                k_offset = batch_idx * k_stride_batch + head_idx * k_stride_head + seq_idx * k_stride_seq
-                
-                q_val = tl.load(q_ptr + q_offset + off_features, mask=off_features_mask, other=0.0)
-                k_val = tl.load(k_ptr + k_offset + off_features, mask=off_features_mask, other=0.0)
-                
-                q_var = tl.sum(q_val * q_val) / hidden_dim
-                k_var = tl.sum(k_val * k_val) / hidden_dim
-                
-                q_norm = q_val * tl.rsqrt(q_var + eps) * weight
-                k_norm = k_val * tl.rsqrt(k_var + eps) * weight
-                
-                tl.store(q_out_ptr + q_offset + off_features, q_norm, mask=off_features_mask)
-                tl.store(k_out_ptr + k_offset + off_features, k_norm, mask=off_features_mask)
-        else:
-            total_elements = tl.num_program_ids(1)
-            elem_idx = tl.program_id(1)
-            
-            if q_is_contiguous and k_is_contiguous:
-                q_offset = elem_idx * hidden_dim
-                k_offset = elem_idx * hidden_dim
-            else:
-                q_offset = elem_idx * q_stride_seq
-                k_offset = elem_idx * k_stride_seq
-            
-            q_val = tl.load(q_ptr + q_offset + off_features, mask=off_features_mask, other=0.0)
-            k_val = tl.load(k_ptr + k_offset + off_features, mask=off_features_mask, other=0.0)
-            
-            q_var = tl.sum(q_val * q_val) / hidden_dim
-            k_var = tl.sum(k_val * k_val) / hidden_dim
-            
-            q_norm = q_val * tl.rsqrt(q_var + eps) * weight
-            k_norm = k_val * tl.rsqrt(k_var + eps) * weight
-            
-            tl.store(q_out_ptr + q_offset + off_features, q_norm, mask=off_features_mask)
-            tl.store(k_out_ptr + k_offset + off_features, k_norm, mask=off_features_mask)
-
-def qknorm(q: torch.Tensor, k: torch.Tensor, norm_weight: torch.Tensor, eps: float = 1e-6):
-    device = q.device
-    dtype = q.dtype
-    
-    if q.dim() == 2:
-        q_2d = q
-        k_2d = k
-        q_out = torch.empty_like(q_2d)
-        k_out = torch.empty_like(k_2d)
+        x = tl.load(x_ptrs, mask=offs_n[:, None] * vec_size + tl.arange(0, vec_size)[None, :] < N, other=0.0)
+        weight = tl.load(weight_ptrs, mask=offs_n[:, None] * vec_size + tl.arange(0, vec_size)[None, :] < N, other=0.0)
         
-        n_elements = q_2d.shape[0]
-        hidden_dim = q_2d.shape[1]
+        x_flat = tl.reshape(x, (BLOCK_SIZE_N,))
+        weight_flat = tl.reshape(weight, (BLOCK_SIZE_N,))
         
-        BLOCK_SIZE = 128 if hidden_dim % 128 == 0 else 64
-        
-        grid = (triton.cdiv(hidden_dim, BLOCK_SIZE), n_elements)
-        
-        q_is_contiguous = q_2d.is_contiguous()
-        k_is_contiguous = k_2d.is_contiguous()
-        
-        _qknorm_kernel[grid](
-            q_2d, k_2d, norm_weight, q_out, k_out,
-            0, 0, q_2d.stride(0), q_2d.stride(1),
-            0, 0, k_2d.stride(0), k_2d.stride(1),
-            hidden_dim, eps, BLOCK_SIZE,
-            True, False, False, q_is_contiguous, k_is_contiguous
-        )
-        
-        return q_out.view(q.shape), k_out.view(k.shape)
-    
-    elif q.dim() == 4:
-        batch_size, num_heads, seq_len, hidden_dim = q.shape
-        
-        q_out = torch.empty_like(q)
-        k_out = torch.empty_like(k)
-        
-        BLOCK_SIZE = 128 if hidden_dim % 128 == 0 else 64
-        
-        grid = (
-            triton.cdiv(hidden_dim, BLOCK_SIZE),
-            batch_size,
-            num_heads,
-            seq_len
-        )
-        
-        _qknorm_kernel[grid](
-            q, k, norm_weight, q_out, k_out,
-            q.stride(0), q.stride(1), q.stride(2), q.stride(3),
-            k.stride(0), k.stride(1), k.stride(2), k.stride(3),
-            hidden_dim, eps, BLOCK_SIZE,
-            False, True, True, True, True
-        )
-        
-        return q_out, k_out
-    
+        x_masked = tl.where(tl.arange(0, BLOCK_SIZE_N) < N, x_flat, 0.0)
+        weight_masked = tl.where(tl.arange(0, BLOCK_SIZE_N) < N, weight_flat, 0.0)
     else:
-        original_q_shape = q.shape
-        original_k_shape = k.shape
+        offs_n = tl.arange(0, BLOCK_SIZE_N)
+        x_ptrs = x_ptr + pid_batch * stride_x_batch + offs_n * stride_x_n
+        weight_ptrs = weight_ptr + offs_n * stride_x_n
         
-        q_2d = q.view(-1, q.shape[-1])
-        k_2d = k.view(-1, k.shape[-1])
-        q_out = torch.empty_like(q_2d)
-        k_out = torch.empty_like(k_2d)
-        
-        n_elements = q_2d.shape[0]
-        hidden_dim = q_2d.shape[1]
-        
-        BLOCK_SIZE = 128 if hidden_dim % 128 == 0 else 64
-        
-        grid = (triton.cdiv(hidden_dim, BLOCK_SIZE), n_elements)
-        
-        q_is_contiguous = q_2d.is_contiguous()
-        k_is_contiguous = k_2d.is_contiguous()
-        
-        _qknorm_kernel[grid](
-            q_2d, k_2d, norm_weight, q_out, k_out,
-            0, 0, q_2d.stride(0), q_2d.stride(1),
-            0, 0, k_2d.stride(0), k_2d.stride(1),
-            hidden_dim, eps, BLOCK_SIZE,
-            True, False, False, q_is_contiguous, k_is_contiguous
-        )
-        
-        return q_out.view(original_q_shape), k_out.view(original_k_shape)
+        x_masked = tl.load(x_ptrs, mask=offs_n < N, other=0.0)
+        weight_masked = tl.load(weight_ptrs, mask=offs_n < N, other=0.0)
+    
+    x_float = x_masked.to(tl.float32)
+    mean_sq = tl.sum(x_float * x_float, axis=0) / N
+    rms = tl.sqrt(mean_sq + eps)
+    
+    normalized = x_float / rms
+    output = normalized * weight_masked.to(tl.float32)
+    
+    if USE_VECTOR_LOAD:
+        output_stored = tl.reshape(output, (BLOCK_SIZE_N // vec_size, vec_size))
+        output_ptrs = output_ptr + pid_batch * stride_output_batch + offs_n[:, None] * stride_output_n + tl.arange(0, vec_size)[None, :]
+        tl.store(output_ptrs, output_stored, mask=offs_n[:, None] * vec_size + tl.arange(0, vec_size)[None, :] < N)
+    else:
+        output_ptrs = output_ptr + pid_batch * stride_output_batch + offs_n * stride_output_n
+        tl.store(output_ptrs, output, mask=offs_n < N)
 
-"""}
+class QKNormTriton:
+    @staticmethod
+    def forward(q, k, norm_weight, eps=1e-6):
+        assert q.dim() >= 2 and k.dim() >= 2
+        assert q.shape[-1] == k.shape[-1] == norm_weight.shape[0]
+        
+        q_orig_shape = q.shape
+        k_orig_shape = k.shape
+        hidden_dim = norm_weight.shape[0]
+        
+        q_2d = q.view(-1, hidden_dim)
+        k_2d = k.view(-1, hidden_dim)
+        
+        batch_size_q = q_2d.shape[0]
+        batch_size_k = k_2d.shape[0]
+        
+        dtype = q.dtype
+        device = q.device
+        
+        q_output = torch.empty_like(q_2d)
+        k_output = torch.empty_like(k_2d)
+        
+        def get_config(N):
+            if N % 256 == 0 and dtype in [torch.float16, torch.bfloat16]:
+                return 256, True
+            elif N % 128 == 0:
+                return 128, dtype in [torch.float16, torch.bfloat16]
+            elif N % 64 == 0:
+                return 64, dtype in [torch.float16, torch.bfloat16]
+            else:
+                return 64, False
+        
+        block_n, use_vector_load = get_config(hidden_dim)
+        
+        grid_q = (batch_size_q,)
+        grid_k = (batch_size_k,)
+        
+        if batch_size_q > 0:
+            _rmsnorm_kernel[grid_q](
+                q_2d,
+                norm_weight,
+                q_output,
+                hidden_dim,
+                eps,
+                q_2d.stride(0),
+                q_2d.stride(1),
+                q_output.stride(0),
+                q_output.stride(1),
+                BLOCK_SIZE_N=block_n,
+                USE_VECTOR_LOAD=use_vector_load,
+                RESIDUAL_OUT=False,
+            )
+        
+        if batch_size_k > 0:
+            _rmsnorm_kernel[grid_k](
+                k_2d,
+                norm_weight,
+                k_output,
+                hidden_dim,
+                eps,
+                k_2d.stride(0),
+                k_2d.stride(1),
+                k_output.stride(0),
+                k_output.stride(1),
+                BLOCK_SIZE_N=block_n,
+                USE_VECTOR_LOAD=use_vector_load,
+                RESIDUAL_OUT=False,
+            )
+        
+        return q_output.view(q_orig_shape), k_output.view(k_orig_shape)
+
+def qknorm(q: torch.Tensor, k: torch.Tensor, norm_weight: torch.Tensor):
+    if q.device.type == "cuda" and q.dim() >= 2 and k.dim() >= 2:
+        try:
+            return QKNormTriton.forward(q, k, norm_weight)
+        except Exception:
+            pass
+    
+    q_2d = q.view(-1, q.shape[-1])
+    k_2d = k.view(-1, k.shape[-1])
+    
+    if q_2d.is_contiguous() and k_2d.is_contiguous():
+        q_o = torch.empty_like(q_2d)
+        k_o = torch.empty_like(k_2d)
+        flashinfer.norm.rmsnorm(q_2d, norm_weight, out=q_o)
+        flashinfer.norm.rmsnorm(k_2d, norm_weight, out=k_o)
+    else:
+        q_o = torch.empty_like(q)
+        k_o = torch.empty_like(k)
+        flashinfer.norm.rmsnorm(q, norm_weight, out=q_o)
+        flashinfer.norm.rmsnorm(k, norm_weight, out=k_o)
+    
+    return q_o.view(q.shape), k_o.view(k.shape)
+'''
+        return {"code": code}

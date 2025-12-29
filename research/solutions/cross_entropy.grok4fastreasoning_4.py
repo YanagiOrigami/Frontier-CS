@@ -9,81 +9,89 @@ import torch
 import triton
 import triton.language as tl
 
-@triton.jit
-def cross_entropy_kernel(
-    logits_ptr, targets_ptr, output_ptr,
-    M: tl.int32, N: tl.int32,
-    stride_m, stride_n, stride_t, stride_o,
-    BLOCK_N: tl.constexpr
-):
-    pid_m = tl.program_id(0)
-    if pid_m >= M:
-        return
-
-    target_offset = pid_m * stride_t
-    target = tl.load(targets_ptr + target_offset).to(tl.int32)
-
-    # Compute max
-    max_val = tl.full([], float("-inf"), dtype=tl.float32)
-    block_start = 0
-    while block_start < N:
-        num_elem = tl.minimum(BLOCK_N, N - block_start)
-        offs = tl.arange(0, num_elem)
-        col_offsets = (block_start + offs) * stride_n
-        x_ptrs = logits_ptr + pid_m * stride_m + col_offsets
-        x = tl.load(x_ptrs)
-        local_max = tl.max(x, axis=0)
-        max_val = tl.maximum(max_val, local_max)
-        block_start += BLOCK_N
-
-    # Compute sum of exps
-    sum_exp = tl.zeros([], dtype=tl.float32)
-    block_start = 0
-    while block_start < N:
-        num_elem = tl.minimum(BLOCK_N, N - block_start)
-        offs = tl.arange(0, num_elem)
-        col_offsets = (block_start + offs) * stride_n
-        x_ptrs = logits_ptr + pid_m * stride_m + col_offsets
-        x = tl.load(x_ptrs)
-        x_minus_max = x - max_val
-        exp_x = tl.exp(x_minus_max)
-        local_sum = tl.sum(exp_x, axis=0)
-        sum_exp += local_sum
-        block_start += BLOCK_N
-
-    log_sum_exp = tl.log(sum_exp) + max_val
-
-    # Load logit at target
-    target_offset_bytes = target * stride_n
-    l_ptr = logits_ptr + pid_m * stride_m + target_offset_bytes
-    logit_target = tl.load(l_ptr)
-
-    # Compute loss
-    loss = -(logit_target - log_sum_exp)
-
-    # Store
-    output_offset = pid_m * stride_o
-    tl.store(output_ptr + output_offset, loss)
-
 def cross_entropy(logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
     M, N = logits.shape
-    output = torch.empty((M,), dtype=torch.float32, device=logits.device)
-    stride_m_bytes = logits.stride(0) * logits.element_size()
-    stride_n_bytes = logits.stride(1) * logits.element_size()
-    stride_t_bytes = targets.stride(0) * targets.element_size()
-    stride_o_bytes = output.stride(0) * output.element_size()
+    output = torch.empty(M, dtype=torch.float32, device=logits.device)
+    if M == 0:
+        return output
+    assert targets.shape[0] == M
+    assert logits.dtype == torch.float32
+    assert targets.dtype == torch.int64
+    stride_h = logits.stride(0) // 4
+    stride_w = logits.stride(1) // 4
+    stride_t = targets.stride(0) // 8
+
+    BLOCK_SIZES = [64, 128, 256, 512, 1024, 2048]
+
+    @triton.autotune(
+        configs=[
+            triton.Config(
+                {'BLOCK_SIZE': bs},
+                num_stages=2 + (bs // 256),
+                num_warps=max(4, bs // 256)
+            )
+            for bs in BLOCK_SIZES
+            if bs <= N
+        ],
+        key=['N'],
+    )
+    @triton.jit
+    def kernel(
+        logits_ptr,
+        targets_ptr,
+        output_ptr,
+        stride_h,
+        stride_w,
+        stride_t,
+        M,
+        N,
+        BLOCK_SIZE: tl.constexpr
+    ):
+        pid = tl.program_id(0)
+        if pid >= M:
+            return
+
+        target = tl.load(targets_ptr + pid * stride_t, dtype=tl.int64)
+
+        # Compute max_val
+        max_val = -1e9
+        for start in range(0, N, BLOCK_SIZE):
+            cols = tl.arange(0, BLOCK_SIZE)
+            mask = cols < (N - start)
+            offsets = (pid * stride_h + (start + cols) * stride_w).to(logits_ptr.dtype.element_ty)
+            x = tl.load(logits_ptr + offsets, mask=mask, other=-1e9)
+            max_val = tl.maximum(max_val, tl.max(x, axis=0))
+
+        # Compute sum_exp
+        sum_exp = 0.0
+        for start in range(0, N, BLOCK_SIZE):
+            cols = tl.arange(0, BLOCK_SIZE)
+            mask = cols < (N - start)
+            offsets = (pid * stride_h + (start + cols) * stride_w).to(logits_ptr.dtype.element_ty)
+            x = tl.load(logits_ptr + offsets, mask=mask, other=max_val)
+            x_minus_max = x - max_val
+            exp_x = tl.exp(x_minus_max)
+            exp_x = tl.where(mask, exp_x, 0.0)
+            sum_exp += tl.sum(exp_x, axis=0)
+
+        logsumexp = tl.log(sum_exp) + max_val
+
+        # Compute loss
+        y_offset = (pid * stride_h + target * stride_w).to(logits_ptr.dtype.element_ty)
+        logit_y = tl.load(logits_ptr + y_offset)
+        loss = -(logit_y - logsumexp)
+        tl.store(output_ptr + pid, loss)
+
     grid = (M,)
-    cross_entropy_kernel[grid](
+    kernel[grid](
         logits.data_ptr(),
         targets.data_ptr(),
         output.data_ptr(),
+        stride_h,
+        stride_w,
+        stride_t,
         M,
-        N,
-        stride_m_bytes,
-        stride_n_bytes,
-        stride_t_bytes,
-        stride_o_bytes,
-        BLOCK_N=1024
+        N
     )
     return output
 """

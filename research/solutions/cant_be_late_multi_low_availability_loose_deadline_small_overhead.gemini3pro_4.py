@@ -6,19 +6,13 @@ from sky_spot.utils import ClusterType
 
 
 class Solution(MultiRegionStrategy):
-    """Your multi-region scheduling strategy."""
+    """Cant-Be-Late Multi-Region Scheduling Strategy."""
 
-    NAME = "my_strategy"  # REQUIRED: unique identifier
+    NAME = "cant_be_late_solution"
 
     def solve(self, spec_path: str) -> "Solution":
         """
         Initialize the solution from spec_path config.
-
-        The spec file contains:
-        - deadline: deadline in hours
-        - duration: task duration in hours
-        - overhead: restart overhead in hours
-        - trace_files: list of trace file paths (one per region)
         """
         with open(spec_path) as f:
             config = json.load(f)
@@ -35,49 +29,50 @@ class Solution(MultiRegionStrategy):
     def _step(self, last_cluster_type: ClusterType, has_spot: bool) -> ClusterType:
         """
         Decide next action based on current state.
+        Strategy:
+        1. Safety First: If time is running out, force On-Demand execution to meet deadline.
+        2. Economy: If safe, prefer Spot instances.
+           - If current region has Spot, use it.
+           - If current region lacks Spot, switch region and pause (NONE) to probe next step.
         """
-        # Gather State
+        # Current status
         elapsed = self.env.elapsed_seconds
         done = sum(self.task_done_time)
-        work_remaining = self.task_duration - done
-        
-        # If work is done, stop (though environment usually handles this)
-        if work_remaining <= 1e-6:
+        remaining_work = self.task_duration - done
+
+        # If task is effectively done, stop
+        if remaining_work <= 1e-6:
             return ClusterType.NONE
 
         time_left = self.deadline - elapsed
         overhead = self.restart_overhead
         gap = self.env.gap_seconds
-        
-        # Safety Logic:
-        # We must finish before deadline.
-        # Minimal time needed using On-Demand = work_remaining + restart_overhead.
-        # If we delay decision by 1 step (return NONE or fail to find spot), we lose 'gap' seconds.
-        # We enforce a safety buffer to switch to On-Demand if time is tight.
-        # Buffer includes the current step gap (to be safe for next evaluation) plus overheads.
-        safety_margin = work_remaining + overhead + (1.5 * gap) + overhead
 
-        if time_left < safety_margin:
-            # We are close to the deadline. Use On-Demand to guarantee completion.
-            # Sticking to current region prevents unnecessary region-switch overheads 
-            # if we were already here, though switching to OD forces overhead anyway if we weren't running.
+        # Safety Threshold Calculation
+        # We need enough time to finish the work using On-Demand (guaranteed capacity).
+        # Required time = remaining_work + restart_overhead (if we switch type).
+        # We add a buffer of 2 * gap_seconds to account for:
+        # - The discrete nature of time steps (we decide for the *next* gap)
+        # - Potential overhead/transition delays
+        # If we are below this threshold, we cannot risk hunting for Spot anymore.
+        safety_threshold = remaining_work + overhead + 2.0 * gap
+
+        if time_left < safety_threshold:
             return ClusterType.ON_DEMAND
 
-        # Cost Optimization Logic:
+        # Economy Strategy
         if has_spot:
-            # Spot is available and we have slack. Use it.
+            # Spot is available in current region, use it
             return ClusterType.SPOT
         else:
-            # Spot is unavailable in current region, but we have slack.
-            # Strategy: Switch to the next region and wait (NONE) to probe its availability in the next step.
-            # We iterate through regions in a cycle.
-            current_region = self.env.get_current_region()
+            # Spot unavailable in current region.
+            # Switch to the next region to check its availability in the next step.
+            # We return NONE (pause) because we cannot check 'has_spot' for the new region
+            # in the current step, and returning SPOT blindly may cause an error.
+            # This incurs a time cost of 'gap' seconds, but saves money compared to On-Demand.
+            curr_region = self.env.get_current_region()
             num_regions = self.env.get_num_regions()
-            next_region = (current_region + 1) % num_regions
+            next_region = (curr_region + 1) % num_regions
             
             self.env.switch_region(next_region)
-            
-            # We cannot return SPOT immediately because we don't know if the new region has spot.
-            # Returning ON_DEMAND is expensive if we are just probing.
-            # Returning NONE costs time (slack) but 0 money. Since we have slack, this is optimal.
             return ClusterType.NONE

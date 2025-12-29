@@ -1,11 +1,13 @@
 import json
+import random
 from argparse import Namespace
+
 from sky_spot.strategies.multi_strategy import MultiRegionStrategy
 from sky_spot.utils import ClusterType
 
 
 class Solution(MultiRegionStrategy):
-    NAME = "cant_be_late_mr_v1"
+    NAME = "cant_be_late_heuristic"
 
     def solve(self, spec_path: str) -> "Solution":
         with open(spec_path) as f:
@@ -19,131 +21,108 @@ class Solution(MultiRegionStrategy):
         )
         super().__init__(args)
 
-        # Runtime state (initialized lazily in _step when env is ready)
-        self._initialized = False
-        self._commit_to_od = False
-        self._cooldown_remaining = 0
-        self._alpha_prior = 2.0
-        self._switch_delta = 0.06
-        self._down_streak_threshold = 2
-        self._cooldown_steps = 1
+        # Internal initialization
+        self._rng = random.Random(42)
+        self._committed_on_demand = False
+        self._cached_task_done_total = 0.0
+        self._cached_task_done_len = 0
 
+        # Region stats (lazy init in _step because env might not be fully set up before)
+        self._regions_inited = False
+        self._region_S = []
+        self._region_F = []
+        self._region_obs = []
         return self
 
-    def _lazy_init(self):
-        if self._initialized:
-            return
-        n = self.env.get_num_regions()
-        self._region_seen = [0] * n
-        self._region_up = [0] * n
-        self._region_down_streak = [0] * n
-        self._initialized = True
+    def _lazy_init_regions(self):
+        if not self._regions_inited:
+            n = self.env.get_num_regions()
+            self._region_S = [1.0] * n  # Beta prior alpha
+            self._region_F = [1.0] * n  # Beta prior beta
+            self._region_obs = [0] * n
+            self._regions_inited = True
 
-    def _update_region_stats(self, region_idx: int, has_spot: bool):
-        self._region_seen[region_idx] += 1
-        if has_spot:
-            self._region_up[region_idx] += 1
-            self._region_down_streak[region_idx] = 0
-        else:
-            self._region_down_streak[region_idx] += 1
+    def _update_task_done_cache(self):
+        # Efficiently maintain sum of task_done_time
+        l = len(self.task_done_time)
+        if l > self._cached_task_done_len:
+            for i in range(self._cached_task_done_len, l):
+                self._cached_task_done_total += self.task_done_time[i]
+            self._cached_task_done_len = l
 
-    def _region_score(self, idx: int) -> float:
-        # Beta prior smoothed estimate; penalize down streak slightly to encourage switching
-        seen = self._region_seen[idx]
-        up = self._region_up[idx]
-        alpha = self._alpha_prior
-        base = (up + alpha) / (seen + 2 * alpha) if seen >= 0 else 0.5
-        penalty = 0.03 * min(self._region_down_streak[idx], 10)
-        s = base - penalty
-        if s < 0.0:
-            s = 0.0
-        if s > 1.0:
-            s = 1.0
-        return s
-
-    def _best_region(self):
-        n = self.env.get_num_regions()
+    def _choose_region(self):
+        # Epsilon-greedy on estimated spot availability
+        n = len(self._region_S)
+        # Compute estimate
+        estimates = []
+        for i in range(n):
+            a = self._region_S[i]
+            b = self._region_F[i]
+            estimates.append(a / (a + b))
+        # Epsilon
+        epsilon = 0.1
+        if self._rng.random() < epsilon:
+            return self._rng.randrange(n)
+        # Greedy
         best_idx = 0
-        best_score = self._region_score(0)
-        for i in range(1, n):
-            s = self._region_score(i)
-            if s > best_score:
-                best_score = s
+        best_val = -1.0
+        for i in range(n):
+            v = estimates[i]
+            if v > best_val:
+                best_val = v
                 best_idx = i
-        return best_idx, best_score
+        return best_idx
+
+    def _should_commit_to_on_demand(self, last_cluster_type: ClusterType, time_left: float, remaining_work: float) -> bool:
+        # Small safety fudge
+        fudge = 60.0  # seconds
+        overhead_switch = 0.0 if last_cluster_type == ClusterType.ON_DEMAND else self.restart_overhead
+        return time_left <= remaining_work + overhead_switch + fudge
+
+    def _safe_to_idle_one_step(self, time_left: float, remaining_work: float) -> bool:
+        # After idling one step, we still need enough time to finish with ON_DEMAND
+        # Assume we'll need to pay restart overhead upon starting ON_DEMAND.
+        fudge = 60.0  # seconds
+        return time_left >= remaining_work + self.restart_overhead + self.env.gap_seconds + fudge
 
     def _step(self, last_cluster_type: ClusterType, has_spot: bool) -> ClusterType:
-        self._lazy_init()
+        self._lazy_init_regions()
 
-        # Decrement cooldown
-        if self._cooldown_remaining > 0:
-            self._cooldown_remaining -= 1
-
+        # Update per-region observation with current region and current has_spot
         current_region = self.env.get_current_region()
-        # Update stats with current observation
-        self._update_region_stats(current_region, has_spot)
+        self._region_obs[current_region] += 1
+        if has_spot:
+            self._region_S[current_region] += 1.0
+        else:
+            self._region_F[current_region] += 1.0
 
-        # Remaining work and time
-        work_done = sum(self.task_done_time)
-        remaining_work = max(0.0, self.task_duration - work_done)
-        if remaining_work <= 0.0:
-            return ClusterType.NONE
+        # Update work done cache
+        self._update_task_done_cache()
 
         time_left = self.deadline - self.env.elapsed_seconds
-        # Safe commit computation: enough time to finish with OD if we start now
-        od_time_needed = remaining_work + self.restart_overhead
+        remaining_work = self.task_duration - self._cached_task_done_total
 
-        # Margin to guard discretization and pending overheads
-        commit_margin = max(self.env.gap_seconds, 0.5 * self.restart_overhead)
-
-        # If already committed, keep using OD
-        if self._commit_to_od:
+        # If already committed, stay on ON_DEMAND
+        if self._committed_on_demand:
             return ClusterType.ON_DEMAND
 
-        # If close to deadline, commit to OD
-        if time_left <= od_time_needed + commit_margin:
-            self._commit_to_od = True
+        # If time is tight, commit to ON_DEMAND now
+        if self._should_commit_to_on_demand(last_cluster_type, time_left, remaining_work):
+            self._committed_on_demand = True
             return ClusterType.ON_DEMAND
 
-        # Opportunistic Spot usage when available
+        # Pre-commit phase: prefer SPOT when available
         if has_spot:
             return ClusterType.SPOT
 
-        # Spot not available in current region; decide to wait or switch or commit early
-        # Pre-commit slightly earlier if very close to barrier (two steps margin)
-        if time_left <= od_time_needed + 2.0 * self.env.gap_seconds:
-            self._commit_to_od = True
+        # SPOT not available: decide to idle or start ON_DEMAND
+        if self._safe_to_idle_one_step(time_left, remaining_work):
+            # Switch to best region while idling to increase chance of SPOT next step
+            target_region = self._choose_region()
+            if target_region != current_region:
+                self.env.switch_region(target_region)
+            return ClusterType.NONE
+        else:
+            # Not safe to idle; start ON_DEMAND and commit to it
+            self._committed_on_demand = True
             return ClusterType.ON_DEMAND
-
-        # Consider switching regions to one with better estimated availability
-        n_regions = self.env.get_num_regions()
-        if n_regions > 1:
-            current_score = self._region_score(current_region)
-            best_idx, best_score = self._best_region()
-
-            should_switch = False
-            if best_idx != current_region:
-                # Switch if the other region appears significantly better or we are in a down streak
-                if (best_score - current_score) >= self._switch_delta:
-                    should_switch = True
-                elif self._region_down_streak[current_region] >= self._down_streak_threshold:
-                    should_switch = True
-
-            if should_switch and self._cooldown_remaining <= 0:
-                self.env.switch_region(best_idx)
-                self._cooldown_remaining = self._cooldown_steps
-                # Wait this step; we'll try spot next step in the new region
-                return ClusterType.NONE
-
-            # Optional exploration: mild round-robin if severe down streak and no clear best
-            if (
-                self._region_down_streak[current_region] >= (self._down_streak_threshold + 2)
-                and self._cooldown_remaining <= 0
-            ):
-                next_idx = (current_region + 1) % n_regions
-                self.env.switch_region(next_idx)
-                self._cooldown_remaining = self._cooldown_steps
-                return ClusterType.NONE
-
-        # Default: wait for Spot to return
-        return ClusterType.NONE

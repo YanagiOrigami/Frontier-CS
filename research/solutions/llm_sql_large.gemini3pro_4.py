@@ -13,75 +13,92 @@ class Solution:
         distinct_value_threshold: float = 0.7,
         parallel: bool = True,
     ) -> pd.DataFrame:
-        # Work on a copy to prevent modifying the original dataframe
+        """
+        Reorder columns in the DataFrame to maximize prefix hit rate.
+        Implements a greedy strategy based on maximizing the ratio of 
+        expected shared length to the non-match probability.
+        """
+        # Create a working copy of the dataframe
         df_curr = df.copy()
-        N = len(df_curr)
-        if N == 0:
-            return df_curr
-
+        
         # 1. Apply Column Merges
-        # Merge groups of columns into single columns by concatenation
         if col_merge:
             for group in col_merge:
+                # Identify valid columns in this group that exist in the dataframe
+                # Filter to ensure we don't try to access missing columns
                 valid_cols = [c for c in group if c in df_curr.columns]
-                if not valid_cols:
+                
+                # Need at least 2 columns to merge
+                if len(valid_cols) < 2:
                     continue
                 
-                # Vectorized string concatenation of the columns
+                # Perform vectorized string concatenation
+                # Convert first column to string
                 merged_series = df_curr[valid_cols[0]].astype(str)
+                # Concatenate remaining columns
                 for c in valid_cols[1:]:
                     merged_series = merged_series + df_curr[c].astype(str)
                 
-                # Name the new column using joined names of original columns
-                new_col_name = "|".join(map(str, valid_cols))
-                df_curr[new_col_name] = merged_series
+                # Generate new column name by concatenating original names
+                # This helps ensure uniqueness and traceability
+                new_col = "".join(str(c) for c in valid_cols)
                 
-                # Remove the original columns
+                # Drop original columns first to handle potential naming collisions safely
                 df_curr.drop(columns=valid_cols, inplace=True)
-
-        # 2. Calculate Heuristic Scores
-        # We want to maximize the expected prefix match length.
-        # This is modeled as a scheduling problem (Smith's Rule).
-        # We sort columns by Score = (P * L) / (1 - P), where:
-        #   P = Probability of a match (approximated by sum of squared probabilities of values)
-        #   L = Expected length of the column value given a match
+                
+                # Assign the merged series to the new column
+                df_curr[new_col] = merged_series
         
-        cols = list(df_curr.columns)
-        scores = []
-        inv_N = 1.0 / N
-        inv_N_sq = inv_N * inv_N
+        # 2. Calculate Scoring Metric for Each Column
+        # Goal: Maximize prefix hit rate sum(LCP) / sum(len).
+        # We sort columns to maximize the "Retention Ratio": S / (1 - q)
+        # S = Sum(p_v^2 * len(v)) : Expected length contribution
+        # q = Sum(p_v^2)          : Probability of match (collision)
+        # 
+        # This metric prioritizes columns that are:
+        # - Low cardinality (High q) -> create fewer branches
+        # - Long string length (High len) -> contribute more to LCP
         
-        for col in cols:
-            # Convert to string for length and frequency analysis
-            series = df_curr[col].astype(str)
+        col_metrics = []
+        
+        for col in df_curr.columns:
+            # Convert column to string representation (handling NaNs as 'nan')
+            s_vals = df_curr[col].astype(str)
             
-            # Calculate value counts
-            vc = series.value_counts()
-            counts = vc.values
+            # Compute value counts and normalize to get probabilities (p)
+            # dropna=False ensures NaNs are treated as a distinct category
+            v_counts = s_vals.value_counts(normalize=True, dropna=False)
             
-            # Calculate squared probabilities: (count / N)^2
-            probs_sq = (counts * counts) * inv_N_sq
+            # Extract probabilities
+            p = v_counts.values
+            p_sq = p * p
             
-            # P: Probability of match
-            P = np.sum(probs_sq)
+            # q: Probability that two random rows match on this column (Collision Probability)
+            q = np.sum(p_sq)
             
-            # PL: Expected length contribution (weighted by match probability)
-            # lengths aligned with counts in vc
-            lengths = vc.index.map(len).values
-            PL = np.sum(probs_sq * lengths)
+            # Calculate lengths of each unique string value
+            # v_counts.index contains the unique strings
+            lengths = v_counts.index.astype(str).map(len).values
             
-            # Calculate score
-            # Prioritize constant columns (P approx 1) infinitely high
-            if P > 0.99999999:
-                s = float('inf')
+            # S: Expected length added to LCP if this column is placed next and matches
+            S = np.sum(p_sq * lengths)
+            
+            # Calculate final metric: S / (1 - q)
+            # If q is 1 (constant column), the denominator is 0. 
+            # Constant columns are optimal at the start (infinite score).
+            if q >= 1.0 - 1e-9:
+                metric = float('inf')
             else:
-                s = PL / (1.0 - P)
+                metric = S / (1.0 - q)
             
-            scores.append((s, col))
+            col_metrics.append((col, metric))
         
-        # 3. Sort and Reorder
-        # Descending order of scores
-        scores.sort(key=lambda x: x[0], reverse=True)
-        ordered_cols = [x[1] for x in scores]
+        # 3. Sort Columns
+        # Sort by metric in descending order
+        col_metrics.sort(key=lambda x: x[1], reverse=True)
         
-        return df_curr[ordered_cols]
+        # Extract ordered column names
+        ordered_columns = [c for c, m in col_metrics]
+        
+        # Return DataFrame with columns reordered
+        return df_curr[ordered_columns]

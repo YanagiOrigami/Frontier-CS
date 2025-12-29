@@ -8,11 +8,17 @@ from sky_spot.utils import ClusterType
 class Solution(MultiRegionStrategy):
     """Your multi-region scheduling strategy."""
 
-    NAME = "my_strategy"
+    NAME = "cant_be_late_strategy"
 
     def solve(self, spec_path: str) -> "Solution":
         """
         Initialize the solution from spec_path config.
+
+        The spec file contains:
+        - deadline: deadline in hours
+        - duration: task duration in hours
+        - overhead: restart overhead in hours
+        - trace_files: list of trace file paths (one per region)
         """
         with open(spec_path) as f:
             config = json.load(f)
@@ -29,51 +35,69 @@ class Solution(MultiRegionStrategy):
     def _step(self, last_cluster_type: ClusterType, has_spot: bool) -> ClusterType:
         """
         Decide next action based on current state.
+
+        Available attributes:
+        - self.env.get_current_region(): Get current region index
+        - self.env.get_num_regions(): Get total number of regions
+        - self.env.switch_region(idx): Switch to region by index
+        - self.env.elapsed_seconds: Current time elapsed
+        - self.task_duration: Total task duration needed (seconds)
+        - self.deadline: Deadline time (seconds)
+        - self.restart_overhead: Restart overhead (seconds)
+        - self.task_done_time: List of completed work segments
+        - self.remaining_restart_overhead: Current pending overhead
+
+        Returns: ClusterType.SPOT, ClusterType.ON_DEMAND, or ClusterType.NONE
         """
-        # Strategy Thresholds
-        # If slack < 2.0 hours, stop optimizing for cost and ensure completion
-        PANIC_SLACK_HOURS = 2.0
-        # If slack > 6.0 hours, we can afford to wait (NONE) while switching regions to find Spot
-        SEEK_SLACK_HOURS = 6.0
+        # 1. Calculate remaining work and time
+        done = sum(self.task_done_time)
+        remaining = self.task_duration - done
 
-        # Gather State
-        current_time = self.env.elapsed_seconds
-        work_done = sum(self.task_done_time)
-        work_needed = self.task_duration - work_done
-        if work_needed < 0:
-            work_needed = 0.0
-
-        # Pending overhead
-        current_overhead = self.remaining_restart_overhead if self.remaining_restart_overhead is not None else 0.0
-
-        # Calculate Slack
-        # Slack = Time Remaining - (Work Needed + Pending Overhead)
-        time_left = self.deadline - current_time
-        slack_seconds = time_left - (work_needed + current_overhead)
-        slack_hours = slack_seconds / 3600.0
-
-        # 1. Safety Check: Low Slack
-        if slack_hours < PANIC_SLACK_HOURS:
-            # Force On-Demand to guarantee progress. 
-            # We stay in the current region to avoid incurring unnecessary switch overheads 
-            # unless we were already switching, but OD is safe everywhere.
-            return ClusterType.ON_DEMAND
-
-        # 2. Prefer Spot
-        if has_spot:
-            return ClusterType.SPOT
-
-        # 3. Spot Unavailable: Hunt for Spot
-        # Switch to the next region in a round-robin fashion
-        current_region = self.env.get_current_region()
-        num_regions = self.env.get_num_regions()
-        next_region = (current_region + 1) % num_regions
-        self.env.switch_region(next_region)
-
-        # 4. Action during Search
-        # If we have plenty of slack, return NONE to save money (paying only time)
-        # If slack is tightening, use ON_DEMAND to progress task while moving
-        if slack_hours > SEEK_SLACK_HOURS:
+        # If effectively finished, return NONE (env should handle termination)
+        if remaining <= 1e-6:
             return ClusterType.NONE
-        else:
+
+        time_left = self.deadline - self.env.elapsed_seconds
+        gap = self.env.gap_seconds
+        overhead = self.restart_overhead
+
+        # 2. Calculate Slack
+        # Slack is the time buffer we have assuming we switch to OD immediately.
+        # We subtract overhead because starting OD (or any new instance) incurs it.
+        # If we are already running OD, the env won't charge overhead, but for safety
+        # we calculate slack conservatively assuming a potential restart.
+        slack = time_left - remaining - overhead
+
+        # 3. Critical Threshold for Safety
+        # If we use Spot and it fails (or we wait), we lose 'gap' time.
+        # We also face the risk of needing another restart overhead.
+        # If slack is less than gap + overhead, we are in danger of missing the deadline
+        # if anything goes wrong. We force OD to ensure completion.
+        # Added small buffer (10s) for float precision.
+        critical_threshold = gap + overhead + 10.0
+
+        if slack < critical_threshold:
             return ClusterType.ON_DEMAND
+
+        # 4. Standard Decision Logic
+        if has_spot:
+            # We have enough slack, and Spot is available. Use it to save cost.
+            return ClusterType.SPOT
+        
+        # 5. Search Logic
+        # Spot is unavailable in current region.
+        # We can switch regions and wait (ClusterType.NONE) to find Spot.
+        # Switching costs 1 'gap' of time (since we return NONE for this step).
+        # We check if we have enough slack to afford this search cost.
+        # We want to ensure that after wasting 'gap' time, we still have positive slack.
+        if slack > gap + 10.0:
+            current_region = self.env.get_current_region()
+            num_regions = self.env.get_num_regions()
+            # Simple Round-Robin search to find an available region
+            next_region = (current_region + 1) % num_regions
+            self.env.switch_region(next_region)
+            return ClusterType.NONE
+        
+        # 6. Fallback
+        # Spot unavailable and not enough slack to search -> Force OD.
+        return ClusterType.ON_DEMAND

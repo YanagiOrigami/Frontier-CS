@@ -3,32 +3,27 @@ class Solution:
         """
         Generate a PoC that triggers the vulnerability.
 
-        Args:
-            src_path: Path to the vulnerable source code tarball
+        The vulnerability is a double-free of an anonymous classpermission in libsepol/cil.
+        It occurs when an anonymous classpermission is passed as an argument to a macro,
+        and that macro then uses the argument within a classpermissionset definition.
 
-        Returns:
-            bytes: The PoC input that should trigger the vulnerability
+        The AST destruction process will free the anonymous classpermission once as
+        part of the macro call's argument list, and a second time as part of the
+        classpermissionset's contents, leading to a heap-use-after-free/double-free crash.
+
+        To construct the PoC, we create a minimal CIL policy with this structure:
+        1. Define a class and a permission, which are prerequisites for a classpermission.
+        2. Define a macro that accepts a classpermission and uses it in a classpermissionset.
+        3. Call the macro, passing an anonymous classpermission as the argument.
+        4. Wrap these statements in a block to form a valid policy.
+
+        Short, single-character names are used to minimize the PoC size for a better score.
         """
-        # This CIL (Common Intermediate Language) code triggers a double free.
-        #
-        # 1. `(class c (p))`: Defines a simple class 'c' with a permission 'p'.
-        #    This is a prerequisite for defining a classpermission.
-        #
-        # 2. `(macro m ((classpermission a)) (classpermissionset s (a)))`:
-        #    Defines a macro 'm' that takes a `classpermission` argument 'a'.
-        #    Inside the macro, a `classpermissionset` named 's' is created,
-        #    which includes the passed-in classpermission 'a'.
-        #
-        # 3. `(call m ((classpermission (c (p)))))`: Calls the macro 'm'.
-        #    The argument is an *anonymous* classpermission. This is the key.
-        #
-        # The vulnerability occurs because the CIL compiler creates an AST node
-        # for the anonymous classpermission. This node is marked for destruction
-        # after the `call` expression is processed. However, a reference to this
-        # same node is also stored within the `classpermissionset` 's'. When the
-        # entire AST is destroyed, the `classpermissionset` 's' is destroyed,
-        # which in turn tries to destroy its member classpermissions, leading
-        # to a second free of the same anonymous classpermission object.
-        
-        poc = b"(class c(p))(macro m((classpermission a))(classpermissionset s(a)))(call m((classpermission(c(p)))))"
+        poc = (
+            b"(block b "
+            b"(class c (p)) "
+            b"(macro m ((classpermission x)) (classpermissionset s (x))) "
+            b"(call m ((classpermission (c (p)))))"
+            b")"
+        )
         return poc

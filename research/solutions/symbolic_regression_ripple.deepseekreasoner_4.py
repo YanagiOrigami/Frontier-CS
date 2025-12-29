@@ -1,150 +1,91 @@
 import numpy as np
 from pysr import PySRRegressor
-import sympy
 
 class Solution:
     def __init__(self, **kwargs):
         pass
 
     def solve(self, X: np.ndarray, y: np.ndarray) -> dict:
+        # Configure PySR for efficient CPU execution
         model = PySRRegressor(
-            niterations=40,
+            niterations=30,
             binary_operators=["+", "-", "*", "/", "**"],
             unary_operators=["sin", "cos", "exp", "log"],
-            populations=15,
-            population_size=33,
-            maxsize=30,
-            model_selection="best",
-            temp_equation_file=False,
+            populations=8,
+            population_size=20,
+            maxsize=15,
+            early_stop_condition=(
+                "stop_if(loss, complexity) = loss < 1e-6 && complexity < 10"
+            ),
+            deterministic=True,
             verbosity=0,
             progress=False,
             random_state=42,
-            deterministic=True,
-            max_depth=10,
-            early_stop_condition="stop_if(loss, complexity) = loss < 1e-6 && complexity < 10",
-            nested_constraints={"log": {"log": 0}},
-            extra_sympy_mappings={},
-            constraints={"**": (9, 2)},
-            weight_optimize=0.01,
+            multithreading=True,
+            turbo=True,
+            warm_start=False,
+            optimizer_algorithm="BFGS",
+            optimizer_iterations=10,
+            model_selection="best",
+            loss="L2DistLoss()",
+            complexity_of_operators={
+                "+": 1, "-": 1, "*": 1, "/": 1, "**": 2,
+                "sin": 2, "cos": 2, "exp": 2, "log": 2
+            },
+            use_frequency=True,
+            optimizer_nrestarts=2,
+            should_optimize_constants=True,
+            weight_add_node=0.01,
+            weight_insert_node=0.01,
+            weight_delete_node=0.005,
+            weight_do_nothing=0.05,
+            weight_mutate_constant=0.15,
+            weight_mutate_operator=0.15,
+            weight_swap_operands=0.1,
+            weight_simplify=0.02,
+            weight_randomize=0.005,
+            weight_optimize=0.1,
         )
-        
+
+        # Fit model
+        model.fit(X, y, variable_names=["x1", "x2"])
+
+        # Get best expression
         try:
-            model.fit(X, y, variable_names=["x1", "x2"])
-        except Exception:
-            # Fallback to polynomial fit if PySR fails
-            return self._fallback_fit(X, y)
-        
+            expression = str(model.sympy())
+        except:
+            # Fallback to best equation from equations_
+            best_eq = model.equations_.iloc[model.equations_["loss"].argmin()]
+            expression = best_eq["equation"]
+
+        # Clean up expression formatting
+        expression = expression.replace(" ", "").replace("np.", "")
+
+        # Ensure variable names are x1 and x2
+        expression = expression.replace("x0", "x1").replace("x1", "x1").replace("x2", "x2")
+
+        # Generate predictions
         try:
-            best_expr = model.sympy()
-            if best_expr is None:
-                return self._fallback_fit(X, y)
-            
-            # Simplify expression
-            expr_str = str(best_expr)
-            
-            # Replace any np.* or math.* functions
-            expr_str = expr_str.replace("np.", "").replace("math.", "")
-            
-            # Ensure x1, x2 are used
-            if "x1" not in expr_str and "x2" not in expr_str:
-                return self._fallback_fit(X, y)
-                
-            # Get predictions
-            predictions = model.predict(X)
-            
-            # Calculate complexity
-            complexity = self._calculate_complexity(str(best_expr))
-            
-            return {
-                "expression": expr_str,
-                "predictions": predictions.tolist(),
-                "details": {"complexity": complexity}
-            }
-            
-        except Exception:
-            return self._fallback_fit(X, y)
-    
-    def _fallback_fit(self, X: np.ndarray, y: np.ndarray) -> dict:
-        """Fallback to polynomial regression if PySR fails."""
-        x1, x2 = X[:, 0], X[:, 1]
-        
-        # Try polynomial features up to degree 3
-        features = []
-        feature_names = []
-        
-        # Add linear terms
-        features.append(x1)
-        features.append(x2)
-        feature_names.extend(["x1", "x2"])
-        
-        # Add polynomial terms up to degree 3
-        for i in range(2, 4):
-            for j in range(i + 1):
-                if j <= i:
-                    feat = (x1 ** (i - j)) * (x2 ** j)
-                    features.append(feat)
-                    feature_names.append(f"x1**{i-j}*x2**{j}")
-        
-        # Add trigonometric terms
-        for func in [np.sin, np.cos]:
-            features.append(func(x1))
-            features.append(func(x2))
-            features.append(func(x1 + x2))
-            feature_names.extend([f"{func.__name__}(x1)", f"{func.__name__}(x2)", f"{func.__name__}(x1+x2)"])
-        
-        # Add interaction terms
-        features.append(x1 * x2)
-        features.append(x1 * np.sin(x2))
-        features.append(x2 * np.sin(x1))
-        feature_names.extend(["x1*x2", "x1*sin(x2)", "x2*sin(x1)"])
-        
-        A = np.column_stack(features)
-        
-        # Add intercept
-        A = np.column_stack([A, np.ones_like(x1)])
-        feature_names.append("1")
-        
-        # Solve with ridge regression for stability
-        coeffs = np.linalg.lstsq(A, y, rcond=1e-10)[0]
-        
-        # Build expression string
-        terms = []
-        for coef, name in zip(coeffs[:-1], feature_names):
-            if abs(coef) > 1e-10:
-                sign = "+" if coef >= 0 else "-"
-                term = f"{sign}{abs(coef):.6f}*{name}"
-                terms.append(term)
-        
-        # Add intercept
-        if abs(coeffs[-1]) > 1e-10:
-            sign = "+" if coeffs[-1] >= 0 else "-"
-            terms.append(f"{sign}{abs(coeffs[-1]):.6f}")
-        
-        expr = " ".join(terms).strip()
-        if expr.startswith("+"):
-            expr = expr[1:].strip()
-        
-        predictions = A @ coeffs
-        complexity = self._calculate_complexity(expr)
-        
+            predictions = model.predict(X).tolist()
+        except:
+            # Manual evaluation fallback
+            x1 = X[:, 0]
+            x2 = X[:, 1]
+            predictions = eval(expression, {"x1": x1, "x2": x2,
+                                          "sin": np.sin, "cos": np.cos,
+                                          "exp": np.exp, "log": np.log,
+                                          "np": np}).tolist()
+
+        # Compute complexity
+        complexity = 0
+        for op in ["+", "-", "*", "/"]:
+            complexity += 2 * expression.count(op)
+        complexity += 2 * expression.count("**")
+        for fn in ["sin", "cos", "exp", "log"]:
+            complexity += 2 * expression.count(fn)
+
         return {
-            "expression": expr,
-            "predictions": predictions.tolist(),
+            "expression": expression,
+            "predictions": predictions,
             "details": {"complexity": complexity}
         }
-    
-    def _calculate_complexity(self, expr_str: str) -> int:
-        """Calculate expression complexity."""
-        complexity = 0
-        
-        # Count binary operators
-        binary_ops = ["+", "-", "*", "/", "**"]
-        for op in binary_ops:
-            complexity += 2 * expr_str.count(op)
-        
-        # Count unary functions
-        unary_funcs = ["sin", "cos", "exp", "log"]
-        for func in unary_funcs:
-            complexity += expr_str.count(func)
-        
-        return max(1, complexity)

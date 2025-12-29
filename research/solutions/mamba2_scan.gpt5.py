@@ -1,125 +1,170 @@
+import math
 import torch
 import triton
 import triton.language as tl
 
 
-@triton.jit
-def _chunk_params_kernel(
-    X_ptr, A_ptr, B_ptr,
-    P_ptr, Q_ptr,
-    L, D,
-    stride_xl, stride_xd,
-    stride_al, stride_ad,
-    stride_bl, stride_bd,
-    stride_pc, stride_pd,
-    stride_qc, stride_qd,
-    CHUNK: tl.constexpr,
-    BD: tl.constexpr,
-):
-    pid_c = tl.program_id(0)
-    pid_d = tl.program_id(1)
-
-    d_offsets = pid_d * BD + tl.arange(0, BD)
-    mask_d = d_offsets < D
-
-    base_l = pid_c * CHUNK
-
-    y = tl.zeros([BD], dtype=tl.float32)
-    p = tl.ones([BD], dtype=tl.float32)
-
-    for t in range(0, CHUNK):
-        l_idx = base_l + t
-        a = tl.load(A_ptr + l_idx * stride_al + d_offsets * stride_ad, mask=mask_d, other=0).to(tl.float32)
-        b = tl.load(B_ptr + l_idx * stride_bl + d_offsets * stride_bd, mask=mask_d, other=0).to(tl.float32)
-        x = tl.load(X_ptr + l_idx * stride_xl + d_offsets * stride_xd, mask=mask_d, other=0).to(tl.float32)
-        y = a * y + b * x
-        p = p * a
-
-    tl.store(P_ptr + pid_c * stride_pc + d_offsets * stride_pd, p, mask=mask_d)
-    tl.store(Q_ptr + pid_c * stride_qc + d_offsets * stride_qd, y, mask=mask_d)
+def _ceil_div(a, b):
+    return (a + b - 1) // b
 
 
 @triton.jit
-def _chunk_apply_kernel(
-    X_ptr, A_ptr, B_ptr,
-    Y_ptr, Yinit_ptr,
-    L, D,
-    stride_xl, stride_xd,
-    stride_al, stride_ad,
-    stride_bl, stride_bd,
-    stride_yl, stride_yd,
-    stride_ic, stride_id,
+def _kernel_chunk_summarize(
+    X_ptr, A_ptr, B_ptr, M_ptr, C_ptr,
+    stride_x0, stride_x1,
+    stride_a0, stride_a1,
+    stride_b0, stride_b1,
+    stride_m0, stride_m1,
+    stride_c0, stride_c1,
+    D,
     CHUNK: tl.constexpr,
-    BD: tl.constexpr,
+    BLOCK_D: tl.constexpr,
 ):
-    pid_c = tl.program_id(0)
+    pid_chunk = tl.program_id(0)
     pid_d = tl.program_id(1)
 
-    d_offsets = pid_d * BD + tl.arange(0, BD)
-    mask_d = d_offsets < D
+    offs_d = pid_d * BLOCK_D + tl.arange(0, BLOCK_D)
+    mask_d = offs_d < D
 
-    base_l = pid_c * CHUNK
+    # Initialize accumulators in fp32
+    y = tl.zeros([BLOCK_D], dtype=tl.float32)
+    prodA = tl.ones([BLOCK_D], dtype=tl.float32)
 
-    y = tl.load(Yinit_ptr + pid_c * stride_ic + d_offsets * stride_id, mask=mask_d, other=0.0).to(tl.float32)
+    start_t = pid_chunk * CHUNK
+    for s in tl.static_range(0, CHUNK):
+        t = start_t + s
+        a = tl.load(A_ptr + t * stride_a0 + offs_d * stride_a1, mask=mask_d, other=0).to(tl.float32)
+        x = tl.load(X_ptr + t * stride_x0 + offs_d * stride_x1, mask=mask_d, other=0).to(tl.float32)
+        b = tl.load(B_ptr + t * stride_b0 + offs_d * stride_b1, mask=mask_d, other=0).to(tl.float32)
+        u = x * b
+        y = a * y + u
+        prodA = prodA * a
 
-    for t in range(0, CHUNK):
-        l_idx = base_l + t
-        a = tl.load(A_ptr + l_idx * stride_al + d_offsets * stride_ad, mask=mask_d, other=0).to(tl.float32)
-        b = tl.load(B_ptr + l_idx * stride_bl + d_offsets * stride_bd, mask=mask_d, other=0).to(tl.float32)
-        x = tl.load(X_ptr + l_idx * stride_xl + d_offsets * stride_xd, mask=mask_d, other=0).to(tl.float32)
-        y = a * y + b * x
-        tl.store(Y_ptr + l_idx * stride_yl + d_offsets * stride_yd, y.to(tl.float16), mask=mask_d)
+    tl.store(M_ptr + pid_chunk * stride_m0 + offs_d * stride_m1, prodA, mask=mask_d)
+    tl.store(C_ptr + pid_chunk * stride_c0 + offs_d * stride_c1, y, mask=mask_d)
+
+
+@triton.jit
+def _kernel_chunk_prefix(
+    M_ptr, C_ptr, INIT_ptr,
+    stride_m0, stride_m1,
+    stride_c0, stride_c1,
+    stride_i0, stride_i1,
+    D,
+    NC: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+):
+    pid_d = tl.program_id(0)
+    offs_d = pid_d * BLOCK_D + tl.arange(0, BLOCK_D)
+    mask_d = offs_d < D
+
+    state = tl.zeros([BLOCK_D], dtype=tl.float32)
+    for k in tl.static_range(0, NC):
+        # store initial state for chunk k
+        tl.store(INIT_ptr + k * stride_i0 + offs_d * stride_i1, state, mask=mask_d)
+        Mk = tl.load(M_ptr + k * stride_m0 + offs_d * stride_m1, mask=mask_d, other=1.0).to(tl.float32)
+        Ck = tl.load(C_ptr + k * stride_c0 + offs_d * stride_c1, mask=mask_d, other=0.0).to(tl.float32)
+        state = Mk * state + Ck
+
+
+@triton.jit
+def _kernel_chunk_compute(
+    X_ptr, A_ptr, B_ptr, INIT_ptr, Y_ptr,
+    stride_x0, stride_x1,
+    stride_a0, stride_a1,
+    stride_b0, stride_b1,
+    stride_i0, stride_i1,
+    stride_y0, stride_y1,
+    D,
+    CHUNK: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+):
+    pid_chunk = tl.program_id(0)
+    pid_d = tl.program_id(1)
+
+    offs_d = pid_d * BLOCK_D + tl.arange(0, BLOCK_D)
+    mask_d = offs_d < D
+
+    init = tl.load(INIT_ptr + pid_chunk * stride_i0 + offs_d * stride_i1, mask=mask_d, other=0.0).to(tl.float32)
+    y = init
+
+    start_t = pid_chunk * CHUNK
+    for s in tl.static_range(0, CHUNK):
+        t = start_t + s
+        a = tl.load(A_ptr + t * stride_a0 + offs_d * stride_a1, mask=mask_d, other=0).to(tl.float32)
+        x = tl.load(X_ptr + t * stride_x0 + offs_d * stride_x1, mask=mask_d, other=0).to(tl.float32)
+        b = tl.load(B_ptr + t * stride_b0 + offs_d * stride_b1, mask=mask_d, other=0).to(tl.float32)
+        u = x * b
+        y = a * y + u
+        tl.store(Y_ptr + t * stride_y0 + offs_d * stride_y1, y.to(tl.float16), mask=mask_d)
 
 
 def chunk_scan(X: torch.Tensor, A: torch.Tensor, B: torch.Tensor, chunk: int = 128, BD: int = 128) -> torch.Tensor:
-    assert X.is_cuda and A.is_cuda and B.is_cuda, "Inputs must be on CUDA"
-    assert X.dtype == torch.float16 and A.dtype == torch.float16 and B.dtype == torch.float16
-    assert X.shape == A.shape == B.shape
+    """
+    Mamba2 chunked scan computation.
+    y_t = a_t * y_{t-1} + b_t * x_t
+    """
+    assert X.is_cuda and A.is_cuda and B.is_cuda, "Inputs must be on CUDA device"
+    assert X.dtype == torch.float16 and A.dtype == torch.float16 and B.dtype == torch.float16, "Inputs must be float16"
+    assert X.shape == A.shape == B.shape, "Shapes of X, A, B must match"
     L, D = X.shape
     assert L % chunk == 0, "L must be divisible by chunk"
+    n_chunks = L // chunk
 
-    C = L // chunk
+    # Allocate temporaries
     device = X.device
+    M = torch.empty((n_chunks, D), dtype=torch.float32, device=device)
+    C = torch.empty((n_chunks, D), dtype=torch.float32, device=device)
+    INIT = torch.empty((n_chunks, D), dtype=torch.float32, device=device)
+    Y = torch.empty((L, D), dtype=torch.float16, device=device)
 
-    # Allocate per-chunk parameters and initial states
-    P = torch.empty((C, D), dtype=torch.float32, device=device)
-    Q = torch.empty((C, D), dtype=torch.float32, device=device)
+    grid_chunks = (n_chunks, _ceil_div(D, BD))
+    grid_d = (_ceil_div(D, BD),)
 
-    grid = (C, triton.cdiv(D, BD))
+    # Heuristic for num_warps
+    num_warps = 8 if BD >= 128 else 4
 
-    _chunk_params_kernel[grid](
-        X, A, B,
-        P, Q,
-        L, D,
+    # Summarize each chunk: compute M and C
+    _kernel_chunk_summarize[grid_chunks](
+        X, A, B, M, C,
         X.stride(0), X.stride(1),
         A.stride(0), A.stride(1),
         B.stride(0), B.stride(1),
-        P.stride(0), P.stride(1),
-        Q.stride(0), Q.stride(1),
-        CHUNK=chunk, BD=BD,
-        num_warps=4, num_stages=2,
+        M.stride(0), M.stride(1),
+        C.stride(0), C.stride(1),
+        D,
+        CHUNK=chunk,
+        BLOCK_D=BD,
+        num_warps=num_warps,
+        num_stages=2,
     )
 
-    # Compute initial state for each chunk via sequential composition on GPU
-    Yinit = torch.empty((C, D), dtype=torch.float32, device=device)
-    acc = torch.zeros((D,), dtype=torch.float32, device=device)
-    for ci in range(C):
-        Yinit[ci].copy_(acc)
-        acc = P[ci] * acc + Q[ci]
+    # Prefix to get initial state per chunk
+    _kernel_chunk_prefix[grid_d](
+        M, C, INIT,
+        M.stride(0), M.stride(1),
+        C.stride(0), C.stride(1),
+        INIT.stride(0), INIT.stride(1),
+        D,
+        NC=n_chunks,
+        BLOCK_D=BD,
+        num_warps=4 if BD <= 64 else 8,
+        num_stages=1,
+    )
 
-    # Second pass: compute outputs per chunk
-    Y = torch.empty((L, D), dtype=torch.float16, device=device)
-    _chunk_apply_kernel[grid](
-        X, A, B,
-        Y, Yinit,
-        L, D,
+    # Final compute: produce Y
+    _kernel_chunk_compute[grid_chunks](
+        X, A, B, INIT, Y,
         X.stride(0), X.stride(1),
         A.stride(0), A.stride(1),
         B.stride(0), B.stride(1),
+        INIT.stride(0), INIT.stride(1),
         Y.stride(0), Y.stride(1),
-        Yinit.stride(0), Yinit.stride(1),
-        CHUNK=chunk, BD=BD,
-        num_warps=4, num_stages=3,
+        D,
+        CHUNK=chunk,
+        BLOCK_D=BD,
+        num_warps=num_warps,
+        num_stages=2,
     )
 
     return Y
@@ -127,106 +172,176 @@ def chunk_scan(X: torch.Tensor, A: torch.Tensor, B: torch.Tensor, chunk: int = 1
 
 class Solution:
     def solve(self, spec_path: str = None) -> dict:
-        code = (
-            "import torch\n"
-            "import triton\n"
-            "import triton.language as tl\n\n"
-            "@triton.jit\n"
-            "def _chunk_params_kernel(\n"
-            "    X_ptr, A_ptr, B_ptr,\n"
-            "    P_ptr, Q_ptr,\n"
-            "    L, D,\n"
-            "    stride_xl, stride_xd,\n"
-            "    stride_al, stride_ad,\n"
-            "    stride_bl, stride_bd,\n"
-            "    stride_pc, stride_pd,\n"
-            "    stride_qc, stride_qd,\n"
-            "    CHUNK: tl.constexpr,\n"
-            "    BD: tl.constexpr,\n"
-            "):\n"
-            "    pid_c = tl.program_id(0)\n"
-            "    pid_d = tl.program_id(1)\n\n"
-            "    d_offsets = pid_d * BD + tl.arange(0, BD)\n"
-            "    mask_d = d_offsets < D\n\n"
-            "    base_l = pid_c * CHUNK\n\n"
-            "    y = tl.zeros([BD], dtype=tl.float32)\n"
-            "    p = tl.ones([BD], dtype=tl.float32)\n\n"
-            "    for t in range(0, CHUNK):\n"
-            "        l_idx = base_l + t\n"
-            "        a = tl.load(A_ptr + l_idx * stride_al + d_offsets * stride_ad, mask=mask_d, other=0).to(tl.float32)\n"
-            "        b = tl.load(B_ptr + l_idx * stride_bl + d_offsets * stride_bd, mask=mask_d, other=0).to(tl.float32)\n"
-            "        x = tl.load(X_ptr + l_idx * stride_xl + d_offsets * stride_xd, mask=mask_d, other=0).to(tl.float32)\n"
-            "        y = a * y + b * x\n"
-            "        p = p * a\n"
-            "    tl.store(P_ptr + pid_c * stride_pc + d_offsets * stride_pd, p, mask=mask_d)\n"
-            "    tl.store(Q_ptr + pid_c * stride_qc + d_offsets * stride_qd, y, mask=mask_d)\n\n"
-            "@triton.jit\n"
-            "def _chunk_apply_kernel(\n"
-            "    X_ptr, A_ptr, B_ptr,\n"
-            "    Y_ptr, Yinit_ptr,\n"
-            "    L, D,\n"
-            "    stride_xl, stride_xd,\n"
-            "    stride_al, stride_ad,\n"
-            "    stride_bl, stride_bd,\n"
-            "    stride_yl, stride_yd,\n"
-            "    stride_ic, stride_id,\n"
-            "    CHUNK: tl.constexpr,\n"
-            "    BD: tl.constexpr,\n"
-            "):\n"
-            "    pid_c = tl.program_id(0)\n"
-            "    pid_d = tl.program_id(1)\n\n"
-            "    d_offsets = pid_d * BD + tl.arange(0, BD)\n"
-            "    mask_d = d_offsets < D\n"
-            "    base_l = pid_c * CHUNK\n"
-            "    y = tl.load(Yinit_ptr + pid_c * stride_ic + d_offsets * stride_id, mask=mask_d, other=0.0).to(tl.float32)\n"
-            "    for t in range(0, CHUNK):\n"
-            "        l_idx = base_l + t\n"
-            "        a = tl.load(A_ptr + l_idx * stride_al + d_offsets * stride_ad, mask=mask_d, other=0).to(tl.float32)\n"
-            "        b = tl.load(B_ptr + l_idx * stride_bl + d_offsets * stride_bd, mask=mask_d, other=0).to(tl.float32)\n"
-            "        x = tl.load(X_ptr + l_idx * stride_xl + d_offsets * stride_xd, mask=mask_d, other=0).to(tl.float32)\n"
-            "        y = a * y + b * x\n"
-            "        tl.store(Y_ptr + l_idx * stride_yl + d_offsets * stride_yd, y.to(tl.float16), mask=mask_d)\n\n"
-            "def chunk_scan(X: torch.Tensor, A: torch.Tensor, B: torch.Tensor, chunk: int = 128, BD: int = 128) -> torch.Tensor:\n"
-            "    assert X.is_cuda and A.is_cuda and B.is_cuda, 'Inputs must be on CUDA'\n"
-            "    assert X.dtype == torch.float16 and A.dtype == torch.float16 and B.dtype == torch.float16\n"
-            "    assert X.shape == A.shape == B.shape\n"
-            "    L, D = X.shape\n"
-            "    assert L % chunk == 0, 'L must be divisible by chunk'\n"
-            "    C = L // chunk\n"
-            "    device = X.device\n"
-            "    P = torch.empty((C, D), dtype=torch.float32, device=device)\n"
-            "    Q = torch.empty((C, D), dtype=torch.float32, device=device)\n"
-            "    grid = (C, triton.cdiv(D, BD))\n"
-            "    _chunk_params_kernel[grid](\n"
-            "        X, A, B,\n"
-            "        P, Q,\n"
-            "        L, D,\n"
-            "        X.stride(0), X.stride(1),\n"
-            "        A.stride(0), A.stride(1),\n"
-            "        B.stride(0), B.stride(1),\n"
-            "        P.stride(0), P.stride(1),\n"
-            "        Q.stride(0), Q.stride(1),\n"
-            "        CHUNK=chunk, BD=BD,\n"
-            "        num_warps=4, num_stages=2,\n"
-            "    )\n"
-            "    Yinit = torch.empty((C, D), dtype=torch.float32, device=device)\n"
-            "    acc = torch.zeros((D,), dtype=torch.float32, device=device)\n"
-            "    for ci in range(C):\n"
-            "        Yinit[ci].copy_(acc)\n"
-            "        acc = P[ci] * acc + Q[ci]\n"
-            "    Y = torch.empty((L, D), dtype=torch.float16, device=device)\n"
-            "    _chunk_apply_kernel[grid](\n"
-            "        X, A, B,\n"
-            "        Y, Yinit,\n"
-            "        L, D,\n"
-            "        X.stride(0), X.stride(1),\n"
-            "        A.stride(0), A.stride(1),\n"
-            "        B.stride(0), B.stride(1),\n"
-            "        Y.stride(0), Y.stride(1),\n"
-            "        Yinit.stride(0), Yinit.stride(1),\n"
-            "        CHUNK=chunk, BD=BD,\n"
-            "        num_warps=4, num_stages=3,\n"
-            "    )\n"
-            "    return Y\n"
-        )
+        code = r'''
+import math
+import torch
+import triton
+import triton.language as tl
+
+
+def _ceil_div(a, b):
+    return (a + b - 1) // b
+
+
+@triton.jit
+def _kernel_chunk_summarize(
+    X_ptr, A_ptr, B_ptr, M_ptr, C_ptr,
+    stride_x0, stride_x1,
+    stride_a0, stride_a1,
+    stride_b0, stride_b1,
+    stride_m0, stride_m1,
+    stride_c0, stride_c1,
+    D,
+    CHUNK: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+):
+    pid_chunk = tl.program_id(0)
+    pid_d = tl.program_id(1)
+
+    offs_d = pid_d * BLOCK_D + tl.arange(0, BLOCK_D)
+    mask_d = offs_d < D
+
+    # Initialize accumulators in fp32
+    y = tl.zeros([BLOCK_D], dtype=tl.float32)
+    prodA = tl.ones([BLOCK_D], dtype=tl.float32)
+
+    start_t = pid_chunk * CHUNK
+    for s in tl.static_range(0, CHUNK):
+        t = start_t + s
+        a = tl.load(A_ptr + t * stride_a0 + offs_d * stride_a1, mask=mask_d, other=0).to(tl.float32)
+        x = tl.load(X_ptr + t * stride_x0 + offs_d * stride_x1, mask=mask_d, other=0).to(tl.float32)
+        b = tl.load(B_ptr + t * stride_b0 + offs_d * stride_b1, mask=mask_d, other=0).to(tl.float32)
+        u = x * b
+        y = a * y + u
+        prodA = prodA * a
+
+    tl.store(M_ptr + pid_chunk * stride_m0 + offs_d * stride_m1, prodA, mask=mask_d)
+    tl.store(C_ptr + pid_chunk * stride_c0 + offs_d * stride_c1, y, mask=mask_d)
+
+
+@triton.jit
+def _kernel_chunk_prefix(
+    M_ptr, C_ptr, INIT_ptr,
+    stride_m0, stride_m1,
+    stride_c0, stride_c1,
+    stride_i0, stride_i1,
+    D,
+    NC: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+):
+    pid_d = tl.program_id(0)
+    offs_d = pid_d * BLOCK_D + tl.arange(0, BLOCK_D)
+    mask_d = offs_d < D
+
+    state = tl.zeros([BLOCK_D], dtype=tl.float32)
+    for k in tl.static_range(0, NC):
+        # store initial state for chunk k
+        tl.store(INIT_ptr + k * stride_i0 + offs_d * stride_i1, state, mask=mask_d)
+        Mk = tl.load(M_ptr + k * stride_m0 + offs_d * stride_m1, mask=mask_d, other=1.0).to(tl.float32)
+        Ck = tl.load(C_ptr + k * stride_c0 + offs_d * stride_c1, mask=mask_d, other=0.0).to(tl.float32)
+        state = Mk * state + Ck
+
+
+@triton.jit
+def _kernel_chunk_compute(
+    X_ptr, A_ptr, B_ptr, INIT_ptr, Y_ptr,
+    stride_x0, stride_x1,
+    stride_a0, stride_a1,
+    stride_b0, stride_b1,
+    stride_i0, stride_i1,
+    stride_y0, stride_y1,
+    D,
+    CHUNK: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+):
+    pid_chunk = tl.program_id(0)
+    pid_d = tl.program_id(1)
+
+    offs_d = pid_d * BLOCK_D + tl.arange(0, BLOCK_D)
+    mask_d = offs_d < D
+
+    init = tl.load(INIT_ptr + pid_chunk * stride_i0 + offs_d * stride_i1, mask=mask_d, other=0.0).to(tl.float32)
+    y = init
+
+    start_t = pid_chunk * CHUNK
+    for s in tl.static_range(0, CHUNK):
+        t = start_t + s
+        a = tl.load(A_ptr + t * stride_a0 + offs_d * stride_a1, mask=mask_d, other=0).to(tl.float32)
+        x = tl.load(X_ptr + t * stride_x0 + offs_d * stride_x1, mask=mask_d, other=0).to(tl.float32)
+        b = tl.load(B_ptr + t * stride_b0 + offs_d * stride_b1, mask=mask_d, other=0).to(tl.float32)
+        u = x * b
+        y = a * y + u
+        tl.store(Y_ptr + t * stride_y0 + offs_d * stride_y1, y.to(tl.float16), mask=mask_d)
+
+
+def chunk_scan(X: torch.Tensor, A: torch.Tensor, B: torch.Tensor, chunk: int = 128, BD: int = 128) -> torch.Tensor:
+    """
+    Mamba2 chunked scan computation.
+    y_t = a_t * y_{t-1} + b_t * x_t
+    """
+    assert X.is_cuda and A.is_cuda and B.is_cuda, "Inputs must be on CUDA device"
+    assert X.dtype == torch.float16 and A.dtype == torch.float16 and B.dtype == torch.float16, "Inputs must be float16"
+    assert X.shape == A.shape == B.shape, "Shapes of X, A, B must match"
+    L, D = X.shape
+    assert L % chunk == 0, "L must be divisible by chunk"
+    n_chunks = L // chunk
+
+    # Allocate temporaries
+    device = X.device
+    M = torch.empty((n_chunks, D), dtype=torch.float32, device=device)
+    C = torch.empty((n_chunks, D), dtype=torch.float32, device=device)
+    INIT = torch.empty((n_chunks, D), dtype=torch.float32, device=device)
+    Y = torch.empty((L, D), dtype=torch.float16, device=device)
+
+    grid_chunks = (n_chunks, _ceil_div(D, BD))
+    grid_d = (_ceil_div(D, BD),)
+
+    # Heuristic for num_warps
+    num_warps = 8 if BD >= 128 else 4
+
+    # Summarize each chunk: compute M and C
+    _kernel_chunk_summarize[grid_chunks](
+        X, A, B, M, C,
+        X.stride(0), X.stride(1),
+        A.stride(0), A.stride(1),
+        B.stride(0), B.stride(1),
+        M.stride(0), M.stride(1),
+        C.stride(0), C.stride(1),
+        D,
+        CHUNK=chunk,
+        BLOCK_D=BD,
+        num_warps=num_warps,
+        num_stages=2,
+    )
+
+    # Prefix to get initial state per chunk
+    _kernel_chunk_prefix[grid_d](
+        M, C, INIT,
+        M.stride(0), M.stride(1),
+        C.stride(0), C.stride(1),
+        INIT.stride(0), INIT.stride(1),
+        D,
+        NC=n_chunks,
+        BLOCK_D=BD,
+        num_warps=4 if BD <= 64 else 8,
+        num_stages=1,
+    )
+
+    # Final compute: produce Y
+    _kernel_chunk_compute[grid_chunks](
+        X, A, B, INIT, Y,
+        X.stride(0), X.stride(1),
+        A.stride(0), A.stride(1),
+        B.stride(0), B.stride(1),
+        INIT.stride(0), INIT.stride(1),
+        Y.stride(0), Y.stride(1),
+        D,
+        CHUNK=chunk,
+        BLOCK_D=BD,
+        num_warps=num_warps,
+        num_stages=2,
+    )
+
+    return Y
+'''
         return {"code": code}

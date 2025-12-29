@@ -1,7 +1,4 @@
 import pandas as pd
-import os
-from os.path import commonprefix
-from typing import List, Tuple
 
 class Solution:
     def solve(
@@ -15,115 +12,87 @@ class Solution:
         distinct_value_threshold: float = 0.7,
         parallel: bool = True,
     ) -> pd.DataFrame:
-        # Ignore one_way_dep as per specification
-        if one_way_dep is not None:
-            pass
-
-        # Apply column merges
         df = df.copy()
-        used_cols = set()
-        for group in col_merge or []:
-            group = [c for c in group if c in df.columns and c not in used_cols]
-            if len(group) > 1:
-                merged_name = '_'.join(sorted(group))
-                df[merged_name] = df.apply(lambda row: ''.join(str(row[c]) for c in group), axis=1)
-                used_cols.update(group)
-
-        # Drop used original columns
-        df = df.drop(columns=list(used_cols), errors='ignore')
-
-        # Columns to reorder
-        columns = list(df.columns)
-        M = len(columns)
-        if M <= 1:
+        if col_merge is not None:
+            for group in col_merge:
+                if group:
+                    new_col = '_'.join(group)
+                    df[new_col] = df.apply(lambda r: ''.join(str(r[c]) for c in group), axis=1)
+                    df.drop(columns=group, inplace=True)
+        current_cols = list(df.columns)
+        M = len(current_cols)
+        if M == 0:
             return df
-
+        str_rows = [[str(cell) for cell in row] for row in df.values]
         N = len(df)
-
-        # Precompute max_freq for heuristic
-        max_freq = {}
-        for col in columns:
-            counts = df[col].astype(str).value_counts()
-            max_freq[col] = counts.max() / N if len(counts) > 0 else 0.0
-
-        # Sample size
-        if N <= 1024:
-            sample_size = N
+        sample_size = row_stop * 50
+        sample_size = min(sample_size, N)
+        if N <= sample_size:
+            sample_indices = list(range(N))
         else:
-            sample_size = 256
-        if sample_size < 2:
-            # Sort all by max_freq descending
-            columns.sort(key=lambda c: max_freq[c], reverse=True)
-            return df[columns]
-
-        sample_df = df.iloc[:sample_size]
-
-        # Beam search parameters
-        beam_size = max(1, col_stop)
-
-        # Initial beam: (order, used_set, score)
-        beam: List[Tuple[List[str], set, float]] = [([], set(), 0.0)]
-
-        total_evals = 0
-
-        for depth in range(1, M + 1):
-            new_beam = []
-            partials = []
-            for order, used, _ in beam:
-                remaining = [c for c in columns if c not in used]
-                partials.append((order, used, remaining))
-
-            all_extensions = []
-            for order, used, remaining in partials:
-                for cand in remaining:
-                    temp_order = order + [cand]
-                    temp_used = used | {cand}
-
-                    # Compute temp_strings
-                    temp_strings = [
-                        ''.join(str(sample_df.iloc[r][col]) for col in temp_order)
-                        for r in range(sample_size)
-                    ]
-
-                    # Compute sum_lcp
-                    partial_sum_lcp = 0
-                    for i in range(1, sample_size):
-                        si = temp_strings[i]
-                        max_l = 0
-                        for j in range(i):
-                            sj = temp_strings[j]
-                            lcp_len = len(commonprefix((si, sj)))
-                            if lcp_len > max_l:
-                                max_l = lcp_len
-                        partial_sum_lcp += max_l
-
-                    partial_total_len = sum(len(s) for s in temp_strings)
-                    new_score = partial_sum_lcp / partial_total_len if partial_total_len > 0 else 0.0
-
-                    all_extensions.append((temp_order, temp_used, new_score))
-                    total_evals += 1
-
-                    if total_evals > early_stop:
-                        break
-                if total_evals > early_stop:
-                    break
-            if total_evals > early_stop:
-                break
-
-            # Select top beam_size
-            all_extensions.sort(key=lambda x: x[2], reverse=True)
-            beam = all_extensions[:beam_size]
-
-        # Get best order
-        best_order, _, _ = beam[0]
-
-        # If not full (due to early stop), add remaining sorted by max_freq
-        if len(best_order) < M:
-            remaining = [c for c in columns if c not in set(best_order)]
-            remaining.sort(key=lambda c: max_freq[c], reverse=True)
-            best_order += remaining
-
-        # Reorder df
-        result_df = df[best_order]
-
-        return result_df
+            step = max(1, N // sample_size)
+            sample_indices = list(range(0, N, step))[:sample_size]
+        sample_str_rows = [str_rows[i] for i in sample_indices]
+        def compute_partial_score(perm, sample_str_rows):
+            K = len(sample_str_rows)
+            root = {}
+            total_sum = 0.0
+            total_len = 0
+            for si in range(K):
+                row = sample_str_rows[si]
+                row_len = sum(len(row[p]) for p in perm)
+                total_len += row_len
+                if si > 0:
+                    node = root
+                    k = 0
+                    broke = False
+                    for p in perm:
+                        for char in row[p]:
+                            if char not in node:
+                                broke = True
+                                break
+                            node = node[char]
+                            k += 1
+                        if broke:
+                            break
+                    total_sum += k
+                node = root
+                for p in perm:
+                    for char in row[p]:
+                        node = node.setdefault(char, {})
+            return total_sum / total_len if total_len > 0 else 0.0
+        candidates = []
+        for col in range(M):
+            score = compute_partial_score([col], sample_str_rows)
+            candidates.append((score, [col]))
+        candidates.sort(key=lambda x: x[0], reverse=True)
+        beam = candidates[:col_stop]
+        evals = M
+        for depth in range(1, M):
+            new_candidates = []
+            for score, perm in beam:
+                used = set(perm)
+                remaining = [c for c in range(M) if c not in used]
+                for next_col in remaining:
+                    new_perm = perm[:] + [next_col]
+                    new_score = compute_partial_score(new_perm, sample_str_rows)
+                    new_candidates.append((new_score, new_perm))
+                    evals += 1
+                    if evals > early_stop:
+                        new_candidates.sort(key=lambda x: x[0], reverse=True)
+                        if new_candidates:
+                            best = new_candidates[0][1]
+                            used = set(best)
+                            remaining = [c for c in range(M) if c not in used]
+                            best += sorted(remaining)
+                            reordered_cols = [current_cols[i] for i in best]
+                            return df[reordered_cols]
+            new_candidates.sort(key=lambda x: x[0], reverse=True)
+            beam = new_candidates[:col_stop]
+        if beam:
+            beam.sort(key=lambda x: x[0], reverse=True)
+            best_perm = beam[0][1]
+        else:
+            best_perm = list(range(M))
+        reordered_cols = [current_cols[i] for i in best_perm]
+        return df[reordered_cols]

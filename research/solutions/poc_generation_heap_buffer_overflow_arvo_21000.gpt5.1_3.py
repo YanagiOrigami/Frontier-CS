@@ -1,332 +1,234 @@
 import os
 import tarfile
-import re
-from typing import Optional
+import tempfile
+import subprocess
+import time
+import random
+import shutil
+from typing import List, Tuple, Optional
 
 
 class Solution:
-    POC_TARGET_LEN = 33
-    MAX_SCAN_FILE_SIZE = 65536
-    MAX_CFILE_SIZE = 1024 * 1024
+    def _extract_tarball(self, src_path: str, dst_dir: str) -> str:
+        with tarfile.open(src_path, "r:*") as tar:
+            tar.extractall(dst_dir)
+        # Determine project root: if single top-level directory, use it
+        entries = [e for e in os.listdir(dst_dir) if not e.startswith(".")]
+        if len(entries) == 1:
+            sole = os.path.join(dst_dir, entries[0])
+            if os.path.isdir(sole):
+                return sole
+        return dst_dir
+
+    def _gather_sources(self, root: str) -> Tuple[List[str], List[str]]:
+        c_files: List[str] = []
+        cpp_files: List[str] = []
+        for dirpath, _, filenames in os.walk(root):
+            for name in filenames:
+                lower = name.lower()
+                full = os.path.join(dirpath, name)
+                if lower.endswith(".c"):
+                    c_files.append(full)
+                elif lower.endswith((".cc", ".cpp", ".cxx")):
+                    cpp_files.append(full)
+        return c_files, cpp_files
+
+    def _select_preferred_sources(
+        self, root: str, c_files: List[str], cpp_files: List[str]
+    ) -> List[str]:
+        # Heuristic: prefer files mentioning both main and ndpi_search_setup_capwap / capwap
+        main_files: List[str] = []
+        capwap_files: List[str] = []
+        for paths in (c_files, cpp_files):
+            for path in paths:
+                try:
+                    with open(path, "r", errors="ignore") as f:
+                        txt = f.read(100_000)
+                except OSError:
+                    continue
+                low = txt.lower()
+                has_main = "main(" in low
+                has_capwap = "ndpi_search_setup_capwap" in low or "capwap" in low
+                if has_main:
+                    main_files.append(path)
+                if has_capwap:
+                    capwap_files.append(path)
+
+        selected: List[str] = []
+
+        if main_files:
+            # Prefer main files that also look related to capwap
+            ranked = []
+            for m in main_files:
+                try:
+                    with open(m, "r", errors="ignore") as f:
+                        txt = f.read(100_000).lower()
+                except OSError:
+                    txt = ""
+                score = 0
+                if "ndpi_search_setup_capwap" in txt:
+                    score += 2
+                if "capwap" in txt:
+                    score += 1
+                ranked.append((score, len(m), m))
+            ranked.sort(reverse=True)
+            best_main = ranked[0][2]
+            selected.append(best_main)
+        # Add all capwap-related files
+        for p in capwap_files:
+            if p not in selected:
+                selected.append(p)
+
+        if selected:
+            return selected
+
+        # Fallback: select all fairly small C/C++ files
+        small_sources: List[str] = []
+        for path in c_files + cpp_files:
+            try:
+                sz = os.path.getsize(path)
+            except OSError:
+                continue
+            if sz <= 400_000:
+                small_sources.append(path)
+        if small_sources:
+            return small_sources
+
+        # Final fallback: all sources
+        return c_files + cpp_files
+
+    def _compile_sources(
+        self, root: str, sources: List[str], out_path: str
+    ) -> Tuple[bool, bool]:
+        if not sources:
+            return False, False
+
+        is_cpp = any(
+            s.lower().endswith((".cc", ".cpp", ".cxx")) for s in sources
+        )
+
+        compiler_order: List[Tuple[str, List[str]]] = []
+
+        if is_cpp:
+            compiler_order.extend(
+                [
+                    ("clang++", ["-fsanitize=address"]),
+                    ("g++", ["-fsanitize=address"]),
+                    ("clang++", []),
+                    ("g++", []),
+                ]
+            )
+        else:
+            compiler_order.extend(
+                [
+                    ("clang", ["-fsanitize=address"]),
+                    ("gcc", ["-fsanitize=address"]),
+                    ("clang", []),
+                    ("gcc", []),
+                ]
+            )
+
+        for cc, extra in compiler_order:
+            if shutil.which(cc) is None:
+                continue
+            cmd = [cc, "-g", "-O1", "-fno-omit-frame-pointer"] + extra + sources + [
+                "-o",
+                out_path,
+            ]
+            try:
+                res = subprocess.run(
+                    cmd,
+                    cwd=root,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    timeout=60,
+                )
+            except subprocess.TimeoutExpired:
+                continue
+            if res.returncode == 0 and os.path.isfile(out_path):
+                asan_enabled = "-fsanitize=address" in extra
+                return True, asan_enabled
+        return False, False
+
+    def _fuzz_for_asan_crash(
+        self, bin_path: str, max_time: float = 10.0, max_len: int = 64
+    ) -> Optional[bytes]:
+        start = time.time()
+        random.seed(0)
+        crash_markers = [
+            b"AddressSanitizer",
+            b"heap-buffer-overflow",
+            b"heap-buffer-overrun",
+            b"buffer-overflow",
+            b"buffer-overrun",
+        ]
+        # Try some structured-ish seeds around length 33 as well
+        fixed_lengths = [33, 32, 34, 24, 40]
+
+        attempt = 0
+        while time.time() - start < max_time:
+            # Alternate between fixed and random lengths
+            if attempt < len(fixed_lengths):
+                length = fixed_lengths[attempt]
+            else:
+                length = random.randint(1, max_len)
+            attempt += 1
+            try:
+                data = os.urandom(max(1, length))
+            except NotImplementedError:
+                # Fallback if os.urandom not available
+                data = bytes(random.getrandbits(8) for _ in range(max(1, length)))
+            try:
+                res = subprocess.run(
+                    [bin_path],
+                    input=data,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    timeout=2,
+                )
+            except subprocess.TimeoutExpired:
+                continue
+            except OSError:
+                break
+
+            if res.returncode != 0:
+                err = res.stderr or b""
+                if any(m in err for m in crash_markers):
+                    return data
+        return None
 
     def solve(self, src_path: str) -> bytes:
-        try:
-            if os.path.isdir(src_path):
-                data = self._solve_from_dir(src_path)
-            else:
-                data = self._solve_from_tar(src_path)
-            if data is None:
-                data = b"A" * self.POC_TARGET_LEN
-            return data
-        except Exception:
-            return b"A" * self.POC_TARGET_LEN
+        with tempfile.TemporaryDirectory() as tmpdir:
+            try:
+                proj_root = self._extract_tarball(src_path, tmpdir)
+            except Exception:
+                # If extraction fails, return simple fallback PoC
+                return b"A" * 33
 
-    def _solve_from_tar(self, tar_path: str) -> Optional[bytes]:
-        best_content: Optional[bytes] = None
-        best_score = float("-inf")
-        try:
-            with tarfile.open(tar_path, "r:*") as tf:
-                members = tf.getmembers()
-                # Pass 1: small binary-like files
-                for m in members:
-                    if not m.isfile():
-                        continue
-                    size = m.size
-                    if size <= 0 or size > self.MAX_SCAN_FILE_SIZE:
-                        continue
-                    name = m.name
-                    _, ext = os.path.splitext(name)
-                    ext = ext.lower().lstrip(".")
-                    if self._skip_ext(ext):
-                        continue
-                    f = tf.extractfile(m)
-                    if f is None:
-                        continue
-                    try:
-                        content = f.read()
-                    finally:
-                        f.close()
-                    score = self._score_candidate(name, len(content), content, ext)
-                    if score > best_score:
-                        best_score = score
-                        best_content = content
-                # Pass 2: arrays in relevant C/C++ headers
-                for m in members:
-                    if not m.isfile():
-                        continue
-                    name_lower = m.name.lower()
-                    if not name_lower.endswith((".c", ".h", ".cpp", ".cc", ".cxx")):
-                        continue
-                    if not any(
-                        k in name_lower
-                        for k in ("poc", "capwap", "crash", "fuzz", "overflow", "heap")
-                    ):
-                        continue
-                    if m.size <= 0 or m.size > self.MAX_CFILE_SIZE:
-                        continue
-                    f = tf.extractfile(m)
-                    if f is None:
-                        continue
-                    try:
-                        text = f.read().decode("latin1", errors="ignore")
-                    finally:
-                        f.close()
-                    for varname, arr_bytes in self._extract_arrays(text):
-                        score = self._score_candidate(
-                            m.name + "::" + varname,
-                            len(arr_bytes),
-                            arr_bytes,
-                            ext="",
-                            varname=varname,
-                        )
-                        if score > best_score:
-                            best_score = score
-                            best_content = arr_bytes
-        except tarfile.TarError:
-            return None
-        return best_content
+            c_files, cpp_files = self._gather_sources(proj_root)
+            if not c_files and not cpp_files:
+                return b"A" * 33
 
-    def _solve_from_dir(self, root: str) -> Optional[bytes]:
-        best_content: Optional[bytes] = None
-        best_score = float("-inf")
-        # Pass 1: binary-like files
-        for dirpath, _, filenames in os.walk(root):
-            for fn in filenames:
-                path = os.path.join(dirpath, fn)
-                try:
-                    size = os.path.getsize(path)
-                except OSError:
-                    continue
-                if size <= 0 or size > self.MAX_SCAN_FILE_SIZE:
-                    continue
-                _, ext = os.path.splitext(fn)
-                ext = ext.lower().lstrip(".")
-                if self._skip_ext(ext):
-                    continue
-                try:
-                    with open(path, "rb") as f:
-                        content = f.read()
-                except OSError:
-                    continue
-                rel_path = os.path.relpath(path, root)
-                score = self._score_candidate(rel_path, len(content), content, ext)
-                if score > best_score:
-                    best_score = score
-                    best_content = content
-        # Pass 2: arrays in relevant C/C++ headers
-        for dirpath, _, filenames in os.walk(root):
-            for fn in filenames:
-                lower_fn = fn.lower()
-                if not lower_fn.endswith((".c", ".h", ".cpp", ".cc", ".cxx")):
-                    continue
-                if not any(
-                    k in lower_fn
-                    for k in ("poc", "capwap", "crash", "fuzz", "overflow", "heap")
-                ):
-                    continue
-                path = os.path.join(dirpath, fn)
-                try:
-                    size = os.path.getsize(path)
-                except OSError:
-                    continue
-                if size <= 0 or size > self.MAX_CFILE_SIZE:
-                    continue
-                try:
-                    with open(path, "r", encoding="latin1", errors="ignore") as f:
-                        text = f.read()
-                except OSError:
-                    continue
-                rel_path = os.path.relpath(path, root)
-                for varname, arr_bytes in self._extract_arrays(text):
-                    score = self._score_candidate(
-                        rel_path + "::" + varname,
-                        len(arr_bytes),
-                        arr_bytes,
-                        ext="",
-                        varname=varname,
-                    )
-                    if score > best_score:
-                        best_score = score
-                        best_content = arr_bytes
-        return best_content
+            preferred_sources = self._select_preferred_sources(
+                proj_root, c_files, cpp_files
+            )
+            bin_path = os.path.join(proj_root, "poc_bin")
 
-    def _skip_ext(self, ext: str) -> bool:
-        skip = {
-            "c",
-            "h",
-            "cpp",
-            "cc",
-            "cxx",
-            "hpp",
-            "hxx",
-            "py",
-            "sh",
-            "bat",
-            "ps1",
-            "pl",
-            "rb",
-            "java",
-            "cs",
-            "js",
-            "ts",
-            "go",
-            "php",
-            "md",
-            "rst",
-            "txt",
-            "rtf",
-            "html",
-            "htm",
-            "xml",
-            "xsl",
-            "json",
-            "yml",
-            "yaml",
-            "csv",
-            "tsv",
-            "ini",
-            "cfg",
-            "conf",
-            "cmake",
-            "am",
-            "ac",
-            "m4",
-            "pc",
-            "log",
-            "tex",
-            "cl",
-            "v",
-            "sv",
-            "s",
-            "asm",
-            "o",
-            "a",
-            "so",
-            "dylib",
-            "dll",
-            "lib",
-            "jpg",
-            "jpeg",
-            "png",
-            "gif",
-            "bmp",
-            "tiff",
-            "svg",
-            "gz",
-            "bz2",
-            "xz",
-            "zip",
-            "7z",
-            "rar",
-            "tar",
-            "tgz",
-            "tbz",
-            "txz",
-            "pdf",
-            "doc",
-            "docx",
-            "xls",
-            "xlsx",
-            "ppt",
-            "pptx",
-        }
-        return ext in skip
+            compiled, asan_enabled = self._compile_sources(
+                proj_root, preferred_sources, bin_path
+            )
 
-    def _score_candidate(
-        self,
-        rel_path: str,
-        size: int,
-        content: bytes,
-        ext: str = "",
-        varname: Optional[str] = None,
-    ) -> float:
-        lower_path = rel_path.lower()
-        score = 0.0
-        if "poc" in lower_path:
-            score += 120.0
-        if varname and "poc" in varname.lower():
-            score += 120.0
-        if "crash" in lower_path or (varname and "crash" in varname.lower()):
-            score += 90.0
-        if "heap" in lower_path or "overflow" in lower_path:
-            score += 60.0
-        if "capwap" in lower_path or (varname and "capwap" in varname.lower()):
-            score += 80.0
-        if "fuzz" in lower_path or "corpus" in lower_path or "seed" in lower_path:
-            score += 40.0
-        if "id:" in lower_path or "id_" in lower_path or "id-" in lower_path:
-            score += 50.0
-        if ext in ("bin", "dat", "raw", "pcap", "cap", "in", "inp", "seed"):
-            score += 30.0
-        base = os.path.basename(rel_path)
-        if "." not in base:
-            score += 10.0
-        # closeness to target length
-        score += max(0.0, 60.0 - abs(size - self.POC_TARGET_LEN))
-        # binary-like bonus
-        if size > 0:
-            nonprint = 0
-            for b in content:
-                if b < 9 or (13 < b < 32) or b > 126:
-                    nonprint += 1
-            ratio = nonprint / size
-            score += ratio * 20.0
-        # small penalty for large files
-        if size > 2048:
-            score -= (size - 2048) / 1024.0 * 10.0
-        return score
+            if not compiled:
+                # Fallback: try compiling all sources
+                all_sources = c_files + cpp_files
+                compiled, asan_enabled = self._compile_sources(
+                    proj_root, all_sources, bin_path
+                )
 
-    def _extract_arrays(self, text: str):
-        pattern = re.compile(
-            r"(?:static\s+)?(?:const\s+)?(?:unsigned\s+char|uint8_t|u_char|char)\s+"
-            r"([A-Za-z_]\w*)\s*\[\s*\]\s*=\s*{(.*?)}\s*;",
-            re.S,
-        )
-        results = []
-        for m in pattern.finditer(text):
-            varname = m.group(1)
-            body = m.group(2)
-            arr = []
-            for token in body.split(","):
-                tok = token.strip()
-                if not tok:
-                    continue
-                # remove comments
-                if "/*" in tok:
-                    tok = tok.split("/*", 1)[0].strip()
-                if "//" in tok:
-                    tok = tok.split("//", 1)[0].strip()
-                if not tok:
-                    continue
-                # remove leading casts like (uint8_t)
-                if tok.startswith("("):
-                    while tok.startswith("(") and ")" in tok:
-                        tok = tok.split(")", 1)[1].strip()
-                if not tok:
-                    continue
-                # char literal
-                if tok[0] == "'" and tok.endswith("'") and len(tok) >= 3:
-                    ch = tok[1]
-                    arr.append(ord(ch) & 0xFF)
-                    continue
-                # string literal
-                if tok[0] == '"' and tok.endswith('"'):
-                    s = tok[1:-1].encode("latin1", errors="ignore")
-                    arr.extend(s)
-                    continue
-                # numeric with optional suffix
-                m_int = re.match(r"(-?0x[0-9A-Fa-f]+)|(-?\d+)", tok)
-                if not m_int:
-                    continue
-                num_str = m_int.group(0)
-                try:
-                    if num_str.lower().startswith("0x"):
-                        v = int(num_str, 16)
-                    else:
-                        v = int(num_str, 10)
-                except ValueError:
-                    continue
-                arr.append(v & 0xFF)
-            if arr and len(arr) <= self.MAX_SCAN_FILE_SIZE:
-                results.append((varname, bytes(arr)))
-        return results
+            if compiled and asan_enabled:
+                poc = self._fuzz_for_asan_crash(bin_path)
+                if poc is not None:
+                    return poc
+
+        # Final fallback: deterministic 33-byte payload
+        return b"A" * 33

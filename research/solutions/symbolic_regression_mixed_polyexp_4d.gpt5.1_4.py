@@ -1,106 +1,144 @@
 import numpy as np
-from itertools import product
+
+try:
+    from pysr import PySRRegressor
+    _HAVE_PYSR = True
+except Exception:
+    PySRRegressor = None
+    _HAVE_PYSR = False
 
 
 class Solution:
     def __init__(self, **kwargs):
         pass
 
-    def solve(self, X: np.ndarray, y: np.ndarray) -> dict:
-        X = np.asarray(X, dtype=float)
-        y = np.asarray(y, dtype=float).ravel()
+    def _fit_pysr(self, X: np.ndarray, y: np.ndarray):
+        if not _HAVE_PYSR:
+            return None, None
 
-        expression = None
+        model = PySRRegressor(
+            niterations=50,
+            binary_operators=["+", "-", "*", "/"],
+            unary_operators=["sin", "cos", "exp", "log"],
+            populations=20,
+            population_size=40,
+            maxsize=30,
+            verbosity=0,
+            progress=False,
+            random_state=42,
+        )
 
-        # Try PySR-based symbolic regression
+        model.fit(X, y, variable_names=["x1", "x2", "x3", "x4"])
+        best_expr = model.sympy()
+        expression = str(best_expr)
+
         try:
-            from pysr import PySRRegressor
-
-            model = PySRRegressor(
-                niterations=50,
-                binary_operators=["+", "-", "*", "^"],
-                unary_operators=["exp"],
-                populations=20,
-                population_size=40,
-                maxsize=25,
-                verbosity=0,
-                progress=False,
-                random_state=42,
-            )
-            model.fit(X, y, variable_names=["x1", "x2", "x3", "x4"])
-            best_expr = model.sympy()
-            if best_expr is not None:
-                expression = str(best_expr)
+            predictions = model.predict(X)
         except Exception:
-            expression = None
+            predictions = None
 
-        # Fallback to polynomial regression if PySR is unavailable or fails
-        if not isinstance(expression, str) or not expression:
-            expression = self._fallback_polynomial(X, y)
+        return expression, predictions
 
-        return {
-            "expression": expression,
-            "predictions": None,
-            "details": {},
-        }
+    def _fallback_polynomial(self, X: np.ndarray, y: np.ndarray):
+        x1 = X[:, 0]
+        x2 = X[:, 1]
+        x3 = X[:, 2]
+        x4 = X[:, 3]
 
-    def _fallback_polynomial(self, X: np.ndarray, y: np.ndarray, degree: int = 4) -> str:
-        n_samples, n_features = X.shape
-        n_vars = min(4, n_features)
-        X_use = X[:, :n_vars]
+        ones = np.ones_like(x1)
 
-        # Build polynomial feature matrix up to the specified degree
-        features = [np.ones(n_samples, dtype=float)]
-        exponents_list = []
-
-        for exps in product(range(degree + 1), repeat=n_vars):
-            total_deg = sum(exps)
-            if total_deg == 0 or total_deg > degree:
-                continue
-            exponents_list.append(exps)
-            term = np.ones(n_samples, dtype=float)
-            for j, power in enumerate(exps):
-                if power:
-                    term *= X_use[:, j] ** power
-            features.append(term)
+        features = [
+            ones,
+            x1,
+            x2,
+            x3,
+            x4,
+            x1 ** 2,
+            x2 ** 2,
+            x3 ** 2,
+            x4 ** 2,
+            x1 * x2,
+            x1 * x3,
+            x1 * x4,
+            x2 * x3,
+            x2 * x4,
+            x3 * x4,
+        ]
 
         A = np.column_stack(features)
         coeffs, _, _, _ = np.linalg.lstsq(A, y, rcond=None)
 
-        expression = self._build_polynomial_expression(coeffs, exponents_list)
-        return expression
+        terms = [
+            "1",
+            "x1",
+            "x2",
+            "x3",
+            "x4",
+            "x1**2",
+            "x2**2",
+            "x3**2",
+            "x4**2",
+            "x1*x2",
+            "x1*x3",
+            "x1*x4",
+            "x2*x3",
+            "x2*x4",
+            "x3*x4",
+        ]
 
-    def _build_polynomial_expression(
-        self,
-        coeffs: np.ndarray,
-        exponents_list,
-        coeff_tol: float = 1e-12,
-    ) -> str:
-        # Constant term
-        const = float(coeffs[0])
-        expression = f"{const:.12g}"
-
-        # Non-constant terms
-        for coef, exps in zip(coeffs[1:], exponents_list):
-            coef = float(coef)
-            if abs(coef) < coeff_tol:
+        expression_parts = []
+        for c, term in zip(coeffs, terms):
+            if abs(c) < 1e-8:
                 continue
-
-            mon_parts = []
-            for var_idx, power in enumerate(exps):
-                if power == 0:
-                    continue
-                var_name = f"x{var_idx + 1}"
-                if power == 1:
-                    mon_parts.append(var_name)
+            c_val = float(c)
+            c_abs_str = f"{abs(c_val):.12g}"
+            if term == "1":
+                core = c_abs_str
+            else:
+                core = f"{c_abs_str}*{term}"
+            if not expression_parts:
+                if c_val < 0:
+                    expression_parts.append(f"-{core}")
                 else:
-                    mon_parts.append(f"{var_name}**{power}")
-            mon_expr = "*".join(mon_parts) if mon_parts else "1"
+                    expression_parts.append(core)
+            else:
+                if c_val < 0:
+                    expression_parts.append(f" - {core}")
+                else:
+                    expression_parts.append(f" + {core}")
 
-            sign = "+" if coef >= 0 else "-"
-            coef_abs = abs(coef)
-            expression += f" {sign} {coef_abs:.12g}*{mon_expr}"
-
-        if not expression:
+        if not expression_parts:
             expression = "0"
-        return expression
+        else:
+            expression = "".join(expression_parts)
+
+        predictions = A @ coeffs
+        return expression, predictions
+
+    def solve(self, X: np.ndarray, y: np.ndarray) -> dict:
+        expression = None
+        predictions = None
+
+        if _HAVE_PYSR:
+            try:
+                expression, predictions = self._fit_pysr(X, y)
+            except Exception:
+                expression = None
+                predictions = None
+
+        if expression is None:
+            expression, predictions = self._fallback_polynomial(X, y)
+
+        if isinstance(predictions, np.ndarray):
+            predictions = predictions.tolist()
+        elif predictions is not None:
+            try:
+                predictions = list(predictions)
+            except Exception:
+                predictions = None
+
+        return {
+            "expression": expression,
+            "predictions": predictions,
+            "details": {},
+        }

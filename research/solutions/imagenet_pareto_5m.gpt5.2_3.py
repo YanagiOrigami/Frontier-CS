@@ -1,312 +1,414 @@
-import os
 import math
-import time
+import copy
+import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 
-class _NormalizedLinear(nn.Module):
-    def __init__(self, mean, std, weight, bias):
+class _ResidualLinearBlock(nn.Module):
+    def __init__(self, width: int, dropout: float):
         super().__init__()
-        self.register_buffer("mean", mean.detach().clone())
-        self.register_buffer("inv_std", (1.0 / std.detach().clone()))
-        self.register_buffer("weight", weight.detach().clone())
-        self.register_buffer("bias", bias.detach().clone())
+        self.ln = nn.LayerNorm(width)
+        self.fc = nn.Linear(width, width, bias=True)
+        self.drop = nn.Dropout(dropout) if dropout and dropout > 0 else nn.Identity()
 
-    def forward(self, x):
-        x = (x - self.mean) * self.inv_std
-        return x.matmul(self.weight) + self.bias
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        y = self.ln(x)
+        y = F.gelu(y)
+        y = self.fc(y)
+        y = self.drop(y)
+        return x + y
 
 
-class _RFFModel(nn.Module):
-    def __init__(self, mean, std, proj_w, proj_b, out_w, out_b, scale):
+class _MLPWithCentroids(nn.Module):
+    def __init__(
+        self,
+        input_dim: int,
+        num_classes: int,
+        width: int,
+        num_blocks: int,
+        dropout: float,
+        x_mean: torch.Tensor,
+        x_invstd: torch.Tensor,
+        centroids: torch.Tensor,
+        centroid_temp: float = 10.0,
+    ):
         super().__init__()
-        self.register_buffer("mean", mean.detach().clone())
-        self.register_buffer("inv_std", (1.0 / std.detach().clone()))
-        self.register_buffer("proj_w", proj_w.detach().clone())
-        self.register_buffer("proj_b", proj_b.detach().clone())
-        self.register_buffer("out_w", out_w.detach().clone())
-        self.register_buffer("out_b", out_b.detach().clone())
-        self.register_buffer("scale", torch.tensor(float(scale), dtype=torch.float32))
+        self.input_dim = input_dim
+        self.num_classes = num_classes
+        self.width = width
+        self.num_blocks = num_blocks
 
-    def forward(self, x):
-        x = (x - self.mean) * self.inv_std
-        z = x.matmul(self.proj_w) + self.proj_b
-        z = torch.cos(z) * self.scale
-        return z.matmul(self.out_w) + self.out_b
+        self.register_buffer("x_mean", x_mean.detach().clone())
+        self.register_buffer("x_invstd", x_invstd.detach().clone())
+
+        self.register_buffer("centroids", centroids.detach().clone())
+        self.register_buffer("centroid_temp", torch.tensor(float(centroid_temp), dtype=torch.float32))
+
+        self.centroid_scale = nn.Parameter(torch.tensor(1.0, dtype=torch.float32))
+
+        self.in_ln = nn.LayerNorm(input_dim)
+        self.stem = nn.Linear(input_dim, width, bias=True)
+        self.blocks = nn.ModuleList([_ResidualLinearBlock(width, dropout) for _ in range(num_blocks)])
+        self.out_ln = nn.LayerNorm(width)
+        self.head = nn.Linear(width, num_classes, bias=True)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = x.to(dtype=torch.float32)
+        x_std = (x - self.x_mean) * self.x_invstd
+
+        x_norm = F.normalize(x_std, dim=-1)
+        cent_logits = self.centroid_temp * (x_norm @ self.centroids.t())
+
+        h = self.in_ln(x_std)
+        h = self.stem(h)
+        for blk in self.blocks:
+            h = blk(h)
+        h = self.out_ln(h)
+        logits = self.head(h)
+
+        logits = logits + self.centroid_scale * cent_logits
+        return logits
 
 
-class _Ensemble(nn.Module):
-    def __init__(self, models):
-        super().__init__()
-        self.models = nn.ModuleList(models)
+class _EMA:
+    def __init__(self, model: nn.Module, decay: float = 0.995):
+        self.decay = float(decay)
+        self.shadow = {}
+        self._backup = None
+        with torch.no_grad():
+            for name, p in model.named_parameters():
+                if p.requires_grad:
+                    self.shadow[name] = p.detach().clone()
 
-    def forward(self, x):
-        out = None
-        for m in self.models:
-            y = m(x)
-            if out is None:
-                out = y
-            else:
-                out = out + y
-        return out / float(len(self.models))
+    @torch.no_grad()
+    def update(self, model: nn.Module):
+        d = self.decay
+        for name, p in model.named_parameters():
+            if not p.requires_grad:
+                continue
+            self.shadow[name].mul_(d).add_(p.detach(), alpha=(1.0 - d))
+
+    @torch.no_grad()
+    def apply_to(self, model: nn.Module):
+        self._backup = {}
+        for name, p in model.named_parameters():
+            if not p.requires_grad:
+                continue
+            self._backup[name] = p.detach().clone()
+            p.copy_(self.shadow[name])
+
+    @torch.no_grad()
+    def restore(self, model: nn.Module):
+        if self._backup is None:
+            return
+        for name, p in model.named_parameters():
+            if not p.requires_grad:
+                continue
+            p.copy_(self._backup[name])
+        self._backup = None
 
 
-def _collect_xy(loader, input_dim=None):
+def _param_count_formula(input_dim: int, num_classes: int, width: int, num_blocks: int) -> int:
+    # Trainable params:
+    # centroid_scale: 1
+    # in_ln: 2*input_dim
+    # stem: width*input_dim + width
+    # each block: ln(2*width) + linear(width*width + width) = width*width + 3*width
+    # out_ln: 2*width
+    # head: width*num_classes + num_classes
+    return (
+        1
+        + 2 * input_dim
+        + width * input_dim
+        + width
+        + num_blocks * (width * width + 3 * width)
+        + 2 * width
+        + width * num_classes
+        + num_classes
+    )
+
+
+def _collect_all(loader):
     xs = []
     ys = []
     for batch in loader:
-        if isinstance(batch, (list, tuple)):
-            x = batch[0]
-            y = batch[1]
+        if isinstance(batch, (list, tuple)) and len(batch) >= 2:
+            x, y = batch[0], batch[1]
         else:
-            x, y = batch
+            continue
         if not torch.is_tensor(x):
             x = torch.as_tensor(x)
         if not torch.is_tensor(y):
             y = torch.as_tensor(y)
-        x = x.detach().cpu()
-        y = y.detach().cpu()
-        if x.dtype != torch.float32:
-            x = x.float()
-        y = y.long()
-        if x.dim() > 2:
-            x = x.view(x.size(0), -1)
-        if input_dim is not None and x.size(1) != input_dim:
-            x = x.view(x.size(0), input_dim)
-        xs.append(x)
-        ys.append(y)
-    if not xs:
-        return torch.empty(0, input_dim or 0, dtype=torch.float32), torch.empty(0, dtype=torch.long)
-    return torch.cat(xs, dim=0), torch.cat(ys, dim=0)
+        xs.append(x.detach().cpu())
+        ys.append(y.detach().cpu())
+    x = torch.cat(xs, dim=0).contiguous()
+    y = torch.cat(ys, dim=0).contiguous()
+    if x.dtype != torch.float32:
+        x = x.to(torch.float32)
+    if y.dtype != torch.long:
+        y = y.to(torch.long)
+    return x, y
+
+
+def _compute_mean_invstd(x: torch.Tensor, eps: float = 1e-5):
+    mean = x.mean(dim=0)
+    var = x.var(dim=0, unbiased=False)
+    invstd = torch.rsqrt(var + eps)
+    return mean, invstd
+
+
+def _compute_centroids(x_std: torch.Tensor, y: torch.Tensor, num_classes: int):
+    input_dim = x_std.shape[1]
+    cent = torch.zeros(num_classes, input_dim, dtype=torch.float32)
+    cnt = torch.zeros(num_classes, dtype=torch.float32)
+    for c in range(num_classes):
+        mask = (y == c)
+        if mask.any():
+            xc = x_std[mask]
+            cent[c] = xc.mean(dim=0)
+            cnt[c] = float(xc.shape[0])
+        else:
+            cent[c].zero_()
+            cnt[c] = 1.0
+    cent = F.normalize(cent, dim=-1)
+    return cent
 
 
 @torch.no_grad()
-def _accuracy(model, x, y, batch_size=2048):
+def _accuracy(model: nn.Module, x: torch.Tensor, y: torch.Tensor, batch_size: int = 1024) -> float:
     model.eval()
-    n = y.numel()
+    n = x.shape[0]
     correct = 0
     for i in range(0, n, batch_size):
-        xb = x[i:i + batch_size]
-        yb = y[i:i + batch_size]
+        xb = x[i : i + batch_size]
+        yb = y[i : i + batch_size]
         logits = model(xb)
         pred = logits.argmax(dim=1)
         correct += (pred == yb).sum().item()
     return correct / max(1, n)
 
 
-def _make_onehot(y, num_classes, dtype=torch.float32):
-    n = y.numel()
-    oh = torch.zeros(n, num_classes, dtype=dtype)
-    oh.scatter_(1, y.view(-1, 1), 1.0)
-    return oh
-
-
-def _fit_centroid(x, y, num_classes):
-    n, d = x.shape
-    mu = torch.zeros(num_classes, d, dtype=torch.float32)
-    mu.index_add_(0, y, x)
-    counts = torch.bincount(y, minlength=num_classes).clamp_min(1).float().unsqueeze(1)
-    mu = mu / counts
-    weight = mu.t().contiguous()
-    bias = -0.5 * (mu * mu).sum(dim=1)
-    return weight, bias
-
-
-def _fit_ridge(x, y, num_classes, lam):
-    n, d = x.shape
-    xb = torch.cat([x, torch.ones(n, 1, dtype=torch.float32)], dim=1)  # (n, d+1)
-    yoh = _make_onehot(y, num_classes, dtype=torch.float32)  # (n, c)
-    xtx = xb.t().matmul(xb)  # (d+1, d+1)
-    reg = torch.eye(d + 1, dtype=torch.float32) * float(lam)
-    reg[-1, -1] = 0.0
-    a = xtx + reg
-    b = xb.t().matmul(yoh)  # (d+1, c)
-    wb = torch.linalg.solve(a, b)  # (d+1, c)
-    weight = wb[:-1, :].contiguous()
-    bias = wb[-1, :].contiguous()
-    return weight, bias
-
-
-def _fit_lda(x, y, num_classes, alpha):
-    n, d = x.shape
-    mu = torch.zeros(num_classes, d, dtype=torch.float32)
-    mu.index_add_(0, y, x)
-    counts = torch.bincount(y, minlength=num_classes).clamp_min(1).float().unsqueeze(1)
-    mu = mu / counts
-    centered = x - mu[y]
-    denom = float(max(1, n - num_classes))
-    sigma = centered.t().matmul(centered) / denom
-    sigma2 = float(torch.trace(sigma).item() / d) if d > 0 else 1.0
-    a = sigma + (float(alpha) * sigma2 + 1e-6 * sigma2) * torch.eye(d, dtype=torch.float32)
-    inv_mu = torch.linalg.solve(a, mu.t())  # (d, c)
-    quad = (mu * inv_mu.t()).sum(dim=1)  # (c,)
-    bias = (-0.5 * quad).contiguous()
-    weight = inv_mu.contiguous()
-    return weight, bias
-
-
-def _compute_norm_stats(x, eps=1e-5):
-    mean = x.mean(dim=0)
-    var = (x - mean).pow(2).mean(dim=0)
-    std = torch.sqrt(var + eps)
-    return mean, std
-
-
-def _fit_rff_ridge(x, y, num_classes, proj_w, proj_b, lam):
-    n = x.size(0)
-    z = torch.cos(x.matmul(proj_w) + proj_b) * math.sqrt(2.0 / float(proj_w.size(1)))  # (n, m)
-    zb = torch.cat([z, torch.ones(n, 1, dtype=torch.float32)], dim=1)  # (n, m+1)
-    yoh = _make_onehot(y, num_classes, dtype=torch.float32)  # (n, c)
-    m1 = zb.size(1)
-    ztz = zb.t().matmul(zb)  # (m+1, m+1)
-    reg = torch.eye(m1, dtype=torch.float32) * float(lam)
-    reg[-1, -1] = 0.0
-    a = ztz + reg
-    b = zb.t().matmul(yoh)  # (m+1, c)
-    wb = torch.linalg.solve(a, b)  # (m+1, c)
-    out_w = wb[:-1, :].contiguous()
-    out_b = wb[-1, :].contiguous()
-    return out_w, out_b
-
-
 class Solution:
     def solve(self, train_loader, val_loader, metadata: dict = None) -> torch.nn.Module:
-        try:
-            torch.set_num_threads(min(8, os.cpu_count() or 8))
-        except Exception:
-            pass
-
         if metadata is None:
             metadata = {}
+        device = metadata.get("device", "cpu")
         input_dim = int(metadata.get("input_dim", 384))
         num_classes = int(metadata.get("num_classes", 128))
         param_limit = int(metadata.get("param_limit", 5_000_000))
-        device = str(metadata.get("device", "cpu"))
+
+        try:
+            torch.set_num_threads(min(8, torch.get_num_threads()))
+        except Exception:
+            pass
 
         torch.manual_seed(0)
+        np.random.seed(0)
 
-        x_tr, y_tr = _collect_xy(train_loader, input_dim=input_dim)
-        x_va, y_va = _collect_xy(val_loader, input_dim=input_dim)
-
-        if x_tr.numel() == 0:
-            model = nn.Linear(input_dim, num_classes)
-            return model.to(device)
-
-        mean, std = _compute_norm_stats(x_tr)
-        xtrn = (x_tr - mean) / std
-        xvan = (x_va - mean) / std if x_va.numel() else x_va
-
-        candidates = []
-
-        # Centroid
-        w, b = _fit_centroid(xtrn, y_tr, num_classes)
-        model_centroid = _NormalizedLinear(mean, std, w, b)
-        acc_centroid = _accuracy(model_centroid, x_va, y_va) if x_va.numel() else 0.0
-        candidates.append(("centroid", None, model_centroid, acc_centroid))
-
-        # Ridge regression grid
-        ridge_lams = [1e-6, 1e-5, 1e-4, 1e-3, 1e-2, 5e-2, 1e-1, 5e-1, 1.0, 5.0]
-        for lam in ridge_lams:
-            w, b = _fit_ridge(xtrn, y_tr, num_classes, lam)
-            m = _NormalizedLinear(mean, std, w, b)
-            acc = _accuracy(m, x_va, y_va) if x_va.numel() else 0.0
-            candidates.append(("ridge", lam, m, acc))
-
-        # LDA shrinkage grid
-        lda_alphas = [0.0, 1e-5, 1e-4, 3e-4, 1e-3, 3e-3, 1e-2, 3e-2, 1e-1, 3e-1, 1.0]
-        for a in lda_alphas:
-            w, b = _fit_lda(xtrn, y_tr, num_classes, a)
-            m = _NormalizedLinear(mean, std, w, b)
-            acc = _accuracy(m, x_va, y_va) if x_va.numel() else 0.0
-            candidates.append(("lda", a, m, acc))
-
-        candidates.sort(key=lambda t: t[3], reverse=True)
-        best_name, best_h, best_model, best_acc = candidates[0]
-
-        # If linear doesn't look strong, try a small RFF ridge head
-        if x_va.numel() and best_acc < 0.92:
-            rff_specs = [
-                (256, 1.0, [1e-3, 1e-2, 1e-1, 5e-1]),
-                (384, 1.0, [1e-3, 1e-2, 1e-1, 5e-1]),
-            ]
-            for mfeat, gamma, lam_list in rff_specs:
-                g = float(gamma)
-                gen = torch.Generator(device="cpu")
-                gen.manual_seed(12345 + mfeat)
-                proj_w = torch.randn(input_dim, mfeat, generator=gen, dtype=torch.float32) * math.sqrt(2.0 * g)
-                proj_b = torch.rand(mfeat, generator=gen, dtype=torch.float32) * (2.0 * math.pi)
-
-                for lam in lam_list:
-                    out_w, out_b = _fit_rff_ridge(xtrn, y_tr, num_classes, proj_w, proj_b, lam)
-                    rff_model = _RFFModel(mean, std, proj_w, proj_b, out_w, out_b, scale=math.sqrt(2.0 / float(mfeat)))
-                    acc = _accuracy(rff_model, x_va, y_va)
-                    candidates.append(("rff", (mfeat, g, lam), rff_model, acc))
-
-            candidates.sort(key=lambda t: t[3], reverse=True)
-            best_name, best_h, best_model, best_acc = candidates[0]
-
-        # Try simple ensemble of top-2
-        if x_va.numel() and len(candidates) >= 2:
-            top = candidates[:4]
-            best_ens = None
-            best_ens_acc = best_acc
-            for i in range(min(3, len(top))):
-                for j in range(i + 1, min(4, len(top))):
-                    m1 = top[i][2]
-                    m2 = top[j][2]
-                    ens = _Ensemble([m1, m2])
-                    acc = _accuracy(ens, x_va, y_va)
-                    if acc > best_ens_acc + 1e-6:
-                        best_ens_acc = acc
-                        best_ens = (("ens", (top[i][0], top[i][1], top[j][0], top[j][1]), ens, acc))
-            if best_ens is not None:
-                best_name, best_h, best_model, best_acc = best_ens
-
-        # Refit on train+val with chosen method (and chosen hypers); then return
-        x_all = x_tr
-        y_all = y_tr
-        if x_va.numel():
-            x_all = torch.cat([x_tr, x_va], dim=0)
-            y_all = torch.cat([y_tr, y_va], dim=0)
-
-        mean2, std2 = _compute_norm_stats(x_all)
-        xalln = (x_all - mean2) / std2
-
-        def refit_one(name, h):
-            if name == "centroid":
-                w, b = _fit_centroid(xalln, y_all, num_classes)
-                return _NormalizedLinear(mean2, std2, w, b)
-            if name == "ridge":
-                w, b = _fit_ridge(xalln, y_all, num_classes, float(h))
-                return _NormalizedLinear(mean2, std2, w, b)
-            if name == "lda":
-                w, b = _fit_lda(xalln, y_all, num_classes, float(h))
-                return _NormalizedLinear(mean2, std2, w, b)
-            if name == "rff":
-                mfeat, gamma, lam = h
-                gen = torch.Generator(device="cpu")
-                gen.manual_seed(12345 + int(mfeat))
-                proj_w = torch.randn(input_dim, int(mfeat), generator=gen, dtype=torch.float32) * math.sqrt(2.0 * float(gamma))
-                proj_b = torch.rand(int(mfeat), generator=gen, dtype=torch.float32) * (2.0 * math.pi)
-                out_w, out_b = _fit_rff_ridge(xalln, y_all, num_classes, proj_w, proj_b, float(lam))
-                return _RFFModel(mean2, std2, proj_w, proj_b, out_w, out_b, scale=math.sqrt(2.0 / float(mfeat)))
-            raise ValueError("unknown model")
-
-        if best_name == "ens":
-            n1, h1, n2, h2 = best_h
-            m1 = refit_one(n1, h1)
-            m2 = refit_one(n2, h2)
-            final_model = _Ensemble([m1, m2])
+        x_train, y_train = _collect_all(train_loader)
+        if val_loader is not None:
+            x_val, y_val = _collect_all(val_loader)
         else:
-            final_model = refit_one(best_name, best_h)
+            x_val, y_val = None, None
 
-        final_model = final_model.to(device)
-        final_model.eval()
+        if x_train.shape[1] != input_dim:
+            input_dim = int(x_train.shape[1])
+        if num_classes <= int(y_train.max().item()) + 1:
+            num_classes = int(y_train.max().item()) + 1
 
-        trainable_params = sum(p.numel() for p in final_model.parameters() if p.requires_grad)
-        if trainable_params > param_limit:
-            final_model = nn.Linear(input_dim, num_classes).to(device)
-            final_model.eval()
+        x_mean, x_invstd = _compute_mean_invstd(x_train)
+        x_train_std = (x_train - x_mean) * x_invstd
+        centroids = _compute_centroids(x_train_std, y_train, num_classes=num_classes)
 
-        return final_model
+        # Select (width, blocks) close to param_limit
+        best = None
+        best_params = -1
+        for b in range(3, 13):
+            for w in range(256, 2049, 16):
+                p = _param_count_formula(input_dim, num_classes, w, b)
+                if p <= param_limit and p > best_params:
+                    best_params = p
+                    best = (w, b)
+        if best is None:
+            # Fallback minimal
+            best = (256, 3)
+
+        width, num_blocks = best
+
+        dropout = 0.10
+        model = _MLPWithCentroids(
+            input_dim=input_dim,
+            num_classes=num_classes,
+            width=width,
+            num_blocks=num_blocks,
+            dropout=dropout,
+            x_mean=x_mean.to(torch.float32),
+            x_invstd=x_invstd.to(torch.float32),
+            centroids=centroids.to(torch.float32),
+            centroid_temp=10.0,
+        ).to(device)
+
+        # Final safety check
+        param_count = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        if param_count > param_limit:
+            # Reduce width until within limit
+            w = width
+            b = num_blocks
+            while w > 128 and sum(p.numel() for p in model.parameters() if p.requires_grad) > param_limit:
+                w -= 16
+                model = _MLPWithCentroids(
+                    input_dim=input_dim,
+                    num_classes=num_classes,
+                    width=w,
+                    num_blocks=b,
+                    dropout=dropout,
+                    x_mean=x_mean.to(torch.float32),
+                    x_invstd=x_invstd.to(torch.float32),
+                    centroids=centroids.to(torch.float32),
+                    centroid_temp=10.0,
+                ).to(device)
+
+        # Training setup
+        criterion = nn.CrossEntropyLoss(label_smoothing=0.05)
+        # Exclude LayerNorm bias/weight and centroid_scale from weight decay
+        decay, no_decay = [], []
+        for name, p in model.named_parameters():
+            if not p.requires_grad:
+                continue
+            if p.ndim == 1 or "ln" in name.lower() or "layernorm" in name.lower() or name.endswith(".bias") or name == "centroid_scale":
+                no_decay.append(p)
+            else:
+                decay.append(p)
+
+        optimizer = torch.optim.AdamW(
+            [{"params": decay, "weight_decay": 1e-2}, {"params": no_decay, "weight_decay": 0.0}],
+            lr=2.5e-3,
+            betas=(0.9, 0.99),
+        )
+
+        ema = _EMA(model, decay=0.995)
+
+        n_train = x_train.shape[0]
+        if x_val is not None:
+            n_val = x_val.shape[0]
+        else:
+            n_val = 0
+
+        batch_size = 512 if n_train >= 512 else max(64, int(2 ** math.floor(math.log2(max(1, n_train)))))
+        max_epochs = 220
+        warmup_epochs = 10
+        lr_max = 2.5e-3
+        lr_min = 2.0e-4
+        patience = 45
+        min_epochs = 60
+        mixup_alpha = 0.2
+
+        best_state = None
+        best_acc = -1.0
+        best_loss = float("inf")
+        bad_epochs = 0
+
+        x_train = x_train.to(device)
+        y_train = y_train.to(device)
+        if x_val is not None:
+            x_val = x_val.to(device)
+            y_val = y_val.to(device)
+
+        for epoch in range(max_epochs):
+            if epoch < warmup_epochs:
+                lr = lr_max * float(epoch + 1) / float(warmup_epochs)
+            else:
+                t = float(epoch - warmup_epochs) / float(max(1, max_epochs - warmup_epochs - 1))
+                lr = lr_min + 0.5 * (lr_max - lr_min) * (1.0 + math.cos(math.pi * t))
+            for pg in optimizer.param_groups:
+                pg["lr"] = lr
+
+            model.train()
+            perm = torch.randperm(n_train, device=device)
+            use_mixup = epoch < int(0.85 * max_epochs)
+            total_loss = 0.0
+
+            for i in range(0, n_train, batch_size):
+                idx = perm[i : i + batch_size]
+                xb = x_train.index_select(0, idx)
+                yb = y_train.index_select(0, idx)
+
+                if use_mixup and mixup_alpha > 0:
+                    lam = np.random.beta(mixup_alpha, mixup_alpha)
+                    lam = float(lam)
+                    perm2 = torch.randperm(xb.shape[0], device=device)
+                    xb2 = xb.index_select(0, perm2)
+                    yb2 = yb.index_select(0, perm2)
+                    xm = xb.mul(lam).add(xb2, alpha=(1.0 - lam))
+                    logits = model(xm)
+                    loss = lam * criterion(logits, yb) + (1.0 - lam) * criterion(logits, yb2)
+                else:
+                    logits = model(xb)
+                    loss = criterion(logits, yb)
+
+                optimizer.zero_grad(set_to_none=True)
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                optimizer.step()
+                ema.update(model)
+
+                total_loss += float(loss.detach().cpu().item()) * xb.shape[0]
+
+            avg_train_loss = total_loss / max(1, n_train)
+
+            if x_val is not None and n_val > 0:
+                ema.apply_to(model)
+                with torch.no_grad():
+                    model.eval()
+                    logits_v = model(x_val)
+                    val_loss = float(criterion(logits_v, y_val).detach().cpu().item())
+                    val_acc = float((logits_v.argmax(dim=1) == y_val).float().mean().detach().cpu().item())
+                state = copy.deepcopy(model.state_dict())
+                ema.restore(model)
+
+                improved = (val_acc > best_acc + 1e-4) or (abs(val_acc - best_acc) <= 1e-4 and val_loss < best_loss - 1e-4)
+                if improved:
+                    best_acc = val_acc
+                    best_loss = val_loss
+                    best_state = state
+                    bad_epochs = 0
+                else:
+                    bad_epochs += 1
+
+                if epoch >= min_epochs and bad_epochs >= patience:
+                    break
+            else:
+                # No validation: keep EMA weights at end
+                pass
+
+        if best_state is not None:
+            model.load_state_dict(best_state)
+
+        # Optional short fine-tune on train+val if val exists
+        if x_val is not None and n_val > 0:
+            x_all = torch.cat([x_train, x_val], dim=0)
+            y_all = torch.cat([y_train, y_val], dim=0)
+            n_all = x_all.shape[0]
+            ft_epochs = 25
+            ft_lr = 7.5e-4
+            for pg in optimizer.param_groups:
+                pg["lr"] = ft_lr
+            for epoch in range(ft_epochs):
+                model.train()
+                perm = torch.randperm(n_all, device=device)
+                for i in range(0, n_all, batch_size):
+                    idx = perm[i : i + batch_size]
+                    xb = x_all.index_select(0, idx)
+                    yb = y_all.index_select(0, idx)
+                    logits = model(xb)
+                    loss = criterion(logits, yb)
+                    optimizer.zero_grad(set_to_none=True)
+                    loss.backward()
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                    optimizer.step()
+
+        model.eval()
+        return model.to(device)

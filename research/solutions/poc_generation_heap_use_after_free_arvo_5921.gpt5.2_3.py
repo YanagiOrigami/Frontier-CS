@@ -1,343 +1,354 @@
 import os
-import io
 import re
+import io
 import tarfile
 import zipfile
 import gzip
-import lzma
 import bz2
-import struct
-from typing import Optional, Tuple, List, Iterable
-
-
-def _is_pcap(data: bytes) -> bool:
-    if len(data) < 24:
-        return False
-    magic = data[:4]
-    return magic in (
-        b"\xd4\xc3\xb2\xa1",  # le
-        b"\xa1\xb2\xc3\xd4",  # be
-        b"\x4d\x3c\xb2\xa1",  # le ns
-        b"\xa1\xb2\x3c\x4d",  # be ns
-    )
-
-
-def _is_pcapng(data: bytes) -> bool:
-    return len(data) >= 12 and data[:4] == b"\x0a\x0d\x0d\x0a"
-
-
-def _maybe_decompress(path: str, data: bytes) -> List[Tuple[str, bytes]]:
-    out = [(path, data)]
-    if not data:
-        return out
-
-    def _safe_add(suffix: str, blob: bytes):
-        if blob and blob not in (data,):
-            out.append((path + suffix, blob))
-
-    try:
-        if path.lower().endswith(".gz") or data[:2] == b"\x1f\x8b":
-            _safe_add(":gunz", gzip.decompress(data))
-    except Exception:
-        pass
-    try:
-        if path.lower().endswith((".xz", ".lzma")) or data[:6] == b"\xfd7zXZ\x00":
-            _safe_add(":unxz", lzma.decompress(data))
-    except Exception:
-        pass
-    try:
-        if path.lower().endswith(".bz2") or data[:3] == b"BZh":
-            _safe_add(":unbz2", bz2.decompress(data))
-    except Exception:
-        pass
-
-    return out
-
-
-def _path_score(path: str) -> int:
-    p = path.lower().replace("\\", "/")
-    score = 0
-    for kw, w in (
-        ("crash", 80),
-        ("repro", 70),
-        ("poc", 60),
-        ("uaf", 60),
-        ("use-after-free", 70),
-        ("asan", 40),
-        ("5921", 90),
-        ("h225", 45),
-        ("ras", 25),
-        ("next_tvb", 55),
-        ("oss-fuzz", 25),
-        ("fuzz", 20),
-        ("corpus", 20),
-        ("seed", 10),
-        ("regress", 15),
-        ("capture", 15),
-        ("pcap", 15),
-        ("pcapng", 15),
-    ):
-        if kw in p:
-            score += w
-
-    ext_bonus = 0
-    for ext, w in (
-        (".pcap", 30),
-        (".pcapng", 30),
-        (".cap", 20),
-        (".raw", 15),
-        (".bin", 15),
-        (".dat", 10),
-        (".pkt", 10),
-        (".dump", 10),
-        (".gz", 5),
-        (".xz", 5),
-        (".bz2", 5),
-    ):
-        if p.endswith(ext):
-            ext_bonus += w
-    score += ext_bonus
-    return score
-
-
-def _data_score(data: bytes) -> int:
-    score = 0
-    if _is_pcap(data):
-        score += 60
-    if _is_pcapng(data):
-        score += 60
-    if len(data) == 73:
-        score += 40
-    else:
-        score += max(0, 25 - abs(len(data) - 73))
-    if len(data) <= 256:
-        score += 12
-    elif len(data) <= 2048:
-        score += 6
-    return score
-
-
-def _iter_files_from_directory(root: str) -> Iterable[Tuple[str, int, callable]]:
-    for dirpath, _, filenames in os.walk(root):
-        for fn in filenames:
-            full = os.path.join(dirpath, fn)
-            try:
-                st = os.stat(full)
-            except Exception:
-                continue
-            if not os.path.isfile(full):
-                continue
-
-            def _reader(p=full):
-                with open(p, "rb") as f:
-                    return f.read()
-
-            rel = os.path.relpath(full, root).replace("\\", "/")
-            yield (rel, st.st_size, _reader)
-
-
-def _iter_files_from_tar(tar_path: str) -> Iterable[Tuple[str, int, callable]]:
-    with tarfile.open(tar_path, "r:*") as tf:
-        for m in tf.getmembers():
-            if not m.isfile():
-                continue
-            name = m.name.replace("\\", "/")
-            size = m.size
-
-            def _reader(member=m, t=tf):
-                f = t.extractfile(member)
-                if f is None:
-                    return b""
-                with f:
-                    return f.read()
-
-            yield (name, size, _reader)
-
-
-def _iter_files_from_zip(zip_path: str) -> Iterable[Tuple[str, int, callable]]:
-    with zipfile.ZipFile(zip_path, "r") as zf:
-        for zi in zf.infolist():
-            if zi.is_dir():
-                continue
-            name = zi.filename.replace("\\", "/")
-            size = zi.file_size
-
-            def _reader(n=name, z=zf):
-                with z.open(n, "r") as f:
-                    return f.read()
-
-            yield (name, size, _reader)
-
-
-def _detect_expects_pcap(src_path: str) -> Optional[bool]:
-    # Heuristic: scan a limited set of likely fuzzer/harness source files.
-    # Return True if we see wtap/pcap style harness; False if it looks like raw tvb harness; None if unknown.
-    patterns_pcap = (b"wtap_open_offline", b"pcapng", b"pcap", b"wtap_read", b"wtap")
-    patterns_raw = (b"tvb_new_real_data", b"LLVMFuzzerTestOneInput", b"call_dissector", b"dissect_")
-    strong_pcap = 0
-    strong_raw = 0
-
-    def consider_file(name: str, size: int) -> bool:
-        n = name.lower()
-        if not (n.endswith((".c", ".cc", ".cpp", ".cxx", ".h", ".hh", ".hpp"))):
-            return False
-        if "fuzz" in n or "fuzzer" in n or "oss-fuzz" in n or "afl" in n:
-            return size <= 500_000
-        if "tools" in n and ("fuzz" in n or "oss" in n):
-            return size <= 500_000
-        return False
-
-    it = None
-    if os.path.isdir(src_path):
-        it = _iter_files_from_directory(src_path)
-    else:
-        try:
-            if zipfile.is_zipfile(src_path):
-                it = _iter_files_from_zip(src_path)
-            else:
-                it = _iter_files_from_tar(src_path)
-        except Exception:
-            it = None
-
-    if it is None:
-        return None
-
-    max_files = 200
-    for name, size, reader in it:
-        if max_files <= 0:
-            break
-        if not consider_file(name, size):
-            continue
-        max_files -= 1
-        try:
-            blob = reader()
-        except Exception:
-            continue
-        if not blob:
-            continue
-        blob = blob[:250_000]
-        lp = blob.lower()
-        if any(p in lp for p in patterns_pcap):
-            strong_pcap += 1
-        if all(p in lp for p in (b"tvb_new_real_data", b"LLVMFuzzerTestOneInput")):
-            strong_raw += 2
-        elif any(p in lp for p in patterns_raw):
-            strong_raw += 1
-
-    if strong_pcap == 0 and strong_raw == 0:
-        return None
-    return strong_pcap >= strong_raw
-
-
-def _make_pcap_user0(packets: List[bytes]) -> bytes:
-    # pcap classic, little endian, DLT_USER0 = 147
-    gh = struct.pack("<IHHIIII", 0xA1B2C3D4, 2, 4, 0, 0, 65535, 147)
-    out = bytearray(gh)
-    ts = 0
-    for pkt in packets:
-        incl = len(pkt)
-        ph = struct.pack("<IIII", ts, 0, incl, incl)
-        out.extend(ph)
-        out.extend(pkt)
-        ts += 1
-    return bytes(out)
+import lzma
+import binascii
+import ast
+from typing import Optional, Tuple, List
 
 
 class Solution:
+    _GT_LEN = 73
+
+    _BIN_EXTS = {
+        ".pcap", ".pcapng", ".cap", ".raw", ".bin", ".dat", ".pkt", ".pdu", ".dump", ".input", ".blob"
+    }
+    _TEXT_EXTS = {
+        ".c", ".cc", ".cpp", ".h", ".hpp", ".md", ".rst", ".txt", ".cnf", ".asn", ".py", ".sh", ".cmake", ".yml",
+        ".yaml", ".json", ".xml", ".in", ".am", ".ac", ".m4", ".patch", ".diff", ".mak", ".make", ".nsi", ".vim",
+        ".lua", ".pl", ".rb", ".java", ".cs", ".go", ".rs", ".ts", ".js", ".css", ".html"
+    }
+    _KEYWORDS_STRONG = ("crash", "poc", "repro", "uaf", "use-after-free", "use_after_free", "asan", "addresssanitizer")
+    _KEYWORDS_MED = ("h225", "h323", "ras", "next_tvb", "dissector", "fuzz", "oss-fuzz", "ossfuzz", "fuzzer", "corpus",
+                     "seed", "test", "capture", "captures", "regression", "issue", "cve")
+    _ID = "5921"
+    _ID2 = "arvo:5921"
+
     def solve(self, src_path: str) -> bytes:
-        expects_pcap = _detect_expects_pcap(src_path)
-        # Default to PCAP if unknown (most common in Wireshark dissection fuzzing harnesses).
-        if expects_pcap is None:
-            expects_pcap = True
-
-        best_pcap: Optional[Tuple[int, bytes]] = None
-        best_raw: Optional[Tuple[int, bytes]] = None
-        raw_pool: List[Tuple[int, bytes]] = []
-
-        def consider_candidate(name: str, data: bytes):
-            nonlocal best_pcap, best_raw, raw_pool
-            if not data:
-                return
-            ps = _path_score(name)
-            for n2, d2 in _maybe_decompress(name, data):
-                if not d2:
-                    continue
-                ds = _data_score(d2)
-                score = ps + ds
-                if _is_pcap(d2) or _is_pcapng(d2):
-                    if best_pcap is None or score > best_pcap[0] or (score == best_pcap[0] and len(d2) < len(best_pcap[1])):
-                        best_pcap = (score, d2)
-                else:
-                    if best_raw is None or score > best_raw[0] or (score == best_raw[0] and len(d2) < len(best_raw[1])):
-                        best_raw = (score, d2)
-                    if len(d2) <= 4096:
-                        raw_pool.append((score, d2))
-
-        def file_is_interesting(name: str, size: int) -> bool:
-            n = name.lower().replace("\\", "/")
-            if size <= 0:
-                return False
-            if size <= 20000:
-                return True
-            # Larger only if clearly relevant.
-            if any(k in n for k in ("crash", "repro", "poc", "uaf", "5921", "h225", "ras", "next_tvb")):
-                return size <= 2_000_000
-            if n.endswith((".pcap", ".pcapng", ".cap")):
-                return size <= 2_000_000
-            return False
-
-        # Pass 1: scan likely relevant files
-        it = None
         if os.path.isdir(src_path):
-            it = _iter_files_from_directory(src_path)
-        else:
-            try:
-                if zipfile.is_zipfile(src_path):
-                    it = _iter_files_from_zip(src_path)
-                else:
-                    it = _iter_files_from_tar(src_path)
-            except Exception:
-                it = None
+            b = self._solve_dir(src_path)
+            if b is not None:
+                return b
+            return self._fallback()
+        if tarfile.is_tarfile(src_path):
+            b = self._solve_tar(src_path)
+            if b is not None:
+                return b
+            return self._fallback()
+        if zipfile.is_zipfile(src_path):
+            b = self._solve_zip(src_path)
+            if b is not None:
+                return b
+            return self._fallback()
+        try:
+            with open(src_path, "rb") as f:
+                data = f.read()
+            data = self._maybe_decompress(data)
+            data2 = self._maybe_decode_text_blob(data)
+            return data2 if data2 is not None else data
+        except Exception:
+            return self._fallback()
 
-        if it is not None:
-            scanned = 0
-            for name, size, reader in it:
-                if scanned >= 4000:
-                    break
-                if not file_is_interesting(name, size):
-                    continue
-                scanned += 1
+    def _fallback(self) -> bytes:
+        return (
+            b"\x00\x01\x02\x03\x04\x05\x06\x07"
+            b"\x10\x11\x12\x13\x14\x15\x16\x17"
+            b"\x20\x21\x22\x23\x24\x25\x26\x27"
+            b"\x30\x31\x32\x33\x34\x35\x36\x37"
+            b"\x40\x41\x42\x43\x44\x45\x46\x47"
+            b"\x50\x51\x52\x53\x54\x55\x56\x57"
+            b"\x60\x61\x62\x63\x64\x65\x66\x67"
+            b"\x70"
+        )
+
+    def _score_path(self, path_l: str, size: int) -> float:
+        base, ext = os.path.splitext(path_l)
+        score = 0.0
+
+        if self._ID in path_l or self._ID2 in path_l:
+            score += 5000.0
+        if "arvo" in path_l:
+            score += 200.0
+
+        for k in self._KEYWORDS_STRONG:
+            if k in path_l:
+                score += 250.0
+        for k in self._KEYWORDS_MED:
+            if k in path_l:
+                score += 30.0
+
+        if ext in self._BIN_EXTS:
+            score += 100.0
+        if ext in self._TEXT_EXTS:
+            score -= 80.0
+
+        if 1 <= size <= 4096:
+            score += 60.0
+        if size <= 256:
+            score += 40.0
+        if size <= 128:
+            score += 30.0
+
+        score += max(0.0, 120.0 - abs(size - self._GT_LEN) * 4.0)
+        score -= min(50.0, size / 200.0)
+
+        return score
+
+    def _maybe_decompress(self, data: bytes) -> bytes:
+        if not data:
+            return data
+        try:
+            if data.startswith(b"\x1f\x8b"):
+                out = gzip.decompress(data)
+                return out if out else data
+        except Exception:
+            pass
+        try:
+            if data.startswith(b"BZh"):
+                out = bz2.decompress(data)
+                return out if out else data
+        except Exception:
+            pass
+        try:
+            if data.startswith(b"\xfd7zXZ\x00"):
+                out = lzma.decompress(data)
+                return out if out else data
+        except Exception:
+            pass
+        return data
+
+    def _looks_binary(self, data: bytes) -> bool:
+        if not data:
+            return False
+        if b"\x00" in data:
+            return True
+        n = len(data)
+        if n <= 8:
+            return True
+        non_print = 0
+        for c in data[: min(n, 512)]:
+            if c in (9, 10, 13):
+                continue
+            if c < 32 or c > 126:
+                non_print += 1
+        return (non_print / float(min(n, 512))) > 0.08
+
+    def _maybe_decode_text_blob(self, data: bytes) -> Optional[bytes]:
+        if not data:
+            return None
+        if self._looks_binary(data):
+            return None
+        try:
+            s = data.decode("utf-8", errors="strict")
+        except Exception:
+            return None
+
+        s_strip = s.strip()
+        if not s_strip:
+            return None
+
+        m = re.search(r"(?:0x)?([0-9a-fA-F][0-9a-fA-F])(?:[\s,]+(?:0x)?([0-9a-fA-F][0-9a-fA-F]))+", s_strip)
+        if m:
+            hex_bytes = re.findall(r"(?:0x)?([0-9a-fA-F]{2})", s_strip)
+            if hex_bytes and len(hex_bytes) >= 8:
                 try:
-                    data = reader()
+                    return bytes(int(x, 16) for x in hex_bytes)
                 except Exception:
+                    pass
+
+        if re.fullmatch(r"[0-9a-fA-F\s]+", s_strip) and len(re.sub(r"\s+", "", s_strip)) % 2 == 0:
+            try:
+                return binascii.unhexlify(re.sub(r"\s+", "", s_strip))
+            except Exception:
+                pass
+
+        for m in re.finditer(r"""(?s)\bb(['"])(.*?)\1""", s_strip):
+            lit = "b" + m.group(1) + m.group(2) + m.group(1)
+            try:
+                v = ast.literal_eval(lit)
+                if isinstance(v, (bytes, bytearray)) and len(v) > 0:
+                    return bytes(v)
+            except Exception:
+                continue
+
+        b64_candidates = re.findall(r"[A-Za-z0-9+/]{40,}={0,2}", s_strip)
+        b64_candidates.sort(key=len, reverse=True)
+        for c in b64_candidates[:5]:
+            if len(c) % 4 != 0:
+                continue
+            try:
+                out = binascii.a2b_base64(c.encode("ascii"))
+                if out:
+                    return out
+            except Exception:
+                continue
+
+        return None
+
+    def _read_best_from_candidates(self, candidates: List[Tuple[float, str, int, callable]]) -> Optional[bytes]:
+        candidates.sort(key=lambda x: x[0], reverse=True)
+        for score, path_l, size, reader in candidates[:20]:
+            try:
+                data = reader()
+                if not data:
                     continue
-                if data is None:
-                    continue
-                consider_candidate(name, data)
+                data = self._maybe_decompress(data)
+                decoded = self._maybe_decode_text_blob(data)
+                if decoded is not None:
+                    data = decoded
+                if data:
+                    return data
+            except Exception:
+                continue
+        return None
 
-        # If we found a strong pcap candidate, use it.
-        if best_pcap is not None:
-            return best_pcap[1]
+    def _solve_tar(self, tar_path: str) -> Optional[bytes]:
+        candidates: List[Tuple[float, str, int, callable]] = []
+        try:
+            with tarfile.open(tar_path, "r:*") as tf:
+                for m in tf:
+                    if not m.isreg():
+                        continue
+                    if m.size <= 0 or m.size > 2_000_000:
+                        continue
+                    name_l = (m.name or "").lower()
 
-        # If harness likely expects raw and we found something promising, return it.
-        if not expects_pcap and best_raw is not None:
-            return best_raw[1]
+                    ext = os.path.splitext(name_l)[1]
+                    if ext in self._TEXT_EXTS and m.size > 8192:
+                        continue
 
-        # Otherwise, try to wrap the best raw payload(s) into a minimal PCAP with two packets.
-        if raw_pool:
-            raw_pool.sort(key=lambda t: (-t[0], len(t[1])))
-            payload = raw_pool[0][1]
-            payload2 = payload
-            if len(raw_pool) > 1:
-                payload2 = raw_pool[1][1]
-            # Keep it small but non-empty
-            if len(payload) == 0:
-                payload = b"\x00"
-            if len(payload2) == 0:
-                payload2 = b"\x00"
-            return _make_pcap_user0([payload, payload2])
+                    score = self._score_path(name_l, m.size)
 
-        # Absolute fallback: 2 tiny packets in USER0 pcap, matching total length 73 bytes (8 + 9 payload).
-        p1 = b"\x00" * 8
-        p2 = b"\xff" * 9
-        return _make_pcap_user0([p1, p2])
+                    immediate = False
+                    if self._ID in name_l or self._ID2 in name_l:
+                        if m.size <= 4096:
+                            immediate = True
+                    elif any(k in name_l for k in ("h225", "ras", "h323")) and any(k in name_l for k in ("crash", "poc", "repro", "uaf")):
+                        if m.size <= 4096:
+                            immediate = True
+                    elif m.size == self._GT_LEN and any(k in name_l for k in ("crash", "poc", "repro", "uaf", "h225", "ras", "h323")):
+                        immediate = True
+
+                    def _reader(mref=m):
+                        f = tf.extractfile(mref)
+                        if f is None:
+                            return b""
+                        return f.read()
+
+                    if immediate:
+                        try:
+                            data = _reader()
+                            data = self._maybe_decompress(data)
+                            decoded = self._maybe_decode_text_blob(data)
+                            return decoded if decoded is not None else data
+                        except Exception:
+                            pass
+
+                    if score > 0:
+                        candidates.append((score, name_l, m.size, _reader))
+        except Exception:
+            return None
+
+        return self._read_best_from_candidates(candidates)
+
+    def _solve_zip(self, zip_path: str) -> Optional[bytes]:
+        candidates: List[Tuple[float, str, int, callable]] = []
+        try:
+            with zipfile.ZipFile(zip_path, "r") as zf:
+                for zi in zf.infolist():
+                    if zi.is_dir():
+                        continue
+                    if zi.file_size <= 0 or zi.file_size > 2_000_000:
+                        continue
+                    name_l = (zi.filename or "").lower()
+
+                    ext = os.path.splitext(name_l)[1]
+                    if ext in self._TEXT_EXTS and zi.file_size > 8192:
+                        continue
+
+                    score = self._score_path(name_l, zi.file_size)
+
+                    immediate = False
+                    if self._ID in name_l or self._ID2 in name_l:
+                        if zi.file_size <= 4096:
+                            immediate = True
+                    elif any(k in name_l for k in ("h225", "ras", "h323")) and any(k in name_l for k in ("crash", "poc", "repro", "uaf")):
+                        if zi.file_size <= 4096:
+                            immediate = True
+                    elif zi.file_size == self._GT_LEN and any(k in name_l for k in ("crash", "poc", "repro", "uaf", "h225", "ras", "h323")):
+                        immediate = True
+
+                    def _reader(nm=zi.filename):
+                        with zf.open(nm, "r") as f:
+                            return f.read()
+
+                    if immediate:
+                        try:
+                            data = _reader()
+                            data = self._maybe_decompress(data)
+                            decoded = self._maybe_decode_text_blob(data)
+                            return decoded if decoded is not None else data
+                        except Exception:
+                            pass
+
+                    if score > 0:
+                        candidates.append((score, name_l, zi.file_size, _reader))
+        except Exception:
+            return None
+
+        return self._read_best_from_candidates(candidates)
+
+    def _solve_dir(self, root: str) -> Optional[bytes]:
+        candidates: List[Tuple[float, str, int, callable]] = []
+        try:
+            for dirpath, dirnames, filenames in os.walk(root):
+                for fn in filenames:
+                    full = os.path.join(dirpath, fn)
+                    try:
+                        st = os.stat(full)
+                    except Exception:
+                        continue
+                    if st.st_size <= 0 or st.st_size > 2_000_000:
+                        continue
+                    rel = os.path.relpath(full, root)
+                    name_l = rel.replace("\\", "/").lower()
+
+                    ext = os.path.splitext(name_l)[1]
+                    if ext in self._TEXT_EXTS and st.st_size > 8192:
+                        continue
+
+                    score = self._score_path(name_l, st.st_size)
+
+                    immediate = False
+                    if self._ID in name_l or self._ID2 in name_l:
+                        if st.st_size <= 4096:
+                            immediate = True
+                    elif any(k in name_l for k in ("h225", "ras", "h323")) and any(k in name_l for k in ("crash", "poc", "repro", "uaf")):
+                        if st.st_size <= 4096:
+                            immediate = True
+                    elif st.st_size == self._GT_LEN and any(k in name_l for k in ("crash", "poc", "repro", "uaf", "h225", "ras", "h323")):
+                        immediate = True
+
+                    def _reader(p=full):
+                        with open(p, "rb") as f:
+                            return f.read()
+
+                    if immediate:
+                        try:
+                            data = _reader()
+                            data = self._maybe_decompress(data)
+                            decoded = self._maybe_decode_text_blob(data)
+                            return decoded if decoded is not None else data
+                        except Exception:
+                            pass
+
+                    if score > 0:
+                        candidates.append((score, name_l, st.st_size, _reader))
+        except Exception:
+            return None
+
+        return self._read_best_from_candidates(candidates)

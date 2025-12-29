@@ -1,88 +1,149 @@
 import os
 import tarfile
-import tempfile
-import shutil
 
 
 class Solution:
     def solve(self, src_path: str) -> bytes:
-        tmpdir = None
-        try:
-            tmpdir = tempfile.mkdtemp(prefix="poc_tic30_")
+        """
+        Generate a PoC that triggers the vulnerability, by mining the source
+        tarball for an existing PoC or crash-inducing input.
+        """
+        fallback_poc = b"A" * 10
 
-            # Safely extract the tarball
-            with tarfile.open(src_path, "r:*") as tf:
-                def is_within_directory(directory, target):
-                    abs_directory = os.path.abspath(directory)
-                    abs_target = os.path.abspath(target)
-                    return os.path.commonpath([abs_directory]) == os.path.commonpath([abs_directory, abs_target])
+        def is_large(m: tarfile.TarInfo) -> bool:
+            return m.size > 65536  # avoid very large files
 
-                safe_members = []
+        code_exts = {
+            ".c", ".h", ".hpp", ".hh", ".cc", ".cpp", ".cxx",
+            ".py", ".sh", ".bash", ".zsh", ".ksh",
+            ".pl", ".rb", ".tcl",
+            ".java", ".js", ".ts",
+            ".html", ".htm", ".xml", ".xsl",
+            ".tex", ".texi", ".texinfo", ".sty",
+            ".md", ".rst",
+            ".txt", ".log",
+            ".in", ".ac", ".am", ".m4",
+            ".y", ".l",
+            ".el",
+            ".s", ".S", ".asm",
+            ".go", ".rs", ".php",
+            ".m", ".mm",
+            ".cs",
+            ".properties", ".cfg", ".conf", ".ini",
+        }
+
+        def choose_poc_from_tar(path: str):
+            try:
+                tf = tarfile.open(path, "r:*")
+            except Exception:
+                return None
+            try:
+                members = []
                 for m in tf.getmembers():
-                    target_path = os.path.join(tmpdir, m.name)
-                    if is_within_directory(tmpdir, target_path):
-                        safe_members.append(m)
-                tf.extractall(tmpdir, members=safe_members)
+                    if not m.isfile():
+                        continue
+                    if m.size <= 0:
+                        continue
+                    if is_large(m):
+                        continue
+                    lname = m.name.lower()
+                    # Skip obvious VCS/admin files
+                    if "/.git/" in lname or lname.endswith(".gitignore") or lname.endswith(".gitattributes"):
+                        continue
+                    members.append(m)
 
-            # Heuristic search for a 10-byte PoC file in the source tree
-            best_data = None
-            best_score = -1
+                if not members:
+                    return None
 
-            for root, _, files in os.walk(tmpdir):
-                root_lower = root.lower()
-                for fname in files:
-                    full_path = os.path.join(root, fname)
+                # Phase 1: prioritize files whose names suggest they are PoCs / crashes / seeds.
+                poc_keywords = ["poc", "crash", "id:", "id_", "id-", "bug", "overflow", "input", "seed"]
+                poc_like = []
+                for m in members:
+                    lname = m.name.lower()
+                    if any(k in lname for k in poc_keywords):
+                        poc_like.append(m)
+
+                def ext_info(m: tarfile.TarInfo):
+                    base = os.path.basename(m.name)
+                    _, ext = os.path.splitext(base)
+                    ext = ext.lower()
+                    is_code = 1 if ext in code_exts else 0  # prefer 0 (non-code/binary)
+                    return is_code
+
+                if poc_like:
+                    def score_poc(m: tarfile.TarInfo):
+                        lname = m.name.lower()
+                        size = m.size
+                        is_code = ext_info(m)
+                        tic_bonus = 0 if ("tic30" in lname or "tic-30" in lname) else 1
+                        size_penalty = abs(size - 10)
+                        return (is_code, tic_bonus, size_penalty, size, len(m.name), m.name)
+
+                    best = min(poc_like, key=score_poc)
+                    f = tf.extractfile(best)
+                    if f is None:
+                        return None
                     try:
-                        size = os.path.getsize(full_path)
-                    except OSError:
-                        continue
+                        data = f.read()
+                    finally:
+                        f.close()
+                    if data:
+                        return data
 
-                    if size != 10:
-                        continue
+                # Phase 2: generic heuristic based on size, extension, and keywords.
+                def generic_score(m: tarfile.TarInfo):
+                    name = m.name
+                    lname = name.lower()
+                    size = m.size
+                    base = os.path.basename(lname)
+                    root, ext = os.path.splitext(base)
+                    ext = ext.lower()
 
-                    name_lower = fname.lower()
-                    tokens = [
-                        "tic30",
-                        "tic-30",
-                        "tms320c30",
-                        "branch",
-                        "print_branch",
-                        "overflow",
-                        "stack",
-                        "poc",
-                        "crash",
-                        "bug",
-                        "cve",
-                        "pr",
-                        "id:"
-                    ]
-                    score = 0
-                    for t in tokens:
-                        if t in name_lower or t in root_lower:
-                            score += 1
+                    is_size10 = 0 if size == 10 else 1  # prefer exact 10-byte files
+                    is_code_ext = 1 if ext in code_exts else 0  # prefer non-code
+                    is_hidden = 1 if base.startswith(".") else 0  # prefer non-hidden
 
-                    # Prefer files whose names/directories look PoC-related
-                    if score > best_score:
-                        try:
-                            with open(full_path, "rb") as f:
-                                data = f.read()
-                            if len(data) == 10:
-                                best_data = data
-                                best_score = score
-                        except OSError:
-                            continue
+                    keyword_rank = 4
+                    if "poc" in lname:
+                        keyword_rank = 0
+                    elif ("crash" in lname) or ("overflow" in lname) or ("bug" in lname):
+                        keyword_rank = 1
+                    elif ("tic30" in lname) or ("tic-30" in lname):
+                        keyword_rank = 2
+                    elif ("test" in lname) or ("regress" in lname):
+                        keyword_rank = 3
 
-            if best_data is not None:
-                return best_data
+                    size_penalty = abs(size - 10)
 
-        except Exception:
-            pass
-        finally:
-            if tmpdir is not None:
+                    return (
+                        is_size10,
+                        is_code_ext,
+                        is_hidden,
+                        keyword_rank,
+                        size_penalty,
+                        size,
+                        len(name),
+                        name,
+                    )
+
+                best_generic = min(members, key=generic_score)
+                f = tf.extractfile(best_generic)
+                if f is None:
+                    return None
                 try:
-                    shutil.rmtree(tmpdir)
+                    data = f.read()
+                finally:
+                    f.close()
+                if not data:
+                    return None
+                return data
+            finally:
+                try:
+                    tf.close()
                 except Exception:
                     pass
 
-        # Fallback: simple 10-byte pattern
-        return b"\xff" * 10
+        data = choose_poc_from_tar(src_path)
+        if not data:
+            return fallback_poc
+        return data

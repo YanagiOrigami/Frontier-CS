@@ -2,144 +2,135 @@ import torch
 import triton
 import triton.language as tl
 
-class Solution:
-    def solve(self, spec_path: str = None) -> dict:
-        kernel_code = """
+_MAMBA2_CHUNK_SCAN_CODE = """
 import torch
 import triton
 import triton.language as tl
 
 @triton.jit
-def _scan_kernel(
-    X_ptr, A_ptr, B_ptr, Y_ptr, H_ends_ptr, A_prods_ptr,
+def _forward_kernel_pass1(
+    X, A, B, Y, Chunk_A, Chunk_Y, A_cumprod,
     L, D,
-    stride_x_l, stride_x_d,
-    stride_a_l, stride_a_d,
-    stride_b_l, stride_b_d,
-    stride_y_l, stride_y_d,
-    stride_h_c, stride_h_d,
-    stride_ap_c, stride_ap_d,
     CHUNK_SIZE: tl.constexpr,
     BLOCK_D: tl.constexpr,
 ):
-    \"\"\"
-    Pass 1: Intra-chunk scan.
-    Processes each chunk in parallel assuming an initial state of 0.
-    Writes intermediate scan results to Y, and saves the final state (h_end)
-    and total decay factor (a_prod) for each chunk to be used in Pass 2.
-    \"\"\"
-    pid_c = tl.program_id(0)
+    # Each program instance handles one chunk (pid_l) for a block of features (pid_d)
+    pid_l = tl.program_id(0)
     pid_d = tl.program_id(1)
 
+    # Offsets for the current block
+    l_offsets = pid_l * CHUNK_SIZE + tl.arange(0, CHUNK_SIZE)
     d_offsets = pid_d * BLOCK_D + tl.arange(0, BLOCK_D)
-    d_mask = d_offsets < D
 
-    chunk_start_offset_l = pid_c * CHUNK_SIZE
+    # Pointers to the input and output tensors
+    X_ptrs = X + l_offsets[:, None] * D + d_offsets[None, :]
+    A_ptrs = A + l_offsets[:, None] * D + d_offsets[None, :]
+    B_ptrs = B + l_offsets[:, None] * D + d_offsets[None, :]
+    Y_ptrs = Y + l_offsets[:, None] * D + d_offsets[None, :]
+    A_cumprod_ptrs = A_cumprod + l_offsets[:, None] * D + d_offsets[None, :]
 
-    # Pointers to the start of the current chunk for this feature block
-    x_chunk_ptr = X_ptr + chunk_start_offset_l * stride_x_l + d_offsets
-    a_chunk_ptr = A_ptr + chunk_start_offset_l * stride_a_l + d_offsets
-    b_chunk_ptr = B_ptr + chunk_start_offset_l * stride_b_l + d_offsets
-    y_chunk_ptr = Y_ptr + chunk_start_offset_l * stride_y_l + d_offsets
-    
-    # Initialize state (h) and accumulated decay (a_prod)
-    h = tl.zeros([BLOCK_D], dtype=tl.float32)
-    a_prod = tl.ones([BLOCK_D], dtype=tl.float32)
+    # Load input blocks from global memory
+    # Use float32 for high-precision accumulation
+    x_chunk = tl.load(X_ptrs).to(tl.float32)
+    a_chunk = tl.load(A_ptrs).to(tl.float32)
+    b_chunk = tl.load(B_ptrs).to(tl.float32)
 
-    # Iterate over the time dimension of the chunk
+    z_chunk = x_chunk * b_chunk
+
+    # Initialize states for the scan
+    h_state = tl.zeros([BLOCK_D], dtype=tl.float32)
+    a_cp_state = tl.ones([BLOCK_D], dtype=tl.float32)
+
+    # Intra-chunk scan loop
     for t in range(CHUNK_SIZE):
-        x_t = tl.load(x_chunk_ptr + t * stride_x_l, mask=d_mask, other=0.0).to(tl.float32)
-        a_t = tl.load(a_chunk_ptr + t * stride_a_l, mask=d_mask, other=0.0).to(tl.float32)
-        b_t = tl.load(b_chunk_ptr + t * stride_b_l, mask=d_mask, other=0.0).to(tl.float32)
-
-        # Mamba recurrence: h_t = a_t * h_{t-1} + b_t * x_t
-        h = a_t * h + b_t * x_t
-        a_prod = a_prod * a_t
+        a_t = a_chunk[t, :]
+        z_t = z_chunk[t, :]
         
-        # Store intermediate result (Y_intra)
-        tl.store(y_chunk_ptr + t * stride_y_l, h.to(tl.float16), mask=d_mask)
+        h_state = a_t * h_state + z_t
+        a_cp_state = a_t * a_cp_state
 
-    # Store final state and A_prod for this chunk
-    h_ends_c_ptr = H_ends_ptr + pid_c * stride_h_c + d_offsets
-    a_prods_c_ptr = A_prods_ptr + pid_c * stride_ap_c + d_offsets
+        # Store intermediate results (Y_partial and A_cumprod)
+        tl.store(Y_ptrs + t * D, h_state.to(tl.float16))
+        tl.store(A_cumprod_ptrs + t * D, a_cp_state)
+
+    # Store the final state of the chunk for the next pass
+    chunk_a_ptr = Chunk_A + pid_l * D + d_offsets
+    chunk_y_ptr = Chunk_Y + pid_l * D + d_offsets
     
-    tl.store(h_ends_c_ptr, h, mask=d_mask)
-    tl.store(a_prods_c_ptr, a_prod, mask=d_mask)
+    tl.store(chunk_a_ptr, a_cp_state)
+    tl.store(chunk_y_ptr, h_state)
 
 
 @triton.jit
-def _correction_kernel(
-    Y_ptr, A_ptr, H_ends_ptr, A_prods_ptr,
-    L, D, NUM_CHUNKS,
-    stride_y_l, stride_y_d,
-    stride_a_l, stride_a_d,
-    stride_h_c, stride_h_d,
-    stride_ap_c, stride_ap_d,
-    CHUNK_SIZE: tl.constexpr,
+def _forward_kernel_pass2(
+    Chunk_A, Chunk_Y, H_initial,
+    NUM_CHUNKS, D,
     BLOCK_D: tl.constexpr,
 ):
-    \"\"\"
-    Pass 2: State propagation and correction.
-    This kernel has two stages, both performed by the same thread block.
-    1. Sequentially compute the true final states for all chunks by scanning over
-       the intermediate results from Pass 1.
-    2. Iterate through chunks again to apply a correction based on the propagated
-       initial state from the previous chunk.
-    \"\"\"
+    # Each program instance handles a block of features for all chunks
     pid_d = tl.program_id(0)
 
     d_offsets = pid_d * BLOCK_D + tl.arange(0, BLOCK_D)
-    d_mask = d_offsets < D
+    
+    # Initialize the hidden state for the inter-chunk scan
+    h_state = tl.zeros([BLOCK_D], dtype=tl.float32)
 
-    # --- Stage 1: Compute true chunk-end states sequentially ---
-    s_prev = tl.zeros([BLOCK_D], dtype=tl.float32)
+    # Inter-chunk scan loop
     for c in range(NUM_CHUNKS):
-        h_end_ptr = H_ends_ptr + c * stride_h_c + d_offsets
-        a_prod_ptr = A_prods_ptr + c * stride_ap_c + d_offsets
-        
-        h_end = tl.load(h_end_ptr, mask=d_mask, other=0.0)
-        a_prod = tl.load(a_prod_ptr, mask=d_mask, other=0.0)
-        
-        # S_c = A_prod_c * S_{c-1} + H_intra_end_c
-        s_current = a_prod * s_prev + h_end
-        
-        # Overwrite H_ends with the true final state S_c
-        tl.store(h_end_ptr, s_current, mask=d_mask)
-        s_prev = s_current
+        # Store the initial state for the current chunk
+        H_initial_ptr = H_initial + c * D + d_offsets
+        tl.store(H_initial_ptr, h_state)
 
-    # --- Stage 2: Propagate states and correct Y ---
-    s_initial = tl.zeros([BLOCK_D], dtype=tl.float32)
-    for c in range(NUM_CHUNKS):
-        if c > 0:
-            # Load S_{c-1}, now stored in H_ends[c-1]
-            s_initial_ptr = H_ends_ptr + (c - 1) * stride_h_c + d_offsets
-            s_initial = tl.load(s_initial_ptr, mask=d_mask, other=0.0)
+        # Load the transformation parameters for the current chunk
+        a_chunk_ptr = Chunk_A + c * D + d_offsets
+        y_chunk_ptr = Chunk_Y + c * D + d_offsets
+        a_chunk = tl.load(a_chunk_ptr)
+        y_chunk = tl.load(y_chunk_ptr)
 
-        chunk_start_l = c * CHUNK_SIZE
-        a_chunk_ptr = A_ptr + chunk_start_l * stride_a_l + d_offsets
-        y_chunk_ptr = Y_ptr + chunk_start_l * stride_y_l + d_offsets
-        
-        a_prefix_prod_t = tl.ones([BLOCK_D], dtype=tl.float32)
-        for t in range(CHUNK_SIZE):
-            a_t_ptr = a_chunk_ptr + t * stride_a_l
-            y_t_ptr = y_chunk_ptr + t * stride_y_l
-            
-            a_t = tl.load(a_t_ptr, mask=d_mask, other=0.0).to(tl.float32)
-            
-            # Update prefix product: (a_t * ... * a_0)
-            a_prefix_prod_t = a_prefix_prod_t * a_t
-            
-            y_intra_t = tl.load(y_t_ptr, mask=d_mask, other=0.0).to(tl.float32)
-            
-            # Correction term: (a_t * ... * a_0) * s_initial
-            correction = a_prefix_prod_t * s_initial
-            y_final_t = y_intra_t + correction
-            
-            tl.store(y_t_ptr, y_final_t.to(tl.float16), mask=d_mask)
+        # Apply the transformation to update the state
+        h_state = a_chunk * h_state + y_chunk
+
+
+@triton.jit
+def _forward_kernel_pass3(
+    Y, A_cumprod, H_initial,
+    L, D,
+    CHUNK_SIZE: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+):
+    # Each program instance handles one chunk (pid_l) for a block of features (pid_d)
+    pid_l = tl.program_id(0)
+    pid_d = tl.program_id(1)
+
+    # Chunk 0 is already correct, so we skip it
+    if pid_l == 0:
+        return
+
+    # Offsets for the current block
+    l_offsets = pid_l * CHUNK_SIZE + tl.arange(0, CHUNK_SIZE)
+    d_offsets = pid_d * BLOCK_D + tl.arange(0, BLOCK_D)
+
+    Y_ptrs = Y + l_offsets[:, None] * D + d_offsets[None, :]
+    A_cumprod_ptrs = A_cumprod + l_offsets[:, None] * D + d_offsets[None, :]
+
+    # Load the initial state for the current chunk from the result of pass 2
+    h_initial_ptr = H_initial + pid_l * D + d_offsets
+    h_initial = tl.load(h_initial_ptr)
+
+    # Load the intermediate results from pass 1
+    y_partial_chunk = tl.load(Y_ptrs).to(tl.float32)
+    a_cumprod_chunk = tl.load(A_cumprod_ptrs) # This is already float32
+
+    # Apply the correction factor
+    correction = a_cumprod_chunk * h_initial[None, :]
+    y_final_chunk = y_partial_chunk + correction
+
+    # Store the final corrected result back to global memory
+    tl.store(Y_ptrs, y_final_chunk.to(tl.float16))
 
 
 def chunk_scan(X: torch.Tensor, A: torch.Tensor, B: torch.Tensor, chunk: int = 128, BD: int = 128) -> torch.Tensor:
-    \"\"\"
+    """
     Mamba2 chunked scan computation.
     
     Args:
@@ -151,42 +142,58 @@ def chunk_scan(X: torch.Tensor, A: torch.Tensor, B: torch.Tensor, chunk: int = 1
     
     Returns:
         Output tensor of shape (L, D) - scan output (float16)
-    \"\"\"
+    """
     L, D = X.shape
-    C = L // chunk
-    if L % chunk != 0:
-        raise ValueError("L must be divisible by chunk size")
+    assert L % chunk == 0, "Sequence length L must be divisible by chunk size"
+    assert D % BD == 0, "Feature dimension D must be divisible by block dimension BD"
+    
+    num_chunks = L // chunk
 
+    # Allocate output and intermediate tensors
+    # Y will store partial results from pass 1 and be corrected in pass 3
     Y = torch.empty_like(X)
-    H_ends = torch.empty((C, D), device=X.device, dtype=torch.float32)
-    A_prods = torch.empty((C, D), device=X.device, dtype=torch.float32)
+    
+    # Use float32 for intermediate states to maintain precision during accumulation
+    Chunk_A = torch.empty((num_chunks, D), device=X.device, dtype=torch.float32)
+    Chunk_Y = torch.empty((num_chunks, D), device=X.device, dtype=torch.float32)
+    H_initial = torch.empty((num_chunks, D), device=X.device, dtype=torch.float32)
+    A_cumprod = torch.empty((L, D), device=X.device, dtype=torch.float32)
 
-    grid1 = (C, triton.cdiv(D, BD))
-    _scan_kernel[grid1](
-        X, A, B, Y, H_ends, A_prods,
+    # Define grid dimensions for Triton kernels
+    grid_p1_p3 = (num_chunks, D // BD)
+    grid_p2 = (D // BD,)
+
+    # Pass 1: Perform intra-chunk scans in parallel
+    _forward_kernel_pass1[grid_p1_p3](
+        X, A, B, Y, Chunk_A, Chunk_Y, A_cumprod,
         L, D,
-        X.stride(0), X.stride(1),
-        A.stride(0), A.stride(1),
-        B.stride(0), B.stride(1),
-        Y.stride(0), Y.stride(1),
-        H_ends.stride(0), H_ends.stride(1),
-        A_prods.stride(0), A_prods.stride(1),
         CHUNK_SIZE=chunk,
         BLOCK_D=BD,
     )
-    
-    grid2 = (triton.cdiv(D, BD),)
-    _correction_kernel[grid2](
-        Y, A, H_ends, A_prods,
-        L, D, C,
-        Y.stride(0), Y.stride(1),
-        A.stride(0), A.stride(1),
-        H_ends.stride(0), H_ends.stride(1),
-        A_prods.stride(0), A_prods.stride(1),
+
+    # Pass 2: Perform inter-chunk scan to compute the correct initial states for each chunk
+    _forward_kernel_pass2[grid_p2](
+        Chunk_A, Chunk_Y, H_initial,
+        num_chunks, D,
+        BLOCK_D=BD,
+    )
+
+    # Pass 3: Apply corrections to the results from pass 1 using the initial states from pass 2
+    _forward_kernel_pass3[grid_p1_p3](
+        Y, A_cumprod, H_initial,
+        L, D,
         CHUNK_SIZE=chunk,
         BLOCK_D=BD,
     )
 
     return Y
 """
-        return {"code": kernel_code}
+
+class Solution:
+    def solve(self, spec_path: str = None) -> dict:
+        """
+        Returns a dict with either:
+        - {"code": "python_code_string"}
+        - {"program_path": "path/to/kernel.py"}
+        """
+        return {"code": _MAMBA2_CHUNK_SCAN_CODE}

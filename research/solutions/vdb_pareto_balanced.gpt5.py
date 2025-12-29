@@ -1,95 +1,107 @@
-import os
-from typing import Tuple
 import numpy as np
-
-try:
-    import faiss
-except ImportError as e:
-    raise RuntimeError("faiss-cpu is required for this solution") from e
-
+import faiss
+import os
+import math
+import multiprocessing
+from typing import Tuple
 
 class YourIndexClass:
     def __init__(self, dim: int, **kwargs):
         self.dim = int(dim)
-        self.nlist = int(kwargs.get("nlist", 8192))
-        self.nprobe = int(kwargs.get("nprobe", 128))
-        self.train_size = int(kwargs.get("train_size", 200000))
-        self.refine_k = int(kwargs.get("refine_k", 2))
-        self.seed = int(kwargs.get("seed", 123))
-        self.num_threads = int(kwargs.get("num_threads", os.cpu_count() or 8))
+        # Parameters (with sensible defaults)
+        self.nlist = int(kwargs.get("nlist", 0))  # will be decided at first add if 0
+        self.nprobe = int(kwargs.get("nprobe", 96))
+        self.max_train_points = int(kwargs.get("max_train_points", 200000))
+        self.random_seed = int(kwargs.get("seed", 12345))
+        self._index = None
+        self._trained = False
+        self._added = 0
+        # threading
+        num_threads = kwargs.get("num_threads", None)
+        if num_threads is None:
+            try:
+                num_threads = min(32, multiprocessing.cpu_count() or 1)
+            except Exception:
+                num_threads = 8
+        try:
+            faiss.omp_set_num_threads(int(num_threads))
+        except Exception:
+            pass
+        # allow override via env var
+        env_nprobe = os.environ.get("VDB_NPROBE")
+        if env_nprobe is not None:
+            try:
+                self.nprobe = int(env_nprobe)
+            except Exception:
+                pass
+        env_nlist = os.environ.get("VDB_NLIST")
+        if env_nlist is not None:
+            try:
+                self.nlist = int(env_nlist)
+            except Exception:
+                pass
+        np.random.seed(self.random_seed)
+        try:
+            faiss.cvar.rand_seed = self.random_seed
+        except Exception:
+            pass
 
-        faiss.omp_set_num_threads(self.num_threads)
-
-        self._rng = np.random.RandomState(self.seed)
-
-        self.base_index = None  # underlying IVF index
-        self.index = None       # possibly wrapped with refine
-        self._is_trained = False
-        self.ntotal = 0
-
-    def _build_index(self):
-        quantizer = faiss.IndexFlatL2(self.dim)
-        ivf = faiss.IndexIVFFlat(quantizer, self.dim, self.nlist, faiss.METRIC_L2)
-        if self.refine_k > 1:
-            refine = faiss.IndexRefineFlat(ivf)
-            refine.k_factor = self.refine_k
-            self.base_index = ivf
-            self.index = refine
+    def _decide_nlist(self, N: int) -> int:
+        if self.nlist > 0:
+            return self.nlist
+        # Heuristic for nlist based on dataset size
+        # Favor power-of-two nlist values for efficiency
+        if N >= 2_000_000:
+            base = 16384
+        elif N >= 1_000_000:
+            base = 8192
+        elif N >= 500_000:
+            base = 4096
+        elif N >= 200_000:
+            base = 2048
         else:
-            self.base_index = ivf
-            self.index = ivf
-        self.base_index.nprobe = max(1, self.nprobe)
+            base = max(1024, int(4 * math.sqrt(max(N, 1))))
+        # round to nearest power of two between 512 and 32768
+        pow2 = 2 ** int(round(math.log2(max(512, min(base, 32768)))))
+        return pow2
 
-    def _ensure_index(self):
-        if self.index is None:
-            self._build_index()
+    def _build_index(self, xb: np.ndarray):
+        N = xb.shape[0]
+        nl = self._decide_nlist(N)
+        self.nlist = nl
+        quantizer = faiss.IndexFlatL2(self.dim)
+        index = faiss.IndexIVFFlat(quantizer, self.dim, nl, faiss.METRIC_L2)
+        index.nprobe = int(self.nprobe)
+        self._index = index
 
     def add(self, xb: np.ndarray) -> None:
-        if xb is None or xb.size == 0:
-            return
-        if xb.dtype != np.float32:
-            xb = xb.astype(np.float32, copy=False)
-        xb = np.ascontiguousarray(xb)
-        if xb.shape[1] != self.dim:
-            raise ValueError("Input vectors have incorrect dimensionality")
-
-        self._ensure_index()
-
-        if not self._is_trained:
-            n = xb.shape[0]
-            n_train = min(self.train_size, n)
-            if n_train < self.nlist:
-                n_train = min(n, max(self.nlist, self.nlist))  # ensure >= nlist
-            if n_train == n:
-                xt = xb
+        xb = np.asarray(xb, dtype=np.float32, order="C")
+        if xb.ndim != 2 or xb.shape[1] != self.dim:
+            raise ValueError("xb must have shape (N, dim) with dim matching the index dimension")
+        if self._index is None:
+            self._build_index(xb)
+        if not self._trained:
+            # Train on a random subset (or all if small)
+            ntrain = min(self.max_train_points, xb.shape[0])
+            if xb.shape[0] > ntrain:
+                idx = np.random.choice(xb.shape[0], size=ntrain, replace=False)
+                train_x = xb[idx]
             else:
-                idx = self._rng.choice(n, size=n_train, replace=False)
-                xt = xb[idx]
-            self.index.train(xt)
-            self._is_trained = True
-
-        self.index.add(xb)
-        self.ntotal += xb.shape[0]
+                train_x = xb
+            self._index.train(train_x)
+            self._trained = True
+        self._index.add(xb)
+        self._added += xb.shape[0]
 
     def search(self, xq: np.ndarray, k: int) -> Tuple[np.ndarray, np.ndarray]:
-        if xq.dtype != np.float32:
-            xq = xq.astype(np.float32, copy=False)
-        xq = np.ascontiguousarray(xq)
-        if xq.shape[1] != self.dim:
-            raise ValueError("Query vectors have incorrect dimensionality")
-
-        if self.index is None or not self._is_trained or self.ntotal == 0:
-            # Return empty results if not ready
-            nq = xq.shape[0]
-            return np.full((nq, k), np.inf, dtype=np.float32), np.full((nq, k), -1, dtype=np.int64)
-
-        # Ensure thread setting and nprobe are applied
-        faiss.omp_set_num_threads(self.num_threads)
-        self.base_index.nprobe = max(1, self.nprobe)
-
-        D, I = self.index.search(xq, k)
-        if D.dtype != np.float32:
-            D = D.astype(np.float32, copy=False)
-        if I.dtype != np.int64:
-            I = I.astype(np.int64, copy=False)
+        if self._index is None or not self._trained or self._added == 0:
+            raise RuntimeError("Index is not built or empty. Call add() with data before searching.")
+        xq = np.asarray(xq, dtype=np.float32, order="C")
+        if xq.ndim != 2 or xq.shape[1] != self.dim:
+            raise ValueError("xq must have shape (nq, dim) with dim matching the index dimension")
+        k = int(k)
+        if k <= 0:
+            raise ValueError("k must be positive")
+        self._index.nprobe = int(self.nprobe)
+        D, I = self._index.search(xq, k)
         return D, I

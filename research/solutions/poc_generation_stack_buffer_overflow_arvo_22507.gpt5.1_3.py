@@ -1,5 +1,6 @@
-import os
+import typing
+
 
 class Solution:
     def solve(self, src_path: str) -> bytes:
-        return b"%1234567890123456789.123456789012345678d"
+        return b"9223372036854775807 9223372036854775807\n"

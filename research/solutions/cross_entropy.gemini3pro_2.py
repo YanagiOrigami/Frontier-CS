@@ -1,114 +1,107 @@
 import torch
-import triton
-import triton.language as tl
 
 class Solution:
-    def solve(self, spec_path: str = None) -> dict:
-        return {
-            "code": r"""
+    def solve(self, spec_path=None):
+        return {"code": r"""
 import torch
 import triton
 import triton.language as tl
 
 @triton.autotune(
     configs=[
-        triton.Config({'BLOCK_SIZE': 1024, 'num_warps': 4}, num_stages=2),
-        triton.Config({'BLOCK_SIZE': 2048, 'num_warps': 8}, num_stages=2),
-        triton.Config({'BLOCK_SIZE': 4096, 'num_warps': 8}, num_stages=3),
+        triton.Config({'BLOCK_SIZE': 1024}, num_warps=4),
+        triton.Config({'BLOCK_SIZE': 2048}, num_warps=8),
+        triton.Config({'BLOCK_SIZE': 4096}, num_warps=8),
+        triton.Config({'BLOCK_SIZE': 8192}, num_warps=16),
+        triton.Config({'BLOCK_SIZE': 1024}, num_warps=4, num_stages=3),
+        triton.Config({'BLOCK_SIZE': 2048}, num_warps=8, num_stages=3),
     ],
-    key=['N'],
+    key=['N']
 )
 @triton.jit
 def cross_entropy_kernel(
-    logits_ptr, 
-    stride_logits_m, 
-    stride_logits_n,
-    targets_ptr,
-    stride_targets_m,
-    loss_ptr,
-    stride_loss_m,
+    logits_ptr, targets_ptr, loss_ptr,
+    stride_logits_m, stride_logits_n, stride_targets_m,
     N,
     BLOCK_SIZE: tl.constexpr
 ):
     pid = tl.program_id(0)
     
-    # Pointers
-    logits_row_start = logits_ptr + pid * stride_logits_m
+    # Calculate pointers for the current row
+    row_logits_ptr = logits_ptr + pid * stride_logits_m
+    target_idx_ptr = targets_ptr + pid * stride_targets_m
     
-    # Load target index
-    target_idx = tl.load(targets_ptr + pid * stride_targets_m)
+    # Load the target class index for this sample
+    target_idx = tl.load(target_idx_ptr)
     
-    # Load target logit
-    # Convert to float32 for numerical stability in loss calculation
-    target_logit_ptr = logits_row_start + target_idx * stride_logits_n
-    target_logit = tl.load(target_logit_ptr).to(tl.float32)
+    # Load the specific logit value corresponding to the target class
+    # We do this first or separate from the loop to ensure we have it
+    # Assumes target_idx is within [0, N)
+    target_val_ptr = row_logits_ptr + target_idx * stride_logits_n
+    target_val = tl.load(target_val_ptr).to(tl.float32)
     
-    # Online Softmax Accumulation
-    # m_i: running max
-    # l_i: running sum of exponentials (shifted by m_i)
-    # Initialize m_i to a very small finite value (-1e30) to handle initial -inf blocks gracefully
-    # and avoid NaN generation in (m_i - m_new) when both are -inf.
-    m_i = -1.0e30
-    l_i = 0.0
+    # Initialize accumulators for Online Softmax
+    # m_global: running max
+    # s_global: running sum of exponentials
+    m_global = float("-inf")
+    s_global = 0.0
     
+    # Iterate over the row in blocks
+    # This handles cases where N > BLOCK_SIZE or simply tiles the computation
     for off in range(0, N, BLOCK_SIZE):
         cols = off + tl.arange(0, BLOCK_SIZE)
         mask = cols < N
         
-        # Load logits block
-        vals = tl.load(logits_row_start + cols * stride_logits_n, mask=mask, other=-float('inf'))
-        vals = vals.to(tl.float32)
+        # Load a chunk of logits
+        a_ptr = row_logits_ptr + cols * stride_logits_n
+        # Load with -inf for masked values to allow correct max/sum computation
+        val = tl.load(a_ptr, mask=mask, other=float("-inf")).to(tl.float32)
         
-        # Update statistics using online softmax logic
-        m_curr = tl.max(vals, 0)
-        m_new = tl.maximum(m_i, m_curr)
+        # Compute local max for this chunk
+        m_local = tl.max(val, axis=0)
         
-        # Update sum of exponentials
-        l_i = l_i * tl.exp(m_i - m_new) + tl.sum(tl.exp(vals - m_new), 0)
-        m_i = m_new
+        # Update global max using online softmax formula
+        m_new = tl.maximum(m_global, m_local)
         
-    # Final Loss Computation
-    # loss = log(sum(exp(x_j))) - x_target
-    #      = log(l_i * exp(m_i)) - x_target
-    #      = log(l_i) + m_i - x_target
-    loss = tl.log(l_i) + m_i - target_logit
+        # Update global sum
+        # s_global = s_global * exp(m_global - m_new) + sum(exp(val - m_new))
+        s_global = s_global * tl.exp(m_global - m_new) + tl.sum(tl.exp(val - m_new), axis=0)
+        
+        m_global = m_new
+        
+    # Final cross entropy loss calculation
+    # loss = -log_likelihood = - (logits[target] - log(sum(exp(logits))))
+    # loss = log(sum) + max_val - target_val
+    loss = tl.log(s_global) + m_global - target_val
     
-    tl.store(loss_ptr + pid * stride_loss_m, loss)
+    # Store the result
+    tl.store(loss_ptr + pid, loss)
 
 def cross_entropy(logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
     """
     Cross entropy loss computation using Triton.
     
     Args:
-        logits: Input tensor of shape (M, N)
-        targets: Input tensor of shape (M,)
+        logits: Input tensor of shape (M, N) - logits for M samples and N classes
+        targets: Input tensor of shape (M,) - target class indices
     
     Returns:
-        Output tensor of shape (M,)
+        Output tensor of shape (M,) - negative log-likelihood loss
     """
     M, N = logits.shape
     
-    # Ensure targets is on correct device and shape
-    if targets.dim() != 1 or targets.shape[0] != M:
-        raise ValueError("targets must be 1D tensor of shape (M,)")
-        
-    # Output tensor
-    loss = torch.empty((M,), dtype=torch.float32, device=logits.device)
+    # Allocate output tensor
+    losses = torch.empty(M, device=logits.device, dtype=torch.float32)
     
-    # Grid: One kernel instance per sample (row)
+    # Grid configuration: one program instance per row (sample)
     grid = lambda META: (M,)
     
+    # Launch kernel
     cross_entropy_kernel[grid](
-        logits, 
-        logits.stride(0), 
-        logits.stride(1),
-        targets,
-        targets.stride(0),
-        loss,
-        loss.stride(0),
+        logits, targets, losses,
+        logits.stride(0), logits.stride(1), targets.stride(0),
         N
     )
     
-    return loss
-"""
-        }
+    return losses
+"""}

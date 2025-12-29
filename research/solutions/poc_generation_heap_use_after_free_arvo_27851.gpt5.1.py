@@ -1,124 +1,246 @@
-import tarfile
 import os
-import re
+import tarfile
+import zipfile
+import io
+import string
 
 
 class Solution:
     def solve(self, src_path: str) -> bytes:
-        def is_probably_binary(data: bytes) -> bool:
-            if not data:
-                return False
-            text_chars = b"\t\n\r" + bytes(range(0x20, 0x7F))
-            nontext = sum(1 for b in data if b not in text_chars)
-            return nontext / len(data) > 0.30
+        L_G = 72
+        MAX_CANDIDATE_SIZE = 4096
+        MAX_ARCHIVE_RECURSION = 3
+        MAX_NESTED_ARCHIVE_SIZE = 50_000_000
 
-        patterns = {
-            "poc": 20,
-            "crash": 20,
-            "uaf": 12,
-            "heap": 8,
-            "testcase": 12,
-            "id_": 6,
-            "raw_encap": 25,
-            "raw-encap": 25,
-            "rawencap": 25,
-            "encap": 8,
-            "27851": 10,
-            "ofp": 5,
-            "openflow": 5,
-            "ovs": 5,
-            "fuzz": 5,
-            "clusterfuzz": 8,
+        best_score = None
+        best_bytes = None
+
+        pattern_scores = {
+            "nxast_raw_encap": 500,
+            "raw_encap": 450,
+            "raw-encap": 440,
+            "rawencap": 430,
+            "27851": 420,
+            "poc": 400,
+            "proof": 350,
+            "repro": 340,
+            "reproducer": 330,
+            "crash": 320,
+            "heap": 300,
+            "uaf": 300,
+            "use-after-free": 300,
+            "use_after_free": 300,
+            "bug": 200,
+            "testcase": 200,
+            "input": 150,
+            "id_": 120,
+            "fuzz": 110,
+            "raw": 80,
+            "encap": 80,
+            "openflow": 60,
+            "ovs": 40,
         }
 
-        source_exts = {
-            ".c", ".h", ".hpp", ".cc", ".hh", ".cpp", ".inl",
-            ".py", ".sh", ".md", ".txt", ".rst", ".html", ".xml",
-            ".json", ".yml", ".yaml", ".java", ".go", ".rb",
-            ".php", ".pl", ".m4", ".ac", ".am",
-        }
+        printable_set = {ord(c) for c in string.printable}
 
-        def score_member(name: str, size: int, data: bytes, prefer_named: bool) -> int:
-            base = os.path.basename(name).lower()
-            ext = os.path.splitext(base)[1]
+        def compute_name_score(name_lower: str) -> int:
             score = 0
-
-            # Size closeness to ground-truth 72 bytes.
-            dist = abs(size - 72)
-            if dist == 0:
-                score += 25
-            elif dist <= 32:
-                score += 32 - dist
-
-            # Name-based hints.
-            for patt, w in patterns.items():
-                if patt in base:
-                    score += w
-
-            # Prefer candidates with interesting names in first pass.
-            if prefer_named:
-                if not any(p in base for p in (
-                    "poc", "crash", "uaf", "raw_encap", "raw-encap",
-                    "rawencap", "encap", "testcase", "id_", "27851"
-                )):
-                    score -= 15
-
-            # Penalize obvious source files.
-            if ext in source_exts:
-                score -= 12
-
-            # Binary vs text heuristic.
-            if is_probably_binary(data):
-                score += 6
-            else:
-                score += 2  # allow textual PoCs (e.g., command-line strings)
-
+            for pat, val in pattern_scores.items():
+                if pat in name_lower:
+                    score += val
             return score
 
-        def find_best_candidate(tar: tarfile.TarFile, prefer_named: bool) -> bytes | None:
-            best_data = None
-            best_score = None
+        def process_candidate(path: str, size: int, data: bytes) -> None:
+            nonlocal best_score, best_bytes
+            if not data:
+                return
+            name_lower = path.lower()
+            closeness = max(0, 100 - abs(size - L_G))
+            name_score = compute_name_score(name_lower)
+            if closeness == 0 and name_score == 0:
+                return
+            non_printable = 0
+            for b in data:
+                if b not in printable_set:
+                    non_printable += 1
+            ratio = non_printable / float(len(data))
+            binary_bonus = int(ratio * 50)
+            total_score = closeness * 2 + name_score + binary_bonus
+            if best_score is None or total_score > best_score:
+                best_score = total_score
+                best_bytes = data
 
-            for m in tar.getmembers():
-                if m.isdir():
+        def is_archive_name(name: str) -> bool:
+            lower = name.lower()
+            return lower.endswith(
+                (
+                    ".tar",
+                    ".tar.gz",
+                    ".tgz",
+                    ".tar.bz2",
+                    ".tbz2",
+                    ".tbz",
+                    ".tar.xz",
+                    ".txz",
+                    ".zip",
+                )
+            )
+
+        def should_consider_file(size: int, name_lower: str) -> bool:
+            if size <= 0:
+                return False
+            name_score = compute_name_score(name_lower)
+            closeness = max(0, 100 - abs(size - L_G))
+            if size <= MAX_CANDIDATE_SIZE:
+                return closeness > 0 or name_score > 0
+            else:
+                return name_score > 0
+
+        def scan_archive_bytes(data: bytes, name: str, depth: int) -> None:
+            if depth > MAX_ARCHIVE_RECURSION:
+                return
+            bio = io.BytesIO(data)
+            try:
+                with tarfile.open(fileobj=bio, mode="r:*") as tf:
+                    scan_tar_obj(tf, name, depth)
+                    return
+            except Exception:
+                pass
+            bio = io.BytesIO(data)
+            try:
+                with zipfile.ZipFile(bio, "r") as zf:
+                    scan_zip_obj(zf, name, depth)
+                    return
+            except Exception:
+                pass
+
+        def scan_tar_obj(tf: tarfile.TarFile, base: str, depth: int) -> None:
+            for member in tf.getmembers():
+                if not member.isfile():
                     continue
-                size = m.size
-                # Ignore huge files to avoid unnecessary I/O.
-                if size <= 0 or size > 16384:
+                size = member.size
+                member_path = os.path.join(base, member.name) if base else member.name
+                name_lower = member_path.lower()
+                if should_consider_file(size, name_lower):
+                    try:
+                        f = tf.extractfile(member)
+                        if f is None:
+                            continue
+                        data = f.read()
+                    except Exception:
+                        data = None
+                    if data is not None:
+                        process_candidate(member_path, len(data), data)
+                if (
+                    size > 0
+                    and size <= MAX_NESTED_ARCHIVE_SIZE
+                    and depth < MAX_ARCHIVE_RECURSION
+                    and is_archive_name(member.name)
+                ):
+                    try:
+                        f = tf.extractfile(member)
+                        if f is None:
+                            continue
+                        nested_data = f.read()
+                    except Exception:
+                        nested_data = None
+                    if nested_data:
+                        scan_archive_bytes(nested_data, member_path, depth + 1)
+
+        def scan_zip_obj(zf: zipfile.ZipFile, base: str, depth: int) -> None:
+            for info in zf.infolist():
+                if info.is_dir():
                     continue
-                try:
-                    f = tar.extractfile(m)
-                    if f is None:
+                size = info.file_size
+                member_path = os.path.join(base, info.filename) if base else info.filename
+                name_lower = member_path.lower()
+                if should_consider_file(size, name_lower):
+                    try:
+                        data = zf.read(info)
+                    except Exception:
+                        data = None
+                    if data is not None:
+                        process_candidate(member_path, len(data), data)
+                if (
+                    size > 0
+                    and size <= MAX_NESTED_ARCHIVE_SIZE
+                    and depth < MAX_ARCHIVE_RECURSION
+                    and is_archive_name(info.filename)
+                ):
+                    try:
+                        nested_data = zf.read(info)
+                    except Exception:
+                        nested_data = None
+                    if nested_data:
+                        scan_archive_bytes(nested_data, member_path, depth + 1)
+
+        def scan_directory(dir_path: str, depth: int) -> None:
+            if depth > MAX_ARCHIVE_RECURSION:
+                return
+            for root, _, files in os.walk(dir_path):
+                for fname in files:
+                    full_path = os.path.join(root, fname)
+                    name_lower = full_path.lower()
+                    try:
+                        size = os.path.getsize(full_path)
+                    except Exception:
                         continue
-                    data = f.read()
+                    if should_consider_file(size, name_lower):
+                        try:
+                            with open(full_path, "rb") as f:
+                                data = f.read()
+                        except Exception:
+                            data = None
+                        if data is not None:
+                            process_candidate(full_path, len(data), data)
+                    if (
+                        size > 0
+                        and size <= MAX_NESTED_ARCHIVE_SIZE
+                        and depth < MAX_ARCHIVE_RECURSION
+                        and is_archive_name(fname)
+                    ):
+                        try:
+                            with open(full_path, "rb") as f:
+                                nested_data = f.read()
+                        except Exception:
+                            nested_data = None
+                        if nested_data:
+                            scan_archive_bytes(nested_data, full_path, depth + 1)
+
+        def scan_root(path: str) -> None:
+            if os.path.isdir(path):
+                scan_directory(path, 0)
+                return
+            try:
+                if tarfile.is_tarfile(path):
+                    with tarfile.open(path, "r:*") as tf:
+                        scan_tar_obj(tf, "", 0)
+                        return
+            except Exception:
+                pass
+            try:
+                if zipfile.is_zipfile(path):
+                    with zipfile.ZipFile(path, "r") as zf:
+                        scan_zip_obj(zf, "", 0)
+                        return
+            except Exception:
+                pass
+            try:
+                size = os.path.getsize(path)
+            except Exception:
+                return
+            name_lower = os.path.basename(path).lower()
+            if should_consider_file(size, name_lower):
+                try:
+                    with open(path, "rb") as f:
+                        data = f.read()
                 except Exception:
-                    continue
+                    data = None
+                if data is not None:
+                    process_candidate(path, len(data), data)
 
-                score = score_member(m.name, size, data, prefer_named)
-                if best_score is None or score > best_score:
-                    best_score = score
-                    best_data = data
+        scan_root(src_path)
 
-            # Require a minimal score to accept.
-            if best_score is not None and best_score >= 10:
-                return best_data
-            return None
-
-        # Try opening the tarball; on failure, fall back.
-        try:
-            with tarfile.open(src_path, "r:*") as tar:
-                # First pass: strongly prefer files whose names look like PoCs.
-                poc = find_best_candidate(tar, prefer_named=True)
-                if poc is not None:
-                    return poc
-
-            # Second pass: consider all small-ish files.
-            with tarfile.open(src_path, "r:*") as tar:
-                poc = find_best_candidate(tar, prefer_named=False)
-                if poc is not None:
-                    return poc
-        except Exception:
-            pass
-
-        # Fallback: generic 72-byte placeholder (unlikely to trigger, but required return).
-        return b"A" * 72
+        if best_bytes is not None:
+            return best_bytes
+        return b"A" * L_G

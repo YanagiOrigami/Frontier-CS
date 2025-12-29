@@ -1,9 +1,10 @@
 import numpy as np
-import os
-import shutil
-import tempfile
-import sympy
 from pysr import PySRRegressor
+import sympy
+import warnings
+
+# Suppress warnings from libraries to keep output clean
+warnings.filterwarnings("ignore")
 
 class Solution:
     def __init__(self, **kwargs):
@@ -12,64 +13,72 @@ class Solution:
     def solve(self, X: np.ndarray, y: np.ndarray) -> dict:
         """
         Solves the symbolic regression problem using PySR.
+        
+        Args:
+            X: Feature matrix of shape (n, 2)
+            y: Target values of shape (n,)
+
+        Returns:
+            dict containing expression, predictions, and details
         """
-        # Create a temporary directory for PySR output files to ensure isolation
-        temp_dir = tempfile.mkdtemp()
-        equation_file = os.path.join(temp_dir, "hall_of_fame.csv")
+        # Ensure inputs are contiguous float64 arrays
+        X = np.ascontiguousarray(X, dtype=np.float64)
+        y = np.ascontiguousarray(y, dtype=np.float64)
+
+        # Configure PySRRegressor
+        # Optimized for SinCos dataset on 8 vCPUs
+        # Trigonometric functions are prioritized in unary_operators
+        model = PySRRegressor(
+            niterations=100,                  # Sufficient iterations for convergence
+            binary_operators=["+", "-", "*", "/"],
+            unary_operators=["sin", "cos", "exp", "log"],
+            populations=32,                   # 4 populations per core (8 vCPUs)
+            population_size=40,
+            maxsize=40,                       # Limit complexity
+            verbosity=0,
+            progress=False,
+            random_state=42,
+            procs=8,                          # Utilize all 8 vCPUs
+            multithreading=False,             # Use multiprocessing
+            model_selection="best",           # Select best model based on score/complexity
+            timeout_in_seconds=600,           # Safety timeout
+            early_stop_condition=1e-8,        # Stop if MSE is negligible
+            deterministic=True                # Ensure reproducibility
+        )
+
+        expression = "0"
+        predictions = np.zeros_like(y)
 
         try:
-            # Initialize PySRRegressor
-            # Configuration optimized for 8 vCPUs and the SinCos dataset characteristics
-            model = PySRRegressor(
-                niterations=100,  # Sufficient iterations for convergence on basic trig functions
-                binary_operators=["+", "-", "*", "/"],
-                unary_operators=["sin", "cos", "exp", "log"],
-                populations=24,   # 3 populations per core (8 vCPUs)
-                population_size=40,
-                ncycles_per_iteration=500,
-                maxsize=35,       # Limit complexity
-                verbosity=0,
-                progress=False,
-                random_state=42,
-                procs=8,          # Use all available vCPUs
-                multiprocessing=True,
-                equation_file=equation_file,
-                model_selection="best",  # Balances accuracy and complexity
-                temp_equation_file=False # We handle the file location manually
-            )
-
             # Fit the model
             model.fit(X, y, variable_names=["x1", "x2"])
-
-            # Retrieve the best expression found
-            # PySR returns a sympy object which we convert to string
+            
+            # Retrieve the best symbolic expression as a string
+            # model.sympy() returns the expression selected by 'model_selection'
             best_expr = model.sympy()
             expression = str(best_expr)
-
-            # Generate predictions on the input data
+            
+            # Generate predictions using the fitted model
             predictions = model.predict(X)
 
-        except Exception as e:
-            # Fallback: Linear Regression Baseline
-            # Used if PySR fails due to environment issues or timeouts
-            x1, x2 = X[:, 0], X[:, 1]
-            A = np.column_stack([x1, x2, np.ones_like(x1)])
-            # Least squares fit
-            coeffs, _, _, _ = np.linalg.lstsq(A, y, rcond=None)
-            a, b, c = coeffs
-            
-            # Construct linear expression
-            expression = f"{a}*x1 + {b}*x2 + {c}"
-            predictions = A @ coeffs
-
-        finally:
-            # Clean up temporary directory and files
-            if os.path.exists(temp_dir):
-                shutil.rmtree(temp_dir, ignore_errors=True)
-
-        # Post-process expression to ensure it is a valid Python string
-        # Remove numpy prefixes if present (e.g., 'numpy.sin' -> 'sin')
-        expression = expression.replace("numpy.", "").replace("np.", "")
+        except Exception:
+            # Fallback strategy: Linear Regression
+            # Used if symbolic regression fails or times out
+            try:
+                # Add bias column
+                A = np.column_stack([X, np.ones(len(X))])
+                # Least squares fit
+                coeffs, _, _, _ = np.linalg.lstsq(A, y, rcond=None)
+                
+                # Reconstruct expression string (x1 is col 0, x2 is col 1, bias is col 2)
+                a, b, c = coeffs
+                expression = f"{a}*x1 + {b}*x2 + {c}"
+                predictions = A @ coeffs
+            except Exception:
+                # Ultimate fallback: Mean constant
+                mean_val = np.mean(y)
+                expression = str(mean_val)
+                predictions = np.full(len(y), mean_val)
 
         return {
             "expression": expression,

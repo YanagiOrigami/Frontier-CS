@@ -1,46 +1,15 @@
 import pandas as pd
+import numpy as np
 from joblib import Parallel, delayed
 
 class Solution:
-    def _find_best_order(
-        self, df_sample: pd.DataFrame, cardinality: pd.Series, parallel: bool
-    ) -> list:
-        if df_sample.empty:
-            return []
-
-        cols = df_sample.columns.tolist()
-        
-        first_col = min(cols, key=lambda c: cardinality.get(c, float('inf')))
-        
-        ordered_cols = [first_col]
-        remaining_cols = [c for c in cols if c != first_col]
-        
-        for _ in range(len(remaining_cols)):
-            if not remaining_cols:
-                break
-            if len(remaining_cols) == 1:
-                ordered_cols.append(remaining_cols[0])
-                break
-
-            current_groups = df_sample.groupby(ordered_cols, sort=False)
-            
-            def calculate_score(col: str) -> int:
-                return current_groups[col].nunique().sum()
-
-            if parallel and len(remaining_cols) > 1:
-                scores = Parallel(n_jobs=-1, prefer="threads")(
-                    delayed(calculate_score)(c) for c in remaining_cols
-                )
-                scores_map = dict(zip(remaining_cols, scores))
-            else:
-                scores_map = {c: calculate_score(c) for c in remaining_cols}
-
-            best_col = min(scores_map, key=scores_map.get)
-            
-            ordered_cols.append(best_col)
-            remaining_cols.remove(best_col)
-            
-        return ordered_cols
+    @staticmethod
+    def _calculate_score_groupby(col: str, selected_cols: list, df_sample: pd.DataFrame) -> int:
+        """
+        Calculates the number of unique groups formed by adding a new column.
+        This static method is designed to be picklable for parallel processing.
+        """
+        return df_sample.groupby(by=selected_cols + [col], sort=False).ngroups
 
     def solve(
         self,
@@ -53,59 +22,85 @@ class Solution:
         distinct_value_threshold: float = 0.7,
         parallel: bool = True,
     ) -> pd.DataFrame:
-        if df.empty or len(df.columns) <= 1:
+        if df.empty:
             return df
-        
+
         df_processed = df.copy()
 
         if col_merge:
-            all_cols = set(df_processed.columns)
+            cols_to_drop = set()
             for group in col_merge:
-                valid_group = [col for col in group if col in all_cols]
-                if len(valid_group) > 1:
-                    new_col_name = "_".join(valid_group)
-                    temp_name = new_col_name
-                    counter = 0
-                    while temp_name in df_processed.columns:
-                        counter += 1
-                        temp_name = f"{new_col_name}_{counter}"
-                    new_col_name = temp_name
-                    
-                    df_processed[new_col_name] = (
-                        df_processed[valid_group].astype(str).agg("".join, axis=1)
-                    )
-                    df_processed = df_processed.drop(columns=valid_group)
+                if not group:
+                    continue
+                
+                valid_group = [c for c in group if c in df_processed.columns]
+                if len(valid_group) < 1:
+                    continue
 
-        df_processed = df_processed.astype(str)
+                new_col_name = '_'.join(map(str, valid_group))
+                df_processed[new_col_name] = df_processed[valid_group].astype(str).apply(''.join, axis=1)
+                cols_to_drop.update(valid_group)
+            
+            if cols_to_drop:
+                df_processed = df_processed.drop(columns=list(cols_to_drop))
 
-        sample_size = min(len(df_processed), 5000)
-        sample_size = min(sample_size, early_stop)
+        if len(df_processed.columns) <= 1:
+            return df_processed
+        
+        num_rows, num_cols = df_processed.shape
+        
+        sample_size = min(num_rows, early_stop)
         df_sample = df_processed.head(sample_size)
 
-        if df_sample.empty:
-            return df_processed
+        selected_cols = []
+        remaining_cols = list(df_processed.columns)
+        
+        effective_col_stop = min(col_stop, num_cols)
+        
+        for _ in range(effective_col_stop):
+            if not remaining_cols:
+                break
             
-        cardinality = df_sample.nunique()
-        
-        if len(df_sample) > 0:
-            distinct_count_threshold = len(df_sample) * distinct_value_threshold
-        else:
-            distinct_count_threshold = 0
+            if selected_cols and sample_size > 0:
+                num_groups = df_sample.groupby(by=selected_cols, sort=False).ngroups
+                if sample_size > row_stop and num_groups >= sample_size - row_stop:
+                    break
+            
+            if parallel:
+                scores = Parallel(n_jobs=-1, prefer='threads')(
+                    delayed(self._calculate_score_groupby)(col, selected_cols, df_sample)
+                    for col in remaining_cols
+                )
+            else:
+                scores = [
+                    self._calculate_score_groupby(col, selected_cols, df_sample)
+                    for col in remaining_cols
+                ]
+            
+            if not scores:
+                break
 
-        high_card_cols = cardinality[cardinality > distinct_count_threshold].index.tolist()
-        low_card_cols = cardinality[cardinality <= distinct_count_threshold].index.tolist()
-        
-        high_card_cols.sort(key=lambda c: cardinality.get(c, float('inf')), reverse=True)
-        
-        df_sample_low_card = df_sample[low_card_cols] if low_card_cols else pd.DataFrame()
-        
-        ordered_low_card_cols = self._find_best_order(
-            df_sample_low_card, cardinality, parallel
-        )
+            best_col_idx = np.argmin(scores)
+            best_col = remaining_cols.pop(best_col_idx)
+            selected_cols.append(best_col)
+            
+        if remaining_cols:
+            if sample_size > 0:
+                nunique_cache = {
+                    c: df_sample[c].nunique() for c in remaining_cols
+                }
+                
+                threshold = sample_size * distinct_value_threshold
+                
+                high_card_cols = [c for c in remaining_cols if nunique_cache[c] > threshold]
+                low_card_cols = [c for c in remaining_cols if nunique_cache[c] <= threshold]
 
-        final_order = ordered_low_card_cols + high_card_cols
-        
-        if set(final_order) != set(df_processed.columns):
-            return df_processed
+                low_card_cols.sort(key=lambda c: nunique_cache[c])
+                high_card_cols.sort(key=lambda c: nunique_cache[c])
+                
+                selected_cols.extend(low_card_cols)
+                selected_cols.extend(high_card_cols)
+            else:
+                selected_cols.extend(remaining_cols)
 
-        return df_processed[final_order]
+        return df_processed[selected_cols]

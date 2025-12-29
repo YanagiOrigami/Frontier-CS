@@ -1,134 +1,118 @@
 import os
 import torch
-import torch.nn.functional as F
 import triton
 import triton.language as tl
 
 
 @triton.autotune(
     configs=[
-        triton.Config({'BLOCK_SIZE': 128}, num_warps=4, num_stages=3),
-        triton.Config({'BLOCK_SIZE': 256}, num_warps=4, num_stages=3),
-        triton.Config({'BLOCK_SIZE': 512}, num_warps=8, num_stages=3),
-        triton.Config({'BLOCK_SIZE': 1024}, num_warps=8, num_stages=4),
+        triton.Config({"BLOCK_N": 128, "TILES_PER_ROW": 64}, num_warps=4, num_stages=2),
+        triton.Config({"BLOCK_N": 256, "TILES_PER_ROW": 32}, num_warps=4, num_stages=2),
+        triton.Config({"BLOCK_N": 512, "TILES_PER_ROW": 16}, num_warps=8, num_stages=2),
+        triton.Config({"BLOCK_N": 1024, "TILES_PER_ROW": 8}, num_warps=8, num_stages=2),
     ],
-    key=['N'],
+    key=["N"],
 )
 @triton.jit
 def _cross_entropy_kernel(
-    logits_ptr,  # *f32 / *f16 / *bf16
-    targets_ptr,  # *i64
-    losses_ptr,  # *f32
-    stride_lm, stride_ln,
-    stride_tm,
+    logits_ptr,
+    targets_ptr,
+    output_ptr,
     M,
-    N: tl.constexpr,
-    BLOCK_SIZE: tl.constexpr,
+    N,
+    stride_m,
+    stride_n,
+    BLOCK_N: tl.constexpr,
+    TILES_PER_ROW: tl.constexpr,
 ):
-    row_id = tl.program_id(0)
-    if row_id >= M:
+    row = tl.program_id(0)
+    if row >= M:
         return
 
-    offs = tl.arange(0, BLOCK_SIZE)
-    row_start = row_id * stride_lm
+    row_offset = row * stride_m
 
-    # 1. Compute row-wise max for numerical stability
-    max_val = -float('inf')
-    for start_n in tl.static_range(0, N, BLOCK_SIZE):
-        cols = start_n + offs
-        mask = cols < N
-        logits = tl.load(
-            logits_ptr + row_start + cols * stride_ln,
-            mask=mask,
-            other=-float('inf'),
-        )
-        logits = logits.to(tl.float32)
-        curr_max = tl.max(logits, axis=0)
-        max_val = tl.maximum(max_val, curr_max)
+    # First pass: compute per-row maximum for numerical stability
+    row_max = -float("inf")
+    for tile in tl.static_range(0, TILES_PER_ROW):
+        col_start = tile * BLOCK_N
+        offs = col_start + tl.arange(0, BLOCK_N)
+        mask = offs < N
+        ptrs = logits_ptr + row_offset + offs * stride_n
+        x = tl.load(ptrs, mask=mask, other=-float("inf"))
+        x = x.to(tl.float32)
+        tile_max = tl.max(x, axis=0)
+        row_max = tl.maximum(row_max, tile_max)
 
-    # 2. Compute log-sum-exp using the max
-    sum_exp = 0.0
-    for start_n in tl.static_range(0, N, BLOCK_SIZE):
-        cols = start_n + offs
-        mask = cols < N
-        logits = tl.load(
-            logits_ptr + row_start + cols * stride_ln,
-            mask=mask,
-            other=-float('inf'),
-        )
-        logits = logits.to(tl.float32)
-        logits = logits - max_val
-        exp_logits = tl.exp(logits)
-        sum_exp += tl.sum(exp_logits, axis=0)
+    # Second pass: compute sum(exp(logits - row_max))
+    exp_sum = 0.0
+    for tile in tl.static_range(0, TILES_PER_ROW):
+        col_start = tile * BLOCK_N
+        offs = col_start + tl.arange(0, BLOCK_N)
+        mask = offs < N
+        ptrs = logits_ptr + row_offset + offs * stride_n
+        x = tl.load(ptrs, mask=mask, other=-float("inf"))
+        x = x.to(tl.float32)
+        exp_block = tl.exp(x - row_max)
+        exp_sum += tl.sum(exp_block, axis=0)
 
-    log_denom = tl.log(sum_exp) + max_val
+    # Logit of the target class
+    target_idx = tl.load(targets_ptr + row)
+    target_idx = target_idx.to(tl.int32)
+    target_ptr = logits_ptr + row_offset + target_idx * stride_n
+    logit_target = tl.load(target_ptr)
+    logit_target = logit_target.to(tl.float32)
 
-    # 3. Gather logit corresponding to the target class
-    target_idx = tl.load(targets_ptr + row_id * stride_tm)
-    target_idx = target_idx.to(tl.int64)
-    target_logit = tl.load(logits_ptr + row_start + target_idx * stride_ln)
-    target_logit = target_logit.to(tl.float32)
+    logsumexp = row_max + tl.log(exp_sum)
+    loss = logsumexp - logit_target
 
-    loss = log_denom - target_logit
-    tl.store(losses_ptr + row_id, loss)
+    tl.store(output_ptr + row, loss)
 
 
 def cross_entropy(logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
     """
-    Cross entropy loss computation using a Triton kernel.
+    Cross entropy loss computation.
 
     Args:
-        logits: Tensor of shape (M, N) on CUDA device
-        targets: Tensor of shape (M,) with int64 class indices
+        logits: Tensor of shape (M, N) - logits for M samples and N classes
+        targets: Tensor of shape (M,) - target class indices (int64)
 
     Returns:
-        Tensor of shape (M,) with float32 losses.
+        Tensor of shape (M,) - negative log-likelihood loss for each sample
     """
-    if not isinstance(logits, torch.Tensor) or not isinstance(targets, torch.Tensor):
-        raise TypeError("logits and targets must be torch.Tensors")
-
     if logits.ndim != 2:
-        raise ValueError("logits must be 2D (M, N)")
+        raise ValueError(f"logits must be 2D (M, N), got shape {logits.shape}")
     if targets.ndim != 1:
-        raise ValueError("targets must be 1D (M,)")
+        raise ValueError(f"targets must be 1D (M,), got shape {targets.shape}")
+    if logits.shape[0] != targets.shape[0]:
+        raise ValueError(
+            f"Batch size mismatch: logits.shape[0]={logits.shape[0]}, targets.shape[0]={targets.shape[0]}"
+        )
+    if not logits.is_cuda or not targets.is_cuda:
+        raise ValueError("Both logits and targets must be CUDA tensors")
 
     M, N = logits.shape
-    if targets.shape[0] != M:
-        raise ValueError("targets length must match logits batch dimension")
+    stride_m, stride_n = logits.stride()
 
-    # Fallback to PyTorch implementation on CPU
-    if not logits.is_cuda or not targets.is_cuda:
-        return F.cross_entropy(logits, targets.long(), reduction='none').to(torch.float32)
-
+    # Ensure targets are of integer type
     if targets.dtype != torch.long:
-        targets = targets.long()
+        targets_tensor = targets.to(torch.long)
+    else:
+        targets_tensor = targets
 
-    # Ensure reasonably good memory layout
-    if not logits.is_contiguous():
-        logits = logits.contiguous()
-    if not targets.is_contiguous():
-        targets = targets.contiguous()
-
-    # Allocate output
-    losses = torch.empty((M,), device=logits.device, dtype=torch.float32)
-
-    stride_lm, stride_ln = logits.stride()
-    stride_tm = targets.stride(0)
+    output = torch.empty(M, device=logits.device, dtype=torch.float32)
 
     grid = (M,)
-
     _cross_entropy_kernel[grid](
         logits,
-        targets,
-        losses,
-        stride_lm,
-        stride_ln,
-        stride_tm,
+        targets_tensor,
+        output,
         M,
         N,
+        stride_m,
+        stride_n,
     )
 
-    return losses
+    return output
 
 
 class Solution:

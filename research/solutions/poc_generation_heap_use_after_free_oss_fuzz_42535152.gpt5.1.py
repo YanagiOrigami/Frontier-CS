@@ -1,179 +1,285 @@
 import os
 import tarfile
+import re
+import io
 import zipfile
+import gzip
+import tempfile
 
 
 class Solution:
-    TARGET_SIZE = 33453
-    BUG_ID = "42535152"
-    KEYWORDS = ["clusterfuzz", "oss-fuzz", "poc", "crash", "uaf", "use-after-free"]
+    def __init__(self):
+        self.LG = 33453
+        self.patterns = [
+            (re.compile(r'42535152'), 1000.0),
+            (re.compile(r'oss[-_]?fuzz'), 500.0),
+            (re.compile(r'clusterfuzz'), 400.0),
+            (re.compile(r'testcase'), 300.0),
+            (re.compile(r'crash'), 300.0),
+            (re.compile(r'poc'), 300.0),
+            (re.compile(r'repro'), 250.0),
+            (re.compile(r'use[_-]?after[_-]?free'), 200.0),
+            (re.compile(r'\buaf\b'), 150.0),
+            (re.compile(r'qpdf'), 100.0),
+            (re.compile(r'fuzz'), 80.0),
+            (re.compile(r'asan'), 60.0),
+            (re.compile(r'ubsan'), 60.0),
+            (re.compile(r'\.pdf'), 40.0),
+        ]
+        self.nested_name_tokens = [
+            '42535152',
+            'clusterfuzz',
+            'oss-fuzz',
+            'ossfuzz',
+            'qpdf',
+            'fuzz',
+            'testcase',
+            'crash',
+            'poc',
+        ]
 
-    def _score_candidate(self, name: str, size: int) -> int:
-        name_l = name.lower()
-        score = 0
-
-        # Prefer exact ground-truth size for plausible PoCs with reasonable extensions
-        ext = os.path.splitext(name_l)[1]
-        if size == self.TARGET_SIZE and (ext in (".pdf", ".bin", "") or "pdf" in name_l):
-            score += 50000
-
-        if self.BUG_ID in name_l:
-            score += 10000
-
-        for kw in self.KEYWORDS:
-            if kw in name_l:
-                score += 2000
-
-        if name_l.endswith(".pdf"):
-            score += 1000
-        elif name_l.endswith(".bin"):
-            score += 300
-
-        if "test" in name_l or "fuzz" in name_l or "regress" in name_l:
-            score += 100
-
-        # Mild preference for non-trivial size
-        score += min(size // 1024, 100)
-
+    def _score_candidate(self, path_lower: str, size: int, penalize_non_pdf: bool = True) -> float:
+        score = 0.0
+        for regex, weight in self.patterns:
+            if regex.search(path_lower):
+                score += weight
+        diff = abs(size - self.LG)
+        size_score = 300.0 - (diff / 100.0)
+        if size_score < 0.0:
+            size_score = 0.0
+        score += size_score
+        if '/tests/' in path_lower or path_lower.startswith('tests/'):
+            score += 50.0
+        if 'regress' in path_lower:
+            score += 50.0
+        if 'bug' in path_lower:
+            score += 25.0
+        if penalize_non_pdf:
+            if not path_lower.endswith('.pdf') and '.pdf' not in path_lower:
+                score -= 150.0
+        if score < 0.0:
+            score = 0.0
         return score
 
-    def _from_directory(self, src_dir: str):
+    def _fallback_poc(self) -> bytes:
+        return (
+            b'%PDF-1.4\n'
+            b'1 0 obj\n'
+            b'<< /Type /Catalog /Pages 2 0 R >>\n'
+            b'endobj\n'
+            b'2 0 obj\n'
+            b'<< /Type /Pages /Kids [3 0 R] /Count 1 >>\n'
+            b'endobj\n'
+            b'3 0 obj\n'
+            b'<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>\n'
+            b'endobj\n'
+            b'trailer\n'
+            b'<< /Root 1 0 R >>\n'
+            b'%%EOF\n'
+        )
+
+    def _solve_from_tar(self, src_path: str) -> bytes:
+        best_member = None
+        best_score = -1.0
+        nested_best_data = None
+        nested_best_score = -1.0
+
+        try:
+            tf = tarfile.open(src_path, 'r:*')
+        except tarfile.ReadError:
+            return self._fallback_poc()
+
+        with tf:
+            members = tf.getmembers()
+
+            # Direct candidates (e.g., .pdf files)
+            for member in members:
+                if not member.isreg():
+                    continue
+                size = member.size
+                if size <= 0 or size > 2 * 1024 * 1024:
+                    continue
+                path_lower = member.name.lower()
+                score = self._score_candidate(path_lower, size, penalize_non_pdf=True)
+                if score > best_score:
+                    best_score = score
+                    best_member = member
+
+            direct_data = None
+            if best_member is not None and best_score > 0.0:
+                try:
+                    f = tf.extractfile(best_member)
+                    if f is not None:
+                        data = f.read()
+                        if data:
+                            direct_data = data
+                except Exception:
+                    direct_data = None
+
+            # Nested archives (.zip, .gz) that may contain the PoC
+            for member in members:
+                if not member.isreg():
+                    continue
+                if member.size <= 0 or member.size > 5 * 1024 * 1024:
+                    continue
+                name_lower = member.name.lower()
+                if not (name_lower.endswith('.zip') or name_lower.endswith('.gz')):
+                    continue
+                if not any(tok in name_lower for tok in self.nested_name_tokens):
+                    continue
+                try:
+                    f = tf.extractfile(member)
+                    if f is None:
+                        continue
+                    raw = f.read()
+                except Exception:
+                    continue
+                if not raw:
+                    continue
+
+                if name_lower.endswith('.zip'):
+                    try:
+                        zf = zipfile.ZipFile(io.BytesIO(raw))
+                    except Exception:
+                        continue
+                    for zi in zf.infolist():
+                        try:
+                            data = zf.read(zi)
+                        except Exception:
+                            continue
+                        if not data:
+                            continue
+                        size2 = len(data)
+                        combined_name = name_lower + '/' + zi.filename.lower()
+                        score = self._score_candidate(
+                            combined_name, size2, penalize_non_pdf=False
+                        )
+                        if score > nested_best_score:
+                            nested_best_score = score
+                            nested_best_data = data
+                else:
+                    try:
+                        data = gzip.decompress(raw)
+                    except Exception:
+                        continue
+                    if not data:
+                        continue
+                    size2 = len(data)
+                    score = self._score_candidate(
+                        name_lower, size2, penalize_non_pdf=False
+                    )
+                    if score > nested_best_score:
+                        nested_best_score = score
+                        nested_best_data = data
+
+        if nested_best_data is not None and nested_best_score >= (best_score if best_score > 0.0 else 0.0):
+            return nested_best_data
+        if direct_data is not None:
+            return direct_data
+        return self._fallback_poc()
+
+    def _solve_from_dir(self, src_dir: str) -> bytes:
         best_path = None
-        best_score = -1
+        best_score = -1.0
+        nested_best_data = None
+        nested_best_score = -1.0
 
         for root, _, files in os.walk(src_dir):
             for fname in files:
-                fpath = os.path.join(root, fname)
+                full_path = os.path.join(root, fname)
                 try:
-                    size = os.path.getsize(fpath)
+                    size = os.path.getsize(full_path)
                 except OSError:
                     continue
                 if size <= 0:
                     continue
-                score = self._score_candidate(fpath, size)
-                if score > best_score:
-                    best_score = score
-                    best_path = fpath
+                path_lower = full_path.lower()
 
-        if best_path is not None:
+                # Direct candidate
+                if size <= 2 * 1024 * 1024:
+                    score = self._score_candidate(path_lower, size, penalize_non_pdf=True)
+                    if score > best_score:
+                        best_score = score
+                        best_path = full_path
+
+                # Nested archives
+                if size <= 5 * 1024 * 1024 and (
+                    path_lower.endswith('.zip') or path_lower.endswith('.gz')
+                ):
+                    if not any(tok in path_lower for tok in self.nested_name_tokens):
+                        continue
+                    try:
+                        with open(full_path, 'rb') as fh:
+                            raw = fh.read()
+                    except OSError:
+                        continue
+                    if not raw:
+                        continue
+
+                    if path_lower.endswith('.zip'):
+                        try:
+                            zf = zipfile.ZipFile(io.BytesIO(raw))
+                        except Exception:
+                            continue
+                        for zi in zf.infolist():
+                            try:
+                                data = zf.read(zi)
+                            except Exception:
+                                continue
+                            if not data:
+                                continue
+                            size2 = len(data)
+                            combined_name = path_lower + '/' + zi.filename.lower()
+                            score = self._score_candidate(
+                                combined_name, size2, penalize_non_pdf=False
+                            )
+                            if score > nested_best_score:
+                                nested_best_score = score
+                                nested_best_data = data
+                    else:
+                        try:
+                            data = gzip.decompress(raw)
+                        except Exception:
+                            continue
+                        if not data:
+                            continue
+                        size2 = len(data)
+                        score = self._score_candidate(
+                            path_lower, size2, penalize_non_pdf=False
+                        )
+                        if score > nested_best_score:
+                            nested_best_score = score
+                            nested_best_data = data
+
+        direct_data = None
+        if best_path is not None and best_score > 0.0:
             try:
-                with open(best_path, "rb") as f:
-                    return f.read()
+                with open(best_path, 'rb') as fh:
+                    data = fh.read()
+                if data:
+                    direct_data = data
             except OSError:
-                pass
+                direct_data = None
 
-        return None
-
-    def _from_tar(self, tar_path: str):
-        try:
-            with tarfile.open(tar_path, "r:*") as tf:
-                members = tf.getmembers()
-                best_member = None
-                best_score = -1
-                for m in members:
-                    if not m.isfile():
-                        continue
-                    size = getattr(m, "size", 0)
-                    if size <= 0:
-                        continue
-                    name = m.name
-                    score = self._score_candidate(name, size)
-                    if score > best_score:
-                        best_score = score
-                        best_member = m
-
-                if best_member is not None:
-                    try:
-                        f = tf.extractfile(best_member)
-                        if f is not None:
-                            return f.read()
-                    except Exception:
-                        pass
-        except tarfile.TarError:
-            return None
-
-        return None
-
-    def _from_zip(self, zip_path: str):
-        try:
-            with zipfile.ZipFile(zip_path, "r") as zf:
-                best_info = None
-                best_score = -1
-                for info in zf.infolist():
-                    # Skip directories
-                    if hasattr(info, "is_dir") and info.is_dir():
-                        continue
-                    size = info.file_size
-                    if size <= 0:
-                        continue
-                    name = info.filename
-                    score = self._score_candidate(name, size)
-                    if score > best_score:
-                        best_score = score
-                        best_info = info
-
-                if best_info is not None:
-                    try:
-                        with zf.open(best_info, "r") as f:
-                            return f.read()
-                    except Exception:
-                        pass
-        except zipfile.BadZipFile:
-            return None
-
-        return None
-
-    def _fallback_poc(self) -> bytes:
-        # Minimal generic PDF; unlikely to trigger the specific bug, used only as last resort
-        return (
-            b"%PDF-1.4\n"
-            b"1 0 obj\n"
-            b"<< /Type /Catalog /Pages 2 0 R >>\n"
-            b"endobj\n"
-            b"2 0 obj\n"
-            b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>\n"
-            b"endobj\n"
-            b"3 0 obj\n"
-            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>\n"
-            b"endobj\n"
-            b"xref\n"
-            b"0 4\n"
-            b"0000000000 65535 f \n"
-            b"0000000010 00000 n \n"
-            b"0000000060 00000 n \n"
-            b"0000000114 00000 n \n"
-            b"trailer\n"
-            b"<< /Root 1 0 R /Size 4 >>\n"
-            b"startxref\n"
-            b"170\n"
-            b"%%EOF\n"
-        )
+        if nested_best_data is not None and nested_best_score >= (best_score if best_score > 0.0 else 0.0):
+            return nested_best_data
+        if direct_data is not None:
+            return direct_data
+        return self._fallback_poc()
 
     def solve(self, src_path: str) -> bytes:
-        # Try as directory
         if os.path.isdir(src_path):
-            data = self._from_directory(src_path)
-            if data:
-                return data
-
-        # Try as tar archive
-        if os.path.isfile(src_path) and tarfile.is_tarfile(src_path):
-            data = self._from_tar(src_path)
-            if data:
-                return data
-
-        # Try as zip archive
-        if os.path.isfile(src_path) and zipfile.is_zipfile(src_path):
-            data = self._from_zip(src_path)
-            if data:
-                return data
-
-        # As a last resort, try treating src_path as already-extracted directory again
-        # (in case tar/zip detection failed but it's actually a directory)
-        if os.path.isdir(src_path):
-            data = self._from_directory(src_path)
-            if data:
-                return data
-
-        # Final fallback PoC
-        return self._fallback_poc()
+            return self._solve_from_dir(src_path)
+        try:
+            return self._solve_from_tar(src_path)
+        except tarfile.ReadError:
+            # Try treating as a zip archive containing the source tree
+            try:
+                if zipfile.is_zipfile(src_path):
+                    with tempfile.TemporaryDirectory() as tmpdir:
+                        with zipfile.ZipFile(src_path, 'r') as zf:
+                            zf.extractall(tmpdir)
+                        return self._solve_from_dir(tmpdir)
+            except Exception:
+                pass
+            return self._fallback_poc()

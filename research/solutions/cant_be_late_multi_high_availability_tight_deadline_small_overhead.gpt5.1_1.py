@@ -6,20 +6,15 @@ from sky_spot.utils import ClusterType
 
 
 class Solution(MultiRegionStrategy):
-    """Your multi-region scheduling strategy."""
+    """Multi-region scheduling strategy that prioritizes cheap Spot instances
+    while guaranteeing completion before the deadline by switching to On-Demand
+    when necessary.
+    """
 
-    NAME = "my_strategy"  # REQUIRED: unique identifier
+    NAME = "cant_be_late_v1"
 
     def solve(self, spec_path: str) -> "Solution":
-        """
-        Initialize the solution from spec_path config.
-
-        The spec file contains:
-        - deadline: deadline in hours
-        - duration: task duration in hours
-        - overhead: restart overhead in hours
-        - trace_files: list of trace file paths (one per region)
-        """
+        """Initialize the solution from spec_path config."""
         with open(spec_path) as f:
             config = json.load(f)
 
@@ -28,110 +23,123 @@ class Solution(MultiRegionStrategy):
             task_duration_hours=[float(config["duration"])],
             restart_overhead_hours=[float(config["overhead"])],
             inter_task_overhead=[0.0],
-            trace_files=config.get("trace_files", []),
         )
         super().__init__(args)
 
-        # Internal state for tracking progress efficiently.
-        self._strategy_initialized = False
+        # Internal state for incremental progress tracking
+        self._progress_sec = 0.0
+        self._last_task_done_count = 0
+
+        # Whether we've irrevocably switched to only using On-Demand
+        self._committed_to_ondemand = False
+        self._commit_time = None
         return self
 
-    def _initialize_internal_state(self):
-        """Lazily initialize internal state needed for the strategy."""
-        if self._strategy_initialized:
+    @staticmethod
+    def _scalar(value):
+        """Convert a possibly list-valued attribute into a scalar float."""
+        if isinstance(value, (list, tuple)):
+            if not value:
+                return 0.0
+            return float(value[0])
+        return float(value)
+
+    def _update_progress(self):
+        """Incrementally update cached progress from task_done_time."""
+        td_list = getattr(self, "task_done_time", None)
+
+        # Handle None or empty list
+        if not td_list:
+            # If previously non-zero, reset to actual (which is zero here)
+            self._progress_sec = 0.0
+            self._last_task_done_count = 0
             return
-        self._strategy_initialized = True
 
-        # Determine the correct enum member for "no cluster".
-        none_attr = None
-        if hasattr(ClusterType, "NONE"):
-            none_attr = ClusterType.NONE
-        elif hasattr(ClusterType, "None"):
-            none_attr = getattr(ClusterType, "None")
-        else:
-            # Fallback: take the first enum member (should rarely be needed).
-            try:
-                none_attr = list(ClusterType)[0]
-            except Exception:
-                none_attr = None
-        self._none_cluster_type = none_attr
+        current_len = len(td_list)
 
-        # Once we commit to on-demand, we never go back to spot.
-        self._force_on_demand = False
+        # List shrank unexpectedly (very rare): recompute from scratch
+        if current_len < self._last_task_done_count:
+            total = 0.0
+            for v in td_list:
+                if isinstance(v, (list, tuple)):
+                    for inner in v:
+                        total += float(inner)
+                else:
+                    total += float(v)
+            self._progress_sec = total
+            self._last_task_done_count = current_len
+            return
 
-        # Track cumulative work done without recomputing sum(task_done_time)
-        # on every step (which would be O(n^2)).
-        segments = getattr(self, "task_done_time", [])
-        self._last_task_segments_len = len(segments)
-        self._work_done = float(sum(segments)) if segments else 0.0
-
-    def _update_work_done(self):
-        """Update cached total work done using new task_done_time segments."""
-        segments = self.task_done_time
-        current_len = len(segments)
-        if current_len > self._last_task_segments_len:
-            new_segments = segments[self._last_task_segments_len:current_len]
-            if new_segments:
-                self._work_done += float(sum(new_segments))
-            self._last_task_segments_len = current_len
+        # New segments appended: accumulate only the new ones
+        if current_len > self._last_task_done_count:
+            total_new = 0.0
+            for v in td_list[self._last_task_done_count:current_len]:
+                if isinstance(v, (list, tuple)):
+                    for inner in v:
+                        total_new += float(inner)
+                else:
+                    total_new += float(v)
+            self._progress_sec += total_new
+            self._last_task_done_count = current_len
 
     def _step(self, last_cluster_type: ClusterType, has_spot: bool) -> ClusterType:
-        """
-        Decide next action based on current state.
+        """Decide next action: Spot, On-Demand, or None."""
+        # Defensive initialization in case solve() wasn't called (shouldn't happen)
+        if not hasattr(self, "_progress_sec"):
+            self._progress_sec = 0.0
+            self._last_task_done_count = 0
+            self._committed_to_ondemand = False
+            self._commit_time = None
 
-        Returns: ClusterType.SPOT, ClusterType.ON_DEMAND, or ClusterType.NONE
-        """
-        # Ensure internal fields are ready.
-        self._initialize_internal_state()
-        self._update_work_done()
+        # Update progress based on environment-reported completed segments
+        self._update_progress()
+        progress = self._progress_sec
 
-        # Basic quantities (in seconds).
-        gap = self.env.gap_seconds
-        t = self.env.elapsed_seconds
-        time_left = self.deadline - t
-        remaining_work = max(self.task_duration - self._work_done, 0.0)
-        overhead = self.restart_overhead
+        # Convert environment parameters to scalar seconds
+        task_duration = self._scalar(getattr(self, "task_duration", 0.0))
+        deadline = self._scalar(getattr(self, "deadline", 0.0))
+        restart_overhead = self._scalar(getattr(self, "restart_overhead", 0.0))
+        gap_seconds = float(getattr(self.env, "gap_seconds", 0.0))
+        elapsed_seconds = float(getattr(self.env, "elapsed_seconds", 0.0))
 
-        # If task is already complete, don't run anything.
+        remaining_work = max(task_duration - progress, 0.0)
+        time_left = deadline - elapsed_seconds
+
+        # If task already completed, do nothing.
         if remaining_work <= 0.0:
-            return (
-                self._none_cluster_type
-                if self._none_cluster_type is not None
-                else ClusterType.ON_DEMAND
-            )
+            return ClusterType.NONE
 
-        # If we've already decided to stick with on-demand, do so.
-        if self._force_on_demand:
+        # If we've already committed to On-Demand, always use it.
+        if self._committed_to_ondemand:
             return ClusterType.ON_DEMAND
 
-        # If there is effectively no time left, we can only try on-demand.
+        # If somehow past the deadline, just finish as cheaply as possible.
         if time_left <= 0.0:
-            self._force_on_demand = True
-            return ClusterType.ON_DEMAND
-
-        # If even immediate on-demand can't finish in time, still choose it
-        # (we've already missed the deadline, but this is best effort).
-        if time_left <= remaining_work + overhead:
-            self._force_on_demand = True
-            return ClusterType.ON_DEMAND
-
-        # Decide whether we can safely risk one more step with zero progress
-        # (e.g., due to spot unavailability or preemption).
-        #
-        # After waiting one more step (gap seconds) with zero progress, we must
-        # still have enough time to finish on pure on-demand:
-        #   (time_left - gap) >= remaining_work + overhead
-        if time_left - gap >= remaining_work + overhead:
-            # Safe to risk this step.
+            # This case should be rare; deadline miss penalty is already incurred.
             if has_spot:
                 return ClusterType.SPOT
-            # No spot: idle to avoid unnecessary cost, since we're still early.
-            return (
-                self._none_cluster_type
-                if self._none_cluster_type is not None
-                else ClusterType.ON_DEMAND
-            )
+            return ClusterType.ON_DEMAND
 
-        # Not safe to risk losing another gap of time; commit to on-demand.
-        self._force_on_demand = True
-        return ClusterType.ON_DEMAND
+        # Safety buffer to account for discrete time steps and minor modeling errors.
+        # We choose a conservative buffer: at least one step or one restart_overhead.
+        safety_buffer = max(gap_seconds, restart_overhead)
+
+        # Assume switching to On-Demand will cost at most one restart_overhead from now.
+        overhead_to_ondemand = restart_overhead
+
+        # Guarantee-feasible commit rule:
+        # If the remaining time is no more than the time needed to finish entirely on
+        # On-Demand (remaining_work + overhead) plus a small buffer, we must switch
+        # now to ensure we finish before the deadline in the worst case.
+        if time_left <= remaining_work + overhead_to_ondemand + safety_buffer:
+            self._committed_to_ondemand = True
+            self._commit_time = elapsed_seconds
+            return ClusterType.ON_DEMAND
+
+        # In the "early" phase we prioritize cost:
+        # - Use Spot whenever it's available.
+        # - Otherwise, pause (NONE) and rely on future Spot or eventual On-Demand commit.
+        if has_spot:
+            return ClusterType.SPOT
+        else:
+            return ClusterType.NONE

@@ -1,137 +1,169 @@
-import os
-import sys
-import inspect
-
-import torch
-import triton
-import triton.language as tl
-
-
-@triton.autotune(
-    configs=[
-        triton.Config({"BLOCK_SIZE": 64}, num_warps=2),
-        triton.Config({"BLOCK_SIZE": 128}, num_warps=4),
-        triton.Config({"BLOCK_SIZE": 256}, num_warps=4),
-        triton.Config({"BLOCK_SIZE": 512}, num_warps=8),
-        triton.Config({"BLOCK_SIZE": 1024}, num_warps=8),
-    ],
-    key=["N"],
-)
-@triton.jit
-def _cross_entropy_kernel(
-    logits_ptr,
-    targets_ptr,
-    output_ptr,
-    M,
-    N,
-    stride_m,
-    stride_n,
-    BLOCK_SIZE: tl.constexpr,
-):
-    pid = tl.program_id(axis=0)
-    if pid >= M:
-        return
-
-    # Base pointer for this row
-    row_logits_ptr = logits_ptr + pid * stride_m
-
-    # Load target index for this row
-    tgt = tl.load(targets_ptr + pid)
-    tgt = tgt.to(tl.int64)
-    tgt = tgt.to(tl.int32)
-
-    # Load logit of the target class (original value, not shifted)
-    target_logit = tl.load(row_logits_ptr + tgt * stride_n).to(tl.float32)
-
-    # Streaming log-sum-exp across the row
-    offsets = tl.arange(0, BLOCK_SIZE)
-    neg_inf = -float("inf")
-    max_val = tl.full((), neg_inf, dtype=tl.float32)
-    sum_exp = tl.zeros((), dtype=tl.float32)
-
-    for start in range(0, N, BLOCK_SIZE):
-        cols = start + offsets
-        mask = cols < N
-        ptrs = row_logits_ptr + cols * stride_n
-        x = tl.load(ptrs, mask=mask, other=neg_inf).to(tl.float32)
-
-        tile_max = tl.max(x, axis=0)
-        x_minus_tile_max = x - tile_max
-        tile_exp = tl.exp(x_minus_tile_max)
-        tile_sum = tl.sum(tile_exp, axis=0)
-
-        new_max = tl.maximum(max_val, tile_max)
-        # Combine previous and current tile contributions in a numerically stable way
-        sum_exp = sum_exp * tl.exp(max_val - new_max) + tile_sum * tl.exp(tile_max - new_max)
-        max_val = new_max
-
-    logsumexp = max_val + tl.log(sum_exp)
-    loss = logsumexp - target_logit
-
-    tl.store(output_ptr + pid, loss)
-
-
-def cross_entropy(logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
-    """
-    Cross entropy loss computation using a Triton kernel.
-
-    Args:
-        logits: Tensor of shape (M, N) on CUDA device
-        targets: Tensor of shape (M,) with int64 class indices
-
-    Returns:
-        Tensor of shape (M,) with float32 per-sample losses
-    """
-    if not isinstance(logits, torch.Tensor) or not isinstance(targets, torch.Tensor):
-        raise TypeError("logits and targets must be torch.Tensors")
-
-    if logits.dim() != 2:
-        raise ValueError("logits must be a 2D tensor of shape (M, N)")
-    if targets.dim() != 1:
-        raise ValueError("targets must be a 1D tensor of shape (M,)")
-
-    M, N = logits.shape
-    if targets.shape[0] != M:
-        raise ValueError("targets length must match batch size of logits (M)")
-
-    # CPU fallback
-    if logits.device.type != "cuda":
-        log_probs = torch.nn.functional.log_softmax(logits, dim=-1)
-        loss = -log_probs[torch.arange(M, device=targets.device), targets]
-        return loss.to(torch.float32)
-
-    if targets.device != logits.device:
-        targets = targets.to(logits.device)
-
-    logits_contig = logits  # we rely on explicit strides, no need to make contiguous
-    stride_m, stride_n = logits_contig.stride()
-
-    output = torch.empty((M,), device=logits_contig.device, dtype=torch.float32)
-
-    grid = (M,)
-
-    _cross_entropy_kernel[grid](
-        logits_contig,
-        targets,
-        output,
-        M,
-        N,
-        stride_m,
-        stride_n,
-    )
-
-    return output
+import textwrap
 
 
 class Solution:
     def solve(self, spec_path: str = None) -> dict:
-        # Prefer returning a file path if available
-        try:
-            path = os.path.abspath(__file__)
-            if os.path.exists(path):
-                return {"program_path": path}
-        except NameError:
-            pass
-        # Fallback: return the current module's source code
-        src = inspect.getsource(sys.modules[__name__])
-        return {"code": src}
+        code = textwrap.dedent(
+            """
+            import torch
+            import triton
+            import triton.language as tl
+
+            MAX_BLOCK_SIZE = 8192
+
+
+            @triton.autotune(
+                configs=[
+                    triton.Config({}, num_warps=4, num_stages=1),
+                    triton.Config({}, num_warps=8, num_stages=1),
+                    triton.Config({}, num_warps=4, num_stages=2),
+                    triton.Config({}, num_warps=8, num_stages=2),
+                    triton.Config({}, num_warps=16, num_stages=2),
+                ],
+                key=["M", "N"],
+            )
+            @triton.jit
+            def _cross_entropy_kernel(
+                logits_ptr,
+                targets_ptr,
+                output_ptr,
+                M,
+                N,
+                stride_logits_m,
+                stride_logits_n,
+                stride_targets,
+                stride_output,
+                BLOCK_SIZE: tl.constexpr,
+            ):
+                row_id = tl.program_id(0)
+
+                # Pointers for this row
+                row_logits_ptr = logits_ptr + row_id * stride_logits_m
+
+                # Column indices
+                col_offsets = tl.arange(0, BLOCK_SIZE)
+                mask = col_offsets < N
+
+                # Load logits for this row
+                logits = tl.load(
+                    row_logits_ptr + col_offsets * stride_logits_n,
+                    mask=mask,
+                    other=-float("inf"),
+                )
+
+                # Compute max for numerical stability
+                row_max = tl.max(logits, axis=0)
+                logits = logits - row_max
+
+                # Compute log-sum-exp denominator: log(sum_j exp(logits_j - max))
+                exp_logits = tl.exp(logits)
+                denom = tl.sum(exp_logits, axis=0)
+                log_denom = tl.log(denom)
+
+                # Load target index for this row
+                target_index = tl.load(targets_ptr + row_id * stride_targets)
+                target_index = target_index.to(tl.int32)
+
+                # Extract centered logit at target index: logits[target] - row_max
+                is_target = col_offsets == target_index
+                x_t_centered = tl.sum(tl.where(is_target, logits, 0.0), axis=0)
+
+                # loss = log_sum_exp - x_t
+                #     = (log(denom) + row_max) - (x_t_centered + row_max)
+                #     = log(denom) - x_t_centered
+                loss = log_denom - x_t_centered
+
+                tl.store(output_ptr + row_id * stride_output, loss)
+
+
+            def cross_entropy(logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+                """
+                Cross entropy loss computation using a Triton kernel.
+
+                Args:
+                    logits: Tensor of shape (M, N), float16/bfloat16/float32, on CUDA.
+                    targets: Tensor of shape (M,), int64/int32, on CUDA.
+
+                Returns:
+                    Tensor of shape (M,), float32, per-sample negative log-likelihood.
+                """
+                if logits.ndim != 2:
+                    raise ValueError(f"logits must be 2D, got shape {tuple(logits.shape)}")
+                if targets.ndim != 1:
+                    raise ValueError(f"targets must be 1D, got shape {tuple(targets.shape)}")
+                if logits.shape[0] != targets.shape[0]:
+                    raise ValueError(
+                        f"Batch size mismatch: logits.shape[0]={logits.shape[0]} "
+                        f"vs targets.shape[0]={targets.shape[0]}"
+                    )
+
+                M, N = logits.shape
+
+                # Fallback for non-CUDA tensors or mismatched devices
+                if logits.device.type != "cuda" or targets.device.type != "cuda":
+                    device = logits.device
+                    targets_dev = targets.to(device=device, non_blocking=True)
+                    log_probs = torch.log_softmax(logits, dim=-1)
+                    idx = torch.arange(M, device=device)
+                    loss = -log_probs[idx, targets_dev]
+                    return loss.to(torch.float32)
+
+                if targets.dtype not in (torch.int64, torch.int32):
+                    raise TypeError(
+                        f"targets must be int64 or int32, got dtype {targets.dtype}"
+                    )
+
+                if logits.dtype not in (torch.float16, torch.bfloat16, torch.float32):
+                    raise TypeError(
+                        f"logits must be float16, bfloat16, or float32, got dtype {logits.dtype}"
+                    )
+
+                # Upcast logits to float32 for numeric stability
+                if logits.dtype != torch.float32:
+                    logits_fp32 = logits.to(torch.float32)
+                else:
+                    logits_fp32 = logits
+
+                # Handle very large vocab sizes with a safe PyTorch fallback
+                if N > MAX_BLOCK_SIZE:
+                    log_probs = torch.log_softmax(logits_fp32, dim=-1)
+                    idx = torch.arange(M, device=logits_fp32.device)
+                    loss = -log_probs[idx, targets]
+                    return loss
+
+                # Allocate output
+                out = torch.empty((M,), device=logits.device, dtype=torch.float32)
+
+                # Strides in elements
+                stride_logits_m, stride_logits_n = logits_fp32.stride()
+                stride_targets = targets.stride(0)
+                stride_output = out.stride(0)
+
+                if N == 0:
+                    return out.zero_()
+
+                # BLOCK_SIZE: next power of two >= N, capped by MAX_BLOCK_SIZE
+                block_size = 1 << (int(N) - 1).bit_length()
+                if block_size > MAX_BLOCK_SIZE:
+                    block_size = MAX_BLOCK_SIZE  # N <= MAX_BLOCK_SIZE already ensured
+
+                grid = (M,)
+
+                _cross_entropy_kernel[grid](
+                    logits_fp32,
+                    targets,
+                    out,
+                    M,
+                    N,
+                    stride_logits_m,
+                    stride_logits_n,
+                    stride_targets,
+                    stride_output,
+                    BLOCK_SIZE=block_size,
+                )
+
+                return out
+
+            """
+        )
+        return {"code": code}

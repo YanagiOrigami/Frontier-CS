@@ -2,49 +2,67 @@ import numpy as np
 import faiss
 from typing import Tuple
 
-class YourIndexClass:
+class Recall95Index:
     def __init__(self, dim: int, **kwargs):
         """
         Initialize the index for vectors of dimension `dim`.
         
-        We use HNSW (Hierarchical Navigable Small World) graph index which offers 
-        state-of-the-art performance for memory-resident vector search on CPUs.
-        
-        Configuration:
-        - M=32: Number of connections per node. 32 is a robust standard for SIFT1M 
-          that balances graph density and navigation speed.
-        - efConstruction=200: Controls the quality of the graph during build. 
-          Higher values result in a better graph structure, allowing for faster 
-          search times to achieve a given recall. Construction time is not scored.
+        Uses HNSW (Hierarchical Navigable Small World) graph which offers 
+        state-of-the-art performance for high-recall, low-latency search on CPU.
         """
         self.dim = dim
-        self.index = faiss.IndexHNSWFlat(dim, 32, faiss.METRIC_L2)
-        self.index.hnsw.efConstruction = 200
-        
-        # Ensure FAISS utilizes all available cores (8 vCPUs in the evaluation environment)
+        # Explicitly set the number of threads to utilize the 8 vCPUs available
         faiss.omp_set_num_threads(8)
+        
+        # HNSW Hyperparameters
+        # M: Number of neighbors per node in the graph. 
+        # M=32 is a robust sweet spot for SIFT1M (128d), balancing graph density and traversal speed.
+        self.M = kwargs.get('M', 32)
+        
+        # efConstruction: Controls the depth of the search during index construction.
+        # Higher values lead to a higher quality graph (better recall/speed tradeoff later)
+        # at the cost of slower build time. Given the 1h timeout, we can afford 200.
+        self.ef_construction = kwargs.get('ef_construction', 200)
+        
+        # efSearch: Controls the depth of the search during queries.
+        # This is the primary knob for Recall vs Latency.
+        # For SIFT1M with HNSW32, ef=64 typically yields recall > 0.98,
+        # providing a safe margin above the 0.95 requirement while keeping latency < 1ms.
+        self.ef_search = kwargs.get('ef_search', 64)
+        
+        # Initialize Faiss HNSW Index
+        # We use IndexHNSWFlat which stores the full vectors for precise distance calculation
+        self.index = faiss.IndexHNSWFlat(dim, self.M, faiss.METRIC_L2)
+        self.index.hnsw.efConstruction = self.ef_construction
+        self.index.hnsw.efSearch = self.ef_search
 
     def add(self, xb: np.ndarray) -> None:
         """
         Add vectors to the index.
-        HNSW supports efficient batch addition.
         """
+        # Faiss requires C-contiguous float32 arrays
+        if not xb.flags.c_contiguous:
+            xb = np.ascontiguousarray(xb, dtype=np.float32)
+        if xb.dtype != np.float32:
+            xb = xb.astype(np.float32)
+            
         self.index.add(xb)
 
     def search(self, xq: np.ndarray, k: int) -> Tuple[np.ndarray, np.ndarray]:
         """
-        Search for k nearest neighbors.
-        
-        Strategy:
-        - The goal is to minimize latency subject to recall@1 >= 0.95.
-        - On SIFT1M, HNSW (M=32) typically achieves >98% recall with efSearch=64.
-        - efSearch=64 is chosen as a safe parameter that guarantees the recall constraint 
-          is met (avoiding the 0 score penalty) while providing extremely low latency 
-          (typically sub-millisecond per batch), maximizing the latency score.
+        Search for k nearest neighbors of query vectors.
         """
-        # Set search-time exploration factor
-        self.index.hnsw.efSearch = 64
+        # Ensure query vectors are in the correct format
+        if not xq.flags.c_contiguous:
+            xq = np.ascontiguousarray(xq, dtype=np.float32)
+        if xq.dtype != np.float32:
+            xq = xq.astype(np.float32)
+            
+        # Ensure efSearch is set to our target value before searching
+        self.index.hnsw.efSearch = self.ef_search
         
-        # Perform search (returns distances and indices)
+        # Perform batch search
+        # Faiss handles batching and threading internally
         D, I = self.index.search(xq, k)
+        
         return D, I

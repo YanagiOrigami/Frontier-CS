@@ -1,152 +1,142 @@
 import os
 import sys
-import tarfile
 import subprocess
 import shutil
+import tarfile
 import tempfile
 import random
+import glob
 import time
+import concurrent.futures
 
 class Solution:
     def solve(self, src_path: str) -> bytes:
-        """
-        Generate a PoC that triggers the vulnerability.
-        """
         work_dir = tempfile.mkdtemp()
         try:
-            # 1. Extract source code
-            with tarfile.open(src_path) as tar:
-                tar.extractall(path=work_dir)
+            # 1. Extract source
+            if tarfile.is_tarfile(src_path):
+                with tarfile.open(src_path) as tar:
+                    tar.extractall(path=work_dir)
             
-            # Find source root
             src_root = work_dir
-            for root, dirs, files in os.walk(work_dir):
-                if 'Makefile' in files:
-                    src_root = root
-                    break
+            # Find Makefile to determine root
+            makefiles = glob.glob(os.path.join(work_dir, '**', 'Makefile'), recursive=True)
+            if makefiles:
+                makefiles.sort(key=lambda p: len(p.split(os.sep)))
+                src_root = os.path.dirname(makefiles[0])
             
-            # 2. Compile UPX with AddressSanitizer
+            # 2. Compile UPX with ASAN
             env = os.environ.copy()
-            flags = "-fsanitize=address -g -O1"
-            env['CFLAGS'] = flags
+            # ASAN flags for detection
+            flags = "-O1 -g -fsanitize=address -fno-omit-frame-pointer"
             env['CXXFLAGS'] = flags
+            env['CFLAGS'] = flags
             env['LDFLAGS'] = flags
             
-            # Attempt compilation
-            try:
-                subprocess.run(['make', '-j8', 'all'], cwd=src_root, env=env, 
-                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=300)
-            except subprocess.TimeoutExpired:
-                pass
+            # Build
+            subprocess.run(['make', '-j8', 'all'], cwd=src_root, env=env, 
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             
-            # Find the compiled binary
+            # Find compiled binary
             upx_bin = None
-            possible_locs = [
-                os.path.join(src_root, 'src', 'upx.out'),
-                os.path.join(src_root, 'build', 'release', 'upx'),
-                os.path.join(src_root, 'upx.out'),
-                os.path.join(src_root, 'upx')
-            ]
-            
-            for loc in possible_locs:
-                if os.path.exists(loc) and os.access(loc, os.X_OK):
-                    upx_bin = loc
+            candidates = glob.glob(os.path.join(src_root, '**', 'upx*'), recursive=True)
+            for c in candidates:
+                if os.access(c, os.X_OK) and not os.path.isdir(c) and 'test' not in os.path.basename(c):
+                    upx_bin = c
                     break
             
             if not upx_bin:
-                # Fallback search
-                for root, dirs, files in os.walk(src_root):
-                    for f in files:
-                        if f in ['upx', 'upx.out']:
-                            p = os.path.join(root, f)
-                            if os.access(p, os.X_OK):
-                                upx_bin = p
-                                break
-                    if upx_bin: break
+                return b''
+
+            # 3. Create base ELF file
+            base_so = os.path.join(work_dir, 'base.so')
+            c_src = os.path.join(work_dir, 't.c')
+            with open(c_src, 'w') as f:
+                f.write('void f(){}')
             
-            # If compilation failed, return a dummy header to satisfy return type
-            if not upx_bin:
-                return b'\x7fELF' + b'\x00' * 508
-            
-            # 3. Generate a seed (valid UPX packed ELF)
-            # Create a minimal C program
-            src_c = os.path.join(work_dir, 'seed.c')
-            with open(src_c, 'w') as f:
-                f.write('int main() { return 0; }')
-            
-            elf_bin = os.path.join(work_dir, 'seed.elf')
-            subprocess.run(['gcc', src_c, '-o', elf_bin], check=True)
-            
-            packed_bin = os.path.join(work_dir, 'seed.upx')
-            # Pack using the compiled upx
-            subprocess.run([upx_bin, '-1', '-f', '-o', packed_bin, elf_bin],
+            # Try 32-bit first (often smaller and target for this type of bug)
+            # Use strip -s to reduce size towards 512 bytes ground truth
+            subprocess.run(['gcc', '-m32', '-shared', '-fPIC', '-s', '-o', base_so, c_src],
                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             
-            if not os.path.exists(packed_bin):
-                return b'\x7fELF' + b'\x00' * 508
+            if not os.path.exists(base_so):
+                subprocess.run(['gcc', '-shared', '-fPIC', '-s', '-o', base_so, c_src],
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             
-            with open(packed_bin, 'rb') as f:
-                seed_data = bytearray(f.read())
+            if not os.path.exists(base_so):
+                # Fallback
+                with open(base_so, 'wb') as f:
+                    f.write(b'\x7fELF' + b'\x00'*100)
+
+            with open(base_so, 'rb') as f:
+                base_data = f.read()
+
+            # 4. Fuzzing
+            result = []
             
-            # 4. Fuzzing Loop
-            # Target: Crash in decompression (upx -d)
-            # Constraints: Ground truth is 512 bytes (suggests truncation/header issues)
-            
-            start_time = time.time()
-            best_poc = seed_data
-            
-            # We run until we find a crash or run out of time (allocation ~2 mins)
-            while time.time() - start_time < 120:
-                mutation = bytearray(seed_data)
-                
-                # Mutation Strategy
-                # 1. Truncation (High probability due to short ground truth)
-                if len(mutation) > 512 and random.random() < 0.4:
-                    # Truncate to somewhere between 200 and 1000 bytes
-                    cut = random.randint(200, min(len(mutation), 1000))
-                    mutation = mutation[:cut]
-                
-                # 2. Byte corruption (Flip bits/bytes)
-                num_mutations = random.randint(1, 10)
-                for _ in range(num_mutations):
-                    if len(mutation) > 0:
-                        idx = random.randint(0, len(mutation) - 1)
-                        mutation[idx] = random.randint(0, 255)
-                
-                # Write candidate
-                cand_path = os.path.join(work_dir, 'cand')
-                with open(cand_path, 'wb') as f:
-                    f.write(mutation)
-                
-                # Run Test
-                try:
-                    # -d: decompress, -o /dev/null: discard output
-                    proc = subprocess.run(
-                        [upx_bin, '-d', '-o', '/dev/null', cand_path],
-                        stdout=subprocess.DEVNULL,
-                        stderr=subprocess.PIPE,
-                        timeout=0.5
-                    )
+            def fuzz(wid):
+                t_start = time.time()
+                # Run for up to 60 seconds
+                while time.time() - t_start < 60:
+                    if result: return
                     
-                    # Check for crash
-                    # ASAN writes to stderr. Return code might be non-zero.
-                    # Signal 11 (SIGSEGV) is crash.
-                    if b"AddressSanitizer" in proc.stderr or proc.returncode == -11:
-                        best_poc = mutation
-                        break
+                    # Mutate base ELF
+                    data = bytearray(base_data)
+                    if len(data) > 4:
+                        # Mutate a few bytes
+                        n = random.randint(1, 5)
+                        for _ in range(n):
+                            # Skip magic bytes
+                            idx = random.randint(4, len(data)-1)
+                            data[idx] = random.randint(0, 255)
+                    
+                    in_f = os.path.join(work_dir, f'i_{wid}.so')
+                    out_f = os.path.join(work_dir, f'o_{wid}.upx')
+                    
+                    with open(in_f, 'wb') as f:
+                        f.write(data)
+                    
+                    # Pack
+                    # Use --force to pack even if UPX thinks it's suspicious
+                    p = subprocess.run([upx_bin, '--force', '-o', out_f, in_f],
+                                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10)
+                    
+                    if p.returncode == 0 and os.path.exists(out_f):
+                        # Unpack / Test
+                        # -d triggers full decompression and un_DT_INIT
+                        u = subprocess.run([upx_bin, '-d', '-o', '/dev/null', out_f],
+                                           stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=10)
                         
-                except subprocess.TimeoutExpired:
-                    pass
-                except Exception:
-                    pass
-                finally:
-                    if os.path.exists(cand_path):
-                        os.remove(cand_path)
+                        # Check for crash (ASAN or Segfault)
+                        is_crash = False
+                        if u.returncode == 139 or u.returncode == -11:
+                            is_crash = True
+                        elif u.returncode != 0:
+                            err = u.stderr.decode(errors='ignore')
+                            if "AddressSanitizer" in err or "segmentation fault" in err.lower():
+                                is_crash = True
+                        
+                        if is_crash:
+                            result.append(out_f)
+                            return
+                    
+                    # Cleanup
+                    try:
+                        if os.path.exists(in_f): os.remove(in_f)
+                        if os.path.exists(out_f): os.remove(out_f)
+                    except: pass
             
-            return bytes(best_poc)
+            # Parallel fuzzing
+            with concurrent.futures.ThreadPoolExecutor(max_workers=8) as exc:
+                exc.map(fuzz, range(8))
             
-        except Exception as e:
-            # Fallback in case of environment errors
-            return b'\x7fELF' + b'\x00' * 508
+            if result:
+                with open(result[0], 'rb') as f:
+                    return f.read()
+            
+            return b''
+
+        except Exception:
+            return b''
         finally:
-            shutil.rmtree(work_dir)
+            shutil.rmtree(work_dir, ignore_errors=True)

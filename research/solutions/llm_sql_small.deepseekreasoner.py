@@ -1,45 +1,13 @@
 import pandas as pd
 import numpy as np
-from typing import List, Tuple, Dict
 from collections import defaultdict
+from itertools import permutations, combinations
 import time
-import math
-from multiprocessing import Pool, cpu_count
-import itertools
-
-class TrieNode:
-    __slots__ = ('children', 'count')
-    def __init__(self):
-        self.children = {}
-        self.count = 0
-
-class Trie:
-    def __init__(self):
-        self.root = TrieNode()
-    
-    def insert(self, word: str) -> None:
-        node = self.root
-        for ch in word:
-            if ch not in node.children:
-                node.children[ch] = TrieNode()
-            node = node.children[ch]
-            node.count += 1
-    
-    def total_common_prefix_length(self) -> int:
-        total = 0
-        stack = [self.root]
-        while stack:
-            node = stack.pop()
-            for child in node.children.values():
-                if child.count > 1:
-                    total += child.count * (child.count - 1) // 2
-                stack.append(child)
-        return total
+from concurrent.futures import ProcessPoolExecutor, as_completed
+import multiprocessing as mp
+from functools import partial
 
 class Solution:
-    def __init__(self):
-        self.cached_strings = {}
-    
     def solve(
         self,
         df: pd.DataFrame,
@@ -51,206 +19,246 @@ class Solution:
         distinct_value_threshold: float = 0.7,
         parallel: bool = True,
     ) -> pd.DataFrame:
+        
+        # Start timing
         start_time = time.time()
         
-        # Step 1: Apply column merges
-        if col_merge is not None:
-            df = df.copy()
-            for group in col_merge:
-                if len(group) > 1:
-                    # Merge columns in the group
-                    merged_col = df[group[0]].astype(str)
-                    for col in group[1:]:
-                        merged_col += df[col].astype(str)
-                    df[group[0]] = merged_col
-                    df = df.drop(columns=group[1:])
+        # Apply column merges if specified
+        if col_merge:
+            df = self._apply_column_merges(df, col_merge)
         
-        # If only one column, return as is
+        # If DataFrame is empty or has only 1 column, return as is
         if len(df.columns) <= 1:
             return df
         
-        # Step 2: Preprocess data
+        # Get column names
         columns = list(df.columns)
-        M = len(columns)
+        m = len(columns)
         
-        # Convert all values to strings and cache
-        str_data = {}
-        for col in columns:
-            str_data[col] = df[col].astype(str).values
+        # Convert DataFrame to string matrix
+        str_matrix = df.astype(str).values
         
-        # Step 3: Compute column scores based on common prefix length
-        scores = {}
-        N = len(df)
-        for col in columns:
-            trie = Trie()
-            for val in str_data[col]:
-                trie.insert(val)
-            total_lcp = trie.total_common_prefix_length()
-            if N > 1:
-                score = total_lcp / (N * (N - 1) / 2)
+        # If m is small, try all permutations
+        if m <= 6:
+            best_order, _ = self._exact_search(str_matrix, columns)
+        else:
+            # Use heuristic search for larger m
+            if parallel and m > 3:
+                best_order = self._parallel_heuristic_search(str_matrix, columns, 
+                                                            early_stop, row_stop)
             else:
-                score = 0
-            scores[col] = score
+                best_order = self._heuristic_search(str_matrix, columns, 
+                                                   early_stop, row_stop)
         
-        # Step 4: Initial permutation - sort by score descending
-        sorted_cols = sorted(columns, key=lambda x: scores[x], reverse=True)
+        # Reorder DataFrame columns
+        result = df[best_order]
         
-        # Step 5: Evaluate initial permutation
-        best_perm = sorted_cols
-        best_score = self._evaluate_permutation(str_data, best_perm, df)
+        # Check runtime constraint
+        elapsed = time.time() - start_time
+        if elapsed > 10.0:
+            # Fallback to original order if timeout
+            return df
         
-        # Step 6: Local search with adjacent swaps
-        if M > 1 and early_stop > 0:
-            current_perm = best_perm.copy()
-            current_score = best_score
+        return result
+    
+    def _apply_column_merges(self, df: pd.DataFrame, col_merge: list) -> pd.DataFrame:
+        """Merge columns as specified in col_merge list."""
+        result_df = df.copy()
+        
+        for merge_group in col_merge:
+            if not all(col in result_df.columns for col in merge_group):
+                continue
             
-            # Create subset for faster evaluation
-            subset_size = min(row_stop * 1000, N)  # Use row_stop as multiplier
-            if subset_size < N:
-                indices = np.random.choice(N, size=subset_size, replace=False)
-                subset_data = {}
-                for col in columns:
-                    subset_data[col] = str_data[col][indices]
-            else:
-                subset_data = str_data
+            # Create merged column
+            merged_name = f"merged_{'_'.join(merge_group)}"
+            merged_values = []
             
-            iterations = 0
-            improved = True
+            for idx in range(len(result_df)):
+                row_values = [str(result_df.iloc[idx][col]) for col in merge_group]
+                merged_values.append(''.join(row_values))
             
-            while improved and iterations < early_stop:
-                improved = False
-                
-                # Generate all adjacent swaps
-                swaps = []
-                for i in range(M-1):
-                    new_perm = current_perm.copy()
-                    new_perm[i], new_perm[i+1] = new_perm[i+1], new_perm[i]
-                    swaps.append(new_perm)
-                
-                # Evaluate swaps
-                swap_scores = []
-                if parallel and len(swaps) > 1:
-                    with Pool(min(cpu_count(), len(swaps))) as pool:
-                        args = [(subset_data, perm) for perm in swaps]
-                        swap_scores = pool.starmap(self._evaluate_permutation_subset, args)
-                else:
-                    for perm in swaps:
-                        score = self._evaluate_permutation_subset(subset_data, perm)
-                        swap_scores.append(score)
-                
-                # Find best swap
-                best_idx = np.argmax(swap_scores)
-                best_swap_score = swap_scores[best_idx]
-                
-                if best_swap_score > current_score + 1e-12:
-                    current_perm = swaps[best_idx]
-                    current_score = best_swap_score
-                    improved = True
-                    iterations += M - 1
+            # Add merged column
+            result_df[merged_name] = merged_values
+            
+            # Remove original columns
+            result_df = result_df.drop(columns=merge_group)
+        
+        return result_df
+    
+    def _exact_search(self, matrix: np.ndarray, columns: list):
+        """Try all permutations for small number of columns."""
+        m = len(columns)
+        best_score = -1
+        best_order = None
+        
+        for perm in permutations(range(m)):
+            order = [columns[i] for i in perm]
+            score = self._evaluate_order(matrix, perm)
+            if score > best_score:
+                best_score = score
+                best_order = order
+        
+        return best_order, best_score
+    
+    def _heuristic_search(self, matrix: np.ndarray, columns: list,
+                         early_stop: int, row_stop: int):
+        """Heuristic search for column ordering."""
+        m = len(columns)
+        
+        # Start with random order
+        current_order = list(range(m))
+        np.random.shuffle(current_order)
+        current_score = self._evaluate_order(matrix, current_order)
+        
+        # Local search with swaps
+        improved = True
+        iteration = 0
+        
+        while improved and iteration < 100:
+            improved = False
+            iteration += 1
+            
+            # Try all pairwise swaps
+            for i in range(m):
+                for j in range(i + 1, m):
+                    if iteration > 50 and np.random.random() > 0.7:
+                        continue  # Early stopping for later iterations
                     
-                    # Evaluate on full dataset
-                    full_score = self._evaluate_permutation(str_data, current_perm, df)
-                    if full_score > best_score + 1e-12:
-                        best_perm = current_perm.copy()
-                        best_score = full_score
+                    new_order = current_order.copy()
+                    new_order[i], new_order[j] = new_order[j], new_order[i]
+                    
+                    new_score = self._evaluate_order(matrix, new_order)
+                    
+                    if new_score > current_score:
+                        current_score = new_score
+                        current_order = new_order
+                        improved = True
+                        break
+                if improved:
+                    break
+        
+        # Convert back to column names
+        return [columns[i] for i in current_order]
+    
+    def _parallel_heuristic_search(self, matrix: np.ndarray, columns: list,
+                                  early_stop: int, row_stop: int):
+        """Parallel version of heuristic search."""
+        m = len(columns)
+        n_workers = min(mp.cpu_count(), 8)
+        
+        # Generate multiple starting points
+        n_starts = min(20, 2 ** m)
+        starts = []
+        
+        for _ in range(n_starts):
+            order = list(range(m))
+            np.random.shuffle(order)
+            starts.append(order)
+        
+        # Evaluate in parallel
+        with ProcessPoolExecutor(max_workers=n_workers) as executor:
+            futures = []
+            for start_order in starts:
+                future = executor.submit(self._optimize_order, matrix, start_order.copy())
+                futures.append(future)
+            
+            best_score = -1
+            best_order = None
+            
+            for future in as_completed(futures):
+                order, score = future.result()
+                if score > best_score:
+                    best_score = score
+                    best_order = order
+        
+        # Convert back to column names
+        return [columns[i] for i in best_order]
+    
+    def _optimize_order(self, matrix: np.ndarray, start_order: list):
+        """Optimize a single starting order."""
+        m = len(start_order)
+        current_order = start_order.copy()
+        current_score = self._evaluate_order(matrix, current_order)
+        
+        improved = True
+        iteration = 0
+        
+        while improved and iteration < 50:
+            improved = False
+            iteration += 1
+            
+            # Try all pairwise swaps
+            for i in range(m):
+                for j in range(i + 1, m):
+                    if iteration > 25 and np.random.random() > 0.5:
+                        continue
+                    
+                    new_order = current_order.copy()
+                    new_order[i], new_order[j] = new_order[j], new_order[i]
+                    
+                    new_score = self._evaluate_order(matrix, new_order)
+                    
+                    if new_score > current_score:
+                        current_score = new_score
+                        current_order = new_order
+                        improved = True
+                        break
+                if improved:
+                    break
+        
+        return current_order, current_score
+    
+    def _evaluate_order(self, matrix: np.ndarray, order: list) -> float:
+        """Evaluate the hit rate for a given column order."""
+        n = len(matrix)
+        if n == 0:
+            return 0.0
+        
+        # Build strings in the given order
+        strings = []
+        total_length = 0
+        
+        for i in range(n):
+            row_str = ''.join(str(matrix[i][j]) for j in order)
+            strings.append(row_str)
+            total_length += len(row_str)
+        
+        if total_length == 0:
+            return 0.0
+        
+        # Calculate hit rate
+        lcp_sum = 0
+        
+        # Use a trie-like structure for efficient LCP calculation
+        root = {}
+        
+        for i in range(n):
+            if i == 0:
+                # Build trie for first string
+                node = root
+                for ch in strings[0]:
+                    if ch not in node:
+                        node[ch] = {}
+                    node = node[ch]
+                continue
+            
+            # Find LCP with previous strings using trie
+            s = strings[i]
+            node = root
+            lcp = 0
+            
+            for ch in s:
+                if ch in node:
+                    lcp += 1
+                    node = node[ch]
                 else:
+                    # Add new path to trie
+                    temp_node = node
+                    for ch2 in s[lcp:]:
+                        temp_node[ch2] = {}
+                        temp_node = temp_node[ch2]
                     break
             
-            # Additional optimization: try random permutations if time permits
-            remaining_iterations = early_stop - iterations
-            if remaining_iterations > 0 and M > 2:
-                num_random = min(remaining_iterations, 1000)
-                for _ in range(num_random):
-                    perm = np.random.permutation(columns).tolist()
-                    score = self._evaluate_permutation_subset(subset_data, perm)
-                    if score > current_score + 1e-12:
-                        current_perm = perm
-                        current_score = score
-                        # Evaluate on full dataset
-                        full_score = self._evaluate_permutation(str_data, current_perm, df)
-                        if full_score > best_score + 1e-12:
-                            best_perm = current_perm.copy()
-                            best_score = full_score
+            lcp_sum += lcp
         
-        # Ensure we don't exceed time limit
-        if time.time() - start_time > 9.5:  # Leave some margin
-            print("Warning: approaching time limit")
-        
-        # Return reordered DataFrame
-        return df[best_perm]
-    
-    def _evaluate_permutation(self, str_data: Dict[str, np.ndarray], 
-                             perm: List[str], df: pd.DataFrame) -> float:
-        """Evaluate permutation on full dataset."""
-        N = len(next(iter(str_data.values())))
-        if N == 0:
-            return 0.0
-        
-        # Build concatenated strings
-        strings = []
-        for i in range(N):
-            parts = []
-            for col in perm:
-                parts.append(str_data[col][i])
-            strings.append(''.join(parts))
-        
-        # Compute hit rate using trie
-        total_lcp = 0
-        total_len = 0
-        trie = Trie()
-        
-        for s in strings:
-            # Find LCP with existing strings
-            node = trie.root
-            lcp = 0
-            for ch in s:
-                if ch in node.children:
-                    node = node.children[ch]
-                    lcp += 1
-                else:
-                    break
-            total_lcp += lcp
-            total_len += len(s)
-            # Insert into trie
-            trie.insert(s)
-        
-        if total_len == 0:
-            return 0.0
-        return total_lcp / total_len
-    
-    def _evaluate_permutation_subset(self, str_data: Dict[str, np.ndarray],
-                                    perm: List[str]) -> float:
-        """Evaluate permutation on subset data (faster)."""
-        N = len(next(iter(str_data.values())))
-        if N == 0:
-            return 0.0
-        
-        # Build concatenated strings
-        strings = []
-        for i in range(N):
-            parts = []
-            for col in perm:
-                parts.append(str_data[col][i])
-            strings.append(''.join(parts))
-        
-        # Compute hit rate using trie
-        total_lcp = 0
-        total_len = 0
-        trie = Trie()
-        
-        for s in strings:
-            node = trie.root
-            lcp = 0
-            for ch in s:
-                if ch in node.children:
-                    node = node.children[ch]
-                    lcp += 1
-                else:
-                    break
-            total_lcp += lcp
-            total_len += len(s)
-            trie.insert(s)
-        
-        if total_len == 0:
-            return 0.0
-        return total_lcp / total_len
+        return lcp_sum / total_length if total_length > 0 else 0.0

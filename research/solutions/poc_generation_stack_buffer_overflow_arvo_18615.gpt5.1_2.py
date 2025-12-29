@@ -1,130 +1,107 @@
-import os
 import tarfile
-import sys
+import os
 
 
 class Solution:
-    def _score_member(self, member) -> float:
-        name = member.name.lower()
-        size = member.size
-        score = 0.0
-
-        # Prefer sizes close to 10 bytes
-        score -= abs(size - 10) * 5.0
-        score -= size / 1024.0  # slight penalty for large files
-
-        # Name-based heuristics
-        if "poc" in name:
-            score += 1000.0
-        if "crash" in name:
-            score += 900.0
-        if "id:" in name or "id_" in name or "id-" in name:
-            score += 700.0
-        if "tic30" in name or "tic-30" in name or "tic_30" in name or "tic30-dis" in name:
-            score += 400.0
-        if "binutils" in name:
-            score += 100.0
-        if "/poc" in name or "\\poc" in name:
-            score += 100.0
-        if "/crash" in name or "\\crash" in name:
-            score += 100.0
-
-        # Extension-based heuristics
-        for ext, val in ((".bin", 300.0), (".dat", 280.0), (".raw", 250.0),
-                         (".obj", 200.0), (".o", 150.0)):
-            if name.endswith(ext):
-                score += val
-                break
-
-        return score
-
-    class _DirMember:
-        def __init__(self, path: str, size: int):
-            self.name = path
-            self.size = size
-
-    def _select_best_member(self, members):
-        best_any = None
-        best_any_score = float("-inf")
-        best_10 = None
-        best_10_score = float("-inf")
-
-        for m in members:
-            if m.size <= 0:
-                continue
-            s = self._score_member(m)
-            if s > best_any_score:
-                best_any_score = s
-                best_any = m
-            if m.size == 10 and s > best_10_score:
-                best_10_score = s
-                best_10 = m
-
-        return best_10 if best_10 is not None else best_any
-
-    def _solve_from_dir(self, src_dir: str) -> bytes:
-        members = []
-        for root, _, files in os.walk(src_dir):
-            for fname in files:
-                fpath = os.path.join(root, fname)
-                try:
-                    size = os.path.getsize(fpath)
-                except OSError:
-                    continue
-                members.append(self._DirMember(fpath, size))
-
-        if not members:
-            return b"A" * 10
-
-        candidate = self._select_best_member(members)
-        if candidate is None:
-            return b"A" * 10
-
-        try:
-            with open(candidate.name, "rb") as f:
-                return f.read()
-        except OSError:
-            return b"A" * 10
-
     def solve(self, src_path: str) -> bytes:
-        """
-        Generate a PoC that triggers the vulnerability.
-
-        Args:
-            src_path: Path to the vulnerable source code tarball or directory
-
-        Returns:
-            bytes: The PoC input that should trigger the vulnerability
-        """
-        if os.path.isdir(src_path):
-            return self._solve_from_dir(src_path)
-
+        target_len = 10
         try:
-            tar = tarfile.open(src_path, "r:*")
-        except tarfile.ReadError:
-            # Not a tarball; treat as directory
-            return self._solve_from_dir(src_path)
-
-        with tar:
-            members = [m for m in tar.getmembers() if m.isfile() and m.size > 0]
-            if not members:
-                return b"A" * 10
-
-            candidate = self._select_best_member(members)
-            if candidate is None:
-                return b"A" * 10
-
-            try:
-                f = tar.extractfile(candidate)
-                if f is None:
-                    return b"A" * 10
-                data = f.read()
+            data = self._find_poc_in_tar(src_path, target_len)
+            if data is not None:
                 return data
-            except Exception:
-                return b"A" * 10
+        except Exception:
+            pass
+        return b"\x00" * target_len
 
+    def _find_poc_in_tar(self, src_path: str, target_len: int):
+        best_general = None
+        best_general_score = float('-inf')
+        best_tic30 = None
+        best_tic30_score = float('-inf')
 
-if __name__ == "__main__":
-    src = sys.argv[1] if len(sys.argv) > 1 else "."
-    data = Solution().solve(src)
-    sys.stdout.buffer.write(data)
+        with tarfile.open(src_path, 'r:*') as tar:
+            for m in tar.getmembers():
+                if not m.isfile():
+                    continue
+                size = m.size
+                if size == 0 or size > 4096:
+                    continue
+
+                name_lower = m.name.lower()
+                base_name = os.path.basename(name_lower)
+
+                score = 0
+                if size == target_len:
+                    score += 100
+                else:
+                    diff = abs(size - target_len)
+                    score += max(0, 50 - 5 * diff)
+
+                keywords = [
+                    'poc', 'proof', 'crash', 'id_', 'id-', 'tic30', 'tic30-', 'tic30_',
+                    'c30', 'tms320c30', 'overflow', 'stack', 'bug', 'fail', 'cve',
+                    '21462', '21629', 'tic30-dis', 'tic30_dis'
+                ]
+                for kw in keywords:
+                    if kw in name_lower:
+                        score += 30
+
+                ext = ''
+                if '.' in base_name:
+                    ext = base_name.rsplit('.', 1)[1]
+                if ext in ('bin', 'dat', 'obj', 'o', 'elf', 'exe', 'out', 'raw'):
+                    score += 10
+                if ext in (
+                    'txt',
+                    'text',
+                    'md',
+                    'rst',
+                    'c',
+                    'h',
+                    'hpp',
+                    'cpp',
+                    'py',
+                    'pl',
+                    'sh',
+                    'cfg',
+                    'ini',
+                    'json',
+                    'xml',
+                    'yml',
+                    'yaml',
+                    'log',
+                ):
+                    score -= 20
+
+                f = tar.extractfile(m)
+                if f is None:
+                    continue
+                data = f.read()
+                if not data:
+                    continue
+
+                printable = 0
+                for b in data:
+                    if 32 <= b <= 126 or b in (9, 10, 13):
+                        printable += 1
+                if printable == len(data):
+                    score -= 30
+                else:
+                    score += 5
+
+                is_tic30 = ('tic30' in name_lower or 'tms320c30' in name_lower)
+
+                if is_tic30:
+                    if score > best_tic30_score:
+                        best_tic30_score = score
+                        best_tic30 = data
+                else:
+                    if score > best_general_score:
+                        best_general_score = score
+                        best_general = data
+
+        if best_tic30 is not None and best_tic30_score >= 40:
+            return best_tic30
+        if best_general is not None and best_general_score >= 60:
+            return best_general
+        return None

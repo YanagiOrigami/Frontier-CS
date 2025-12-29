@@ -8,7 +8,7 @@ class Solution:
     def solve(self, X: np.ndarray, y: np.ndarray) -> dict:
         model = PySRRegressor(
             niterations=40,
-            binary_operators=["+", "-", "*", "/", "^"],
+            binary_operators=["+", "-", "*", "/"],
             unary_operators=["sin", "cos", "exp", "log"],
             populations=15,
             population_size=33,

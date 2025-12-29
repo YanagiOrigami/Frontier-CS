@@ -2,226 +2,188 @@ import os
 import sys
 import tarfile
 import subprocess
-import tempfile
 import shutil
-import glob
+import tempfile
 import random
 import time
-import concurrent.futures
+import threading
+from concurrent.futures import ThreadPoolExecutor
 
 class Solution:
     def solve(self, src_path: str) -> bytes:
-        # Create a temporary directory for build and execution
-        base_dir = os.getcwd()
+        """
+        Generate a PoC that triggers the heap-use-after-free vulnerability in ots::OTSStream::Write.
+        """
         work_dir = tempfile.mkdtemp()
-        
         try:
-            # Extract the source code
+            # Extract source code
             with tarfile.open(src_path) as tar:
-                # Sanitize extraction paths to prevent traversal
-                def is_within_directory(directory, target):
-                    abs_directory = os.path.abspath(directory)
-                    abs_target = os.path.abspath(target)
-                    prefix = os.path.commonprefix([abs_directory, abs_target])
-                    return prefix == abs_directory
-
-                def safe_extract(tar, path=".", members=None, *, numeric_owner=False):
-                    for member in tar.getmembers():
-                        member_path = os.path.join(path, member.name)
-                        if not is_within_directory(path, member_path):
-                            continue
-                    tar.extractall(path, members, numeric_owner=numeric_owner)
-                
-                safe_extract(tar, work_dir)
-
-            # Identify source root directory
-            src_root = work_dir
-            for item in os.listdir(work_dir):
-                candidate = os.path.join(work_dir, item)
-                if os.path.isdir(candidate):
-                    if os.path.exists(os.path.join(candidate, 'configure.ac')) or \
-                       os.path.exists(os.path.join(candidate, 'meson.build')) or \
-                       os.path.exists(os.path.join(candidate, 'CMakeLists.txt')):
-                        src_root = candidate
-                        break
+                tar.extractall(work_dir)
             
-            # Prepare build environment with AddressSanitizer (ASan)
+            # Locate the source root directory
+            src_root = work_dir
+            for root, dirs, files in os.walk(work_dir):
+                if 'meson.build' in files or 'configure.ac' in files or 'configure' in files:
+                    src_root = root
+                    break
+            
+            # Prepare build environment
+            build_dir = os.path.join(work_dir, 'build_output')
+            os.makedirs(build_dir, exist_ok=True)
+            
             env = os.environ.copy()
             env['CC'] = 'clang'
             env['CXX'] = 'clang++'
-            # -fsanitize=address is crucial to detect Use-After-Free
-            flags = '-fsanitize=address -g -O1'
-            env['CFLAGS'] = flags
-            env['CXXFLAGS'] = flags
-            env['LDFLAGS'] = flags
+            env['CFLAGS'] = '-fsanitize=address -g -O1'
+            env['CXXFLAGS'] = '-fsanitize=address -g -O1'
+            env['LDFLAGS'] = '-fsanitize=address'
             
-            binary_path = None
+            executable = None
+            built = False
             
-            # Strategy 1: Build using Meson
-            if os.path.exists(os.path.join(src_root, 'meson.build')) and shutil.which('meson'):
-                build_dir = os.path.join(src_root, 'build_meson')
+            # Build Strategy 1: Meson
+            if os.path.exists(os.path.join(src_root, 'meson.build')):
                 try:
-                    subprocess.run(['meson', 'setup', build_dir], cwd=src_root, env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
-                    subprocess.run(['ninja', '-C', build_dir], cwd=src_root, env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
-                    
-                    for root, dirs, files in os.walk(build_dir):
-                        if 'ots-sanitize' in files:
-                            candidate = os.path.join(root, 'ots-sanitize')
-                            if os.access(candidate, os.X_OK):
-                                binary_path = candidate
-                                break
+                    subprocess.run(['meson', 'setup', build_dir], cwd=src_root, env=env, 
+                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
+                    subprocess.run(['ninja', '-C', build_dir], env=env, 
+                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
+                    built = True
                 except Exception:
                     pass
-
-            # Strategy 2: Build using Autotools if Meson failed
-            if not binary_path and (os.path.exists(os.path.join(src_root, 'configure.ac')) or os.path.exists(os.path.join(src_root, 'autogen.sh'))):
+            
+            # Build Strategy 2: Autotools / Make
+            if not built:
                 try:
                     if os.path.exists(os.path.join(src_root, 'autogen.sh')):
-                        subprocess.run(['./autogen.sh'], cwd=src_root, env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+                        subprocess.run(['./autogen.sh'], cwd=src_root, env=env, 
+                                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                     
                     if os.path.exists(os.path.join(src_root, 'configure')):
-                        subprocess.run(['./configure'], cwd=src_root, env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
-                        subprocess.run(['make', '-j8'], cwd=src_root, env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
-                        
-                        # Locate binary
-                        for root, dirs, files in os.walk(src_root):
-                            if 'ots-sanitize' in files:
-                                candidate = os.path.join(root, 'ots-sanitize')
-                                if os.access(candidate, os.X_OK):
-                                    binary_path = candidate
-                                    break
+                        subprocess.run(['./configure'], cwd=src_root, env=env, 
+                                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                        subprocess.run(['make', '-j8'], cwd=src_root, env=env, 
+                                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                        built = True
+                    elif os.path.exists(os.path.join(src_root, 'Makefile')):
+                         subprocess.run(['make', '-j8'], cwd=src_root, env=env, 
+                                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                         built = True
                 except Exception:
                     pass
-            
-            # Fallback: Look for any pre-existing or misplaced binary
-            if not binary_path:
-                for root, dirs, files in os.walk(src_root):
-                    if 'ots-sanitize' in files:
-                        candidate = os.path.join(root, 'ots-sanitize')
-                        if os.access(candidate, os.X_OK):
-                            binary_path = candidate
-                            break
-            
-            if not binary_path:
-                return b''
 
-            # Gather seeds for fuzzing
+            # Find the ots-sanitize executable
+            for root, dirs, files in os.walk(work_dir):
+                if 'ots-sanitize' in files:
+                    path = os.path.join(root, 'ots-sanitize')
+                    if os.access(path, os.X_OK):
+                        executable = path
+                        break
+            
+            if not executable:
+                # Fallback if build fails
+                return b'\x00\x01\x00\x00\x00\x00\x00\x00'
+
+            # Collect seed files from the source tree
             seeds = []
-            for root, dirs, files in os.walk(src_root):
+            for root, dirs, files in os.walk(work_dir):
                 for f in files:
                     if f.lower().endswith(('.ttf', '.otf', '.woff', '.woff2')):
-                        seeds.append(os.path.join(root, f))
+                        try:
+                            with open(os.path.join(root, f), 'rb') as fd:
+                                content = fd.read()
+                                if len(content) < 50000: # Limit size for speed
+                                    seeds.append(content)
+                        except:
+                            pass
             
-            # Prioritize seeds based on problem description ('arvo')
-            arvo_seeds = [s for s in seeds if 'arvo' in os.path.basename(s).lower()]
-            if arvo_seeds:
-                primary_seeds = arvo_seeds
-            else:
-                # If no specific target seed found, use smallest valid fonts to speed up fuzzing
-                primary_seeds = sorted(seeds, key=os.path.getsize)[:50]
-            
-            if not primary_seeds:
-                # Create dummy seed if no fonts found
-                dummy = os.path.join(work_dir, 'dummy.ttf')
-                with open(dummy, 'wb') as f:
-                    f.write(b'\x00\x01\x00\x00' + b'\x00'*12)
-                primary_seeds = [dummy]
+            if not seeds:
+                # Add a minimal valid TTF header as a fallback seed
+                seeds.append(b'\x00\x01\x00\x00\x00\x00\x00\x00')
 
             # Fuzzing Logic
-            stop_event = False
-            found_solution = None
+            start_time = time.time()
+            crash_found = None
+            lock = threading.Lock()
+            
+            def fuzz_worker():
+                nonlocal crash_found
+                local_rng = random.Random()
+                
+                while True:
+                    # Check global stop conditions
+                    if time.time() - start_time > 120: # Timeout after 2 minutes
+                        break
+                    
+                    with lock:
+                        if crash_found: return
+                    
+                    # Selection
+                    seed = local_rng.choice(seeds)
+                    mutated = bytearray(seed)
+                    
+                    # Mutation
+                    num_ops = local_rng.randint(1, 8)
+                    for _ in range(num_ops):
+                        if not mutated: break
+                        op = local_rng.randint(0, 3)
+                        idx = local_rng.randint(0, len(mutated)-1)
+                        if op == 0: # Bit flip
+                            mutated[idx] ^= (1 << local_rng.randint(0, 7))
+                        elif op == 1: # Byte replace
+                            mutated[idx] = local_rng.randint(0, 255)
+                        elif op == 2: # Delete byte
+                            del mutated[idx]
+                        elif op == 3: # Insert byte
+                            mutated.insert(idx, local_rng.randint(0, 255))
 
-            def fuzz_worker(worker_idx, seed_list, bin_path, tmp_base, timeout_ts):
-                nonlocal stop_event
-                nonlocal found_solution
-                
-                # Seed random generator uniquely per thread
-                rng = random.Random(worker_idx + time.time())
-                
-                while time.time() < timeout_ts and not stop_event:
-                    # Pick a seed
-                    seed_file = rng.choice(seed_list)
+                    # Execution
+                    # Use unique temp files
+                    inp_fd, inp_path = tempfile.mkstemp()
+                    out_fd, out_path = tempfile.mkstemp()
+                    os.close(inp_fd)
+                    os.close(out_fd)
+                    
                     try:
-                        with open(seed_file, 'rb') as f:
-                            data = bytearray(f.read())
-                    except:
-                        continue
+                        with open(inp_path, 'wb') as f:
+                            f.write(mutated)
                         
-                    if not data: continue
-                    
-                    # Mutate
-                    mutations = rng.randint(1, 4)
-                    for _ in range(mutations):
-                        mtype = rng.randint(0, 3)
-                        if mtype == 0: # Byte Flip
-                            idx = rng.randint(0, len(data)-1)
-                            data[idx] ^= rng.randint(1, 255)
-                        elif mtype == 1: # Delete Chunk
-                            if len(data) > 5:
-                                idx = rng.randint(0, len(data)-1)
-                                l = rng.randint(1, min(20, len(data)-idx))
-                                del data[idx:idx+l]
-                        elif mtype == 2: # Insert Junk
-                            idx = rng.randint(0, len(data))
-                            count = rng.randint(1, 4)
-                            vals = [rng.randint(0, 255) for _ in range(count)]
-                            data[idx:idx] = bytearray(vals)
-                        elif mtype == 3: # Integer Overwrite (trigger buffer issues)
-                             if len(data) > 4:
-                                 idx = rng.randint(0, len(data)-4)
-                                 v = rng.choice([0xFFFFFFFF, 0x7FFFFFFF, 0x80000000, 0xFFFF, 0, 0x01000000])
-                                 data[idx] = v & 0xFF
-                                 data[idx+1] = (v >> 8) & 0xFF
-                                 data[idx+2] = (v >> 16) & 0xFF
-                                 data[idx+3] = (v >> 24) & 0xFF
-                    
-                    # Save mutated file
-                    tname = f"fuzz_{worker_idx}.ttf"
-                    tpath = os.path.join(tmp_base, tname)
-                    try:
-                        with open(tpath, 'wb') as f:
-                            f.write(data)
-                    except:
-                        continue
-
-                    # Execute binary
-                    try:
-                        res = subprocess.run(
-                            [bin_path, tpath],
-                            stdout=subprocess.PIPE,
+                        # ots-sanitize [input] [output]
+                        # We must provide output arg to trigger writing (where vuln lies)
+                        proc = subprocess.run(
+                            [executable, inp_path, out_path],
+                            stdout=subprocess.DEVNULL,
                             stderr=subprocess.PIPE,
-                            timeout=0.5
+                            env=env,
+                            timeout=1
                         )
-                        # Check for ASan crash
-                        if res.returncode != 0:
-                            err = res.stderr.decode(errors='ignore')
-                            if "AddressSanitizer" in err and "heap-use-after-free" in err:
-                                stop_event = True
-                                found_solution = bytes(data)
+                        
+                        if proc.returncode != 0:
+                            stderr_output = proc.stderr.decode(errors='ignore')
+                            if "AddressSanitizer" in stderr_output and "heap-use-after-free" in stderr_output:
+                                with lock:
+                                    if not crash_found:
+                                        crash_found = bytes(mutated)
                                 return
                     except subprocess.TimeoutExpired:
                         pass
                     except Exception:
                         pass
-            
-            # Run parallel fuzzers
-            # Set time limit to allow compilation + ~2-3 mins of fuzzing
-            end_time = time.time() + 180 
-            
-            with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
-                futures = [executor.submit(fuzz_worker, i, primary_seeds, binary_path, work_dir, end_time) for i in range(8)]
-                concurrent.futures.wait(futures)
-            
-            if found_solution:
-                return found_solution
-            
-            # Fallback: return a seed if no crash found (unlikely if vulnerable)
-            if primary_seeds:
-                with open(primary_seeds[0], 'rb') as f:
-                    return f.read()
-            return b''
+                    finally:
+                        if os.path.exists(inp_path): os.unlink(inp_path)
+                        if os.path.exists(out_path): os.unlink(out_path)
 
-        except Exception:
-            return b''
+            # Run fuzzing threads
+            with ThreadPoolExecutor(max_workers=8) as executor:
+                futures = [executor.submit(fuzz_worker) for _ in range(8)]
+                for f in futures:
+                    f.result()
+            
+            if crash_found:
+                return crash_found
+            
+            # Return a seed if no crash found (best effort)
+            return seeds[0]
+
         finally:
             shutil.rmtree(work_dir, ignore_errors=True)

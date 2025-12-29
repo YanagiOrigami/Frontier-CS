@@ -1,146 +1,129 @@
 import os
 import sys
 import subprocess
+import tarfile
 import tempfile
 import shutil
-import struct
 import glob
 
 class Solution:
     def solve(self, src_path: str) -> bytes:
         """
-        Generate a PoC that triggers the vulnerability.
-        Args:
-            src_path: Path to the vulnerable source code tarball
-        Returns:
-            bytes: The PoC input that should trigger the vulnerability
+        Generate a PoC that triggers the vulnerability by compiling the target
+        with ASAN/LibFuzzer and running it.
         """
-        tmp_dir = tempfile.mkdtemp()
+        temp_dir = tempfile.mkdtemp()
         try:
-            # 1. Extract the source code
-            subprocess.check_call(['tar', '-xf', src_path, '-C', tmp_dir], stderr=subprocess.DEVNULL)
-            
-            # 2. Locate source files and the fuzz target
+            # Extract source code
+            if src_path.endswith('.tar.gz') or src_path.endswith('.tgz'):
+                with tarfile.open(src_path, "r:gz") as tar:
+                    tar.extractall(path=temp_dir)
+            elif src_path.endswith('.tar'):
+                with tarfile.open(src_path, "r:") as tar:
+                    tar.extractall(path=temp_dir)
+            else:
+                try:
+                    with tarfile.open(src_path) as tar:
+                        tar.extractall(path=temp_dir)
+                except:
+                    pass
+
+            # Scan for source files, headers, and fuzzer harness
             c_files = []
-            include_dirs = set()
-            fuzz_target = None
-            
-            for root, dirs, files in os.walk(tmp_dir):
-                include_dirs.add(root)
-                for f in files:
-                    path = os.path.join(root, f)
-                    # Look for C/C++ files
-                    if f.endswith('.c') or f.endswith('.cc') or f.endswith('.cpp'):
+            h_dirs = set()
+            harness_candidates = []
+
+            for root, dirs, files in os.walk(temp_dir):
+                for file in files:
+                    full_path = os.path.join(root, file)
+                    if file.endswith(".h"):
+                        h_dirs.add(root)
+                    elif file.endswith(".c") or file.endswith(".cc") or file.endswith(".cpp"):
                         try:
-                            with open(path, 'r', encoding='utf-8', errors='ignore') as fo:
-                                content = fo.read()
-                            
-                            # Identify fuzz target by the presence of LLVMFuzzerTestOneInput
-                            if 'LLVMFuzzerTestOneInput' in content:
-                                fuzz_target = path
-                            # Exclude files with 'main' to avoid linker errors (tests, tools),
-                            # unless it's the fuzz target itself (rare for libFuzzer targets)
-                            elif 'main' in content:
-                                continue
-                            elif f.endswith('.c'):
-                                c_files.append(path)
-                        except IOError:
+                            with open(full_path, "r", encoding="utf-8", errors="ignore") as f:
+                                content = f.read()
+                                if "LLVMFuzzerTestOneInput" in content:
+                                    harness_candidates.append((full_path, content))
+                                    continue
+                                if " main(" in content or " main (" in content:
+                                    # Skip files with main to avoid link collisions
+                                    continue
+                                c_files.append(full_path)
+                        except:
                             pass
 
-            if not fuzz_target:
-                # Fallback: if we can't find it, we can't compile. 
-                # Return a large buffer to attempt a blind crash or just satisfy return type.
-                return b'A' * 1032
+            if not harness_candidates:
+                return b""
 
-            # 3. Compile the fuzzer
-            # Use clang with AddressSanitizer and LibFuzzer
-            bin_path = os.path.join(tmp_dir, 'fuzzer_bin')
+            # Select the most appropriate harness
+            # Priority: mentions 'polygonToCellsExperimental', then 'polygonToCells', then any.
+            target_harness = harness_candidates[0][0]
+            best_priority = 0
+            
+            for path, content in harness_candidates:
+                priority = 1
+                if "polygonToCells" in content:
+                    priority = 2
+                if "polygonToCellsExperimental" in content:
+                    priority = 3
+                
+                if priority > best_priority:
+                    best_priority = priority
+                    target_harness = path
+
+            # Prepare compilation
+            compiler = "clang"
+            if target_harness.endswith(".cc") or target_harness.endswith(".cpp"):
+                compiler = "clang++"
+            
+            fuzzer_bin = os.path.join(temp_dir, "fuzz_target")
+            
             cmd = [
-                'clang', 
-                '-fsanitize=address,fuzzer', 
-                '-O2', 
-                '-g', 
-                '-lm' # Link math library common in geometry libs
+                compiler,
+                "-fsanitize=address,fuzzer",
+                "-O1",
+                "-g",
+                "-D_GNU_SOURCE",
+                "-Wno-everything"
             ]
             
-            for inc in include_dirs:
-                cmd.extend(['-I', inc])
+            for inc in h_dirs:
+                cmd.extend(["-I", inc])
             
-            cmd.append(fuzz_target)
+            cmd.append(target_harness)
             cmd.extend(c_files)
-            cmd.extend(['-o', bin_path])
-            
-            # Compile, suppressing output
-            comp_res = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            
-            if comp_res.returncode != 0 or not os.path.exists(bin_path):
-                # Compilation failed
-                return b'A' * 1032
+            cmd.extend(["-o", fuzzer_bin, "-lm"])
 
-            # 4. Prepare Corpus
-            corpus_dir = os.path.join(tmp_dir, 'corpus')
-            work_dir = os.path.join(tmp_dir, 'work')
-            os.makedirs(corpus_dir, exist_ok=True)
-            os.makedirs(work_dir, exist_ok=True)
-
-            # Generate seeds to accelerate fuzzing
-            # Vulnerability is "under-estimation" in polygonToCells.
-            # Target length ~1032 bytes implies ~64 vertices (16 bytes each + header).
-            # Structure: [Resolution (int)] [Count (int)] [Coord Pairs...]
+            # Compile
+            subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             
-            # Seed 1: 64 vertices, small polygon
-            n_verts = 64
-            # Resolution 9 (valid H3 resolution)
-            seed_data = struct.pack('<i', 9) + struct.pack('<i', n_verts)
-            for i in range(n_verts):
-                seed_data += struct.pack('<dd', 37.7 + i*0.001, -122.4 + i*0.001)
-            
-            with open(os.path.join(corpus_dir, 'seed1'), 'wb') as f:
-                f.write(seed_data)
+            if not os.path.exists(fuzzer_bin):
+                return b""
 
-            # 5. Run Fuzzer
-            # We use a timeout to limit execution time.
-            # artifact_prefix directs crashes to work_dir.
-            run_cmd = [
-                bin_path,
-                corpus_dir,
-                '-max_total_time=45',
-                '-rss_limit_mb=4096',
-                '-artifact_prefix=' + os.path.join(work_dir, 'crash-')
+            # Run Fuzzer
+            # Set time limit to find the crash.
+            fuzz_cmd = [
+                fuzzer_bin,
+                "-max_total_time=45",
+                "-rss_limit_mb=2048",
+                "-print_final_stats=0"
             ]
             
-            try:
-                subprocess.run(run_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=50)
-            except subprocess.TimeoutExpired:
-                pass
+            subprocess.run(fuzz_cmd, cwd=temp_dir, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
-            # 6. Collect Crashes
-            # LibFuzzer names artifacts as prefix-<sha1>
-            crashes = glob.glob(os.path.join(work_dir, 'crash-*'))
-            crashes += glob.glob(os.path.join(work_dir, 'leak-*'))
-            crashes += glob.glob(os.path.join(work_dir, 'oom-*'))
-
+            # Retrieve crash artifact
+            # LibFuzzer outputs files named crash-<sha1>, leak-<sha1>, etc.
+            crashes = glob.glob(os.path.join(temp_dir, "crash-*"))
             if not crashes:
-                # If no crash found, return the seed as it mimics the structure of the target
-                return seed_data
-
-            # 7. Select best PoC
-            # Optimization: Shorter PoCs score higher.
-            best_crash = None
-            min_len = float('inf')
-
-            for c_path in crashes:
-                with open(c_path, 'rb') as f:
-                    data = f.read()
-                    if len(data) < min_len:
-                        min_len = len(data)
-                        best_crash = data
+                crashes = glob.glob(os.path.join(temp_dir, "leak-*"))
             
-            return best_crash if best_crash is not None else seed_data
+            if crashes:
+                with open(crashes[0], "rb") as f:
+                    return f.read()
 
-        except Exception as e:
-            # Fallback in case of runtime error
-            return b'A' * 1032
+        except Exception:
+            pass
         finally:
-            # Cleanup
-            shutil.rmtree(tmp_dir, ignore_errors=True)
+            shutil.rmtree(temp_dir, ignore_errors=True)
+            
+        return b""

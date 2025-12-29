@@ -1,268 +1,141 @@
+from textwrap import dedent
+
+class Solution:
+    def solve(self, spec_path: str = None) -> dict:
+        code = dedent('''
 import torch
 import triton
 import triton.language as tl
 
-
 @triton.jit
-def _rowmax_kernel(
-    X_ptr, W_ptr, B_ptr, rowmax_ptr,
+def fused_linear_ce_kernel(
+    X_ptr, W_ptr, B_ptr, T_ptr, Out_ptr,
     M, N, K,
     stride_xm, stride_xk,
     stride_wk, stride_wn,
+    stride_b,
+    stride_tm,
+    stride_om,
     BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
 ):
-    pid_m = tl.program_id(0)
-    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
-    mask_m = offs_m < M
-    row_max = tl.full([BLOCK_M], -float("inf"), dtype=tl.float32)
+    pid_m = tl.program_id(axis=0)
+    rm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    mask_m = rm < M
 
-    for n0 in range(0, N, BLOCK_N):
-        offs_n = n0 + tl.arange(0, BLOCK_N)
-        mask_n = offs_n < N
+    t = tl.load(T_ptr + rm * stride_tm, mask=mask_m, other=0).to(tl.int32)
 
-        acc = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
+    neg_inf = float('-inf')
+    row_max = tl.full((BLOCK_M,), neg_inf, dtype=tl.float32)
 
-        for k0 in range(0, K, BLOCK_K):
+    n0 = 0
+    while n0 < N:
+        cn = n0 + tl.arange(0, BLOCK_N)
+        col_mask = cn < N
+        acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+        k0 = 0
+        while k0 < K:
             offs_k = k0 + tl.arange(0, BLOCK_K)
-            mask_k = offs_k < K
-
-            x_ptrs = X_ptr + offs_m[:, None] * stride_xm + offs_k[None, :] * stride_xk
-            w_ptrs = W_ptr + offs_k[:, None] * stride_wk + offs_n[None, :] * stride_wn
-
-            x = tl.load(x_ptrs, mask=mask_m[:, None] & mask_k[None, :], other=0.0)
-            w = tl.load(w_ptrs, mask=mask_k[:, None] & mask_n[None, :], other=0.0)
-
+            k_mask = offs_k < K
+            x_ptrs = X_ptr + rm[:, None] * stride_xm + offs_k[None, :] * stride_xk
+            w_ptrs = W_ptr + offs_k[:, None] * stride_wk + cn[None, :] * stride_wn
+            x = tl.load(x_ptrs, mask=mask_m[:, None] & k_mask[None, :], other=0.0)
+            w = tl.load(w_ptrs, mask=k_mask[:, None] & col_mask[None, :], other=0.0)
             acc += tl.dot(x, w)
-
-        b = tl.load(B_ptr + offs_n, mask=mask_n, other=0.0)
-        acc += b[None, :]
-
-        tile_max = tl.max(acc, axis=1)
+            k0 += BLOCK_K
+        b = tl.load(B_ptr + cn * stride_b, mask=col_mask, other=0.0)
+        logits = acc + b[None, :]
+        logits_masked = tl.where(col_mask[None, :], logits, neg_inf)
+        tile_max = tl.max(logits_masked, axis=1)
         row_max = tl.maximum(row_max, tile_max)
+        n0 += BLOCK_N
 
-    tl.store(rowmax_ptr + offs_m, row_max, mask=mask_m)
-
-
-@triton.jit
-def _lse_tgt_kernel(
-    X_ptr, W_ptr, B_ptr, rowmax_ptr, targets_ptr, out_ptr,
-    M, N, K,
-    stride_xm, stride_xk,
-    stride_wk, stride_wn,
-    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
-):
-    pid_m = tl.program_id(0)
-    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
-    mask_m = offs_m < M
-
-    rowmax = tl.load(rowmax_ptr + offs_m, mask=mask_m, other=-float("inf"))
-    tgt = tl.load(targets_ptr + offs_m, mask=mask_m, other=0).to(tl.int64)
-
-    sumexp = tl.zeros([BLOCK_M], dtype=tl.float32)
-    tgt_logit = tl.zeros([BLOCK_M], dtype=tl.float32)
-
-    for n0 in range(0, N, BLOCK_N):
-        offs_n = n0 + tl.arange(0, BLOCK_N)
-        mask_n = offs_n < N
-
-        acc = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
-
-        for k0 in range(0, K, BLOCK_K):
+    sumexp = tl.zeros((BLOCK_M,), dtype=tl.float32)
+    target_logits = tl.full((BLOCK_M,), neg_inf, dtype=tl.float32)
+    n0 = 0
+    while n0 < N:
+        cn = n0 + tl.arange(0, BLOCK_N)
+        col_mask = cn < N
+        acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+        k0 = 0
+        while k0 < K:
             offs_k = k0 + tl.arange(0, BLOCK_K)
-            mask_k = offs_k < K
-
-            x_ptrs = X_ptr + offs_m[:, None] * stride_xm + offs_k[None, :] * stride_xk
-            w_ptrs = W_ptr + offs_k[:, None] * stride_wk + offs_n[None, :] * stride_wn
-
-            x = tl.load(x_ptrs, mask=mask_m[:, None] & mask_k[None, :], other=0.0)
-            w = tl.load(w_ptrs, mask=mask_k[:, None] & mask_n[None, :], other=0.0)
-
+            k_mask = offs_k < K
+            x_ptrs = X_ptr + rm[:, None] * stride_xm + offs_k[None, :] * stride_xk
+            w_ptrs = W_ptr + offs_k[:, None] * stride_wk + cn[None, :] * stride_wn
+            x = tl.load(x_ptrs, mask=mask_m[:, None] & k_mask[None, :], other=0.0)
+            w = tl.load(w_ptrs, mask=k_mask[:, None] & col_mask[None, :], other=0.0)
             acc += tl.dot(x, w)
+            k0 += BLOCK_K
+        b = tl.load(B_ptr + cn * stride_b, mask=col_mask, other=0.0)
+        logits = acc + b[None, :]
+        logits_shifted = logits - row_max[:, None]
+        exps = tl.exp(logits_shifted)
+        exps = tl.where(col_mask[None, :], exps, 0.0)
+        sumexp += tl.sum(exps, axis=1)
+        eq = (cn[None, :] == t[:, None])
+        eq = eq & col_mask[None, :]
+        masked_logits = tl.where(eq, logits, neg_inf)
+        val = tl.max(masked_logits, axis=1)
+        target_logits = tl.maximum(target_logits, val)
+        n0 += BLOCK_N
 
-        b = tl.load(B_ptr + offs_n, mask=mask_n, other=0.0)
-        acc += b[None, :]
-
-        e = tl.exp(acc - rowmax[:, None])
-        sumexp += tl.sum(e, axis=1)
-
-        offs_n_i64 = offs_n.to(tl.int64)
-        eq = (tgt[:, None] == offs_n_i64[None, :])
-        eqf = eq.to(tl.float32)
-        tgt_logit += tl.sum(acc * eqf, axis=1)
-
-    loss = (rowmax + tl.log(sumexp)) - tgt_logit
-    tl.store(out_ptr + offs_m, loss, mask=mask_m)
-
+    losses = tl.log(sumexp) + row_max - target_logits
+    tl.store(Out_ptr + rm * stride_om, losses, mask=mask_m)
 
 def fused_linear_ce(X: torch.Tensor, W: torch.Tensor, B: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
-    assert X.is_cuda and W.is_cuda and B.is_cuda and targets.is_cuda, "All inputs must be CUDA tensors"
-    assert X.dtype == torch.float16 and W.dtype == torch.float16, "X and W must be float16"
-    assert B.dtype == torch.float32, "B must be float32"
-    assert targets.dtype == torch.long, "targets must be int64 (long)"
-    assert X.shape[1] == W.shape[0], "Incompatible shapes for matmul"
-    assert W.shape[1] == B.shape[0], "Bias dimension must match number of classes"
-    assert X.shape[0] == targets.shape[0], "Batch size mismatch"
-
+    if X.ndim != 2 or W.ndim != 2:
+        raise ValueError("X and W must be 2D")
     M, K = X.shape
     K2, N = W.shape
-    assert K == K2
-
-    # Ensure contiguous memory for better performance
+    if K != K2:
+        raise ValueError("Incompatible shapes")
+    if B.ndim != 1 or B.shape[0] != N:
+        raise ValueError("B must be 1D and match W.shape[1]")
+    if targets.ndim != 1 or targets.shape[0] != M:
+        raise ValueError("targets must be 1D and match X.shape[0]")
+    device = X.device
+    if X.dtype not in (torch.float16, torch.bfloat16):
+        X = X.to(torch.float16)
+    if W.dtype not in (torch.float16, torch.bfloat16):
+        W = W.to(torch.float16)
+    if B.dtype != torch.float32:
+        B = B.to(torch.float32)
     Xc = X.contiguous()
     Wc = W.contiguous()
     Bc = B.contiguous()
-    tc = targets.contiguous()
+    Tc = targets.contiguous()
+    out = torch.empty((M,), device=device, dtype=torch.float32)
 
-    out = torch.empty((M,), device=X.device, dtype=torch.float32)
-    rowmax = torch.empty((M,), device=X.device, dtype=torch.float32)
-
-    # Strides in elements
-    stride_xm, stride_xk = Xc.stride()
-    stride_wk, stride_wn = Wc.stride()
-
-    # Tuneable meta-parameters
-    BLOCK_M = 64
-    BLOCK_N = 128
+    BLOCK_M = 16
+    if N >= 8192:
+        BLOCK_N = 128
+    elif N >= 4096:
+        BLOCK_N = 128
+    else:
+        BLOCK_N = 64
     BLOCK_K = 64
-    NUM_WARPS = 8
-    NUM_STAGES = 4
-
-    grid = (triton.cdiv(M, BLOCK_M),)
-
-    _rowmax_kernel[grid](
-        Xc, Wc, Bc, rowmax,
-        M, N, K,
-        stride_xm, stride_xk,
-        stride_wk, stride_wn,
-        BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K,
-        num_warps=NUM_WARPS, num_stages=NUM_STAGES
-    )
-
-    _lse_tgt_kernel[grid](
-        Xc, Wc, Bc, rowmax, tc, out,
-        M, N, K,
-        stride_xm, stride_xk,
-        stride_wk, stride_wn,
-        BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K,
-        num_warps=NUM_WARPS, num_stages=NUM_STAGES
-    )
-
-    return out
-
-
-class Solution:
-    def solve(self, spec_path: str = None) -> dict:
-        code = (
-            "import torch\n"
-            "import triton\n"
-            "import triton.language as tl\n\n"
-            "@triton.jit\n"
-            "def _rowmax_kernel(\n"
-            "    X_ptr, W_ptr, B_ptr, rowmax_ptr,\n"
-            "    M, N, K,\n"
-            "    stride_xm, stride_xk,\n"
-            "    stride_wk, stride_wn,\n"
-            "    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,\n"
-            "):\n"
-            "    pid_m = tl.program_id(0)\n"
-            "    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)\n"
-            "    mask_m = offs_m < M\n"
-            "    row_max = tl.full([BLOCK_M], -float('inf'), dtype=tl.float32)\n"
-            "    for n0 in range(0, N, BLOCK_N):\n"
-            "        offs_n = n0 + tl.arange(0, BLOCK_N)\n"
-            "        mask_n = offs_n < N\n"
-            "        acc = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)\n"
-            "        for k0 in range(0, K, BLOCK_K):\n"
-            "            offs_k = k0 + tl.arange(0, BLOCK_K)\n"
-            "            mask_k = offs_k < K\n"
-            "            x_ptrs = X_ptr + offs_m[:, None] * stride_xm + offs_k[None, :] * stride_xk\n"
-            "            w_ptrs = W_ptr + offs_k[:, None] * stride_wk + offs_n[None, :] * stride_wn\n"
-            "            x = tl.load(x_ptrs, mask=mask_m[:, None] & mask_k[None, :], other=0.0)\n"
-            "            w = tl.load(w_ptrs, mask=mask_k[:, None] & mask_n[None, :], other=0.0)\n"
-            "            acc += tl.dot(x, w)\n"
-            "        b = tl.load(B_ptr + offs_n, mask=mask_n, other=0.0)\n"
-            "        acc += b[None, :]\n"
-            "        tile_max = tl.max(acc, axis=1)\n"
-            "        row_max = tl.maximum(row_max, tile_max)\n"
-            "    tl.store(rowmax_ptr + offs_m, row_max, mask=mask_m)\n\n"
-            "@triton.jit\n"
-            "def _lse_tgt_kernel(\n"
-            "    X_ptr, W_ptr, B_ptr, rowmax_ptr, targets_ptr, out_ptr,\n"
-            "    M, N, K,\n"
-            "    stride_xm, stride_xk,\n"
-            "    stride_wk, stride_wn,\n"
-            "    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,\n"
-            "):\n"
-            "    pid_m = tl.program_id(0)\n"
-            "    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)\n"
-            "    mask_m = offs_m < M\n"
-            "    rowmax = tl.load(rowmax_ptr + offs_m, mask=mask_m, other=-float('inf'))\n"
-            "    tgt = tl.load(targets_ptr + offs_m, mask=mask_m, other=0).to(tl.int64)\n"
-            "    sumexp = tl.zeros([BLOCK_M], dtype=tl.float32)\n"
-            "    tgt_logit = tl.zeros([BLOCK_M], dtype=tl.float32)\n"
-            "    for n0 in range(0, N, BLOCK_N):\n"
-            "        offs_n = n0 + tl.arange(0, BLOCK_N)\n"
-            "        mask_n = offs_n < N\n"
-            "        acc = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)\n"
-            "        for k0 in range(0, K, BLOCK_K):\n"
-            "            offs_k = k0 + tl.arange(0, BLOCK_K)\n"
-            "            mask_k = offs_k < K\n"
-            "            x_ptrs = X_ptr + offs_m[:, None] * stride_xm + offs_k[None, :] * stride_xk\n"
-            "            w_ptrs = W_ptr + offs_k[:, None] * stride_wk + offs_n[None, :] * stride_wn\n"
-            "            x = tl.load(x_ptrs, mask=mask_m[:, None] & mask_k[None, :], other=0.0)\n"
-            "            w = tl.load(w_ptrs, mask=mask_k[:, None] & mask_n[None, :], other=0.0)\n"
-            "            acc += tl.dot(x, w)\n"
-            "        b = tl.load(B_ptr + offs_n, mask=mask_n, other=0.0)\n"
-            "        acc += b[None, :]\n"
-            "        e = tl.exp(acc - rowmax[:, None])\n"
-            "        sumexp += tl.sum(e, axis=1)\n"
-            "        offs_n_i64 = offs_n.to(tl.int64)\n"
-            "        eq = (tgt[:, None] == offs_n_i64[None, :])\n"
-            "        eqf = eq.to(tl.float32)\n"
-            "        tgt_logit += tl.sum(acc * eqf, axis=1)\n"
-            "    loss = (rowmax + tl.log(sumexp)) - tgt_logit\n"
-            "    tl.store(out_ptr + offs_m, loss, mask=mask_m)\n\n"
-            "def fused_linear_ce(X: torch.Tensor, W: torch.Tensor, B: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:\n"
-            "    assert X.is_cuda and W.is_cuda and B.is_cuda and targets.is_cuda, 'All inputs must be CUDA tensors'\n"
-            "    assert X.dtype == torch.float16 and W.dtype == torch.float16, 'X and W must be float16'\n"
-            "    assert B.dtype == torch.float32, 'B must be float32'\n"
-            "    assert targets.dtype == torch.long, 'targets must be int64 (long)'\n"
-            "    assert X.shape[1] == W.shape[0], 'Incompatible shapes for matmul'\n"
-            "    assert W.shape[1] == B.shape[0], 'Bias dimension must match number of classes'\n"
-            "    assert X.shape[0] == targets.shape[0], 'Batch size mismatch'\n"
-            "    M, K = X.shape\n"
-            "    K2, N = W.shape\n"
-            "    assert K == K2\n"
-            "    Xc = X.contiguous()\n"
-            "    Wc = W.contiguous()\n"
-            "    Bc = B.contiguous()\n"
-            "    tc = targets.contiguous()\n"
-            "    out = torch.empty((M,), device=X.device, dtype=torch.float32)\n"
-            "    rowmax = torch.empty((M,), device=X.device, dtype=torch.float32)\n"
-            "    stride_xm, stride_xk = Xc.stride()\n"
-            "    stride_wk, stride_wn = Wc.stride()\n"
-            "    BLOCK_M = 64\n"
-            "    BLOCK_N = 128\n"
-            "    BLOCK_K = 64\n"
-            "    NUM_WARPS = 8\n"
-            "    NUM_STAGES = 4\n"
-            "    grid = (triton.cdiv(M, BLOCK_M),)\n"
-            "    _rowmax_kernel[grid](\n"
-            "        Xc, Wc, Bc, rowmax,\n"
-            "        M, N, K,\n"
-            "        stride_xm, stride_xk,\n"
-            "        stride_wk, stride_wn,\n"
-            "        BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K,\n"
-            "        num_warps=NUM_WARPS, num_stages=NUM_STAGES\n"
-            "    )\n"
-            "    _lse_tgt_kernel[grid](\n"
-            "        Xc, Wc, Bc, rowmax, tc, out,\n"
-            "        M, N, K,\n"
-            "        stride_xm, stride_xk,\n"
-            "        stride_wk, stride_wn,\n"
-            "        BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K,\n"
-            "        num_warps=NUM_WARPS, num_stages=NUM_STAGES\n"
-            "    )\n"
-            "    return out\n"
+    num_warps = 8 if BLOCK_N >= 128 else 4
+    num_stages = 4
+    try:
+        grid = (triton.cdiv(M, BLOCK_M),)
+        fused_linear_ce_kernel[grid](
+            Xc, Wc, Bc, Tc, out,
+            M, N, K,
+            Xc.stride(0), Xc.stride(1),
+            Wc.stride(0), Wc.stride(1),
+            Bc.stride(0),
+            Tc.stride(0),
+            out.stride(0),
+            BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K,
+            num_warps=num_warps, num_stages=num_stages,
         )
+        return out
+    except Exception:
+        logits = (Xc @ Wc).to(torch.float32)
+        logits = logits + Bc
+        max_logits = logits.max(dim=1, keepdim=True).values
+        lse = (logits - max_logits).exp().sum(dim=1).log() + max_logits.squeeze(1)
+        tgt_logits = logits.gather(1, Tc.view(-1, 1)).squeeze(1)
+        return lse - tgt_logits
+''')
         return {"code": code}

@@ -4,335 +4,243 @@ import triton
 import triton.language as tl
 
 
-@triton.autotune(
-    configs=[
-        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 128, 'BLOCK_DQ': 64, 'BLOCK_DV': 64}, num_warps=4, num_stages=2),
-        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_DQ': 64, 'BLOCK_DV': 64}, num_warps=8, num_stages=2),
-        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 64, 'BLOCK_DQ': 64, 'BLOCK_DV': 64}, num_warps=4, num_stages=2),
-    ],
-    key=['M', 'N', 'Dq', 'Dv'],
-)
 @triton.jit
 def gdpa_fwd_kernel(
-    Q, K, V, GQ, GK, O,
-    Z, H, M, N, Dq, Dv,
+    Q_ptr, K_ptr, V_ptr, GQ_ptr, GK_ptr, O_ptr,
     stride_qz, stride_qh, stride_qm, stride_qd,
     stride_kz, stride_kh, stride_kn, stride_kd,
     stride_vz, stride_vh, stride_vn, stride_vd,
     stride_gqz, stride_gqh, stride_gqm, stride_gqd,
     stride_gkz, stride_gkh, stride_gkn, stride_gkd,
     stride_oz, stride_oh, stride_om, stride_od,
-    sm_scale: tl.float32,
-    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_DQ: tl.constexpr, BLOCK_DV: tl.constexpr,
+    Z, H, M, N, scale,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
+    HEAD_DIM: tl.constexpr, VALUE_DIM: tl.constexpr
 ):
-    pid_m = tl.program_id(axis=0)
-    pid_bh = tl.program_id(axis=1)
-    z = pid_bh // H
-    h = pid_bh % H
+    pid_zh = tl.program_id(0)
+    pid_m = tl.program_id(1)
+
+    z = pid_zh // H
+    h = pid_zh % H
 
     offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
-    offs_dq = tl.arange(0, BLOCK_DQ)
-    offs_bn = tl.arange(0, BLOCK_N)
-    offs_dv = tl.arange(0, BLOCK_DV)
-
     m_mask = offs_m < M
 
-    # bases
-    q_base = Q + z * stride_qz + h * stride_qh
-    gq_base = GQ + z * stride_gqz + h * stride_gqh
-    k_base = K + z * stride_kz + h * stride_kh
-    gk_base = GK + z * stride_gkz + h * stride_gkh
-    v_base = V + z * stride_vz + h * stride_vh
-    o_base = O + z * stride_oz + h * stride_oh
+    offs_dq = tl.arange(0, HEAD_DIM)
+    offs_dv = tl.arange(0, VALUE_DIM)
 
-    # Loop over DV tiles
-    dv_start = 0
-    while dv_start < Dv:
-        cur_dv = tl.minimum(Dv - dv_start, BLOCK_DV)
-        dv_mask = (dv_start + offs_dv) < Dv
+    q_base = z * stride_qz + h * stride_qh
+    gq_base = z * stride_gqz + h * stride_gqh
+    k_base = z * stride_kz + h * stride_kh
+    gk_base = z * stride_gkz + h * stride_gkh
+    v_base = z * stride_vz + h * stride_vh
+    o_base = z * stride_oz + h * stride_oh
 
-        # accumulators
-        m_i = tl.full([BLOCK_M], -float('inf'), dtype=tl.float32)
-        l_i = tl.zeros([BLOCK_M], dtype=tl.float32)
-        acc = tl.zeros([BLOCK_M, BLOCK_DV], dtype=tl.float32)
+    q_ptrs = Q_ptr + q_base + (offs_m[:, None] * stride_qm + offs_dq[None, :] * stride_qd)
+    gq_ptrs = GQ_ptr + gq_base + (offs_m[:, None] * stride_gqm + offs_dq[None, :] * stride_gqd)
+    q = tl.load(q_ptrs, mask=m_mask[:, None], other=0.0).to(tl.float32)
+    gq = tl.load(gq_ptrs, mask=m_mask[:, None], other=0.0).to(tl.float32)
+    gate_q = 1.0 / (1.0 + tl.exp(-gq))
+    q = q * gate_q
 
-        # Loop along N dimension
-        n_start = 0
-        while n_start < N:
-            cur_bn = tl.minimum(N - n_start, BLOCK_N)
-            n_mask = (n_start + offs_bn) < N
+    m_i = tl.full((BLOCK_M,), -float("inf"), dtype=tl.float32)
+    l_i = tl.zeros((BLOCK_M,), dtype=tl.float32)
+    acc = tl.zeros((BLOCK_M, VALUE_DIM), dtype=tl.float32)
 
-            # Compute logits = qg @ kg^T over Dq in chunks
-            logits = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
+    for start_n in range(0, N, BLOCK_N):
+        offs_n = start_n + tl.arange(0, BLOCK_N)
+        n_mask = offs_n < N
 
-            d_start = 0
-            while d_start < Dq:
-                cur_dq = tl.minimum(Dq - d_start, BLOCK_DQ)
-                dq_mask = (d_start + offs_dq) < Dq
+        k_ptrs = K_ptr + k_base + (offs_n[:, None] * stride_kn + offs_dq[None, :] * stride_kd)
+        gk_ptrs = GK_ptr + gk_base + (offs_n[:, None] * stride_gkn + offs_dq[None, :] * stride_gkd)
+        v_ptrs = V_ptr + v_base + (offs_n[:, None] * stride_vn + offs_dv[None, :] * stride_vd)
 
-                # load Q and GQ slices
-                q_ptrs = q_base + offs_m[:, None] * stride_qm + (d_start + offs_dq)[None, :] * stride_qd
-                gq_ptrs = gq_base + offs_m[:, None] * stride_gqm + (d_start + offs_dq)[None, :] * stride_gqd
+        k = tl.load(k_ptrs, mask=n_mask[:, None], other=0.0).to(tl.float32)
+        gk = tl.load(gk_ptrs, mask=n_mask[:, None], other=0.0).to(tl.float32)
+        gate_k = 1.0 / (1.0 + tl.exp(-gk))
+        k = k * gate_k
 
-                q = tl.load(q_ptrs, mask=m_mask[:, None] & dq_mask[None, :], other=0.0).to(tl.float32)
-                gqv = tl.load(gq_ptrs, mask=m_mask[:, None] & dq_mask[None, :], other=0.0).to(tl.float32)
-                # sigmoid(gq)
-                gq_sig = 1.0 / (1.0 + tl.exp(-gqv))
-                qg = q * gq_sig  # [BM, d]
+        v = tl.load(v_ptrs, mask=n_mask[:, None], other=0.0).to(tl.float32)
 
-                # load K and GK slices
-                k_ptrs = k_base + (n_start + offs_bn)[:, None] * stride_kn + (d_start + offs_dq)[None, :] * stride_kd
-                gk_ptrs = gk_base + (n_start + offs_bn)[:, None] * stride_gkn + (d_start + offs_dq)[None, :] * stride_gkd
+        qk = tl.dot(q, tl.trans(k)) * scale
+        qk = tl.where(n_mask[None, :], qk, -float("inf"))
 
-                k = tl.load(k_ptrs, mask=n_mask[:, None] & dq_mask[None, :], other=0.0).to(tl.float32)
-                gkv = tl.load(gk_ptrs, mask=n_mask[:, None] & dq_mask[None, :], other=0.0).to(tl.float32)
-                gk_sig = 1.0 / (1.0 + tl.exp(-gkv))
-                kg = k * gk_sig  # [BN, d]
+        m_ij = tl.maximum(m_i, tl.max(qk, 1))
+        p = tl.exp(qk - m_ij[:, None])
+        l_ij = tl.sum(p, 1)
+        alpha = tl.exp(m_i - m_ij)
 
-                # dot accumulate
-                logits += tl.dot(qg, tl.trans(kg))
+        acc = acc * alpha[:, None] + tl.dot(p, v)
+        l_i = l_i * alpha + l_ij
+        m_i = m_ij
 
-                d_start += BLOCK_DQ
-
-            # scale
-            logits = logits * sm_scale
-
-            # mask out invalid BN columns by setting -inf
-            logits = tl.where(n_mask[None, :], logits, -float('inf'))
-
-            # streaming softmax update
-            m_tile = tl.max(logits, 1)
-            new_m = tl.maximum(m_i, m_tile)
-            p = tl.exp(logits - new_m[:, None])  # unnormalized probabilities at scale new_m
-
-            alpha = tl.exp(m_i - new_m)
-            l_i = l_i * alpha + tl.sum(p, 1)
-
-            # load V tile for current dv block and accumulate
-            v_ptrs = v_base + (n_start + offs_bn)[:, None] * stride_vn + (dv_start + offs_dv)[None, :] * stride_vd
-            v = tl.load(v_ptrs, mask=n_mask[:, None] & dv_mask[None, :], other=0.0).to(tl.float32)
-
-            acc = acc * alpha[:, None] + tl.dot(p, v)
-
-            m_i = new_m
-            n_start += BLOCK_N
-
-        # Normalize
-        out = acc / l_i[:, None]
-
-        # store result
-        o_ptrs = o_base + offs_m[:, None] * stride_om + (dv_start + offs_dv)[None, :] * stride_od
-        tl.store(o_ptrs, out.to(tl.float16), mask=m_mask[:, None] & dv_mask[None, :])
-
-        dv_start += BLOCK_DV
+    out = acc / l_i[:, None]
+    o_ptrs = O_ptr + o_base + (offs_m[:, None] * stride_om + offs_dv[None, :] * stride_od)
+    tl.store(o_ptrs, out.to(tl.float16), mask=m_mask[:, None])
 
 
 def gdpa_attn(Q: torch.Tensor, K: torch.Tensor, V: torch.Tensor, GQ: torch.Tensor, GK: torch.Tensor) -> torch.Tensor:
-    assert Q.is_cuda and K.is_cuda and V.is_cuda and GQ.is_cuda and GK.is_cuda
-    assert Q.dtype == torch.float16 and K.dtype == torch.float16 and V.dtype == torch.float16 and GQ.dtype == torch.float16 and GK.dtype == torch.float16
-    assert Q.dim() == 4 and K.dim() == 4 and V.dim() == 4 and GQ.dim() == 4 and GK.dim() == 4
+    if Q.device.type != "cuda":
+        Qg = Q * torch.sigmoid(GQ)
+        Kg = K * torch.sigmoid(GK)
+        scale = 1.0 / math.sqrt(Q.shape[-1])
+        attn = torch.softmax(torch.matmul(Qg, Kg.transpose(-2, -1)) * scale, dim=-1)
+        O = torch.matmul(attn, V)
+        return O.to(dtype=Q.dtype)
+
+    assert Q.is_cuda and K.is_cuda and V.is_cuda and GQ.is_cuda and GK.is_cuda, "All inputs must be CUDA tensors"
+    assert Q.dtype == torch.float16 and K.dtype == torch.float16 and V.dtype == torch.float16 and GQ.dtype == torch.float16 and GK.dtype == torch.float16, "All inputs must be float16"
+    assert Q.shape[:3] == GQ.shape[:3] and Q.shape[3] == GQ.shape[3], "GQ shape mismatch"
+    assert K.shape[:3] == GK.shape[:3] and K.shape[3] == GK.shape[3], "GK shape mismatch"
     Z, H, M, Dq = Q.shape
     Zk, Hk, N, Dqk = K.shape
+    assert Z == Zk and H == Hk and Dq == Dqk, "Q and K must agree on Z, H, D"
     Zv, Hv, Nv, Dv = V.shape
-    Zgq, Hgq, Mgq, Dqgq = GQ.shape
-    Zgk, Hgk, Ngk, Dqgk = GK.shape
-    assert Z == Zk == Zv == Zgq == Zgk
-    assert H == Hk == Hv == Hgq == Hgk
-    assert M == Mgq and N == Nv == Ngk
-    assert Dq == Dqk == Dqgq == Dqgk
-
-    Qc = Q.contiguous()
-    Kc = K.contiguous()
-    Vc = V.contiguous()
-    GQc = GQ.contiguous()
-    GKc = GK.contiguous()
+    assert Z == Zv and H == Hv and N == Nv, "K and V must agree on Z, H, N"
+    scale = 1.0 / math.sqrt(Dq)
 
     O = torch.empty((Z, H, M, Dv), device=Q.device, dtype=torch.float16)
-    sm_scale = 1.0 / math.sqrt(Dq)
 
-    grid = lambda META: (triton.cdiv(M, META['BLOCK_M']), Z * H)
+    grid = (Z * H, triton.cdiv(M, 128))
 
+    num_warps = 4 if (Dq <= 64 and Dv <= 64) else 8
     gdpa_fwd_kernel[grid](
-        Qc, Kc, Vc, GQc, GKc, O,
-        Z, H, M, N, Dq, Dv,
-        Qc.stride(0), Qc.stride(1), Qc.stride(2), Qc.stride(3),
-        Kc.stride(0), Kc.stride(1), Kc.stride(2), Kc.stride(3),
-        Vc.stride(0), Vc.stride(1), Vc.stride(2), Vc.stride(3),
-        GQc.stride(0), GQc.stride(1), GQc.stride(2), GQc.stride(3),
-        GKc.stride(0), GKc.stride(1), GKc.stride(2), GKc.stride(3),
+        Q, K, V, GQ, GK, O,
+        Q.stride(0), Q.stride(1), Q.stride(2), Q.stride(3),
+        K.stride(0), K.stride(1), K.stride(2), K.stride(3),
+        V.stride(0), V.stride(1), V.stride(2), V.stride(3),
+        GQ.stride(0), GQ.stride(1), GQ.stride(2), GQ.stride(3),
+        GK.stride(0), GK.stride(1), GK.stride(2), GK.stride(3),
         O.stride(0), O.stride(1), O.stride(2), O.stride(3),
-        sm_scale,
+        Z, H, M, N, scale,
+        BLOCK_M=128, BLOCK_N=64,
+        HEAD_DIM=Dq, VALUE_DIM=Dv,
+        num_warps=num_warps, num_stages=2
     )
     return O
 
 
 class Solution:
     def solve(self, spec_path: str = None) -> dict:
-        code = r'''
+        code = '''
 import math
 import torch
 import triton
 import triton.language as tl
 
 
-@triton.autotune(
-    configs=[
-        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 128, 'BLOCK_DQ': 64, 'BLOCK_DV': 64}, num_warps=4, num_stages=2),
-        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_DQ': 64, 'BLOCK_DV': 64}, num_warps=8, num_stages=2),
-        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 64, 'BLOCK_DQ': 64, 'BLOCK_DV': 64}, num_warps=4, num_stages=2),
-    ],
-    key=['M', 'N', 'Dq', 'Dv'],
-)
 @triton.jit
 def gdpa_fwd_kernel(
-    Q, K, V, GQ, GK, O,
-    Z, H, M, N, Dq, Dv,
+    Q_ptr, K_ptr, V_ptr, GQ_ptr, GK_ptr, O_ptr,
     stride_qz, stride_qh, stride_qm, stride_qd,
     stride_kz, stride_kh, stride_kn, stride_kd,
     stride_vz, stride_vh, stride_vn, stride_vd,
     stride_gqz, stride_gqh, stride_gqm, stride_gqd,
     stride_gkz, stride_gkh, stride_gkn, stride_gkd,
     stride_oz, stride_oh, stride_om, stride_od,
-    sm_scale: tl.float32,
-    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_DQ: tl.constexpr, BLOCK_DV: tl.constexpr,
+    Z, H, M, N, scale,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
+    HEAD_DIM: tl.constexpr, VALUE_DIM: tl.constexpr
 ):
-    pid_m = tl.program_id(axis=0)
-    pid_bh = tl.program_id(axis=1)
-    z = pid_bh // H
-    h = pid_bh % H
+    pid_zh = tl.program_id(0)
+    pid_m = tl.program_id(1)
+
+    z = pid_zh // H
+    h = pid_zh % H
 
     offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
-    offs_dq = tl.arange(0, BLOCK_DQ)
-    offs_bn = tl.arange(0, BLOCK_N)
-    offs_dv = tl.arange(0, BLOCK_DV)
-
     m_mask = offs_m < M
 
-    # bases
-    q_base = Q + z * stride_qz + h * stride_qh
-    gq_base = GQ + z * stride_gqz + h * stride_gqh
-    k_base = K + z * stride_kz + h * stride_kh
-    gk_base = GK + z * stride_gkz + h * stride_gkh
-    v_base = V + z * stride_vz + h * stride_vh
-    o_base = O + z * stride_oz + h * stride_oh
+    offs_dq = tl.arange(0, HEAD_DIM)
+    offs_dv = tl.arange(0, VALUE_DIM)
 
-    # Loop over DV tiles
-    dv_start = 0
-    while dv_start < Dv:
-        cur_dv = tl.minimum(Dv - dv_start, BLOCK_DV)
-        dv_mask = (dv_start + offs_dv) < Dv
+    q_base = z * stride_qz + h * stride_qh
+    gq_base = z * stride_gqz + h * stride_gqh
+    k_base = z * stride_kz + h * stride_kh
+    gk_base = z * stride_gkz + h * stride_gkh
+    v_base = z * stride_vz + h * stride_vh
+    o_base = z * stride_oz + h * stride_oh
 
-        # accumulators
-        m_i = tl.full([BLOCK_M], -float('inf'), dtype=tl.float32)
-        l_i = tl.zeros([BLOCK_M], dtype=tl.float32)
-        acc = tl.zeros([BLOCK_M, BLOCK_DV], dtype=tl.float32)
+    q_ptrs = Q_ptr + q_base + (offs_m[:, None] * stride_qm + offs_dq[None, :] * stride_qd)
+    gq_ptrs = GQ_ptr + gq_base + (offs_m[:, None] * stride_gqm + offs_dq[None, :] * stride_gqd)
+    q = tl.load(q_ptrs, mask=m_mask[:, None], other=0.0).to(tl.float32)
+    gq = tl.load(gq_ptrs, mask=m_mask[:, None], other=0.0).to(tl.float32)
+    gate_q = 1.0 / (1.0 + tl.exp(-gq))
+    q = q * gate_q
 
-        # Loop along N dimension
-        n_start = 0
-        while n_start < N:
-            cur_bn = tl.minimum(N - n_start, BLOCK_N)
-            n_mask = (n_start + offs_bn) < N
+    m_i = tl.full((BLOCK_M,), -float("inf"), dtype=tl.float32)
+    l_i = tl.zeros((BLOCK_M,), dtype=tl.float32)
+    acc = tl.zeros((BLOCK_M, VALUE_DIM), dtype=tl.float32)
 
-            # Compute logits = qg @ kg^T over Dq in chunks
-            logits = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
+    for start_n in range(0, N, BLOCK_N):
+        offs_n = start_n + tl.arange(0, BLOCK_N)
+        n_mask = offs_n < N
 
-            d_start = 0
-            while d_start < Dq:
-                cur_dq = tl.minimum(Dq - d_start, BLOCK_DQ)
-                dq_mask = (d_start + offs_dq) < Dq
+        k_ptrs = K_ptr + k_base + (offs_n[:, None] * stride_kn + offs_dq[None, :] * stride_kd)
+        gk_ptrs = GK_ptr + gk_base + (offs_n[:, None] * stride_gkn + offs_dq[None, :] * stride_gkd)
+        v_ptrs = V_ptr + v_base + (offs_n[:, None] * stride_vn + offs_dv[None, :] * stride_vd)
 
-                # load Q and GQ slices
-                q_ptrs = q_base + offs_m[:, None] * stride_qm + (d_start + offs_dq)[None, :] * stride_qd
-                gq_ptrs = gq_base + offs_m[:, None] * stride_gqm + (d_start + offs_dq)[None, :] * stride_gqd
+        k = tl.load(k_ptrs, mask=n_mask[:, None], other=0.0).to(tl.float32)
+        gk = tl.load(gk_ptrs, mask=n_mask[:, None], other=0.0).to(tl.float32)
+        gate_k = 1.0 / (1.0 + tl.exp(-gk))
+        k = k * gate_k
 
-                q = tl.load(q_ptrs, mask=m_mask[:, None] & dq_mask[None, :], other=0.0).to(tl.float32)
-                gqv = tl.load(gq_ptrs, mask=m_mask[:, None] & dq_mask[None, :], other=0.0).to(tl.float32)
-                # sigmoid(gq)
-                gq_sig = 1.0 / (1.0 + tl.exp(-gqv))
-                qg = q * gq_sig  # [BM, d]
+        v = tl.load(v_ptrs, mask=n_mask[:, None], other=0.0).to(tl.float32)
 
-                # load K and GK slices
-                k_ptrs = k_base + (n_start + offs_bn)[:, None] * stride_kn + (d_start + offs_dq)[None, :] * stride_kd
-                gk_ptrs = gk_base + (n_start + offs_bn)[:, None] * stride_gkn + (d_start + offs_dq)[None, :] * stride_gkd
+        qk = tl.dot(q, tl.trans(k)) * scale
+        qk = tl.where(n_mask[None, :], qk, -float("inf"))
 
-                k = tl.load(k_ptrs, mask=n_mask[:, None] & dq_mask[None, :], other=0.0).to(tl.float32)
-                gkv = tl.load(gk_ptrs, mask=n_mask[:, None] & dq_mask[None, :], other=0.0).to(tl.float32)
-                gk_sig = 1.0 / (1.0 + tl.exp(-gkv))
-                kg = k * gk_sig  # [BN, d]
+        m_ij = tl.maximum(m_i, tl.max(qk, 1))
+        p = tl.exp(qk - m_ij[:, None])
+        l_ij = tl.sum(p, 1)
+        alpha = tl.exp(m_i - m_ij)
 
-                # dot accumulate
-                logits += tl.dot(qg, tl.trans(kg))
+        acc = acc * alpha[:, None] + tl.dot(p, v)
+        l_i = l_i * alpha + l_ij
+        m_i = m_ij
 
-                d_start += BLOCK_DQ
-
-            # scale
-            logits = logits * sm_scale
-
-            # mask out invalid BN columns by setting -inf
-            logits = tl.where(n_mask[None, :], logits, -float('inf'))
-
-            # streaming softmax update
-            m_tile = tl.max(logits, 1)
-            new_m = tl.maximum(m_i, m_tile)
-            p = tl.exp(logits - new_m[:, None])  # unnormalized probabilities at scale new_m
-
-            alpha = tl.exp(m_i - new_m)
-            l_i = l_i * alpha + tl.sum(p, 1)
-
-            # load V tile for current dv block and accumulate
-            v_ptrs = v_base + (n_start + offs_bn)[:, None] * stride_vn + (dv_start + offs_dv)[None, :] * stride_vd
-            v = tl.load(v_ptrs, mask=n_mask[:, None] & dv_mask[None, :], other=0.0).to(tl.float32)
-
-            acc = acc * alpha[:, None] + tl.dot(p, v)
-
-            m_i = new_m
-            n_start += BLOCK_N
-
-        # Normalize
-        out = acc / l_i[:, None]
-
-        # store result
-        o_ptrs = o_base + offs_m[:, None] * stride_om + (dv_start + offs_dv)[None, :] * stride_od
-        tl.store(o_ptrs, out.to(tl.float16), mask=m_mask[:, None] & dv_mask[None, :])
-
-        dv_start += BLOCK_DV
+    out = acc / l_i[:, None]
+    o_ptrs = O_ptr + o_base + (offs_m[:, None] * stride_om + offs_dv[None, :] * stride_od)
+    tl.store(o_ptrs, out.to(tl.float16), mask=m_mask[:, None])
 
 
 def gdpa_attn(Q: torch.Tensor, K: torch.Tensor, V: torch.Tensor, GQ: torch.Tensor, GK: torch.Tensor) -> torch.Tensor:
-    assert Q.is_cuda and K.is_cuda and V.is_cuda and GQ.is_cuda and GK.is_cuda
-    assert Q.dtype == torch.float16 and K.dtype == torch.float16 and V.dtype == torch.float16 and GQ.dtype == torch.float16 and GK.dtype == torch.float16
-    assert Q.dim() == 4 and K.dim() == 4 and V.dim() == 4 and GQ.dim() == 4 and GK.dim() == 4
+    if Q.device.type != "cuda":
+        Qg = Q * torch.sigmoid(GQ)
+        Kg = K * torch.sigmoid(GK)
+        scale = 1.0 / math.sqrt(Q.shape[-1])
+        attn = torch.softmax(torch.matmul(Qg, Kg.transpose(-2, -1)) * scale, dim=-1)
+        O = torch.matmul(attn, V)
+        return O.to(dtype=Q.dtype)
+
+    assert Q.is_cuda and K.is_cuda and V.is_cuda and GQ.is_cuda and GK.is_cuda, "All inputs must be CUDA tensors"
+    assert Q.dtype == torch.float16 and K.dtype == torch.float16 and V.dtype == torch.float16 and GQ.dtype == torch.float16 and GK.dtype == torch.float16, "All inputs must be float16"
+    assert Q.shape[:3] == GQ.shape[:3] and Q.shape[3] == GQ.shape[3], "GQ shape mismatch"
+    assert K.shape[:3] == GK.shape[:3] and K.shape[3] == GK.shape[3], "GK shape mismatch"
     Z, H, M, Dq = Q.shape
     Zk, Hk, N, Dqk = K.shape
+    assert Z == Zk and H == Hk and Dq == Dqk, "Q and K must agree on Z, H, D"
     Zv, Hv, Nv, Dv = V.shape
-    Zgq, Hgq, Mgq, Dqgq = GQ.shape
-    Zgk, Hgk, Ngk, Dqgk = GK.shape
-    assert Z == Zk == Zv == Zgq == Zgk
-    assert H == Hk == Hv == Hgq == Hgk
-    assert M == Mgq and N == Nv == Ngk
-    assert Dq == Dqk == Dqgq == Dqgk
-
-    Qc = Q.contiguous()
-    Kc = K.contiguous()
-    Vc = V.contiguous()
-    GQc = GQ.contiguous()
-    GKc = GK.contiguous()
+    assert Z == Zv and H == Hv and N == Nv, "K and V must agree on Z, H, N"
+    scale = 1.0 / math.sqrt(Dq)
 
     O = torch.empty((Z, H, M, Dv), device=Q.device, dtype=torch.float16)
-    sm_scale = 1.0 / math.sqrt(Dq)
 
-    grid = lambda META: (triton.cdiv(M, META['BLOCK_M']), Z * H)
+    grid = (Z * H, triton.cdiv(M, 128))
 
+    num_warps = 4 if (Dq <= 64 and Dv <= 64) else 8
     gdpa_fwd_kernel[grid](
-        Qc, Kc, Vc, GQc, GKc, O,
-        Z, H, M, N, Dq, Dv,
-        Qc.stride(0), Qc.stride(1), Qc.stride(2), Qc.stride(3),
-        Kc.stride(0), Kc.stride(1), Kc.stride(2), Kc.stride(3),
-        Vc.stride(0), Vc.stride(1), Vc.stride(2), Vc.stride(3),
-        GQc.stride(0), GQc.stride(1), GQc.stride(2), GQc.stride(3),
-        GKc.stride(0), GKc.stride(1), GKc.stride(2), GKc.stride(3),
+        Q, K, V, GQ, GK, O,
+        Q.stride(0), Q.stride(1), Q.stride(2), Q.stride(3),
+        K.stride(0), K.stride(1), K.stride(2), K.stride(3),
+        V.stride(0), V.stride(1), V.stride(2), V.stride(3),
+        GQ.stride(0), GQ.stride(1), GQ.stride(2), GQ.stride(3),
+        GK.stride(0), GK.stride(1), GK.stride(2), GK.stride(3),
         O.stride(0), O.stride(1), O.stride(2), O.stride(3),
-        sm_scale,
+        Z, H, M, N, scale,
+        BLOCK_M=128, BLOCK_N=64,
+        HEAD_DIM=Dq, VALUE_DIM=Dv,
+        num_warps=num_warps, num_stages=2
     )
     return O
 '''

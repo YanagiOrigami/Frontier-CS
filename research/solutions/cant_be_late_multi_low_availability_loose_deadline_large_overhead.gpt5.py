@@ -6,7 +6,7 @@ from sky_spot.utils import ClusterType
 
 
 class Solution(MultiRegionStrategy):
-    NAME = "lazy_fallback_od"
+    NAME = "slack_guard_v1"
 
     def solve(self, spec_path: str) -> "Solution":
         with open(spec_path) as f:
@@ -19,51 +19,45 @@ class Solution(MultiRegionStrategy):
             inter_task_overhead=[0.0],
         )
         super().__init__(args)
-
-        # Internal state
-        self._work_done_cache = 0.0
-        self._done_index = 0
-        self.lock_on_od = False
+        self._committed = False
         return self
 
-    def _update_work_done_cache(self):
-        td_list = self.task_done_time
-        idx = len(td_list)
-        if idx > self._done_index:
-            self._work_done_cache += sum(td_list[self._done_index:idx])
-            self._done_index = idx
-
     def _step(self, last_cluster_type: ClusterType, has_spot: bool) -> ClusterType:
-        # Update cached progress efficiently
-        self._update_work_done_cache()
-
-        # Derived quantities
-        work_remaining = max(self.task_duration - self._work_done_cache, 0.0)
-        if work_remaining <= 0.0:
+        # Compute remaining work and time left
+        remaining_work = max(0.0, self.task_duration - sum(self.task_done_time))
+        if remaining_work <= 0:
             return ClusterType.NONE
 
         time_left = self.deadline - self.env.elapsed_seconds
-        if time_left <= 0.0:
-            self.lock_on_od = True
+        if time_left <= 0:
+            self._committed = True
             return ClusterType.ON_DEMAND
 
-        gap = self.env.gap_seconds
-        overhead = self.restart_overhead
+        dt = self.env.gap_seconds
+        # Slack buffer after accounting for one restart to commit to ON_DEMAND
+        slack = time_left - (self.restart_overhead + remaining_work)
 
-        # Once we commit to On-Demand, never leave it to avoid extra overhead.
-        if self.lock_on_od or last_cluster_type == ClusterType.ON_DEMAND:
-            self.lock_on_od = True
+        if self._committed:
             return ClusterType.ON_DEMAND
 
-        # If we cannot afford idling one more step and then switching to OD, commit to OD now.
-        # Safe idling condition: time_left - gap >= work_remaining + overhead
-        if time_left - gap < work_remaining + overhead - 1e-9:
-            self.lock_on_od = True
+        # If we are already on ON_DEMAND, stay committed to avoid extra restarts
+        if last_cluster_type == ClusterType.ON_DEMAND:
+            self._committed = True
             return ClusterType.ON_DEMAND
 
-        # Otherwise, we have slack for at least one more step.
+        # Commit to ON_DEMAND if we are running out of slack
+        safety_margin = dt
+        if slack <= safety_margin:
+            self._committed = True
+            return ClusterType.ON_DEMAND
+
+        # Prefer SPOT if available while we have enough slack
         if has_spot:
             return ClusterType.SPOT
 
-        # Spot not available and safe to idle.
-        return ClusterType.NONE
+        # If SPOT is not available, idle if we have sufficient slack; else commit to ON_DEMAND
+        if slack > 2.0 * dt:
+            return ClusterType.NONE
+        else:
+            self._committed = True
+            return ClusterType.ON_DEMAND

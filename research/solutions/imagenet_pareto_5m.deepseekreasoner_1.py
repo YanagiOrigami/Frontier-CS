@@ -1,121 +1,195 @@
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.optim.lr_scheduler import ReduceLROnPlateau, CosineAnnealingLR
-import numpy as np
-from tqdm import tqdm
+from torch.optim.lr_scheduler import CosineAnnealingLR, ReduceLROnPlateau
+import math
+import time
 
 class ResidualBlock(nn.Module):
     def __init__(self, in_features, out_features, dropout_rate=0.2):
         super().__init__()
+        self.norm1 = nn.BatchNorm1d(in_features)
         self.linear1 = nn.Linear(in_features, out_features)
-        self.bn1 = nn.BatchNorm1d(out_features)
+        self.norm2 = nn.BatchNorm1d(out_features)
         self.linear2 = nn.Linear(out_features, out_features)
-        self.bn2 = nn.BatchNorm1d(out_features)
+        self.activation = nn.GELU()
         self.dropout = nn.Dropout(dropout_rate)
-        self.relu = nn.ReLU()
         
         self.shortcut = nn.Identity() if in_features == out_features else nn.Linear(in_features, out_features)
         
     def forward(self, x):
         identity = self.shortcut(x)
-        out = self.linear1(x)
-        out = self.bn1(out)
-        out = self.relu(out)
+        
+        out = self.norm1(x)
+        out = self.linear1(out)
+        out = self.activation(out)
         out = self.dropout(out)
+        
+        out = self.norm2(out)
         out = self.linear2(out)
-        out = self.bn2(out)
-        out += identity
-        out = self.relu(out)
-        return out
+        out = self.activation(out)
+        out = self.dropout(out)
+        
+        return out + identity
 
-class EfficientNet(nn.Module):
-    def __init__(self, input_dim, num_classes, param_limit=5000000):
+class EfficientMLP(nn.Module):
+    def __init__(self, input_dim, num_classes, width_mult=1.0, depth_mult=1.0):
         super().__init__()
         
-        # Bottleneck architecture for efficiency
-        hidden_dims = [512, 768, 1024, 768, 512]
+        # Calculate dimensions based on multipliers while staying under 5M params
+        base_width = 768
+        base_depth = 6
         
-        layers = []
-        prev_dim = input_dim
+        hidden_dim = int(base_width * width_mult)
+        num_blocks = int(base_depth * depth_mult)
+        
+        # Adjust to ensure we stay under parameter limit
+        if hidden_dim * num_blocks > 4600:  # Empirical adjustment
+            hidden_dim = 768
+            num_blocks = 6
         
         # Initial projection
-        layers.append(nn.Linear(prev_dim, hidden_dims[0]))
-        layers.append(nn.BatchNorm1d(hidden_dims[0]))
-        layers.append(nn.ReLU())
-        layers.append(nn.Dropout(0.2))
-        prev_dim = hidden_dims[0]
+        self.input_proj = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.BatchNorm1d(hidden_dim),
+            nn.GELU(),
+            nn.Dropout(0.1)
+        )
         
         # Residual blocks
-        for i in range(3):
-            layers.append(ResidualBlock(prev_dim, hidden_dims[i+1], 0.2))
-            prev_dim = hidden_dims[i+1]
+        self.blocks = nn.ModuleList([
+            ResidualBlock(hidden_dim, hidden_dim, dropout_rate=0.2) 
+            for _ in range(num_blocks)
+        ])
         
-        # Final projection
-        layers.append(nn.Linear(prev_dim, hidden_dims[-1]))
-        layers.append(nn.BatchNorm1d(hidden_dims[-1]))
-        layers.append(nn.ReLU())
-        layers.append(nn.Dropout(0.2))
+        # Final layers
+        self.norm = nn.BatchNorm1d(hidden_dim)
+        self.output = nn.Linear(hidden_dim, num_classes)
         
-        # Classifier
-        layers.append(nn.Linear(hidden_dims[-1], num_classes))
-        
-        self.network = nn.Sequential(*layers)
-        
-        # Verify parameter count
-        total_params = sum(p.numel() for p in self.parameters() if p.requires_grad)
-        if total_params > param_limit:
-            raise ValueError(f"Model has {total_params} parameters, exceeding limit of {param_limit}")
+        # Initialize weights
+        self._init_weights()
+    
+    def _init_weights(self):
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+            elif isinstance(m, nn.BatchNorm1d):
+                nn.init.ones_(m.weight)
+                nn.init.zeros_(m.bias)
     
     def forward(self, x):
-        return self.network(x)
+        x = self.input_proj(x)
+        
+        for block in self.blocks:
+            x = block(x)
+        
+        x = self.norm(x)
+        return self.output(x)
 
 class Solution:
-    def solve(self, train_loader, val_loader, metadata: dict = None):
+    def solve(self, train_loader, val_loader, metadata: dict = None) -> torch.nn.Module:
         device = metadata.get("device", "cpu")
-        input_dim = metadata["input_dim"]
         num_classes = metadata["num_classes"]
+        input_dim = metadata["input_dim"]
+        param_limit = metadata["param_limit"]
         
-        # Create model with parameter constraint
-        model = EfficientNet(input_dim, num_classes, metadata["param_limit"])
-        model.to(device)
+        # Hyperparameter search space within param limit
+        configs = [
+            (0.85, 1.2),  # narrower, deeper
+            (1.0, 1.0),   # balanced
+            (1.2, 0.85),  # wider, shallower
+        ]
         
-        # Optimizer and scheduler
-        optimizer = optim.AdamW(model.parameters(), lr=0.001, weight_decay=1e-4)
-        scheduler = CosineAnnealingLR(optimizer, T_max=100)
-        
-        criterion = nn.CrossEntropyLoss()
-        
-        # Training loop
-        num_epochs = 200
+        best_model = None
         best_val_acc = 0
-        best_model_state = None
         
-        for epoch in range(num_epochs):
+        for width_mult, depth_mult in configs:
+            # Create and verify model fits parameter constraint
+            model = EfficientMLP(input_dim, num_classes, width_mult, depth_mult).to(device)
+            total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+            
+            if total_params > param_limit:
+                continue
+            
+            # Train this configuration
+            print(f"Training config: width_mult={width_mult:.2f}, depth_mult={depth_mult:.2f}, params={total_params:,}")
+            
+            val_acc = self._train_model(model, train_loader, val_loader, device)
+            
+            if val_acc > best_val_acc:
+                best_val_acc = val_acc
+                best_model = model
+            
+            if val_acc > 0.95:  # Good enough accuracy
+                break
+        
+        # If no model was trained (all exceeded param limit), use conservative one
+        if best_model is None:
+            best_model = EfficientMLP(input_dim, num_classes, 0.8, 0.8).to(device)
+            self._train_model(best_model, train_loader, val_loader, device)
+        
+        return best_model
+    
+    def _train_model(self, model, train_loader, val_loader, device):
+        # Optimizer with weight decay
+        optimizer = optim.AdamW(
+            model.parameters(),
+            lr=0.001,
+            weight_decay=0.05,
+            betas=(0.9, 0.999)
+        )
+        
+        # Learning rate scheduler
+        scheduler = CosineAnnealingLR(
+            optimizer,
+            T_max=100,  # Total epochs for cosine annealing
+            eta_min=1e-6
+        )
+        
+        # Mixed scheduler strategy
+        plateau_scheduler = ReduceLROnPlateau(
+            optimizer,
+            mode='max',
+            factor=0.5,
+            patience=5,
+            verbose=False
+        )
+        
+        criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
+        
+        # Training parameters
+        epochs = 150
+        best_val_acc = 0
+        patience_counter = 0
+        patience = 15
+        
+        for epoch in range(epochs):
             # Training phase
             model.train()
             train_loss = 0
             train_correct = 0
             train_total = 0
             
-            pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{num_epochs} [Train]", leave=False)
-            for inputs, targets in pbar:
+            for batch_idx, (inputs, targets) in enumerate(train_loader):
                 inputs, targets = inputs.to(device), targets.to(device)
                 
                 optimizer.zero_grad()
                 outputs = model(inputs)
                 loss = criterion(outputs, targets)
+                
                 loss.backward()
                 
+                # Gradient clipping
                 torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                
                 optimizer.step()
                 
                 train_loss += loss.item()
                 _, predicted = outputs.max(1)
                 train_total += targets.size(0)
                 train_correct += predicted.eq(targets).sum().item()
-                
-                pbar.set_postfix(loss=loss.item())
             
             train_acc = 100. * train_correct / train_total
             
@@ -134,20 +208,24 @@ class Solution:
             
             val_acc = 100. * val_correct / val_total
             
-            # Save best model
+            # Learning rate scheduling
+            if epoch < 50:
+                scheduler.step()
+            else:
+                plateau_scheduler.step(val_acc)
+            
+            # Early stopping check
             if val_acc > best_val_acc:
                 best_val_acc = val_acc
-                best_model_state = model.state_dict().copy()
+                patience_counter = 0
+            else:
+                patience_counter += 1
             
-            # Learning rate scheduling
-            scheduler.step()
-            
-            # Early stopping condition
-            if epoch > 50 and best_val_acc > 92.0:
+            if patience_counter >= patience and epoch > 50:
                 break
+            
+            if epoch % 20 == 0:
+                print(f"Epoch {epoch}: Train Loss: {train_loss/len(train_loader):.4f}, "
+                      f"Train Acc: {train_acc:.2f}%, Val Acc: {val_acc:.2f}%")
         
-        # Load best model
-        if best_model_state is not None:
-            model.load_state_dict(best_model_state)
-        
-        return model
+        return best_val_acc / 100.0

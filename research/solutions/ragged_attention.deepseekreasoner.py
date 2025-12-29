@@ -1,269 +1,297 @@
 import torch
 import triton
 import triton.language as tl
+import math
+from typing import Optional, Tuple
 
-
+@triton.autotune(
+    configs=[
+        triton.Config({'BM': 64, 'BN': 64, 'BD': 32, 'BDV': 32}, num_stages=3, num_warps=8),
+        triton.Config({'BM': 128, 'BN': 64, 'BD': 32, 'BDV': 32}, num_stages=3, num_warps=8),
+        triton.Config({'BM': 64, 'BN': 128, 'BD': 32, 'BDV': 32}, num_stages=3, num_warps=8),
+        triton.Config({'BM': 128, 'BN': 128, 'BD': 32, 'BDV': 32}, num_stages=3, num_warps=8),
+        triton.Config({'BM': 64, 'BN': 64, 'BD': 64, 'BDV': 64}, num_stages=3, num_warps=8),
+        triton.Config({'BM': 128, 'BN': 64, 'BD': 64, 'BDV': 64}, num_stages=3, num_warps=8),
+        triton.Config({'BM': 64, 'BN': 128, 'BD': 64, 'BDV': 64}, num_stages=3, num_warps=8),
+    ],
+    key=['M', 'N', 'D', 'Dv'],
+)
 @triton.jit
-def _ragged_attn_fwd_kernel(
-    Q, K, V, Out,
+def _ragged_attention_kernel(
+    Q_ptr, K_ptr, V_ptr, O_ptr, 
+    row_lens_ptr,
+    M, N, D, Dv,
     stride_qm, stride_qd,
     stride_kn, stride_kd,
     stride_vn, stride_vd,
     stride_om, stride_od,
-    row_lens_ptr,
-    M, N, D, Dv,
-    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
-    BLOCK_D: tl.constexpr, BLOCK_DV: tl.constexpr,
-    USE_INITIAL_MASK: tl.constexpr
+    scale: tl.constexpr,
+    BM: tl.constexpr,
+    BN: tl.constexpr,
+    BD: tl.constexpr,
+    BDV: tl.constexpr,
 ):
     pid_m = tl.program_id(0)
     pid_n = tl.program_id(1)
     
-    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
-    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
-    offs_d = tl.arange(0, BLOCK_D)
-    offs_dv = tl.arange(0, BLOCK_DV)
+    offs_m = pid_m * BM + tl.arange(0, BM)
+    offs_n = pid_n * BN + tl.arange(0, BN)
     
-    m_mask = offs_m < M
-    q_ptrs = Q + offs_m[:, None] * stride_qm + offs_d[None, :] * stride_qd
-    q = tl.load(q_ptrs, mask=m_mask[:, None] & (offs_d[None, :] < D), other=0.0)
+    mask_m = offs_m < M
+    mask_n = offs_n < N
     
-    row_len_ptrs = row_lens_ptr + offs_m
-    row_lens = tl.load(row_len_ptrs, mask=m_mask, other=0)
+    m_idx = offs_m[:, None]
+    n_idx = offs_n[None, :]
     
-    m_i = tl.zeros([BLOCK_M], dtype=tl.float32) - float('inf')
-    l_i = tl.zeros([BLOCK_M], dtype=tl.float32)
-    acc_o = tl.zeros([BLOCK_M, BLOCK_DV], dtype=tl.float32)
+    row_lens = tl.load(row_lens_ptr + offs_m, mask=mask_m, other=0)
+    row_lens_expanded = row_lens[:, None]
     
-    for start_n in range(0, N, BLOCK_N):
-        n = start_n + offs_n
-        n_mask = n < N
+    acc = tl.zeros((BM, Dv), dtype=tl.float32)
+    m_i = tl.full((BM,), float('-inf'), dtype=tl.float32)
+    l_i = tl.zeros((BM,), dtype=tl.float32)
+    
+    D_block = tl.cdiv(D, BD)
+    for d_block in range(D_block):
+        d_offs = d_block * BD + tl.arange(0, BD)
+        d_mask = d_offs < D
         
-        k_ptrs = K + n[:, None] * stride_kn + offs_d[None, :] * stride_kd
-        k = tl.load(k_ptrs, mask=n_mask[:, None] & (offs_d[None, :] < D), other=0.0)
+        q_ptrs = Q_ptr + m_idx * stride_qm + d_offs[None, :] * stride_qd
+        q = tl.load(q_ptrs, mask=mask_m[:, None] & d_mask[None, :], other=0.0)
         
-        v_ptrs = V + n[:, None] * stride_vn + offs_dv[None, :] * stride_vd
-        v = tl.load(v_ptrs, mask=n_mask[:, None] & (offs_dv[None, :] < Dv), other=0.0)
+        k_ptrs = K_ptr + n_idx * stride_kn + d_offs[:, None] * stride_kd
+        k = tl.load(k_ptrs, mask=mask_n[None, :] & d_mask[:, None], other=0.0)
         
-        scores = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
-        if USE_INITIAL_MASK:
-            for i in range(BLOCK_M):
-                if m_mask[i]:
-                    row_len = tl.minimum(row_lens[i], N)
-                    col_mask = n < row_len
-                    scores_i = tl.dot(q[i], tl.trans(k))
-                    scores_i = tl.where(col_mask, scores_i, float('-inf'))
-                    scores = tl.where(tl.arange(0, BLOCK_M)[:, None] == i, 
-                                    scores_i[None, :], scores)
+        s_block = tl.dot(q, k, allow_tf32=False)
+        if d_block == 0:
+            s = s_block * scale
         else:
-            q_scaled = q * (1.0 / tl.sqrt(D * 1.0))
-            scores = tl.dot(q_scaled, tl.trans(k))
-            
-            row_mask = tl.expand_dims(m_mask, 1) & tl.expand_dims(n_mask, 0)
-            row_len_mask = tl.expand_dims(offs_m, 1) < tl.expand_dims(row_lens, 1)
-            n_mask_expanded = tl.expand_dims(n, 0) < tl.expand_dims(row_lens, 1)
-            scores = tl.where(row_mask & row_len_mask & n_mask_expanded, scores, float('-inf'))
-        
-        m_ij = tl.max(scores, 1)
-        m_ij = tl.where(m_mask, m_ij, float('-inf'))
-        m_new = tl.maximum(m_i, m_ij)
-        
-        alpha = tl.exp(m_i - m_new)
-        beta = tl.exp(m_ij - m_new)
-        
-        p = tl.exp(scores - m_new[:, None])
-        p_sum = tl.sum(p, 1)
-        l_new = alpha * l_i + beta * p_sum
-        
-        acc_o_scale = l_i / l_new
-        p_scale = beta / l_new
-        
-        acc_o = acc_o * acc_o_scale[:, None]
-        
-        p = p * p_scale[:, None]
-        acc_o += tl.dot(p.to(tl.float16), v)
-        
-        m_i = m_new
-        l_i = l_new
+            s += s_block * scale
     
-    out_ptrs = Out + offs_m[:, None] * stride_om + offs_dv[None, :] * stride_od
-    tl.store(out_ptrs, acc_o.to(tl.float16), 
-             mask=m_mask[:, None] & (offs_dv[None, :] < Dv))
+    row_mask = n_idx < row_lens_expanded
+    s_masked = tl.where(row_mask, s, float('-inf'))
+    
+    m_ij = tl.max(s_masked, axis=1)
+    m_new = tl.maximum(m_i, m_ij)
+    
+    alpha = tl.exp(m_i - m_new)
+    p = tl.exp(s_masked - m_new[:, None])
+    
+    l_new = alpha * l_i + tl.sum(p, axis=1)
+    
+    l_i = l_new
+    m_i = m_new
+    
+    Dv_block = tl.cdiv(Dv, BDV)
+    for dv_block in range(Dv_block):
+        dv_offs = dv_block * BDV + tl.arange(0, BDV)
+        dv_mask = dv_offs < Dv
+        
+        v_ptrs = V_ptr + n_idx * stride_vn + dv_offs[None, :] * stride_vd
+        v = tl.load(v_ptrs, mask=mask_n[None, :] & dv_mask[None, :], other=0.0)
+        
+        p_expanded = p[:, :, None]
+        v_expanded = v[None, :, :]
+        
+        acc_block = tl.sum(p_expanded * v_expanded, axis=1)
+        
+        acc_offs = dv_offs
+        acc_ptrs = acc + offs_m[:, None] * Dv + acc_offs[None, :]
+        current_acc = tl.load(acc_ptrs, mask=mask_m[:, None] & dv_mask[None, :], other=0.0)
+        new_acc = alpha[:, None] * current_acc + acc_block
+        
+        tl.store(acc_ptrs, new_acc, mask=mask_m[:, None] & dv_mask[None, :])
+    
+    tl.debug_barrier()
+    
+    if pid_n == tl.num_programs(1) - 1:
+        l_i_safe = tl.where(l_i > 0, l_i, 1.0)
+        acc_normalized = acc / l_i_safe[:, None]
+        
+        for dv_block in range(Dv_block):
+            dv_offs = dv_block * BDV + tl.arange(0, BDV)
+            dv_mask = dv_offs < Dv
+            
+            out_ptrs = O_ptr + offs_m[:, None] * stride_om + dv_offs[None, :] * stride_od
+            tl.store(out_ptrs, acc_normalized[:, dv_offs].to(tl.float16), 
+                    mask=mask_m[:, None] & dv_mask[None, :])
 
-
-def ragged_attn(Q: torch.Tensor, K: torch.Tensor, V: torch.Tensor, 
-                row_lens: torch.Tensor) -> torch.Tensor:
+def ragged_attn(Q: torch.Tensor, K: torch.Tensor, V: torch.Tensor, row_lens: torch.Tensor) -> torch.Tensor:
+    assert Q.dim() == 2 and K.dim() == 2 and V.dim() == 2
+    assert Q.size(1) == K.size(1), "Q and K must have same feature dimension"
+    assert K.size(0) == V.size(0), "K and V must have same sequence length"
+    assert row_lens.size(0) == Q.size(0), "row_lens must match Q batch dimension"
+    assert Q.dtype == torch.float16 and K.dtype == torch.float16 and V.dtype == torch.float16
+    
     M, D = Q.shape
-    N, _ = K.shape
+    N, D = K.shape
     _, Dv = V.shape
     
-    assert Q.dtype == torch.float16
-    assert K.dtype == torch.float16
-    assert V.dtype == torch.float16
-    assert Q.is_cuda and K.is_cuda and V.is_cuda
-    assert row_lens.is_cuda
-    assert row_lens.shape == (M,)
+    O = torch.empty((M, Dv), device=Q.device, dtype=Q.dtype)
     
-    Out = torch.empty((M, Dv), device=Q.device, dtype=torch.float16)
+    scale = 1.0 / math.sqrt(D)
     
-    BLOCK_M = 32
-    BLOCK_N = 64
-    BLOCK_D = 32 if D >= 32 else 16
-    BLOCK_DV = 32 if Dv >= 32 else 16
+    grid = (triton.cdiv(M, 64), triton.cdiv(N, 64))
     
-    grid = (triton.cdiv(M, BLOCK_M), 1)
-    
-    _ragged_attn_fwd_kernel[grid](
-        Q, K, V, Out,
+    _ragged_attention_kernel[grid](
+        Q, K, V, O, row_lens,
+        M, N, D, Dv,
         Q.stride(0), Q.stride(1),
         K.stride(0), K.stride(1),
         V.stride(0), V.stride(1),
-        Out.stride(0), Out.stride(1),
-        row_lens,
-        M, N, D, Dv,
-        BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N,
-        BLOCK_D=BLOCK_D, BLOCK_DV=BLOCK_DV,
-        USE_INITIAL_MASK=False,
-        num_warps=4,
-        num_stages=3
+        O.stride(0), O.stride(1),
+        scale=scale,
+        BM=64, BN=64, BD=32, BDV=32
     )
     
-    return Out
-
+    return O
 
 class Solution:
     def solve(self, spec_path: str = None) -> dict:
-        code = """
+        return {"code": """
 import torch
 import triton
 import triton.language as tl
+import math
+from typing import Optional, Tuple
 
-
+@triton.autotune(
+    configs=[
+        triton.Config({'BM': 64, 'BN': 64, 'BD': 32, 'BDV': 32}, num_stages=3, num_warps=8),
+        triton.Config({'BM': 128, 'BN': 64, 'BD': 32, 'BDV': 32}, num_stages=3, num_warps=8),
+        triton.Config({'BM': 64, 'BN': 128, 'BD': 32, 'BDV': 32}, num_stages=3, num_warps=8),
+        triton.Config({'BM': 128, 'BN': 128, 'BD': 32, 'BDV': 32}, num_stages=3, num_warps=8),
+        triton.Config({'BM': 64, 'BN': 64, 'BD': 64, 'BDV': 64}, num_stages=3, num_warps=8),
+        triton.Config({'BM': 128, 'BN': 64, 'BD': 64, 'BDV': 64}, num_stages=3, num_warps=8),
+        triton.Config({'BM': 64, 'BN': 128, 'BD': 64, 'BDV': 64}, num_stages=3, num_warps=8),
+    ],
+    key=['M', 'N', 'D', 'Dv'],
+)
 @triton.jit
-def _ragged_attn_fwd_kernel(
-    Q, K, V, Out,
+def _ragged_attention_kernel(
+    Q_ptr, K_ptr, V_ptr, O_ptr, 
+    row_lens_ptr,
+    M, N, D, Dv,
     stride_qm, stride_qd,
     stride_kn, stride_kd,
     stride_vn, stride_vd,
     stride_om, stride_od,
-    row_lens_ptr,
-    M, N, D, Dv,
-    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
-    BLOCK_D: tl.constexpr, BLOCK_DV: tl.constexpr,
-    USE_INITIAL_MASK: tl.constexpr
+    scale: tl.constexpr,
+    BM: tl.constexpr,
+    BN: tl.constexpr,
+    BD: tl.constexpr,
+    BDV: tl.constexpr,
 ):
     pid_m = tl.program_id(0)
     pid_n = tl.program_id(1)
     
-    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
-    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
-    offs_d = tl.arange(0, BLOCK_D)
-    offs_dv = tl.arange(0, BLOCK_DV)
+    offs_m = pid_m * BM + tl.arange(0, BM)
+    offs_n = pid_n * BN + tl.arange(0, BN)
     
-    m_mask = offs_m < M
-    q_ptrs = Q + offs_m[:, None] * stride_qm + offs_d[None, :] * stride_qd
-    q = tl.load(q_ptrs, mask=m_mask[:, None] & (offs_d[None, :] < D), other=0.0)
+    mask_m = offs_m < M
+    mask_n = offs_n < N
     
-    row_len_ptrs = row_lens_ptr + offs_m
-    row_lens = tl.load(row_len_ptrs, mask=m_mask, other=0)
+    m_idx = offs_m[:, None]
+    n_idx = offs_n[None, :]
     
-    m_i = tl.zeros([BLOCK_M], dtype=tl.float32) - float('inf')
-    l_i = tl.zeros([BLOCK_M], dtype=tl.float32)
-    acc_o = tl.zeros([BLOCK_M, BLOCK_DV], dtype=tl.float32)
+    row_lens = tl.load(row_lens_ptr + offs_m, mask=mask_m, other=0)
+    row_lens_expanded = row_lens[:, None]
     
-    for start_n in range(0, N, BLOCK_N):
-        n = start_n + offs_n
-        n_mask = n < N
+    acc = tl.zeros((BM, Dv), dtype=tl.float32)
+    m_i = tl.full((BM,), float('-inf'), dtype=tl.float32)
+    l_i = tl.zeros((BM,), dtype=tl.float32)
+    
+    D_block = tl.cdiv(D, BD)
+    for d_block in range(D_block):
+        d_offs = d_block * BD + tl.arange(0, BD)
+        d_mask = d_offs < D
         
-        k_ptrs = K + n[:, None] * stride_kn + offs_d[None, :] * stride_kd
-        k = tl.load(k_ptrs, mask=n_mask[:, None] & (offs_d[None, :] < D), other=0.0)
+        q_ptrs = Q_ptr + m_idx * stride_qm + d_offs[None, :] * stride_qd
+        q = tl.load(q_ptrs, mask=mask_m[:, None] & d_mask[None, :], other=0.0)
         
-        v_ptrs = V + n[:, None] * stride_vn + offs_dv[None, :] * stride_vd
-        v = tl.load(v_ptrs, mask=n_mask[:, None] & (offs_dv[None, :] < Dv), other=0.0)
+        k_ptrs = K_ptr + n_idx * stride_kn + d_offs[:, None] * stride_kd
+        k = tl.load(k_ptrs, mask=mask_n[None, :] & d_mask[:, None], other=0.0)
         
-        scores = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
-        if USE_INITIAL_MASK:
-            for i in range(BLOCK_M):
-                if m_mask[i]:
-                    row_len = tl.minimum(row_lens[i], N)
-                    col_mask = n < row_len
-                    scores_i = tl.dot(q[i], tl.trans(k))
-                    scores_i = tl.where(col_mask, scores_i, float('-inf'))
-                    scores = tl.where(tl.arange(0, BLOCK_M)[:, None] == i, 
-                                    scores_i[None, :], scores)
+        s_block = tl.dot(q, k, allow_tf32=False)
+        if d_block == 0:
+            s = s_block * scale
         else:
-            q_scaled = q * (1.0 / tl.sqrt(D * 1.0))
-            scores = tl.dot(q_scaled, tl.trans(k))
-            
-            row_mask = tl.expand_dims(m_mask, 1) & tl.expand_dims(n_mask, 0)
-            row_len_mask = tl.expand_dims(offs_m, 1) < tl.expand_dims(row_lens, 1)
-            n_mask_expanded = tl.expand_dims(n, 0) < tl.expand_dims(row_lens, 1)
-            scores = tl.where(row_mask & row_len_mask & n_mask_expanded, scores, float('-inf'))
-        
-        m_ij = tl.max(scores, 1)
-        m_ij = tl.where(m_mask, m_ij, float('-inf'))
-        m_new = tl.maximum(m_i, m_ij)
-        
-        alpha = tl.exp(m_i - m_new)
-        beta = tl.exp(m_ij - m_new)
-        
-        p = tl.exp(scores - m_new[:, None])
-        p_sum = tl.sum(p, 1)
-        l_new = alpha * l_i + beta * p_sum
-        
-        acc_o_scale = l_i / l_new
-        p_scale = beta / l_new
-        
-        acc_o = acc_o * acc_o_scale[:, None]
-        
-        p = p * p_scale[:, None]
-        acc_o += tl.dot(p.to(tl.float16), v)
-        
-        m_i = m_new
-        l_i = l_new
+            s += s_block * scale
     
-    out_ptrs = Out + offs_m[:, None] * stride_om + offs_dv[None, :] * stride_od
-    tl.store(out_ptrs, acc_o.to(tl.float16), 
-             mask=m_mask[:, None] & (offs_dv[None, :] < Dv))
+    row_mask = n_idx < row_lens_expanded
+    s_masked = tl.where(row_mask, s, float('-inf'))
+    
+    m_ij = tl.max(s_masked, axis=1)
+    m_new = tl.maximum(m_i, m_ij)
+    
+    alpha = tl.exp(m_i - m_new)
+    p = tl.exp(s_masked - m_new[:, None])
+    
+    l_new = alpha * l_i + tl.sum(p, axis=1)
+    
+    l_i = l_new
+    m_i = m_new
+    
+    Dv_block = tl.cdiv(Dv, BDV)
+    for dv_block in range(Dv_block):
+        dv_offs = dv_block * BDV + tl.arange(0, BDV)
+        dv_mask = dv_offs < Dv
+        
+        v_ptrs = V_ptr + n_idx * stride_vn + dv_offs[None, :] * stride_vd
+        v = tl.load(v_ptrs, mask=mask_n[None, :] & dv_mask[None, :], other=0.0)
+        
+        p_expanded = p[:, :, None]
+        v_expanded = v[None, :, :]
+        
+        acc_block = tl.sum(p_expanded * v_expanded, axis=1)
+        
+        acc_offs = dv_offs
+        acc_ptrs = acc + offs_m[:, None] * Dv + acc_offs[None, :]
+        current_acc = tl.load(acc_ptrs, mask=mask_m[:, None] & dv_mask[None, :], other=0.0)
+        new_acc = alpha[:, None] * current_acc + acc_block
+        
+        tl.store(acc_ptrs, new_acc, mask=mask_m[:, None] & dv_mask[None, :])
+    
+    tl.debug_barrier()
+    
+    if pid_n == tl.num_programs(1) - 1:
+        l_i_safe = tl.where(l_i > 0, l_i, 1.0)
+        acc_normalized = acc / l_i_safe[:, None]
+        
+        for dv_block in range(Dv_block):
+            dv_offs = dv_block * BDV + tl.arange(0, BDV)
+            dv_mask = dv_offs < Dv
+            
+            out_ptrs = O_ptr + offs_m[:, None] * stride_om + dv_offs[None, :] * stride_od
+            tl.store(out_ptrs, acc_normalized[:, dv_offs].to(tl.float16), 
+                    mask=mask_m[:, None] & dv_mask[None, :])
 
-
-def ragged_attn(Q: torch.Tensor, K: torch.Tensor, V: torch.Tensor, 
-                row_lens: torch.Tensor) -> torch.Tensor:
+def ragged_attn(Q: torch.Tensor, K: torch.Tensor, V: torch.Tensor, row_lens: torch.Tensor) -> torch.Tensor:
+    assert Q.dim() == 2 and K.dim() == 2 and V.dim() == 2
+    assert Q.size(1) == K.size(1), "Q and K must have same feature dimension"
+    assert K.size(0) == V.size(0), "K and V must have same sequence length"
+    assert row_lens.size(0) == Q.size(0), "row_lens must match Q batch dimension"
+    assert Q.dtype == torch.float16 and K.dtype == torch.float16 and V.dtype == torch.float16
+    
     M, D = Q.shape
-    N, _ = K.shape
+    N, D = K.shape
     _, Dv = V.shape
     
-    assert Q.dtype == torch.float16
-    assert K.dtype == torch.float16
-    assert V.dtype == torch.float16
-    assert Q.is_cuda and K.is_cuda and V.is_cuda
-    assert row_lens.is_cuda
-    assert row_lens.shape == (M,)
+    O = torch.empty((M, Dv), device=Q.device, dtype=Q.dtype)
     
-    Out = torch.empty((M, Dv), device=Q.device, dtype=torch.float16)
+    scale = 1.0 / math.sqrt(D)
     
-    BLOCK_M = 32
-    BLOCK_N = 64
-    BLOCK_D = 32 if D >= 32 else 16
-    BLOCK_DV = 32 if Dv >= 32 else 16
+    grid = (triton.cdiv(M, 64), triton.cdiv(N, 64))
     
-    grid = (triton.cdiv(M, BLOCK_M), 1)
-    
-    _ragged_attn_fwd_kernel[grid](
-        Q, K, V, Out,
+    _ragged_attention_kernel[grid](
+        Q, K, V, O, row_lens,
+        M, N, D, Dv,
         Q.stride(0), Q.stride(1),
         K.stride(0), K.stride(1),
         V.stride(0), V.stride(1),
-        Out.stride(0), Out.stride(1),
-        row_lens,
-        M, N, D, Dv,
-        BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N,
-        BLOCK_D=BLOCK_D, BLOCK_DV=BLOCK_DV,
-        USE_INITIAL_MASK=False,
-        num_warps=4,
-        num_stages=3
+        O.stride(0), O.stride(1),
+        scale=scale,
+        BM=64, BN=64, BD=32, BDV=32
     )
     
-    return Out
-"""
-        return {"code": code}
+    return O
+"""}

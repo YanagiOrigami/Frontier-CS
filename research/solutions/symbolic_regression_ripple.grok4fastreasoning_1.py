@@ -7,12 +7,12 @@ class Solution:
 
     def solve(self, X: np.ndarray, y: np.ndarray) -> dict:
         model = PySRRegressor(
-            niterations=40,
+            niterations=200,
             binary_operators=["+", "-", "*", "/", "**"],
             unary_operators=["sin", "cos", "exp", "log"],
-            populations=15,
-            population_size=33,
-            maxsize=25,
+            populations=10,
+            population_size=50,
+            maxsize=20,
             verbosity=0,
             progress=False,
             random_state=42,

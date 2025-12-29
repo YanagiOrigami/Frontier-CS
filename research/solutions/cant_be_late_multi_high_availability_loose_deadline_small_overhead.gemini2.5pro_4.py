@@ -1,15 +1,17 @@
 import json
-from argparse import Namespace
 import math
+from argparse import Namespace
 
 from sky_spot.strategies.multi_strategy import MultiRegionStrategy
 from sky_spot.utils import ClusterType
 
 
 class Solution(MultiRegionStrategy):
-    """Your multi-region scheduling strategy."""
+    """
+    An adaptive multi-region scheduling strategy that balances cost and deadline adherence.
+    """
 
-    NAME = "my_strategy"  # REQUIRED: unique identifier
+    NAME = "adaptive_slack_v1"
 
     def solve(self, spec_path: str) -> "Solution":
         """
@@ -25,62 +27,110 @@ class Solution(MultiRegionStrategy):
             inter_task_overhead=[0.0],
         )
         super().__init__(args)
-        self._initialized = False
-        return self
 
-    def _initialize(self):
-        """
-        One-time initialization of strategy state.
-        """
-        self.num_regions = self.env.get_num_regions()
-        self.consecutive_no_spot_in_current_region = 0
+        self.num_regions = len(config.get("trace_files", []))
+        if self.num_regions == 0:
+            self.num_regions = 1 
 
-        if self.env.gap_seconds > 0:
-            self.NO_SPOT_SWITCH_THRESHOLD = max(
-                1, math.ceil(5 * self.restart_overhead / self.env.gap_seconds)
-            )
-        else:
-            self.NO_SPOT_SWITCH_THRESHOLD = 5
+        self.region_stats = [
+            {'spot_seen': 0, 'total_seen': 0, 'consecutive_outages': 0}
+            for _ in range(self.num_regions)
+        ]
 
+        # --- Hyperparameters ---
+        self.INITIAL_SAFETY_MARGIN = 1.15
+        self.FINAL_SAFETY_MARGIN = 1.01
+        self.CONSECUTIVE_OUTAGE_THRESHOLD = 2
+        self.WAIT_SLACK_THRESHOLD_FACTOR = 0.25
+
+        # --- Calculated Parameters ---
         initial_slack = self.deadline - self.task_duration
-        self.WAIT_SLACK_THRESHOLD = 0.15 * initial_slack if initial_slack > 0 else 3600.0
+        self.wait_slack_threshold_sec = initial_slack * self.WAIT_SLACK_THRESHOLD_FACTOR
 
-        self._initialized = True
+        return self
 
     def _step(self, last_cluster_type: ClusterType, has_spot: bool) -> ClusterType:
         """
         Decide next action based on current state.
         """
-        if not self._initialized:
-            self._initialize()
+        # --- 0. State Update and Pre-computation ---
+        env_num_regions = self.env.get_num_regions()
+        if env_num_regions > len(self.region_stats):
+             self.region_stats.extend([
+                {'spot_seen': 0, 'total_seen': 0, 'consecutive_outages': 0}
+                for _ in range(env_num_regions - len(self.region_stats))
+            ])
+             self.num_regions = env_num_regions
 
-        work_rem = self.task_duration - sum(self.task_done_time)
+        current_region = self.env.get_current_region()
+        
+        stats = self.region_stats[current_region]
+        stats['total_seen'] += 1
+        if has_spot:
+            stats['spot_seen'] += 1
+            stats['consecutive_outages'] = 0
+        else:
+            stats['consecutive_outages'] += 1
+
+        work_done = sum(self.task_done_time)
+        work_rem = self.task_duration - work_done
+
         if work_rem <= 0:
             return ClusterType.NONE
 
-        if has_spot:
-            self.consecutive_no_spot_in_current_region = 0
-        else:
-            self.consecutive_no_spot_in_current_region += 1
+        time_to_deadline = self.deadline - self.env.elapsed_seconds
+        gap_seconds = self.env.gap_seconds
 
-        time_left = self.deadline - self.env.elapsed_seconds
+        # --- 1. Urgency Calculation (Panic Mode) ---
+        work_plus_overhead = work_rem + self.restart_overhead
         
-        time_needed_for_guaranteed_completion = work_rem + self.restart_overhead
+        if gap_seconds <= 0:
+             return ClusterType.ON_DEMAND
+             
+        steps_needed_od = math.ceil(work_plus_overhead / gap_seconds)
+        time_needed_od = steps_needed_od * gap_seconds
 
-        if time_needed_for_guaranteed_completion >= time_left:
+        progress_ratio = min(1.0, work_done / self.task_duration) if self.task_duration > 0 else 1.0
+        safety_margin = self.INITIAL_SAFETY_MARGIN - (self.INITIAL_SAFETY_MARGIN - self.FINAL_SAFETY_MARGIN) * progress_ratio
+        
+        if time_needed_od * safety_margin >= time_to_deadline:
             return ClusterType.ON_DEMAND
 
+        # --- 2. Normal Mode (Sufficient Slack) ---
         if has_spot:
             return ClusterType.SPOT
-        else:
-            if self.consecutive_no_spot_in_current_region >= self.NO_SPOT_SWITCH_THRESHOLD:
-                current_region = self.env.get_current_region()
-                next_region = (current_region + 1) % self.num_regions
-                self.env.switch_region(next_region)
-                self.consecutive_no_spot_in_current_region = 0
 
-            slack = time_left - time_needed_for_guaranteed_completion
-            if slack > self.WAIT_SLACK_THRESHOLD:
-                return ClusterType.NONE
-            else:
+        # --- Spot is unavailable. Decide whether to switch, use OD, or wait. ---
+
+        # 2a. Evaluate Region Switching
+        if stats['consecutive_outages'] >= self.CONSECUTIVE_OUTAGE_THRESHOLD:
+            
+            def get_region_score(r_idx):
+                r_stats = self.region_stats[r_idx]
+                return (r_stats['spot_seen'] + 1) / (r_stats['total_seen'] + 2)
+
+            current_score = get_region_score(current_region)
+            
+            best_alt_region = -1
+            max_alt_score = -1.0
+            
+            for i in range(self.num_regions):
+                if i == current_region:
+                    continue
+                
+                score = get_region_score(i)
+                if score > max_alt_score:
+                    max_alt_score = score
+                    best_alt_region = i
+            
+            if best_alt_region != -1 and max_alt_score > current_score:
+                self.env.switch_region(best_alt_region)
                 return ClusterType.ON_DEMAND
+
+        # 2b. Stay in Region: On-Demand vs. Wait (None)
+        slack_sec = time_to_deadline - time_needed_od
+        
+        if slack_sec > self.wait_slack_threshold_sec:
+            return ClusterType.NONE
+        else:
+            return ClusterType.ON_DEMAND

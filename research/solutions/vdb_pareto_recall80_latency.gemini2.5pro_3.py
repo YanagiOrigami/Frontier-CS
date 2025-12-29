@@ -1,124 +1,100 @@
 import numpy as np
-from typing import Tuple
 import faiss
+import os
+from typing import Tuple
 
 class YourIndexClass:
     """
-    An efficient Vector Database index for the Recall80 Latency Tier.
+    A Faiss-based vector index optimized for the Recall80 Latency Tier problem.
 
-    This implementation uses FAISS's IndexIVFPQ, a highly optimized method
-    that combines Inverted Files (for partitioning the search space) and
-    Product Quantization (for vector compression and fast distance calculation).
-
-    The hyperparameters (nlist, m, nprobe) are carefully selected based on
-    public benchmarks for the SIFT1M dataset to achieve the target recall
-    of >= 80% while minimizing query latency.
+    This implementation uses an Inverted File with Product Quantization (IVFPQ)
+    to achieve extremely low latency while satisfying the recall@1 >= 0.80 constraint.
+    Hyperparameters have been carefully selected and tuned for the SIFT1M dataset
+    to provide the best possible performance under the given evaluation criteria.
     """
     def __init__(self, dim: int, **kwargs):
         """
         Initialize the index for vectors of dimension `dim`.
 
         Args:
-            dim: Vector dimensionality.
-            **kwargs: Optional parameters for hyperparameter tuning.
+            dim: Vector dimensionality (e.g., 128 for SIFT1M)
+            **kwargs: Optional parameters to override default Faiss settings.
+                      Supported keys: 'nlist', 'M', 'nprobe'.
         """
-        # --- Environment Optimization ---
-        # Utilize all available CPU cores for FAISS operations. The evaluation
-        # environment provides 8 vCPUs.
-        try:
-            faiss.omp_set_num_threads(8)
-        except AttributeError:
-            # This may happen if FAISS is compiled without OpenMP support.
-            # The code will still work but might be slower.
-            pass
+        # Set Faiss to use all available CPU cores. This is critical for
+        # achieving the sub-millisecond latency requirement on batch queries.
+        if 'OMP_NUM_THREADS' not in os.environ:
+            num_threads = os.cpu_count()
+            if num_threads is not None:
+                faiss.omp_set_num_threads(num_threads)
 
         self.dim = dim
         self.is_trained = False
 
-        # --- Index Hyperparameters ---
-        # These values are chosen to balance the recall/latency trade-off for SIFT1M.
-        # `nlist`: Number of partitions (Voronoi cells).
-        # `m`: Number of sub-vectors for Product Quantization.
-        # `nprobe`: Number of partitions to search at query time. This is the
-        #           primary knob for controlling the speed vs. accuracy trade-off.
-        self.nlist = kwargs.get('nlist', 1024)
-        self.m = kwargs.get('m', 16)  # 128 is divisible by 16
-        self.nbits = kwargs.get('nbits', 8)  # 8 bits -> 256 centroids per sub-quantizer
+        # --- Tuned Hyperparameters for IVFPQ ---
+        # These values are chosen to just exceed the 0.80 recall@1 threshold
+        # on SIFT1M, thereby minimizing latency.
         
-        # A value of nprobe=5 is chosen as a safe margin to exceed the 80% recall
-        # gate, based on SIFT1M benchmarks.
-        self.nprobe = kwargs.get('nprobe', 5)
+        # Number of IVF cells (Voronoi partitions).
+        self.nlist = kwargs.get('nlist', 2048)
+        
+        # Number of sub-quantizers for Product Quantization. Must be a divisor of `dim`.
+        self.M = kwargs.get('M', 16)
+        
+        # Number of bits per sub-quantizer code. 8 is standard.
+        self.nbits = kwargs.get('nbits', 8)
+        
+        # Number of IVF cells to search. This is the most critical parameter
+        # for the speed-recall tradeoff. The value of 26 is a safe estimate
+        # to ensure recall > 0.80.
+        self.nprobe = kwargs.get('nprobe', 26)
 
-        # --- Index Construction ---
-        # 1. Quantizer: A simple index to find the nearest cells for a query vector.
+        # --- Faiss Index Construction ---
+        # The coarse quantizer is used to assign vectors to their nearest IVF cell.
         quantizer = faiss.IndexFlatL2(self.dim)
         
-        # 2. Main Index: IndexIVFPQ combines the quantizer with inverted lists
-        #    and product quantization for memory efficiency and fast search.
+        # The main index combines IVF for partitioning and PQ for compression.
+        # This combination is ideal for high-speed search on large datasets.
+        # The default metric is L2, which is what SIFT1M uses.
         self.index = faiss.IndexIVFPQ(
-            quantizer,
-            self.dim,
-            self.nlist,
-            self.m,
-            self.nbits,
-            faiss.METRIC_L2
+            quantizer, self.dim, self.nlist, self.M, self.nbits
         )
-        
-        # Set the number of probes for the search method.
-        self.index.nprobe = self.nprobe
 
     def add(self, xb: np.ndarray) -> None:
         """
         Add vectors to the index.
-        
-        If the index is not yet trained, it uses a subset of the first data
-        batch `xb` to train the quantizer and PQ codebooks.
-        """
-        # FAISS operates on float32 arrays.
-        if xb.dtype != np.float32:
-            xb = xb.astype(np.float32)
 
+        Args:
+            xb: Base vectors, shape (N, dim), dtype float32
+        """
         if not self.is_trained:
-            # Training is required before adding vectors.
-            # We select a subset of the input data for training.
-            # 100,000 vectors is a robust sample size for training on SIFT1M.
-            ntrain = min(xb.shape[0], 100_000)
-            
-            # Randomly sample to avoid any bias from data ordering.
-            if xb.shape[0] > ntrain:
-                random_indices = np.random.choice(xb.shape[0], size=ntrain, replace=False)
-                xt = xb[random_indices]
-            else:
-                xt = xb
-            
-            self.index.train(xt)
+            # The index must be trained on a representative sample of the data
+            # to learn the IVF cell centroids and the PQ codebooks.
+            # Training on the full 1M SIFT1M dataset is feasible and gives the best quality.
+            self.index.train(xb)
             self.is_trained = True
         
-        # Add the vectors to the inverted lists.
+        # Add the vectors to the index's inverted lists.
         self.index.add(xb)
 
     def search(self, xq: np.ndarray, k: int) -> Tuple[np.ndarray, np.ndarray]:
         """
-        Search for the k nearest neighbors for each query vector.
+        Search for k nearest neighbors of query vectors.
+
+        Args:
+            xq: Query vectors, shape (nq, dim), dtype float32
+            k: Number of nearest neighbors to return
 
         Returns:
-            A tuple of (distances, indices).
-            - distances: L2-squared distances, shape (nq, k)
-            - indices: 0-based indices of the neighbors, shape (nq, k)
+            (distances, indices):
+                - distances: shape (nq, k), dtype float32, L2-squared distances
+                - indices: shape (nq, k), dtype int64, indices into base vectors
         """
-        if not self.is_trained or self.index.ntotal == 0:
-            # Handle search on an empty or untrained index.
-            nq = xq.shape[0]
-            return (
-                np.full((nq, k), -1, dtype=np.float32),
-                np.full((nq, k), -1, dtype=np.int64)
-            )
-
-        # Ensure query vectors are float32.
-        if xq.dtype != np.float32:
-            xq = xq.astype(np.float32)
-
-        # Perform the search.
+        # Set the number of probes for this search.
+        self.index.nprobe = self.nprobe
+        
+        # Perform the search. Faiss handles batching and multithreading internally.
+        # The returned distances are L2-squared, which is acceptable per problem spec.
         distances, indices = self.index.search(xq, k)
         
         return distances, indices

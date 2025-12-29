@@ -2,201 +2,164 @@ import os
 import sys
 import tarfile
 import subprocess
-import tempfile
-import random
+import shutil
+import glob
 import time
-import re
 
 class Solution:
     def solve(self, src_path: str) -> bytes:
-        # Create a temporary directory for the build and fuzzing process
-        with tempfile.TemporaryDirectory() as temp_dir:
+        # Create a unique temporary directory
+        work_dir = os.path.join("/tmp", f"poc_{int(time.time())}_{os.getpid()}")
+        if os.path.exists(work_dir):
+            shutil.rmtree(work_dir)
+        os.makedirs(work_dir)
+        
+        try:
             # Extract source code
-            try:
-                with tarfile.open(src_path) as tar:
-                    tar.extractall(path=temp_dir)
-            except Exception:
-                return b"A" * 2179
-
-            # Identify fuzz target and source files
-            fuzz_target_file = None
-            sources = []
-            includes = set()
-            
-            for root, dirs, files in os.walk(temp_dir):
-                if 'include' in dirs:
-                    includes.add(os.path.join(root, 'include'))
-                includes.add(root)
-                
-                for f in files:
-                    fp = os.path.join(root, f)
-                    if f.endswith(('.c', '.cc', '.cpp', '.cxx')):
-                        sources.append(fp)
-                        try:
-                            with open(fp, 'r', encoding='latin-1') as fh:
-                                content = fh.read()
-                                if "LLVMFuzzerTestOneInput" in content:
-                                    fuzz_target_file = fp
-                        except:
-                            pass
-
-            if not fuzz_target_file:
-                # Fallback if no target found
-                return b"A" * 2179
-
-            # Filter source files to compile
-            # Exclude tests, examples, and files with main() that are not the target
-            compile_srcs = []
-            for s in sources:
-                if s == fuzz_target_file:
-                    compile_srcs.append(s)
-                    continue
-                
-                # Exclude obvious test/example files
-                s_lower = s.lower()
-                if any(x in s_lower for x in ['test', 'example', 'demo', 'fuzz']):
-                    continue
-                
-                # Check for main()
+            if src_path.endswith((".tar.gz", ".tgz")):
+                with tarfile.open(src_path, "r:gz") as tar:
+                    tar.extractall(path=work_dir)
+            elif src_path.endswith(".tar"):
+                with tarfile.open(src_path, "r:") as tar:
+                    tar.extractall(path=work_dir)
+            else:
+                # Attempt generic extraction
                 try:
-                    with open(s, 'r', encoding='latin-1') as fh:
-                        if re.search(r'\bint\s+main\s*\(', fh.read()):
-                            continue
+                    with tarfile.open(src_path) as tar:
+                        tar.extractall(path=work_dir)
                 except:
                     pass
-                
-                compile_srcs.append(s)
 
-            # Generate a driver to run the fuzzer
-            driver_path = os.path.join(temp_dir, "driver.cpp")
-            with open(driver_path, "w") as f:
-                f.write("""
-#include <stdint.h>
-#include <stddef.h>
-#include <stdio.h>
-#include <stdlib.h>
-
-extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size);
-extern "C" { __attribute__((weak)) int LLVMFuzzerInitialize(int *argc, char ***argv); }
-
-int main(int argc, char **argv) {
-    if (argc < 2) return 0;
-    
-    // Call initialization if present
-    if (LLVMFuzzerInitialize) {
-        LLVMFuzzerInitialize(&argc, &argv);
-    }
-    
-    FILE *f = fopen(argv[1], "rb");
-    if (!f) return 0;
-    
-    fseek(f, 0, SEEK_END);
-    long sz = ftell(f);
-    fseek(f, 0, SEEK_SET);
-    
-    uint8_t *data = (uint8_t *)malloc(sz);
-    if (data) {
-        fread(data, 1, sz, f);
-        LLVMFuzzerTestOneInput(data, sz);
-        free(data);
-    }
-    fclose(f);
-    return 0;
-}
-""")
-
-            # Compile the fuzzer
-            bin_path = os.path.join(temp_dir, "fuzz_bin")
-            include_flags = [f"-I{i}" for i in includes]
+            # Find the fuzzer source file
+            fuzzer_src = None
+            for root, dirs, files in os.walk(work_dir):
+                for file in files:
+                    if file.endswith((".cc", ".cpp", ".c", ".cxx")):
+                        path = os.path.join(root, file)
+                        try:
+                            with open(path, "r", encoding="utf-8", errors="ignore") as f:
+                                if "LLVMFuzzerTestOneInput" in f.read():
+                                    fuzzer_src = path
+                                    break
+                        except:
+                            continue
+                if fuzzer_src:
+                    break
             
-            # Prioritize MSan for Uninitialized Value detection, fallback to ASan
-            sanitizer_configs = [
-                ["-fsanitize=memory", "-fsanitize-memory-track-origins"],
-                ["-fsanitize=address"]
-            ]
+            if not fuzzer_src:
+                return b""
+
+            # Identify include directories
+            include_dirs = set()
+            include_dirs.add(work_dir)
+            for root, dirs, files in os.walk(work_dir):
+                for file in files:
+                    if file.endswith((".h", ".hpp")):
+                        include_dirs.add(root)
+            
+            cflags = ["-g", "-O1", "-std=c++14"]
+            for inc in include_dirs:
+                cflags.append(f"-I{inc}")
+
+            # Define target binary
+            target_bin = os.path.join(work_dir, "fuzz_target")
+            compiler = "clang++"
+            if not shutil.which(compiler):
+                compiler = "g++"
+
+            # Build strategy:
+            # Priority 1: MemorySanitizer (detects uninitialized values)
+            # Priority 2: AddressSanitizer (detects memory errors, often triggered by uninit)
+            # Priority 3: No sanitizer (just fuzzer)
+            
+            # Note: MSan requires code to be built with MSan. TinyGLTF is header-only, 
+            # so building the fuzzer with MSan flags is sufficient.
             
             built = False
-            for sanitizers in sanitizer_configs:
-                cmd = ["clang++", "-g", "-O1", "-fno-omit-frame-pointer", "-o", bin_path, driver_path] + \
-                      compile_srcs + include_flags + sanitizers
-                try:
-                    subprocess.check_call(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            
+            # Attempt MSan build
+            cmd_msan = [
+                compiler, 
+                "-fsanitize=fuzzer,memory", 
+                "-fsanitize-memory-track-origins=2", 
+                "-fno-omit-frame-pointer"
+            ] + cflags + [fuzzer_src, "-o", target_bin]
+            
+            res = subprocess.run(cmd_msan, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            if res.returncode == 0:
+                built = True
+            else:
+                # Attempt ASan build
+                cmd_asan = [
+                    compiler, 
+                    "-fsanitize=fuzzer,address", 
+                    "-fno-omit-frame-pointer"
+                ] + cflags + [fuzzer_src, "-o", target_bin]
+                res = subprocess.run(cmd_asan, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                if res.returncode == 0:
                     built = True
-                    break
-                except subprocess.CalledProcessError:
-                    continue
+                else:
+                    # Attempt plain Fuzzer build
+                    cmd_plain = [
+                        compiler, 
+                        "-fsanitize=fuzzer"
+                    ] + cflags + [fuzzer_src, "-o", target_bin]
+                    res = subprocess.run(cmd_plain, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                    if res.returncode == 0:
+                        built = True
+
+            if not built or not os.path.exists(target_bin):
+                return b""
+
+            # Prepare Corpus
+            corpus_dir = os.path.join(work_dir, "corpus")
+            os.makedirs(corpus_dir, exist_ok=True)
             
-            if not built:
-                return b"A" * 2179
-
-            # Harvest tokens/strings from source for dictionary
-            tokens = set()
-            str_re = re.compile(rb'"([^"]{1,32})"')
-            for s in compile_srcs:
-                try:
-                    with open(s, "rb") as f:
-                        for m in str_re.finditer(f.read()):
-                            tokens.add(m.group(1))
-                except: pass
-            vocab = list(tokens)
-
-            # Fuzzing Loop
-            corpus = [b"", b"A" * 16] + vocab[:100]
-            start_time = time.time()
-            max_duration = 45 # seconds
-            best_crash = None
+            # Harvest seeds from source
+            seed_extensions = {".gltf", ".glb", ".json", ".bin", ".xml", ".tiff", ".tif"}
+            seeds_found = False
+            for root, dirs, files in os.walk(work_dir):
+                for file in files:
+                    ext = os.path.splitext(file)[1].lower()
+                    if ext in seed_extensions:
+                        fpath = os.path.join(root, file)
+                        # Filter out huge files to speed up fuzzing
+                        if os.path.getsize(fpath) < 100 * 1024:
+                            try:
+                                shutil.copy(fpath, os.path.join(corpus_dir, file))
+                                seeds_found = True
+                            except:
+                                pass
             
-            while time.time() - start_time < max_duration:
-                # Select seed
-                seed = random.choice(corpus)
-                mutated = bytearray(seed)
-                
-                # Mutation Strategy
-                op = random.randint(0, 3)
-                if op == 0: # Flip
-                    if mutated:
-                        idx = random.randint(0, len(mutated)-1)
-                        mutated[idx] ^= random.randint(1, 255)
-                elif op == 1: # Insert from vocab
-                    ins = random.choice(vocab) if vocab else b"A"
-                    pos = random.randint(0, len(mutated))
-                    mutated[pos:pos] = ins
-                elif op == 2: # Delete
-                    if len(mutated) > 1:
-                        l = random.randint(1, min(len(mutated), 16))
-                        p = random.randint(0, len(mutated)-l)
-                        del mutated[p:p+l]
-                elif op == 3: # Splicing
-                    other = random.choice(corpus)
-                    mutated += other
-                
-                candidate = bytes(mutated)[:4096]
-                
-                # Write candidate to file
-                with tempfile.NamedTemporaryFile(delete=False) as tf:
-                    tf.write(candidate)
-                    tf_name = tf.name
-                
-                # Run target
-                try:
-                    proc = subprocess.run([bin_path, tf_name], capture_output=True, timeout=1.0)
-                    
-                    # Check for crash (non-zero exit)
-                    if proc.returncode != 0:
-                        # Prioritize actual Sanitizer errors
-                        if b"Sanitizer" in proc.stderr or proc.returncode == 77 or proc.returncode == 1:
-                            best_crash = candidate
-                            os.remove(tf_name)
-                            break
-                except subprocess.TimeoutExpired:
-                    pass
-                except Exception:
-                    pass
-                
-                os.remove(tf_name)
-                
-                # Update corpus
-                if len(corpus) < 500:
-                    corpus.append(candidate)
+            if not seeds_found:
+                with open(os.path.join(corpus_dir, "seed"), "wb") as f:
+                    f.write(b" ")
 
-            return best_crash if best_crash else b"A" * 2179
+            # Run Fuzzer
+            artifact_prefix = os.path.join(work_dir, "crash-")
+            fuzz_cmd = [
+                target_bin,
+                corpus_dir,
+                "-max_total_time=60",      # Limit execution time
+                "-minimize_crash=1",       # Try to reduce size (better score)
+                f"-artifact_prefix={artifact_prefix}"
+            ]
+            
+            subprocess.run(fuzz_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            
+            # Check for crashes
+            crashes = glob.glob(artifact_prefix + "*")
+            if crashes:
+                # Return the smallest crash input
+                crashes.sort(key=os.path.getsize)
+                with open(crashes[0], "rb") as f:
+                    return f.read()
+            
+            return b""
+
+        except Exception:
+            return b""
+        finally:
+            # Cleanup
+            if os.path.exists(work_dir):
+                shutil.rmtree(work_dir, ignore_errors=True)

@@ -4,24 +4,26 @@ from typing import Tuple
 
 class YourIndexClass:
     """
-    A FAISS-based vector database index optimized for the Recall80 Latency tier.
+    An optimized FAISS-based index for the Recall80 Latency Tier problem.
 
-    This implementation uses the Hierarchical Navigable Small Worlds (HNSW) algorithm,
-    which provides an excellent trade-off between search speed and accuracy for
-    CPU-based environments. The parameters have been tuned to meet the specific
-    requirements of the tier:
-    - Recall@1 >= 0.80
-    - Average query latency < 0.6ms
+    This index uses an Inverted File with Product Quantization (IVFPQ) structure,
+    which is highly effective for large-scale similarity search on CPUs. The
+    parameters are specifically tuned to meet the aggressive latency target
+    (< 0.6ms average query time) while satisfying the recall constraint (>= 80% @1).
 
-    The chosen parameters are based on standard SIFT1M benchmarks:
-    - M=32: Number of neighbors per node in the HNSW graph. A standard value.
-    - efConstruction=40: Search depth during index construction. Higher values
-      lead to a better quality graph at the cost of longer build time. The evaluation
-      timeout of 1 hour is more than sufficient.
-    - efSearch=8: Search depth during query time. This is the critical parameter
-      for the speed/recall trade-off. A value of 8 provides recall just above 80%
-      (typically ~83-84%) with extremely low latency (typically ~0.18ms), making
-      it an ideal configuration for this specific problem.
+    Key parameter choices:
+    - nlist=4096: A large number of centroids to create fine-grained partitions
+      of the vector space. This improves the chance that a query's true nearest
+      neighbor is in one of the first few lists checked.
+    - m=32: A high number of sub-quantizers for Product Quantization. For a 128-dim
+      vector, this breaks it into 32 sub-vectors of 4 dimensions each. This
+      provides a more accurate distance approximation compared to smaller 'm' values,
+      which is crucial for maintaining recall.
+    - nprobe=3: An extremely small number of inverted lists to probe at search
+      time. This is the primary lever for minimizing latency. By searching only 3
+      out of 4096 lists, we drastically reduce the number of vectors to compare
+      against, ensuring ultra-low query times. The combination of high nlist and high
+      m is designed to make these 3 lists as effective as possible.
     """
 
     def __init__(self, dim: int, **kwargs):
@@ -30,38 +32,48 @@ class YourIndexClass:
 
         Args:
             dim: Vector dimensionality.
-            **kwargs: Optional parameters to override HNSW defaults.
-                - M: Number of neighbors for HNSW graph (default: 32).
-                - efConstruction: Build-time search depth (default: 40).
-                - efSearch: Query-time search depth (default: 8).
+            **kwargs: Optional parameters to override the defaults.
+                      Supported keys: 'nlist', 'm', 'nprobe'.
         """
         self.dim = dim
         
-        self.M = kwargs.get('M', 32)
-        self.efConstruction = kwargs.get('efConstruction', 40)
-        self.efSearch = kwargs.get('efSearch', 8)
+        self.nlist = kwargs.get('nlist', 4096)
+        m = kwargs.get('m', 32)
+        
+        # Using faiss.index_factory for concise index creation.
+        # "IVF{nlist},PQ{m}" creates an IndexIVFPQ with L2 distance by default.
+        factory_string = f"IVF{self.nlist},PQ{m}"
+        self.index = faiss.index_factory(self.dim, factory_string, faiss.METRIC_L2)
+        
+        # nprobe is the most critical search-time parameter for the speed/accuracy trade-off.
+        # A low value is chosen to meet the strict latency requirement.
+        self.nprobe = kwargs.get('nprobe', 3)
 
-        # faiss.IndexHNSWFlat is chosen for its high performance on CPU. It stores
-        # full vectors, avoiding quantization errors and allowing the target recall
-        # to be met with a very low search budget (efSearch).
-        # The metric is L2, as required by the SIFT1M dataset evaluation.
-        self.index = faiss.IndexHNSWFlat(self.dim, self.M, faiss.METRIC_L2)
-        self.index.hnsw.efConstruction = self.efConstruction
 
     def add(self, xb: np.ndarray) -> None:
         """
-        Add vectors to the index. For HNSW, this process builds the graph structure.
+        Add vectors to the index. This involves training the index on a
+        data sample if it hasn't been trained yet, then adding all vectors.
 
         Args:
             xb: Base vectors, shape (N, dim), dtype float32.
         """
-        # HNSW does not require a separate training step like IVF.
-        # The graph is built as vectors are added.
-        # Ensure data is float32, as required by FAISS.
-        if xb.dtype != 'float32':
-            xb = xb.astype('float32')
+        if not self.index.is_trained:
+            # Training is required for IVF-based indexes to learn the centroids.
+            # We train on a random subset of the data for efficiency and to
+            # avoid any ordering bias. FAISS recommends using at least 39*nlist
+            # to 256*nlist vectors. 256k is a safe and robust choice.
+            n_train_vectors = min(xb.shape[0], 256 * 1024)
             
+            random_indices = np.random.permutation(xb.shape[0])[:n_train_vectors]
+            train_vectors = xb[random_indices]
+
+            # The train method computes k-means centroids for IVF and learns PQ codebooks.
+            self.index.train(train_vectors)
+
+        # After training, add the entire database to the index.
         self.index.add(xb)
+
 
     def search(self, xq: np.ndarray, k: int) -> Tuple[np.ndarray, np.ndarray]:
         """
@@ -73,17 +85,17 @@ class YourIndexClass:
 
         Returns:
             A tuple (distances, indices):
-                - distances: shape (nq, k), dtype float32, L2 distances.
-                - indices: shape (nq, k), dtype int64, indices into base vectors.
+                - distances: L2 distances, shape (nq, k), dtype float32.
+                - indices: Vector indices, shape (nq, k), dtype int64.
         """
-        # Set the search-time parameter. This is the main knob for the
-        # speed/accuracy trade-off in HNSW.
-        self.index.hnsw.efSearch = self.efSearch
+        # To access IVF-specific attributes like `nprobe`, we must downcast
+        # the generic `faiss.Index` object returned by the factory.
+        ivf_index = faiss.downcast_index(self.index)
+        ivf_index.nprobe = self.nprobe
         
-        # Ensure query data is float32.
-        if xq.dtype != 'float32':
-            xq = xq.astype('float32')
-
+        # Perform the search. FAISS automatically parallelizes the search over
+        # the batch of queries using OpenMP, which is critical for performance
+        # on a multi-core CPU.
         distances, indices = self.index.search(xq, k)
         
         return distances, indices

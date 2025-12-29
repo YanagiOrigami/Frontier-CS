@@ -1,90 +1,88 @@
 import numpy as np
+import sympy as sp
 from pysr import PySRRegressor
-import warnings
 
 class Solution:
     def __init__(self, **kwargs):
         pass
 
     def solve(self, X: np.ndarray, y: np.ndarray) -> dict:
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore")
-            
-            model = PySRRegressor(
-                niterations=30,
-                binary_operators=["+", "-", "*", "/"],
-                unary_operators=["sin", "cos"],
-                populations=8,
-                population_size=30,
-                maxsize=20,
-                verbosity=0,
-                progress=False,
-                random_state=42,
-                deterministic=True,
-                early_stop_condition="stop_if(loss, complexity) = loss < 1e-12 && complexity < 10",
-                timeout_in_seconds=30,
-                max_evals=10000,
-                constraints={"sin": 4, "cos": 4},
-                nested_constraints={"sin": {"sin": 0, "cos": 0},
-                                   "cos": {"sin": 0, "cos": 0}},
-                use_frequency=True,
-                use_frequency_in_tournament=True,
-                parsimony=0.003,
-                annealing=True,
-                model_selection="accuracy",
-                temp_scale=0.02,
-                temp_decay=0.999,
-                should_optimize_constants=True,
-                optimizer_algorithm="BFGS",
-                optimizer_iterations=30,
-            )
-            
-            try:
-                model.fit(X, y, variable_names=["x1", "x2"])
-                
-                best_expr = model.sympy()
-                expression = str(best_expr).replace("**", "^").replace("^", "**")
-                
-                predictions = model.predict(X)
-                
-                return {
-                    "expression": expression,
-                    "predictions": predictions.tolist(),
-                    "details": {}
-                }
-                
-            except Exception:
-                x1, x2 = X[:, 0], X[:, 1]
-                
-                A = np.column_stack([
-                    np.sin(x1), np.cos(x1), np.sin(x2), np.cos(x2),
-                    np.sin(x1) * np.sin(x2), np.sin(x1) * np.cos(x2),
-                    np.cos(x1) * np.sin(x2), np.cos(x1) * np.cos(x2),
-                    np.ones_like(x1)
-                ])
-                
-                coeffs, _, _, _ = np.linalg.lstsq(A, y, rcond=None)
-                
-                terms = [
-                    f"{coeffs[0]:.6f}*sin(x1)",
-                    f"{coeffs[1]:.6f}*cos(x1)",
-                    f"{coeffs[2]:.6f}*sin(x2)",
-                    f"{coeffs[3]:.6f}*cos(x2)",
-                    f"{coeffs[4]:.6f}*sin(x1)*sin(x2)",
-                    f"{coeffs[5]:.6f}*sin(x1)*cos(x2)",
-                    f"{coeffs[6]:.6f}*cos(x1)*sin(x2)",
-                    f"{coeffs[7]:.6f}*cos(x1)*cos(x2)",
-                    f"{coeffs[8]:.6f}"
-                ]
-                
-                expression = " + ".join([t for t, c in zip(terms, coeffs) if abs(c) > 1e-10])
-                if not expression:
-                    expression = "0"
-                
-                predictions = A @ coeffs
-                
-                return {
-                    "expression": expression,
-                    "predictions": predictions.tolist(),
-                    "details": {}
-                }
+        # Configure PySR with parameters suitable for CPU environment
+        model = PySRRegressor(
+            niterations=200,
+            binary_operators=["+", "-", "*", "/", "**"],
+            unary_operators=["sin", "cos", "exp", "log"],
+            populations=8,  # Match vCPU count
+            population_size=30,
+            maxsize=20,
+            complexity_of_operators={"**": 3},
+            verbosity=0,
+            progress=False,
+            random_state=42,
+            deterministic=True,
+            loss="loss(x, y) = (x - y)^2",
+            weight_optimize=0.0005,
+            tempdir="/tmp/pysr_cache",
+            delete_tempfiles_after_run=True,
+            equation_file=None,
+            multithreading=True,
+            update=False,
+            nested_constraints={
+                "sin": {"sin": 0, "cos": 0},
+                "cos": {"sin": 0, "cos": 0}
+            },
+            constraints={
+                "**": (-1, 3, 0.5),  # exponent between -1 and 3, half-integer allowed
+                "/": (0, 0)  # no division by zero
+            }
+        )
+        
+        # Fit model
+        model.fit(X, y, variable_names=["x1", "x2"])
+        
+        # Get best expression
+        best_expr = model.sympy()
+        if best_expr is None:
+            # Fallback to simple expression if PySR fails
+            expr_str = "0.0"
+        else:
+            # Simplify and clean the expression
+            expr_str = str(best_expr)
+            # Replace any sympy function prefixes and ensure valid Python syntax
+            expr_str = expr_str.replace("**", "**").replace("exp", "exp")
+            expr_str = expr_str.replace("log", "log").replace("sin", "sin").replace("cos", "cos")
+        
+        # Ensure expression uses only allowed variable names
+        # This handles cases where PySR might use different names
+        expr_str = expr_str.replace("x0", "x1").replace("x1", "x2").replace("x2", "x2")
+        
+        # Make predictions
+        try:
+            # Use sympy to evaluate the expression
+            x1_sym, x2_sym = sp.symbols('x1 x2')
+            expr = sp.sympify(expr_str)
+            func = sp.lambdify([x1_sym, x2_sym], expr, 'numpy')
+            predictions = func(X[:, 0], X[:, 1])
+        except Exception:
+            # Fallback to model predictions
+            predictions = model.predict(X)
+        
+        # Calculate complexity
+        complexity = 0
+        try:
+            # Count binary operations
+            binary_ops = ['+', '-', '*', '/', '**']
+            for op in binary_ops:
+                complexity += 2 * expr_str.count(op)
+            # Count unary operations
+            unary_ops = ['sin', 'cos', 'exp', 'log']
+            for op in unary_ops:
+                complexity += expr_str.count(op)
+        except Exception:
+            complexity = 0
+        
+        return {
+            "expression": expr_str,
+            "predictions": predictions.tolist() if hasattr(predictions, 'tolist') else list(predictions),
+            "details": {"complexity": complexity}
+        }

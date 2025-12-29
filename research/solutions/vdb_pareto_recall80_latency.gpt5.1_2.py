@@ -1,120 +1,146 @@
 import numpy as np
-import faiss
 from typing import Tuple
+import faiss
 
 
 class YourIndexClass:
     def __init__(self, dim: int, **kwargs):
         """
-        Vector index optimized for SIFT1M-like data using FAISS IVF-Flat.
-
-        Args:
-            dim: dimensionality of vectors
-            **kwargs:
-                nlist: number of IVF clusters (default: 8192)
-                nprobe: number of clusters to probe at search (default: 32)
-                use_pq: whether to use IVF-PQ instead of IVF-Flat (default: False)
-                pq_m: number of subquantizers for PQ (default: 16)
-                pq_nbits: bits per PQ subvector (default: 8)
-                train_size: number of training vectors for k-means (default: 200000)
-                random_seed: RNG seed for training sampling (default: 123)
-                num_threads: if given, override FAISS OMP thread count
+        Initialize the index for vectors of dimension `dim`.
+        Optional kwargs:
+            - index_type: "ivfflat" (default) or "ivfpq"
+            - nlist: number of IVF lists (default: 4096)
+            - nprobe: number of probes at search time (default: 128)
+            - train_size: number of vectors used for training (default: 100000)
+            - m: number of PQ subquantizers (for ivfpq, default: 16)
+            - nbits: bits per PQ subvector (for ivfpq, default: 8)
         """
         self.dim = int(dim)
-        self.nlist = int(kwargs.get("nlist", 8192))
-        self.nprobe = int(kwargs.get("nprobe", 32))
-        self.use_pq = bool(kwargs.get("use_pq", False))
-        self.pq_m = int(kwargs.get("pq_m", 16))
-        self.pq_nbits = int(kwargs.get("pq_nbits", 8))
-        self.train_size = int(kwargs.get("train_size", 200000))
-        self.random_seed = int(kwargs.get("random_seed", 123))
 
-        self.num_threads = kwargs.get("num_threads", None)
-        if self.num_threads is not None:
-            try:
-                faiss.omp_set_num_threads(int(self.num_threads))
-            except Exception:
-                pass
+        self.index_type = kwargs.get("index_type", "ivfflat").lower()
+        if self.index_type not in ("ivfflat", "ivfpq"):
+            self.index_type = "ivfflat"
 
-        self.index = None
-        self.ntotal = 0
+        self.nlist = int(kwargs.get("nlist", 4096))
+        if self.nlist <= 0:
+            self.nlist = 4096
 
-    def _build_index(self, xb: np.ndarray) -> None:
-        n, d = xb.shape
-        if d != self.dim:
-            raise ValueError(f"Input dimensionality {d} does not match index dim {self.dim}")
+        self.nprobe = int(kwargs.get("nprobe", 128))
+        if self.nprobe <= 0:
+            self.nprobe = 128
 
-        # Choose actual nlist based on dataset size to avoid too many empty lists
-        max_nlist_by_size = max(1, n // 40)  # ~40 vectors per list minimum
-        nlist = min(self.nlist, max_nlist_by_size)
+        self.train_size = int(kwargs.get("train_size", 100000))
+        if self.train_size <= 0:
+            self.train_size = 100000
 
-        quantizer = faiss.IndexFlatL2(self.dim)
-        if self.use_pq:
-            index = faiss.IndexIVFPQ(quantizer, self.dim, nlist, self.pq_m, self.pq_nbits)
-            try:
-                index.use_precomputed_table = True
-            except Exception:
-                pass
-        else:
-            index = faiss.IndexIVFFlat(quantizer, self.dim, nlist, faiss.METRIC_L2)
+        # PQ-specific parameters (used only if index_type == "ivfpq")
+        self.m = int(kwargs.get("m", 16))
+        if self.m <= 0 or self.m > self.dim:
+            self.m = 16
+        self.nbits = int(kwargs.get("nbits", 8))
+        if self.nbits <= 0 or self.nbits > 16:
+            self.nbits = 8
 
-        self.index = index
-
-        # Train IVF index
-        if not self.index.is_trained:
-            train_size = min(self.train_size, n)
-            if train_size < nlist:
-                train_size = nlist
-            if n > train_size:
-                rs = np.random.RandomState(self.random_seed)
-                idx = rs.choice(n, train_size, replace=False)
-                train_x = xb[idx].copy()
-            else:
-                train_x = xb.copy()
-            self.index.train(train_x)
-
-        # Set nprobe (cannot exceed nlist)
-        try:
-            self.index.nprobe = min(self.nprobe, self.index.nlist)
-        except Exception:
-            pass
+        self.index = None  # faiss index (built lazily)
+        self._xb = None    # accumulated database vectors (numpy array)
 
     def add(self, xb: np.ndarray) -> None:
-        if xb is None:
+        """
+        Add vectors to the index. Data is accumulated and the FAISS index
+        is built lazily on the first call to search().
+        """
+        xb = np.asarray(xb, dtype=np.float32)
+        if xb.ndim != 2 or xb.shape[1] != self.dim:
+            raise ValueError(f"xb must have shape (N, {self.dim})")
+
+        xb = np.ascontiguousarray(xb, dtype=np.float32)
+
+        if self._xb is None:
+            # First batch: just keep a reference (no copy if already contiguous)
+            self._xb = xb
+        else:
+            # Subsequent batches: concatenate
+            self._xb = np.vstack((self._xb, xb))
+
+    def _build_index(self) -> None:
+        """
+        Build and train the FAISS index from accumulated vectors.
+        Called lazily on the first search().
+        """
+        if self.index is not None:
             return
 
-        xb = np.asarray(xb, dtype=np.float32, order="C")
-        if xb.ndim != 2 or xb.shape[1] != self.dim:
-            raise ValueError(f"xb must have shape (N, {self.dim}), got {xb.shape}")
-        n, _ = xb.shape
+        if self._xb is None or self._xb.size == 0:
+            raise RuntimeError("No vectors have been added to the index.")
 
-        if self.index is None:
-            self._build_index(xb)
+        xb_all = self._xb
+        n, d = xb_all.shape
+        if d != self.dim:
+            raise ValueError(f"Expected dimension {self.dim}, got {d}")
 
-        self.index.add(xb)
-        self.ntotal += n
+        # Create quantizer and IVF index
+        quantizer = faiss.IndexFlatL2(self.dim)
+
+        if self.index_type == "ivfpq":
+            # IVF with Product Quantization
+            index = faiss.IndexIVFPQ(quantizer, self.dim, self.nlist,
+                                     self.m, self.nbits)
+        else:
+            # Default: IVF with full-precision vectors in lists
+            index = faiss.IndexIVFFlat(quantizer, self.dim, self.nlist, faiss.METRIC_L2)
+
+        # Training
+        n_train = min(self.train_size, n)
+        if n_train < self.nlist:
+            # Ensure we have at least nlist training vectors
+            n_train = min(n, max(self.nlist, 2 * self.nlist))
+
+        if n_train < self.nlist:
+            # Fallback: if still not enough (tiny dataset), use all vectors
+            train_x = xb_all
+        else:
+            if n_train == n:
+                train_x = xb_all
+            else:
+                rs = np.random.RandomState(123)
+                idx = rs.choice(n, size=n_train, replace=False)
+                train_x = xb_all[idx]
+
+        train_x = np.ascontiguousarray(train_x, dtype=np.float32)
+        index.train(train_x)
+
+        # Add all database vectors
+        index.add(xb_all)
+
+        # Set search-time parameters
+        if hasattr(index, "nprobe"):
+            index.nprobe = self.nprobe
+
+        self.index = index
+        # We can release the raw data; FAISS keeps its own copy
+        self._xb = None
 
     def search(self, xq: np.ndarray, k: int) -> Tuple[np.ndarray, np.ndarray]:
-        xq = np.asarray(xq, dtype=np.float32, order="C")
+        """
+        Search for k nearest neighbors of query vectors.
+        """
+        if k <= 0:
+            raise ValueError("k must be positive")
+
+        xq = np.asarray(xq, dtype=np.float32)
         if xq.ndim != 2 or xq.shape[1] != self.dim:
-            raise ValueError(f"xq must have shape (nq, {self.dim}), got {xq.shape}")
-        nq = xq.shape[0]
+            raise ValueError(f"xq must have shape (nq, {self.dim})")
 
-        if self.index is None or self.ntotal == 0 or k <= 0:
-            D = np.full((nq, k), np.inf, dtype=np.float32)
-            I = np.full((nq, k), -1, dtype=np.int64)
-            return D, I
+        xq = np.ascontiguousarray(xq, dtype=np.float32)
 
-        # Ensure nprobe is within valid bounds
-        try:
-            nprobe = self.nprobe
-            if hasattr(self.index, "nlist"):
-                nprobe = min(nprobe, self.index.nlist)
-            if hasattr(self.index, "ntotal") and self.index.ntotal > 0:
-                nprobe = min(nprobe, self.index.ntotal)
-            self.index.nprobe = max(1, nprobe)
-        except Exception:
-            pass
+        if self.index is None:
+            self._build_index()
 
-        D, I = self.index.search(xq, k)
-        return D, I
+        # Perform search using FAISS
+        distances, indices = self.index.search(xq, k)
+
+        # Ensure dtypes and shapes are as required
+        distances = np.asarray(distances, dtype=np.float32)
+        indices = np.asarray(indices, dtype=np.int64)
+
+        return distances, indices

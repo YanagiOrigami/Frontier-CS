@@ -7,53 +7,35 @@ class Solution:
 
     def solve(self, X: np.ndarray, y: np.ndarray) -> dict:
         model = PySRRegressor(
-            niterations=60,
-            binary_operators=["+", "-", "*", "/"],
-            unary_operators=["sin", "cos"],
-            populations=8,
+            niterations=30,
+            binary_operators=["+", "-", "*", "/", "**"],
+            unary_operators=["sin", "cos", "exp", "log"],
+            populations=12,
             population_size=30,
             maxsize=20,
-            maxdepth=8,
-            ncycles_per_iteration=500,
-            parsimony=0.008,
-            constraints={
-                "sin": 2,
-                "cos": 2,
-                "/": (-1, 1)
-            },
-            complexity_of_operators={
-                "sin": 3,
-                "cos": 3,
-                "+": 1,
-                "-": 1,
-                "*": 2,
-                "/": 2
-            },
             verbosity=0,
             progress=False,
             random_state=42,
+            early_stop_condition=1e-10,
             deterministic=True,
-            model_selection="best",
-            early_stop_condition=1e-6,
-            loss="L2DistLoss()",
-            multithreading=True,
-            cluster_manager=None,
-            update=False
+            max_depth=12,
+            timeout_in_seconds=60,
+            ncyclesperiteration=400,
+            parsimony=0.003,
+            complexity_of_operators={
+                "sin": 1, "cos": 1, "exp": 2, "log": 2,
+                "+": 1, "-": 1, "*": 1, "/": 1, "**": 2
+            }
         )
-        
         model.fit(X, y, variable_names=["x1", "x2"])
         
         best_expr = model.sympy()
-        expression = str(best_expr).replace("**", "^")
-        expression = expression.replace("^", "**")
+        expression = str(best_expr).replace("**", "^").replace("^", "**")
         
         predictions = model.predict(X)
         
-        binary_ops = expression.count("+") + expression.count("-") + \
-                     expression.count("*") + expression.count("/") + \
-                     expression.count("**")
-        unary_ops = expression.count("sin(") + expression.count("cos(") + \
-                    expression.count("exp(") + expression.count("log(")
+        binary_ops = expression.count('+') + expression.count('-') + expression.count('*') + expression.count('/') + expression.count('**')
+        unary_ops = expression.count('sin') + expression.count('cos') + expression.count('exp') + expression.count('log')
         complexity = 2 * binary_ops + unary_ops
         
         return {

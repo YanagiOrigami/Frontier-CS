@@ -1,112 +1,111 @@
 import torch
 import torch.nn as nn
 import torch.optim as optim
-import numpy as np
 import math
-import copy
-
-class ResidualBlock(nn.Module):
-    def __init__(self, hidden_dim, dropout_rate):
-        super(ResidualBlock, self).__init__()
-        self.block = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.BatchNorm1d(hidden_dim),
-            nn.ReLU(),
-            nn.Dropout(dropout_rate)
-        )
-
-    def forward(self, x):
-        return x + self.block(x)
-
-class AdaptiveNet(nn.Module):
-    def __init__(self, input_dim, hidden_dim, output_dim, num_res_blocks, dropout_rate):
-        super(AdaptiveNet, self).__init__()
-        
-        # Input projection
-        self.input_proj = nn.Sequential(
-            nn.Linear(input_dim, hidden_dim),
-            nn.BatchNorm1d(hidden_dim),
-            nn.ReLU(),
-            nn.Dropout(dropout_rate)
-        )
-        
-        # Residual blocks
-        self.blocks = nn.ModuleList([
-            ResidualBlock(hidden_dim, dropout_rate) for _ in range(num_res_blocks)
-        ])
-        
-        # Output head
-        self.head = nn.Linear(hidden_dim, output_dim)
-
-    def forward(self, x):
-        x = self.input_proj(x)
-        for block in self.blocks:
-            x = block(x)
-        return self.head(x)
+import numpy as np
 
 class Solution:
     def solve(self, train_loader, val_loader, metadata: dict = None) -> torch.nn.Module:
-        # Extract metadata
+        """
+        Solves the ImageNet Pareto Optimization problem by training a parameter-constrained model.
+        """
+        # 1. Extract Metadata & Configuration
         input_dim = metadata.get("input_dim", 384)
         num_classes = metadata.get("num_classes", 128)
         param_limit = metadata.get("param_limit", 500000)
         device = metadata.get("device", "cpu")
         
-        # Architecture Planning to maximize capacity within limits
-        # We use an architecture with:
-        # 1. Input Block: Linear(In, H) + BN(H) -> Params: In*H + H + 2H = H*(In + 3)
-        # 2. ResBlocks (k=2): k * [Linear(H, H) + BN(H)] -> Params: k*(H^2 + H + 2H) = k*(H^2 + 3H)
-        # 3. Head: Linear(H, Out) -> Params: H*Out + Out
-        # Total Params = k*H^2 + H*(In + 3 + 3k + Out) + Out
+        # 2. Dynamic Architecture Calculation
+        # We design a 3-layer MLP with Batch Norm and Dropout.
+        # Architecture: 
+        #   Input -> BN(In) -> Linear(In, W) -> BN(W) -> SiLU -> Dropout 
+        #         -> Linear(W, W//2) -> BN(W//2) -> SiLU -> Dropout 
+        #         -> Linear(W//2, Out)
         
-        k = 2 # Number of residual blocks
-        a = float(k)
-        b = float(input_dim + num_classes + 3 + (3 * k))
-        c = float(num_classes - param_limit)
+        # Parameter Count Formula:
+        # Input BN: 2 * In
+        # L1: In*W + W (bias) + 2*W (BN) = W(In + 3)
+        # L2: W*(W/2) + W/2 (bias) + 2*(W/2) (BN) = 0.5*W^2 + 1.5*W
+        # L3: (W/2)*Out + Out (bias) = 0.5*Out*W + Out
+        # Total = 0.5*W^2 + W(In + 4.5 + 0.5*Out) + (Out + 2*In)
         
-        # Quadratic formula to find max Hidden Dim (H)
-        delta = b**2 - 4*a*c
-        max_h = int((-b + math.sqrt(delta)) / (2*a))
+        # Solve quadratic equation ax^2 + bx + c = 0 for W (width)
+        # target params slightly lower than limit for safety buffer
+        target = param_limit - 2500 
         
-        # Set parameters
-        hidden_dim = max_h - 2 # Buffer for safety
-        dropout_rate = 0.4     # High dropout for small dataset
+        a = 0.5
+        b = input_dim + 4.5 + 0.5 * num_classes
+        c_const = num_classes + 2 * input_dim - target
         
-        # Instantiate Model
-        model = AdaptiveNet(input_dim, hidden_dim, num_classes, k, dropout_rate).to(device)
+        # Quadratic formula: x = (-b + sqrt(b^2 - 4ac)) / 2a
+        # Since 2a = 1, x = -b + sqrt(b^2 - 2*c_const)
+        delta = b**2 - 2 * c_const
+        w_float = -b + math.sqrt(delta)
+        width = int(w_float)
         
-        # Strict Parameter Count Check & Adjustment
-        def count_params(m):
-            return sum(p.numel() for p in m.parameters() if p.requires_grad)
+        # Ensure width is even for clean division by 2
+        if width % 2 != 0:
+            width -= 1
             
-        while count_params(model) > param_limit:
-            hidden_dim -= 4
-            model = AdaptiveNet(input_dim, hidden_dim, num_classes, k, dropout_rate).to(device)
-            
-        # Training Configuration
-        optimizer = optim.AdamW(model.parameters(), lr=0.001, weight_decay=1e-2)
-        # Label smoothing helps with synthetic/noisy data and prevents overfitting
-        criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
+        # 3. Model Definition
+        class ParetoNet(nn.Module):
+            def __init__(self, in_d, w, out_d):
+                super().__init__()
+                self.input_bn = nn.BatchNorm1d(in_d)
+                self.features = nn.Sequential(
+                    nn.Linear(in_d, w),
+                    nn.BatchNorm1d(w),
+                    nn.SiLU(),
+                    nn.Dropout(p=0.4),
+                    
+                    nn.Linear(w, w // 2),
+                    nn.BatchNorm1d(w // 2),
+                    nn.SiLU(),
+                    nn.Dropout(p=0.4),
+                    
+                    nn.Linear(w // 2, out_d)
+                )
+                
+            def forward(self, x):
+                x = self.input_bn(x)
+                return self.features(x)
+
+        model = ParetoNet(input_dim, width, num_classes).to(device)
         
-        epochs = 80
-        scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
+        # 4. Training Setup
+        # Use Label Smoothing to prevent overfitting on small dataset
+        criterion = nn.CrossEntropyLoss(label_smoothing=0.15)
         
-        best_val_acc = 0.0
-        best_model_state = copy.deepcopy(model.state_dict())
+        # AdamW with weight decay for regularization
+        optimizer = optim.AdamW(model.parameters(), lr=1e-3, weight_decay=0.05)
         
-        # Mixup Augmentation Settings
-        use_mixup = True
+        epochs = 60
+        # OneCycleLR for super-convergence
+        scheduler = optim.lr_scheduler.OneCycleLR(
+            optimizer,
+            max_lr=1e-3,
+            epochs=epochs,
+            steps_per_epoch=len(train_loader),
+            pct_start=0.2,
+            div_factor=25.0,
+            final_div_factor=1000.0
+        )
+        
+        best_acc = -1.0
+        best_state = None
+        
+        # Mixup configuration
         mixup_alpha = 0.4
+        mixup_prob = 0.7
         
+        # 5. Training Loop
         for epoch in range(epochs):
             model.train()
-            
             for inputs, targets in train_loader:
                 inputs, targets = inputs.to(device), targets.to(device)
-                optimizer.zero_grad()
                 
-                # Apply Mixup during first 90% of training
-                if use_mixup and epoch < int(epochs * 0.9):
+                # Apply Mixup Augmentation
+                if np.random.random() < mixup_prob:
                     lam = np.random.beta(mixup_alpha, mixup_alpha)
                     index = torch.randperm(inputs.size(0)).to(device)
                     
@@ -119,12 +118,12 @@ class Solution:
                     outputs = model(inputs)
                     loss = criterion(outputs, targets)
                 
+                optimizer.zero_grad()
                 loss.backward()
                 optimizer.step()
+                scheduler.step()
             
-            scheduler.step()
-            
-            # Validation
+            # 6. Validation
             model.eval()
             correct = 0
             total = 0
@@ -136,13 +135,17 @@ class Solution:
                     total += targets.size(0)
                     correct += predicted.eq(targets).sum().item()
             
-            val_acc = correct / total
+            acc = correct / total
             
             # Save best model
-            if val_acc >= best_val_acc:
-                best_val_acc = val_acc
-                best_model_state = copy.deepcopy(model.state_dict())
+            if acc > best_acc:
+                best_acc = acc
+                # Save state to CPU to avoid memory issues and persist across device moves
+                best_state = {k: v.cpu() for k, v in model.state_dict().items()}
         
-        # Restore best model
-        model.load_state_dict(best_model_state)
+        # 7. Restore Best Model
+        if best_state is not None:
+            model.load_state_dict(best_state)
+            model.to(device)
+            
         return model

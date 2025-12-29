@@ -1,159 +1,260 @@
+import math
 import os
+import sys
+from typing import Dict
+
+KERNEL_SRC = r'''
 import math
 import torch
-
-try:
-    import triton
-    import triton.language as tl
-    _TRITON_AVAILABLE = True
-except Exception:
-    triton = None
-    tl = None
-    _TRITON_AVAILABLE = False
+import triton
+import triton.language as tl
 
 
-_LOG2E = 1.4426950408889634
+def _ceil_pow2(x: int) -> int:
+    if x <= 1:
+        return 1
+    return 1 << (x - 1).bit_length()
 
 
-if _TRITON_AVAILABLE:
-    @triton.jit
-    def _decoding_attn_kernel(
-        Q_ptr,
-        K_ptr,
-        V_ptr,
-        O_ptr,
-        stride_qz: tl.constexpr,
-        stride_qh: tl.constexpr,
-        stride_qm: tl.constexpr,
-        stride_qd: tl.constexpr,
-        stride_kz: tl.constexpr,
-        stride_kh: tl.constexpr,
-        stride_kn: tl.constexpr,
-        stride_kd: tl.constexpr,
-        stride_vz: tl.constexpr,
-        stride_vh: tl.constexpr,
-        stride_vn: tl.constexpr,
-        stride_vd: tl.constexpr,
-        stride_oz: tl.constexpr,
-        stride_oh: tl.constexpr,
-        stride_om: tl.constexpr,
-        stride_od: tl.constexpr,
-        Z: tl.constexpr,
-        H: tl.constexpr,
-        M: tl.constexpr,
-        N_CTX: tl.constexpr,
-        SM_SCALE_LOG2: tl.constexpr,
-        DQ: tl.constexpr,
-        DV: tl.constexpr,
-        BLOCK_M: tl.constexpr,
-        BLOCK_N: tl.constexpr,
-    ):
-        pid_zh = tl.program_id(0)
-        pid_m = tl.program_id(1)
+def _pick_block_dim(x: int) -> int:
+    b = _ceil_pow2(int(x))
+    if b < 16:
+        b = 16
+    if b % 16 != 0:
+        b = ((b + 15) // 16) * 16
+    return b
 
-        z = pid_zh // H
-        h = pid_zh - z * H
 
-        offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
-        mask_m = offs_m < M
+def _pick_split(q: int, n: int) -> int:
+    # Choose SPLIT from {1,2,4,8,16} to increase parallelism when q is small.
+    if n <= 0:
+        return 1
+    if q <= 16:
+        s = 16 if n >= 4096 else 8
+    elif q <= 32:
+        s = 8 if n >= 4096 else 4
+    elif q <= 64:
+        s = 4
+    elif q <= 128:
+        s = 2
+    else:
+        s = 1
+    if s > 16:
+        s = 16
+    if s > n:
+        # clamp to <= n but keep power-of-two
+        s = 1 << ((n).bit_length() - 1)
+        if s < 1:
+            s = 1
+    return int(s)
 
-        offs_dq = tl.arange(0, DQ)
-        offs_dv = tl.arange(0, DV)
 
-        q_base = Q_ptr + z * stride_qz + h * stride_qh
-        k_base = K_ptr + z * stride_kz + h * stride_kh
-        v_base = V_ptr + z * stride_vz + h * stride_vh
-        o_base = O_ptr + z * stride_oz + h * stride_oh
+@triton.autotune(
+    configs=[
+        triton.Config({"BLOCK_N": 128}, num_warps=4, num_stages=3),
+        triton.Config({"BLOCK_N": 256}, num_warps=8, num_stages=3),
+        triton.Config({"BLOCK_N": 512}, num_warps=8, num_stages=4),
+    ],
+    key=["N", "DQ", "DV", "SPLIT", "CHUNK", "BLOCK_DQ", "BLOCK_DV"],
+)
+@triton.jit
+def _decoding_attn_split_kernel(
+    Q_ptr, K_ptr, V_ptr,
+    TMP_M_ptr, TMP_L_ptr, TMP_A_ptr,
+    stride_qz: tl.constexpr, stride_qh: tl.constexpr, stride_qm: tl.constexpr, stride_qd: tl.constexpr,
+    stride_kz: tl.constexpr, stride_kh: tl.constexpr, stride_kn: tl.constexpr, stride_kd: tl.constexpr,
+    stride_vz: tl.constexpr, stride_vh: tl.constexpr, stride_vn: tl.constexpr, stride_vd: tl.constexpr,
+    stride_tm_q: tl.constexpr, stride_tm_s: tl.constexpr,
+    stride_tl_q: tl.constexpr, stride_tl_s: tl.constexpr,
+    stride_ta_q: tl.constexpr, stride_ta_s: tl.constexpr, stride_ta_d: tl.constexpr,
+    Z, H, M,
+    N: tl.constexpr, DQ: tl.constexpr, DV: tl.constexpr,
+    SPLIT: tl.constexpr,
+    CHUNK: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_DQ: tl.constexpr,
+    BLOCK_DV: tl.constexpr,
+    SM_SCALE: tl.constexpr,
+):
+    pid_q = tl.program_id(0)
+    pid_s = tl.program_id(1)
 
-        q_ptrs = q_base + offs_m[:, None] * stride_qm + offs_dq[None, :] * stride_qd
-        q = tl.load(q_ptrs, mask=mask_m[:, None], other=0.0).to(tl.float16)
+    hm = H * M
+    z = pid_q // hm
+    rem = pid_q - z * hm
+    h = rem // M
+    m = rem - h * M
 
-        m_i = tl.full((BLOCK_M,), -float("inf"), tl.float32)
-        l_i = tl.zeros((BLOCK_M,), tl.float32)
-        acc = tl.zeros((BLOCK_M, DV), tl.float32)
+    # load q
+    offs_dq = tl.arange(0, BLOCK_DQ)
+    q_ptrs = Q_ptr + z * stride_qz + h * stride_qh + m * stride_qm + offs_dq * stride_qd
+    q = tl.load(q_ptrs, mask=offs_dq < DQ, other=0.0).to(tl.float16)
 
-        # Online softmax over N
-        for start_n in tl.static_range(0, N_CTX, BLOCK_N):
-            offs_n = start_n + tl.arange(0, BLOCK_N)
-            mask_n = offs_n < N_CTX
+    m_i = tl.full([1], -1.0e9, tl.float32)
+    l_i = tl.zeros([1], tl.float32)
+    acc = tl.zeros([BLOCK_DV], tl.float32)
 
-            k_ptrs = k_base + offs_dq[:, None] * stride_kd + offs_n[None, :] * stride_kn
-            k = tl.load(k_ptrs, mask=mask_n[None, :], other=0.0).to(tl.float16)
+    base_n = pid_s * CHUNK
 
-            qk = tl.dot(q, k).to(tl.float32) * SM_SCALE_LOG2
-            qk = tl.where(mask_n[None, :], qk, -float("inf"))
+    offs_dv = tl.arange(0, BLOCK_DV)
 
-            m_ij = tl.maximum(m_i, tl.max(qk, axis=1))
-            alpha = tl.exp2(m_i - m_ij)
-            l_i = l_i * alpha
+    for start in tl.static_range(0, CHUNK, BLOCK_N):
+        offs_n = base_n + start + tl.arange(0, BLOCK_N)
+        mask_n = offs_n < N
 
-            p = tl.exp2(qk - m_ij[:, None])
-            p = tl.where(mask_n[None, :], p, 0.0)
-            l_i = l_i + tl.sum(p, axis=1)
+        # Load K block
+        k_ptrs = K_ptr + z * stride_kz + h * stride_kh + offs_n[:, None] * stride_kn + offs_dq[None, :] * stride_kd
+        k = tl.load(k_ptrs, mask=mask_n[:, None] & (offs_dq[None, :] < DQ), other=0.0).to(tl.float16)
 
-            acc = acc * alpha[:, None]
+        # scores: (BLOCK_N,)
+        s = tl.dot(k, q[:, None])[:, 0].to(tl.float32) * SM_SCALE
+        s = tl.where(mask_n, s, -1.0e9)
 
-            v_ptrs = v_base + offs_n[:, None] * stride_vn + offs_dv[None, :] * stride_vd
-            v = tl.load(v_ptrs, mask=mask_n[:, None], other=0.0).to(tl.float16)
+        m_curr = tl.maximum(m_i, tl.max(s, axis=0))
+        alpha = tl.exp(m_i - m_curr)
 
-            acc = acc + tl.dot(p.to(tl.float16), v).to(tl.float32)
+        p = tl.exp(s - m_curr)
+        p = p * mask_n.to(tl.float32)
 
-            m_i = m_ij
+        l_curr = l_i * alpha + tl.sum(p, axis=0)
 
-        out = acc / l_i[:, None]
-        o_ptrs = o_base + offs_m[:, None] * stride_om + offs_dv[None, :] * stride_od
-        tl.store(o_ptrs, out.to(tl.float16), mask=mask_m[:, None])
+        # Load V block
+        v_ptrs = V_ptr + z * stride_vz + h * stride_vh + offs_n[:, None] * stride_vn + offs_dv[None, :] * stride_vd
+        v = tl.load(v_ptrs, mask=mask_n[:, None] & (offs_dv[None, :] < DV), other=0.0).to(tl.float16)
+
+        acc = acc * alpha + tl.dot(p.to(tl.float16)[None, :], v)[0, :].to(tl.float32)
+
+        m_i = m_curr
+        l_i = l_curr
+
+    # Store partials
+    tm_ptr = TMP_M_ptr + pid_q * stride_tm_q + pid_s * stride_tm_s
+    tl_ptr = TMP_L_ptr + pid_q * stride_tl_q + pid_s * stride_tl_s
+    tl.store(tm_ptr, m_i)
+    tl.store(tl_ptr, l_i)
+
+    ta_ptrs = TMP_A_ptr + pid_q * stride_ta_q + pid_s * stride_ta_s + offs_dv * stride_ta_d
+    tl.store(ta_ptrs, acc, mask=offs_dv < DV)
+
+
+@triton.jit
+def _decoding_attn_reduce_kernel(
+    TMP_M_ptr, TMP_L_ptr, TMP_A_ptr,
+    O_ptr,
+    stride_tm_q: tl.constexpr, stride_tm_s: tl.constexpr,
+    stride_tl_q: tl.constexpr, stride_tl_s: tl.constexpr,
+    stride_ta_q: tl.constexpr, stride_ta_s: tl.constexpr, stride_ta_d: tl.constexpr,
+    stride_oz: tl.constexpr, stride_oh: tl.constexpr, stride_om: tl.constexpr, stride_od: tl.constexpr,
+    Z, H, M,
+    N: tl.constexpr,  # unused, but included for caching consistency
+    DV: tl.constexpr,
+    SPLIT: tl.constexpr,
+    BLOCK_DV: tl.constexpr,
+):
+    pid_q = tl.program_id(0)
+
+    hm = H * M
+    z = pid_q // hm
+    rem = pid_q - z * hm
+    h = rem // M
+    m = rem - h * M
+
+    offs_s = tl.arange(0, SPLIT)
+    m_s = tl.load(TMP_M_ptr + pid_q * stride_tm_q + offs_s * stride_tm_s).to(tl.float32)
+    m_g = tl.max(m_s, axis=0)
+
+    l_s = tl.load(TMP_L_ptr + pid_q * stride_tl_q + offs_s * stride_tl_s).to(tl.float32)
+    scale_s = tl.exp(m_s - m_g)
+    l_g = tl.sum(l_s * scale_s, axis=0)
+
+    offs_dv = tl.arange(0, BLOCK_DV)
+    a_ptrs = TMP_A_ptr + pid_q * stride_ta_q + offs_s[:, None] * stride_ta_s + offs_dv[None, :] * stride_ta_d
+    a_s = tl.load(a_ptrs, mask=(offs_dv[None, :] < DV), other=0.0).to(tl.float32)
+    acc = tl.sum(a_s * scale_s[:, None], axis=0)
+
+    out = acc / l_g
+
+    o_ptrs = O_ptr + z * stride_oz + h * stride_oh + m * stride_om + offs_dv * stride_od
+    tl.store(o_ptrs, out.to(tl.float16), mask=offs_dv < DV)
 
 
 def decoding_attn(Q: torch.Tensor, K: torch.Tensor, V: torch.Tensor) -> torch.Tensor:
-    if not _TRITON_AVAILABLE or (not Q.is_cuda) or (not K.is_cuda) or (not V.is_cuda):
-        d = Q.shape[-1]
-        scores = torch.matmul(Q.to(torch.float32), K.transpose(-2, -1).to(torch.float32)) * (1.0 / math.sqrt(d))
-        p = torch.softmax(scores, dim=-1).to(torch.float32)
-        out = torch.matmul(p, V.to(torch.float32)).to(torch.float16)
-        return out
-
-    assert Q.dtype == torch.float16 and K.dtype == torch.float16 and V.dtype == torch.float16
-    assert Q.ndim == 4 and K.ndim == 4 and V.ndim == 4
+    if not (Q.is_cuda and K.is_cuda and V.is_cuda):
+        raise ValueError("Q, K, V must be CUDA tensors")
+    if Q.dtype != torch.float16 or K.dtype != torch.float16 or V.dtype != torch.float16:
+        raise ValueError("Q, K, V must be float16 tensors")
+    if Q.ndim != 4 or K.ndim != 4 or V.ndim != 4:
+        raise ValueError("Q, K, V must be rank-4 tensors")
     Z, H, M, DQ = Q.shape
     Zk, Hk, N, DQk = K.shape
     Zv, Hv, Nv, DV = V.shape
-    assert Zk == Z and Zv == Z and Hk == H and Hv == H and DQk == DQ and Nv == N
+    if Zk != Z or Zv != Z or Hk != H or Hv != H or DQk != DQ or Nv != N:
+        raise ValueError("Shape mismatch: Q(Z,H,M,DQ), K(Z,H,N,DQ), V(Z,H,N,DV) required")
 
-    O = torch.empty((Z, H, M, DV), device=Q.device, dtype=torch.float16)
+    q_count = int(Z * H * M)
+    split = _pick_split(q_count, int(N))
+    chunk = (int(N) + split - 1) // split
 
-    # Choose a fixed high-perf config for decoding (M is typically 1)
-    if N >= 4096:
-        BLOCK_N = 512
-        num_warps = 8
-        num_stages = 4
-    else:
-        BLOCK_N = 256
-        num_warps = 4
-        num_stages = 4
+    block_dq = _pick_block_dim(int(DQ))
+    block_dv = _pick_block_dim(int(DV))
 
-    BLOCK_M = 1
+    tmp_m = torch.empty((q_count, split), device=Q.device, dtype=torch.float32)
+    tmp_l = torch.empty((q_count, split), device=Q.device, dtype=torch.float32)
+    tmp_a = torch.empty((q_count, split, int(DV)), device=Q.device, dtype=torch.float32)
+    O = torch.empty((int(Z), int(H), int(M), int(DV)), device=Q.device, dtype=torch.float16)
 
-    scale_log2 = (1.0 / math.sqrt(DQ)) * _LOG2E
+    stride_qz, stride_qh, stride_qm, stride_qd = Q.stride()
+    stride_kz, stride_kh, stride_kn, stride_kd = K.stride()
+    stride_vz, stride_vh, stride_vn, stride_vd = V.stride()
 
-    grid = (Z * H, triton.cdiv(M, BLOCK_M))
+    stride_tm_q, stride_tm_s = tmp_m.stride()
+    stride_tl_q, stride_tl_s = tmp_l.stride()
+    stride_ta_q, stride_ta_s, stride_ta_d = tmp_a.stride()
 
-    _decoding_attn_kernel[grid](
-        Q, K, V, O,
-        Q.stride(0), Q.stride(1), Q.stride(2), Q.stride(3),
-        K.stride(0), K.stride(1), K.stride(2), K.stride(3),
-        V.stride(0), V.stride(1), V.stride(2), V.stride(3),
-        O.stride(0), O.stride(1), O.stride(2), O.stride(3),
-        Z=Z, H=H, M=M, N_CTX=N,
-        SM_SCALE_LOG2=scale_log2,
-        DQ=DQ, DV=DV,
-        BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N,
-        num_warps=num_warps,
-        num_stages=num_stages,
+    stride_oz, stride_oh, stride_om, stride_od = O.stride()
+
+    sm_scale = 1.0 / math.sqrt(float(DQ))
+
+    _decoding_attn_split_kernel[(q_count, split)](
+        Q, K, V,
+        tmp_m, tmp_l, tmp_a,
+        stride_qz, stride_qh, stride_qm, stride_qd,
+        stride_kz, stride_kh, stride_kn, stride_kd,
+        stride_vz, stride_vh, stride_vn, stride_vd,
+        stride_tm_q, stride_tm_s,
+        stride_tl_q, stride_tl_s,
+        stride_ta_q, stride_ta_s, stride_ta_d,
+        int(Z), int(H), int(M),
+        N=int(N), DQ=int(DQ), DV=int(DV),
+        SPLIT=int(split),
+        CHUNK=int(chunk),
+        BLOCK_DQ=int(block_dq),
+        BLOCK_DV=int(block_dv),
+        SM_SCALE=float(sm_scale),
     )
+
+    _decoding_attn_reduce_kernel[(q_count,)](
+        tmp_m, tmp_l, tmp_a,
+        O,
+        stride_tm_q, stride_tm_s,
+        stride_tl_q, stride_tl_s,
+        stride_ta_q, stride_ta_s, stride_ta_d,
+        stride_oz, stride_oh, stride_om, stride_od,
+        int(Z), int(H), int(M),
+        N=int(N),
+        DV=int(DV),
+        SPLIT=int(split),
+        BLOCK_DV=int(block_dv),
+        num_warps=4,
+        num_stages=2,
+    )
+
     return O
+'''
+
+exec(KERNEL_SRC, globals())
 
 
 class Solution:
-    def solve(self, spec_path: str = None) -> dict:
-        return {"program_path": os.path.abspath(__file__)}
+    def solve(self, spec_path: str = None) -> Dict[str, str]:
+        return {"code": KERNEL_SRC}

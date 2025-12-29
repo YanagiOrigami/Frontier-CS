@@ -1,3 +1,3 @@
 class Solution:
     def solve(self, src_path: str) -> bytes:
-        return b"A" * 10
+        return b'\xff' * 10

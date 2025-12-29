@@ -1,63 +1,101 @@
 import os
-import sys
-import inspect
+import textwrap
 import torch
 import triton
 import triton.language as tl
 
-N_ELEMENTS = 1 << 24
+_N = 16777216
 
 
 @triton.jit
-def _add_kernel(x_ptr, y_ptr, out_ptr, BLOCK: tl.constexpr, NUM_ITERS: tl.constexpr):
-    pid = tl.program_id(0)
-    start = pid * BLOCK * NUM_ITERS
-    r = tl.arange(0, BLOCK)
-    tl.multiple_of(r, 16)
-    tl.max_contiguous(r, 256)
-    for i in tl.static_range(0, NUM_ITERS):
-        offs = start + i * BLOCK + r
-        x = tl.load(x_ptr + offs, cache_modifier=".cg", eviction_policy="evict_first")
-        y = tl.load(y_ptr + offs, cache_modifier=".cg", eviction_policy="evict_first")
-        tl.store(out_ptr + offs, x + y, cache_modifier=".cg", eviction_policy="evict_first")
+def _add_kernel(X_ptr, Y_ptr, Z_ptr, BLOCK: tl.constexpr):
+    pid = tl.program_id(axis=0)
+    base = pid * BLOCK
+    offs = base + tl.arange(0, BLOCK)
+    tl.multiple_of(X_ptr, 32)
+    tl.multiple_of(Y_ptr, 32)
+    tl.multiple_of(Z_ptr, 32)
+    x = tl.load(X_ptr + offs)
+    y = tl.load(Y_ptr + offs)
+    tl.store(Z_ptr + offs, x + y)
 
 
 def add(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
-    if not x.is_cuda or not y.is_cuda:
-        raise ValueError("Inputs must be CUDA tensors")
-    if x.numel() != N_ELEMENTS or y.numel() != N_ELEMENTS:
-        raise ValueError(f"Inputs must have exactly {N_ELEMENTS} elements")
-    if x.dtype != y.dtype:
-        raise ValueError("Inputs must have the same dtype")
-    if not x.is_contiguous() or not y.is_contiguous():
+    if (not isinstance(x, torch.Tensor)) or (not isinstance(y, torch.Tensor)):
+        raise TypeError("x and y must be torch.Tensors")
+    if x.shape != y.shape:
+        raise ValueError("x and y must have the same shape")
+    if x.numel() != _N:
+        raise ValueError(f"Expected numel == {_N}, got {x.numel()}")
+    if not (x.is_contiguous() and y.is_contiguous()):
         x = x.contiguous()
         y = y.contiguous()
+
+    if not (x.is_cuda and y.is_cuda):
+        return x + y
+
+    if x.dtype != y.dtype:
+        y = y.to(dtype=x.dtype)
+
+    if x.dtype not in (torch.float16, torch.bfloat16, torch.float32):
+        return x + y
+
     out = torch.empty_like(x)
-
-    BLOCK = 1024
-    NUM_ITERS = 4
-    grid = (N_ELEMENTS // (BLOCK * NUM_ITERS),)
-
-    _add_kernel[grid](
-        x, y, out,
-        BLOCK=BLOCK,
-        NUM_ITERS=NUM_ITERS,
-        num_warps=8,
-        num_stages=4,
-    )
+    BLOCK = 8192
+    grid = (_N // BLOCK,)
+    _add_kernel[grid](x, y, out, BLOCK=BLOCK, num_warps=8, num_stages=2)
     return out
+
+
+_KERNEL_MODULE_CODE = textwrap.dedent(
+    r"""
+    import torch
+    import triton
+    import triton.language as tl
+
+    _N = 16777216
+
+    @triton.jit
+    def _add_kernel(X_ptr, Y_ptr, Z_ptr, BLOCK: tl.constexpr):
+        pid = tl.program_id(axis=0)
+        base = pid * BLOCK
+        offs = base + tl.arange(0, BLOCK)
+        tl.multiple_of(X_ptr, 32)
+        tl.multiple_of(Y_ptr, 32)
+        tl.multiple_of(Z_ptr, 32)
+        x = tl.load(X_ptr + offs)
+        y = tl.load(Y_ptr + offs)
+        tl.store(Z_ptr + offs, x + y)
+
+    def add(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+        if (not isinstance(x, torch.Tensor)) or (not isinstance(y, torch.Tensor)):
+            raise TypeError("x and y must be torch.Tensors")
+        if x.shape != y.shape:
+            raise ValueError("x and y must have the same shape")
+        if x.numel() != _N:
+            raise ValueError(f"Expected numel == {_N}, got {x.numel()}")
+        if not (x.is_contiguous() and y.is_contiguous()):
+            x = x.contiguous()
+            y = y.contiguous()
+
+        if not (x.is_cuda and y.is_cuda):
+            return x + y
+
+        if x.dtype != y.dtype:
+            y = y.to(dtype=x.dtype)
+
+        if x.dtype not in (torch.float16, torch.bfloat16, torch.float32):
+            return x + y
+
+        out = torch.empty_like(x)
+        BLOCK = 8192
+        grid = (_N // BLOCK,)
+        _add_kernel[grid](x, y, out, BLOCK=BLOCK, num_warps=8, num_stages=2)
+        return out
+    """
+).lstrip()
 
 
 class Solution:
     def solve(self, spec_path: str = None) -> dict:
-        try:
-            p = __file__
-            if p and os.path.exists(p):
-                return {"program_path": p}
-        except Exception:
-            pass
-        try:
-            src = inspect.getsource(sys.modules[__name__])
-            return {"code": src}
-        except Exception:
-            return {"code": ""}
+        return {"code": _KERNEL_MODULE_CODE}

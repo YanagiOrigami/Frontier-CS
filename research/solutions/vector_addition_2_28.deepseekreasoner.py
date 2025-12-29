@@ -1,6 +1,7 @@
 import torch
 import triton
 import triton.language as tl
+import os
 
 @triton.jit
 def add_kernel(
@@ -13,28 +14,33 @@ def add_kernel(
     offsets = block_start + tl.arange(0, BLOCK_SIZE)
     
     mask = offsets < n_elements
-    
     x = tl.load(x_ptr + offsets, mask=mask)
     y = tl.load(y_ptr + offsets, mask=mask)
+    
     output = x + y
     tl.store(output_ptr + offsets, output, mask=mask)
 
 def add(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
-    assert x.is_cuda and y.is_cuda, "Inputs must be on GPU"
-    assert x.is_contiguous() and y.is_contiguous(), "Inputs must be contiguous"
-    assert x.shape == y.shape, "Input shapes must match"
+    """
+    Element-wise addition of two vectors.
     
+    Args:
+        x: Input tensor of shape (268435456,)
+        y: Input tensor of shape (268435456,)
+    
+    Returns:
+        Output tensor of shape (268435456,) with x + y
+    """
     n_elements = x.numel()
     output = torch.empty_like(x)
     
-    # Use 1024 as block size for good occupancy
-    # and minimal wasted threads at the tail
-    BLOCK_SIZE = 1024
+    grid = lambda meta: (triton.cdiv(n_elements, meta['BLOCK_SIZE']),)
     
-    # Calculate grid size
-    grid = (triton.cdiv(n_elements, BLOCK_SIZE),)
-    
-    add_kernel[grid](x, y, output, n_elements, BLOCK_SIZE)
+    add_kernel[grid](
+        x, y, output,
+        n_elements,
+        BLOCK_SIZE=1024,
+    )
     
     return output
 
@@ -55,24 +61,36 @@ def add_kernel(
     offsets = block_start + tl.arange(0, BLOCK_SIZE)
     
     mask = offsets < n_elements
-    
     x = tl.load(x_ptr + offsets, mask=mask)
     y = tl.load(y_ptr + offsets, mask=mask)
+    
     output = x + y
     tl.store(output_ptr + offsets, output, mask=mask)
 
 def add(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
-    assert x.is_cuda and y.is_cuda, "Inputs must be on GPU"
-    assert x.is_contiguous() and y.is_contiguous(), "Inputs must be contiguous"
-    assert x.shape == y.shape, "Input shapes must match"
+    """
+    Element-wise addition of two vectors.
     
+    Args:
+        x: Input tensor of shape (268435456,)
+        y: Input tensor of shape (268435456,)
+    
+    Returns:
+        Output tensor of shape (268435456,) with x + y
+    """
     n_elements = x.numel()
     output = torch.empty_like(x)
     
-    BLOCK_SIZE = 1024
-    grid = (triton.cdiv(n_elements, BLOCK_SIZE),)
+    # Optimal grid size for large vectors
+    grid = lambda meta: (triton.cdiv(n_elements, meta['BLOCK_SIZE']),)
     
-    add_kernel[grid](x, y, output, n_elements, BLOCK_SIZE)
+    # Using 1024 threads per block for good occupancy
+    # and memory coalescing on modern GPUs
+    add_kernel[grid](
+        x, y, output,
+        n_elements,
+        BLOCK_SIZE=1024,
+    )
     
     return output
 '''

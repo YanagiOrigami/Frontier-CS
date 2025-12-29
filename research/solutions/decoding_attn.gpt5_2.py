@@ -1,5 +1,4 @@
 import math
-import os
 import torch
 import triton
 import triton.language as tl
@@ -7,151 +6,126 @@ import triton.language as tl
 
 @triton.autotune(
     configs=[
-        triton.Config({'BLOCK_M': 1, 'BLOCK_N': 64,  'BLOCK_DQ': 64,  'BLOCK_DV': 64},  num_warps=2, num_stages=2),
-        triton.Config({'BLOCK_M': 1, 'BLOCK_N': 128, 'BLOCK_DQ': 64,  'BLOCK_DV': 64},  num_warps=4, num_stages=2),
-        triton.Config({'BLOCK_M': 1, 'BLOCK_N': 256, 'BLOCK_DQ': 64,  'BLOCK_DV': 64},  num_warps=4, num_stages=3),
-        triton.Config({'BLOCK_M': 2, 'BLOCK_N': 128, 'BLOCK_DQ': 64,  'BLOCK_DV': 64},  num_warps=4, num_stages=3),
-        triton.Config({'BLOCK_M': 4, 'BLOCK_N': 128, 'BLOCK_DQ': 64,  'BLOCK_DV': 64},  num_warps=4, num_stages=3),
-        triton.Config({'BLOCK_M': 1, 'BLOCK_N': 64,  'BLOCK_DQ': 128, 'BLOCK_DV': 64},  num_warps=2, num_stages=2),
-        triton.Config({'BLOCK_M': 1, 'BLOCK_N': 128, 'BLOCK_DQ': 128, 'BLOCK_DV': 64},  num_warps=4, num_stages=2),
-        triton.Config({'BLOCK_M': 1, 'BLOCK_N': 64,  'BLOCK_DQ': 64,  'BLOCK_DV': 128}, num_warps=2, num_stages=2),
-        triton.Config({'BLOCK_M': 1, 'BLOCK_N': 128, 'BLOCK_DQ': 64,  'BLOCK_DV': 128}, num_warps=4, num_stages=2),
+        triton.Config({'BLOCK_M': 1, 'BLOCK_N': 64, 'BLOCK_DMODEL': 64, 'BLOCK_DV': 64}, num_warps=4, num_stages=2),
+        triton.Config({'BLOCK_M': 1, 'BLOCK_N': 128, 'BLOCK_DMODEL': 64, 'BLOCK_DV': 64}, num_warps=4, num_stages=2),
+        triton.Config({'BLOCK_M': 1, 'BLOCK_N': 256, 'BLOCK_DMODEL': 64, 'BLOCK_DV': 64}, num_warps=8, num_stages=2),
+        triton.Config({'BLOCK_M': 1, 'BLOCK_N': 512, 'BLOCK_DMODEL': 64, 'BLOCK_DV': 64}, num_warps=8, num_stages=3),
+        triton.Config({'BLOCK_M': 2, 'BLOCK_N': 128, 'BLOCK_DMODEL': 64, 'BLOCK_DV': 64}, num_warps=4, num_stages=2),
+        triton.Config({'BLOCK_M': 2, 'BLOCK_N': 256, 'BLOCK_DMODEL': 64, 'BLOCK_DV': 64}, num_warps=8, num_stages=3),
+        triton.Config({'BLOCK_M': 4, 'BLOCK_N': 128, 'BLOCK_DMODEL': 64, 'BLOCK_DV': 64}, num_warps=8, num_stages=3),
+        triton.Config({'BLOCK_M': 4, 'BLOCK_N': 256, 'BLOCK_DMODEL': 64, 'BLOCK_DV': 64}, num_warps=8, num_stages=4),
     ],
     key=['N'],
 )
 @triton.jit
 def _decoding_attn_kernel(
     Q_ptr, K_ptr, V_ptr, O_ptr,
+    Z, H, M, N, Dq, Dv,
     stride_qz, stride_qh, stride_qm, stride_qd,
     stride_kz, stride_kh, stride_kn, stride_kd,
     stride_vz, stride_vh, stride_vn, stride_vd,
     stride_oz, stride_oh, stride_om, stride_od,
-    Z, H, M, N, Dq, Dv,
-    sm_scale,
-    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_DQ: tl.constexpr, BLOCK_DV: tl.constexpr,
+    softmax_scale,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_DMODEL: tl.constexpr, BLOCK_DV: tl.constexpr,
 ):
-    pid_zh = tl.program_id(0)
-    pid_m = tl.program_id(1)
+    pid = tl.program_id(0)
+    M_BLOCKS = tl.cdiv(M, BLOCK_M)
+    qh_id = pid // M_BLOCKS
+    m_block_id = pid % M_BLOCKS
 
-    z = pid_zh // H
-    h = pid_zh % H
+    h_id = qh_id % H
+    z_id = qh_id // H
 
-    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
-    offs_dq = tl.arange(0, BLOCK_DQ)
+    m_start = m_block_id * BLOCK_M
+
+    offs_m = m_start + tl.arange(0, BLOCK_M)
+    offs_dq = tl.arange(0, BLOCK_DMODEL)
     offs_dv = tl.arange(0, BLOCK_DV)
 
-    # Load Q tile: [BM, Dq]
-    q_ptrs = Q_ptr + z * stride_qz + h * stride_qh + offs_m[:, None] * stride_qm + offs_dq[None, :] * stride_qd
-    q_mask = (offs_m[:, None] < M) & (offs_dq[None, :] < Dq)
-    q = tl.load(q_ptrs, mask=q_mask, other=0.0).to(tl.float32)
+    mask_m = offs_m < M
+    mask_dq = offs_dq < Dq
+    mask_dv = offs_dv < Dv
 
-    # Online softmax state per row in BM
-    m_i = tl.full((BLOCK_M,), -float('inf'), tl.float32)
-    l_i = tl.zeros((BLOCK_M,), tl.float32)
-    acc = tl.zeros((BLOCK_M, BLOCK_DV), tl.float32)
+    q_ptrs = Q_ptr + z_id * stride_qz + h_id * stride_qh + offs_m[:, None] * stride_qm + offs_dq[None, :] * stride_qd
+    q = tl.load(q_ptrs, mask=mask_m[:, None] & mask_dq[None, :], other=0.0).to(tl.float32)
 
-    # Loop over K/V blocks along N
-    start_n = 0
-    while start_n < N:
-        offs_n = start_n + tl.arange(0, BLOCK_N)
-        n_mask = offs_n < N
+    m_i = tl.full([BLOCK_M], -float('inf'), tl.float32)
+    l_i = tl.zeros([BLOCK_M], tl.float32)
+    acc = tl.zeros([BLOCK_M, BLOCK_DV], tl.float32)
 
-        # Load K block: [BN, Dq]
-        k_ptrs = K_ptr + z * stride_kz + h * stride_kh + offs_n[:, None] * stride_kn + offs_dq[None, :] * stride_kd
-        k = tl.load(k_ptrs, mask=(n_mask[:, None] & (offs_dq[None, :] < Dq)), other=0.0)
+    n_iter = tl.cdiv(N, BLOCK_N)
+    for n_idx in range(0, n_iter):
+        n_start = n_idx * BLOCK_N
+        offs_n = n_start + tl.arange(0, BLOCK_N)
+        mask_n = offs_n < N
 
-        # Compute qk: [BM, BN]
-        qk = tl.dot(q, tl.trans(k)).to(tl.float32)
-        qk = qk * sm_scale
-        qk = tl.where(n_mask[None, :], qk, -float('inf'))
+        k_ptrs = K_ptr + z_id * stride_kz + h_id * stride_kh + offs_n[:, None] * stride_kn + offs_dq[None, :] * stride_kd
+        v_ptrs = V_ptr + z_id * stride_vz + h_id * stride_vh + offs_n[:, None] * stride_vn + offs_dv[None, :] * stride_vd
 
-        # Compute new max and l values
-        m_curr = tl.max(qk, axis=1)
-        m_new = tl.maximum(m_i, m_curr)
+        k = tl.load(k_ptrs, mask=mask_n[:, None] & mask_dq[None, :], other=0.0).to(tl.float32)
+        v = tl.load(v_ptrs, mask=mask_n[:, None] & mask_dv[None, :], other=0.0).to(tl.float32)
 
-        p = tl.exp(qk - m_new[:, None])
-        l_new = tl.exp(m_i - m_new) * l_i + tl.sum(p, axis=1)
+        qk = tl.dot(q, tl.trans(k))
+        qk = qk * softmax_scale
+        qk = tl.where(mask_n[None, :], qk, -float('inf'))
 
-        # Load V block: [BN, Dv]
-        v_ptrs = V_ptr + z * stride_vz + h * stride_vh + offs_n[:, None] * stride_vn + offs_dv[None, :] * stride_vd
-        v = tl.load(v_ptrs, mask=(n_mask[:, None] & (offs_dv[None, :] < Dv)), other=0.0).to(tl.float32)
+        row_max = tl.max(qk, 1)
+        m_new = tl.maximum(m_i, row_max)
 
-        # Update accumulator
-        acc = acc * (tl.exp(m_i - m_new))[:, None] + tl.dot(p.to(tl.float32), v)
+        m_i_safe = tl.where(mask_m, m_i, 0.0)
+        m_new_safe = tl.where(mask_m, m_new, 0.0)
 
-        # Commit state
+        p = tl.exp(qk - m_new_safe[:, None])
+
+        l_i = tl.where(mask_m, tl.exp(m_i_safe - m_new_safe) * l_i + tl.sum(p, 1), l_i)
+
+        acc = acc * tl.exp(m_i_safe - m_new_safe)[:, None]
+        acc += tl.dot(p.to(tl.float32), v)
+
         m_i = m_new
-        l_i = l_new
 
-        start_n += BLOCK_N
+    denom = tl.where(mask_m, l_i, 1.0)
+    out = acc / denom[:, None]
 
-    # Normalize and store
-    out = acc / l_i[:, None]
-    out = out.to(tl.float16)
-    o_ptrs = O_ptr + z * stride_oz + h * stride_oh + offs_m[:, None] * stride_om + offs_dv[None, :] * stride_od
-    o_mask = (offs_m[:, None] < M) & (offs_dv[None, :] < Dv)
-    tl.store(o_ptrs, out, mask=o_mask)
+    o_ptrs = O_ptr + z_id * stride_oz + h_id * stride_oh + offs_m[:, None] * stride_om + offs_dv[None, :] * stride_od
+    tl.store(o_ptrs, out.to(tl.float16), mask=mask_m[:, None] & mask_dv[None, :])
 
 
 def decoding_attn(Q: torch.Tensor, K: torch.Tensor, V: torch.Tensor) -> torch.Tensor:
-    if not (Q.is_cuda and K.is_cuda and V.is_cuda):
-        # Fallback to PyTorch on CPU if needed
-        sm_scale = 1.0 / math.sqrt(Q.shape[-1])
-        attn = torch.softmax(torch.matmul(Q.to(torch.float32), K.transpose(-1, -2).to(torch.float32)) * sm_scale, dim=-1)
-        O = torch.matmul(attn, V.to(torch.float32)).to(Q.dtype)
-        return O
-
-    assert Q.dtype == torch.float16 and K.dtype == torch.float16 and V.dtype == torch.float16, "decoding_attn expects fp16 inputs"
-    assert Q.device.type == 'cuda' and K.device.type == 'cuda' and V.device.type == 'cuda'
-    assert Q.shape[0] == K.shape[0] == V.shape[0], "Batch (Z) mismatch"
-    assert Q.shape[1] == K.shape[1] == V.shape[1], "Head (H) mismatch"
-    assert Q.shape[-1] == K.shape[-1], "Dq mismatch between Q and K"
-
-    Z, H, M, Dq = Q.shape
-    _, _, N, _ = K.shape
-    _, _, _, Dv = V.shape
-
-    sm_scale = 1.0 / math.sqrt(Dq)
+    assert Q.is_cuda and K.is_cuda and V.is_cuda, "Inputs must be CUDA tensors"
+    assert Q.dtype == torch.float16 and K.dtype == torch.float16 and V.dtype == torch.float16, "Input dtypes must be float16"
+    assert Q.dim() == 4 and K.dim() == 4 and V.dim() == 4, "Q, K, V must be 4D tensors (Z, H, M/N, D)"
+    Zq, Hq, M, Dq = Q.shape
+    Zk, Hk, N, Dk = K.shape
+    Zv, Hv, Nv, Dv = V.shape
+    assert Zq == Zk == Zv, "Batch Z must match"
+    assert Hq == Hk == Hv, "Heads H must match"
+    assert Dq == Dk, "Q and K last dims must match"
+    assert N == Nv, "K and V sequence length must match"
+    Z, H = Zq, Hq
 
     O = torch.empty((Z, H, M, Dv), device=Q.device, dtype=torch.float16)
 
-    stride_qz, stride_qh, stride_qm, stride_qd = Q.stride()
-    stride_kz, stride_kh, stride_kn, stride_kd = K.stride()
-    stride_vz, stride_vh, stride_vn, stride_vd = V.stride()
-    stride_oz, stride_oh, stride_om, stride_od = O.stride()
+    softmax_scale = 1.0 / math.sqrt(float(Dq))
 
-    # Pick BLOCK sizes as next power of two to cover D dimensions
-    def next_power_of_2(x):
-        return 1 if x <= 1 else 1 << (x - 1).bit_length()
+    grid = lambda META: (int(Z * H * triton.cdiv(M, META['BLOCK_M'])),)
 
-    BLOCK_DQ = next_power_of_2(int(Dq))
-    BLOCK_DV = next_power_of__2(int(Dv))
-
-    # Reasonable caps to avoid too large tiles
-    BLOCK_DQ = 128 if BLOCK_DQ > 128 else BLOCK_DQ
-    BLOCK_DV = 128 if BLOCK_DV > 128 else BLOCK_DV
-
-    grid = (Z * H, triton.cdiv(M, 1))
-    # Kernel launch
     _decoding_attn_kernel[grid](
         Q, K, V, O,
-        stride_qz, stride_qh, stride_qm, stride_qd,
-        stride_kz, stride_kh, stride_kn, stride_kd,
-        stride_vz, stride_vh, stride_vn, stride_vd,
-        stride_oz, stride_oh, stride_om, stride_od,
         Z, H, M, N, Dq, Dv,
-        sm_scale,
-        BLOCK_M=1,  # decoding typically M=1; kernel still supports >1 for small blocks
-        BLOCK_N=0,  # Will be set by autotuner
-        BLOCK_DQ=BLOCK_DQ,
-        BLOCK_DV=BLOCK_DV,
+        Q.stride(0), Q.stride(1), Q.stride(2), Q.stride(3),
+        K.stride(0), K.stride(1), K.stride(2), K.stride(3),
+        V.stride(0), V.stride(1), V.stride(2), V.stride(3),
+        O.stride(0), O.stride(1), O.stride(2), O.stride(3),
+        softmax_scale,
     )
+
     return O
 
 
 class Solution:
     def solve(self, spec_path: str = None) -> dict:
-        code = """
+        code = r'''
 import math
 import torch
 import triton
@@ -160,141 +134,120 @@ import triton.language as tl
 
 @triton.autotune(
     configs=[
-        triton.Config({'BLOCK_M': 1, 'BLOCK_N': 64,  'BLOCK_DQ': 64,  'BLOCK_DV': 64},  num_warps=2, num_stages=2),
-        triton.Config({'BLOCK_M': 1, 'BLOCK_N': 128, 'BLOCK_DQ': 64,  'BLOCK_DV': 64},  num_warps=4, num_stages=2),
-        triton.Config({'BLOCK_M': 1, 'BLOCK_N': 256, 'BLOCK_DQ': 64,  'BLOCK_DV': 64},  num_warps=4, num_stages=3),
-        triton.Config({'BLOCK_M': 2, 'BLOCK_N': 128, 'BLOCK_DQ': 64,  'BLOCK_DV': 64},  num_warps=4, num_stages=3),
-        triton.Config({'BLOCK_M': 4, 'BLOCK_N': 128, 'BLOCK_DQ': 64,  'BLOCK_DV': 64},  num_warps=4, num_stages=3),
-        triton.Config({'BLOCK_M': 1, 'BLOCK_N': 64,  'BLOCK_DQ': 128, 'BLOCK_DV': 64},  num_warps=2, num_stages=2),
-        triton.Config({'BLOCK_M': 1, 'BLOCK_N': 128, 'BLOCK_DQ': 128, 'BLOCK_DV': 64},  num_warps=4, num_stages=2),
-        triton.Config({'BLOCK_M': 1, 'BLOCK_N': 64,  'BLOCK_DQ': 64,  'BLOCK_DV': 128}, num_warps=2, num_stages=2),
-        triton.Config({'BLOCK_M': 1, 'BLOCK_N': 128, 'BLOCK_DQ': 64,  'BLOCK_DV': 128}, num_warps=4, num_stages=2),
+        triton.Config({'BLOCK_M': 1, 'BLOCK_N': 64, 'BLOCK_DMODEL': 64, 'BLOCK_DV': 64}, num_warps=4, num_stages=2),
+        triton.Config({'BLOCK_M': 1, 'BLOCK_N': 128, 'BLOCK_DMODEL': 64, 'BLOCK_DV': 64}, num_warps=4, num_stages=2),
+        triton.Config({'BLOCK_M': 1, 'BLOCK_N': 256, 'BLOCK_DMODEL': 64, 'BLOCK_DV': 64}, num_warps=8, num_stages=2),
+        triton.Config({'BLOCK_M': 1, 'BLOCK_N': 512, 'BLOCK_DMODEL': 64, 'BLOCK_DV': 64}, num_warps=8, num_stages=3),
+        triton.Config({'BLOCK_M': 2, 'BLOCK_N': 128, 'BLOCK_DMODEL': 64, 'BLOCK_DV': 64}, num_warps=4, num_stages=2),
+        triton.Config({'BLOCK_M': 2, 'BLOCK_N': 256, 'BLOCK_DMODEL': 64, 'BLOCK_DV': 64}, num_warps=8, num_stages=3),
+        triton.Config({'BLOCK_M': 4, 'BLOCK_N': 128, 'BLOCK_DMODEL': 64, 'BLOCK_DV': 64}, num_warps=8, num_stages=3),
+        triton.Config({'BLOCK_M': 4, 'BLOCK_N': 256, 'BLOCK_DMODEL': 64, 'BLOCK_DV': 64}, num_warps=8, num_stages=4),
     ],
     key=['N'],
 )
 @triton.jit
 def _decoding_attn_kernel(
     Q_ptr, K_ptr, V_ptr, O_ptr,
+    Z, H, M, N, Dq, Dv,
     stride_qz, stride_qh, stride_qm, stride_qd,
     stride_kz, stride_kh, stride_kn, stride_kd,
     stride_vz, stride_vh, stride_vn, stride_vd,
     stride_oz, stride_oh, stride_om, stride_od,
-    Z, H, M, N, Dq, Dv,
-    sm_scale,
-    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_DQ: tl.constexpr, BLOCK_DV: tl.constexpr,
+    softmax_scale,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_DMODEL: tl.constexpr, BLOCK_DV: tl.constexpr,
 ):
-    pid_zh = tl.program_id(0)
-    pid_m = tl.program_id(1)
+    pid = tl.program_id(0)
+    M_BLOCKS = tl.cdiv(M, BLOCK_M)
+    qh_id = pid // M_BLOCKS
+    m_block_id = pid % M_BLOCKS
 
-    z = pid_zh // H
-    h = pid_zh % H
+    h_id = qh_id % H
+    z_id = qh_id // H
 
-    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
-    offs_dq = tl.arange(0, BLOCK_DQ)
+    m_start = m_block_id * BLOCK_M
+
+    offs_m = m_start + tl.arange(0, BLOCK_M)
+    offs_dq = tl.arange(0, BLOCK_DMODEL)
     offs_dv = tl.arange(0, BLOCK_DV)
 
-    # Load Q tile: [BM, Dq]
-    q_ptrs = Q_ptr + z * stride_qz + h * stride_qh + offs_m[:, None] * stride_qm + offs_dq[None, :] * stride_qd
-    q_mask = (offs_m[:, None] < M) & (offs_dq[None, :] < Dq)
-    q = tl.load(q_ptrs, mask=q_mask, other=0.0).to(tl.float32)
+    mask_m = offs_m < M
+    mask_dq = offs_dq < Dq
+    mask_dv = offs_dv < Dv
 
-    # Online softmax state per row in BM
-    m_i = tl.full((BLOCK_M,), -float('inf'), tl.float32)
-    l_i = tl.zeros((BLOCK_M,), tl.float32)
-    acc = tl.zeros((BLOCK_M, BLOCK_DV), tl.float32)
+    q_ptrs = Q_ptr + z_id * stride_qz + h_id * stride_qh + offs_m[:, None] * stride_qm + offs_dq[None, :] * stride_qd
+    q = tl.load(q_ptrs, mask=mask_m[:, None] & mask_dq[None, :], other=0.0).to(tl.float32)
 
-    # Loop over K/V blocks along N
-    start_n = 0
-    while start_n < N:
-        offs_n = start_n + tl.arange(0, BLOCK_N)
-        n_mask = offs_n < N
+    m_i = tl.full([BLOCK_M], -float('inf'), tl.float32)
+    l_i = tl.zeros([BLOCK_M], tl.float32)
+    acc = tl.zeros([BLOCK_M, BLOCK_DV], tl.float32)
 
-        # Load K block: [BN, Dq]
-        k_ptrs = K_ptr + z * stride_kz + h * stride_kh + offs_n[:, None] * stride_kn + offs_dq[None, :] * stride_kd
-        k = tl.load(k_ptrs, mask=(n_mask[:, None] & (offs_dq[None, :] < Dq)), other=0.0)
+    n_iter = tl.cdiv(N, BLOCK_N)
+    for n_idx in range(0, n_iter):
+        n_start = n_idx * BLOCK_N
+        offs_n = n_start + tl.arange(0, BLOCK_N)
+        mask_n = offs_n < N
 
-        # Compute qk: [BM, BN]
-        qk = tl.dot(q, tl.trans(k)).to(tl.float32)
-        qk = qk * sm_scale
-        qk = tl.where(n_mask[None, :], qk, -float('inf'))
+        k_ptrs = K_ptr + z_id * stride_kz + h_id * stride_kh + offs_n[:, None] * stride_kn + offs_dq[None, :] * stride_kd
+        v_ptrs = V_ptr + z_id * stride_vz + h_id * stride_vh + offs_n[:, None] * stride_vn + offs_dv[None, :] * stride_vd
 
-        # Compute new max and l values
-        m_curr = tl.max(qk, axis=1)
-        m_new = tl.maximum(m_i, m_curr)
+        k = tl.load(k_ptrs, mask=mask_n[:, None] & mask_dq[None, :], other=0.0).to(tl.float32)
+        v = tl.load(v_ptrs, mask=mask_n[:, None] & mask_dv[None, :], other=0.0).to(tl.float32)
 
-        p = tl.exp(qk - m_new[:, None])
-        l_new = tl.exp(m_i - m_new) * l_i + tl.sum(p, axis=1)
+        qk = tl.dot(q, tl.trans(k))
+        qk = qk * softmax_scale
+        qk = tl.where(mask_n[None, :], qk, -float('inf'))
 
-        # Load V block: [BN, Dv]
-        v_ptrs = V_ptr + z * stride_vz + h * stride_vh + offs_n[:, None] * stride_vn + offs_dv[None, :] * stride_vd
-        v = tl.load(v_ptrs, mask=(n_mask[:, None] & (offs_dv[None, :] < Dv)), other=0.0).to(tl.float32)
+        row_max = tl.max(qk, 1)
+        m_new = tl.maximum(m_i, row_max)
 
-        # Update accumulator
-        acc = acc * (tl.exp(m_i - m_new))[:, None] + tl.dot(p.to(tl.float32), v)
+        m_i_safe = tl.where(mask_m, m_i, 0.0)
+        m_new_safe = tl.where(mask_m, m_new, 0.0)
 
-        # Commit state
+        p = tl.exp(qk - m_new_safe[:, None])
+
+        l_i = tl.where(mask_m, tl.exp(m_i_safe - m_new_safe) * l_i + tl.sum(p, 1), l_i)
+
+        acc = acc * tl.exp(m_i_safe - m_new_safe)[:, None]
+        acc += tl.dot(p.to(tl.float32), v)
+
         m_i = m_new
-        l_i = l_new
 
-        start_n += BLOCK_N
+    denom = tl.where(mask_m, l_i, 1.0)
+    out = acc / denom[:, None]
 
-    # Normalize and store
-    out = acc / l_i[:, None]
-    out = out.to(tl.float16)
-    o_ptrs = O_ptr + z * stride_oz + h * stride_oh + offs_m[:, None] * stride_om + offs_dv[None, :] * stride_od
-    o_mask = (offs_m[:, None] < M) & (offs_dv[None, :] < Dv)
-    tl.store(o_ptrs, out, mask=o_mask)
+    o_ptrs = O_ptr + z_id * stride_oz + h_id * stride_oh + offs_m[:, None] * stride_om + offs_dv[None, :] * stride_od
+    tl.store(o_ptrs, out.to(tl.float16), mask=mask_m[:, None] & mask_dv[None, :])
 
 
 def decoding_attn(Q: torch.Tensor, K: torch.Tensor, V: torch.Tensor) -> torch.Tensor:
-    if not (Q.is_cuda and K.is_cuda and V.is_cuda):
-        # Fallback to PyTorch on CPU if needed
-        sm_scale = 1.0 / math.sqrt(Q.shape[-1])
-        attn = torch.softmax(torch.matmul(Q.to(torch.float32), K.transpose(-1, -2).to(torch.float32)) * sm_scale, dim=-1)
-        O = torch.matmul(attn, V.to(torch.float32)).to(Q.dtype)
-        return O
-
-    assert Q.dtype == torch.float16 and K.dtype == torch.float16 and V.dtype == torch.float16, "decoding_attn expects fp16 inputs"
-    assert Q.device.type == 'cuda' and K.device.type == 'cuda' and V.device.type == 'cuda'
-    assert Q.shape[0] == K.shape[0] == V.shape[0], "Batch (Z) mismatch"
-    assert Q.shape[1] == K.shape[1] == V.shape[1], "Head (H) mismatch"
-    assert Q.shape[-1] == K.shape[-1], "Dq mismatch between Q and K"
-
-    Z, H, M, Dq = Q.shape
-    _, _, N, _ = K.shape
-    _, _, _, Dv = V.shape
-
-    sm_scale = 1.0 / math.sqrt(Dq)
+    assert Q.is_cuda and K.is_cuda and V.is_cuda, "Inputs must be CUDA tensors"
+    assert Q.dtype == torch.float16 and K.dtype == torch.float16 and V.dtype == torch.float16, "Input dtypes must be float16"
+    assert Q.dim() == 4 and K.dim() == 4 and V.dim() == 4, "Q, K, V must be 4D tensors (Z, H, M/N, D)"
+    Zq, Hq, M, Dq = Q.shape
+    Zk, Hk, N, Dk = K.shape
+    Zv, Hv, Nv, Dv = V.shape
+    assert Zq == Zk == Zv, "Batch Z must match"
+    assert Hq == Hk == Hv, "Heads H must match"
+    assert Dq == Dk, "Q and K last dims must match"
+    assert N == Nv, "K and V sequence length must match"
+    Z, H = Zq, Hq
 
     O = torch.empty((Z, H, M, Dv), device=Q.device, dtype=torch.float16)
 
-    stride_qz, stride_qh, stride_qm, stride_qd = Q.stride()
-    stride_kz, stride_kh, stride_kn, stride_kd = K.stride()
-    stride_vz, stride_vh, stride_vn, stride_vd = V.stride()
-    stride_oz, stride_oh, stride_om, stride_od = O.stride()
+    softmax_scale = 1.0 / math.sqrt(float(Dq))
 
-    def next_power_of_2(x):
-        return 1 if x <= 1 else 1 << (x - 1).bit_length()
+    grid = lambda META: (int(Z * H * triton.cdiv(M, META['BLOCK_M'])),)
 
-    BLOCK_DQ = next_power_of_2(int(Dq))
-    BLOCK_DV = next_power_of_2(int(Dv))
-    BLOCK_DQ = 128 if BLOCK_DQ > 128 else BLOCK_DQ
-    BLOCK_DV = 128 if BLOCK_DV > 128 else BLOCK_DV
-
-    grid = (Z * H, triton.cdiv(M, 1))
     _decoding_attn_kernel[grid](
         Q, K, V, O,
-        stride_qz, stride_qh, stride_qm, stride_qd,
-        stride_kz, stride_kh, stride_kn, stride_kd,
-        stride_vz, stride_vh, stride_vn, stride_vd,
-        stride_oz, stride_oh, stride_om, stride_od,
         Z, H, M, N, Dq, Dv,
-        sm_scale,
-        BLOCK_M=1,
-        BLOCK_N=0,  # autotuner
-        BLOCK_DQ=BLOCK_DQ,
-        BLOCK_DV=BLOCK_DV,
+        Q.stride(0), Q.stride(1), Q.stride(2), Q.stride(3),
+        K.stride(0), K.stride(1), K.stride(2), K.stride(3),
+        V.stride(0), V.stride(1), V.stride(2), V.stride(3),
+        O.stride(0), O.stride(1), O.stride(2), O.stride(3),
+        softmax_scale,
     )
+
     return O
-"""
+'''
         return {"code": code}

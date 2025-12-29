@@ -1,35 +1,46 @@
 import pandas as pd
-import numpy as np
-import os
-from concurrent.futures import ProcessPoolExecutor, as_completed
-from collections import defaultdict
-import itertools
-
-# This helper function is defined at the module level for compatibility with some
-# parallel processing backends that have trouble with nested function pickling.
-def _calculate_gain_static(prefixes_and_values):
-    """
-    Helper function for parallel execution.
-    Calculates the LCP score gain for a new column.
-    """
-    prefixes, col_values = prefixes_and_values
-    score_gain = 0
-    # Using defaultdict for efficient grouping
-    groups = defaultdict(list)
-    for p, v in zip(prefixes, col_values):
-        groups[p].append(v)
-    
-    for group_vals in groups.values():
-        if len(group_vals) > 1:
-            # Using numpy for fast sorting of string arrays
-            sorted_vals = np.sort(group_vals)
-            for i in range(len(sorted_vals) - 1):
-                # os.path.commonprefix is implemented in C and is very fast
-                score_gain += len(os.path.commonprefix([sorted_vals[i], sorted_vals[i+1]]))
-    return score_gain
-
+from joblib import Parallel, delayed
 
 class Solution:
+    def _handle_merges(self, df: pd.DataFrame, col_merge: list) -> pd.DataFrame:
+        if not col_merge:
+            return df.copy()
+
+        df_copy = df.copy()
+        processed_cols = set()
+        new_df_parts = []
+
+        for group in col_merge:
+            if not group:
+                continue
+            
+            group = sorted(list(set(col for col in group if col in df_copy.columns)))
+            if not group:
+                continue
+
+            merged_col_name = "__".join(group)
+            merged_series = df_copy[group].astype(str).agg("".join, axis=1)
+            merged_series.name = merged_col_name
+            new_df_parts.append(merged_series)
+            processed_cols.update(group)
+
+        unmerged_cols = [col for col in df_copy.columns if col not in processed_cols]
+        if unmerged_cols:
+            new_df_parts.append(df_copy[unmerged_cols])
+
+        if not new_df_parts:
+            return pd.DataFrame(index=df.index)
+            
+        return pd.concat(new_df_parts, axis=1)
+
+    @staticmethod
+    def _calculate_score(col: str, df: pd.DataFrame, current_order: list) -> int:
+        if not current_order:
+            return df[col].nunique()
+        else:
+            subset_cols = current_order + [col]
+            return df.drop_duplicates(subset=subset_cols).shape[0]
+
     def solve(
         self,
         df: pd.DataFrame,
@@ -41,116 +52,72 @@ class Solution:
         distinct_value_threshold: float = 0.7,
         parallel: bool = True,
     ) -> pd.DataFrame:
-        """
-        Reorder columns in the DataFrame to maximize prefix hit rate.
-        """
-        df_processed = df.copy()
-
-        if col_merge:
-            # Flatten the list of columns to be merged and remove duplicates
-            cols_to_drop = set(itertools.chain.from_iterable(col_merge))
-            
-            for i, group in enumerate(col_merge):
-                if not group or not all(c in df_processed.columns for c in group):
-                    continue
-                new_col_name = f"__merged_{i}__"
-                df_processed[new_col_name] = df_processed[group].astype(str).apply("".join, axis=1)
-            
-            # Drop the original columns that have been merged
-            df_processed = df_processed.drop(columns=[c for c in cols_to_drop if c in df_processed.columns])
-
-        df_str = df_processed.astype(str)
-        all_cols = list(df_str.columns)
-        num_cols = len(all_cols)
-
-        if num_cols <= 1:
-            return df_processed
-
-        beam_width = row_stop
         
-        # --- Beam Search for the first `col_stop` columns ---
-        beams = [([], 0.0)]  # List of (order, score)
+        if col_merge:
+            df_proc = self._handle_merges(df, col_merge)
+        else:
+            df_proc = df.copy()
 
-        for k in range(min(col_stop, num_cols)):
-            if not beams or not beams[0][0]: # Handle first iteration or empty beams
-                if not any(c for c, _ in beams): # all orders are empty
-                    prefixes_for_all = pd.Series([""] * len(df_str), index=df_str.index)
-
-            candidates = []
-            tasks = []
+        if df_proc.shape[1] <= 1:
+            return df_proc
             
-            prefixes_cache = {}
-            for current_order, current_score in beams:
-                order_tuple = tuple(current_order)
-                if order_tuple not in prefixes_cache:
-                    if not current_order:
-                        prefixes = prefixes_for_all
-                    else:
-                        prefixes = df_str[current_order].apply("".join, axis=1)
-                    prefixes_cache[order_tuple] = prefixes
-                
-                prefixes = prefixes_cache[order_tuple]
-                
-                remaining_cols = [c for c in all_cols if c not in current_order]
-                for col in remaining_cols:
-                    tasks.append({
-                        "order": current_order,
-                        "score": current_score,
-                        "col": col,
-                        "prefixes": prefixes
-                    })
+        df_str = df_proc.astype(str)
+        sample_df = df_str.head(min(early_stop, len(df_str)))
+        
+        all_cols = list(sample_df.columns)
+        
+        high_card_cols = []
+        low_card_cols = []
+        
+        sample_len = len(sample_df)
+        if sample_len > 0:
+            for col in all_cols:
+                nunique = sample_df[col].nunique()
+                if nunique / sample_len > distinct_value_threshold:
+                    high_card_cols.append(col)
+                else:
+                    low_card_cols.append(col)
+        else:
+            low_card_cols = all_cols
 
-            if parallel and len(tasks) > 1:
-                with ProcessPoolExecutor() as executor:
-                    future_to_task = {
-                        executor.submit(_calculate_gain_static, (task["prefixes"].to_numpy(dtype=str), df_str[task["col"]].to_numpy(dtype=str))): task
-                        for task in tasks
-                    }
-                    for future in as_completed(future_to_task):
-                        task = future_to_task[future]
-                        score_gain = future.result()
-                        candidates.append((task["order"] + [task["col"]], task["score"] + score_gain))
-            else:
-                for task in tasks:
-                    score_gain = _calculate_gain_static((task["prefixes"].to_numpy(dtype=str), df_str[task["col"]].to_numpy(dtype=str)))
-                    candidates.append((task["order"] + [task["col"]], task["score"] + score_gain))
-
-            if not candidates:
+        final_order = []
+        cols_to_search = low_card_cols.copy()
+        
+        num_greedy_steps = min(col_stop, len(cols_to_search))
+        
+        for _ in range(num_greedy_steps):
+            if not cols_to_search:
                 break
 
-            candidates.sort(key=lambda x: x[1], reverse=True)
+            if parallel:
+                scores = Parallel(n_jobs=-1, prefer="threads")(
+                    delayed(self._calculate_score)(
+                        c, sample_df, final_order
+                    ) for c in cols_to_search
+                )
+                scores_map = dict(zip(cols_to_search, scores))
+            else:
+                scores_map = {
+                    c: self._calculate_score(c, sample_df, final_order)
+                    for c in cols_to_search
+                }
             
-            # Prune to beam width, ensuring unique orders
-            new_beams = []
-            seen_orders = set()
-            for order, score in candidates:
-                order_tuple = tuple(order)
-                if order_tuple not in seen_orders:
-                    new_beams.append((order, score))
-                    seen_orders.add(order_tuple)
-                    if len(new_beams) == beam_width:
-                        break
-            beams = new_beams if new_beams else [([], 0.0)]
-
-        best_order_prefix = beams[0][0]
-        
-        # --- Heuristic for remaining columns ---
-        remaining_cols = [c for c in all_cols if c not in best_order_prefix]
+            best_col = min(scores_map, key=scores_map.get)
+            
+            final_order.append(best_col)
+            cols_to_search.remove(best_col)
+            
+        remaining_cols = cols_to_search + high_card_cols
         
         if remaining_cols:
-            n_rows = len(df_str)
-            if n_rows > 0:
-                nuniques = {c: df_str[c].nunique() for c in remaining_cols}
-                
-                low_card = [c for c in remaining_cols if nuniques[c] / n_rows <= distinct_value_threshold]
-                high_card = [c for c in remaining_cols if nuniques[c] / n_rows > distinct_value_threshold]
-                
-                low_card.sort(key=lambda c: nuniques[c])
-                high_card.sort(key=lambda c: nuniques[c])
-                
-                best_order_prefix.extend(low_card)
-                best_order_prefix.extend(high_card)
-
-        final_order = best_order_prefix if best_order_prefix else all_cols
-        
-        return df_processed[final_order]
+            if sample_len > 0:
+                remaining_uniques = {
+                    c: sample_df[c].nunique() for c in remaining_cols
+                }
+                sorted_remaining = sorted(remaining_cols, key=lambda c: remaining_uniques[c])
+            else:
+                sorted_remaining = sorted(remaining_cols)
+            
+            final_order.extend(sorted_remaining)
+            
+        return df_proc[final_order]

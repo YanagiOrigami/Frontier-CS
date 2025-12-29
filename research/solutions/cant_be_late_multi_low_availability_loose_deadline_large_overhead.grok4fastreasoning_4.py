@@ -1,25 +1,13 @@
 import json
 from argparse import Namespace
-
 from sky_spot.strategies.multi_strategy import MultiRegionStrategy
 from sky_spot.utils import ClusterType
 
 
 class Solution(MultiRegionStrategy):
-    """Your multi-region scheduling strategy."""
-
-    NAME = "my_strategy"  # REQUIRED: unique identifier
+    NAME = "my_strategy"
 
     def solve(self, spec_path: str) -> "Solution":
-        """
-        Initialize the solution from spec_path config.
-
-        The spec file contains:
-        - deadline: deadline in hours
-        - duration: task duration in hours
-        - overhead: restart overhead in hours
-        - trace_files: list of trace file paths (one per region)
-        """
         with open(spec_path) as f:
             config = json.load(f)
 
@@ -33,23 +21,22 @@ class Solution(MultiRegionStrategy):
         return self
 
     def _step(self, last_cluster_type: ClusterType, has_spot: bool) -> ClusterType:
-        """
-        Decide next action based on current state.
+        done = sum(self.task_done_time)
+        if done >= self.task_duration:
+            return ClusterType.NONE
 
-        Available attributes:
-        - self.env.get_current_region(): Get current region index
-        - self.env.get_num_regions(): Get total number of regions
-        - self.env.switch_region(idx): Switch to region by index
-        - self.env.elapsed_seconds: Current time elapsed
-        - self.task_duration: Total task duration needed (seconds)
-        - self.deadline: Deadline time (seconds)
-        - self.restart_overhead: Restart overhead (seconds)
-        - self.task_done_time: List of completed work segments
-        - self.remaining_restart_overhead: Current pending overhead
+        current_region = self.env.get_current_region()
+        num_regions = self.env.get_num_regions()
 
-        Returns: ClusterType.SPOT, ClusterType.ON_DEMAND, or ClusterType.NONE
-        """
-        # Your decision logic here
-        if has_spot:
+        if self.env.has_spot:
             return ClusterType.SPOT
+
+        for i in range(num_regions):
+            if i == current_region:
+                continue
+            self.env.switch_region(i)
+            if self.env.has_spot:
+                return ClusterType.SPOT
+            self.env.switch_region(current_region)
+
         return ClusterType.ON_DEMAND

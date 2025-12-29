@@ -2,7 +2,7 @@ import numpy as np
 import faiss
 from typing import Tuple
 
-class VDBIndex:
+class HNSWIndex:
     def __init__(self, dim: int, **kwargs):
         M = kwargs.get('M', 32)
         ef_construction = kwargs.get('ef_construction', 200)
@@ -16,4 +16,4 @@ class VDBIndex:
 
     def search(self, xq: np.ndarray, k: int) -> Tuple[np.ndarray, np.ndarray]:
         distances, indices = self.index.search(xq, k)
-        return distances, indices.astype(np.int64)
+        return distances, indices

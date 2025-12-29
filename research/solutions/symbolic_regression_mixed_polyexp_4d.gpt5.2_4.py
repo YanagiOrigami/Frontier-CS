@@ -1,361 +1,469 @@
 import numpy as np
 
-def _exp_clip(z):
-    return np.exp(np.clip(z, -60.0, 60.0))
-
-def _generate_exponents_4vars(max_degree):
-    exps = []
-    for total in range(max_degree + 1):
-        for e1 in range(total + 1):
-            rem1 = total - e1
-            for e2 in range(rem1 + 1):
-                rem2 = rem1 - e2
-                for e3 in range(rem2 + 1):
-                    e4 = rem2 - e3
-                    exps.append((e1, e2, e3, e4))
-    return exps
-
-def _generate_exponents_2vars(max_degree):
-    exps = []
-    for total in range(max_degree + 1):
-        for e1 in range(total + 1):
-            e2 = total - e1
-            exps.append((e1, e2))
-    return exps
-
-def _monomial_expr_4(e):
-    e1, e2, e3, e4 = e
-    parts = []
-    if e1:
-        parts.append("x1" if e1 == 1 else f"x1**{e1}")
-    if e2:
-        parts.append("x2" if e2 == 1 else f"x2**{e2}")
-    if e3:
-        parts.append("x3" if e3 == 1 else f"x3**{e3}")
-    if e4:
-        parts.append("x4" if e4 == 1 else f"x4**{e4}")
-    return "1" if not parts else "*".join(parts)
-
-def _monomial_expr_2(e):
-    e1, e2 = e
-    parts = []
-    if e1:
-        parts.append("x1" if e1 == 1 else f"x1**{e1}")
-    if e2:
-        parts.append("x2" if e2 == 1 else f"x2**{e2}")
-    return "1" if not parts else "*".join(parts)
-
-def _eval_monomial_4(x1, x2, x3, x4, e):
-    e1, e2, e3, e4 = e
-    out = np.ones_like(x1, dtype=np.float64)
-    if e1:
-        out *= x1 ** e1
-    if e2:
-        out *= x2 ** e2
-    if e3:
-        out *= x3 ** e3
-    if e4:
-        out *= x4 ** e4
-    return out
-
-def _eval_monomial_2(x1, x2, e):
-    e1, e2 = e
-    out = np.ones_like(x1, dtype=np.float64)
-    if e1:
-        out *= x1 ** e1
-    if e2:
-        out *= x2 ** e2
-    return out
-
-def _ridge_solve(A, y, alpha):
-    # Solve (A^T A + alpha I) w = A^T y
-    ATA = A.T @ A
-    ATy = A.T @ y
-    if alpha > 0.0:
-        ATA = ATA + alpha * np.eye(ATA.shape[0], dtype=ATA.dtype)
-    try:
-        return np.linalg.solve(ATA, ATy)
-    except np.linalg.LinAlgError:
-        return np.linalg.lstsq(A, y, rcond=None)[0]
-
-def _stlsq(A, y, alpha, tol, max_iter=12):
-    m = A.shape[1]
-    active = np.ones(m, dtype=bool)
-    w = np.zeros(m, dtype=np.float64)
-    last_active = None
-    for _ in range(max_iter):
-        idx = np.flatnonzero(active)
-        if idx.size == 0:
-            return w, active
-        Aw = A[:, idx]
-        w_sub = _ridge_solve(Aw, y, alpha)
-        w[:] = 0.0
-        w[idx] = w_sub
-        if tol > 0.0:
-            active_new = np.abs(w) >= tol
-        else:
-            active_new = active.copy()
-        if last_active is not None and np.array_equal(active_new, last_active):
-            active = active_new
-            break
-        if np.array_equal(active_new, active):
-            break
-        last_active = active.copy()
-        active = active_new
-    return w, active
-
-def _build_feature_library(X):
-    x1 = X[:, 0].astype(np.float64, copy=False)
-    x2 = X[:, 1].astype(np.float64, copy=False)
-    x3 = X[:, 2].astype(np.float64, copy=False)
-    x4 = X[:, 3].astype(np.float64, copy=False)
-
-    exps_all_deg3 = _generate_exponents_4vars(3)
-    exps_x1x2_deg3 = _generate_exponents_2vars(3)
-    exps_lin_all = [(0, 0, 0, 0), (1, 0, 0, 0), (0, 1, 0, 0), (0, 0, 1, 0), (0, 0, 0, 1)]
-
-    kset = (0.5, 1.0, 2.0)
-
-    dampers = []
-
-    # x3,x4-based dampers
-    s34 = x3 * x3 + x4 * x4
-    sp = (x3 + x4) * (x3 + x4)
-    sm = (x3 - x4) * (x3 - x4)
-    p = (x3 * x4) * (x3 * x4)
-
-    for k in kset:
-        dampers.append((_exp_clip(-k * s34), f"exp(-({k}*(x3**2 + x4**2)))"))
-    for k in kset:
-        dampers.append((_exp_clip(-k * sp), f"exp(-({k}*((x3 + x4)**2)))"))
-    for k in kset:
-        dampers.append((_exp_clip(-k * sm), f"exp(-({k}*((x3 - x4)**2)))"))
-    for k in kset:
-        dampers.append((_exp_clip(-k * p), f"exp(-({k}*((x3*x4)**2)))"))
-
-    # x1,x2 Gaussian-like dampers
-    s12 = x1 * x1 + x2 * x2
-    for k in kset:
-        dampers.append((_exp_clip(-k * s12), f"exp(-({k}*(x1**2 + x2**2)))"))
-
-    # full Gaussian-like dampers
-    sall = s12 + s34
-    for k in kset:
-        dampers.append((_exp_clip(-k * sall), f"exp(-({k}*(x1**2 + x2**2 + x3**2 + x4**2)))"))
-
-    features = []
-    exprs = []
-
-    # Base polynomial terms (deg <= 3 in all vars)
-    for e in exps_all_deg3:
-        v = _eval_monomial_4(x1, x2, x3, x4, e)
-        features.append(v)
-        exprs.append(_monomial_expr_4(e))
-
-    # Damped terms: polynomial in x1,x2 (deg <= 3) times each damper
-    for dval, dexpr in dampers:
-        for e in exps_x1x2_deg3:
-            mval = _eval_monomial_2(x1, x2, e)
-            v = dval * mval
-            mex = _monomial_expr_2(e)
-            if mex == "1":
-                fexpr = dexpr
-            else:
-                fexpr = f"({mex})*({dexpr})"
-            features.append(v)
-            exprs.append(fexpr)
-
-    # Damped linear terms in all vars times each damper (captures x3/x4 modulation etc.)
-    for dval, dexpr in dampers:
-        for e in exps_lin_all:
-            mval = _eval_monomial_4(x1, x2, x3, x4, e)
-            mex = _monomial_expr_4(e)
-            if mex == "1":
-                fexpr = dexpr
-                v = dval
-            else:
-                fexpr = f"({mex})*({dexpr})"
-                v = mval * dval
-            features.append(v)
-            exprs.append(fexpr)
-
-    Theta = np.column_stack(features).astype(np.float64, copy=False)
-    return Theta, exprs
-
-def _format_float(c):
-    if not np.isfinite(c):
-        c = 0.0
-    if abs(c) < 1e-16:
-        c = 0.0
-    s = f"{c:.15g}"
-    if s == "-0":
-        s = "0"
-    return s
-
-def _build_expression(exprs, coefs, min_abs_coef=0.0):
-    terms = []
-    for e, c in zip(exprs, coefs):
-        if not np.isfinite(c):
-            continue
-        if abs(c) <= min_abs_coef:
-            continue
-        if e == "1":
-            terms.append((_format_float(c), None))
-        else:
-            terms.append((_format_float(c), e))
-
-    if not terms:
-        return "0"
-
-    # Put constant first if exists, then others by descending abs coef.
-    const_terms = [(c, e) for c, e in terms if e is None]
-    other_terms = [(c, e) for c, e in terms if e is not None]
-    other_terms.sort(key=lambda t: abs(float(t[0])) if t[0] not in ("nan", "inf", "-inf") else 0.0, reverse=True)
-
-    ordered = const_terms + other_terms
-    out = []
-    for i, (c_str, e) in enumerate(ordered):
-        c_val = float(c_str)
-        if e is None:
-            term = c_str
-        else:
-            if c_val == 1.0:
-                term = f"({e})"
-            elif c_val == -1.0:
-                term = f"-({e})"
-            else:
-                term = f"{c_str}*({e})"
-
-        if i == 0:
-            out.append(term)
-        else:
-            if term.startswith("-"):
-                out.append(term)
-            else:
-                out.append(f"+{term}")
-    return "".join(out)
-
 class Solution:
     def __init__(self, **kwargs):
         self.random_state = int(kwargs.get("random_state", 0))
+        self.max_omp_terms = int(kwargs.get("max_omp_terms", 8))
+        self.subsample = int(kwargs.get("subsample", 5000))
+
+    @staticmethod
+    def _safe_exp_arg(arg):
+        return np.clip(arg, -50.0, 50.0)
+
+    @staticmethod
+    def _ridge_solve(A, b, lam=1e-10):
+        k = A.shape[1]
+        ATA = A.T @ A
+        ATA.flat[::k + 1] += lam
+        ATb = A.T @ b
+        try:
+            return np.linalg.solve(ATA, ATb)
+        except np.linalg.LinAlgError:
+            return np.linalg.lstsq(A, b, rcond=None)[0]
+
+    @staticmethod
+    def _omp(Phi, y, k, Phi_normed=None, tol=1e-12):
+        n, m = Phi.shape
+        if Phi_normed is None:
+            norms = np.linalg.norm(Phi, axis=0)
+            norms = np.where(norms > 0, norms, 1.0)
+            Phi_normed = Phi / norms
+
+        selected = []
+        residual = y.astype(np.float64, copy=True)
+
+        last_rss = float(np.dot(residual, residual))
+        for _ in range(min(k, m)):
+            corr = np.abs(Phi_normed.T @ residual)
+            if selected:
+                corr[selected] = 0.0
+            j = int(np.argmax(corr))
+            if not np.isfinite(corr[j]) or corr[j] < tol:
+                break
+            selected.append(j)
+
+            A = Phi[:, selected]
+            beta = Solution._ridge_solve(A, y, lam=1e-10)
+            residual = y - A @ beta
+            rss = float(np.dot(residual, residual))
+            if last_rss - rss <= tol * max(1.0, last_rss):
+                break
+            last_rss = rss
+
+        if not selected:
+            return [], np.zeros((0,), dtype=np.float64)
+
+        A = Phi[:, selected]
+        beta = Solution._ridge_solve(A, y, lam=1e-10)
+        return selected, beta
+
+    @staticmethod
+    def _build_poly_terms(X):
+        x1 = X[:, 0].astype(np.float64, copy=False)
+        x2 = X[:, 1].astype(np.float64, copy=False)
+        x3 = X[:, 2].astype(np.float64, copy=False)
+        x4 = X[:, 3].astype(np.float64, copy=False)
+
+        x1_2 = x1 * x1
+        x2_2 = x2 * x2
+        x3_2 = x3 * x3
+        x4_2 = x4 * x4
+
+        x1_3 = x1_2 * x1
+        x2_3 = x2_2 * x2
+        x3_3 = x3_2 * x3
+        x4_3 = x4_2 * x4
+
+        x1x2 = x1 * x2
+        x1x3 = x1 * x3
+        x1x4 = x1 * x4
+        x2x3 = x2 * x3
+        x2x4 = x2 * x4
+        x3x4 = x3 * x4
+
+        terms = []
+        exprs = []
+
+        def add(col, expr):
+            terms.append(col)
+            exprs.append(expr)
+
+        ones = np.ones_like(x1)
+        add(ones, "1")
+
+        add(x1, "x1")
+        add(x2, "x2")
+        add(x3, "x3")
+        add(x4, "x4")
+
+        add(x1_2, "x1**2")
+        add(x2_2, "x2**2")
+        add(x3_2, "x3**2")
+        add(x4_2, "x4**2")
+
+        add(x1x2, "x1*x2")
+        add(x1x3, "x1*x3")
+        add(x1x4, "x1*x4")
+        add(x2x3, "x2*x3")
+        add(x2x4, "x2*x4")
+        add(x3x4, "x3*x4")
+
+        add(x1_3, "x1**3")
+        add(x2_3, "x2**3")
+        add(x3_3, "x3**3")
+        add(x4_3, "x4**3")
+
+        add(x1_2 * x2, "x1**2*x2")
+        add(x1_2 * x3, "x1**2*x3")
+        add(x1_2 * x4, "x1**2*x4")
+
+        add(x2_2 * x1, "x2**2*x1")
+        add(x2_2 * x3, "x2**2*x3")
+        add(x2_2 * x4, "x2**2*x4")
+
+        add(x3_2 * x1, "x3**2*x1")
+        add(x3_2 * x2, "x3**2*x2")
+        add(x3_2 * x4, "x3**2*x4")
+
+        add(x4_2 * x1, "x4**2*x1")
+        add(x4_2 * x2, "x4**2*x2")
+        add(x4_2 * x3, "x4**2*x3")
+
+        add(x1x2 * x3, "x1*x2*x3")
+        add(x1x2 * x4, "x1*x2*x4")
+        add(x1x3 * x4, "x1*x3*x4")
+        add(x2x3 * x4, "x2*x3*x4")
+
+        Phi = np.column_stack(terms).astype(np.float64, copy=False)
+        return Phi, exprs
+
+    @staticmethod
+    def _format_float(a):
+        if not np.isfinite(a):
+            return "0.0"
+        if a == 0.0:
+            return "0.0"
+        s = format(float(a), ".12g")
+        if "e" in s or "E" in s:
+            s = s.replace("E", "e")
+        if s == "-0":
+            s = "0"
+        return s
+
+    @staticmethod
+    def _build_linear_combo_expr(terms, coeffs, coef_threshold=0.0):
+        parts = []
+        for term, c in zip(terms, coeffs):
+            if not np.isfinite(c):
+                continue
+            if abs(c) <= coef_threshold:
+                continue
+            sign = "-" if c < 0 else "+"
+            ac = abs(c)
+            if term == "1":
+                piece = Solution._format_float(ac)
+            else:
+                cstr = Solution._format_float(ac)
+                if cstr == "1":
+                    piece = term
+                else:
+                    piece = cstr + "*" + term
+            parts.append((sign, piece))
+
+        if not parts:
+            return "0.0"
+
+        sign0, piece0 = parts[0]
+        expr = piece0 if sign0 == "+" else "-" + piece0
+        for sgn, piece in parts[1:]:
+            expr += " " + sgn + " " + piece
+        return expr
+
+    @staticmethod
+    def _mse(y, yhat):
+        r = y - yhat
+        return float(np.mean(r * r))
 
     def solve(self, X: np.ndarray, y: np.ndarray) -> dict:
         X = np.asarray(X)
-        y = np.asarray(y, dtype=np.float64)
+        y = np.asarray(y).astype(np.float64, copy=False)
+        n = X.shape[0]
 
-        n, d = X.shape
-        if d != 4 or n == 0:
-            return {"expression": "0", "predictions": [0.0] * int(n), "details": {"complexity": 0}}
+        x1 = X[:, 0].astype(np.float64, copy=False)
+        x2 = X[:, 1].astype(np.float64, copy=False)
+        x3 = X[:, 2].astype(np.float64, copy=False)
+        x4 = X[:, 3].astype(np.float64, copy=False)
 
-        Theta, exprs = _build_feature_library(X)
+        # Baseline linear regression MSE
+        A_lin = np.column_stack([x1, x2, x3, x4, np.ones_like(x1)]).astype(np.float64, copy=False)
+        beta_lin = self._ridge_solve(A_lin, y, lam=1e-10)
+        yhat_lin = A_lin @ beta_lin
+        mse_base = self._mse(y, yhat_lin)
 
-        # Remove any columns with NaNs/Infs
-        finite_cols = np.isfinite(Theta).all(axis=0)
-        Theta = Theta[:, finite_cols]
-        exprs = [e for e, ok in zip(exprs, finite_cols) if ok]
+        # Polynomial library
+        Phi, term_exprs = self._build_poly_terms(X)
+        norms = np.linalg.norm(Phi, axis=0)
+        norms = np.where(norms > 0, norms, 1.0)
+        Phi_normed = Phi / norms
 
-        # Scale columns by L2 norm for conditioning (no centering)
-        col_norms = np.linalg.norm(Theta, axis=0)
-        col_norms = np.where(col_norms > 0.0, col_norms, 1.0)
-        Theta_s = Theta / col_norms
-
-        # Train/validation split
+        # Subsample for candidate selection
         rng = np.random.default_rng(self.random_state)
-        idx = rng.permutation(n)
-        n_val = int(0.2 * n)
-        if n >= 250:
-            n_val = max(n_val, 50)
-        n_val = max(1, min(n - 1, n_val))
-        val_idx = idx[:n_val]
-        tr_idx = idx[n_val:]
+        if n > self.subsample:
+            idx = rng.choice(n, size=self.subsample, replace=False)
+            idx.sort()
+        else:
+            idx = None
 
-        A_tr = Theta_s[tr_idx]
-        y_tr = y[tr_idx]
-        A_val = Theta_s[val_idx]
-        y_val = y[val_idx]
+        if idx is None:
+            Phi_s = Phi
+            Phi_normed_s = Phi_normed
+            y_s = y
+            x1_s, x2_s, x3_s, x4_s = x1, x2, x3, x4
+        else:
+            Phi_s = Phi[idx]
+            Phi_normed_s = Phi_normed[idx]
+            y_s = y[idx]
+            x1_s, x2_s, x3_s, x4_s = x1[idx], x2[idx], x3[idx], x4[idx]
 
-        # Initial fit to set tolerance scale
-        alpha0 = 1e-10
-        w0 = _ridge_solve(A_tr, y_tr, alpha0)
-        coefs0 = w0 / col_norms
-        max_coef = float(np.max(np.abs(coefs0))) if coefs0.size else 1.0
-        if not np.isfinite(max_coef) or max_coef <= 0.0:
-            max_coef = 1.0
+        # Precompute quadratic forms (subset + full)
+        def quad_parts(a1, a2, a3, a4):
+            q12 = a1 * a1 + a2 * a2
+            q34 = a3 * a3 + a4 * a4
+            r2 = q12 + q34
+            cross = a1 * a2 + a3 * a4
+            return q12, q34, r2, cross
 
-        tols = [0.0]
-        for t in (max_coef * np.logspace(-8, -2, 10)).tolist():
-            if t > 0:
-                tols.append(float(t))
-        # Add a slightly stronger pruning level
-        tols.append(max_coef * 5e-2)
+        q12_s, q34_s, r2_s, cross_s = quad_parts(x1_s, x2_s, x3_s, x4_s)
+        q12_f, q34_f, r2_f, cross_f = quad_parts(x1, x2, x3, x4)
 
-        alphas = [0.0, 1e-12, 1e-10, 1e-8, 1e-6]
+        # Candidate search: multiplicative model y = exp(arg)*poly
+        theta_grid = np.array([-2.0, -1.5, -1.0, -0.75, -0.5, -0.25, -0.125], dtype=np.float64)
+        theta_grid2 = np.array([-2.0, -1.0, -0.5, -0.25, -0.125], dtype=np.float64)
+        theta_cross = np.array([-1.0, -0.5, -0.25, 0.0, 0.25, 0.5, 1.0], dtype=np.float64)
 
-        best = None
-        best_mse = None
-        best_terms = None
-        best_alpha = None
-        best_tol = None
-        best_active = None
+        best = {
+            "mse_s": np.inf,
+            "kind": "none",
+            "params": None,
+            "sel": None,
+            "beta": None,
+        }
 
-        y_var = float(np.var(y_tr)) + 1e-12
+        def eval_candidate_on_subset(arg_s, kind, params):
+            arg_s = self._safe_exp_arg(arg_s)
+            w_s = np.exp(arg_s)
+            t_s = y_s / w_s
+            sel, beta = self._omp(Phi_s, t_s, k=self.max_omp_terms, Phi_normed=Phi_normed_s)
+            if not sel:
+                return
+            yhat_s = w_s * (Phi_s[:, sel] @ beta)
+            mse_s = self._mse(y_s, yhat_s)
+            if mse_s < best["mse_s"]:
+                best["mse_s"] = mse_s
+                best["kind"] = kind
+                best["params"] = params
+                best["sel"] = sel
+                best["beta"] = beta
 
-        for alpha in alphas:
-            for tol in tols:
-                w_s, active = _stlsq(A_tr, y_tr, alpha=alpha, tol=tol, max_iter=12)
-                if not np.any(active):
-                    continue
-                pred_val = A_val @ w_s
-                err = y_val - pred_val
-                mse = float(np.mean(err * err))
-                terms = int(np.count_nonzero(active))
+        # No exp (arg = 0)
+        eval_candidate_on_subset(np.zeros_like(y_s), kind="noexp", params=None)
 
-                # Slight penalty for large models
-                penalty = (1.0 + 0.0025 * max(0, terms - 12))
-                score = mse * penalty + 1e-10 * terms * y_var
+        # exp(theta * r2)
+        for th in theta_grid:
+            eval_candidate_on_subset(th * r2_s, kind="r2", params=(float(th),))
 
-                if best is None or score < best:
-                    best = score
-                    best_mse = mse
-                    best_terms = terms
-                    best_alpha = alpha
-                    best_tol = tol
-                    best_active = active.copy()
+        # exp(thetaA*q12 + thetaB*q34)
+        for thA in theta_grid2:
+            for thB in theta_grid2:
+                eval_candidate_on_subset(thA * q12_s + thB * q34_s, kind="split", params=(float(thA), float(thB)))
 
-        if best_active is None or not np.any(best_active):
-            # Fall back to linear regression on x1..x4 + bias
-            x1, x2, x3, x4 = X[:, 0], X[:, 1], X[:, 2], X[:, 3]
-            A = np.column_stack([x1, x2, x3, x4, np.ones(n, dtype=np.float64)])
-            coef, _, _, _ = np.linalg.lstsq(A, y, rcond=None)
-            a, b, c, d, e = coef.tolist()
-            expr = f"{_format_float(a)}*x1+{_format_float(b)}*x2+{_format_float(c)}*x3+{_format_float(d)}*x4+{_format_float(e)}"
-            pred = (A @ coef).astype(np.float64, copy=False)
-            return {"expression": expr, "predictions": pred.tolist(), "details": {"complexity": 5}}
+        # exp(theta1*r2 + theta2*cross)
+        for th1 in np.array([-2.0, -1.0, -0.5, -0.25], dtype=np.float64):
+            for th2 in theta_cross:
+                eval_candidate_on_subset(th1 * r2_s + th2 * cross_s, kind="r2cross", params=(float(th1), float(th2)))
 
-        # Refit on full data with selected active set
-        A_full = Theta_s[:, best_active]
-        w_full = _ridge_solve(A_full, y, best_alpha)
-        w_s_full = np.zeros(Theta_s.shape[1], dtype=np.float64)
-        w_s_full[np.flatnonzero(best_active)] = w_full
+        # Refit on full data with best candidate (still multiplicative)
+        def arg_full_from_best():
+            kind = best["kind"]
+            params = best["params"]
+            if kind == "noexp":
+                return np.zeros_like(y, dtype=np.float64), "1"
+            if kind == "r2":
+                (th,) = params
+                arg = th * r2_f
+                s = f"exp({self._format_float(th)}*(x1**2+x2**2+x3**2+x4**2))"
+                return arg, s
+            if kind == "split":
+                thA, thB = params
+                if abs(thA - thB) <= 1e-14:
+                    th = thA
+                    arg = th * r2_f
+                    s = f"exp({self._format_float(th)}*(x1**2+x2**2+x3**2+x4**2))"
+                    return arg, s
+                arg = thA * q12_f + thB * q34_f
+                a = self._format_float(thA)
+                b = self._format_float(thB)
+                s = f"exp({a}*(x1**2+x2**2)+{b}*(x3**2+x4**2))"
+                return arg, s
+            if kind == "r2cross":
+                th1, th2 = params
+                arg = th1 * r2_f + th2 * cross_f
+                a = self._format_float(th1)
+                b = self._format_float(th2)
+                if b == "0.0":
+                    s = f"exp({a}*(x1**2+x2**2+x3**2+x4**2))"
+                else:
+                    s = f"exp({a}*(x1**2+x2**2+x3**2+x4**2)+{b}*(x1*x2+x3*x4))"
+                return arg, s
+            return np.zeros_like(y, dtype=np.float64), "1"
 
-        coefs = w_s_full / col_norms
-        # Drop ultra-small coefficients
-        min_abs = float(np.max(np.abs(coefs)) * 1e-10) if coefs.size else 0.0
-        expression = _build_expression(exprs, coefs, min_abs_coef=min_abs)
+        arg_f, wexpr = arg_full_from_best()
+        arg_f = self._safe_exp_arg(arg_f)
+        w_f = np.exp(arg_f)
+        t_f = y / w_f
 
-        # Predictions using our fitted linear combination
-        predictions = (Theta @ coefs).astype(np.float64, copy=False)
+        sel_f, beta_f = self._omp(Phi, t_f, k=self.max_omp_terms, Phi_normed=Phi_normed)
+        if sel_f:
+            A = Phi[:, sel_f]
+            beta_f = self._ridge_solve(A, t_f, lam=1e-10)
+            poly_terms = [term_exprs[j] for j in sel_f]
+            poly_expr = self._build_linear_combo_expr(poly_terms, beta_f, coef_threshold=0.0)
 
-        used_terms = int(np.sum(np.abs(coefs) > min_abs))
+            if wexpr == "1":
+                expression = poly_expr
+                predictions = (Phi[:, sel_f] @ beta_f)
+            else:
+                expression = f"({poly_expr})*{wexpr}"
+                predictions = w_f * (Phi[:, sel_f] @ beta_f)
+            mse_mult = self._mse(y, predictions)
+        else:
+            expression = self._build_linear_combo_expr(["x1", "x2", "x3", "x4", "1"], beta_lin, coef_threshold=0.0)
+            predictions = yhat_lin
+            mse_mult = mse_base
+
+        # Stage2 (optional): if multiplicative fit not good, fit sparse linear combo of poly*exp(...) features
+        # This increases robustness but may raise complexity. Only activate if needed.
+        activate_stage2 = False
+        if np.isfinite(mse_base) and mse_base > 0:
+            if not np.isfinite(mse_mult) or mse_mult > 0.30 * mse_base:
+                activate_stage2 = True
+        else:
+            if not np.isfinite(mse_mult):
+                activate_stage2 = True
+
+        if activate_stage2:
+            # Build weight set
+            w_specs = [("1", np.zeros_like(y_s), np.zeros_like(y))]
+            for th in np.array([-2.0, -1.0, -0.5, -0.25], dtype=np.float64):
+                w_specs.append((f"exp({self._format_float(th)}*(x1**2+x2**2+x3**2+x4**2))", th * r2_s, th * r2_f))
+            for th in np.array([-2.0, -1.0, -0.5, -0.25], dtype=np.float64):
+                w_specs.append((f"exp({self._format_float(th)}*(x1**2+x2**2))", th * q12_s, th * q12_f))
+            for th in np.array([-2.0, -1.0, -0.5, -0.25], dtype=np.float64):
+                w_specs.append((f"exp({self._format_float(th)}*(x3**2+x4**2))", th * q34_s, th * q34_f))
+
+            # Precompute weights (subset)
+            W_s = []
+            W_f = []
+            W_expr = []
+            for s_expr, arg_s2, arg_f2 in w_specs:
+                arg_s2 = self._safe_exp_arg(arg_s2)
+                arg_f2 = self._safe_exp_arg(arg_f2)
+                W_s.append(np.exp(arg_s2))
+                W_f.append(np.exp(arg_f2))
+                W_expr.append(s_expr)
+
+            J = len(W_s)
+            T = Phi_s.shape[1]
+
+            Phi_sq_s = Phi_s * Phi_s
+            norm_jk = np.empty((J, T), dtype=np.float64)
+            for j in range(J):
+                w2 = W_s[j] * W_s[j]
+                norm_jk[j, :] = np.sqrt(Phi_sq_s.T @ w2)
+            norm_jk = np.where(norm_jk > 0, norm_jk, 1.0)
+
+            selected_pairs = []
+            selected_mask = np.zeros(J * T, dtype=bool)
+            residual = y_s.astype(np.float64, copy=True)
+            k_total = min(10, J * T)
+
+            for _ in range(k_total):
+                best_val = -1.0
+                best_pair = None
+                for j in range(J):
+                    tmp = W_s[j] * residual
+                    corr = np.abs(Phi_s.T @ tmp) / norm_jk[j]
+                    if selected_pairs:
+                        # Mask already selected entries for this j
+                        # (fast path: check individually)
+                        pass
+                    k_idx = int(np.argmax(corr))
+                    val = float(corr[k_idx])
+                    flat = j * T + k_idx
+                    if selected_mask[flat]:
+                        # find next best by partial scan
+                        order = np.argsort(-corr)
+                        found = False
+                        for k2 in order[:10]:
+                            flat2 = j * T + int(k2)
+                            if not selected_mask[flat2]:
+                                k_idx = int(k2)
+                                val = float(corr[k_idx])
+                                flat = flat2
+                                found = True
+                                break
+                        if not found:
+                            continue
+                    if np.isfinite(val) and val > best_val:
+                        best_val = val
+                        best_pair = (j, k_idx)
+
+                if best_pair is None or best_val <= 1e-12:
+                    break
+
+                j, k_idx = best_pair
+                selected_pairs.append((j, k_idx))
+                selected_mask[j * T + k_idx] = True
+
+                cols = [W_s[jj] * Phi_s[:, kk] for (jj, kk) in selected_pairs]
+                A = np.column_stack(cols)
+                coef = self._ridge_solve(A, y_s, lam=1e-10)
+                residual = y_s - A @ coef
+
+                if not np.isfinite(residual).all():
+                    break
+
+            if selected_pairs:
+                cols_f = [W_f[jj] * Phi[:, kk] for (jj, kk) in selected_pairs]
+                A_f = np.column_stack(cols_f)
+                coef_f = self._ridge_solve(A_f, y, lam=1e-10)
+                yhat_f = A_f @ coef_f
+                mse_stage2 = self._mse(y, yhat_f)
+
+                if np.isfinite(mse_stage2) and mse_stage2 < mse_mult:
+                    # Build expression
+                    feature_exprs = []
+                    for (jj, kk) in selected_pairs:
+                        w_e = W_expr[jj]
+                        t_e = term_exprs[kk]
+                        if w_e == "1":
+                            f_e = t_e
+                        else:
+                            if t_e == "1":
+                                f_e = w_e
+                            else:
+                                f_e = f"({t_e})*{w_e}"
+                        feature_exprs.append(f_e)
+                    expression = self._build_linear_combo_expr(feature_exprs, coef_f, coef_threshold=0.0)
+                    predictions = yhat_f
+                    mse_mult = mse_stage2
+
+        if predictions is None or (not np.isfinite(predictions).all()):
+            predictions = yhat_lin
+            expression = self._build_linear_combo_expr(["x1", "x2", "x3", "x4", "1"], beta_lin, coef_threshold=0.0)
 
         return {
             "expression": expression,
             "predictions": predictions.tolist(),
-            "details": {
-                "complexity": used_terms,
-                "val_mse": best_mse,
-                "terms": best_terms,
-                "alpha": best_alpha,
-                "tol": best_tol,
-            },
+            "details": {}
         }

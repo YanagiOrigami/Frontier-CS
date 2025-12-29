@@ -1,63 +1,73 @@
 import numpy as np
-import faiss
 from typing import Tuple
+import faiss
+import os
 
 class YourIndexClass:
-    """
-    An HNSW-based index optimized for high recall under a strict latency constraint.
-
-    This implementation uses Faiss's `IndexHNSWFlat` for its excellent performance
-    and recall-vs-speed trade-off on CPU. The hyperparameters are aggressively tuned
-    to maximize recall for the SIFT1M dataset, aiming to stay just under the
-    5.775ms latency limit in the specified 8-core CPU environment.
-    """
-
     def __init__(self, dim: int, **kwargs):
         """
         Initialize the index for vectors of dimension `dim`.
 
         Args:
             dim: Vector dimensionality (e.g., 128 for SIFT1M)
-            **kwargs: Optional parameters for HNSW configuration.
-                - M (int): Connections per node in the graph. Default: 48.
-                - ef_construction (int): Build-time search depth. Default: 512.
-                - ef_search (int): Query-time search depth. Default: 768.
-                - num_threads (int): CPU threads for Faiss. Default: 8.
+            **kwargs: Optional parameters (e.g., M, ef_construction for HNSW)
         """
+        # Utilize all available CPU cores for parallel processing during search.
+        # This is critical for meeting the latency constraint with batch queries.
+        if hasattr(faiss, "omp_set_num_threads"):
+            num_threads = os.cpu_count()
+            if num_threads is not None:
+                faiss.omp_set_num_threads(num_threads)
+
         self.dim = dim
-        
-        # Hyperparameters chosen for high recall on SIFT1M
-        self.M = kwargs.get('M', 48)
-        self.ef_construction = kwargs.get('ef_construction', 512)
-        self.ef_search = kwargs.get('ef_search', 768)
-        num_threads = kwargs.get('num_threads', 8)
+        self.index = None
 
-        # Set Faiss to use the number of available vCPUs for parallelization
-        faiss.omp_set_num_threads(num_threads)
+        # --- Parameter Tuning for HNSW (Hierarchical Navigable Small World) ---
+        # The goal is to maximize recall@1 under the 5.775ms latency constraint.
+        # This requires a high-quality index and an exhaustive search.
 
-        # IndexHNSWFlat uses an HNSW graph to find candidate vectors and then
-        # computes exact L2 distances for refinement. This provides high accuracy.
-        # METRIC_L2 is the specified distance metric (Euclidean).
-        self.index = faiss.IndexHNSWFlat(self.dim, self.M, faiss.METRIC_L2)
+        # M: Number of neighbors per node. Higher values create a denser, more
+        # accurate graph, improving recall at the cost of memory and build time.
+        # M=48 is a strong choice for high-recall scenarios.
+        M = 48
         
-        # Set build-time and search-time parameters
-        self.index.hnsw.efConstruction = self.ef_construction
-        self.index.hnsw.efSearch = self.ef_search
+        # efConstruction: Controls index quality during the build phase. Higher
+        # values lead to better search performance. Given the generous build time
+        # allowance, we can set this high to create an optimal graph structure.
+        efConstruction = 512
         
+        # efSearch: Controls the search-time trade-off between speed and recall.
+        # This is the most critical parameter. We set it to an aggressive value
+        # to use as much of the latency budget as possible to find the true
+        # nearest neighbors, thus maximizing recall. This value is chosen based on
+        # balancing the risk of exceeding the latency gate against the reward of higher recall.
+        self.efSearch = 144
+
+        # We use IndexHNSWFlat, which stores the original, uncompressed vectors.
+        # This avoids the recall degradation associated with quantization methods (like PQ)
+        # and is necessary for achieving recalls above 99%.
+        # The metric is set to L2, as required by the SIFT1M dataset.
+        self.index = faiss.IndexHNSWFlat(self.dim, M, faiss.METRIC_L2)
+        self.index.hnsw.efConstruction = efConstruction
+        self.index.hnsw.efSearch = self.efSearch
+
+
     def add(self, xb: np.ndarray) -> None:
         """
         Add vectors to the index.
 
         Args:
             xb: Base vectors, shape (N, dim), dtype float32
+
+        Notes:
+            - Can be called multiple times (cumulative)
+            - Must handle large N (e.g., 1,000,000 vectors)
         """
-        # Faiss requires C-contiguous float32 arrays.
-        if xb.dtype != np.float32:
-            xb = xb.astype(np.float32)
-        if not xb.flags['C_CONTIGUOUS']:
-            xb = np.ascontiguousarray(xb)
-            
-        self.index.add(xb)
+        # HNSW indices do not require a separate training step.
+        # We can add vectors directly. FAISS handles cumulative adds.
+        if xb.shape[0] > 0:
+            self.index.add(xb)
+
 
     def search(self, xq: np.ndarray, k: int) -> Tuple[np.ndarray, np.ndarray]:
         """
@@ -71,20 +81,24 @@ class YourIndexClass:
             (distances, indices):
                 - distances: shape (nq, k), dtype float32, L2-squared distances
                 - indices: shape (nq, k), dtype int64, indices into base vectors
+
+        Notes:
+            - Must return exactly k neighbors per query
+            - Indices should refer to positions in the vectors passed to add()
+            - Lower distance = more similar
         """
+        # Handle the edge case of an empty index.
         if self.index.ntotal == 0:
-            # Return empty arrays if index is not built
-            nq = xq.shape[0]
-            return np.full((nq, k), -1, dtype=np.float32), np.full((nq, k), -1, dtype=np.int64)
+            return (
+                np.full((xq.shape[0], k), -1.0, dtype=np.float32),
+                np.full((xq.shape[0], k), -1, dtype=np.int64),
+            )
 
-        # Ensure query vectors are in the correct format for Faiss
-        if xq.dtype != np.float32:
-            xq = xq.astype(np.float32)
-        if not xq.flags['C_CONTIGUOUS']:
-            xq = np.ascontiguousarray(xq)
-
-        # Faiss HNSW search returns L2-squared distances, which is permitted by
-        # the problem spec ("L2 or L2-squared") and avoids a costly sqrt operation.
+        # The efSearch parameter, which dictates search quality, is set during
+        # initialization. The search method will use this pre-configured value.
         distances, indices = self.index.search(xq, k)
         
+        # The problem allows for L2 or L2-squared distances. Faiss's METRIC_L2
+        # returns squared distances, which is faster as it avoids a sqrt operation
+        # for every returned distance. We return these directly for maximum performance.
         return distances, indices

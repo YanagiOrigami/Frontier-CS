@@ -1,390 +1,367 @@
-import os
-import time
 import math
-import copy
-from typing import Optional, Tuple, Dict
+import os
+import random
+from copy import deepcopy
+from typing import Dict, Optional, Tuple
 
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.data import DataLoader, TensorDataset
+
+
+def _set_seed(seed: int = 42) -> None:
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
 
 
 def _count_trainable_params(model: nn.Module) -> int:
     return sum(p.numel() for p in model.parameters() if p.requires_grad)
 
 
-def _extract_loader(loader) -> Tuple[torch.Tensor, torch.Tensor]:
+@torch.no_grad()
+def _loader_to_tensors(loader: DataLoader) -> Tuple[torch.Tensor, torch.Tensor]:
     xs = []
     ys = []
-    for batch in loader:
-        if isinstance(batch, (list, tuple)) and len(batch) >= 2:
-            x, y = batch[0], batch[1]
-        else:
-            raise ValueError("Loader must yield (inputs, targets)")
+    for x, y in loader:
         if not torch.is_tensor(x):
             x = torch.as_tensor(x)
         if not torch.is_tensor(y):
             y = torch.as_tensor(y)
         xs.append(x.detach().cpu())
         ys.append(y.detach().cpu())
-    x = torch.cat(xs, dim=0)
-    y = torch.cat(ys, dim=0)
-    return x, y
+    X = torch.cat(xs, dim=0).contiguous().to(dtype=torch.float32)
+    Y = torch.cat(ys, dim=0).contiguous().to(dtype=torch.long)
+    return X, Y
 
 
-def _compute_mean_std(x: torch.Tensor, eps: float = 1e-6) -> Tuple[torch.Tensor, torch.Tensor]:
-    x = x.float()
-    mean = x.mean(dim=0)
-    var = x.var(dim=0, unbiased=False)
+def _infer_input_dim_num_classes(train_loader: DataLoader) -> Tuple[int, int]:
+    x0, y0 = next(iter(train_loader))
+    if not torch.is_tensor(x0):
+        x0 = torch.as_tensor(x0)
+    if not torch.is_tensor(y0):
+        y0 = torch.as_tensor(y0)
+    input_dim = int(x0.shape[-1])
+    num_classes = int(torch.max(y0).item() + 1)
+    return input_dim, num_classes
+
+
+def _compute_mean_std(X: torch.Tensor, eps: float = 1e-6) -> Tuple[torch.Tensor, torch.Tensor]:
+    mean = X.mean(dim=0)
+    var = X.var(dim=0, unbiased=False)
     std = torch.sqrt(var + eps)
-    std = torch.clamp(std, min=1e-3)
     return mean, std
 
 
-def _accuracy(model: nn.Module, x: torch.Tensor, y: torch.Tensor, batch_size: int = 512) -> float:
-    model.eval()
-    correct = 0
-    total = 0
-    with torch.no_grad():
-        n = x.shape[0]
-        for i in range(0, n, batch_size):
-            xb = x[i:i + batch_size]
-            yb = y[i:i + batch_size]
-            logits = model(xb)
-            pred = logits.argmax(dim=1)
-            correct += (pred == yb).sum().item()
-            total += yb.numel()
-    return correct / max(1, total)
+class InputNorm(nn.Module):
+    def __init__(self, mean: torch.Tensor, std: torch.Tensor):
+        super().__init__()
+        self.register_buffer("mean", mean.clone().detach())
+        self.register_buffer("std", std.clone().detach())
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return (x - self.mean) / self.std
 
 
-def _ce_soft(logits: torch.Tensor, soft_targets: torch.Tensor) -> torch.Tensor:
-    logp = F.log_softmax(logits, dim=1)
-    return -(soft_targets * logp).sum(dim=1).mean()
+class ResidualBlock(nn.Module):
+    def __init__(self, dim: int, dropout: float = 0.1):
+        super().__init__()
+        self.bn = nn.BatchNorm1d(dim, eps=1e-5, momentum=0.05, affine=True)
+        self.act = nn.SiLU()
+        self.fc = nn.Linear(dim, dim, bias=False)
+        self.drop = nn.Dropout(p=dropout)
+        self.scale = nn.Parameter(torch.tensor(1e-3, dtype=torch.float32))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        y = self.fc(self.act(self.bn(x)))
+        y = self.drop(y)
+        return x + self.scale * y
 
 
-class _TinyMLP(nn.Module):
+class MLPResNet(nn.Module):
     def __init__(
         self,
         input_dim: int,
         num_classes: int,
-        w1: int,
-        w2: int,
-        w3: int,
         mean: torch.Tensor,
         std: torch.Tensor,
-        dropout: float = 0.10,
+        hidden_dim: int = 330,
+        num_blocks: int = 3,
+        dropout: float = 0.1,
     ):
         super().__init__()
-        self.register_buffer("x_mean", mean.view(1, -1).float(), persistent=True)
-        self.register_buffer("x_std", std.view(1, -1).float(), persistent=True)
+        self.norm = InputNorm(mean, std)
+        self.fc0 = nn.Linear(input_dim, hidden_dim, bias=False)
+        self.bn0 = nn.BatchNorm1d(hidden_dim, eps=1e-5, momentum=0.05, affine=True)
+        self.act0 = nn.SiLU()
+        self.drop0 = nn.Dropout(p=dropout)
 
-        self.fc1 = nn.Linear(input_dim, w1, bias=True)
-        self.bn1 = nn.BatchNorm1d(w1, eps=1e-5, momentum=0.06, affine=True, track_running_stats=True)
+        self.blocks = nn.ModuleList([ResidualBlock(hidden_dim, dropout=dropout) for _ in range(num_blocks)])
 
-        self.fc2 = nn.Linear(w1, w2, bias=True)
-        self.bn2 = nn.BatchNorm1d(w2, eps=1e-5, momentum=0.06, affine=True, track_running_stats=True)
-
-        self.fc3 = nn.Linear(w2, w3, bias=True)
-        self.bn3 = nn.BatchNorm1d(w3, eps=1e-5, momentum=0.06, affine=True, track_running_stats=True)
-
-        self.head = nn.Linear(w3, num_classes, bias=True)
-
-        self.drop = nn.Dropout(p=dropout)
-
-        for m in self.modules():
-            if isinstance(m, nn.Linear):
-                nn.init.kaiming_uniform_(m.weight, a=math.sqrt(5))
-                if m.bias is not None:
-                    fan_in, _ = nn.init._calculate_fan_in_and_fan_out(m.weight)
-                    bound = 1 / math.sqrt(max(1, fan_in))
-                    nn.init.uniform_(m.bias, -bound, bound)
+        self.bn_head = nn.BatchNorm1d(hidden_dim, eps=1e-5, momentum=0.05, affine=True)
+        self.act_head = nn.SiLU()
+        self.fc_out = nn.Linear(hidden_dim, num_classes, bias=True)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if x.dim() > 2:
-            x = x.view(x.size(0), -1)
-        x = x.float()
-        x = (x - self.x_mean) / self.x_std
-
-        x = self.fc1(x)
-        x = self.bn1(x)
-        x = F.gelu(x)
-        x = self.drop(x)
-
-        x = self.fc2(x)
-        x = self.bn2(x)
-        x = F.gelu(x)
-        x = self.drop(x)
-
-        x = self.fc3(x)
-        x = self.bn3(x)
-        x = F.gelu(x)
-        x = self.drop(x)
-
-        x = self.head(x)
-        return x
+        x = x.to(dtype=torch.float32)
+        x = self.norm(x)
+        x = self.drop0(self.act0(self.bn0(self.fc0(x))))
+        for blk in self.blocks:
+            x = blk(x)
+        x = self.act_head(self.bn_head(x))
+        return self.fc_out(x)
 
 
-def _choose_widths(input_dim: int, num_classes: int, param_limit: int) -> Tuple[int, int, int]:
-    d = int(input_dim)
-    c = int(num_classes)
-    w2 = d
-    w3 = int(round((2.0 / 3.0) * d))
-    w3 = max(64, (w3 // 16) * 16)
-    if w3 < 64:
-        w3 = 64
+class EMA:
+    def __init__(self, model: nn.Module, decay: float = 0.995):
+        self.decay = float(decay)
+        self.shadow = {}
+        for n, p in model.named_parameters():
+            if p.requires_grad:
+                self.shadow[n] = p.detach().clone()
 
-    def total_params(w1v: int, w3v: int) -> int:
-        return (d * w1v + w1v) + (w1v * w2 + w2) + (w2 * w3v + w3v) + (w3v * c + c) + 2 * (w1v + w2 + w3v)
+    @torch.no_grad()
+    def update(self, model: nn.Module):
+        d = self.decay
+        for n, p in model.named_parameters():
+            if not p.requires_grad:
+                continue
+            self.shadow[n].mul_(d).add_(p.detach(), alpha=(1.0 - d))
 
-    # max w1 under limit (approx), with slack for safety
-    base = (w2 * w3 + w3) + (w3 * c + c) + (w2) + 2 * (w2 + w3)
-    # Remaining for first two linears and BN1: d*w1 + w1*w2 + w1 + 2*w1 = w1*(d+w2+3)
-    rem = max(0, param_limit - base)
-    denom = d + w2 + 3
-    w1 = int(rem // max(1, denom))
-    w1 = max(128, w1)
-    w1 = (w1 // 8) * 8
+    @torch.no_grad()
+    def copy_to(self, model: nn.Module):
+        for n, p in model.named_parameters():
+            if p.requires_grad:
+                p.copy_(self.shadow[n])
 
-    # Fit strictly
-    while total_params(w1, w3) > param_limit and w1 > 128:
-        w1 -= 8
+    @torch.no_grad()
+    def store(self, model: nn.Module):
+        self._backup = {}
+        for n, p in model.named_parameters():
+            if p.requires_grad:
+                self._backup[n] = p.detach().clone()
 
-    # If still too big, reduce w3
-    while total_params(w1, w3) > param_limit and w3 > 64:
-        w3 -= 16
-        while total_params(w1, w3) > param_limit and w1 > 128:
-            w1 -= 8
+    @torch.no_grad()
+    def restore(self, model: nn.Module):
+        for n, p in model.named_parameters():
+            if p.requires_grad:
+                p.copy_(self._backup[n])
+        self._backup = None
 
-    # Ensure feasible
-    if total_params(w1, w3) > param_limit:
-        # fallback small
-        w1 = max(128, (d * 3) // 2)
-        w1 = (w1 // 8) * 8
-        w3 = max(64, (d // 2 // 16) * 16)
-        while total_params(w1, w3) > param_limit and w1 > 128:
-            w1 -= 8
-        while total_params(w1, w3) > param_limit and w3 > 64:
-            w3 -= 16
 
-    return int(w1), int(w2), int(w3)
+@torch.no_grad()
+def _accuracy(model: nn.Module, loader: DataLoader, device: torch.device) -> float:
+    model.eval()
+    correct = 0
+    total = 0
+    for x, y in loader:
+        x = x.to(device=device, dtype=torch.float32, non_blocking=False)
+        y = y.to(device=device, dtype=torch.long, non_blocking=False)
+        logits = model(x)
+        pred = logits.argmax(dim=1)
+        correct += (pred == y).sum().item()
+        total += y.numel()
+    return float(correct) / float(total) if total > 0 else 0.0
 
 
 class Solution:
-    def solve(self, train_loader, val_loader, metadata: dict = None) -> nn.Module:
-        if metadata is None:
-            metadata = {}
-        device = metadata.get("device", "cpu")
-        if device != "cpu":
-            device = "cpu"
-
-        input_dim = int(metadata.get("input_dim", 384))
-        num_classes = int(metadata.get("num_classes", 128))
-        param_limit = int(metadata.get("param_limit", 500_000))
-
+    def solve(self, train_loader, val_loader, metadata: dict = None) -> torch.nn.Module:
+        _set_seed(42)
         try:
             torch.set_num_threads(min(8, os.cpu_count() or 8))
         except Exception:
             pass
-        torch.manual_seed(0)
 
-        x_train, y_train = _extract_loader(train_loader)
-        x_val, y_val = _extract_loader(val_loader)
+        if metadata is None:
+            metadata = {}
 
-        if x_train.dim() > 2:
-            x_train = x_train.view(x_train.size(0), -1)
-        if x_val.dim() > 2:
-            x_val = x_val.view(x_val.size(0), -1)
+        if "input_dim" in metadata and "num_classes" in metadata:
+            input_dim = int(metadata["input_dim"])
+            num_classes = int(metadata["num_classes"])
+        else:
+            input_dim, num_classes = _infer_input_dim_num_classes(train_loader)
 
-        x_train = x_train.float()
-        x_val = x_val.float()
-        y_train = y_train.long()
-        y_val = y_val.long()
+        param_limit = int(metadata.get("param_limit", 500_000))
+        device_str = str(metadata.get("device", "cpu"))
+        device = torch.device(device_str)
 
-        mean, std = _compute_mean_std(x_train)
+        Xtr, Ytr = _loader_to_tensors(train_loader)
+        Xva, Yva = _loader_to_tensors(val_loader)
 
-        w1, w2, w3 = _choose_widths(input_dim=input_dim, num_classes=num_classes, param_limit=param_limit)
-        model = _TinyMLP(
+        mean, std = _compute_mean_std(Xtr)
+
+        hidden_dim = 330
+        num_blocks = 3
+        dropout = 0.12
+        model = MLPResNet(
             input_dim=input_dim,
             num_classes=num_classes,
-            w1=w1,
-            w2=w2,
-            w3=w3,
             mean=mean,
             std=std,
-            dropout=0.10,
-        ).to("cpu")
+            hidden_dim=hidden_dim,
+            num_blocks=num_blocks,
+            dropout=dropout,
+        ).to(device)
 
         if _count_trainable_params(model) > param_limit:
-            # last-resort shrink
-            for _ in range(200):
-                if _count_trainable_params(model) <= param_limit:
-                    break
-                w1 = max(128, w1 - 8)
-                model = _TinyMLP(
-                    input_dim=input_dim,
-                    num_classes=num_classes,
-                    w1=w1,
-                    w2=w2,
-                    w3=w3,
-                    mean=mean,
-                    std=std,
-                    dropout=0.10,
-                ).to("cpu")
+            # Fallback: slightly smaller
+            model = MLPResNet(
+                input_dim=input_dim,
+                num_classes=num_classes,
+                mean=mean,
+                std=std,
+                hidden_dim=320,
+                num_blocks=3,
+                dropout=dropout,
+            ).to(device)
 
-        # Build internal loaders for speed/consistency
-        n_train = x_train.shape[0]
-        n_val = x_val.shape[0]
-        train_bs = 256 if n_train >= 256 else max(32, (n_train // 2) if n_train >= 64 else n_train)
-        val_bs = 512 if n_val >= 512 else max(64, n_val)
+        if _count_trainable_params(model) > param_limit:
+            model = MLPResNet(
+                input_dim=input_dim,
+                num_classes=num_classes,
+                mean=mean,
+                std=std,
+                hidden_dim=300,
+                num_blocks=3,
+                dropout=dropout,
+            ).to(device)
 
-        train_ds = torch.utils.data.TensorDataset(x_train, y_train)
-        train_dl = torch.utils.data.DataLoader(train_ds, batch_size=train_bs, shuffle=True, drop_last=(n_train >= train_bs))
+        if _count_trainable_params(model) > param_limit:
+            model = MLPResNet(
+                input_dim=input_dim,
+                num_classes=num_classes,
+                mean=mean,
+                std=std,
+                hidden_dim=280,
+                num_blocks=2,
+                dropout=dropout,
+            ).to(device)
 
-        # Training
+        # Cached loaders
+        bs = getattr(train_loader, "batch_size", None)
+        if bs is None or bs <= 0:
+            bs = 64
+        bs = int(bs)
+
+        train_ds = TensorDataset(Xtr, Ytr)
+        val_ds = TensorDataset(Xva, Yva)
+        train_cached = DataLoader(train_ds, batch_size=bs, shuffle=True, num_workers=0, drop_last=False)
+        val_cached = DataLoader(val_ds, batch_size=256, shuffle=False, num_workers=0, drop_last=False)
+
+        # Stage 1 training with early stopping on val
+        epochs = 140
+        mixup_epochs = int(epochs * 0.75)
         label_smoothing = 0.06
         mixup_alpha = 0.20
-        mixup_prob = 0.80
-        noise_std = 0.015
+        noise_std = 0.010
 
-        max_epochs = 220
-        patience = 35
-        min_epochs = 35
-
-        optimizer = torch.optim.AdamW(model.parameters(), lr=5e-3, weight_decay=1.5e-4, betas=(0.9, 0.99))
-        steps_per_epoch = max(1, len(train_dl))
+        criterion = nn.CrossEntropyLoss(label_smoothing=label_smoothing)
+        optimizer = torch.optim.AdamW(model.parameters(), lr=2.6e-3, weight_decay=1.0e-2, betas=(0.9, 0.99))
+        steps_per_epoch = len(train_cached)
+        total_steps = max(1, epochs * steps_per_epoch)
         scheduler = torch.optim.lr_scheduler.OneCycleLR(
             optimizer,
-            max_lr=5e-3,
-            epochs=max_epochs,
-            steps_per_epoch=steps_per_epoch,
+            max_lr=2.6e-3,
+            total_steps=total_steps,
             pct_start=0.12,
             anneal_strategy="cos",
-            div_factor=10.0,
-            final_div_factor=80.0,
+            div_factor=20.0,
+            final_div_factor=200.0,
         )
 
-        # EMA
-        ema_decay = 0.995
-        ema_shadow: Dict[str, torch.Tensor] = {}
-        for name, p in model.named_parameters():
-            if p.requires_grad:
-                ema_shadow[name] = p.detach().clone()
+        ema = EMA(model, decay=0.995)
 
-        def ema_update():
-            with torch.no_grad():
-                for name, p in model.named_parameters():
-                    if not p.requires_grad:
-                        continue
-                    ema_shadow[name].mul_(ema_decay).add_(p.detach(), alpha=(1.0 - ema_decay))
-
-        def ema_apply():
-            with torch.no_grad():
-                for name, p in model.named_parameters():
-                    if not p.requires_grad:
-                        continue
-                    p.copy_(ema_shadow[name])
-
-        best_state = copy.deepcopy(model.state_dict())
-        best_val = -1.0
-        best_epoch = -1
+        best_acc = -1.0
+        best_state = None
+        patience = 28
         bad = 0
 
-        start_time = time.monotonic()
-        time_budget = 3300.0  # leave margin
-
-        for epoch in range(max_epochs):
-            if time.monotonic() - start_time > time_budget:
-                break
-
+        global_step = 0
+        for epoch in range(epochs):
             model.train()
-            for xb, yb in train_dl:
-                xb = xb.float()
-                yb = yb.long()
+            for xb, yb in train_cached:
+                xb = xb.to(device=device, dtype=torch.float32, non_blocking=False)
+                yb = yb.to(device=device, dtype=torch.long, non_blocking=False)
 
-                if noise_std > 0:
-                    xb = xb + torch.randn_like(xb) * noise_std
+                if epoch < mixup_epochs:
+                    if noise_std > 0:
+                        xb = xb + noise_std * torch.randn_like(xb)
+                    if mixup_alpha > 0:
+                        lam = np.random.beta(mixup_alpha, mixup_alpha)
+                        if lam < 0.5:
+                            lam = 1.0 - lam
+                        perm = torch.randperm(xb.size(0), device=device)
+                        xb2 = xb[perm]
+                        yb2 = yb[perm]
+                        xb = lam * xb + (1.0 - lam) * xb2
 
-                do_mixup = (mixup_alpha > 0) and (torch.rand(()) < mixup_prob)
-                if do_mixup:
-                    lam = torch.distributions.Beta(mixup_alpha, mixup_alpha).sample().item()
-                    lam = float(max(0.05, min(0.95, lam)))
-                    idx = torch.randperm(xb.size(0))
-                    xb2 = xb[idx]
-                    yb2 = yb[idx]
-                    xb_mix = xb.mul(lam).add(xb2, alpha=(1.0 - lam))
-
-                    y1 = F.one_hot(yb, num_classes=num_classes).float()
-                    y2 = F.one_hot(yb2, num_classes=num_classes).float()
-                    y_soft = y1.mul(lam).add(y2, alpha=(1.0 - lam))
-                    if label_smoothing > 0:
-                        y_soft = y_soft * (1.0 - label_smoothing) + (label_smoothing / num_classes)
-
-                    logits = model(xb_mix)
-                    loss = _ce_soft(logits, y_soft)
+                        logits = model(xb)
+                        loss = lam * criterion(logits, yb) + (1.0 - lam) * criterion(logits, yb2)
+                    else:
+                        logits = model(xb)
+                        loss = criterion(logits, yb)
                 else:
                     logits = model(xb)
-                    loss = F.cross_entropy(logits, yb, label_smoothing=label_smoothing)
+                    loss = criterion(logits, yb)
 
                 optimizer.zero_grad(set_to_none=True)
                 loss.backward()
-                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                 optimizer.step()
                 scheduler.step()
-                ema_update()
 
-            # Evaluate (EMA weights)
-            current_state = copy.deepcopy(model.state_dict())
-            ema_apply()
-            val_acc = _accuracy(model, x_val, y_val, batch_size=val_bs)
+                global_step += 1
+                if global_step > 50:
+                    ema.update(model)
+                else:
+                    ema.update(model)
 
-            if val_acc > best_val + 1e-5:
-                best_val = val_acc
-                best_epoch = epoch
-                best_state = copy.deepcopy(model.state_dict())
+            ema.store(model)
+            ema.copy_to(model)
+            va = _accuracy(model, val_cached, device)
+            ema.restore(model)
+
+            if va > best_acc + 1e-4:
+                best_acc = va
+                best_state = deepcopy(ema.shadow)
                 bad = 0
             else:
                 bad += 1
+                if bad >= patience:
+                    break
 
-            model.load_state_dict(current_state)
+        if best_state is not None:
+            for n, p in model.named_parameters():
+                if p.requires_grad and n in best_state:
+                    p.data.copy_(best_state[n])
 
-            if epoch >= min_epochs and bad >= patience:
-                break
+        # Stage 2: short fine-tune on train+val (no mixup)
+        Xall = torch.cat([Xtr, Xva], dim=0)
+        Yall = torch.cat([Ytr, Yva], dim=0)
+        all_ds = TensorDataset(Xall, Yall)
+        all_loader = DataLoader(all_ds, batch_size=bs, shuffle=True, num_workers=0, drop_last=False)
 
-        # Load best EMA state
-        model.load_state_dict(best_state)
+        ft_epochs = 25
+        ft_criterion = nn.CrossEntropyLoss(label_smoothing=0.02)
+        ft_optimizer = torch.optim.AdamW(model.parameters(), lr=6.0e-4, weight_decay=6.0e-3, betas=(0.9, 0.99))
+        ft_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(ft_optimizer, T_max=max(1, ft_epochs))
 
-        # Optional small fine-tune on train+val with reduced LR
-        x_all = torch.cat([x_train, x_val], dim=0)
-        y_all = torch.cat([y_train, y_val], dim=0)
-        all_ds = torch.utils.data.TensorDataset(x_all, y_all)
-        all_bs = 256 if x_all.shape[0] >= 256 else max(32, x_all.shape[0] // 2)
-        all_dl = torch.utils.data.DataLoader(all_ds, batch_size=all_bs, shuffle=True, drop_last=(x_all.shape[0] >= all_bs))
-
-        ft_epochs = 18
-        ft_optimizer = torch.optim.AdamW(model.parameters(), lr=1.5e-3, weight_decay=1.2e-4, betas=(0.9, 0.99))
-        ft_steps = max(1, len(all_dl) * ft_epochs)
-        ft_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(ft_optimizer, T_max=max(1, ft_steps), eta_min=2.5e-4)
-
-        model.train()
-        step = 0
         for _ in range(ft_epochs):
-            if time.monotonic() - start_time > time_budget:
-                break
-            for xb, yb in all_dl:
-                xb = xb.float()
-                yb = yb.long()
-                if noise_std > 0:
-                    xb = xb + torch.randn_like(xb) * (noise_std * 0.6)
+            model.train()
+            for xb, yb in all_loader:
+                xb = xb.to(device=device, dtype=torch.float32, non_blocking=False)
+                yb = yb.to(device=device, dtype=torch.long, non_blocking=False)
 
                 logits = model(xb)
-                loss = F.cross_entropy(logits, yb, label_smoothing=label_smoothing)
+                loss = ft_criterion(logits, yb)
 
                 ft_optimizer.zero_grad(set_to_none=True)
                 loss.backward()
-                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                 ft_optimizer.step()
-                ft_scheduler.step()
-                step += 1
+            ft_scheduler.step()
 
         model.eval()
-        return model.to("cpu")
+        return model

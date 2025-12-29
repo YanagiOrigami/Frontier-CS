@@ -1,141 +1,156 @@
-import sys
+import networkx as nx
 
-# Per problem spec, the solution must be a class named Solution.
-# The `solve` method should return the algorithm as a string or path.
-# Returning as a string is the most self-contained and robust approach.
 class Solution:
     def solve(self, spec_path: str = None) -> dict:
         """
-        Generates and returns the Python code for the broadcast optimization algorithm.
+        Returns a dict with the Python code for the search algorithm.
         """
         
-        # The algorithm code is encapsulated in a single string.
-        # This string includes all necessary imports, class definitions, and the
-        # main search_algorithm function. This makes the submission self-contained.
-        algorithm_code = '''
+        algorithm_code = """
 import networkx as nx
-import itertools
+from collections import defaultdict
 
 class BroadCastTopology:
-    """
-    A class to store and manage the broadcast topology paths.
-    This class is provided by the evaluation environment but is included here
-    for completeness and to make the algorithm code self-contained.
-    """
     def __init__(self, src: str, dsts: list[str], num_partitions: int):
         self.src = src
         self.dsts = dsts
         self.num_partitions = int(num_partitions)
+        # Structure: {dst: {partition_id: [edges]}}
+        # Each edge is [src_node, dst_node, edge_data_dict]
         self.paths = {dst: {str(i): None for i in range(self.num_partitions)} for dst in dsts}
 
     def append_dst_partition_path(self, dst: str, partition: int, path: list):
+        \"\"\"
+        Append an edge to the path for a specific destination-partition pair.
+
+        Args:
+            dst: Destination node
+            partition: Partition ID (0 to num_partitions-1)
+            path: Edge represented as [src_node, dst_node, edge_data_dict]
+                  where edge_data_dict = G[src_node][dst_node]
+        \"\"\"
         partition = str(partition)
         if self.paths[dst][partition] is None:
             self.paths[dst][partition] = []
         self.paths[dst][partition].append(path)
 
     def set_dst_partition_paths(self, dst: str, partition: int, paths: list[list]):
+        \"\"\"
+        Set the complete path (list of edges) for a destination-partition pair.
+
+        Args:
+            dst: Destination node
+            partition: Partition ID
+            paths: List of edges, each edge is [src_node, dst_node, edge_data_dict]
+        \"\"\"
         partition = str(partition)
         self.paths[dst][partition] = paths
 
     def set_num_partitions(self, num_partitions: int):
+        \"\"\"Update number of partitions\"\"\"
         self.num_partitions = num_partitions
 
-def search_algorithm(src: str, dsts: list[str], G: nx.DiGraph, num_partitions: int) -> BroadCastTopology:
-    """
-    Design routing paths for broadcasting data partitions to multiple destinations.
 
-    Args:
-        src: Source node (e.g., "aws:ap-northeast-1")
-        dsts: List of destination nodes (e.g., ["aws:us-east-1", "gcp:us-central1"])
-        G: NetworkX DiGraph with edge attributes:
-           - "cost": float ($/GB) - egress cost for transferring data
-           - "throughput": float (Gbps) - maximum bandwidth capacity
-        num_partitions: Number of data partitions to broadcast
+def search_algorithm(src: str, dsts: list[str], G: nx.DiGraph, num_partitions: int) -> 'BroadCastTopology':
+    \"\"\"
+    Designs optimal routing paths for broadcasting data partitions.
 
-    Returns:
-        BroadCastTopology object with routing paths for all (destination, partition) pairs
-    """
-    # --- Constants and Heuristics ---
-    N_VM = 2
-    R_INSTANCE = 0.54  # $/hour
-
-    # Determine K, the number of diverse paths for load balancing.
-    # The logic ensures K=1 for a single partition, and then ramps up
-    # to a max of 8 paths to spread the load for multiple partitions.
-    if num_partitions <= 1:
-        K = 1
-    else:
-        K = min(8, max(2, num_partitions // 2))
-
-    # --- Composite Edge Weight Calculation ---
-    # The total cost is a sum of egress and instance costs. Instance cost is
-    # proportional to transfer time, which is inversely related to throughput.
-    # We define a composite edge weight to balance these two factors:
-    # effective_cost = egress_cost + (time_cost_factor / throughput)
-    
-    # Estimate the number of nodes involved to approximate the time_cost_factor.
-    num_nodes_approx = len(G.nodes())
-    
-    # This factor, X, models the instance cost component per GB transferred over an edge.
-    # X = |V| * n_vm * (r_instance / 3600) * 8 bits/byte
-    X = num_nodes_approx * N_VM * (R_INSTANCE / 3600) * 8
-
-    # Pre-calculate and assign the composite weight to each edge in the graph.
-    for u, v, data in G.edges(data=True):
-        cost = data.get('cost', 0.0)
-        throughput = data.get('throughput', 1e-9)
-        # Prevent division by zero or negative throughput.
-        if throughput <= 1e-9:
-            throughput = 1e-9
-        data['effective_cost'] = cost + X / throughput
-
-    # --- Topology Construction ---
+    The strategy is a two-phase approach:
+    1. Path Finding: For each destination, find K diverse, low-cost paths using an 
+       iterative Dijkstra's algorithm with edge weight penalties. This provides a
+       set of good candidate routes. The edge weight is primarily cost, with a
+       small tie-breaker for higher throughput to choose better paths when costs are equal.
+    2. Partition Assignment: Greedily assign each partition (for each destination)
+       to the candidate path that is currently the least congested. Congestion is
+       measured by the maximum number of partitions already assigned to any edge
+       along the path. This balances the load across the network, minimizing the
+       maximum traffic on any single link, which is key to reducing transfer time
+       and overall instance costs.
+    \"\"\"
     bc_topology = BroadCastTopology(src, dsts, num_partitions)
 
-    for dst in dsts:
-        # 1. Find K shortest simple paths using the composite weight.
-        candidate_node_paths = []
-        try:
-            paths_generator = nx.shortest_simple_paths(G, src, dst, weight='effective_cost')
-            candidate_node_paths = list(itertools.islice(paths_generator, K))
-        except (nx.NetworkXNoPath, nx.NodeNotFound):
-            pass
+    if num_partitions == 0:
+        return bc_topology
 
-        # Fallback 1: If no path is found, try again using only egress cost.
-        if not candidate_node_paths:
-            try:
-                paths_generator = nx.shortest_simple_paths(G, src, dst, weight='cost')
-                candidate_node_paths = list(itertools.islice(paths_generator, K))
-            except (nx.NetworkXNoPath, nx.NodeNotFound):
-                pass
+    # Heuristic for the number of diverse paths (K) to find per destination.
+    K = min(num_partitions, 8) if num_partitions > 1 else 1
+
+    edge_partition_counts = defaultdict(int)
+    all_candidate_paths = {}
+
+    # Phase 1: Find K diverse candidate paths for each destination
+    for dst in dsts:
+        temp_G = G.copy()
         
-        # Fallback 2: As a last resort, find an unweighted shortest path.
-        if not candidate_node_paths:
+        for u, v, data in temp_G.edges(data=True):
+            cost = float(data.get('cost', 1e9))
+            throughput = float(data.get('throughput', 1e-9))
+            # Use cost as primary weight, with throughput as a minor tie-breaker
+            data['temp_weight'] = cost - 1e-12 * throughput
+
+        candidate_paths_for_dst = []
+        for _ in range(K):
             try:
-                path = nx.shortest_path(G, src, dst)
-                candidate_node_paths = [path]
+                path_nodes = nx.dijkstra_path(temp_G, src, dst, weight='temp_weight')
+                
+                if len(path_nodes) > 1:
+                    candidate_paths_for_dst.append(path_nodes)
+                    # Penalize edges on the found path to encourage diversity
+                    penalty_factor = 1.5
+                    for u, v in zip(path_nodes[:-1], path_nodes[1:]):
+                        if temp_G.has_edge(u, v):
+                            temp_G[u][v]['temp_weight'] *= penalty_factor
+                else:
+                    break
             except (nx.NetworkXNoPath, nx.NodeNotFound):
-                # If the destination is unreachable, we must skip it.
+                break
+
+        # Fallback to a single shortest path if the iterative method fails
+        if not candidate_paths_for_dst:
+            try:
+                path_nodes = nx.dijkstra_path(G, src, dst, weight='cost')
+                if path_nodes:
+                    candidate_paths_for_dst.append(path_nodes)
+            except (nx.NetworkXNoPath, nx.NodeNotFound):
+                # Destination is unreachable, skip it
+                continue
+        
+        all_candidate_paths[dst] = candidate_paths_for_dst
+
+    # Phase 2: Greedily assign partitions to the least congested paths
+    for p_id in range(num_partitions):
+        for dst in dsts:
+            candidate_paths = all_candidate_paths.get(dst)
+            if not candidate_paths:
                 continue
 
-        num_found_paths = len(candidate_node_paths)
+            best_path_nodes = None
+            min_max_congestion = float('inf')
 
-        # 2. Distribute partitions across the found paths in a round-robin fashion.
-        # This simple load balancing strategy helps avoid congestion and reduces max transfer time.
-        for p_id in range(num_partitions):
-            path_idx = p_id % num_found_paths
-            node_path = candidate_node_paths[path_idx]
+            # Find the least congested path among the pre-computed candidates
+            for path_nodes in candidate_paths:
+                max_congestion_on_path = 0
+                for u, v in zip(path_nodes[:-1], path_nodes[1:]):
+                    max_congestion_on_path = max(max_congestion_on_path, edge_partition_counts[(u, v)])
+                
+                if max_congestion_on_path < min_max_congestion:
+                    min_max_congestion = max_congestion_on_path
+                    best_path_nodes = path_nodes
             
-            # Convert the node path to the required edge path format.
-            edge_path = []
-            for i in range(len(node_path) - 1):
-                u, v = node_path[i], node_path[i + 1]
-                edge_data = G[u][v]
-                edge_path.append([u, v, edge_data])
+            # Default to the first path (lowest cost) if all have same congestion
+            if best_path_nodes is None:
+                best_path_nodes = candidate_paths[0]
+
+            # Assign partition, update congestion counts, and set path in topology
+            edge_path_for_topology = []
+            for u, v in zip(best_path_nodes[:-1], best_path_nodes[1:]):
+                edge_partition_counts[(u, v)] += 1
+                edge_data = G.get_edge_data(u, v)
+                if edge_data:
+                    edge_path_for_topology.append([u, v, edge_data])
             
-            bc_topology.set_dst_partition_paths(dst, p_id, edge_path)
-            
+            bc_topology.set_dst_partition_paths(dst, p_id, edge_path_for_topology)
+
     return bc_topology
-'''
+"""
         return {"code": algorithm_code}

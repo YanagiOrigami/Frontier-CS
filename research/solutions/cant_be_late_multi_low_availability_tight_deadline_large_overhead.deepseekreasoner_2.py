@@ -1,15 +1,19 @@
 import json
 from argparse import Namespace
+import math
+from typing import List, Optional
+
 from sky_spot.strategies.multi_strategy import MultiRegionStrategy
 from sky_spot.utils import ClusterType
-import math
+
 
 class Solution(MultiRegionStrategy):
-    NAME = "my_strategy"
+    NAME = "adaptive_spot_optimizer"
 
     def solve(self, spec_path: str) -> "Solution":
         with open(spec_path) as f:
             config = json.load(f)
+
         args = Namespace(
             deadline_hours=float(config["deadline"]),
             task_duration_hours=[float(config["duration"])],
@@ -17,56 +21,122 @@ class Solution(MultiRegionStrategy):
             inter_task_overhead=[0.0],
         )
         super().__init__(args)
+        
+        self.initialized = False
+        self.current_region = 0
+        self.consecutive_no_spot = 0
+        self.num_regions = 0
+        self.region_history = []
+        self.last_action = None
+        self.spot_attempts = 0
+        self.on_demand_used = False
+        self.critical_threshold = 0.15
+        
         return self
 
+    def _initialize_state(self):
+        self.num_regions = self.env.get_num_regions()
+        self.current_region = self.env.get_current_region()
+        self.region_history = [0] * self.num_regions
+        self.initialized = True
+
     def _step(self, last_cluster_type: ClusterType, has_spot: bool) -> ClusterType:
-        remaining_work = self.task_duration - sum(self.task_done_time)
-        remaining_time = self.deadline - self.env.elapsed_seconds
+        if not self.initialized:
+            self._initialize_state()
         
-        # If no work left, do nothing
-        if remaining_work <= 0:
+        self.current_region = self.env.get_current_region()
+        
+        time_left = self.deadline - self.env.elapsed_seconds
+        work_done = sum(self.task_done_time)
+        work_left = self.task_duration - work_done
+        
+        if work_left <= 0:
             return ClusterType.NONE
-        
-        # Calculate time buffer needed for safety
-        time_per_work_unit = self.env.gap_seconds
-        safety_buffer = 2 * self.restart_overhead + time_per_work_unit
-        
-        # If we're in a restart overhead, wait
+            
         if self.remaining_restart_overhead > 0:
             return ClusterType.NONE
         
-        # Emergency mode: if we might miss deadline, use on-demand
-        if remaining_time - safety_buffer < remaining_work:
+        hours_left = time_left / 3600.0
+        hours_work_left = work_left / 3600.0
+        
+        if hours_work_left <= 0:
+            return ClusterType.NONE
+        
+        progress_ratio = 1.0 - (work_left / self.task_duration)
+        time_ratio = self.env.elapsed_seconds / self.deadline
+        
+        urgent = hours_work_left > hours_left * (1.0 + self.critical_threshold)
+        
+        if urgent:
+            self.on_demand_used = True
             return ClusterType.ON_DEMAND
         
-        # Try spot if available
+        if has_spot:
+            spot_score = self._calculate_spot_score(hours_work_left, hours_left)
+            
+            if spot_score > 0.3 or not self.on_demand_used:
+                self.spot_attempts += 1
+                self.consecutive_no_spot = 0
+                self.region_history[self.current_region] += 1
+                return ClusterType.SPOT
+        
+        self.consecutive_no_spot += 1
+        
+        if self.consecutive_no_spot >= 2 and self.num_regions > 1:
+            best_region = self._find_best_region()
+            if best_region != self.current_region:
+                self.env.switch_region(best_region)
+                self.current_region = best_region
+                self.consecutive_no_spot = 0
+        
+        if hours_work_left > hours_left * 0.9:
+            self.on_demand_used = True
+            return ClusterType.ON_DEMAND
+        
         if has_spot:
             return ClusterType.SPOT
         
-        # Spot not available - explore other regions
-        current_region = self.env.get_current_region()
-        num_regions = self.env.get_num_regions()
+        return ClusterType.NONE
+
+    def _calculate_spot_score(self, hours_work_left: float, hours_left: float) -> float:
+        if hours_left <= 0:
+            return 0.0
         
-        # Try to find a region with spot
-        best_region = current_region
-        best_score = -1
+        time_pressure = hours_work_left / hours_left if hours_left > 0 else float('inf')
         
-        # Simple heuristic: check adjacent regions
-        for offset in range(1, num_regions):
-            check_region = (current_region + offset) % num_regions
-            # Switch temporarily to check (this is a conceptual check)
-            # In reality we don't know has_spot in other regions without switching
-            # We'll implement a simple round-robin exploration
-            if offset == 1:  # Just try next region
-                self.env.switch_region(check_region)
-                # After switching, we need to return a cluster type
-                # We'll return NONE for this step since we just switched
-                return ClusterType.NONE
+        base_score = 0.7
         
-        # If we haven't switched region and no spot available, use on-demand
-        # but only if we have enough time buffer
-        if remaining_time - self.restart_overhead > remaining_work:
-            # Wait for spot to potentially become available
-            return ClusterType.NONE
-        else:
-            return ClusterType.ON_DEMAND
+        if time_pressure > 1.5:
+            base_score *= 0.3
+        elif time_pressure > 1.2:
+            base_score *= 0.6
+        elif time_pressure > 1.0:
+            base_score *= 0.8
+        
+        progress = 1.0 - (hours_work_left / (self.task_duration / 3600.0))
+        if progress > 0.8:
+            base_score *= 1.2
+        elif progress > 0.5:
+            base_score *= 1.1
+        
+        return min(max(base_score, 0.0), 1.0)
+
+    def _find_best_region(self) -> int:
+        current_time = self.env.elapsed_seconds / 3600.0
+        
+        scores = []
+        for i in range(self.num_regions):
+            if i == self.current_region:
+                score = -self.consecutive_no_spot * 0.5
+            else:
+                score = 0.0
+            
+            if self.region_history[i] < 1:
+                score += 2.0
+            else:
+                score += 1.0 / (self.region_history[i] + 1)
+            
+            scores.append((score, i))
+        
+        scores.sort(reverse=True)
+        return scores[0][1]

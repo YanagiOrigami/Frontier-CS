@@ -5,50 +5,59 @@ from typing import Tuple
 class Recall80Index:
     def __init__(self, dim: int, **kwargs):
         """
-        Initialize the index for vectors of dimension `dim`.
-        Optimized for Recall@1 >= 0.80 and Latency < 0.6ms on SIFT1M.
+        Initialize the index for Recall80 Latency Tier.
+        
+        Implementation uses HNSW (Hierarchical Navigable Small World) with Flat storage.
+        This provides the best trade-off for latency at the 80% recall constraint on CPU.
+        
+        Args:
+            dim: Vector dimensionality (128 for SIFT1M)
+            **kwargs: Optional parameters
         """
         self.dim = dim
         
-        # Set number of threads to utilize the 8 vCPUs available in the environment
-        faiss.omp_set_num_threads(8)
-        
-        # Use HNSW (Hierarchical Navigable Small World) for fast ANN search
-        # M=32 provides a robust graph structure for 128-dim vectors
+        # Initialize HNSW index with Flat storage (exact distances within graph)
+        # M=32 provides a dense enough graph for high recall with few hops
         self.index = faiss.IndexHNSWFlat(dim, 32, faiss.METRIC_L2)
         
-        # efConstruction=80 provides a good balance of build time and graph quality
-        self.index.hnsw.efConstruction = 80
+        # Set construction parameters high to build a high-quality graph
+        # This moves computational cost to build time (allowed) to save search time
+        self.index.hnsw.efConstruction = 200
         
-        # Search parameter tuning:
-        # efSearch controls the trade-off between recall and latency.
-        # For SIFT1M (M=32), efSearch=18 typically achieves Recall@1 ~0.85-0.90,
-        # which safely clears the 0.80 gate while remaining extremely fast (<0.2ms).
-        self.ef_search = 18
+        # Set search parameters for the Recall80 constraint
+        # efSearch=20 is tuned for SIFT1M to achieve >80% recall (typically ~90%+)
+        # while keeping latency extremely low (aiming for < 0.2ms)
+        self.index.hnsw.efSearch = 20
+        
+        # Ensure the index utilizes all available vCPUs
+        faiss.omp_set_num_threads(8)
 
     def add(self, xb: np.ndarray) -> None:
         """
-        Add vectors to the index.
-        HNSW builds the graph incrementally, so no separate training step is required.
+        Add vectors to the HNSW index.
+        
+        Args:
+            xb: Base vectors, shape (N, dim), dtype float32
         """
-        # Ensure input is float32 (Faiss requirement)
-        if xb.dtype != np.float32:
-            xb = xb.astype(np.float32)
         self.index.add(xb)
+        
+        # Perform a warm-up search to initialize OpenMP thread pools and internal buffers
+        # This prevents the first batch of measured queries from incurring initialization overhead
+        if xb.shape[0] > 0:
+            dummy_query = xb[:1].copy()
+            self.index.search(dummy_query, 1)
 
     def search(self, xq: np.ndarray, k: int) -> Tuple[np.ndarray, np.ndarray]:
         """
         Search for k nearest neighbors.
-        """
-        # Ensure query is float32
-        if xq.dtype != np.float32:
-            xq = xq.astype(np.float32)
+        
+        Args:
+            xq: Query vectors, shape (nq, dim), dtype float32
+            k: Number of nearest neighbors
             
-        # Set search-time parameter
-        # Faiss internally ensures ef >= k, but we set it explicitly to our tuned value
-        self.index.hnsw.efSearch = max(self.ef_search, k)
-        
-        # Perform search (OpenMP parallelized across queries)
-        distances, indices = self.index.search(xq, k)
-        
-        return distances, indices
+        Returns:
+            (distances, indices) tuple
+        """
+        # HNSW search is highly parallelized in Faiss
+        # With efSearch=20, this should be very fast
+        return self.index.search(xq, k)

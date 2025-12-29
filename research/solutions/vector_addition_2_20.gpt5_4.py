@@ -1,51 +1,62 @@
-from typing import Dict
+import textwrap
 
 class Solution:
-    def solve(self, spec_path: str = None) -> Dict[str, str]:
-        code = r'''
-import torch
-import triton
-import triton.language as tl
+    def solve(self, spec_path: str = None) -> dict:
+        code = textwrap.dedent("""
+            import torch
+            import triton
+            import triton.language as tl
 
-@triton.jit
-def _add_kernel(x_ptr, y_ptr, out_ptr, N, BLOCK_SIZE: tl.constexpr):
-    pid = tl.program_id(0)
-    offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
-    mask = offsets < N
-    x = tl.load(x_ptr + offsets, mask=mask)
-    y = tl.load(y_ptr + offsets, mask=mask)
-    z = x + y
-    tl.store(out_ptr + offsets, z, mask=mask)
+            @triton.autotune(
+                configs=[
+                    triton.Config({'BLOCK_SIZE': 1024}, num_warps=4, num_stages=2),
+                    triton.Config({'BLOCK_SIZE': 2048}, num_warps=4, num_stages=2),
+                    triton.Config({'BLOCK_SIZE': 4096}, num_warps=8, num_stages=2),
+                    triton.Config({'BLOCK_SIZE': 8192}, num_warps=8, num_stages=2),
+                ],
+                key=['n_elements'],
+            )
+            @triton.jit
+            def _vec_add_kernel(x_ptr, y_ptr, out_ptr, n_elements, BLOCK_SIZE: tl.constexpr):
+                pid = tl.program_id(axis=0)
+                block_start = pid * BLOCK_SIZE
+                offsets = block_start + tl.arange(0, BLOCK_SIZE)
+                mask = offsets < n_elements
+                x = tl.load(x_ptr + offsets, mask=mask)
+                y = tl.load(y_ptr + offsets, mask=mask)
+                tl.store(out_ptr + offsets, x + y, mask=mask)
 
-def add(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
-    """
-    Element-wise addition of two vectors.
-    
-    Args:
-        x: Input tensor of shape (1048576,)
-        y: Input tensor of shape (1048576,)
-    
-    Returns:
-        Output tensor of shape (1048576,) with x + y
-    """
-    if x.device.type != 'cuda' or y.device.type != 'cuda':
-        # Fallback for CPU tensors; GPU performance evaluation will pass CUDA tensors.
-        return x + y
-    assert x.is_contiguous() and y.is_contiguous(), "Inputs must be contiguous"
-    assert x.numel() == y.numel(), "Input sizes must match"
-    assert x.dtype == y.dtype, "Input dtypes must match"
-    N = x.numel()
-    BLOCK_SIZE = 4096  # tuned for 2^20 elems on L4; 256 programs -> good occupancy
-    grid = (triton.cdiv(N, BLOCK_SIZE),)
-    if x.dtype != torch.float32:
-        x_fp32 = x.to(torch.float32)
-        y_fp32 = y.to(torch.float32)
-        out_fp32 = torch.empty_like(x_fp32)
-        _add_kernel[grid](x_fp32, y_fp32, out_fp32, N, BLOCK_SIZE=BLOCK_SIZE, num_warps=8, num_stages=2)
-        return out_fp32.to(dtype=x.dtype)
-    else:
-        out = torch.empty_like(x)
-        _add_kernel[grid](x, y, out, N, BLOCK_SIZE=BLOCK_SIZE, num_warps=8, num_stages=2)
-        return out
-'''
+            def add(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+                if x.numel() != y.numel():
+                    raise ValueError("Input tensors must have the same number of elements.")
+                n = x.numel()
+
+                # Ensure on CUDA
+                device = x.device if x.is_cuda else (y.device if y.is_cuda else torch.device('cuda'))
+                if not x.is_cuda:
+                    x = x.to(device, non_blocking=True)
+                if not y.is_cuda:
+                    y = y.to(device, non_blocking=True)
+
+                # Match dtypes to avoid unnecessary casts; prefer common dtype
+                if x.dtype != y.dtype:
+                    common_dtype = torch.result_type(x, y)
+                    if x.dtype != common_dtype:
+                        x = x.to(common_dtype)
+                    if y.dtype != common_dtype:
+                        y = y.to(common_dtype)
+                dtype = x.dtype
+
+                # Ensure contiguity (guaranteed by spec, but keep for safety)
+                if not x.is_contiguous():
+                    x = x.contiguous()
+                if not y.is_contiguous():
+                    y = y.contiguous()
+
+                out = torch.empty_like(x, dtype=dtype, device=device)
+
+                grid = lambda META: (triton.cdiv(n, META['BLOCK_SIZE']),)
+                _vec_add_kernel[grid](x, y, out, n, num_warps=None, num_stages=None)
+                return out
+        """)
         return {"code": code}

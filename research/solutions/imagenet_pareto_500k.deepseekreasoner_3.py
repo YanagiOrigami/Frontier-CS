@@ -1,63 +1,63 @@
 import torch
 import torch.nn as nn
+import torch.optim as optim
 import torch.nn.functional as F
-from torch.optim import AdamW
-from torch.optim.lr_scheduler import CosineAnnealingLR
-import math
+from torch.optim.lr_scheduler import CosineAnnealingLR, ReduceLROnPlateau
+import numpy as np
+import copy
 
-class EfficientMLP(nn.Module):
+class ResidualBlock(nn.Module):
+    def __init__(self, in_dim, out_dim, stride=1, dropout=0.1):
+        super().__init__()
+        self.bn1 = nn.BatchNorm1d(in_dim)
+        self.conv1 = nn.Linear(in_dim, out_dim)
+        self.bn2 = nn.BatchNorm1d(out_dim)
+        self.conv2 = nn.Linear(out_dim, out_dim)
+        self.dropout = nn.Dropout(dropout)
+        
+        self.shortcut = nn.Sequential()
+        if stride != 1 or in_dim != out_dim:
+            self.shortcut = nn.Linear(in_dim, out_dim)
+            
+    def forward(self, x):
+        residual = self.shortcut(x)
+        
+        out = self.bn1(x)
+        out = F.relu(out)
+        out = self.conv1(out)
+        out = self.bn2(out)
+        out = F.relu(out)
+        out = self.dropout(out)
+        out = self.conv2(out)
+        
+        out += residual
+        return out
+
+class OptimizedModel(nn.Module):
     def __init__(self, input_dim=384, num_classes=128, param_limit=500000):
         super().__init__()
-        self.input_dim = input_dim
-        self.num_classes = num_classes
         
-        # Carefully designed architecture to maximize capacity within budget
-        # Using residual connections and bottleneck layers
-        hidden1 = 512
-        hidden2 = 512
-        hidden3 = 384
-        hidden4 = 256
+        # Optimized architecture to maximize capacity within budget
+        # Starting with wider layers then compressing
+        self.initial_conv = nn.Linear(input_dim, 512)
         
-        # Calculate current parameters
-        params = 0
-        params += input_dim * hidden1 + hidden1  # fc1
-        params += hidden1 * hidden2 + hidden2    # fc2
-        params += hidden2 * hidden3 + hidden3    # fc3
-        params += hidden3 * hidden4 + hidden4    # fc4
-        params += hidden4 * num_classes + num_classes  # fc_out
+        # Residual blocks with progressive compression
+        self.block1 = ResidualBlock(512, 384, dropout=0.15)
+        self.block2 = ResidualBlock(384, 256, dropout=0.15)
+        self.block3 = ResidualBlock(256, 192, dropout=0.1)
         
-        # Add batch norm params (2 per feature)
-        params += 4 * hidden1 * 2 + 4 * hidden2 * 2 + 4 * hidden3 * 2 + 4 * hidden4 * 2
+        # Final layers
+        self.final_bn = nn.BatchNorm1d(192)
+        self.final_dropout = nn.Dropout(0.1)
+        self.final_fc = nn.Linear(192, num_classes)
         
-        # If we're under budget, we can increase capacity
-        if params < param_limit:
-            # Increase hidden dimensions proportionally
-            scale = math.sqrt(param_limit / params)
-            hidden1 = min(768, int(hidden1 * scale))
-            hidden2 = min(768, int(hidden2 * scale))
-            hidden3 = min(512, int(hidden3 * scale))
-            hidden4 = min(384, int(hidden4 * scale))
-        
-        # Main layers with residual connections
-        self.fc1 = nn.Linear(input_dim, hidden1)
-        self.bn1 = nn.BatchNorm1d(hidden1)
-        
-        self.fc2 = nn.Linear(hidden1, hidden2)
-        self.bn2 = nn.BatchNorm1d(hidden2)
-        
-        self.fc3 = nn.Linear(hidden2, hidden3)
-        self.bn3 = nn.BatchNorm1d(hidden3)
-        
-        self.fc4 = nn.Linear(hidden3, hidden4)
-        self.bn4 = nn.BatchNorm1d(hidden4)
-        
-        self.fc_out = nn.Linear(hidden4, num_classes)
-        
-        # Dropout for regularization
-        self.dropout = nn.Dropout(0.3)
-        
-        # Initialize weights properly
+        # Initialize weights
         self._initialize_weights()
+        
+        # Verify parameter count
+        total_params = sum(p.numel() for p in self.parameters() if p.requires_grad)
+        if total_params > param_limit:
+            raise ValueError(f"Model has {total_params} parameters, exceeding limit of {param_limit}")
     
     def _initialize_weights(self):
         for m in self.modules():
@@ -70,78 +70,58 @@ class EfficientMLP(nn.Module):
                 nn.init.constant_(m.bias, 0)
     
     def forward(self, x):
-        # Residual block 1
-        identity = x
-        if x.shape[1] != self.fc1.out_features:
-            identity = self.fc1(x)  # Project residual
+        x = self.initial_conv(x)
+        x = F.relu(x)
         
-        out = F.relu(self.bn1(self.fc1(x)))
-        out = self.dropout(out)
+        x = self.block1(x)
+        x = self.block2(x)
+        x = self.block3(x)
         
-        # Residual block 2
-        out = F.relu(self.bn2(self.fc2(out) + identity))
-        out = self.dropout(out)
+        x = self.final_bn(x)
+        x = F.relu(x)
+        x = self.final_dropout(x)
+        x = self.final_fc(x)
         
-        # Continue through network
-        out = F.relu(self.bn3(self.fc3(out)))
-        out = self.dropout(out)
-        
-        out = F.relu(self.bn4(self.fc4(out)))
-        out = self.dropout(out)
-        
-        out = self.fc_out(out)
-        return out
+        return x
 
 class Solution:
     def solve(self, train_loader, val_loader, metadata: dict = None) -> torch.nn.Module:
-        # Extract metadata
-        num_classes = metadata["num_classes"]
+        device = metadata.get("device", "cpu")
         input_dim = metadata["input_dim"]
+        num_classes = metadata["num_classes"]
         param_limit = metadata["param_limit"]
-        device = metadata["device"]
         
-        # Create model with parameter constraint
-        model = EfficientMLP(input_dim=input_dim, num_classes=num_classes, param_limit=param_limit)
+        # Initialize model
+        model = OptimizedModel(input_dim, num_classes, param_limit)
         model.to(device)
         
-        # Verify parameter count
-        total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-        if total_params > param_limit:
-            # If somehow over limit, reduce capacity
-            model = nn.Sequential(
-                nn.Linear(input_dim, 512),
-                nn.BatchNorm1d(512),
-                nn.ReLU(),
-                nn.Dropout(0.3),
-                nn.Linear(512, 256),
-                nn.BatchNorm1d(256),
-                nn.ReLU(),
-                nn.Dropout(0.3),
-                nn.Linear(256, num_classes)
-            )
-            model.to(device)
+        # Training configuration
+        criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
+        optimizer = optim.AdamW(
+            model.parameters(),
+            lr=0.001,
+            weight_decay=0.05
+        )
         
-        # Training setup
-        criterion = nn.CrossEntropyLoss()
-        optimizer = AdamW(model.parameters(), lr=0.001, weight_decay=0.01)
-        scheduler = CosineAnnealingLR(optimizer, T_max=100, eta_min=1e-5)
+        # Mixed schedulers
+        scheduler_cosine = CosineAnnealingLR(optimizer, T_max=30, eta_min=1e-6)
+        scheduler_plateau = ReduceLROnPlateau(optimizer, mode='max', factor=0.5, patience=5)
         
-        # Early stopping
-        best_val_acc = 0
+        best_val_acc = 0.0
         best_model_state = None
-        patience = 20
+        patience = 15
         patience_counter = 0
         
-        # Training loop
-        num_epochs = 200
+        num_epochs = 120
+        
         for epoch in range(num_epochs):
             # Training phase
             model.train()
-            train_loss = 0
+            train_loss = 0.0
             train_correct = 0
             train_total = 0
             
-            for batch_idx, (inputs, targets) in enumerate(train_loader):
+            for inputs, targets in train_loader:
                 inputs, targets = inputs.to(device), targets.to(device)
                 
                 optimizer.zero_grad()
@@ -150,8 +130,7 @@ class Solution:
                 loss.backward()
                 
                 # Gradient clipping
-                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-                
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                 optimizer.step()
                 
                 train_loss += loss.item()
@@ -159,7 +138,7 @@ class Solution:
                 train_total += targets.size(0)
                 train_correct += predicted.eq(targets).sum().item()
             
-            scheduler.step()
+            train_acc = train_correct / train_total
             
             # Validation phase
             model.eval()
@@ -176,14 +155,19 @@ class Solution:
             
             val_acc = val_correct / val_total
             
-            # Early stopping check
-            if val_acc > best_val_acc:
+            # Learning rate scheduling
+            scheduler_cosine.step()
+            scheduler_plateau.step(val_acc)
+            
+            # Early stopping with patience
+            if val_acc > best_val_acc + 1e-4:
                 best_val_acc = val_acc
-                best_model_state = model.state_dict().copy()
+                best_model_state = copy.deepcopy(model.state_dict())
                 patience_counter = 0
             else:
                 patience_counter += 1
             
+            # Early stopping
             if patience_counter >= patience:
                 break
         
@@ -191,30 +175,4 @@ class Solution:
         if best_model_state is not None:
             model.load_state_dict(best_model_state)
         
-        # Final training on combined data for a few more epochs
-        model.train()
-        combined_loader = torch.utils.data.ConcatDataset([
-            train_loader.dataset, 
-            val_loader.dataset
-        ])
-        combined_loader = torch.utils.data.DataLoader(
-            combined_loader, 
-            batch_size=train_loader.batch_size,
-            shuffle=True
-        )
-        
-        # Short fine-tuning on combined data
-        fine_tune_epochs = 20
-        optimizer = AdamW(model.parameters(), lr=0.0001)
-        
-        for _ in range(fine_tune_epochs):
-            for inputs, targets in combined_loader:
-                inputs, targets = inputs.to(device), targets.to(device)
-                optimizer.zero_grad()
-                outputs = model(inputs)
-                loss = criterion(outputs, targets)
-                loss.backward()
-                optimizer.step()
-        
-        model.eval()
         return model

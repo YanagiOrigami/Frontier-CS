@@ -1,462 +1,228 @@
 import torch
 import triton
 import triton.language as tl
-from typing import Optional
-import math
-
-@triton.jit
-def _fused_linear_jsd_kernel_pass1(
-    X, W1, W2, B1, B2, M, K, N,
-    stride_xm, stride_xk,
-    stride_w1k, stride_w1n,
-    stride_w2k, stride_w2n,
-    log_sum_exp1, log_sum_exp2,
-    BLOCK_SIZE_M: tl.constexpr,
-    BLOCK_SIZE_K: tl.constexpr,
-    BLOCK_SIZE_N: tl.constexpr,
-    GROUP_SIZE_M: tl.constexpr,
-):
-    pid = tl.program_id(0)
-    num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
-    num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
-    num_pid_in_group = GROUP_SIZE_M * num_pid_n
-    group_id = pid // num_pid_in_group
-    first_pid_m = group_id * GROUP_SIZE_M
-    group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
-    pid_m = first_pid_m + (pid % group_size_m)
-    pid_n = (pid % num_pid_in_group) // group_size_m
-    
-    offs_m = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
-    offs_n = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
-    offs_k = tl.arange(0, BLOCK_SIZE_K)
-    
-    X_ptrs = X + (offs_m[:, None] * stride_xm + offs_k[None, :] * stride_xk)
-    W1_ptrs = W1 + (offs_k[:, None] * stride_w1k + offs_n[None, :] * stride_w1n)
-    W2_ptrs = W2 + (offs_k[:, None] * stride_w2k + offs_n[None, :] * stride_w2n)
-    
-    accumulator1 = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
-    accumulator2 = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
-    
-    for k in range(0, K, BLOCK_SIZE_K):
-        k_remaining = K - k
-        k_mask = offs_k < k_remaining
-        
-        x = tl.load(X_ptrs, mask=k_mask[None, :] & (offs_m[:, None] < M), other=0.0)
-        w1 = tl.load(W1_ptrs, mask=k_mask[:, None] & (offs_n[None, :] < N), other=0.0)
-        w2 = tl.load(W2_ptrs, mask=k_mask[:, None] & (offs_n[None, :] < N), other=0.0)
-        
-        accumulator1 += tl.dot(x, w1, allow_tf32=False)
-        accumulator2 += tl.dot(x, w2, allow_tf32=False)
-        
-        X_ptrs += BLOCK_SIZE_K * stride_xk
-        W1_ptrs += BLOCK_SIZE_K * stride_w1k
-        W2_ptrs += BLOCK_SIZE_K * stride_w2k
-    
-    if BLOCK_SIZE_N == 1:
-        b1 = tl.load(B1 + offs_n, mask=offs_n < N)
-        b2 = tl.load(B2 + offs_n, mask=offs_n < N)
-        accumulator1 += b1[None, :]
-        accumulator2 += b2[None, :]
-    
-    m1 = tl.max(accumulator1, 1)
-    m2 = tl.max(accumulator2, 1)
-    
-    exp1 = tl.exp(accumulator1 - m1[:, None])
-    exp2 = tl.exp(accumulator2 - m2[:, None])
-    
-    sum1 = tl.sum(exp1, 1)
-    sum2 = tl.sum(exp2, 1)
-    
-    lse1 = m1 + tl.log(sum1)
-    lse2 = m2 + tl.log(sum2)
-    
-    out_ptrs1 = log_sum_exp1 + offs_m
-    out_ptrs2 = log_sum_exp2 + offs_m
-    tl.store(out_ptrs1, lse1, mask=offs_m < M)
-    tl.store(out_ptrs2, lse2, mask=offs_m < M)
-
-@triton.jit
-def _fused_linear_jsd_kernel_pass2(
-    X, W1, W2, B1, B2, M, K, N,
-    stride_xm, stride_xk,
-    stride_w1k, stride_w1n,
-    stride_w2k, stride_w2n,
-    log_sum_exp1, log_sum_exp2,
-    output,
-    BLOCK_SIZE_M: tl.constexpr,
-    BLOCK_SIZE_K: tl.constexpr,
-    BLOCK_SIZE_N: tl.constexpr,
-    GROUP_SIZE_M: tl.constexpr,
-):
-    pid = tl.program_id(0)
-    num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
-    num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
-    num_pid_in_group = GROUP_SIZE_M * num_pid_n
-    group_id = pid // num_pid_in_group
-    first_pid_m = group_id * GROUP_SIZE_M
-    group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
-    pid_m = first_pid_m + (pid % group_size_m)
-    pid_n = (pid % num_pid_in_group) // group_size_m
-    
-    offs_m = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
-    offs_n = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
-    offs_k = tl.arange(0, BLOCK_SIZE_K)
-    
-    X_ptrs = X + (offs_m[:, None] * stride_xm + offs_k[None, :] * stride_xk)
-    W1_ptrs = W1 + (offs_k[:, None] * stride_w1k + offs_n[None, :] * stride_w1n)
-    W2_ptrs = W2 + (offs_k[:, None] * stride_w2k + offs_n[None, :] * stride_w2n)
-    
-    accumulator1 = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
-    accumulator2 = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
-    
-    for k in range(0, K, BLOCK_SIZE_K):
-        k_remaining = K - k
-        k_mask = offs_k < k_remaining
-        
-        x = tl.load(X_ptrs, mask=k_mask[None, :] & (offs_m[:, None] < M), other=0.0)
-        w1 = tl.load(W1_ptrs, mask=k_mask[:, None] & (offs_n[None, :] < N), other=0.0)
-        w2 = tl.load(W2_ptrs, mask=k_mask[:, None] & (offs_n[None, :] < N), other=0.0)
-        
-        accumulator1 += tl.dot(x, w1, allow_tf32=False)
-        accumulator2 += tl.dot(x, w2, allow_tf32=False)
-        
-        X_ptrs += BLOCK_SIZE_K * stride_xk
-        W1_ptrs += BLOCK_SIZE_K * stride_w1k
-        W2_ptrs += BLOCK_SIZE_K * stride_w2k
-    
-    if BLOCK_SIZE_N == 1:
-        b1 = tl.load(B1 + offs_n, mask=offs_n < N)
-        b2 = tl.load(B2 + offs_n, mask=offs_n < N)
-        accumulator1 += b1[None, :]
-        accumulator2 += b2[None, :]
-    
-    lse1 = tl.load(log_sum_exp1 + offs_m, mask=offs_m < M)
-    lse2 = tl.load(log_sum_exp2 + offs_m, mask=offs_m < M)
-    
-    log_p = accumulator1 - lse1[:, None]
-    log_q = accumulator2 - lse2[:, None]
-    
-    p = tl.exp(log_p)
-    q = tl.exp(log_q)
-    
-    m = 0.5 * (p + q)
-    
-    log_m = tl.log(m)
-    
-    kl_pm = tl.where(m > 0, p * (log_p - log_m), 0.0)
-    kl_qm = tl.where(m > 0, q * (log_q - log_m), 0.0)
-    
-    jsd_contrib = 0.5 * (kl_pm + kl_qm)
-    jsd_block = tl.sum(jsd_contrib, 1)
-    
-    out_ptrs = output + offs_m
-    tl.atomic_add(out_ptrs, jsd_block, mask=offs_m < M)
+import os
 
 def fused_linear_jsd(X: torch.Tensor, W1: torch.Tensor, B1: torch.Tensor, 
                      W2: torch.Tensor, B2: torch.Tensor) -> torch.Tensor:
+    """
+    Fused linear layers with Jensen-Shannon Divergence computation.
+    """
+    # Check inputs
     M, K = X.shape
     N = W1.shape[1]
+    assert W1.shape == (K, N), f"W1 shape mismatch: {W1.shape} != ({K}, {N})"
+    assert W2.shape == (K, N), f"W2 shape mismatch: {W2.shape} != ({K}, {N})"
+    assert B1.shape == (N,), f"B1 shape mismatch: {B1.shape} != ({N},)"
+    assert B2.shape == (N,), f"B2 shape mismatch: {B2.shape} != ({N},)"
     
-    assert X.dtype == torch.float16
-    assert W1.dtype == torch.float16
-    assert W2.dtype == torch.float16
-    assert B1.dtype == torch.float32
-    assert B2.dtype == torch.float32
+    # Allocate output tensor
+    out = torch.empty(M, device=X.device, dtype=torch.float32)
     
-    device = X.device
+    # Launch kernel with optimized grid configuration
+    BLOCK_M = 64
+    BLOCK_N = 128
+    grid = (triton.cdiv(M, BLOCK_M),)
     
-    log_sum_exp1 = torch.empty(M, dtype=torch.float32, device=device)
-    log_sum_exp2 = torch.empty(M, dtype=torch.float32, device=device)
-    output = torch.zeros(M, dtype=torch.float32, device=device)
-    
-    def get_config(M, N, K):
-        if M <= 128:
-            BLOCK_SIZE_M = 32
-            BLOCK_SIZE_N = 64
-            BLOCK_SIZE_K = 64
-            GROUP_SIZE_M = 4
-        else:
-            BLOCK_SIZE_M = 64
-            BLOCK_SIZE_N = 128
-            BLOCK_SIZE_K = 64
-            GROUP_SIZE_M = 4
-        
-        num_warps = 4
-        if BLOCK_SIZE_N >= 128:
-            num_warps = 8
-        elif BLOCK_SIZE_N >= 256:
-            num_warps = 16
-        
-        return {
-            'BLOCK_SIZE_M': BLOCK_SIZE_M,
-            'BLOCK_SIZE_N': BLOCK_SIZE_N,
-            'BLOCK_SIZE_K': BLOCK_SIZE_K,
-            'GROUP_SIZE_M': GROUP_SIZE_M,
-            'num_warps': num_warps
-        }
-    
-    config = get_config(M, N, K)
-    
-    grid = lambda META: (
-        triton.cdiv(M, META['BLOCK_SIZE_M']) * triton.cdiv(N, META['BLOCK_SIZE_N']), 
-    )
-    
-    # Pass 1: Compute log-sum-exp
-    _fused_linear_jsd_kernel_pass1[grid](
-        X, W1, W2, B1, B2, M, K, N,
+    _fused_linear_jsd_kernel[grid](
+        X, W1, B1, W2, B2, out,
+        M, N, K,
         X.stride(0), X.stride(1),
         W1.stride(0), W1.stride(1),
         W2.stride(0), W2.stride(1),
-        log_sum_exp1, log_sum_exp2,
-        **config
+        B1.stride(0),
+        B2.stride(0),
+        BLOCK_M=BLOCK_M,
+        BLOCK_N=BLOCK_N,
+        BLOCK_K=32,
+        num_warps=4,
+        num_stages=3
     )
     
-    # Reset output for atomic accumulation
-    output.zero_()
+    return out
+
+@triton.jit
+def _fused_linear_jsd_kernel(
+    X_ptr, W1_ptr, B1_ptr, W2_ptr, B2_ptr, out_ptr,
+    M, N, K,
+    stride_Xm, stride_Xk,
+    stride_W1k, stride_W1n,
+    stride_W2k, stride_W2n,
+    stride_B1n,
+    stride_B2n,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    """
+    Triton kernel for fused linear JSD computation.
+    """
+    pid_m = tl.program_id(0)
     
-    # Pass 2: Compute JSD
-    _fused_linear_jsd_kernel_pass2[grid](
-        X, W1, W2, B1, B2, M, K, N,
-        X.stride(0), X.stride(1),
-        W1.stride(0), W1.stride(1),
-        W2.stride(0), W2.stride(1),
-        log_sum_exp1, log_sum_exp2,
-        output,
-        **config
-    )
+    # Range of rows this program handles
+    m_start = pid_m * BLOCK_M
+    m_offsets = m_start + tl.arange(0, BLOCK_M)
+    m_mask = m_offsets < M
     
-    return output
+    # Initialize output
+    out_acc = tl.zeros((BLOCK_M,), dtype=tl.float32)
+    
+    # First pass: compute log-sum-exp for both branches
+    logsumexp1 = tl.full((BLOCK_M,), float('-inf'), dtype=tl.float32)
+    logsumexp2 = tl.full((BLOCK_M,), float('-inf'), dtype=tl.float32)
+    sumexp1 = tl.zeros((BLOCK_M,), dtype=tl.float32)
+    sumexp2 = tl.zeros((BLOCK_M,), dtype=tl.float32)
+    
+    # Process N dimension in tiles
+    for n_start in range(0, N, BLOCK_N):
+        n_offsets = n_start + tl.arange(0, BLOCK_N)
+        n_mask = n_offsets < N
+        
+        # Initialize accumulators for this tile
+        logits1_acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+        logits2_acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+        
+        # Process K dimension in tiles
+        for k_start in range(0, K, BLOCK_K):
+            k_offsets = k_start + tl.arange(0, BLOCK_K)
+            k_mask = k_offsets < K
+            
+            # Load input tile
+            x_ptrs = X_ptr + m_offsets[:, None] * stride_Xm + k_offsets[None, :] * stride_Xk
+            x = tl.load(x_ptrs, mask=m_mask[:, None] & k_mask[None, :], other=0.0)
+            
+            # Load weight tiles
+            w1_ptrs = W1_ptr + k_offsets[:, None] * stride_W1k + n_offsets[None, :] * stride_W1n
+            w1 = tl.load(w1_ptrs, mask=k_mask[:, None] & n_mask[None, :], other=0.0)
+            
+            w2_ptrs = W2_ptr + k_offsets[:, None] * stride_W2k + n_offsets[None, :] * stride_W2n
+            w2 = tl.load(w2_ptrs, mask=k_mask[:, None] & n_mask[None, :], other=0.0)
+            
+            # Matrix multiplication with accumulation
+            logits1_acc += tl.dot(x, w1, allow_tf32=True)
+            logits2_acc += tl.dot(x, w2, allow_tf32=True)
+        
+        # Load bias tiles
+        b1_ptrs = B1_ptr + n_offsets * stride_B1n
+        b1 = tl.load(b1_ptrs, mask=n_mask, other=0.0).to(tl.float32)
+        
+        b2_ptrs = B2_ptr + n_offsets * stride_B2n
+        b2 = tl.load(b2_ptrs, mask=n_mask, other=0.0).to(tl.float32)
+        
+        # Add biases
+        logits1_acc += b1[None, :]
+        logits2_acc += b2[None, :]
+        
+        # Update log-sum-exp for this tile
+        tile_max1 = tl.max(logits1_acc, axis=1)
+        tile_max2 = tl.max(logits2_acc, axis=1)
+        
+        # Compute exponential values safely
+        exp1 = tl.exp(logits1_acc - tile_max1[:, None])
+        exp2 = tl.exp(logits2_acc - tile_max2[:, None])
+        
+        # Update global max and sumexp
+        # For branch 1
+        old_max1 = tl.where(tile_max1 > logsumexp1, tile_max1, logsumexp1)
+        new_max1 = tl.where(tile_max1 > logsumexp1, logsumexp1, tile_max1)
+        
+        sumexp1 = tl.where(tile_max1 > logsumexp1,
+                          sumexp1 * tl.exp(new_max1 - old_max1) + tl.sum(exp1, axis=1),
+                          sumexp1 + tl.sum(exp1, axis=1) * tl.exp(tile_max1 - old_max1))
+        
+        # For branch 2
+        old_max2 = tl.where(tile_max2 > logsumexp2, tile_max2, logsumexp2)
+        new_max2 = tl.where(tile_max2 > logsumexp2, logsumexp2, tile_max2)
+        
+        sumexp2 = tl.where(tile_max2 > logsumexp2,
+                          sumexp2 * tl.exp(new_max2 - old_max2) + tl.sum(exp2, axis=1),
+                          sumexp2 + tl.sum(exp2, axis=1) * tl.exp(tile_max2 - old_max2))
+        
+        logsumexp1 = old_max1
+        logsumexp2 = old_max2
+    
+    # Compute final log-sum-exp
+    lse1 = logsumexp1 + tl.log(sumexp1)
+    lse2 = logsumexp2 + tl.log(sumexp2)
+    
+    # Second pass: compute JSD
+    for n_start in range(0, N, BLOCK_N):
+        n_offsets = n_start + tl.arange(0, BLOCK_N)
+        n_mask = n_offsets < N
+        
+        # Initialize accumulators for this tile
+        logits1_acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+        logits2_acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+        
+        # Process K dimension in tiles
+        for k_start in range(0, K, BLOCK_K):
+            k_offsets = k_start + tl.arange(0, BLOCK_K)
+            k_mask = k_offsets < K
+            
+            # Load input tile
+            x_ptrs = X_ptr + m_offsets[:, None] * stride_Xm + k_offsets[None, :] * stride_Xk
+            x = tl.load(x_ptrs, mask=m_mask[:, None] & k_mask[None, :], other=0.0)
+            
+            # Load weight tiles
+            w1_ptrs = W1_ptr + k_offsets[:, None] * stride_W1k + n_offsets[None, :] * stride_W1n
+            w1 = tl.load(w1_ptrs, mask=k_mask[:, None] & n_mask[None, :], other=0.0)
+            
+            w2_ptrs = W2_ptr + k_offsets[:, None] * stride_W2k + n_offsets[None, :] * stride_W2n
+            w2 = tl.load(w2_ptrs, mask=k_mask[:, None] & n_mask[None, :], other=0.0)
+            
+            # Matrix multiplication with accumulation
+            logits1_acc += tl.dot(x, w1, allow_tf32=True)
+            logits2_acc += tl.dot(x, w2, allow_tf32=True)
+        
+        # Load bias tiles
+        b1_ptrs = B1_ptr + n_offsets * stride_B1n
+        b1 = tl.load(b1_ptrs, mask=n_mask, other=0.0).to(tl.float32)
+        
+        b2_ptrs = B2_ptr + n_offsets * stride_B2n
+        b2 = tl.load(b2_ptrs, mask=n_mask, other=0.0).to(tl.float32)
+        
+        # Add biases
+        logits1_acc += b1[None, :]
+        logits2_acc += b2[None, :]
+        
+        # Compute probabilities in log space
+        log_p = logits1_acc - lse1[:, None]
+        log_q = logits2_acc - lse2[:, None]
+        
+        # Compute probabilities
+        p = tl.exp(log_p)
+        q = tl.exp(log_q)
+        
+        # Compute M = 0.5 * (P + Q)
+        m = 0.5 * (p + q)
+        
+        # Compute log M safely (avoid log(0))
+        log_m = tl.log(tl.where(m > 0, m, 1e-12))
+        
+        # Compute KL divergences
+        # KL(P||M) = sum(P * (log P - log M))
+        kl_pm = p * (log_p - log_m)
+        kl_qm = q * (log_q - log_m)
+        
+        # Accumulate JSD contributions
+        out_acc += tl.sum(0.5 * (kl_pm + kl_qm), axis=1)
+    
+    # Store output
+    out_ptrs = out_ptr + m_offsets
+    tl.store(out_ptrs, out_acc, mask=m_mask)
 
 class Solution:
     def solve(self, spec_path: str = None) -> dict:
-        code = '''
-import torch
-import triton
-import triton.language as tl
-from typing import Optional
-import math
-
-@triton.jit
-def _fused_linear_jsd_kernel_pass1(
-    X, W1, W2, B1, B2, M, K, N,
-    stride_xm, stride_xk,
-    stride_w1k, stride_w1n,
-    stride_w2k, stride_w2n,
-    log_sum_exp1, log_sum_exp2,
-    BLOCK_SIZE_M: tl.constexpr,
-    BLOCK_SIZE_K: tl.constexpr,
-    BLOCK_SIZE_N: tl.constexpr,
-    GROUP_SIZE_M: tl.constexpr,
-):
-    pid = tl.program_id(0)
-    num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
-    num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
-    num_pid_in_group = GROUP_SIZE_M * num_pid_n
-    group_id = pid // num_pid_in_group
-    first_pid_m = group_id * GROUP_SIZE_M
-    group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
-    pid_m = first_pid_m + (pid % group_size_m)
-    pid_n = (pid % num_pid_in_group) // group_size_m
-    
-    offs_m = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
-    offs_n = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
-    offs_k = tl.arange(0, BLOCK_SIZE_K)
-    
-    X_ptrs = X + (offs_m[:, None] * stride_xm + offs_k[None, :] * stride_xk)
-    W1_ptrs = W1 + (offs_k[:, None] * stride_w1k + offs_n[None, :] * stride_w1n)
-    W2_ptrs = W2 + (offs_k[:, None] * stride_w2k + offs_n[None, :] * stride_w2n)
-    
-    accumulator1 = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
-    accumulator2 = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
-    
-    for k in range(0, K, BLOCK_SIZE_K):
-        k_remaining = K - k
-        k_mask = offs_k < k_remaining
+        """
+        Returns a dict with either:
+        - {"code": "python_code_string"}
+        - {"program_path": "path/to/kernel.py"}
+        """
+        # Read the current file and return its contents
+        current_file = os.path.abspath(__file__)
         
-        x = tl.load(X_ptrs, mask=k_mask[None, :] & (offs_m[:, None] < M), other=0.0)
-        w1 = tl.load(W1_ptrs, mask=k_mask[:, None] & (offs_n[None, :] < N), other=0.0)
-        w2 = tl.load(W2_ptrs, mask=k_mask[:, None] & (offs_n[None, :] < N), other=0.0)
+        # For the purpose of this implementation, we'll return the code
+        with open(current_file, 'r') as f:
+            code_content = f.read()
         
-        accumulator1 += tl.dot(x, w1, allow_tf32=False)
-        accumulator2 += tl.dot(x, w2, allow_tf32=False)
-        
-        X_ptrs += BLOCK_SIZE_K * stride_xk
-        W1_ptrs += BLOCK_SIZE_K * stride_w1k
-        W2_ptrs += BLOCK_SIZE_K * stride_w2k
-    
-    if BLOCK_SIZE_N == 1:
-        b1 = tl.load(B1 + offs_n, mask=offs_n < N)
-        b2 = tl.load(B2 + offs_n, mask=offs_n < N)
-        accumulator1 += b1[None, :]
-        accumulator2 += b2[None, :]
-    
-    m1 = tl.max(accumulator1, 1)
-    m2 = tl.max(accumulator2, 1)
-    
-    exp1 = tl.exp(accumulator1 - m1[:, None])
-    exp2 = tl.exp(accumulator2 - m2[:, None])
-    
-    sum1 = tl.sum(exp1, 1)
-    sum2 = tl.sum(exp2, 1)
-    
-    lse1 = m1 + tl.log(sum1)
-    lse2 = m2 + tl.log(sum2)
-    
-    out_ptrs1 = log_sum_exp1 + offs_m
-    out_ptrs2 = log_sum_exp2 + offs_m
-    tl.store(out_ptrs1, lse1, mask=offs_m < M)
-    tl.store(out_ptrs2, lse2, mask=offs_m < M)
-
-@triton.jit
-def _fused_linear_jsd_kernel_pass2(
-    X, W1, W2, B1, B2, M, K, N,
-    stride_xm, stride_xk,
-    stride_w1k, stride_w1n,
-    stride_w2k, stride_w2n,
-    log_sum_exp1, log_sum_exp2,
-    output,
-    BLOCK_SIZE_M: tl.constexpr,
-    BLOCK_SIZE_K: tl.constexpr,
-    BLOCK_SIZE_N: tl.constexpr,
-    GROUP_SIZE_M: tl.constexpr,
-):
-    pid = tl.program_id(0)
-    num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
-    num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
-    num_pid_in_group = GROUP_SIZE_M * num_pid_n
-    group_id = pid // num_pid_in_group
-    first_pid_m = group_id * GROUP_SIZE_M
-    group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
-    pid_m = first_pid_m + (pid % group_size_m)
-    pid_n = (pid % num_pid_in_group) // group_size_m
-    
-    offs_m = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
-    offs_n = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
-    offs_k = tl.arange(0, BLOCK_SIZE_K)
-    
-    X_ptrs = X + (offs_m[:, None] * stride_xm + offs_k[None, :] * stride_xk)
-    W1_ptrs = W1 + (offs_k[:, None] * stride_w1k + offs_n[None, :] * stride_w1n)
-    W2_ptrs = W2 + (offs_k[:, None] * stride_w2k + offs_n[None, :] * stride_w2n)
-    
-    accumulator1 = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
-    accumulator2 = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
-    
-    for k in range(0, K, BLOCK_SIZE_K):
-        k_remaining = K - k
-        k_mask = offs_k < k_remaining
-        
-        x = tl.load(X_ptrs, mask=k_mask[None, :] & (offs_m[:, None] < M), other=0.0)
-        w1 = tl.load(W1_ptrs, mask=k_mask[:, None] & (offs_n[None, :] < N), other=0.0)
-        w2 = tl.load(W2_ptrs, mask=k_mask[:, None] & (offs_n[None, :] < N), other=0.0)
-        
-        accumulator1 += tl.dot(x, w1, allow_tf32=False)
-        accumulator2 += tl.dot(x, w2, allow_tf32=False)
-        
-        X_ptrs += BLOCK_SIZE_K * stride_xk
-        W1_ptrs += BLOCK_SIZE_K * stride_w1k
-        W2_ptrs += BLOCK_SIZE_K * stride_w2k
-    
-    if BLOCK_SIZE_N == 1:
-        b1 = tl.load(B1 + offs_n, mask=offs_n < N)
-        b2 = tl.load(B2 + offs_n, mask=offs_n < N)
-        accumulator1 += b1[None, :]
-        accumulator2 += b2[None, :]
-    
-    lse1 = tl.load(log_sum_exp1 + offs_m, mask=offs_m < M)
-    lse2 = tl.load(log_sum_exp2 + offs_m, mask=offs_m < M)
-    
-    log_p = accumulator1 - lse1[:, None]
-    log_q = accumulator2 - lse2[:, None]
-    
-    p = tl.exp(log_p)
-    q = tl.exp(log_q)
-    
-    m = 0.5 * (p + q)
-    
-    log_m = tl.log(m)
-    
-    kl_pm = tl.where(m > 0, p * (log_p - log_m), 0.0)
-    kl_qm = tl.where(m > 0, q * (log_q - log_m), 0.0)
-    
-    jsd_contrib = 0.5 * (kl_pm + kl_qm)
-    jsd_block = tl.sum(jsd_contrib, 1)
-    
-    out_ptrs = output + offs_m
-    tl.atomic_add(out_ptrs, jsd_block, mask=offs_m < M)
-
-def fused_linear_jsd(X: torch.Tensor, W1: torch.Tensor, B1: torch.Tensor, 
-                     W2: torch.Tensor, B2: torch.Tensor) -> torch.Tensor:
-    M, K = X.shape
-    N = W1.shape[1]
-    
-    assert X.dtype == torch.float16
-    assert W1.dtype == torch.float16
-    assert W2.dtype == torch.float16
-    assert B1.dtype == torch.float32
-    assert B2.dtype == torch.float32
-    
-    device = X.device
-    
-    log_sum_exp1 = torch.empty(M, dtype=torch.float32, device=device)
-    log_sum_exp2 = torch.empty(M, dtype=torch.float32, device=device)
-    output = torch.zeros(M, dtype=torch.float32, device=device)
-    
-    def get_config(M, N, K):
-        if M <= 128:
-            BLOCK_SIZE_M = 32
-            BLOCK_SIZE_N = 64
-            BLOCK_SIZE_K = 64
-            GROUP_SIZE_M = 4
-        else:
-            BLOCK_SIZE_M = 64
-            BLOCK_SIZE_N = 128
-            BLOCK_SIZE_K = 64
-            GROUP_SIZE_M = 4
-        
-        num_warps = 4
-        if BLOCK_SIZE_N >= 128:
-            num_warps = 8
-        elif BLOCK_SIZE_N >= 256:
-            num_warps = 16
-        
-        return {
-            'BLOCK_SIZE_M': BLOCK_SIZE_M,
-            'BLOCK_SIZE_N': BLOCK_SIZE_N,
-            'BLOCK_SIZE_K': BLOCK_SIZE_K,
-            'GROUP_SIZE_M': GROUP_SIZE_M,
-            'num_warps': num_warps
-        }
-    
-    config = get_config(M, N, K)
-    
-    grid = lambda META: (
-        triton.cdiv(M, META['BLOCK_SIZE_M']) * triton.cdiv(N, META['BLOCK_SIZE_N']), 
-    )
-    
-    # Pass 1: Compute log-sum-exp
-    _fused_linear_jsd_kernel_pass1[grid](
-        X, W1, W2, B1, B2, M, K, N,
-        X.stride(0), X.stride(1),
-        W1.stride(0), W1.stride(1),
-        W2.stride(0), W2.stride(1),
-        log_sum_exp1, log_sum_exp2,
-        **config
-    )
-    
-    # Reset output for atomic accumulation
-    output.zero_()
-    
-    # Pass 2: Compute JSD
-    _fused_linear_jsd_kernel_pass2[grid](
-        X, W1, W2, B1, B2, M, K, N,
-        X.stride(0), X.stride(1),
-        W1.stride(0), W1.stride(1),
-        W2.stride(0), W2.stride(1),
-        log_sum_exp1, log_sum_exp2,
-        output,
-        **config
-    )
-    
-    return output
-'''
-        return {"code": code}
+        return {"code": code_content}

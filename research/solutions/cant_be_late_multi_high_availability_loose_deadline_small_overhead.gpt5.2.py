@@ -1,20 +1,159 @@
 import json
-import math
 import os
+import pickle
 from argparse import Namespace
 from array import array
-from typing import List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from sky_spot.strategies.multi_strategy import MultiRegionStrategy
 from sky_spot.utils import ClusterType
 
+try:
+    import numpy as np  # type: ignore
+except Exception:  # pragma: no cover
+    np = None  # type: ignore
+
+
+_TRACE_CACHE: Dict[str, bytearray] = {}
+
+
+def _to_bit(v: Any) -> int:
+    if v is None:
+        return 0
+    if isinstance(v, (bool, int)):
+        return 1 if int(v) != 0 else 0
+    if isinstance(v, float):
+        return 1 if v > 0.0 else 0
+    s = str(v).strip()
+    if not s:
+        return 0
+    sl = s.lower()
+    if sl in ("1", "true", "t", "yes", "y", "on"):
+        return 1
+    if sl in ("0", "false", "f", "no", "n", "off"):
+        return 0
+    try:
+        return 1 if float(s) > 0.0 else 0
+    except Exception:
+        return 0
+
+
+def _extract_sequence(obj: Any) -> Optional[Sequence[Any]]:
+    if obj is None:
+        return None
+    if isinstance(obj, (list, tuple)):
+        return obj
+    if isinstance(obj, dict):
+        for k in ("availability", "avail", "spot", "has_spot", "spot_available", "data", "trace", "values"):
+            if k in obj and isinstance(obj[k], (list, tuple)):
+                return obj[k]
+        return None
+    return None
+
+
+def _trace_from_sequence(seq: Sequence[Any]) -> bytearray:
+    out = bytearray()
+    append = out.append
+    for x in seq:
+        if isinstance(x, (list, tuple)) and x:
+            append(_to_bit(x[-1]))
+        elif isinstance(x, dict):
+            val = None
+            for k in ("availability", "avail", "spot", "has_spot", "spot_available", "value", "v"):
+                if k in x:
+                    val = x[k]
+                    break
+            append(_to_bit(val))
+        else:
+            append(_to_bit(x))
+    return out
+
+
+def _load_trace_file(path: str) -> bytearray:
+    cached = _TRACE_CACHE.get(path)
+    if cached is not None:
+        return cached
+
+    data: Optional[bytearray] = None
+    try:
+        with open(path, "rb") as f:
+            raw = f.read()
+    except Exception:
+        raw = b""
+
+    if raw:
+        # NPY/NPZ
+        if np is not None and (raw[:6] == b"\x93NUMPY" or path.endswith(".npy") or path.endswith(".npz")):
+            try:
+                if path.endswith(".npz"):
+                    with np.load(path, allow_pickle=True) as z:
+                        if "arr_0" in z:
+                            arr = z["arr_0"]
+                        else:
+                            first_key = next(iter(z.files))
+                            arr = z[first_key]
+                else:
+                    arr = np.load(path, allow_pickle=True)
+                arr = np.asarray(arr).reshape(-1)
+                data = bytearray(int(x) & 1 for x in arr.tolist())
+            except Exception:
+                data = None
+
+        # Pickle
+        if data is None and (raw[:2] == b"\x80\x04" or path.endswith((".pkl", ".pickle"))):
+            try:
+                obj = pickle.loads(raw)
+                seq = _extract_sequence(obj)
+                if seq is not None:
+                    data = _trace_from_sequence(seq)
+            except Exception:
+                data = None
+
+        # JSON
+        if data is None:
+            s0 = raw.lstrip()[:1]
+            if s0 in (b"[", b"{"):
+                try:
+                    obj = json.loads(raw.decode("utf-8", errors="ignore"))
+                    seq = _extract_sequence(obj)
+                    if seq is not None:
+                        data = _trace_from_sequence(seq)
+                except Exception:
+                    data = None
+
+        # Text/CSV fallback
+        if data is None:
+            try:
+                txt = raw.decode("utf-8", errors="ignore")
+                lines = txt.splitlines()
+                out = bytearray()
+                append = out.append
+                for line in lines:
+                    line = line.strip()
+                    if not line or line.startswith("#"):
+                        continue
+                    if "," in line:
+                        token = line.split(",")[-1].strip()
+                    elif "\t" in line:
+                        token = line.split("\t")[-1].strip()
+                    else:
+                        parts = line.split()
+                        token = parts[-1] if parts else ""
+                    append(_to_bit(token))
+                if out:
+                    data = out
+            except Exception:
+                data = None
+
+    if data is None:
+        data = bytearray()
+
+    _TRACE_CACHE[path] = data
+    return data
+
 
 class Solution(MultiRegionStrategy):
-    NAME = "cant_be_late_mr_v1"
-
-    # Prices are fixed in the problem statement; used only for optional heuristics.
-    _ON_DEMAND_PRICE = 3.06
-    _SPOT_PRICE = 0.9701
+    NAME = "cant_be_late_strategy"
 
     def solve(self, spec_path: str) -> "Solution":
         with open(spec_path) as f:
@@ -28,414 +167,215 @@ class Solution(MultiRegionStrategy):
         )
         super().__init__(args)
 
-        self._trace_files = list(config.get("trace_files", [])) if isinstance(config, dict) else []
-        self._traces_avail: List[bytearray] = []
-        self._traces_streak: List[array] = []
-        self._max_trace_len: int = 0
+        self._trace_files: List[str] = list(config.get("trace_files", [])) if isinstance(config.get("trace_files", []), list) else []
+        self._raw_traces: List[bytearray] = []
+        for p in self._trace_files:
+            try:
+                self._raw_traces.append(_load_trace_file(p))
+            except Exception:
+                self._raw_traces.append(bytearray())
 
-        self._any_avail: Optional[bytearray] = None
-        self._next_any: Optional[array] = None
+        self._precomputed = False
+        self._traces: List[bytearray] = []
+        self._streaks: List[array] = []
+        self._any_spot: bytearray = bytearray()
+        self._cum_any: array = array("I")
+        self._avg_avail: List[float] = []
+        self._T = 0
 
-        self._done_sum: float = 0.0
-        self._done_len: int = 0
-
-        self._initialized_runtime: bool = False
-        self._n_regions_runtime: int = 0
-
-        if self._trace_files:
-            for p in self._trace_files:
-                avail = self._load_trace_availability(p)
-                if avail is None:
-                    avail = bytearray()
-                self._traces_avail.append(avail)
-                self._max_trace_len = max(self._max_trace_len, len(avail))
-
-            for avail in self._traces_avail:
-                self._traces_streak.append(self._compute_streak(avail))
-
-            self._recompute_any_next()
+        self._td_len = 0
+        self._work_done = 0.0
 
         return self
 
-    def _sec_attr(self, x):
-        if isinstance(x, (list, tuple)):
-            return float(x[0]) if x else 0.0
-        return float(x)
-
-    def _update_done_sum(self):
+    def _update_progress(self) -> None:
         td = self.task_done_time
-        ln = len(td)
-        if ln > self._done_len:
-            self._done_sum += float(sum(td[self._done_len:ln]))
-            self._done_len = ln
+        n = len(td)
+        if n == self._td_len:
+            return
+        if self._td_len == 0 and n <= 16:
+            self._work_done = float(sum(td))
+        else:
+            self._work_done += float(sum(td[self._td_len :]))
+        self._td_len = n
 
-    def _idx_now(self) -> int:
-        gap = float(self.env.gap_seconds)
-        if gap <= 0:
-            return 0
-        t = float(self.env.elapsed_seconds)
-        # Robust floor for float arithmetic
-        return int(math.floor((t + 1e-9) / gap))
-
-    def _spot_at(self, region: int, idx: int) -> int:
-        if region < 0 or region >= len(self._traces_avail):
-            return 0
-        av = self._traces_avail[region]
-        if idx < 0 or idx >= len(av):
-            return 0
-        return 1 if av[idx] else 0
-
-    def _streak_at(self, region: int, idx: int) -> int:
-        if region < 0 or region >= len(self._traces_streak):
-            return 0
-        st = self._traces_streak[region]
-        if idx < 0 or idx >= len(st):
-            return 0
-        return int(st[idx])
-
-    def _best_spot_region_now(self, idx: int, n_regions: int) -> Tuple[int, int]:
-        # Returns (best_region, best_streak_steps) or (-1, 0) if none have spot.
-        best_r = -1
-        best_s = 0
-        nr = min(n_regions, len(self._traces_avail)) if self._traces_avail else 0
-        if nr <= 0:
-            return -1, 0
-        for r in range(nr):
-            s = self._streak_at(r, idx)
-            if s > best_s:
-                best_s = s
-                best_r = r
-        if best_s <= 0:
-            return -1, 0
-        return best_r, best_s
-
-    def _next_any_spot_idx(self, idx: int) -> int:
-        if self._next_any is None:
-            return 1 << 30
-        if idx < 0:
-            idx = 0
-        if idx >= len(self._next_any):
-            return 1 << 30
-        return int(self._next_any[idx])
-
-    def _recompute_any_next(self):
-        if self._max_trace_len <= 0 or not self._traces_avail:
-            self._any_avail = None
-            self._next_any = None
+    def _ensure_precomputed(self) -> None:
+        if self._precomputed:
             return
 
-        L = self._max_trace_len
-        any_av = bytearray(L)
-
-        # OR across regions
-        for r, av in enumerate(self._traces_avail):
-            m = min(L, len(av))
-            for i in range(m):
-                if av[i]:
-                    any_av[i] = 1
-
-        self._any_avail = any_av
-        nxt = array("I", [L + 1]) * (L + 2)
-        next_pos = L + 1
-        for i in range(L - 1, -1, -1):
-            if any_av[i]:
-                next_pos = i
-            nxt[i] = next_pos
-        nxt[L] = next_pos
-        nxt[L + 1] = L + 1
-        self._next_any = nxt
-
-    def _compute_streak(self, avail: bytearray) -> array:
-        L = len(avail)
-        st = array("I", [0]) * (L + 1)
-        run = 0
-        for i in range(L - 1, -1, -1):
-            if avail[i]:
-                run += 1
-            else:
-                run = 0
-            st[i] = run
-        st[L] = 0
-        return st
-
-    def _load_trace_availability(self, path: str) -> Optional[bytearray]:
         try:
-            if not path or not os.path.exists(path):
-                return bytearray()
-
-            # NPY support (optional)
-            if path.endswith(".npy"):
-                try:
-                    import numpy as np  # type: ignore
-
-                    arr = np.load(path, allow_pickle=False)
-                    flat = arr.ravel()
-                    out = bytearray(int(x) != 0 for x in flat.tolist())
-                    return out
-                except Exception:
-                    pass
-
-            with open(path, "rb") as f:
-                head = f.read(4096)
-            # JSON support
-            s = head.lstrip()
-            if s.startswith(b"[") or s.startswith(b"{"):
-                try:
-                    with open(path, "r", encoding="utf-8") as f:
-                        data = json.load(f)
-                    vals = []
-                    if isinstance(data, list):
-                        vals = data
-                    elif isinstance(data, dict):
-                        for k in ("availability", "available", "has_spot", "spot", "trace", "values"):
-                            if k in data and isinstance(data[k], list):
-                                vals = data[k]
-                                break
-                    out = bytearray()
-                    for x in vals:
-                        if isinstance(x, dict):
-                            if "available" in x:
-                                out.append(1 if x["available"] else 0)
-                            elif "availability" in x:
-                                out.append(1 if x["availability"] else 0)
-                            elif "has_spot" in x:
-                                out.append(1 if x["has_spot"] else 0)
-                            elif "interrupt" in x:
-                                out.append(0 if x["interrupt"] else 1)
-                            elif "interruption" in x:
-                                out.append(0 if x["interruption"] else 1)
-                            elif "price" in x:
-                                v = x["price"]
-                                try:
-                                    fv = float(v)
-                                    out.append(1 if (not math.isnan(fv) and fv > 0.0) else 0)
-                                except Exception:
-                                    out.append(0)
-                            else:
-                                out.append(0)
-                        else:
-                            if isinstance(x, bool):
-                                out.append(1 if x else 0)
-                            else:
-                                try:
-                                    fv = float(x)
-                                    if math.isnan(fv):
-                                        out.append(0)
-                                    else:
-                                        out.append(1 if fv != 0.0 else 0)
-                                except Exception:
-                                    out.append(0)
-                    return out
-                except Exception:
-                    pass
-
-            # Text/CSV support
-            with open(path, "r", encoding="utf-8", errors="ignore") as f:
-                first = f.readline()
-                if not first:
-                    return bytearray()
-
-                delim = "," if "," in first else ("\t" if "\t" in first else None)
-                out = bytearray()
-
-                def is_number(tok: str) -> bool:
-                    try:
-                        float(tok)
-                        return True
-                    except Exception:
-                        return False
-
-                # Header detection
-                tokens = [t.strip() for t in (first.strip().split(delim) if delim else first.strip().split()) if t.strip() != ""]
-                has_header = any(not is_number(t) for t in tokens)
-
-                col_idx = None
-                invert_interrupt = False
-                price_like = False
-
-                if has_header and tokens:
-                    low = [t.lower() for t in tokens]
-                    chosen = None
-                    for key in ("availability", "available", "has_spot", "spot"):
-                        for j, name in enumerate(low):
-                            if key == name or name.endswith(key) or key in name:
-                                if "price" in name:
-                                    continue
-                                chosen = j
-                                break
-                        if chosen is not None:
-                            break
-                    if chosen is None:
-                        for key in ("interrupt", "interruption", "preempt", "evict"):
-                            for j, name in enumerate(low):
-                                if key in name:
-                                    chosen = j
-                                    invert_interrupt = True
-                                    break
-                            if chosen is not None:
-                                break
-                    if chosen is None:
-                        for j, name in enumerate(low):
-                            if "price" in name:
-                                chosen = j
-                                price_like = True
-                                break
-                    col_idx = chosen
-
-                    # Read remaining lines after header
-                    for line in f:
-                        line = line.strip()
-                        if not line:
-                            continue
-                        parts = [p.strip() for p in (line.split(delim) if delim else line.split())]
-                        if not parts:
-                            continue
-                        j = col_idx if col_idx is not None and col_idx < len(parts) else (len(parts) - 1)
-                        tok = parts[j]
-                        if tok == "" or tok.lower() == "nan":
-                            out.append(0 if price_like else 0)
-                            continue
-                        try:
-                            fv = float(tok)
-                            if math.isnan(fv):
-                                out.append(0)
-                            else:
-                                if price_like:
-                                    out.append(1 if fv > 0.0 else 0)
-                                else:
-                                    v = 1 if fv != 0.0 else 0
-                                    if invert_interrupt:
-                                        v = 1 - v
-                                    out.append(v)
-                        except Exception:
-                            tl = tok.lower()
-                            if tl in ("true", "t", "yes", "y"):
-                                v = 1
-                            elif tl in ("false", "f", "no", "n"):
-                                v = 0
-                            else:
-                                v = 0
-                            if invert_interrupt:
-                                v = 1 - v
-                            out.append(v)
-                    return out
-
-                # No header: treat each line as numeric; take last column if multiple.
-                def parse_line(line: str):
-                    line = line.strip()
-                    if not line:
-                        return None
-                    parts = [p.strip() for p in (line.split(delim) if delim else line.split())]
-                    if not parts:
-                        return None
-                    tok = parts[-1]
-                    if tok == "" or tok.lower() == "nan":
-                        return 0
-                    try:
-                        fv = float(tok)
-                        if math.isnan(fv):
-                            return 0
-                        return 1 if fv != 0.0 else 0
-                    except Exception:
-                        tl = tok.lower()
-                        if tl in ("true", "t", "yes", "y"):
-                            return 1
-                        if tl in ("false", "f", "no", "n"):
-                            return 0
-                        return 0
-
-                v0 = parse_line(first)
-                if v0 is not None:
-                    out.append(v0)
-                for line in f:
-                    v = parse_line(line)
-                    if v is not None:
-                        out.append(v)
-                return out
+            R = int(self.env.get_num_regions())
         except Exception:
-            return bytearray()
+            R = len(self._raw_traces)
 
-    def _step(self, last_cluster_type: ClusterType, has_spot: bool) -> ClusterType:
-        if not self._initialized_runtime:
-            try:
-                self._n_regions_runtime = int(self.env.get_num_regions())
-            except Exception:
-                self._n_regions_runtime = 0
-            self._initialized_runtime = True
+        if R <= 0:
+            self._precomputed = True
+            return
 
-        self._update_done_sum()
+        raw = self._raw_traces[:R]
+        if not raw or all(len(x) == 0 for x in raw):
+            self._precomputed = True
+            return
 
-        task_duration = self._sec_attr(self.task_duration)
-        deadline = self._sec_attr(self.deadline)
-        restart_overhead = self._sec_attr(self.restart_overhead)
-        t = float(self.env.elapsed_seconds)
-        remaining_time = deadline - t
-        remaining_work = task_duration - self._done_sum
-        if remaining_work <= 1e-9:
-            return ClusterType.NONE
+        # Determine required horizon length in steps (extend traces if needed).
+        gap = float(getattr(self.env, "gap_seconds", 1.0) or 1.0)
+        needed_steps = int(self.deadline // gap) + 8
+        lengths = [len(x) for x in raw if len(x) > 0]
+        if not lengths:
+            self._precomputed = True
+            return
 
-        pending_oh = float(getattr(self, "remaining_restart_overhead", 0.0) or 0.0)
-        slack = remaining_time - (remaining_work + pending_oh)
+        T = max(max(lengths), needed_steps)
+        traces: List[bytearray] = []
+        avg_avail: List[float] = []
+        for r in range(R):
+            tr = raw[r] if r < len(raw) else bytearray()
+            if len(tr) == 0:
+                tr = bytearray([0]) * T
+            elif len(tr) < T:
+                last = tr[-1]
+                tr = tr + bytearray([last]) * (T - len(tr))
+            elif len(tr) > T:
+                tr = tr[:T]
+            traces.append(tr)
+            avg_avail.append((sum(tr) / float(T)) if T > 0 else 0.0)
+
+        any_spot = bytearray(T)
+        for t in range(T):
+            v = 0
+            for r in range(R):
+                if traces[r][t]:
+                    v = 1
+                    break
+            any_spot[t] = v
+
+        cum_any = array("I", [0]) * (T + 1)
+        c = 0
+        for t in range(T - 1, -1, -1):
+            if any_spot[t]:
+                c += 1
+            cum_any[t] = c
+
+        streaks: List[array] = []
+        for r in range(R):
+            st = array("I", [0]) * (T + 1)
+            tr = traces[r]
+            run = 0
+            for t in range(T - 1, -1, -1):
+                if tr[t]:
+                    run += 1
+                else:
+                    run = 0
+                st[t] = run
+            streaks.append(st)
+
+        self._traces = traces
+        self._streaks = streaks
+        self._any_spot = any_spot
+        self._cum_any = cum_any
+        self._avg_avail = avg_avail
+        self._T = T
+        self._precomputed = True
+
+    def _choose_best_spot_region(self, idx: int, last_cluster_type: ClusterType) -> int:
+        R = len(self._traces)
+        if R <= 1:
+            return 0
+        cur = int(self.env.get_current_region())
+        if idx < 0:
+            idx = 0
+        if idx >= self._T:
+            idx = self._T - 1
 
         gap = float(self.env.gap_seconds)
-        safety = max(0.0, min(0.5 * gap, 4.0 * restart_overhead))
+        switch_penalty = float(self.restart_overhead)
 
-        # If deadline is tight, prefer on-demand to avoid interruption risk and extra restarts.
-        if slack <= -safety:
+        best_r = -1
+        best_score = -1e30
+        best_avg = -1.0
+
+        for r in range(R):
+            if not self._traces[r][idx]:
+                continue
+            streak = float(self._streaks[r][idx])
+            score = streak * gap
+            if r != cur:
+                score -= switch_penalty
+            avg = self._avg_avail[r]
+            if score > best_score or (score == best_score and avg > best_avg) or (score == best_score and avg == best_avg and r == cur):
+                best_score = score
+                best_avg = avg
+                best_r = r
+
+        if best_r < 0:
+            return cur
+        return best_r
+
+    def _step(self, last_cluster_type: ClusterType, has_spot: bool) -> ClusterType:
+        self._update_progress()
+
+        task_duration = float(self.task_duration)
+        remaining_work = task_duration - self._work_done
+        if remaining_work <= 0.0:
+            return ClusterType.NONE
+
+        elapsed = float(self.env.elapsed_seconds)
+        remaining_time = float(self.deadline) - elapsed
+        if remaining_time <= 0.0:
             return ClusterType.ON_DEMAND
 
-        # Avoid wasting already-paid overhead: don't switch cluster type while warmup is pending.
-        if pending_oh > 1e-9:
-            if last_cluster_type == ClusterType.ON_DEMAND:
+        gap = float(self.env.gap_seconds)
+        overhead_pending = float(getattr(self, "remaining_restart_overhead", 0.0) or 0.0)
+
+        required_wall = remaining_work + overhead_pending
+
+        panic_margin = max(2.0 * gap, 4.0 * float(self.restart_overhead))
+        if remaining_time <= required_wall + panic_margin:
+            self._ensure_precomputed()
+            if self._precomputed and self._traces:
+                idx = int(elapsed // gap) if gap > 0 else 0
+                if idx < 0:
+                    idx = 0
+                if idx >= self._T:
+                    idx = self._T - 1
+                cur = int(self.env.get_current_region())
+                if 0 <= cur < len(self._traces) and self._traces[cur][idx]:
+                    if float(self._streaks[cur][idx]) * gap >= required_wall:
+                        return ClusterType.SPOT
                 return ClusterType.ON_DEMAND
-            if last_cluster_type == ClusterType.SPOT and has_spot:
-                return ClusterType.SPOT
-            # If spot is unavailable, fall through to choose a feasible action.
+            return ClusterType.SPOT if has_spot else ClusterType.ON_DEMAND
 
-        idx = self._idx_now()
-        cur_region = 0
-        try:
-            cur_region = int(self.env.get_current_region())
-        except Exception:
-            cur_region = 0
+        self._ensure_precomputed()
 
-        # If no traces loaded, simple fallback.
-        if not self._traces_avail:
-            if has_spot and slack >= safety:
-                return ClusterType.SPOT
-            if slack > safety and not has_spot:
-                return ClusterType.NONE
-            return ClusterType.ON_DEMAND
+        if self._precomputed and self._traces:
+            idx = int(elapsed // gap) if gap > 0 else 0
+            if idx < 0:
+                idx = 0
+            if idx >= self._T:
+                idx = self._T - 1
 
-        n_regions = self._n_regions_runtime if self._n_regions_runtime > 0 else len(self._traces_avail)
-        best_r, best_streak = self._best_spot_region_now(idx, n_regions)
-
-        if best_r >= 0 and best_streak > 0:
-            # Prefer staying on current spot if already on spot and spot is available here.
-            if last_cluster_type == ClusterType.SPOT and has_spot:
+            if self._any_spot[idx]:
+                best_r = self._choose_best_spot_region(idx, last_cluster_type)
+                cur = int(self.env.get_current_region())
+                if best_r != cur:
+                    try:
+                        self.env.switch_region(best_r)
+                    except Exception:
+                        pass
                 return ClusterType.SPOT
 
-            # If switching/restarting, require some slack to absorb overhead-induced delay.
-            if slack < safety:
+            # No spot anywhere now: decide pause vs on-demand based on remaining required work
+            future_spot_steps = int(self._cum_any[idx + 1]) if (idx + 1) <= self._T else 0
+            future_spot_capacity = float(future_spot_steps) * gap
+            safety_work = float(self.restart_overhead) + 0.5 * gap
+            if remaining_work > future_spot_capacity + safety_work:
                 return ClusterType.ON_DEMAND
+            return ClusterType.NONE
 
-            if best_r != cur_region:
-                try:
-                    self.env.switch_region(best_r)
-                except Exception:
-                    pass
+        # No trace-based multi-region info; use simple online fallback.
+        if has_spot:
             return ClusterType.SPOT
 
-        # No spot anywhere now: wait until next spot if safe; otherwise use on-demand.
-        next_idx = self._next_any_spot_idx(idx)
-        if next_idx >= (1 << 29):
-            # No future spot known; use on-demand unless ample slack to pause.
-            if slack > safety:
-                return ClusterType.NONE
+        if remaining_time <= required_wall + max(gap, float(self.restart_overhead) * 2.0):
             return ClusterType.ON_DEMAND
-
-        wait_steps = max(0, next_idx - idx)
-        wait_seconds = wait_steps * gap
-        if wait_seconds <= slack - safety:
-            return ClusterType.NONE
-        return ClusterType.ON_DEMAND
+        return ClusterType.NONE

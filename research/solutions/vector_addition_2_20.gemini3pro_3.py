@@ -1,11 +1,8 @@
-import torch
-import triton
-import triton.language as tl
+import typing
 
 class Solution:
     def solve(self, spec_path: str = None) -> dict:
-        return {
-            "code": r"""
+        code = """
 import torch
 import triton
 import triton.language as tl
@@ -15,7 +12,7 @@ import triton.language as tl
         triton.Config({'BLOCK_SIZE': 1024}, num_warps=4),
         triton.Config({'BLOCK_SIZE': 2048}, num_warps=8),
         triton.Config({'BLOCK_SIZE': 4096}, num_warps=8),
-        triton.Config({'BLOCK_SIZE': 8192}, num_warps=8),
+        triton.Config({'BLOCK_SIZE': 8192}, num_warps=16),
     ],
     key=['n_elements'],
 )
@@ -27,31 +24,26 @@ def add_kernel(x_ptr, y_ptr, output_ptr, n_elements, BLOCK_SIZE: tl.constexpr):
     mask = offsets < n_elements
     
     # Load inputs
+    # Triton handles vectorization automatically for contiguous pointers
     x = tl.load(x_ptr + offsets, mask=mask)
     y = tl.load(y_ptr + offsets, mask=mask)
     
-    # Compute
+    # Element-wise addition
     output = x + y
     
-    # Store output
+    # Store result
     tl.store(output_ptr + offsets, output, mask=mask)
 
 def add(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     """
     Element-wise addition of two vectors using Triton.
-    
-    Args:
-        x: Input tensor of shape (1048576,)
-        y: Input tensor of shape (1048576,)
-    
-    Returns:
-        Output tensor of shape (1048576,) with x + y
+    Optimized for bandwidth.
     """
-    # Allocate output buffer
+    # Allocate output tensor
     output = torch.empty_like(x)
     n_elements = x.numel()
     
-    # Define grid function
+    # Define grid based on block size from autotuner
     grid = lambda meta: (triton.cdiv(n_elements, meta['BLOCK_SIZE']),)
     
     # Launch kernel
@@ -59,4 +51,4 @@ def add(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     
     return output
 """
-        }
+        return {"code": code}

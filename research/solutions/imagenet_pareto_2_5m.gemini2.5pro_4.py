@@ -1,19 +1,18 @@
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.optim.lr_scheduler import CosineAnnealingLR
 import copy
 
-# --- Model Definition ---
-
 class ResidualBlock(nn.Module):
-    """A residual block for an MLP."""
-    def __init__(self, size: int, dropout_p: float):
+    """
+    A residual block for an MLP with BatchNorm and Dropout.
+    """
+    def __init__(self, size: int, dropout_rate: float):
         super().__init__()
         self.fc1 = nn.Linear(size, size)
         self.bn1 = nn.BatchNorm1d(size)
-        self.act = nn.GELU()
-        self.dropout = nn.Dropout(dropout_p)
+        self.relu = nn.ReLU()
+        self.dropout = nn.Dropout(dropout_rate)
         self.fc2 = nn.Linear(size, size)
         self.bn2 = nn.BatchNorm1d(size)
 
@@ -21,38 +20,39 @@ class ResidualBlock(nn.Module):
         residual = x
         out = self.fc1(x)
         out = self.bn1(out)
-        out = self.act(out)
+        out = self.relu(out)
         out = self.dropout(out)
         out = self.fc2(out)
         out = self.bn2(out)
         out += residual
-        out = self.act(out)
+        out = self.relu(out)
         return out
 
-class ParetoNet(nn.Module):
-    """A deep MLP with residual connections optimized for the parameter budget."""
-    def __init__(self, input_dim: int, num_classes: int, hidden_dim: int, num_blocks: int, dropout_p: float):
+class ResNetMLP(nn.Module):
+    """
+    A ResNet-style MLP designed to maximize parameter usage within a budget.
+    """
+    def __init__(self, input_dim: int, num_classes: int, hidden_dim: int, num_blocks: int, dropout_rate: float):
         super().__init__()
-        
-        self.input_proj = nn.Sequential(
+        self.input_layer = nn.Sequential(
             nn.Linear(input_dim, hidden_dim),
             nn.BatchNorm1d(hidden_dim),
-            nn.GELU()
+            nn.ReLU(),
+            nn.Dropout(dropout_rate)
         )
         
-        self.residual_blocks = nn.Sequential(
-            *[ResidualBlock(size=hidden_dim, dropout_p=dropout_p) for _ in range(num_blocks)]
-        )
+        res_layers = []
+        for _ in range(num_blocks):
+            res_layers.append(ResidualBlock(hidden_dim, dropout_rate))
+        self.res_layers = nn.Sequential(*res_layers)
         
-        self.output_proj = nn.Linear(hidden_dim, num_classes)
+        self.output_layer = nn.Linear(hidden_dim, num_classes)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.input_proj(x)
-        x = self.residual_blocks(x)
-        x = self.output_proj(x)
+        x = self.input_layer(x)
+        x = self.res_layers(x)
+        x = self.output_layer(x)
         return x
-
-# --- Main Solution Class ---
 
 class Solution:
     def solve(self, train_loader, val_loader, metadata: dict = None) -> torch.nn.Module:
@@ -62,7 +62,15 @@ class Solution:
         Args:
             train_loader: PyTorch DataLoader with training data
             val_loader: PyTorch DataLoader with validation data
-            metadata: Dict with keys including num_classes, input_dim, device, etc.
+            metadata: Dict with keys:
+                - num_classes: int (128)
+                - input_dim: int (384)
+                - param_limit: int (2,500,000)
+                - baseline_accuracy: float (0.85)
+                - train_samples: int
+                - val_samples: int
+                - test_samples: int
+                - device: str ("cpu")
         
         Returns:
             Trained torch.nn.Module ready for evaluation
@@ -72,40 +80,44 @@ class Solution:
         num_classes = metadata["num_classes"]
 
         # --- Hyperparameters ---
-        HIDDEN_DIM = 727
-        NUM_BLOCKS = 2
-        DROPOUT_P = 0.25
-        LEARNING_RATE = 1e-3
-        WEIGHT_DECAY = 1e-2
-        EPOCHS = 600
-        PATIENCE = 75
+        # Architecture tuned to be just under 2.5M parameters
+        HIDDEN_DIM = 602
+        NUM_BLOCKS = 3
+        DROPOUT_RATE = 0.25
+        
+        # Training hyperparameters
+        LEARNING_RATE = 0.001
+        WEIGHT_DECAY = 0.01
+        EPOCHS = 350
+        PATIENCE = 40
         LABEL_SMOOTHING = 0.1
 
-        # --- Model Initialization ---
-        model = ParetoNet(
+        # --- Model Definition ---
+        model = ResNetMLP(
             input_dim=input_dim,
             num_classes=num_classes,
             hidden_dim=HIDDEN_DIM,
             num_blocks=NUM_BLOCKS,
-            dropout_p=DROPOUT_P
-        ).to(device)
+            dropout_rate=DROPOUT_RATE
+        )
+        model.to(device)
 
-        # --- Training Setup ---
-        criterion = nn.CrossEntropyLoss(label_smoothing=LABEL_SMOOTHING)
+        # --- Optimizer, Scheduler, Loss ---
         optimizer = optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
-        scheduler = CosineAnnealingLR(optimizer, T_max=EPOCHS, eta_min=1e-6)
+        scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=EPOCHS)
+        criterion = nn.CrossEntropyLoss(label_smoothing=LABEL_SMOOTHING)
 
-        best_acc = 0.0
+        # --- Training Loop with Early Stopping ---
+        best_val_acc = -1.0
         epochs_no_improve = 0
-        best_model_wts = copy.deepcopy(model.state_dict())
+        best_model_state = copy.deepcopy(model.state_dict())
 
-        # --- Training Loop ---
-        for _ in range(EPOCHS):
+        for epoch in range(EPOCHS):
             # Training phase
             model.train()
             for inputs, targets in train_loader:
                 inputs, targets = inputs.to(device), targets.to(device)
-
+                
                 optimizer.zero_grad()
                 outputs = model(inputs)
                 loss = criterion(outputs, targets)
@@ -114,32 +126,30 @@ class Solution:
 
             # Validation phase
             model.eval()
-            correct = 0
-            total = 0
+            val_correct = 0
+            val_total = 0
             with torch.no_grad():
                 for inputs, targets in val_loader:
                     inputs, targets = inputs.to(device), targets.to(device)
                     outputs = model(inputs)
                     _, predicted = torch.max(outputs.data, 1)
-                    total += targets.size(0)
-                    correct += (predicted == targets).sum().item()
-
-            val_acc = correct / total if total > 0 else 0.0
+                    val_total += targets.size(0)
+                    val_correct += (predicted == targets).sum().item()
+            
+            current_val_acc = val_correct / val_total
+            
             scheduler.step()
 
-            # Early stopping logic
-            if val_acc > best_acc:
-                best_acc = val_acc
+            # Check for improvement and save the best model
+            if current_val_acc > best_val_acc:
+                best_val_acc = current_val_acc
                 epochs_no_improve = 0
-                best_model_wts = copy.deepcopy(model.state_dict())
+                best_model_state = copy.deepcopy(model.state_dict())
             else:
                 epochs_no_improve += 1
-
+            
             if epochs_no_improve >= PATIENCE:
                 break
         
-        # Load best model weights before returning
-        if best_model_wts:
-            model.load_state_dict(best_model_wts)
-
+        model.load_state_dict(best_model_state)
         return model

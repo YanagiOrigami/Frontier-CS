@@ -1,26 +1,15 @@
 import json
 from argparse import Namespace
-from typing import Any
+from typing import List
 
 from sky_spot.strategies.multi_strategy import MultiRegionStrategy
 from sky_spot.utils import ClusterType
 
 
 class Solution(MultiRegionStrategy):
-    """Your multi-region scheduling strategy."""
-
-    NAME = "my_strategy"  # REQUIRED: unique identifier
+    NAME = "streak_strategy"
 
     def solve(self, spec_path: str) -> "Solution":
-        """
-        Initialize the solution from spec_path config.
-
-        The spec file contains:
-        - deadline: deadline in hours
-        - duration: task duration in hours
-        - overhead: restart overhead in hours
-        - trace_files: list of trace file paths (one per region)
-        """
         with open(spec_path) as f:
             config = json.load(f)
 
@@ -31,47 +20,70 @@ class Solution(MultiRegionStrategy):
             inter_task_overhead=[0.0],
         )
         super().__init__(args)
-        self.consecutive_skips = 0
+
+        self.avail: List[List[bool]] = []
+        for tf in config["trace_files"]:
+            with open(tf, 'r') as f:
+                trace = json.load(f)
+            self.avail.append([bool(x) for x in trace])
+
+        self.num_regions = len(self.avail)
+        if self.num_regions > 0:
+            self.total_steps = len(self.avail[0])
+            self.streaks: List[List[int]] = []
+            for r in range(self.num_regions):
+                trace = self.avail[r]
+                streak = [0] * self.total_steps
+                if self.total_steps > 0 and trace[-1]:
+                    streak[-1] = 1
+                for t in range(self.total_steps - 2, -1, -1):
+                    if trace[t]:
+                        streak[t] = 1 + streak[t + 1]
+                    else:
+                        streak[t] = 0
+                self.streaks.append(streak)
+        else:
+            self.total_steps = 0
+            self.streaks = []
+
         return self
 
     def _step(self, last_cluster_type: ClusterType, has_spot: bool) -> ClusterType:
-        """
-        Decide next action based on current state.
+        current_region = self.env.get_current_region()
+        gap = self.env.gap_seconds
+        elapsed = self.env.elapsed_seconds
+        current_step = int(elapsed // gap)
 
-        Available attributes:
-        - self.env.get_current_region(): Get current region index
-        - self.env.get_num_regions(): Get total number of regions
-        - self.env.switch_region(idx): Switch to region by index
-        - self.env.elapsed_seconds: Current time elapsed
-        - self.task_duration: Total task duration needed (seconds)
-        - self.deadline: Deadline time (seconds)
-        - self.restart_overhead: Restart overhead (seconds)
-        - self.task_done_time: List of completed work segments
-        - self.remaining_restart_overhead: Current pending overhead
-
-        Returns: ClusterType.SPOT, ClusterType.ON_DEMAND, or ClusterType.NONE
-        """
         total_done = sum(self.task_done_time)
         remaining_work = self.task_duration - total_done
         if remaining_work <= 0:
             return ClusterType.NONE
 
-        current_time = self.env.elapsed_seconds
-        remaining_time = self.deadline - current_time
-        slack = remaining_time - remaining_work
+        if self.total_steps == 0 or current_step >= self.total_steps:
+            if has_spot:
+                return ClusterType.SPOT
+            else:
+                return ClusterType.ON_DEMAND
 
-        if has_spot:
-            self.consecutive_skips = 0
+        best_r = -1
+        best_streak = -1
+        for r in range(self.num_regions):
+            if self.avail[r][current_step]:
+                s = self.streaks[r][current_step]
+                update = False
+                if best_r == -1:
+                    update = True
+                elif s > best_streak:
+                    update = True
+                elif s == best_streak and r == current_region:
+                    update = True
+                if update:
+                    best_r = r
+                    best_streak = s
+
+        if best_r != -1:
+            if best_r != current_region:
+                self.env.switch_region(best_r)
             return ClusterType.SPOT
-
-        self.consecutive_skips += 1
-        num_r = self.env.get_num_regions()
-        threshold = 7200.0  # 2 hours in seconds
-        if self.consecutive_skips >= num_r or slack < threshold:
-            self.consecutive_skips = 0
-            return ClusterType.ON_DEMAND
         else:
-            curr_r = self.env.get_current_region()
-            next_r = (curr_r + 1) % num_r
-            self.env.switch_region(next_r)
-            return ClusterType.NONE
+            return ClusterType.ON_DEMAND

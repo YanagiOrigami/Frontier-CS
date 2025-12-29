@@ -2,126 +2,116 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 import copy
-import math
 
-class ResBlock(nn.Module):
-    def __init__(self, dim, dropout):
+class ResidualBlock(nn.Module):
+    def __init__(self, dim, dropout_rate=0.2):
         super().__init__()
-        self.block = nn.Sequential(
-            nn.Linear(dim, dim),
-            nn.BatchNorm1d(dim),
-            nn.SiLU(),
-            nn.Dropout(dropout)
-        )
+        self.l1 = nn.Linear(dim, dim)
+        self.bn1 = nn.BatchNorm1d(dim)
+        self.act = nn.GELU()
+        self.dropout = nn.Dropout(dropout_rate)
+        self.l2 = nn.Linear(dim, dim)
+        self.bn2 = nn.BatchNorm1d(dim)
 
     def forward(self, x):
-        return x + self.block(x)
+        identity = x
+        out = self.l1(x)
+        out = self.bn1(out)
+        out = self.act(out)
+        out = self.dropout(out)
+        out = self.l2(out)
+        out = self.bn2(out)
+        out += identity
+        out = self.act(out)
+        return out
 
-class SingleModel(nn.Module):
-    def __init__(self, input_dim, hidden_dim, num_classes, dropout):
+class ResNetMLP(nn.Module):
+    def __init__(self, input_dim, num_classes):
         super().__init__()
-        self.stem = nn.Sequential(
-            nn.Linear(input_dim, hidden_dim),
-            nn.BatchNorm1d(hidden_dim),
-            nn.SiLU(),
-            nn.Dropout(dropout)
-        )
-        self.res1 = ResBlock(hidden_dim, dropout)
-        self.res2 = ResBlock(hidden_dim, dropout)
-        self.head = nn.Linear(hidden_dim, num_classes)
-
+        # Architecture designed to maximize capacity within 1M parameter budget
+        # H = 576 results in ~963,776 parameters
+        # Calculation:
+        # Input (384->576): 221,184
+        # ResBlock (2x 576->576): 663,552
+        # Output (576->128): 73,728
+        # BN + Bias: ~5k
+        # Total: ~964k < 1M limit
+        self.hidden_dim = 576 
+        
+        self.input_proj = nn.Linear(input_dim, self.hidden_dim)
+        self.bn_in = nn.BatchNorm1d(self.hidden_dim)
+        self.act = nn.GELU()
+        self.dropout = nn.Dropout(0.2)
+        
+        self.block = ResidualBlock(self.hidden_dim, dropout_rate=0.2)
+        
+        self.output = nn.Linear(self.hidden_dim, num_classes)
+        
     def forward(self, x):
-        x = self.stem(x)
-        x = self.res1(x)
-        x = self.res2(x)
-        return self.head(x)
-
-class EnsembleModel(nn.Module):
-    def __init__(self, models):
-        super().__init__()
-        self.models = nn.ModuleList(models)
-
-    def forward(self, x):
-        outputs = [m(x) for m in self.models]
-        return torch.stack(outputs).mean(dim=0)
+        x = self.input_proj(x)
+        x = self.bn_in(x)
+        x = self.act(x)
+        x = self.dropout(x)
+        x = self.block(x)
+        x = self.output(x)
+        return x
 
 class Solution:
     def solve(self, train_loader, val_loader, metadata: dict = None) -> torch.nn.Module:
         """
         Train a model and return it.
         """
-        input_dim = metadata.get("input_dim", 384)
-        num_classes = metadata.get("num_classes", 128)
-        param_limit = metadata.get("param_limit", 1000000)
+        input_dim = metadata["input_dim"]
+        num_classes = metadata["num_classes"]
         device = metadata.get("device", "cpu")
         
-        # Configuration
-        dropout = 0.3
-        num_epochs = 45
-        num_models = 2
+        # Initialize model
+        model = ResNetMLP(input_dim, num_classes).to(device)
         
-        # Dynamic architecture scaling to fit budget
-        # We aim to fit num_models within param_limit with a safety margin
-        # Param count approximation for SingleModel:
-        # 1. Stem Linear: 384*H + H
-        # 2. Res1 Linear: H*H + H
-        # 3. Res2 Linear: H*H + H
-        # 4. Head Linear: H*128 + 128
-        # 5. BN params (3 layers): 3 * 2*H
-        # Total ~= 2H^2 + (384 + 128 + 3 + 3 + 6)H + 128
-        # Total ~= 2H^2 + 524H
+        # Verify parameter count constraint
+        param_count = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        if param_count > 1000000:
+            # Emergency fallback to smaller model if somehow over limit
+            # (Should not happen with H=576)
+            model.hidden_dim = 512
+            model.input_proj = nn.Linear(input_dim, 512).to(device)
+            model.bn_in = nn.BatchNorm1d(512).to(device)
+            model.block = ResidualBlock(512).to(device)
+            model.output = nn.Linear(512, num_classes).to(device)
+
+        # Optimization setup
+        # High weight decay for regularization on small dataset
+        optimizer = optim.AdamW(model.parameters(), lr=0.001, weight_decay=0.05)
         
-        target_per_model = (param_limit * 0.98) / num_models # 2% safety buffer
+        # Training parameters
+        epochs = 100
+        scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs, eta_min=1e-6)
+        criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
         
-        # Solving 2H^2 + 524H - target = 0
-        a = 2
-        b = 524
-        c = -target_per_model
-        h_approx = (-b + math.sqrt(b**2 - 4*a*c)) / (2*a)
-        hidden_dim = int(h_approx)
+        best_acc = 0.0
+        best_model_state = copy.deepcopy(model.state_dict())
         
-        models = []
-        seeds = [42, 101, 2024, 7][:num_models]
-        
-        for i, seed in enumerate(seeds):
-            torch.manual_seed(seed)
-            model = SingleModel(input_dim, hidden_dim, num_classes, dropout).to(device)
-            
-            # Verify parameter constraint on first instantiation
-            if i == 0:
-                current_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-                if current_params * num_models > param_limit:
-                    # Reduce hidden dim if calculation was slightly off due to overhead
-                    ratio = param_limit / (current_params * num_models)
-                    hidden_dim = int(hidden_dim * math.sqrt(ratio) * 0.95)
-                    model = SingleModel(input_dim, hidden_dim, num_classes, dropout).to(device)
-            
-            optimizer = optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-2)
-            criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
-            
-            scheduler = optim.lr_scheduler.OneCycleLR(
-                optimizer,
-                max_lr=1e-3,
-                epochs=num_epochs,
-                steps_per_epoch=len(train_loader)
-            )
-            
-            best_acc = 0.0
-            best_state = copy.deepcopy(model.state_dict())
-            
-            for epoch in range(num_epochs):
-                model.train()
-                for inputs, targets in train_loader:
-                    inputs, targets = inputs.to(device), targets.to(device)
-                    
-                    optimizer.zero_grad()
-                    outputs = model(inputs)
-                    loss = criterion(outputs, targets)
-                    loss.backward()
-                    optimizer.step()
-                    scheduler.step()
+        # Training loop
+        for epoch in range(epochs):
+            model.train()
+            for inputs, targets in train_loader:
+                inputs, targets = inputs.to(device), targets.to(device)
                 
-                # Validation
+                # Noise injection for robustness (only in earlier epochs)
+                if epoch < epochs * 0.8:
+                    noise = torch.randn_like(inputs) * 0.05
+                    inputs = inputs + noise
+                
+                optimizer.zero_grad()
+                outputs = model(inputs)
+                loss = criterion(outputs, targets)
+                loss.backward()
+                optimizer.step()
+            
+            scheduler.step()
+            
+            # Validation
+            if epoch % 2 == 0 or epoch > epochs - 20:
                 model.eval()
                 correct = 0
                 total = 0
@@ -134,12 +124,10 @@ class Solution:
                         correct += (predicted == targets).sum().item()
                 
                 acc = correct / total
-                if acc > best_acc:
+                if acc >= best_acc:
                     best_acc = acc
-                    best_state = copy.deepcopy(model.state_dict())
-            
-            # Restore best model
-            model.load_state_dict(best_state)
-            models.append(model)
-            
-        return EnsembleModel(models)
+                    best_model_state = copy.deepcopy(model.state_dict())
+        
+        # Return best model found
+        model.load_state_dict(best_model_state)
+        return model

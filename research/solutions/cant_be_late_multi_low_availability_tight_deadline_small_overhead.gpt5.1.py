@@ -4,15 +4,11 @@ from argparse import Namespace
 from sky_spot.strategies.multi_strategy import MultiRegionStrategy
 from sky_spot.utils import ClusterType
 
-# Backward compatibility if enum member is named "None" instead of "NONE".
-if not hasattr(ClusterType, "NONE") and hasattr(ClusterType, "None"):
-    setattr(ClusterType, "NONE", getattr(ClusterType, "None"))
-
 
 class Solution(MultiRegionStrategy):
-    """Multi-region scheduling strategy focusing on deadline safety and low cost."""
+    """Cant-Be-Late multi-region scheduling strategy."""
 
-    NAME = "my_strategy"
+    NAME = "cb_late_multi_v1"
 
     def solve(self, spec_path: str) -> "Solution":
         with open(spec_path) as f:
@@ -26,78 +22,113 @@ class Solution(MultiRegionStrategy):
         )
         super().__init__(args)
 
-        # Internal state initialization flag
-        self._internal_inited = False
+        # Custom state
+        self._initialized = False
+        self._prev_task_done_len = 0
+        self._work_done_seconds = 0.0
+        self._force_on_demand = False
+        self._safety_margin_seconds = 0.0
+
+        # Scalarized parameters (set in _lazy_init)
+        self._task_duration = None
+        self._restart_overhead = None
+        self._deadline = None
+        self._gap_seconds = None
+
         return self
 
-    def _initialize_internal(self):
-        if getattr(self, "_internal_inited", False):
+    def _lazy_init(self) -> None:
+        if self._initialized:
             return
-        self._internal_inited = True
 
-        # Total required work in seconds (single task).
-        self.total_work = float(self.task_duration)
+        # Extract scalar task duration (seconds)
+        td = getattr(self, "task_duration", None)
+        if isinstance(td, (list, tuple)):
+            self._task_duration = float(td[0])
+        else:
+            self._task_duration = float(td)
 
-        # Track completed work incrementally.
-        self.completed_work = 0.0
-        self._last_task_done_len = len(getattr(self, "task_done_time", []))
+        # Extract scalar restart overhead (seconds)
+        ro = getattr(self, "restart_overhead", None)
+        if isinstance(ro, (list, tuple)):
+            self._restart_overhead = float(ro[0])
+        else:
+            self._restart_overhead = float(ro)
 
-        # Precompute safety margins (in seconds).
-        gap = float(self.env.gap_seconds)
-        overhead = float(self.restart_overhead)
+        # Extract scalar deadline (seconds)
+        dl = getattr(self, "deadline", None)
+        self._deadline = float(dl)
 
-        # Minimal slack required if we switch to on-demand only now.
-        # We conservatively add one step duration plus one restart overhead.
-        self._safe_commit_slack = gap + overhead
+        # Time per decision step (seconds)
+        gap = getattr(self.env, "gap_seconds", None)
+        if gap is None:
+            gap = 0.0
+        self._gap_seconds = float(gap)
 
-        # Worst-case additional slack that might be lost in a single risky step:
-        # full step without progress plus another restart overhead.
-        self._worst_loss_per_step = gap + 2.0 * overhead
+        # Initial slack = time_left - work_left - one_restart_overhead
+        initial_slack = self._deadline - self._task_duration - self._restart_overhead
 
-        # Commit threshold: once slack <= this, we must stop taking risk.
-        # Ensures after at most one more risky step we still have _safe_commit_slack.
-        self._commit_threshold = self._safe_commit_slack + self._worst_loss_per_step
+        if initial_slack <= 0:
+            # Degenerate case: no slack; choose minimal safe margin
+            margin = max(self._gap_seconds + self._restart_overhead, self._restart_overhead)
+        else:
+            # Base margin accounts for at most one "bad" step that can consume
+            # up to gap + restart_overhead time without progress.
+            base_margin = max(
+                2.0 * (self._gap_seconds + self._restart_overhead),
+                5.0 * self._restart_overhead,
+            )
+            raw_margin = min(initial_slack * 0.5, base_margin)
+            # Ensure margin is at least one worst-case step drop in slack.
+            min_required_margin = self._gap_seconds + self._restart_overhead
+            margin = max(raw_margin, min_required_margin)
 
-        # Once set, always use ON_DEMAND.
-        self._force_on_demand = False
+        self._safety_margin_seconds = margin
+        self._initialized = True
 
-    def _update_completed_work(self):
-        """Incrementally update completed work using newly appended segments."""
+    def _update_work_done(self) -> None:
+        """Incrementally track total work done to avoid O(n^2) summation."""
         cur_len = len(self.task_done_time)
-        if cur_len > self._last_task_done_len:
-            new_work = 0.0
-            for v in self.task_done_time[self._last_task_done_len : cur_len]:
-                new_work += float(v)
-            self.completed_work += new_work
-            self._last_task_done_len = cur_len
+        if cur_len > self._prev_task_done_len:
+            delta = 0.0
+            for i in range(self._prev_task_done_len, cur_len):
+                delta += self.task_done_time[i]
+            self._work_done_seconds += delta
+            self._prev_task_done_len = cur_len
 
     def _step(self, last_cluster_type: ClusterType, has_spot: bool) -> ClusterType:
-        self._initialize_internal()
-        self._update_completed_work()
+        if not self._initialized:
+            self._lazy_init()
 
-        # If task already complete, no further compute is needed.
-        if self.completed_work >= self.total_work:
+        # Update our cached progress
+        self._update_work_done()
+
+        remaining_work = self._task_duration - self._work_done_seconds
+        if remaining_work <= 0:
+            # Task already complete: do not run more
             return ClusterType.NONE
 
-        remaining_work = self.total_work - self.completed_work
-        time_left = self.deadline - self.env.elapsed_seconds
+        elapsed = self.env.elapsed_seconds
+        time_left = self._deadline - elapsed
 
-        # If somehow out of time, aggressively use on-demand.
-        if time_left <= 0.0:
+        # If somehow beyond deadline, still choose ON_DEMAND to minimize further loss
+        if time_left <= 0:
             return ClusterType.ON_DEMAND
 
-        # Slack if we immediately switch to on-demand-only.
-        slack = time_left - remaining_work
+        # Slack beyond what is needed to finish using only on-demand from now:
+        # slack = time_left - (remaining_work + one_restart_overhead)
+        slack = time_left - remaining_work - self._restart_overhead
 
-        # Decide whether to latch into on-demand phase.
-        if not self._force_on_demand:
-            if slack <= self._commit_threshold:
-                self._force_on_demand = True
+        # Once slack is small, irrevocably switch to on-demand to guarantee completion
+        if (not self._force_on_demand) and (slack <= self._safety_margin_seconds):
+            self._force_on_demand = True
 
         if self._force_on_demand:
+            # From this point on, always use on-demand
             return ClusterType.ON_DEMAND
 
-        # Risk-taking phase: prefer Spot when available, otherwise wait (NONE).
+        # Before forcing on-demand: use Spot whenever available, otherwise wait
         if has_spot:
             return ClusterType.SPOT
-        return ClusterType.NONE
+        else:
+            return ClusterType.NONE

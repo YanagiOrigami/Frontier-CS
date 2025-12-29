@@ -1,113 +1,118 @@
 import torch
 import triton
 import triton.language as tl
-import os
 
+class Solution:
+    def solve(self, spec_path: str = None) -> dict:
+        return {
+            "code": """
+import torch
+import triton
+import triton.language as tl
+
+@triton.autotune(
+    configs=[
+        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 64, 'BLOCK_K': 64}, num_warps=8, num_stages=3),
+        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 128, 'BLOCK_K': 64}, num_warps=4, num_stages=3),
+        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 32, 'BLOCK_K': 64}, num_warps=4, num_stages=4),
+        triton.Config({'BLOCK_M': 32, 'BLOCK_N': 128, 'BLOCK_K': 64}, num_warps=4, num_stages=3),
+        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 64, 'BLOCK_K': 64}, num_warps=4, num_stages=4),
+    ],
+    key=['M', 'N', 'K'],
+)
 @triton.jit
 def fused_linear_ce_kernel(
-    X_ptr, W_ptr, B_ptr, T_ptr, Out_ptr,
-    M, N, K,
+    X_ptr, W_ptr, B_ptr, T_ptr, Loss_ptr,
     stride_xm, stride_xk,
     stride_wk, stride_wn,
-    stride_t, stride_o,
+    M, K, N,
     BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr
 ):
     pid = tl.program_id(0)
-    offs_m = pid * BLOCK_M + tl.arange(0, BLOCK_M)
+    start_m = pid * BLOCK_M
+    
+    offs_m = start_m + tl.arange(0, BLOCK_M)
     mask_m = offs_m < M
-
-    # Load targets for the current block of rows
-    target_vals = tl.load(T_ptr + offs_m * stride_t, mask=mask_m, other=0)
-
-    # Initialize running statistics for Online Softmax
-    m_running = tl.full([BLOCK_M], float("-inf"), dtype=tl.float32)
-    s_running = tl.full([BLOCK_M], 0.0, dtype=tl.float32)
-    target_logits = tl.zeros([BLOCK_M], dtype=tl.float32)
-
-    # Iterate over N (vocabulary) in blocks
-    for n_start in range(0, N, BLOCK_N):
-        offs_n = n_start + tl.arange(0, BLOCK_N)
-        mask_n = offs_n < N
-
-        # Accumulate matrix multiplication result (logits)
+    
+    # Load targets
+    t_ptrs = T_ptr + offs_m
+    targets = tl.load(t_ptrs, mask=mask_m, other=0)
+    
+    # Initialize stats
+    m_i = tl.full([BLOCK_M], float("-inf"), dtype=tl.float32)
+    s_i = tl.zeros([BLOCK_M], dtype=tl.float32)
+    tgt_logit = tl.zeros([BLOCK_M], dtype=tl.float32)
+    
+    offs_k = tl.arange(0, BLOCK_K)
+    offs_n = tl.arange(0, BLOCK_N)
+    
+    # Base pointer for X
+    x_base = X_ptr + offs_m[:, None] * stride_xm
+    
+    for start_n in range(0, N, BLOCK_N):
+        # Accumulator for matrix multiplication
         acc = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
         
-        # Iterate over K (features) in blocks
-        for k_start in range(0, K, BLOCK_K):
-            offs_k = k_start + tl.arange(0, BLOCK_K)
-            mask_k = offs_k < K
+        # Base pointer for W
+        w_base = W_ptr + (start_n + offs_n)[None, :] * stride_wn
+        
+        # Inner loop over K
+        for start_k in range(0, K, BLOCK_K):
+            # Load X [BLOCK_M, BLOCK_K]
+            x_ptrs = x_base + (start_k + offs_k)[None, :] * stride_xk
+            x = tl.load(x_ptrs, mask=mask_m[:, None], other=0.0)
             
-            # Load X tile: (BLOCK_M, BLOCK_K)
-            x_ptrs = X_ptr + (offs_m[:, None] * stride_xm + offs_k[None, :] * stride_xk)
-            x_tile = tl.load(x_ptrs, mask=(mask_m[:, None] & mask_k[None, :]), other=0.0)
+            # Load W [BLOCK_K, BLOCK_N]
+            w_ptrs = w_base + (start_k + offs_k)[:, None] * stride_wk
+            w = tl.load(w_ptrs)
             
-            # Load W tile: (BLOCK_K, BLOCK_N)
-            w_ptrs = W_ptr + (offs_k[:, None] * stride_wk + offs_n[None, :] * stride_wn)
-            w_tile = tl.load(w_ptrs, mask=(mask_k[:, None] & mask_n[None, :]), other=0.0)
+            acc += tl.dot(x, w)
             
-            acc += tl.dot(x_tile, w_tile)
+        # Add Bias
+        b_ptrs = B_ptr + (start_n + offs_n)
+        b = tl.load(b_ptrs)
+        acc += b[None, :]
         
-        # Add bias
-        b_ptrs = B_ptr + offs_n
-        b_tile = tl.load(b_ptrs, mask=mask_n, other=0.0)
-        logits = acc + b_tile[None, :]
+        # Online Softmax Update
+        block_max = tl.max(acc, 1)
+        m_new = tl.maximum(m_i, block_max)
         
-        # Mask out-of-bounds columns to -inf
-        logits = tl.where(mask_n[None, :], logits, float("-inf"))
+        # Rescale sum
+        s_i = s_i * tl.exp(m_i - m_new)
+        m_i = m_new
         
-        # Online Softmax Updates
-        m_block = tl.max(logits, 1)
-        m_new = tl.maximum(m_running, m_block)
+        # Add current block exp
+        s_i += tl.sum(tl.exp(acc - m_i[:, None]), 1)
         
-        # Rescale running sum
-        s_scale = tl.exp(m_running - m_new)
-        s_running = s_running * s_scale
+        # Extract target logits
+        cols = start_n + offs_n
+        cols_i64 = cols.to(tl.int64)
+        mask_t = (targets[:, None] == cols_i64[None, :])
         
-        # Add current block contribution
-        p_block = tl.exp(logits - m_new[:, None])
-        s_running = s_running + tl.sum(p_block, 1)
-        
-        # Update running max
-        m_running = m_new
-        
-        # Extract target logits if they exist in this block
-        t_broadcast = target_vals[:, None]
-        n_broadcast = offs_n[None, :]
-        mask_t = (t_broadcast == n_broadcast)
-        
-        target_logits += tl.sum(tl.where(mask_t, logits, 0.0), 1)
+        tgt_logit += tl.sum(tl.where(mask_t, acc, 0.0), 1)
 
-    # Compute Final Loss: -log(softmax(target)) = -target_logit + log(sum_exp)
-    # log(sum_exp) = log(s_running * exp(m_running)) = log(s_running) + m_running
-    loss = tl.log(s_running) + m_running - target_logits
+    # Final Loss calculation
+    # loss = log(s) + m - target_logit
+    loss = tl.log(s_i) + m_i - tgt_logit
     
-    # Store output
-    out_ptrs = Out_ptr + offs_m * stride_o
-    tl.store(out_ptrs, loss, mask=mask_m)
+    l_ptrs = Loss_ptr + offs_m
+    tl.store(l_ptrs, loss, mask=mask_m)
 
 def fused_linear_ce(X: torch.Tensor, W: torch.Tensor, B: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
     M, K = X.shape
     _, N = W.shape
-    out = torch.empty((M,), dtype=torch.float32, device=X.device)
     
-    BLOCK_M = 16
-    BLOCK_N = 128
-    BLOCK_K = 64
-    num_warps = 4
+    losses = torch.empty(M, device=X.device, dtype=torch.float32)
     
-    grid = (triton.cdiv(M, BLOCK_M),)
+    grid = lambda META: (triton.cdiv(M, META['BLOCK_M']),)
     
     fused_linear_ce_kernel[grid](
-        X, W, B, targets, out,
-        M, N, K,
+        X, W, B, targets, losses,
         X.stride(0), X.stride(1),
         W.stride(0), W.stride(1),
-        targets.stride(0), out.stride(0),
-        BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K,
-        num_warps=num_warps
+        M, K, N
     )
-    return out
-
-class Solution:
-    def solve(self, spec_path: str = None) -> dict:
-        return {"program_path": os.path.abspath(__file__)}
+    
+    return losses
+"""
+        }

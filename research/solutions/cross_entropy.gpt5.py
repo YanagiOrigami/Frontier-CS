@@ -5,130 +5,191 @@ import triton.language as tl
 
 @triton.autotune(
     configs=[
-        triton.Config({'BLOCK_M': 1, 'BLOCK_N': 128, 'num_warps': 4}, num_stages=3),
-        triton.Config({'BLOCK_M': 1, 'BLOCK_N': 256, 'num_warps': 4}, num_stages=3),
-        triton.Config({'BLOCK_M': 1, 'BLOCK_N': 512, 'num_warps': 8}, num_stages=4),
-        triton.Config({'BLOCK_M': 2, 'BLOCK_N': 256, 'num_warps': 4}, num_stages=3),
-        triton.Config({'BLOCK_M': 2, 'BLOCK_N': 512, 'num_warps': 8}, num_stages=4),
-        triton.Config({'BLOCK_M': 4, 'BLOCK_N': 256, 'num_warps': 4}, num_stages=3),
-        triton.Config({'BLOCK_M': 4, 'BLOCK_N': 512, 'num_warps': 8}, num_stages=4),
-        triton.Config({'BLOCK_M': 1, 'BLOCK_N': 1024, 'num_warps': 8}, num_stages=4),
-        triton.Config({'BLOCK_M': 2, 'BLOCK_N': 1024, 'num_warps': 8}, num_stages=4),
-        triton.Config({'BLOCK_M': 4, 'BLOCK_N': 1024, 'num_warps': 8}, num_stages=4),
+        triton.Config({'BLOCK_N': 128}, num_warps=4, num_stages=2),
+        triton.Config({'BLOCK_N': 256}, num_warps=4, num_stages=2),
+        triton.Config({'BLOCK_N': 512}, num_warps=8, num_stages=2),
+        triton.Config({'BLOCK_N': 1024}, num_warps=8, num_stages=2),
     ],
     key=['N'],
 )
 @triton.jit
 def _cross_entropy_kernel(
-    logits_ptr,          # *f16/*bf16/*f32
-    targets_ptr,         # *i64
-    loss_ptr,            # *f32
-    M,                   # number of rows
-    stride_m,            # stride along M in elements
-    stride_n,            # stride along N in elements
-    stride_t,            # targets stride
-    N: tl.constexpr,     # number of columns (classes)
-    BLOCK_M: tl.constexpr,
+    logits_ptr,  # *f32 | *f16 | *bf16
+    targets_ptr,  # *i64
+    out_ptr,  # *f32
+    M: tl.constexpr,
+    N: tl.constexpr,
+    stride_m,  # stride along rows for logits
+    stride_n,  # stride along cols for logits
+    target_stride,  # stride for targets
+    out_stride,  # stride for output
     BLOCK_N: tl.constexpr,
 ):
-    pid_m = tl.program_id(axis=0)
-    off_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
-    mask_m = off_m < M
+    row = tl.program_id(0)
+    # Guard against out-of-bounds launch
+    if row >= M:
+        return
 
-    offs_n_init = tl.arange(0, BLOCK_N)
+    # Base pointers for this row
+    row_ptr = logits_ptr + row * stride_m
 
-    # Pass 1: compute row-wise max
-    row_max = tl.full([BLOCK_M], -float('inf'), dtype=tl.float32)
-    num_tiles = (N + BLOCK_N - 1) // BLOCK_N
+    # Load target class index for this row
+    t_idx = tl.load(targets_ptr + row * target_stride, mask=True, other=0).to(tl.int64)
+    # Gather target logit
+    t_logit = tl.load(row_ptr + t_idx * stride_n, mask=True, other=0).to(tl.float32)
 
-    for tile in range(0, num_tiles):
-        col_start = tile * BLOCK_N
-        offs_n = col_start + offs_n_init
-        mask_n = offs_n < N
-        mask = mask_m[:, None] & mask_n[None, :]
+    # Online log-sum-exp reduction across the row
+    m = tl.full((), -float('inf'), tl.float32)  # running max
+    s = tl.zeros((), tl.float32)  # running sum of exp(x - m)
+    offs = tl.arange(0, BLOCK_N)
 
-        ptr = logits_ptr + off_m[:, None] * stride_m + offs_n[None, :] * stride_n
-        x = tl.load(ptr, mask=mask, other=0.0)
+    col = 0
+    while col < N:
+        idx = col + offs
+        mask = idx < N
+        x = tl.load(row_ptr + idx * stride_n, mask=mask, other=0)
         x = x.to(tl.float32)
+        # Apply mask by setting -inf to invalid lanes
         x = tl.where(mask, x, -float('inf'))
-        tile_max = tl.max(x, axis=1)
-        row_max = tl.maximum(row_max, tile_max)
+        block_max = tl.max(x, axis=0)
+        new_m = tl.maximum(m, block_max)
+        # Rescale previous sum to new max and add current block contribution
+        s = s * tl.exp(m - new_m) + tl.sum(tl.exp(x - new_m), axis=0)
+        m = new_m
+        col += BLOCK_N
 
-    # Pass 2: compute row-wise log-sum-exp using max from pass 1
-    expsum = tl.zeros([BLOCK_M], dtype=tl.float32)
-    for tile in range(0, num_tiles):
-        col_start = tile * BLOCK_N
-        offs_n = col_start + offs_n_init
-        mask_n = offs_n < N
-        mask = mask_m[:, None] & mask_n[None, :]
+    # Final log-sum-exp
+    lse = tl.log(s) + m
+    loss = lse - t_logit
 
-        ptr = logits_ptr + off_m[:, None] * stride_m + offs_n[None, :] * stride_n
-        x = tl.load(ptr, mask=mask, other=0.0)
-        x = x.to(tl.float32)
-        x = x - row_max[:, None]
-        x = tl.exp(x)
-        expsum += tl.sum(x, axis=1)
-
-    lse = tl.log(expsum) + row_max
-
-    # Gather target logits for each row
-    tgt_idx = tl.load(targets_ptr + off_m * stride_t, mask=mask_m, other=0).to(tl.int64)
-    tgt_ptrs = logits_ptr + off_m * stride_m + tgt_idx * stride_n
-    tgt_logits = tl.load(tgt_ptrs, mask=mask_m, other=0.0).to(tl.float32)
-
-    loss = lse - tgt_logits
-    tl.store(loss_ptr + off_m, loss, mask=mask_m)
+    # Store result
+    tl.store(out_ptr + row * out_stride, loss)
 
 
 def cross_entropy(logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
-    if logits.dim() != 2:
-        raise ValueError("logits must be a 2D tensor of shape (M, N)")
-    if targets.dim() != 1:
-        raise ValueError("targets must be a 1D tensor of shape (M,)")
+    """
+    Cross entropy loss computation.
 
+    Args:
+        logits: Tensor of shape (M, N) on CUDA device. Supports float32/float16/bfloat16.
+        targets: Tensor of shape (M,) with dtype int64 on CUDA device.
+
+    Returns:
+        Tensor of shape (M,) with dtype float32.
+    """
+    assert logits.is_cuda and targets.is_cuda, "Inputs must be CUDA tensors"
+    assert logits.ndim == 2, "logits must be 2D (M, N)"
+    assert targets.ndim == 1 and targets.shape[0] == logits.shape[0], "targets must be 1D with length M"
     M, N = logits.shape
-    if targets.shape[0] != M:
-        raise ValueError("targets length must match the number of rows in logits")
 
-    if not logits.is_cuda or not targets.is_cuda:
-        raise ValueError("logits and targets must be CUDA tensors")
+    # Ensure targets are int64
+    if targets.dtype != torch.int64:
+        targets = targets.to(torch.int64)
 
-    if targets.dtype != torch.long:
-        targets = targets.long()
+    out = torch.empty((M,), device=logits.device, dtype=torch.float32)
 
-    loss = torch.empty(M, device=logits.device, dtype=torch.float32)
-
-    stride_m, stride_n = logits.stride()
-    stride_t = targets.stride(0)
-
-    grid = lambda META: (triton.cdiv(M, META['BLOCK_M']),)
+    grid = (M,)
 
     _cross_entropy_kernel[grid](
         logits,
         targets,
-        loss,
+        out,
         M,
-        stride_m,
-        stride_n,
-        stride_t,
-        N=N,
+        N,
+        logits.stride(0),
+        logits.stride(1),
+        targets.stride(0),
+        out.stride(0),
     )
-
-    return loss
+    return out
 
 
 class Solution:
     def solve(self, spec_path: str = None) -> dict:
-        import inspect
-        src = inspect.getsource(torch)
-        # above line ensures torch is imported in the generated context
-        module_code = []
-        module_code.append("import torch")
-        module_code.append("import triton")
-        module_code.append("import triton.language as tl")
-        module_code.append(inspect.getsource(_cross_entropy_kernel))
-        module_code.append(inspect.getsource(cross_entropy))
-        module_code.append(inspect.getsource(Solution))
-        # To avoid recursive definition when executed, redefine a minimal Solution that returns this code
-        final_code = "\n".join(module_code)
-        return {"code": final_code}
+        code = '''
+import torch
+import triton
+import triton.language as tl
+
+
+@triton.autotune(
+    configs=[
+        triton.Config({'BLOCK_N': 128}, num_warps=4, num_stages=2),
+        triton.Config({'BLOCK_N': 256}, num_warps=4, num_stages=2),
+        triton.Config({'BLOCK_N': 512}, num_warps=8, num_stages=2),
+        triton.Config({'BLOCK_N': 1024}, num_warps=8, num_stages=2),
+    ],
+    key=['N'],
+)
+@triton.jit
+def _cross_entropy_kernel(
+    logits_ptr,  # *f32 | *f16 | *bf16
+    targets_ptr,  # *i64
+    out_ptr,  # *f32
+    M: tl.constexpr,
+    N: tl.constexpr,
+    stride_m,  # stride along rows for logits
+    stride_n,  # stride along cols for logits
+    target_stride,  # stride for targets
+    out_stride,  # stride for output
+    BLOCK_N: tl.constexpr,
+):
+    row = tl.program_id(0)
+    if row >= M:
+        return
+
+    row_ptr = logits_ptr + row * stride_m
+
+    t_idx = tl.load(targets_ptr + row * target_stride, mask=True, other=0).to(tl.int64)
+    t_logit = tl.load(row_ptr + t_idx * stride_n, mask=True, other=0).to(tl.float32)
+
+    m = tl.full((), -float('inf'), tl.float32)
+    s = tl.zeros((), tl.float32)
+
+    offs = tl.arange(0, BLOCK_N)
+    col = 0
+    while col < N:
+        idx = col + offs
+        mask = idx < N
+        x = tl.load(row_ptr + idx * stride_n, mask=mask, other=0)
+        x = x.to(tl.float32)
+        x = tl.where(mask, x, -float('inf'))
+        block_max = tl.max(x, axis=0)
+        new_m = tl.maximum(m, block_max)
+        s = s * tl.exp(m - new_m) + tl.sum(tl.exp(x - new_m), axis=0)
+        m = new_m
+        col += BLOCK_N
+
+    lse = tl.log(s) + m
+    loss = lse - t_logit
+
+    tl.store(out_ptr + row * out_stride, loss)
+
+
+def cross_entropy(logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+    assert logits.is_cuda and targets.is_cuda, "Inputs must be CUDA tensors"
+    assert logits.ndim == 2, "logits must be 2D (M, N)"
+    assert targets.ndim == 1 and targets.shape[0] == logits.shape[0], "targets must be 1D with length M"
+    M, N = logits.shape
+
+    if targets.dtype != torch.int64:
+        targets = targets.to(torch.int64)
+
+    out = torch.empty((M,), device=logits.device, dtype=torch.float32)
+
+    grid = (M,)
+
+    _cross_entropy_kernel[grid](
+        logits,
+        targets,
+        out,
+        M,
+        N,
+        logits.stride(0),
+        logits.stride(1),
+        targets.stride(0),
+        out.stride(0),
+    )
+    return out
+'''
+        return {"code": code}

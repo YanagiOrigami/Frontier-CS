@@ -1,10 +1,10 @@
 import json
+import networkx as nx
 import heapq
 import math
-import random
-from collections import defaultdict, deque
-import networkx as nx
+from collections import defaultdict
 from typing import List, Dict, Tuple, Set
+import random
 
 class BroadCastTopology:
     def __init__(self, src: str, dsts: list[str], num_partitions: int):
@@ -26,274 +26,313 @@ class BroadCastTopology:
     def set_num_partitions(self, num_partitions: int):
         self.num_partitions = num_partitions
 
-class MultiCommodityFlowSolver:
-    def __init__(self, src, dsts, G, num_partitions, ingress_limits, egress_limits, num_vms=2):
-        self.src = src
-        self.dsts = dsts
-        self.G = G.copy()
-        self.num_partitions = num_partitions
-        self.ingress_limits = ingress_limits
-        self.egress_limits = egress_limits
-        self.num_vms = num_vms
-        
-        # Precompute provider from node name
-        self.node_provider = {}
-        for node in G.nodes():
-            provider = node.split(':')[0]
-            self.node_provider[node] = provider
-            
-        # Initialize flow tracking
-        self.edge_flows = defaultdict(int)  # partitions per edge
-        self.node_in_flows = defaultdict(int)  # partitions entering node
-        self.node_out_flows = defaultdict(int)  # partitions leaving node
-        
-    def get_node_limit(self, node, limit_type):
-        """Get bandwidth limit for a node based on its provider"""
-        provider = self.node_provider[node]
-        limit = self.ingress_limits[provider] if limit_type == 'ingress' else self.egress_limits[provider]
-        return limit * self.num_vms
-    
-    def compute_path_cost(self, path):
-        """Compute cost of a path"""
-        cost = 0
-        for i in range(len(path) - 1):
-            u, v = path[i], path[i + 1]
-            cost += self.G[u][v]['cost']
-        return cost
-    
-    def estimate_congestion_penalty(self, path):
-        """Estimate congestion penalty for adding this path"""
-        penalty = 0
-        for i in range(len(path) - 1):
-            u, v = path[i], path[i + 1]
-            
-            # Edge congestion
-            current_flow = self.edge_flows[(u, v)] + 1
-            capacity = self.G[u][v]['throughput']
-            if capacity > 0:
-                penalty += (current_flow / capacity) * 10
-            
-            # Node egress congestion (from u)
-            out_flow = self.node_out_flows[u] + 1
-            egress_limit = self.get_node_limit(u, 'egress')
-            if egress_limit > 0:
-                penalty += (out_flow / egress_limit) * 5
-            
-            # Node ingress congestion (to v)
-            in_flow = self.node_in_flows[v] + 1
-            ingress_limit = self.get_node_limit(v, 'ingress')
-            if ingress_limit > 0:
-                penalty += (in_flow / ingress_limit) * 5
-                
-        return penalty
-    
-    def update_flows(self, path, delta=1):
-        """Update flow counts for a path"""
-        for i in range(len(path) - 1):
-            u, v = path[i], path[i + 1]
-            self.edge_flows[(u, v)] += delta
-            self.node_out_flows[u] += delta
-            self.node_in_flows[v] += delta
-    
-    def find_k_shortest_paths(self, src, dst, k=5):
-        """Find k shortest paths using Yen's algorithm"""
-        try:
-            paths = list(nx.shortest_simple_paths(self.G, src, dst, weight='cost'))
-            return paths[:k]
-        except:
-            # Fallback to BFS if no path found
-            try:
-                return [nx.shortest_path(self.G, src, dst)]
-            except:
-                return []
-    
-    def find_balanced_path(self, src, dst, partition_id):
-        """Find a balanced path considering congestion"""
-        best_path = None
-        best_score = float('inf')
-        
-        # Try k-shortest paths
-        candidate_paths = self.find_k_shortest_paths(src, dst, k=3)
-        
-        if not candidate_paths:
-            # Try any path
-            try:
-                candidate_paths = [nx.shortest_path(self.G, src, dst)]
-            except:
-                return None
-        
-        for path in candidate_paths:
-            cost = self.compute_path_cost(path)
-            congestion = self.estimate_congestion_penalty(path)
-            score = cost + congestion
-            
-            if score < best_score:
-                best_score = score
-                best_path = path
-        
-        return best_path
-    
-    def solve_iterative(self):
-        """Solve using iterative load balancing"""
-        topology = BroadCastTopology(self.src, self.dsts, self.num_partitions)
-        
-        # First pass: assign all partitions using shortest paths
-        for dst in self.dsts:
-            for pid in range(self.num_partitions):
-                try:
-                    path = nx.shortest_path(self.G, self.src, dst, weight='cost')
-                    self.update_flows(path)
-                    edges = []
-                    for i in range(len(path) - 1):
-                        u, v = path[i], path[i + 1]
-                        edges.append([u, v, self.G[u][v]])
-                    topology.set_dst_partition_paths(dst, pid, edges)
-                except:
-                    pass
-        
-        # Second pass: redistribute to balance load
-        for iteration in range(2):
-            # Reset flows
-            self.edge_flows.clear()
-            self.node_in_flows.clear()
-            self.node_out_flows.clear()
-            
-            # Redistribute partitions
-            for dst in self.dsts:
-                # Group partitions by current paths
-                partition_paths = {}
-                for pid in range(self.num_partitions):
-                    if topology.paths[dst][str(pid)]:
-                        edges = topology.paths[dst][str(pid)]
-                        path = [edges[0][0]] + [e[1] for e in edges]
-                        partition_paths[pid] = path
-                
-                # Reassign partitions one by one
-                for pid in range(self.num_partitions):
-                    # Find balanced path
-                    new_path = self.find_balanced_path(self.src, dst, pid)
-                    
-                    if new_path:
-                        # Update flows
-                        if pid in partition_paths:
-                            self.update_flows(partition_paths[pid], -1)
-                        self.update_flows(new_path, 1)
-                        
-                        # Update topology
-                        edges = []
-                        for i in range(len(new_path) - 1):
-                            u, v = new_path[i], path[i + 1]
-                            edges.append([u, v, self.G[u][v]])
-                        topology.set_dst_partition_paths(dst, pid, edges)
-        
-        return topology
 
 def search_algorithm(src: str, dsts: list[str], G: nx.DiGraph, num_partitions: int) -> BroadCastTopology:
-    # Default bandwidth limits (can be overridden by config)
+    bc_topology = BroadCastTopology(src, dsts, num_partitions)
+    
+    node_providers = {node: node.split(':')[0] for node in G.nodes()}
+    
     ingress_limits = {'aws': 10, 'gcp': 16, 'azure': 16}
     egress_limits = {'aws': 5, 'gcp': 7, 'azure': 16}
+    
     num_vms = 2
     
-    solver = MultiCommodityFlowSolver(src, dsts, G, num_partitions, 
-                                     ingress_limits, egress_limits, num_vms)
-    return solver.solve_iterative()
+    for dst in dsts:
+        all_paths = []
+        
+        k = min(5, num_partitions)
+        try:
+            k_paths = list(nx.shortest_simple_paths(G, src, dst, weight='cost'))[:k]
+            all_paths.extend(k_paths)
+        except:
+            try:
+                single_path = nx.shortest_path(G, src, dst, weight='cost')
+                all_paths.append(single_path)
+            except:
+                continue
+        
+        for partition_id in range(num_partitions):
+            if len(all_paths) == 0:
+                continue
+                
+            path_idx = partition_id % len(all_paths)
+            path = all_paths[path_idx]
+            
+            path_edges = []
+            for i in range(len(path) - 1):
+                u, v = path[i], path[i + 1]
+                edge_data = G[u][v]
+                path_edges.append([u, v, edge_data])
+            
+            bc_topology.set_dst_partition_paths(dst, partition_id, path_edges)
+    
+    return bc_topology
+
 
 class Solution:
     def solve(self, spec_path: str = None) -> dict:
-        # Read specification
-        if spec_path:
-            with open(spec_path, 'r') as f:
-                spec = json.load(f)
-            
-            # Get config files
-            config_files = spec.get('config_files', [])
-            num_vms = spec.get('num_vms', 2)
-            
-            # For simplicity, we'll generate code that handles the first config
-            # The actual evaluator will run this code on all configs
-            if config_files:
-                config_path = config_files[0]
-                code = f'''
+        solution_code = '''
 import json
 import networkx as nx
-from collections import defaultdict
 import heapq
 import math
+from collections import defaultdict
+from typing import List, Dict, Tuple, Set
+import random
 
-# Load configuration
-with open("{config_path}", 'r') as f:
-    config = json.load(f)
+class BroadCastTopology:
+    def __init__(self, src: str, dsts: list[str], num_partitions: int):
+        self.src = src
+        self.dsts = dsts
+        self.num_partitions = int(num_partitions)
+        self.paths = {dst: {str(i): None for i in range(self.num_partitions)} for dst in dsts}
 
-src = config["source_node"]
-dsts = config["dest_nodes"]
-data_vol = config["data_vol"]
-num_partitions = config["num_partitions"]
-ingress_limits = config["ingress_limit"]
-egress_limits = config["egress_limit"]
+    def append_dst_partition_path(self, dst: str, partition: int, path: list):
+        partition = str(partition)
+        if self.paths[dst][partition] is None:
+            self.paths[dst][partition] = []
+        self.paths[dst][partition].append(path)
 
-# The actual graph G will be provided by the evaluator
-def search_algorithm(src, dsts, G, num_partitions):
-    # Use the solver defined below
-    solver = MultiCommodityFlowSolver(src, dsts, G, num_partitions, 
-                                     ingress_limits, egress_limits, {num_vms})
-    return solver.solve_iterative()
+    def set_dst_partition_paths(self, dst: str, partition: int, paths: list[list]):
+        partition = str(partition)
+        self.paths[dst][partition] = paths
 
-# Include all the helper classes and functions
-{inspect.getsource(MultiCommodityFlowSolver.__init__)}
-{inspect.getsource(MultiCommodityFlowSolver.get_node_limit)}
-{inspect.getsource(MultiCommodityFlowSolver.compute_path_cost)}
-{inspect.getsource(MultiCommodityFlowSolver.estimate_congestion_penalty)}
-{inspect.getsource(MultiCommodityFlowSolver.update_flows)}
-{inspect.getsource(MultiCommodityFlowSolver.find_k_shortest_paths)}
-{inspect.getsource(MultiCommodityFlowSolver.find_balanced_path)}
-{inspect.getsource(MultiCommodityFlowSolver.solve_iterative)}
-'''
-            else:
-                code = f'''
-def search_algorithm(src, dsts, G, num_partitions):
-    # Default implementation
-    ingress_limits = {{'aws': 10, 'gcp': 16, 'azure': 16}}
-    egress_limits = {{'aws': 5, 'gcp': 7, 'azure': 16}}
-    num_vms = {num_vms}
+    def set_num_partitions(self, num_partitions: int):
+        self.num_partitions = num_partitions
+
+
+def calculate_edge_usage(bc_topology: BroadCastTopology) -> Tuple[Dict[Tuple[str, str], int], Set[str]]:
+    edge_usage = defaultdict(int)
+    used_nodes = set()
     
-    solver = MultiCommodityFlowSolver(src, dsts, G, num_partitions, 
-                                     ingress_limits, egress_limits, num_vms)
-    return solver.solve_iterative()
-
-# Include all the helper classes and functions
-{inspect.getsource(MultiCommodityFlowSolver.__init__)}
-{inspect.getsource(MultiCommodityFlowSolver.get_node_limit)}
-{inspect.getsource(MultiCommodityFlowSolver.compute_path_cost)}
-{inspect.getsource(MultiCommodityFlowSolver.estimate_congestion_penalty)}
-{inspect.getsource(MultiCommodityFlowSolver.update_flows)}
-{inspect.getsource(MultiCommodityFlowSolver.find_k_shortest_paths)}
-{inspect.getsource(MultiCommodityFlowSolver.find_balanced_path)}
-{inspect.getsource(MultiCommodityFlowSolver.solve_iterative)}
-'''
-        else:
-            code = f'''
-def search_algorithm(src, dsts, G, num_partitions):
-    # Default implementation
-    ingress_limits = {{'aws': 10, 'gcp': 16, 'azure': 16}}
-    egress_limits = {{'aws': 5, 'gcp': 7, 'azure': 16}}
-    num_vms = 2
+    for dst in bc_topology.dsts:
+        for partition in range(bc_topology.num_partitions):
+            path = bc_topology.paths[dst][str(partition)]
+            if path is None:
+                continue
+            for edge in path:
+                u, v, _ = edge
+                edge_key = (u, v)
+                edge_usage[edge_key] += 1
+                used_nodes.add(u)
+                used_nodes.add(v)
     
-    solver = MultiCommodityFlowSolver(src, dsts, G, num_partitions, 
-                                     ingress_limits, egress_limits, num_vms)
-    return solver.solve_iterative()
+    return edge_usage, used_nodes
 
-# Include all the helper classes and functions
-{inspect.getsource(MultiCommodityFlowSolver.__init__)}
-{inspect.getsource(MultiCommodityFlowSolver.get_node_limit)}
-{inspect.getsource(MultiCommodityFlowSolver.compute_path_cost)}
-{inspect.getsource(MultiCommodityFlowSolver.estimate_congestion_penalty)}
-{inspect.getsource(MultiCommodityFlowSolver.update_flows)}
-{inspect.getsource(MultiCommodityFlowSolver.find_k_shortest_paths)}
-{inspect.getsource(MultiCommodityFlowSolver.find_balanced_path)}
-{inspect.getsource(MultiCommodityFlowSolver.solve_iterative)}
-'''
+
+def calculate_transfer_time(G: nx.DiGraph, edge_usage: Dict[Tuple[str, str], int], 
+                           data_vol: float, num_partitions: int,
+                           num_vms: int = 2) -> float:
+    if not edge_usage:
+        return 0.0
+    
+    s_partition = data_vol / num_partitions
+    
+    node_out_edges = defaultdict(list)
+    node_in_edges = defaultdict(list)
+    
+    for (u, v) in edge_usage.keys():
+        node_out_edges[u].append((u, v))
+        node_in_edges[v].append((u, v))
+    
+    ingress_limits = {'aws': 10, 'gcp': 16, 'azure': 16}
+    egress_limits = {'aws': 5, 'gcp': 7, 'azure': 16}
+    
+    max_edge_time = 0.0
+    
+    for (u, v), usage_count in edge_usage.items():
+        edge_data = G[u][v]
+        throughput_capacity = edge_data.get('throughput', float('inf'))
         
-        return {"code": code}
+        provider_u = u.split(':')[0]
+        provider_v = v.split(':')[0]
+        
+        out_degree = len(node_out_edges[u])
+        in_degree = len(node_in_edges[v])
+        
+        egress_limit = egress_limits.get(provider_u, 16) * num_vms
+        ingress_limit = ingress_limits.get(provider_v, 16) * num_vms
+        
+        effective_egress = egress_limit / max(1, out_degree)
+        effective_ingress = ingress_limit / max(1, in_degree)
+        
+        effective_throughput = min(throughput_capacity, effective_egress, effective_ingress)
+        
+        if effective_throughput <= 0:
+            effective_throughput = 0.001
+        
+        time_per_edge = (usage_count * s_partition * 8) / effective_throughput
+        max_edge_time = max(max_edge_time, time_per_edge)
+    
+    return max_edge_time
 
-# Helper to get source code of classes/functions
-import inspect
+
+def calculate_cost(G: nx.DiGraph, edge_usage: Dict[Tuple[str, str], int],
+                   used_nodes: Set[str], transfer_time: float,
+                   data_vol: float, num_partitions: int,
+                   num_vms: int = 2, instance_rate: float = 0.54) -> float:
+    s_partition = data_vol / num_partitions
+    
+    egress_cost = 0.0
+    for (u, v), usage_count in edge_usage.items():
+        edge_data = G[u][v]
+        cost_per_gb = edge_data.get('cost', 0.0)
+        egress_cost += usage_count * s_partition * cost_per_gb
+    
+    instance_cost = len(used_nodes) * num_vms * (instance_rate / 3600) * transfer_time
+    
+    return egress_cost + instance_cost
+
+
+def find_k_shortest_paths(G: nx.DiGraph, src: str, dst: str, k: int, weight='cost'):
+    try:
+        return list(nx.shortest_simple_paths(G, src, dst, weight=weight))[:k]
+    except:
+        try:
+            path = nx.shortest_path(G, src, dst, weight=weight)
+            return [path]
+        except:
+            return []
+
+
+def find_diverse_paths(G: nx.DiGraph, src: str, dst: str, k: int, weight='cost'):
+    paths = find_k_shortest_paths(G, src, dst, k, weight)
+    
+    if len(paths) < k:
+        try:
+            all_paths = list(nx.all_simple_paths(G, src, dst))
+            if weight == 'cost':
+                all_paths.sort(key=lambda p: sum(G[p[i]][p[i+1]]['cost'] for i in range(len(p)-1)))
+            else:
+                all_paths.sort(key=lambda p: sum(1 for _ in range(len(p)-1)))
+            
+            for path in all_paths:
+                if path not in paths:
+                    paths.append(path)
+                if len(paths) >= k:
+                    break
+        except:
+            pass
+    
+    return paths[:k]
+
+
+def search_algorithm(src: str, dsts: list[str], G: nx.DiGraph, num_partitions: int) -> BroadCastTopology:
+    bc_topology = BroadCastTopology(src, dsts, num_partitions)
+    
+    node_providers = {node: node.split(':')[0] for node in G.nodes()}
+    
+    for dst in dsts:
+        k = min(max(3, num_partitions // 2), 10)
+        diverse_paths = find_diverse_paths(G, src, dst, k, weight='cost')
+        
+        if not diverse_paths:
+            continue
+        
+        for partition_id in range(num_partitions):
+            path_idx = partition_id % len(diverse_paths)
+            path = diverse_paths[path_idx]
+            
+            path_edges = []
+            for i in range(len(path) - 1):
+                u, v = path[i], path[i + 1]
+                edge_data = G[u][v]
+                path_edges.append([u, v, edge_data])
+            
+            bc_topology.set_dst_partition_paths(dst, partition_id, path_edges)
+    
+    return bc_topology
+
+
+def optimized_search_algorithm(src: str, dsts: list[str], G: nx.DiGraph, 
+                               num_partitions: int, data_vol: float = 300.0,
+                               num_vms: int = 2) -> BroadCastTopology:
+    bc_topology = BroadCastTopology(src, dsts, num_partitions)
+    
+    all_dst_paths = {}
+    
+    for dst in dsts:
+        k = min(max(3, num_partitions // 3), 8)
+        diverse_paths = find_diverse_paths(G, src, dst, k, weight='cost')
+        
+        if not diverse_paths:
+            try:
+                fallback_path = nx.shortest_path(G, src, dst, weight='cost')
+                diverse_paths = [fallback_path]
+            except:
+                continue
+        
+        path_costs = []
+        for path in diverse_paths:
+            cost = sum(G[path[i]][path[i+1]]['cost'] for i in range(len(path)-1))
+            path_costs.append((cost, path))
+        
+        path_costs.sort()
+        
+        all_dst_paths[dst] = [path for _, path in path_costs]
+    
+    partition_assignments = {}
+    for partition_id in range(num_partitions):
+        partition_assignments[partition_id] = {}
+        for dst in dsts:
+            if dst in all_dst_paths and all_dst_paths[dst]:
+                path_idx = partition_id % len(all_dst_paths[dst])
+                partition_assignments[partition_id][dst] = all_dst_paths[dst][path_idx]
+    
+    best_topology = None
+    best_cost = float('inf')
+    
+    for iteration in range(20):
+        current_bc = BroadCastTopology(src, dsts, num_partitions)
+        
+        for dst in dsts:
+            for partition_id in range(num_partitions):
+                if dst in partition_assignments[partition_id]:
+                    path = partition_assignments[partition_id][dst]
+                    
+                    path_edges = []
+                    for i in range(len(path) - 1):
+                        u, v = path[i], path[i + 1]
+                        edge_data = G[u][v]
+                        path_edges.append([u, v, edge_data])
+                    
+                    current_bc.set_dst_partition_paths(dst, partition_id, path_edges)
+        
+        edge_usage, used_nodes = calculate_edge_usage(current_bc)
+        transfer_time = calculate_transfer_time(G, edge_usage, data_vol, num_partitions, num_vms)
+        total_cost = calculate_cost(G, edge_usage, used_nodes, transfer_time, 
+                                   data_vol, num_partitions, num_vms)
+        
+        if total_cost < best_cost:
+            best_cost = total_cost
+            best_topology = current_bc
+        
+        if iteration < 10:
+            for partition_id in range(num_partitions):
+                for dst in dsts:
+                    if dst in all_dst_paths and len(all_dst_paths[dst]) > 1:
+                        current_path = partition_assignments[partition_id].get(dst)
+                        if current_path and current_path in all_dst_paths[dst]:
+                            current_idx = all_dst_paths[dst].index(current_path)
+                            new_idx = (current_idx + 1) % len(all_dst_paths[dst])
+                            partition_assignments[partition_id][dst] = all_dst_paths[dst][new_idx]
+    
+    if best_topology is None:
+        return search_algorithm(src, dsts, G, num_partitions)
+    
+    return best_topology
+
+
+def final_search_algorithm(src: str, dsts: list[str], G: nx.DiGraph, num_partitions: int) -> BroadCastTopology:
+    try:
+        with open('/tmp/config_cache.json', 'r') as f:
+            config_cache = json.load(f)
+            data_vol = config_cache.get('data_vol', 300.0)
+            num_vms = config_cache.get('num_vms', 2)
+    except:
+        data_vol = 300.0
+        num_vms = 2
+    
+    return optimized_search_algorithm(src, dsts, G, num_partitions, data_vol, num_vms)
+'''
+        return {"code": solution_code}

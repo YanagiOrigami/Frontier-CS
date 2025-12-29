@@ -1,5 +1,7 @@
 import os
+from typing import Optional
+
 
 class Solution:
     def solve(self, src_path: str) -> bytes:
-        return b'.file 4294967289 "a"\n.byte 0\n'
+        return b'.file 1 ""\n.file 4294967289 ""\n'

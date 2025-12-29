@@ -2,330 +2,266 @@ import numpy as np
 
 class Solution:
     def __init__(self, **kwargs):
-        pass
-
-    def _format_number(self, v, sig=12):
-        if not np.isfinite(v):
-            v = 0.0
-        if abs(v) < 1e-12:
-            v = 0.0
-        s = f"{float(v):.{sig}g}"
-        # Normalize -0 to 0
-        if s.startswith("-0") and ("." not in s or set(s.replace("-", "").replace("0", "")) == set()):
-            s = s.replace("-", "")
-        return s
-
-    def _float_from_formatted(self, v):
-        return float(self._format_number(v))
+        self.kwargs = kwargs
 
     def solve(self, X: np.ndarray, y: np.ndarray) -> dict:
-        n, d = X.shape
-        x1 = X[:, 0].astype(float)
-        x2 = X[:, 1].astype(float)
-        y = y.astype(float)
+        x1 = np.asarray(X[:, 0], dtype=float)
+        x2 = np.asarray(X[:, 1], dtype=float)
+        y = np.asarray(y, dtype=float).ravel()
+        n = y.shape[0]
 
-        # Precompute base features
+        # Precompute features
+        ones = np.ones_like(x1)
         s1 = np.sin(x1)
         c1 = np.cos(x1)
         s2 = np.sin(x2)
         c2 = np.cos(x2)
+        s1c2 = s1 * c2
+        c1s2 = c1 * s2
+        c1c2 = c1 * c2
+        s1s2 = s1 * s2
+        sinp = np.sin(x1 + x2)
+        sind = np.sin(x1 - x2)
+        cosp = np.cos(x1 + x2)
+        cosd = np.cos(x1 - x2)
+        sin2x1 = np.sin(2.0 * x1)
+        cos2x1 = np.cos(2.0 * x1)
+        sin2x2 = np.sin(2.0 * x2)
+        cos2x2 = np.cos(2.0 * x2)
 
-        # Candidate features: (name, array values, meta)
-        feats = []
-        def add_feat(name, vals, meta=None):
-            feats.append((name, vals.astype(float), meta))
-
-        # Simple univariate trig
-        add_feat("sin(x1)", s1, {"type": "sin", "args": ("x1",)})
-        add_feat("cos(x1)", c1, {"type": "cos", "args": ("x1",)})
-        add_feat("sin(x2)", s2, {"type": "sin", "args": ("x2",)})
-        add_feat("cos(x2)", c2, {"type": "cos", "args": ("x2",)})
-
-        # Sum/difference trig
-        s12 = np.sin(x1 + x2)
-        s1m2 = np.sin(x1 - x2)
-        c12 = np.cos(x1 + x2)
-        c1m2 = np.cos(x1 - x2)
-        add_feat("sin(x1 + x2)", s12, {"type": "sin", "args": ("x1", "+", "x2")})
-        add_feat("sin(x1 - x2)", s1m2, {"type": "sin", "args": ("x1", "-", "x2")})
-        add_feat("cos(x1 + x2)", c12, {"type": "cos", "args": ("x1", "+", "x2")})
-        add_feat("cos(x1 - x2)", c1m2, {"type": "cos", "args": ("x1", "-", "x2")})
-
-        # Pairwise products
-        add_feat("sin(x1)*sin(x2)", s1 * s2, {"type": "prod", "f1": ("sin", "x1"), "f2": ("sin", "x2")})
-        add_feat("sin(x1)*cos(x2)", s1 * c2, {"type": "prod", "f1": ("sin", "x1"), "f2": ("cos", "x2")})
-        add_feat("cos(x1)*sin(x2)", c1 * s2, {"type": "prod", "f1": ("cos", "x1"), "f2": ("sin", "x2")})
-        add_feat("cos(x1)*cos(x2)", c1 * c2, {"type": "prod", "f1": ("cos", "x1"), "f2": ("cos", "x2")})
-
-        # Linear terms (fallback)
-        add_feat("x1", x1, {"type": "var", "var": "x1"})
-        add_feat("x2", x2, {"type": "var", "var": "x2"})
-
-        names = [f[0] for f in feats]
-        F = np.column_stack([f[1] for f in feats]).astype(float)
-
-        # Helper: fit and compute BIC
-        def fit_and_bic(A, y):
-            if A.ndim == 1:
-                A = A.reshape(-1, 1)
-            coeffs, _, _, _ = np.linalg.lstsq(A, y, rcond=None)
-            pred = A @ coeffs
-            resid = y - pred
-            rss = float(resid @ resid)
-            k = A.shape[1]
-            n = len(y)
-            rss = max(rss, 1e-18)
-            bic = n * np.log(rss / max(n, 1)) + k * np.log(max(n, 1))
-            return coeffs, pred, bic, rss
-
-        ones = np.ones(n, dtype=float)
-        selected = []
-        A_curr = ones.reshape(-1, 1)
-        coeffs_curr, pred_curr, bic_curr, rss_curr = fit_and_bic(A_curr, y)
-
-        # Forward stepwise selection using BIC
-        remaining = list(range(F.shape[1]))
-        bic_tol = 1e-9
-        max_features = min(20, F.shape[1])
-
-        while len(selected) < max_features and len(remaining) > 0:
-            best_bic = bic_curr
-            best_j = None
-            best_coeffs = None
-            best_pred = None
-            for j in remaining:
-                A_try = np.column_stack([A_curr, F[:, j]])
-                c_try, p_try, b_try, _ = fit_and_bic(A_try, y)
-                if b_try + bic_tol < best_bic:
-                    best_bic = b_try
-                    best_j = j
-                    best_coeffs = c_try
-                    best_pred = p_try
-            if best_j is None:
-                break
-            # Accept best candidate
-            A_curr = np.column_stack([A_curr, F[:, best_j]])
-            coeffs_curr = best_coeffs
-            pred_curr = best_pred
-            bic_curr = best_bic
-            selected.append(best_j)
-            remaining.remove(best_j)
-
-        # Backward elimination
-        improved = True
-        while improved and len(selected) > 0:
-            improved = False
-            best_bic = bic_curr
-            best_remove_idx = None
-            for idx_pos, j in enumerate(selected):
-                cols = [0] + [1 + k for k in range(len(selected)) if k != idx_pos]  # 0 is intercept column
-                A_try = A_curr[:, cols]
-                c_try, p_try, b_try, _ = fit_and_bic(A_try, y)
-                if b_try + bic_tol < best_bic:
-                    best_bic = b_try
-                    best_remove_idx = idx_pos
-                    best_coeffs = c_try
-                    best_pred = p_try
-            if best_remove_idx is not None:
-                # Remove that feature
-                keep_mask = np.ones(A_curr.shape[1], dtype=bool)
-                keep_mask[1 + best_remove_idx] = False
-                A_curr = A_curr[:, keep_mask]
-                removed = selected.pop(best_remove_idx)
-                coeffs_curr = best_coeffs
-                pred_curr = best_pred
-                bic_curr = best_bic
-                improved = True
-
-        # Final refit on selected features
-        if len(selected) > 0:
-            A_final = np.column_stack([ones, F[:, selected]])
-        else:
-            A_final = ones.reshape(-1, 1)
-        coeffs_final, pred_final, _, _ = fit_and_bic(A_final, y)
-        intercept = coeffs_final[0]
-        feature_coefs = coeffs_final[1:] if len(coeffs_final) > 1 else np.array([])
-
-        # Map selected feature names to coefficients
-        name_to_coef = {}
-        for idx, coef in zip(selected, feature_coefs):
-            nm = names[idx]
-            name_to_coef[nm] = coef
-
-        # Combine sin(x1) & cos(x1) into amplitude-phase if both present
-        terms = []
-        # Helper to add a term
-        def add_term(coef, values, basis_str, meta=None):
-            terms.append({"coef": coef, "values": values, "basis": basis_str, "meta": meta})
-
-        # Intercept term
-        add_term(intercept, np.ones_like(y), "1", {"type": "const"})
-
-        # Amplitude-phase for x1
-        a1 = name_to_coef.get("sin(x1)", 0.0)
-        b1 = name_to_coef.get("cos(x1)", 0.0)
-        used_x1_sin = "sin(x1)" in name_to_coef
-        used_x1_cos = "cos(x1)" in name_to_coef
-
-        if used_x1_sin and used_x1_cos:
-            R1 = np.hypot(a1, b1)
-            phi1 = np.arctan2(b1, a1)
-            phi1_s = self._float_from_formatted(phi1)
-            v1 = np.sin(x1 + phi1_s)
-            basis1 = f"sin(x1 + {self._format_number(abs(phi1_s))})" if phi1_s >= 0 else f"sin(x1 - {self._format_number(abs(phi1_s))})"
-            add_term(R1, v1, basis1, {"type": "phase", "var": "x1"})
-        else:
-            if used_x1_sin:
-                add_term(a1, s1, "sin(x1)", {"type": "sin", "args": ("x1",)})
-            if used_x1_cos:
-                add_term(b1, c1, "cos(x1)", {"type": "cos", "args": ("x1",)})
-
-        # Amplitude-phase for x2
-        a2 = name_to_coef.get("sin(x2)", 0.0)
-        b2 = name_to_coef.get("cos(x2)", 0.0)
-        used_x2_sin = "sin(x2)" in name_to_coef
-        used_x2_cos = "cos(x2)" in name_to_coef
-
-        if used_x2_sin and used_x2_cos:
-            R2 = np.hypot(a2, b2)
-            phi2 = np.arctan2(b2, a2)
-            phi2_s = self._float_from_formatted(phi2)
-            v2 = np.sin(x2 + phi2_s)
-            basis2 = f"sin(x2 + {self._format_number(abs(phi2_s))})" if phi2_s >= 0 else f"sin(x2 - {self._format_number(abs(phi2_s))})"
-            add_term(R2, v2, basis2, {"type": "phase", "var": "x2"})
-        else:
-            if used_x2_sin:
-                add_term(a2, s2, "sin(x2)", {"type": "sin", "args": ("x2",)})
-            if used_x2_cos:
-                add_term(b2, c2, "cos(x2)", {"type": "cos", "args": ("x2",)})
-
-        # Add remaining selected features (excluding ones folded)
-        excluded = {"sin(x1)", "cos(x1)", "sin(x2)", "cos(x2)"} if (used_x1_sin and used_x1_cos) or (used_x2_sin and used_x2_cos) else set()
-        for nm, coef in name_to_coef.items():
-            if nm in excluded:
-                continue
-            if nm in {"sin(x1)", "cos(x1)", "sin(x2)", "cos(x2)"}:
-                # Already added above
-                continue
-            # Find its values
-            idx = names.index(nm)
-            vals = F[:, idx]
-            add_term(coef, vals, nm, feats[idx][2])
-
-        # Round coefficients to stabilize expression; use formatted numbers for final predictions
-        for t in terms:
-            t["coef"] = self._float_from_formatted(t["coef"])
-
-        # Build predictions consistent with rounded coefficients and rounded phase angles used
-        yhat = np.zeros_like(y)
-        for t in terms:
-            yhat += t["coef"] * t["values"]
-
-        # Build expression string
-        # Prefer ordering: const, x1/x2 phase terms, simple univariate, sum/diff trig, products, vars
-        priority = {
-            "const": 0,
-            "phase_x1": 1,
-            "phase_x2": 2,
-            "sin_x1": 3,
-            "cos_x1": 4,
-            "sin_x2": 5,
-            "cos_x2": 6,
-            "sumdiff": 7,
-            "prod": 8,
-            "var": 9,
-            "other": 10,
+        feat = {
+            "1": ones,
+            "s1": s1,
+            "c1": c1,
+            "s2": s2,
+            "c2": c2,
+            "s1c2": s1c2,
+            "c1s2": c1s2,
+            "c1c2": c1c2,
+            "s1s2": s1s2,
+            "sinp": sinp,
+            "sind": sind,
+            "cosp": cosp,
+            "cosd": cosd,
+            "sin2x1": sin2x1,
+            "cos2x1": cos2x1,
+            "sin2x2": sin2x2,
+            "cos2x2": cos2x2,
         }
-        def term_priority(t):
-            m = t.get("meta") or {}
-            ttype = m.get("type", "other")
-            if ttype == "const":
-                return priority["const"]
-            if ttype == "phase":
-                return priority["phase_x1"] if m.get("var") == "x1" else priority["phase_x2"]
-            if ttype == "sin" and m.get("args") == ("x1",):
-                return priority["sin_x1"]
-            if ttype == "cos" and m.get("args") == ("x1",):
-                return priority["cos_x1"]
-            if ttype == "sin" and m.get("args") == ("x2",):
-                return priority["sin_x2"]
-            if ttype == "cos" and m.get("args") == ("x2",):
-                return priority["cos_x2"]
-            if ttype in {"sin", "cos"} and len(m.get("args", ())) == 3:
-                return priority["sumdiff"]
-            if ttype == "prod":
-                return priority["prod"]
-            if ttype == "var":
-                return priority["var"]
-            return priority["other"]
+        expr_map = {
+            "1": "1",
+            "s1": "sin(x1)",
+            "c1": "cos(x1)",
+            "s2": "sin(x2)",
+            "c2": "cos(x2)",
+            "s1c2": "sin(x1)*cos(x2)",
+            "c1s2": "cos(x1)*sin(x2)",
+            "c1c2": "cos(x1)*cos(x2)",
+            "s1s2": "sin(x1)*sin(x2)",
+            "sinp": "sin(x1 + x2)",
+            "sind": "sin(x1 - x2)",
+            "cosp": "cos(x1 + x2)",
+            "cosd": "cos(x1 - x2)",
+            "sin2x1": "sin(2*x1)",
+            "cos2x1": "cos(2*x1)",
+            "sin2x2": "sin(2*x2)",
+            "cos2x2": "cos(2*x2)",
+        }
 
-        terms_sorted = sorted(terms, key=term_priority)
+        def fmt(c: float) -> str:
+            if not np.isfinite(c):
+                return "0"
+            if abs(c) < 1e-12:
+                return "0"
+            return format(float(c), ".12g")
 
-        def format_term(coef, basis):
-            # coef already rounded
-            if basis == "1":
-                return self._format_number(coef)
-            abscoef = abs(coef)
-            if abs(abscoef - 1.0) < 1e-12:
-                t = basis
-            else:
-                t = f"{self._format_number(abscoef)}*{basis}"
-            if coef < 0:
-                # handle sign
-                if t.startswith("-"):
-                    return t
+        def build_expression(term_names, weights):
+            # separate constant
+            constant = 0.0
+            items = []
+            for name, w in zip(term_names, weights):
+                if abs(w) < 1e-12:
+                    continue
+                if name == "1":
+                    constant += w
                 else:
-                    return f"-{t}"
-            else:
-                return t
+                    items.append((name, w))
 
-        expr_parts = []
-        for i, t in enumerate(terms_sorted):
-            part = format_term(t["coef"], t["basis"])
-            if i == 0:
-                # first term: ensure no leading '+'
-                if part.startswith("+"):
-                    part = part[1:]
-                expr_parts.append(part)
-            else:
-                if part.startswith("-"):
-                    expr_parts.append(f" {part}")
+            expr = ""
+            # start with constant if present
+            if abs(constant) >= 1e-12:
+                expr = fmt(constant)
+
+            for name, w in items:
+                term = expr_map[name]
+                sign = "+" if w > 0 else "-"
+                mag = abs(w)
+                if abs(mag - 1.0) < 1e-12:
+                    part = term
                 else:
-                    expr_parts.append(f" + {part}")
-        expression = "".join(expr_parts) if expr_parts else "0"
+                    part = f"{fmt(mag)}*{term}"
+                if expr == "":
+                    expr = part if sign == "+" else f"-{part}"
+                else:
+                    expr += f" {sign} {part}"
+            if expr == "":
+                expr = "0"
+            return expr
 
-        # Compute complexity (approximate)
-        # Count unary ops (sin, cos), binary ops (+, -, *, /) approximate
-        unary_ops = 0
-        binary_ops = 0
-        # number of additions between top-level terms
-        if len(terms_sorted) > 1:
-            binary_ops += (len(terms_sorted) - 1)
-        for t in terms_sorted:
-            basis = t["basis"]
-            coef = t["coef"]
-            meta = t.get("meta") or {}
-            if basis == "1":
+        def term_base_complexity(name: str):
+            # returns (unary_ops, binary_ops) excluding coefficient multiplication and outer sums
+            if name in ("s1", "c1", "s2", "c2"):
+                return (1, 0)
+            if name in ("s1c2", "c1s2", "c1c2", "s1s2"):
+                return (2, 1)
+            if name in ("sinp", "sind", "cosp", "cosd"):
+                return (1, 1)
+            if name in ("sin2x1", "cos2x1", "sin2x2", "cos2x2"):
+                return (1, 1)  # one mul inside (2*xi)
+            if name == "1":
+                return (0, 0)
+            return (0, 0)
+
+        def compute_complexity(term_names, weights):
+            unary = 0
+            binary = 0
+            num_terms = 0
+            const_nonzero = False
+            for name, w in zip(term_names, weights):
+                if abs(w) < 1e-12:
+                    continue
+                if name == "1":
+                    const_nonzero = True
+                    continue
+                num_terms += 1
+                u, b = term_base_complexity(name)
+                unary += u
+                binary += b
+                if abs(abs(w) - 1.0) > 1e-12:
+                    binary += 1  # coefficient multiplication
+            items = num_terms + (1 if const_nonzero else 0)
+            if items > 1:
+                binary += (items - 1)  # sums at top-level
+            return int(2 * binary + unary)
+
+        def evaluate_expression(expr: str, x1_arr, x2_arr):
+            local_dict = {
+                "x1": x1_arr,
+                "x2": x2_arr,
+                "sin": np.sin,
+                "cos": np.cos,
+                "exp": np.exp,
+                "log": np.log,
+            }
+            try:
+                res = eval(expr, {"__builtins__": {}}, local_dict)
+            except Exception:
+                res = None
+            if res is None:
+                return None
+            if np.isscalar(res):
+                return np.full_like(x1_arr, float(res), dtype=float)
+            return np.asarray(res, dtype=float)
+
+        def ls_fit(term_names):
+            F = np.column_stack([feat[name] for name in term_names])
+            w, _, _, _ = np.linalg.lstsq(F, y, rcond=None)
+            return w, F
+
+        std_y = float(np.std(y)) if np.isfinite(np.std(y)) else 1.0
+        small_coeff_thr = max(1e-8, 1e-6 * std_y)
+        const_snap_thr = max(1e-8, 0.02 * std_y)
+        snap_rel = 0.05
+        mse_tol_improve = 1e-12
+
+        def try_candidate(term_names):
+            w, F = ls_fit(term_names)
+            yhat = F @ w
+            mse = float(np.mean((y - yhat) ** 2))
+            expr = build_expression(term_names, w)
+            comp = compute_complexity(term_names, w)
+            res_expr = expr
+            res_w = w.copy()
+            res_mse = mse
+            res_comp = comp
+
+            # Simplify coefficients: remove tiny, snap to +/-1, zero constant if small
+            w_simpl = w.copy()
+            for i, name in enumerate(term_names):
+                if name == "1":
+                    continue
+                c = w_simpl[i]
+                if abs(c) < small_coeff_thr:
+                    w_simpl[i] = 0.0
+                else:
+                    for target in (1.0, -1.0):
+                        if abs(c - target) <= max(snap_rel * max(abs(c), abs(target)), 1e-6):
+                            w_simpl[i] = target
+                            break
+            # constant term
+            if "1" in term_names:
+                idx_c = term_names.index("1")
+                if abs(w_simpl[idx_c]) <= const_snap_thr:
+                    w_simpl[idx_c] = 0.0
+
+            expr_simpl = build_expression(term_names, w_simpl)
+            yhat_simpl = evaluate_expression(expr_simpl, x1, x2)
+            if yhat_simpl is not None and yhat_simpl.shape == y.shape:
+                mse_simpl = float(np.mean((y - yhat_simpl) ** 2))
+                comp_simpl = compute_complexity(term_names, w_simpl)
+                # Accept simplification if MSE not significantly worse and complexity not higher
+                if (mse_simpl <= res_mse * 1.02 + 1e-15) and (comp_simpl < res_comp or mse_simpl + mse_tol_improve < res_mse):
+                    res_expr = expr_simpl
+                    res_w = w_simpl
+                    res_mse = mse_simpl
+                    res_comp = comp_simpl
+                    yhat = yhat_simpl
+                else:
+                    yhat = F @ w
+            else:
+                yhat = F @ w
+
+            return res_expr, yhat, res_mse, res_comp
+
+        # Candidate term sets
+        candidates = [
+            ["s1", "c2", "1"],
+            ["s1", "c1", "s2", "c2", "1"],
+            ["sinp", "1"],
+            ["s1c2", "1"],
+            ["s1c2", "c1s2", "1"],
+            ["s1", "c2", "s1c2", "1"],
+            ["s1", "c2", "s1c2", "c1s2", "c1c2", "s1s2", "1"],
+            ["s1", "s2", "1"],
+            ["c1", "c2", "1"],
+            ["s1", "c2", "sin2x1", "sin2x2", "cos2x1", "cos2x2", "1"],
+        ]
+
+        best_expr = None
+        best_pred = None
+        best_mse = np.inf
+        best_comp = 10**9
+
+        for terms in candidates:
+            expr, pred, mse_val, comp_val = try_candidate(terms)
+            if pred is None:
                 continue
-            # unary function count
-            if basis.startswith("sin("):
-                unary_ops += 1
-            elif basis.startswith("cos("):
-                unary_ops += 1
-            # binary inside basis
-            if " + " in basis or " - " in basis:
-                binary_ops += 1
-            if "*" in basis:
-                binary_ops += 1  # product of two trig functions
+            if (mse_val + mse_tol_improve < best_mse) or (abs(mse_val - best_mse) <= mse_tol_improve and comp_val < best_comp):
+                best_expr = expr
+                best_pred = pred
+                best_mse = mse_val
+                best_comp = comp_val
 
-            # external multiply by coefficient (if not 1)
-            if abs(abs(coef) - 1.0) >= 1e-12:
-                binary_ops += 1
-
-        complexity = 2 * binary_ops + unary_ops
+        # As a fallback, if nothing worked, default to sin(x1) + cos(x2)
+        if best_expr is None:
+            best_expr = "sin(x1) + cos(x2)"
+            best_pred = evaluate_expression(best_expr, x1, x2)
+            if best_pred is None or best_pred.shape != y.shape:
+                best_pred = np.zeros_like(y)
+            best_comp = 2 * 1 + 2  # one plus (binary), two unary
 
         return {
-            "expression": expression,
-            "predictions": yhat.tolist(),
-            "details": {"complexity": int(complexity)}
+            "expression": best_expr,
+            "predictions": np.asarray(best_pred, dtype=float).tolist(),
+            "details": {"complexity": int(best_comp)}
         }

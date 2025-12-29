@@ -1,20 +1,25 @@
 import torch
 import torch.nn as nn
 import torch.optim as optim
-import math
+import numpy as np
+import copy
 
-class DynamicNet(nn.Module):
-    def __init__(self, input_dim, num_classes, hidden_dim):
-        super(DynamicNet, self).__init__()
+class Network(nn.Module):
+    def __init__(self, input_dim, hidden_dim, num_classes):
+        super(Network, self).__init__()
+        # Architecture designed to maximize parameter usage within 200k limit
+        # Input: 384, Hidden: 256, Output: 128
+        # Params: (384*256+256) + 2*256 + (256*256+256) + 2*256 + (256*128+128)
+        #       = 98,560 + 512 + 65,792 + 512 + 32,896 = 198,272
         self.features = nn.Sequential(
             nn.Linear(input_dim, hidden_dim),
             nn.BatchNorm1d(hidden_dim),
             nn.ReLU(),
-            nn.Dropout(0.25),
+            nn.Dropout(0.3),
             nn.Linear(hidden_dim, hidden_dim),
             nn.BatchNorm1d(hidden_dim),
             nn.ReLU(),
-            nn.Dropout(0.25),
+            nn.Dropout(0.3),
             nn.Linear(hidden_dim, num_classes)
         )
 
@@ -23,70 +28,46 @@ class DynamicNet(nn.Module):
 
 class Solution:
     def solve(self, train_loader, val_loader, metadata: dict = None) -> torch.nn.Module:
+        """
+        Train a model and return it.
+        """
         # Extract metadata
         input_dim = metadata.get("input_dim", 384)
         num_classes = metadata.get("num_classes", 128)
-        param_limit = metadata.get("param_limit", 200000)
         device = metadata.get("device", "cpu")
         
-        # Calculate max hidden dim to satisfy parameter limit
-        # Architecture: 384 -> H -> H -> 128 (with Batch Norms)
-        # Parameters count equation:
-        # Layer 1: (Input + 1) * H
-        # BN 1: 2 * H
-        # Layer 2: (H + 1) * H
-        # BN 2: 2 * H
-        # Layer 3: (H + 1) * Output
-        # Total = H^2 + (Input + Output + 6)H + Output <= Limit
-        
-        a = 1
-        b = input_dim + num_classes + 6
-        c = num_classes - param_limit
-        
-        # Quadratic formula to find max H
-        delta = b**2 - 4*a*c
-        max_h = math.floor((-b + math.sqrt(delta)) / (2*a))
-        
-        # Clamp hidden dim to 256 (sufficient for this problem scale and good for regularization)
-        hidden_dim = min(int(max_h), 256)
-        
-        model = DynamicNet(input_dim, num_classes, hidden_dim).to(device)
-        
-        # Training hyperparameters
-        epochs = 80
-        lr = 1e-3
-        weight_decay = 1e-2
-        
-        optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
-        criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
-        
-        total_steps = epochs * len(train_loader)
-        scheduler = optim.lr_scheduler.OneCycleLR(
-            optimizer,
-            max_lr=lr,
-            total_steps=total_steps,
-            pct_start=0.3,
-            div_factor=25.0,
-            final_div_factor=1000.0
-        )
-        
-        best_val_acc = 0.0
-        best_state = None
-        
-        # Mixup setup
+        # Define hyperparams
+        hidden_dim = 256  # Fits within 200k budget
+        epochs = 100
+        lr = 0.001
+        weight_decay = 1e-4
         mixup_alpha = 0.4
         
+        # Initialize model
+        model = Network(input_dim, hidden_dim, num_classes).to(device)
+        
+        # Setup optimizer and loss
+        optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
+        scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
+        criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
+        
+        best_val_acc = -1.0
+        best_model_wts = copy.deepcopy(model.state_dict())
+        
         for epoch in range(epochs):
+            # Training Phase
             model.train()
             for inputs, targets in train_loader:
-                inputs, targets = inputs.to(device), targets.to(device)
+                inputs = inputs.to(device)
+                targets = targets.to(device)
                 
                 optimizer.zero_grad()
                 
-                # Apply Mixup for the first 85% of epochs
-                if epoch < int(epochs * 0.85):
-                    lam = torch.distributions.Beta(mixup_alpha, mixup_alpha).sample().item()
+                # Mixup Augmentation
+                if mixup_alpha > 0:
+                    lam = np.random.beta(mixup_alpha, mixup_alpha)
                     index = torch.randperm(inputs.size(0)).to(device)
+                    
                     mixed_inputs = lam * inputs + (1 - lam) * inputs[index]
                     target_a, target_b = targets, targets[index]
                     
@@ -98,28 +79,31 @@ class Solution:
                 
                 loss.backward()
                 optimizer.step()
-                scheduler.step()
             
-            # Validation
+            # Validation Phase
             model.eval()
             correct = 0
             total = 0
             with torch.no_grad():
                 for inputs, targets in val_loader:
-                    inputs, targets = inputs.to(device), targets.to(device)
+                    inputs = inputs.to(device)
+                    targets = targets.to(device)
+                    
                     outputs = model(inputs)
-                    _, predicted = torch.max(outputs, 1)
+                    _, preds = torch.max(outputs, 1)
+                    
+                    correct += (preds == targets).sum().item()
                     total += targets.size(0)
-                    correct += (predicted == targets).sum().item()
             
-            val_acc = correct / total
+            val_acc = correct / total if total > 0 else 0.0
             
-            # Save best model
+            # Checkpoint best model
             if val_acc >= best_val_acc:
                 best_val_acc = val_acc
-                best_state = {k: v.clone() for k, v in model.state_dict().items()}
-        
-        if best_state is not None:
-            model.load_state_dict(best_state)
+                best_model_wts = copy.deepcopy(model.state_dict())
             
+            scheduler.step()
+        
+        # Load best weights before returning
+        model.load_state_dict(best_model_wts)
         return model

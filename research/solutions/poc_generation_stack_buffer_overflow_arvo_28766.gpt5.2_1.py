@@ -1,650 +1,717 @@
-import io
 import os
 import re
+import io
+import sys
 import tarfile
-from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple, Set
-
-
-SCALAR_TYPES = {
-    "double",
-    "float",
-    "int32",
-    "int64",
-    "uint32",
-    "uint64",
-    "sint32",
-    "sint64",
-    "fixed32",
-    "fixed64",
-    "sfixed32",
-    "sfixed64",
-    "bool",
-    "string",
-    "bytes",
-}
-
-
-def _varint(n: int) -> bytes:
-    if n < 0:
-        n &= (1 << 64) - 1
-    out = bytearray()
-    while True:
-        b = n & 0x7F
-        n >>= 7
-        if n:
-            out.append(b | 0x80)
-        else:
-            out.append(b)
-            break
-    return bytes(out)
-
-
-def _key(field_number: int, wire_type: int) -> bytes:
-    return _varint((field_number << 3) | wire_type)
-
-
-def _enc_varint(field_number: int, value: int) -> bytes:
-    return _key(field_number, 0) + _varint(value)
-
-
-def _enc_len(field_number: int, payload: bytes) -> bytes:
-    return _key(field_number, 2) + _varint(len(payload)) + payload
-
-
-def _strip_proto_comments(text: str) -> str:
-    text = re.sub(r"/\*.*?\*/", "", text, flags=re.S)
-    text = re.sub(r"//[^\n\r]*", "", text)
-    return text
-
-
-def _find_matching_brace(text: str, open_idx: int) -> int:
-    depth = 1
-    i = open_idx + 1
-    n = len(text)
-    while i < n:
-        c = text[i]
-        if c == "{":
-            depth += 1
-        elif c == "}":
-            depth -= 1
-            if depth == 0:
-                return i
-        i += 1
-    return -1
-
-
-def _remove_nested_message_enum_blocks(body: str) -> str:
-    # Remove nested "message X { ... }" and "enum X { ... }" blocks,
-    # but keep "oneof" blocks (fields inside are part of parent).
-    i = 0
-    n = len(body)
-    out = []
-    while i < n:
-        m = re.search(r"\b(message|enum)\b", body[i:])
-        if not m:
-            out.append(body[i:])
-            break
-        start = i + m.start()
-        out.append(body[i:start])
-        brace = body.find("{", start)
-        if brace == -1:
-            i = start + len(m.group(1))
-            continue
-        end = _find_matching_brace(body, brace)
-        if end == -1:
-            i = brace + 1
-            continue
-        i = end + 1
-    return "".join(out)
-
-
-@dataclass
-class FieldDef:
-    label: str  # 'repeated', 'optional', 'required', ''
-    type: str
-    name: str
-    number: int
-
-
-@dataclass
-class MessageDef:
-    full_name: str
-    package: str
-    fields: List[FieldDef]
-
-
-class ProtoIndex:
-    def __init__(self) -> None:
-        self.messages: Dict[str, MessageDef] = {}
-        self.simple_index: Dict[str, List[str]] = {}
-
-    def add(self, msg: MessageDef) -> None:
-        self.messages[msg.full_name] = msg
-        simple = msg.full_name.split(".")[-1]
-        self.simple_index.setdefault(simple, []).append(msg.full_name)
-
-    def resolve_message(self, type_str: str, context_pkg: str = "") -> Optional[str]:
-        t = type_str.strip()
-        if not t:
-            return None
-        if t.startswith("map<"):
-            return None
-        t = t.lstrip(".")
-        if t in SCALAR_TYPES:
-            return None
-        if t in self.messages:
-            return t
-
-        # Try context package qualification for unqualified names.
-        if "." not in t and context_pkg:
-            cand = f"{context_pkg}.{t}"
-            if cand in self.messages:
-                return cand
-
-        # Try unique simple name match.
-        simple = t.split(".")[-1]
-        cands = self.simple_index.get(simple, [])
-        if len(cands) == 1:
-            return cands[0]
-
-        # Try suffix match (qualified name may include package).
-        suffix = "." + simple
-        suffix_cands = [c for c in cands if c.endswith(suffix)]
-        if len(suffix_cands) == 1:
-            return suffix_cands[0]
-
-        if len(cands) == 1:
-            return cands[0]
-        return None
-
-
-def _parse_proto_messages(proto_text: str, package: str) -> List[MessageDef]:
-    text = _strip_proto_comments(proto_text)
-    res: List[MessageDef] = []
-
-    def parse_block(block_text: str, parent_full: str, pkg: str) -> None:
-        i = 0
-        while True:
-            m = re.search(r"\bmessage\s+([A-Za-z_]\w*)\s*\{", block_text[i:])
-            if not m:
-                return
-            name = m.group(1)
-            start = i + m.start()
-            brace = i + m.end() - 1
-            end = _find_matching_brace(block_text, brace)
-            if end == -1:
-                return
-            body = block_text[brace + 1 : end]
-            full = f"{parent_full}.{name}" if parent_full else (f"{pkg}.{name}" if pkg else name)
-
-            body_for_fields = _remove_nested_message_enum_blocks(body)
-
-            fields: List[FieldDef] = []
-            for raw_line in body_for_fields.splitlines():
-                line = raw_line.strip()
-                if not line:
-                    continue
-                if line.startswith(("option ", "extensions ", "reserved ")):
-                    continue
-                if line.startswith("oneof "):
-                    continue
-                if line in ("{", "}", "};"):
-                    continue
-                line = line.split("[", 1)[0].strip()
-                if not line.endswith(";"):
-                    continue
-                line = line[:-1].strip()
-
-                fm = re.match(
-                    r"^(?:(repeated|required|optional)\s+)?([A-Za-z_][\w.<> ,]*)\s+([A-Za-z_]\w*)\s*=\s*(\d+)\s*$",
-                    line,
-                )
-                if not fm:
-                    continue
-                label = fm.group(1) or ""
-                ftype = fm.group(2).strip()
-                fname = fm.group(3)
-                fnum = int(fm.group(4))
-                fields.append(FieldDef(label=label, type=ftype, name=fname, number=fnum))
-
-            res.append(MessageDef(full_name=full, package=pkg, fields=fields))
-            parse_block(body, full, pkg)
-            i = end + 1
-
-    parse_block(text, "", package)
-    return res
-
-
-def _scan_tar_text_files(tar_path: str, exts: Tuple[str, ...], limit_bytes: int = 2_000_000) -> List[Tuple[str, str]]:
-    out: List[Tuple[str, str]] = []
-    with tarfile.open(tar_path, "r:*") as tf:
-        for m in tf.getmembers():
-            if not m.isfile():
-                continue
-            name = m.name
-            if not any(name.endswith(e) for e in exts):
-                continue
-            if m.size > limit_bytes:
-                continue
-            f = tf.extractfile(m)
-            if f is None:
-                continue
-            data = f.read()
-            try:
-                txt = data.decode("utf-8", errors="ignore")
-            except Exception:
-                continue
-            out.append((name, txt))
-    return out
-
-
-def _extract_hints_from_cpp(tar_path: str) -> Tuple[Set[str], Set[str]]:
-    # Returns (capital_identifiers, lower_snake_tokens) near node_id_map usage
-    cap: Set[str] = set()
-    low: Set[str] = set()
-    cpp_files = _scan_tar_text_files(tar_path, (".cc", ".cpp", ".c", ".h", ".hpp", ".hh"), limit_bytes=3_000_000)
-    for _, txt in cpp_files:
-        if "node_id_map" not in txt:
-            continue
-        for line in txt.splitlines():
-            if "node_id_map" not in line:
-                continue
-            for token in re.findall(r"\b[A-Z][A-Za-z0-9_]*\b", line):
-                if 3 <= len(token) <= 64:
-                    cap.add(token)
-            for token in re.findall(r"\b[a-z][a-z0-9_]{2,64}\b", line):
-                low.add(token)
-            for token in re.findall(r"\.([a-z][a-z0-9_]*)\s*\(", line):
-                low.add(token)
-    return cap, low
-
-
-def _select_container(idx: ProtoIndex, hint_caps: Set[str], hint_lows: Set[str]) -> Optional[str]:
-    best = None
-    best_score = -1
-
-    for full, msg in idx.messages.items():
-        node_fields = []
-        edge_fields = []
-        for f in msg.fields:
-            if f.label != "repeated":
-                continue
-            lname = f.name.lower()
-            if "node" in lname and "edge" not in lname:
-                node_fields.append(f)
-            if "edge" in lname:
-                edge_fields.append(f)
-
-        if not node_fields or not edge_fields:
-            continue
-
-        score = 0
-        simple = full.split(".")[-1]
-        lsimple = simple.lower()
-        if any(simple == hc or simple.endswith(hc) for hc in hint_caps):
-            score += 30
-        if "heap" in lsimple:
-            score += 12
-        if "graph" in lsimple:
-            score += 10
-        if "snapshot" in lsimple:
-            score += 6
-
-        for f in node_fields:
-            if f.name.lower() == "nodes":
-                score += 15
-            if f.name in hint_lows or f.name.lower() in hint_lows:
-                score += 5
-        for f in edge_fields:
-            if f.name.lower() == "edges":
-                score += 15
-            if f.name in hint_lows or f.name.lower() in hint_lows:
-                score += 5
-
-        node_t = idx.resolve_message(node_fields[0].type, msg.package)
-        edge_t = idx.resolve_message(edge_fields[0].type, msg.package)
-        if node_t:
-            score += 5
-            if "node" in node_t.split(".")[-1].lower():
-                score += 3
-        if edge_t:
-            score += 5
-            if "edge" in edge_t.split(".")[-1].lower():
-                score += 3
-
-        if score > best_score:
-            best_score = score
-            best = full
-
-    return best
-
-
-def _pick_node_edge_fields(idx: ProtoIndex, container_full: str) -> Optional[Tuple[FieldDef, FieldDef, str, str]]:
-    container = idx.messages.get(container_full)
-    if not container:
-        return None
-
-    node_candidates: List[FieldDef] = []
-    edge_candidates: List[FieldDef] = []
-
-    for f in container.fields:
-        if f.label != "repeated":
-            continue
-        t = idx.resolve_message(f.type, container.package)
-        if not t:
-            continue
-        lname = f.name.lower()
-        if "edge" in lname:
-            edge_candidates.append(f)
-        elif "node" in lname:
-            node_candidates.append(f)
-
-    def best_by_name(cands: List[FieldDef], exact: str) -> Optional[FieldDef]:
-        for f in cands:
-            if f.name.lower() == exact:
-                return f
-        return cands[0] if cands else None
-
-    node_field = best_by_name(node_candidates, "nodes")
-    edge_field = best_by_name(edge_candidates, "edges")
-    if not node_field or not edge_field:
-        return None
-
-    node_type = idx.resolve_message(node_field.type, container.package)
-    edge_type = idx.resolve_message(edge_field.type, container.package)
-    if not node_type or not edge_type:
-        return None
-    return node_field, edge_field, node_type, edge_type
-
-
-def _find_id_field(idx: ProtoIndex, node_full: str) -> Optional[FieldDef]:
-    node = idx.messages.get(node_full)
-    if not node:
-        return None
-    preferred = ["id", "node_id", "object_id", "uid"]
-    fields = node.fields
-    for pname in preferred:
-        for f in fields:
-            if f.name == pname and f.type.strip().lstrip(".") in ("uint64", "uint32", "int64", "int32"):
-                return f
-    for f in fields:
-        if f.name.endswith("_id") and f.type.strip().lstrip(".") in ("uint64", "uint32", "int64", "int32"):
-            return f
-    for f in fields:
-        if f.type.strip().lstrip(".") in ("uint64", "uint32", "int64", "int32"):
-            return f
-    return None
-
-
-def _find_edge_from_to_fields(idx: ProtoIndex, edge_full: str) -> Optional[Tuple[FieldDef, FieldDef]]:
-    edge = idx.messages.get(edge_full)
-    if not edge:
-        return None
-    fields = edge.fields
-
-    def find_by_names(names: List[str]) -> Optional[FieldDef]:
-        for n in names:
-            for f in fields:
-                if f.name == n and f.type.strip().lstrip(".") in ("uint64", "uint32", "int64", "int32"):
-                    return f
-        return None
-
-    from_field = find_by_names(["from_node_id", "source_node_id", "src_node_id", "from_id", "source_id"])
-    to_field = find_by_names(["to_node_id", "target_node_id", "dst_node_id", "to_id", "target_id"])
-
-    if from_field and to_field:
-        return from_field, to_field
-
-    # Fallback: fuzzy match
-    def best_fuzzy(is_from: bool) -> Optional[FieldDef]:
-        best = None
-        best_score = -1
-        for f in fields:
-            if f.type.strip().lstrip(".") not in ("uint64", "uint32", "int64", "int32"):
-                continue
-            lname = f.name.lower()
-            score = 0
-            if "node" in lname:
-                score += 3
-            if "id" in lname:
-                score += 3
-            if is_from and ("from" in lname or "src" in lname or "source" in lname):
-                score += 5
-            if (not is_from) and ("to" in lname or "dst" in lname or "target" in lname):
-                score += 5
-            if score > best_score:
-                best_score = score
-                best = f
-        return best
-
-    from_f = best_fuzzy(True)
-    to_f = best_fuzzy(False)
-    if from_f and to_f and from_f.number != to_f.number:
-        return from_f, to_f
-    return None
-
-
-def _select_tracepacket(idx: ProtoIndex, container_full: str) -> Optional[str]:
-    # Prefer message ending with TracePacket, then those with a path to container.
-    candidates = idx.simple_index.get("TracePacket", [])
-    if not candidates:
-        candidates = [k for k in idx.messages.keys() if k.split(".")[-1].endswith("TracePacket")]
-
-    def has_path(start: str) -> bool:
-        return _find_path(idx, start, container_full) is not None
-
-    for c in candidates:
-        if has_path(c):
-            return c
-
-    if candidates:
-        return candidates[0]
-
-    # Fallback: find any message with a direct field to container.
-    for full, msg in idx.messages.items():
-        for f in msg.fields:
-            t = idx.resolve_message(f.type, msg.package)
-            if t == container_full:
-                return full
-    return None
-
-
-def _find_trace_wrapper(idx: ProtoIndex, packet_full: str) -> Optional[Tuple[str, FieldDef]]:
-    # Find message named Trace (or ending Trace) that has repeated field of TracePacket type.
-    trace_candidates = idx.simple_index.get("Trace", [])
-    if not trace_candidates:
-        trace_candidates = [k for k in idx.messages.keys() if k.split(".")[-1] == "Trace" or k.split(".")[-1].endswith(".Trace")]
-
-    best = None
-    best_field = None
-    best_score = -1
-    for full in trace_candidates:
-        msg = idx.messages[full]
-        for f in msg.fields:
-            if f.label != "repeated":
-                continue
-            t = idx.resolve_message(f.type, msg.package)
-            if t != packet_full:
-                continue
-            score = 0
-            if full.split(".")[-1] == "Trace":
-                score += 20
-            if f.name.lower() == "packet":
-                score += 20
-            if f.number == 1:
-                score += 10
-            if score > best_score:
-                best_score = score
-                best = full
-                best_field = f
-    if best and best_field:
-        return best, best_field
-    return None
-
-
-def _find_path(idx: ProtoIndex, start_full: str, target_full: str, max_depth: int = 6) -> Optional[List[Tuple[str, FieldDef, str]]]:
-    if start_full == target_full:
-        return []
-
-    q: List[Tuple[str, List[Tuple[str, FieldDef, str]]]] = [(start_full, [])]
-    visited: Set[str] = {start_full}
-    while q:
-        cur, path = q.pop(0)
-        if len(path) >= max_depth:
-            continue
-        msg = idx.messages.get(cur)
-        if not msg:
-            continue
-        for f in msg.fields:
-            t = idx.resolve_message(f.type, msg.package)
-            if not t:
-                continue
-            new_path = path + [(cur, f, t)]
-            if t == target_full:
-                return new_path
-            if t not in visited:
-                visited.add(t)
-                q.append((t, new_path))
-    return None
-
-
-def _build_node_message(idx: ProtoIndex, node_full: str) -> bytes:
-    node = idx.messages.get(node_full)
-    if not node:
-        return b""
-    id_field = _find_id_field(idx, node_full)
-    if not id_field:
-        return b""
-    b = bytearray()
-    b += _enc_varint(id_field.number, 1)
-
-    # Add a couple of common harmless fields (set to 1) if present, to reduce chance of being ignored.
-    for fname in ("self_size", "size", "type_id", "name_id", "class_name_id", "root_type", "flags"):
-        for f in node.fields:
-            if f.name == fname and f.type.strip().lstrip(".") in ("uint64", "uint32", "int64", "int32", "bool"):
-                val = 1
-                b += _enc_varint(f.number, val)
-                break
-    return bytes(b)
-
-
-def _build_edge_message(idx: ProtoIndex, edge_full: str) -> bytes:
-    edge = idx.messages.get(edge_full)
-    if not edge:
-        return b""
-    ft = _find_edge_from_to_fields(idx, edge_full)
-    if not ft:
-        return b""
-    from_f, to_f = ft
-    b = bytearray()
-    b += _enc_varint(from_f.number, 1)
-    b += _enc_varint(to_f.number, 2)
-
-    # Optional: edge type/name id if present
-    for fname in ("type", "edge_type", "name_id", "label_id", "priority"):
-        for f in edge.fields:
-            if f.name == fname and f.type.strip().lstrip(".") in ("uint64", "uint32", "int64", "int32", "bool"):
-                b += _enc_varint(f.number, 0 if f.name in ("type", "edge_type") else 1)
-                break
-    return bytes(b)
-
-
-def _build_container_message(idx: ProtoIndex, container_full: str, node_field: FieldDef, edge_field: FieldDef, node_full: str, edge_full: str) -> bytes:
-    container = idx.messages.get(container_full)
-    if not container:
-        return b""
-    node_msg = _build_node_message(idx, node_full)
-    edge_msg = _build_edge_message(idx, edge_full)
-    if not node_msg or not edge_msg:
-        return b""
-
-    b = bytearray()
-
-    # Common metadata fields
-    for fname in ("pid", "process_id", "timestamp", "ts", "uproducer_id", "upid"):
-        for f in container.fields:
-            if f.name == fname and f.type.strip().lstrip(".") in ("uint64", "uint32", "int64", "int32"):
-                b += _enc_varint(f.number, 1)
-                break
-
-    # Ensure nodes first, then edges (helps if parser builds map while reading)
-    b += _enc_len(node_field.number, node_msg)
-    b += _enc_len(edge_field.number, edge_msg)
-    return bytes(b)
-
-
-def _build_packet_with_path(idx: ProtoIndex, tracepacket_full: str, container_full: str, container_payload: bytes) -> bytes:
-    path = _find_path(idx, tracepacket_full, container_full)
-    if path is None:
-        # Try direct container field in TracePacket
-        msg = idx.messages.get(tracepacket_full)
-        if msg:
-            for f in msg.fields:
-                t = idx.resolve_message(f.type, msg.package)
-                if t == container_full:
-                    path = [(tracepacket_full, f, container_full)]
-                    break
-    if path is None:
-        return b""
-
-    inner = container_payload
-    # wrap from container up to TracePacket
-    for _, f, _ in reversed(path):
-        inner = _enc_len(f.number, inner)
-
-    # Add timestamp if available (prepend)
-    tp = idx.messages.get(tracepacket_full)
-    if tp:
-        for f in tp.fields:
-            if f.name == "timestamp" and f.type.strip().lstrip(".") in ("uint64", "uint32", "int64", "int32"):
-                inner = _enc_varint(f.number, 1) + inner
-                break
-    return inner
+import time
+import shutil
+import struct
+import random
+import tempfile
+import subprocess
+from pathlib import Path
+from collections import Counter
+from typing import List, Optional, Tuple, Set, Dict
 
 
 class Solution:
     def solve(self, src_path: str) -> bytes:
-        proto_files = _scan_tar_text_files(src_path, (".proto",), limit_bytes=3_000_000)
-        hint_caps, hint_lows = _extract_hints_from_cpp(src_path)
+        random.seed(0)
+        workdir = tempfile.mkdtemp(prefix="arvo_poc_")
+        try:
+            root = self._extract_to_dir(src_path, Path(workdir) / "src")
+            root = self._guess_project_root(root)
 
-        idx = ProtoIndex()
-        if proto_files:
-            for _, txt in proto_files:
-                pkg = ""
-                pm = re.search(r"\bpackage\s+([A-Za-z0-9_.]+)\s*;", txt)
-                if pm:
-                    pkg = pm.group(1).strip()
-                for msg in _parse_proto_messages(txt, pkg):
-                    idx.add(msg)
+            existing = self._find_existing_poc_file_bytes(root)
+            if existing is not None:
+                return existing
 
-        container_full = _select_container(idx, hint_caps, hint_lows) if idx.messages else None
-        if not container_full:
-            # Minimal fallback: output something unlikely to crash fixed version
-            return b"\n\x00"
+            bug_files = self._find_bug_files(root)
 
-        picked = _pick_node_edge_fields(idx, container_full)
-        if not picked:
-            return b"\n\x00"
-        node_field, edge_field, node_full, edge_full = picked
+            exe, mode, seed_bytes = self._build_and_find_target_and_seed(root, bug_files=bug_files, time_budget=110.0)
+            if exe is not None:
+                crash = self._find_crashing_input(exe, mode, seed_bytes, bug_files=bug_files, time_budget=45.0)
+                if crash is not None:
+                    crash = self._minimize_crash(exe, mode, crash, bug_files=bug_files, time_budget=25.0)
+                    return crash
 
-        container_payload = _build_container_message(idx, container_full, node_field, edge_field, node_full, edge_full)
-        if not container_payload:
-            return b"\n\x00"
+            if seed_bytes:
+                return seed_bytes
 
-        tracepacket_full = _select_tracepacket(idx, container_full)
-        if not tracepacket_full:
-            return b"\n\x00"
+            return b"\x00" * 140
+        finally:
+            shutil.rmtree(workdir, ignore_errors=True)
 
-        packet_payload = _build_packet_with_path(idx, tracepacket_full, container_full, container_payload)
-        if not packet_payload:
-            return b"\n\x00"
+    def _extract_to_dir(self, src_path: str, out_dir: Path) -> Path:
+        out_dir.mkdir(parents=True, exist_ok=True)
+        p = Path(src_path)
+        if p.is_dir():
+            for child in p.iterdir():
+                dst = out_dir / child.name
+                if child.is_dir():
+                    shutil.copytree(child, dst, dirs_exist_ok=True)
+                else:
+                    shutil.copy2(child, dst)
+        else:
+            if not tarfile.is_tarfile(str(p)):
+                raise ValueError("src_path is neither a directory nor a tarball")
+            with tarfile.open(str(p), "r:*") as tf:
+                self._safe_extract_tar(tf, out_dir)
 
-        wrapper = _find_trace_wrapper(idx, tracepacket_full)
-        if wrapper:
-            _, packet_field = wrapper
-            # Encode as Trace message containing one repeated packet.
-            return _enc_len(packet_field.number, packet_payload)
+        children = [c for c in out_dir.iterdir() if c.name not in (".", "..")]
+        if len(children) == 1 and children[0].is_dir():
+            return children[0]
+        return out_dir
 
-        # If no wrapper, assume raw packet is acceptable.
-        return packet_payload
+    def _safe_extract_tar(self, tf: tarfile.TarFile, out_dir: Path) -> None:
+        out_dir = out_dir.resolve()
+        for member in tf.getmembers():
+            name = member.name
+            if name.startswith("/") or name.startswith("\\"):
+                continue
+            parts = Path(name).parts
+            if any(part == ".." for part in parts):
+                continue
+            target = (out_dir / name).resolve()
+            if not str(target).startswith(str(out_dir) + os.sep) and target != out_dir:
+                continue
+            tf.extract(member, str(out_dir))
+
+    def _guess_project_root(self, root: Path) -> Path:
+        markers = {"CMakeLists.txt", "Makefile", "meson.build", "configure", "build.sh"}
+        cur = root
+        for _ in range(5):
+            if any((cur / m).exists() for m in markers):
+                return cur
+            subs = [d for d in cur.iterdir() if d.is_dir() and d.name not in (".git", "build", "out", ".github")]
+            subs = [d for d in subs if not d.name.startswith(".")]
+            if len(subs) == 1:
+                cur = subs[0]
+                continue
+            cmake_dirs = []
+            make_dirs = []
+            for d in subs:
+                if (d / "CMakeLists.txt").exists():
+                    cmake_dirs.append(d)
+                if (d / "Makefile").exists():
+                    make_dirs.append(d)
+            if len(cmake_dirs) == 1:
+                return cmake_dirs[0]
+            if len(make_dirs) == 1:
+                return make_dirs[0]
+            return cur
+        return cur
+
+    def _find_existing_poc_file_bytes(self, root: Path) -> Optional[bytes]:
+        bad_ext = {
+            ".c", ".cc", ".cpp", ".cxx", ".h", ".hpp", ".hh", ".inl",
+            ".py", ".java", ".js", ".ts", ".go", ".rs",
+            ".md", ".rst", ".txt", ".html", ".css",
+            ".cmake", ".yml", ".yaml", ".json",
+            ".toml", ".ini", ".cfg",
+            ".o", ".a", ".so", ".dylib", ".dll", ".obj", ".lib", ".exe",
+            ".png", ".jpg", ".jpeg", ".gif", ".bmp", ".ico", ".pdf",
+        }
+
+        keywords = ("poc", "repro", "crash", "asan", "ubsan", "overflow", "stack", "snapshot", "corpus", "seed", "testcase")
+        candidates: List[Tuple[int, int, Path]] = []
+        target_len = 140
+
+        for dirpath, dirnames, filenames in os.walk(root):
+            dn = os.path.basename(dirpath).lower()
+            if dn in (".git", "build", "cmakefiles", "node_modules"):
+                dirnames[:] = []
+                continue
+            if any(part.lower() in ("build", "cmakefiles") for part in Path(dirpath).parts):
+                continue
+
+            for fn in filenames:
+                p = Path(dirpath) / fn
+                try:
+                    st = p.stat()
+                except OSError:
+                    continue
+                if st.st_size <= 0 or st.st_size > 50000:
+                    continue
+                ext = p.suffix.lower()
+                if ext in bad_ext:
+                    continue
+                name_l = fn.lower()
+                path_l = str(p).lower()
+                kw_score = sum(1 for k in keywords if k in name_l or k in path_l)
+                size_pen = abs(int(st.st_size) - target_len)
+                score = -(kw_score * 1000) + size_pen
+                candidates.append((score, int(st.st_size), p))
+
+        candidates.sort(key=lambda x: (x[0], x[1]))
+        for _, _, p in candidates[:40]:
+            try:
+                data = p.read_bytes()
+            except OSError:
+                continue
+            if 1 <= len(data) <= 50000:
+                if len(data) == 140:
+                    return data
+
+        for _, _, p in candidates[:20]:
+            try:
+                data = p.read_bytes()
+            except OSError:
+                continue
+            if 1 <= len(data) <= 50000:
+                return data
+
+        return None
+
+    def _find_bug_files(self, root: Path) -> Set[str]:
+        bug_files: Set[str] = set()
+        exts = {".c", ".cc", ".cpp", ".cxx", ".h", ".hpp", ".hh"}
+        for dirpath, dirnames, filenames in os.walk(root):
+            dn = os.path.basename(dirpath).lower()
+            if dn in (".git", "build", "cmakefiles"):
+                dirnames[:] = []
+                continue
+            if any(part.lower() in ("build", "cmakefiles") for part in Path(dirpath).parts):
+                continue
+            for fn in filenames:
+                p = Path(dirpath) / fn
+                if p.suffix.lower() not in exts:
+                    continue
+                try:
+                    txt = p.read_text(errors="ignore")
+                except OSError:
+                    continue
+                if "node_id_map" in txt and ".find(" in txt:
+                    bug_files.add(p.name)
+        return bug_files
+
+    def _build_and_find_target_and_seed(
+        self, root: Path, bug_files: Set[str], time_budget: float
+    ) -> Tuple[Optional[str], Optional[str], bytes]:
+        t0 = time.monotonic()
+        build_ok = self._attempt_build(root, time_budget=max(10.0, time_budget * 0.65))
+        if not build_ok:
+            return None, None, b""
+
+        if time.monotonic() - t0 > time_budget:
+            return None, None, b""
+
+        exes = self._find_executables(root)
+        if not exes:
+            return None, None, b""
+
+        seeds = self._find_seed_files(root)
+        seed_bytes_list: List[bytes] = []
+        for s in seeds[:50]:
+            try:
+                b = s.read_bytes()
+            except OSError:
+                continue
+            if 1 <= len(b) <= 200000:
+                seed_bytes_list.append(b)
+        if not seed_bytes_list:
+            seed_bytes_list = [b"\x00" * 140, b"\x00" * 256, b"{}"]
+
+        exe_candidates = self._rank_executables(exes, root)
+        best: Optional[Tuple[str, str, bytes]] = None
+        for exe in exe_candidates[:12]:
+            if time.monotonic() - t0 > time_budget:
+                break
+            for sb in seed_bytes_list[:15]:
+                for mode in ("file", "stdin"):
+                    rc, out, err = self._run_target(exe, mode, sb, timeout=1.5)
+                    if rc == 0:
+                        best = (exe, mode, sb)
+                        break
+                if best is not None:
+                    break
+            if best is not None:
+                break
+
+        if best is not None:
+            return best[0], best[1], best[2]
+
+        for exe in exe_candidates[:8]:
+            if time.monotonic() - t0 > time_budget:
+                break
+            sb = seed_bytes_list[0]
+            for mode in ("file", "stdin"):
+                rc, out, err = self._run_target(exe, mode, sb, timeout=1.5)
+                if rc is not None:
+                    txt = (out + b"\n" + err).decode("latin1", errors="ignore").lower()
+                    if "usage" in txt or "help" in txt or "argument" in txt:
+                        continue
+                    return exe, mode, sb
+
+        return None, None, b""
+
+    def _attempt_build(self, root: Path, time_budget: float) -> bool:
+        t0 = time.monotonic()
+        env = os.environ.copy()
+        env.setdefault("ASAN_OPTIONS", "detect_leaks=0:abort_on_error=1:exitcode=99")
+        env.setdefault("UBSAN_OPTIONS", "abort_on_error=1:exitcode=99:print_stacktrace=1")
+
+        cxx = shutil.which("clang++") or shutil.which("g++") or shutil.which("c++")
+        cc = shutil.which("clang") or shutil.which("gcc") or shutil.which("cc")
+        if cxx:
+            env["CXX"] = cxx
+        if cc:
+            env["CC"] = cc
+
+        common_flags = "-O1 -g -fno-omit-frame-pointer -fsanitize=address"
+        env["CFLAGS"] = (env.get("CFLAGS", "") + " " + common_flags).strip()
+        env["CXXFLAGS"] = (env.get("CXXFLAGS", "") + " " + common_flags).strip()
+        env["LDFLAGS"] = (env.get("LDFLAGS", "") + " -fsanitize=address").strip()
+
+        build_sh = root / "build.sh"
+        if build_sh.exists():
+            try:
+                rc = self._run_cmd(["bash", str(build_sh)], cwd=root, env=env, timeout=max(10.0, time_budget))
+                return rc == 0
+            except Exception:
+                pass
+
+        if (root / "CMakeLists.txt").exists():
+            bdir = root / "build_asan"
+            bdir.mkdir(exist_ok=True)
+            try:
+                if time.monotonic() - t0 > time_budget:
+                    return False
+                rc1 = self._run_cmd(
+                    [
+                        "cmake",
+                        "-S",
+                        str(root),
+                        "-B",
+                        str(bdir),
+                        "-DCMAKE_BUILD_TYPE=RelWithDebInfo",
+                        f"-DCMAKE_C_FLAGS={env['CFLAGS']}",
+                        f"-DCMAKE_CXX_FLAGS={env['CXXFLAGS']}",
+                        f"-DCMAKE_EXE_LINKER_FLAGS={env['LDFLAGS']}",
+                    ],
+                    cwd=root,
+                    env=env,
+                    timeout=max(10.0, time_budget * 0.5),
+                )
+                if rc1 != 0:
+                    rc1 = self._run_cmd(
+                        ["cmake", "-S", str(root), "-B", str(bdir), "-DCMAKE_BUILD_TYPE=RelWithDebInfo"],
+                        cwd=root,
+                        env=env,
+                        timeout=max(10.0, time_budget * 0.5),
+                    )
+                    if rc1 != 0:
+                        return False
+                if time.monotonic() - t0 > time_budget:
+                    return False
+                rc2 = self._run_cmd(["cmake", "--build", str(bdir), "-j", str(max(1, os.cpu_count() or 1))], cwd=root, env=env, timeout=max(10.0, time_budget))
+                return rc2 == 0
+            except Exception:
+                pass
+
+        if (root / "meson.build").exists():
+            bdir = root / "build_asan"
+            try:
+                if not (bdir / "build.ninja").exists():
+                    rc1 = self._run_cmd(
+                        ["meson", "setup", str(bdir), str(root)],
+                        cwd=root,
+                        env=env,
+                        timeout=max(10.0, time_budget * 0.5),
+                    )
+                    if rc1 != 0:
+                        return False
+                if time.monotonic() - t0 > time_budget:
+                    return False
+                rc2 = self._run_cmd(
+                    ["ninja", "-C", str(bdir)],
+                    cwd=root,
+                    env=env,
+                    timeout=max(10.0, time_budget),
+                )
+                return rc2 == 0
+            except Exception:
+                pass
+
+        if (root / "Makefile").exists():
+            try:
+                rc = self._run_cmd(
+                    ["make", "-j", str(max(1, os.cpu_count() or 1))],
+                    cwd=root,
+                    env=env,
+                    timeout=max(10.0, time_budget),
+                )
+                return rc == 0
+            except Exception:
+                pass
+
+        return False
+
+    def _run_cmd(self, cmd: List[str], cwd: Path, env: Dict[str, str], timeout: float) -> int:
+        p = subprocess.run(
+            cmd,
+            cwd=str(cwd),
+            env=env,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=timeout,
+        )
+        return int(p.returncode)
+
+    def _find_executables(self, root: Path) -> List[str]:
+        exes: List[str] = []
+        for dirpath, dirnames, filenames in os.walk(root):
+            dn = os.path.basename(dirpath).lower()
+            if dn in (".git",):
+                dirnames[:] = []
+                continue
+            if any(part.lower() in (".git",) for part in Path(dirpath).parts):
+                continue
+            for fn in filenames:
+                p = Path(dirpath) / fn
+                if p.is_symlink():
+                    continue
+                try:
+                    st = p.stat()
+                except OSError:
+                    continue
+                if st.st_size <= 0:
+                    continue
+                if not os.access(str(p), os.X_OK):
+                    continue
+                if p.suffix.lower() in (".so", ".a", ".o", ".dylib", ".dll"):
+                    continue
+                if any(part.lower() in ("cmakefiles",) for part in p.parts):
+                    continue
+                exes.append(str(p))
+        return exes
+
+    def _rank_executables(self, exes: List[str], root: Path) -> List[str]:
+        keywords = ["processor", "snapshot", "parse", "parser", "poc", "repro", "fuzz", "test", "driver"]
+        scored: List[Tuple[int, int, str]] = []
+        for e in exes:
+            ep = Path(e)
+            name = ep.name.lower()
+            pathl = str(ep).lower()
+            score = 0
+            for k in keywords:
+                if k in name:
+                    score += 8
+                if k in pathl:
+                    score += 2
+            if "build_asan" in pathl:
+                score += 3
+            if "build" in pathl:
+                score += 1
+            size = 0
+            try:
+                size = ep.stat().st_size
+            except OSError:
+                pass
+            scored.append((-score, size, e))
+        scored.sort()
+        return [e for _, _, e in scored]
+
+    def _find_seed_files(self, root: Path) -> List[Path]:
+        code_ext = {
+            ".c", ".cc", ".cpp", ".cxx", ".h", ".hpp", ".hh",
+            ".py", ".java", ".js", ".ts", ".go", ".rs",
+            ".md", ".rst", ".html", ".css", ".cmake", ".yml", ".yaml",
+            ".toml", ".ini", ".cfg", ".sln", ".vcxproj",
+            ".o", ".a", ".so", ".dylib", ".dll", ".obj", ".lib",
+        }
+        likely_dirs = ("corpus", "seed", "seeds", "test", "tests", "testdata", "data", "samples", "sample", "inputs", "fuzz", "pocs", "repro")
+        likely_ext = (".bin", ".dat", ".snap", ".snapshot", ".dump", ".img", ".raw", ".in", ".input", ".txt", ".json")
+        target_len = 140
+
+        candidates: List[Tuple[int, int, Path]] = []
+        for dirpath, dirnames, filenames in os.walk(root):
+            dn = os.path.basename(dirpath).lower()
+            if dn in (".git", "cmakefiles"):
+                dirnames[:] = []
+                continue
+            path_parts_l = [p.lower() for p in Path(dirpath).parts]
+            if "build_asan" in path_parts_l or "build" in path_parts_l or "out" in path_parts_l:
+                continue
+            dir_score = 0
+            for ld in likely_dirs:
+                if ld in dn or ld in dirpath.lower():
+                    dir_score += 4
+            for fn in filenames:
+                p = Path(dirpath) / fn
+                ext = p.suffix.lower()
+                try:
+                    st = p.stat()
+                except OSError:
+                    continue
+                if st.st_size <= 0 or st.st_size > 500000:
+                    continue
+                if ext in code_ext:
+                    continue
+                name_l = fn.lower()
+                ext_score = 0
+                if ext in likely_ext:
+                    ext_score += 3
+                if any(k in name_l for k in ("seed", "corpus", "poc", "repro", "crash", "snapshot", "input")):
+                    ext_score += 3
+                size_pen = abs(int(st.st_size) - target_len)
+                score = -(dir_score * 10 + ext_score * 10) + size_pen
+                candidates.append((score, int(st.st_size), p))
+
+        candidates.sort(key=lambda x: (x[0], x[1]))
+        return [p for _, _, p in candidates]
+
+    def _run_target(self, exe: str, mode: str, data: bytes, timeout: float) -> Tuple[int, bytes, bytes]:
+        env = os.environ.copy()
+        env.setdefault("ASAN_OPTIONS", "detect_leaks=0:abort_on_error=1:exitcode=99")
+        env.setdefault("UBSAN_OPTIONS", "abort_on_error=1:exitcode=99:print_stacktrace=1")
+
+        if mode == "stdin":
+            try:
+                p = subprocess.run(
+                    [exe],
+                    input=data,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    timeout=timeout,
+                    env=env,
+                )
+                return int(p.returncode), p.stdout, p.stderr
+            except subprocess.TimeoutExpired:
+                return 124, b"", b""
+            except Exception:
+                return 127, b"", b""
+
+        tmpdir = tempfile.mkdtemp(prefix="arvo_inp_")
+        try:
+            inpath = Path(tmpdir) / "input.bin"
+            inpath.write_bytes(data)
+            try:
+                p = subprocess.run(
+                    [exe, str(inpath)],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    timeout=timeout,
+                    env=env,
+                )
+                return int(p.returncode), p.stdout, p.stderr
+            except subprocess.TimeoutExpired:
+                return 124, b"", b""
+            except Exception:
+                return 127, b"", b""
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+    def _is_desired_crash(self, rc: int, out: bytes, err: bytes, bug_files: Set[str]) -> bool:
+        if rc == 0 or rc == 124 or rc == 127:
+            return False
+        s = (out + b"\n" + err).decode("latin1", errors="ignore")
+        sl = s.lower()
+        if "addresssanitizer" in sl or "undefinedbehavior" in sl or "ubsan" in sl:
+            if "stack-buffer-overflow" in sl or "heap-buffer-overflow" in sl or "use-after-free" in sl or "runtime error" in sl or "segmentation fault" in sl:
+                if bug_files:
+                    for bf in bug_files:
+                        if bf.lower() in sl:
+                            return True
+                    if "node_id_map" in sl:
+                        return True
+                    if "unordered_map" in sl or "std::map" in sl:
+                        return True
+                    return False
+                return True
+        if bug_files:
+            for bf in bug_files:
+                if bf.lower() in sl:
+                    return True
+        return False
+
+    def _find_crashing_input(
+        self,
+        exe: str,
+        mode: str,
+        seed: bytes,
+        bug_files: Set[str],
+        time_budget: float,
+    ) -> Optional[bytes]:
+        t0 = time.monotonic()
+
+        rc, out, err = self._run_target(exe, mode, seed, timeout=1.5)
+        if self._is_desired_crash(rc, out, err, bug_files):
+            return seed
+
+        if not seed:
+            seed = b"\x00" * 256
+
+        if self._looks_textual(seed):
+            cand = self._textual_mutate_for_missing_id(seed)
+            if cand is not None:
+                rc, out, err = self._run_target(exe, mode, cand, timeout=1.5)
+                if self._is_desired_crash(rc, out, err, bug_files):
+                    return cand
+
+        for size in (4, 8):
+            if time.monotonic() - t0 > time_budget:
+                break
+            offsets, missing_vals = self._candidate_id_offsets(seed, size)
+            offsets_late = [o for o in offsets if o >= len(seed) // 3]
+            offsets_early = [o for o in offsets if o < len(seed) // 3]
+            for off_list in (offsets_late, offsets_early, offsets):
+                if time.monotonic() - t0 > time_budget:
+                    break
+                for off in off_list[:800]:
+                    if time.monotonic() - t0 > time_budget:
+                        break
+                    cur = seed
+                    for mv in missing_vals:
+                        mut = self._patch_int(cur, off, mv, size)
+                        rc, out, err = self._run_target(exe, mode, mut, timeout=1.5)
+                        if self._is_desired_crash(rc, out, err, bug_files):
+                            return mut
+
+        if time.monotonic() - t0 <= time_budget:
+            values4 = [0, 1, 2, 3, 4, 5, 7, 8, 16, 32, 64, 127, 128, 255, 256, 511, 512, 1024, 1337, 4096, 65535, 0x7FFFFFFF, 0xFFFFFFFF]
+            max_trials = 1500
+            for i in range(max_trials):
+                if time.monotonic() - t0 > time_budget:
+                    break
+                mut = bytearray(seed)
+                if len(mut) >= 4:
+                    off = random.randrange(0, len(mut) - 3)
+                    v = random.choice(values4)
+                    mut[off:off + 4] = struct.pack("<I", v)
+                else:
+                    mut.extend(b"\x00" * (4 - len(mut)))
+                    mut[0:4] = struct.pack("<I", 0xFFFFFFFF)
+                if random.random() < 0.15:
+                    mut.extend(os.urandom(random.randrange(1, 33)))
+                rc, out, err = self._run_target(exe, mode, bytes(mut), timeout=1.5)
+                if self._is_desired_crash(rc, out, err, bug_files):
+                    return bytes(mut)
+
+        return None
+
+    def _minimize_crash(self, exe: str, mode: str, data: bytes, bug_files: Set[str], time_budget: float) -> bytes:
+        t0 = time.monotonic()
+
+        def crashes(d: bytes) -> bool:
+            rc, out, err = self._run_target(exe, mode, d, timeout=1.5)
+            return self._is_desired_crash(rc, out, err, bug_files)
+
+        best = data
+        if len(best) <= 1:
+            return best
+
+        lo, hi = 1, len(best)
+        while lo < hi and time.monotonic() - t0 <= time_budget:
+            mid = (lo + hi) // 2
+            cand = best[:mid]
+            if crashes(cand):
+                hi = mid
+            else:
+                lo = mid + 1
+        if hi < len(best) and time.monotonic() - t0 <= time_budget:
+            if crashes(best[:hi]):
+                best = best[:hi]
+
+        checks = 0
+        chunk = max(1, len(best) // 2)
+        while chunk >= 1 and checks < 120 and time.monotonic() - t0 <= time_budget:
+            changed = False
+            i = 0
+            while i < len(best) and checks < 120 and time.monotonic() - t0 <= time_budget:
+                cand = best[:i] + best[i + chunk:]
+                if cand and crashes(cand):
+                    best = cand
+                    changed = True
+                else:
+                    i += chunk
+                checks += 1
+            if not changed:
+                chunk //= 2
+
+        return best
+
+    def _looks_textual(self, data: bytes) -> bool:
+        if not data:
+            return False
+        if any(b in data[:1] for b in (b"{", b"[", b"<")):
+            return True
+        printable = sum(1 for c in data if 9 <= c <= 13 or 32 <= c <= 126)
+        return printable / max(1, len(data)) > 0.90
+
+    def _textual_mutate_for_missing_id(self, data: bytes) -> Optional[bytes]:
+        try:
+            s = data.decode("utf-8", errors="ignore")
+        except Exception:
+            return None
+        nums = [int(m.group(0)) for m in re.finditer(r"\b\d+\b", s)]
+        if not nums:
+            return None
+        freq = Counter(nums)
+        candidates = [n for n, c in freq.items() if 1 <= n <= 100000 and c >= 2]
+        if not candidates:
+            candidates = [n for n in nums if 1 <= n <= 1000]
+        if not candidates:
+            return None
+        mx = max(candidates)
+        missing = mx + 1
+        target = candidates[0]
+        replaced = False
+
+        def repl(m: re.Match) -> str:
+            nonlocal replaced
+            if not replaced and int(m.group(0)) == target:
+                replaced = True
+                return str(missing)
+            return m.group(0)
+
+        s2 = re.sub(r"\b\d+\b", repl, s, count=0)
+        if not replaced:
+            return None
+        return s2.encode("utf-8", errors="ignore")
+
+    def _candidate_id_offsets(self, data: bytes, size: int) -> Tuple[List[int], List[int]]:
+        if len(data) < size:
+            return [], [0x1337]
+
+        step = size
+        vals: List[int] = []
+        offs: List[int] = []
+        unpack = struct.unpack_from
+        fmt = "<I" if size == 4 else "<Q"
+        for off in range(0, len(data) - size + 1, step):
+            try:
+                v = unpack(fmt, data, off)[0]
+            except struct.error:
+                continue
+            vals.append(int(v))
+            offs.append(off)
+
+        freq = Counter(vals)
+        candidates = {v for v, c in freq.items() if 1 <= v <= 100000 and c >= 2}
+        if not candidates:
+            candidates = {v for v, c in freq.items() if 1 <= v <= 1000 and c >= 1}
+        if not candidates:
+            return [], [0x1337]
+
+        mx = max(candidates)
+        missing_vals: List[int] = []
+        for add in (1, 2, 3, 7, 13):
+            mv = mx + add
+            if mv not in candidates:
+                missing_vals.append(mv)
+        if not missing_vals:
+            missing_vals = [0x1337]
+
+        offsets = [off for off, v in zip(offs, vals) if v in candidates]
+        return offsets, missing_vals
+
+    def _patch_int(self, data: bytes, off: int, val: int, size: int) -> bytes:
+        if off < 0 or off + size > len(data):
+            return data
+        b = bytearray(data)
+        if size == 4:
+            b[off:off + 4] = struct.pack("<I", val & 0xFFFFFFFF)
+        else:
+            b[off:off + 8] = struct.pack("<Q", val & 0xFFFFFFFFFFFFFFFF)
+        return bytes(b)

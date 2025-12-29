@@ -1,11 +1,12 @@
 import os
+from typing import Tuple, Optional
+
 import numpy as np
-from typing import Tuple
 
 try:
     import faiss  # type: ignore
-except Exception as _e:
-    faiss = None
+except Exception:  # pragma: no cover
+    import faiss_cpu as faiss  # type: ignore
 
 
 class YourIndexClass:
@@ -13,125 +14,103 @@ class YourIndexClass:
         self.dim = int(dim)
 
         self.nlist = int(kwargs.get("nlist", 4096))
-        self.nprobe = int(kwargs.get("nprobe", 16))
-
-        self.m = int(kwargs.get("m", 32))
+        self.nprobe = int(kwargs.get("nprobe", 32))
+        self.m = int(kwargs.get("m", 16))
         self.nbits = int(kwargs.get("nbits", 8))
-        self.use_opq = bool(kwargs.get("use_opq", True))
 
         self.train_size = int(kwargs.get("train_size", 200000))
-        self.hnsw_m = int(kwargs.get("hnsw_m", 32))
-        self.quantizer_ef_search = int(kwargs.get("quantizer_ef_search", 64))
+        self.ivf_niter = int(kwargs.get("ivf_niter", 20))
+        self.pq_niter = int(kwargs.get("pq_niter", 25))
+        self.opq_niter = int(kwargs.get("opq_niter", 25))
+        self.use_opq = bool(kwargs.get("use_opq", True))
 
-        self.n_threads = int(kwargs.get("n_threads", min(8, (os.cpu_count() or 1))))
+        self.threads = int(kwargs.get("threads", os.cpu_count() or 1))
+        if self.threads < 1:
+            self.threads = 1
+        faiss.omp_set_num_threads(self.threads)
 
-        self._index = None
+        quantizer = faiss.IndexFlatL2(self.dim)
+        ivfpq = faiss.IndexIVFPQ(quantizer, self.dim, self.nlist, self.m, self.nbits)
+
+        try:
+            ivfpq.cp.niter = self.ivf_niter
+        except Exception:
+            pass
+
+        try:
+            ivfpq.pq.cp.niter = self.pq_niter
+        except Exception:
+            pass
+
+        try:
+            ivfpq.use_precomputed_tables = 1
+        except Exception:
+            pass
+
+        ivfpq.nprobe = self.nprobe
+
+        self._ivf = ivfpq
+        self._opq = None
+        self.index = None
+
+        if self.use_opq:
+            opq = faiss.OPQMatrix(self.dim, self.m)
+            try:
+                opq.niter = self.opq_niter
+            except Exception:
+                pass
+            self._opq = opq
+            self.index = faiss.IndexPreTransform(opq, ivfpq)
+        else:
+            self.index = ivfpq
+
         self._ntotal = 0
 
-        if faiss is not None:
+    def add(self, xb: np.ndarray) -> None:
+        if xb is None:
+            return
+        xb = np.asarray(xb)
+        if xb.ndim != 2 or xb.shape[1] != self.dim:
+            raise ValueError(f"xb must have shape (N, {self.dim})")
+        if xb.dtype != np.float32:
+            xb = xb.astype(np.float32, copy=False)
+        xb = np.ascontiguousarray(xb)
+
+        if not self.index.is_trained:
+            n = xb.shape[0]
+            ts = self.train_size
+            if ts <= 0:
+                ts = min(200000, n)
+            ts = min(ts, n)
+
+            if ts < self.nlist:
+                ts = min(n, max(self.nlist, ts))
+
+            xtrain = xb[:ts]
+            self.index.train(xtrain)
+
             try:
-                faiss.omp_set_num_threads(self.n_threads)
+                if self._ivf is not None:
+                    self._ivf.precompute_table()
             except Exception:
                 pass
 
-    def _ensure_index(self):
-        if self._index is not None or faiss is None:
-            return
-
-        d = self.dim
-        nlist = self.nlist
-        m = self.m
-        nbits = self.nbits
-        hnsw_m = self.hnsw_m
-
-        if self.use_opq:
-            descr = f"OPQ{m}_{d},IVF{nlist}_HNSW{hnsw_m},PQ{m}x{nbits}"
-        else:
-            descr = f"IVF{nlist}_HNSW{hnsw_m},PQ{m}x{nbits}"
-
-        try:
-            self._index = faiss.index_factory(d, descr, faiss.METRIC_L2)
-        except Exception:
-            # Fallback: flat quantizer
-            if self.use_opq:
-                descr = f"OPQ{m}_{d},IVF{nlist},PQ{m}x{nbits}"
-            else:
-                descr = f"IVF{nlist},PQ{m}x{nbits}"
-            self._index = faiss.index_factory(d, descr, faiss.METRIC_L2)
-
-        try:
-            ivf = faiss.extract_index_ivf(self._index)
-            if ivf is not None:
-                ivf.nprobe = self.nprobe
-        except Exception:
-            pass
-
-        try:
-            # If the IVF quantizer is HNSW, set efSearch for centroid assignment
-            ivf = faiss.extract_index_ivf(self._index)
-            if ivf is not None and hasattr(ivf, "quantizer") and hasattr(ivf.quantizer, "hnsw"):
-                ivf.quantizer.hnsw.efSearch = self.quantizer_ef_search
-        except Exception:
-            pass
-
-    @staticmethod
-    def _as_contig_f32(x: np.ndarray) -> np.ndarray:
-        if x.dtype != np.float32:
-            x = x.astype(np.float32, copy=False)
-        if not x.flags["C_CONTIGUOUS"]:
-            x = np.ascontiguousarray(x)
-        return x
-
-    def add(self, xb: np.ndarray) -> None:
-        xb = self._as_contig_f32(xb)
-        if xb.ndim != 2 or xb.shape[1] != self.dim:
-            raise ValueError("xb must have shape (N, dim)")
-
-        if faiss is None:
-            raise RuntimeError("faiss is required for this solution")
-
-        self._ensure_index()
-        idx = self._index
-
-        if not idx.is_trained:
-            n = xb.shape[0]
-            ts = min(self.train_size, n)
-            if ts < n:
-                step = max(1, n // ts)
-                xt = xb[::step][:ts]
-            else:
-                xt = xb
-            xt = self._as_contig_f32(xt)
-            idx.train(xt)
-
-        idx.add(xb)
+        self.index.add(xb)
         self._ntotal += xb.shape[0]
 
     def search(self, xq: np.ndarray, k: int) -> Tuple[np.ndarray, np.ndarray]:
-        if faiss is None:
-            raise RuntimeError("faiss is required for this solution")
-
-        if self._index is None or self._ntotal == 0:
-            raise RuntimeError("Index is empty; call add() first")
-
-        xq = self._as_contig_f32(xq)
-        if xq.ndim != 2 or xq.shape[1] != self.dim:
-            raise ValueError("xq must have shape (nq, dim)")
-
         k = int(k)
         if k <= 0:
             raise ValueError("k must be >= 1")
 
-        try:
-            ivf = faiss.extract_index_ivf(self._index)
-            if ivf is not None:
-                ivf.nprobe = self.nprobe
-                if hasattr(ivf, "quantizer") and hasattr(ivf.quantizer, "hnsw"):
-                    ivf.quantizer.hnsw.efSearch = self.quantizer_ef_search
-        except Exception:
-            pass
+        xq = np.asarray(xq)
+        if xq.ndim != 2 or xq.shape[1] != self.dim:
+            raise ValueError(f"xq must have shape (nq, {self.dim})")
+        if xq.dtype != np.float32:
+            xq = xq.astype(np.float32, copy=False)
+        xq = np.ascontiguousarray(xq)
 
-        D, I = self._index.search(xq, k)
+        D, I = self.index.search(xq, k)
         if D.dtype != np.float32:
             D = D.astype(np.float32, copy=False)
         if I.dtype != np.int64:

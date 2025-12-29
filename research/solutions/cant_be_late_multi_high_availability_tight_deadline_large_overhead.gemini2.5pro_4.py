@@ -1,15 +1,38 @@
 import json
-import math
 from argparse import Namespace
+import math
 
 from sky_spot.strategies.multi_strategy import MultiRegionStrategy
 from sky_spot.utils import ClusterType
 
 
 class Solution(MultiRegionStrategy):
-    """Your multi-region scheduling strategy."""
+    """
+    Your multi-region scheduling strategy.
+    
+    This strategy uses an Upper Confidence Bound (UCB1) algorithm to manage the
+    exploration-exploitation trade-off between different AWS regions.
+    
+    Core Logic:
+    1.  **Panic Mode:** If the deadline is approaching and there's not enough time
+        to finish the job even with a 100% reliable On-Demand instance, the
+        strategy will lock into using On-Demand to guarantee completion.
+    2.  **Spot-First:** If Spot instances are available in the current region and
+        the system is not in panic mode, it will always choose Spot to minimize cost.
+    3.  **No Spot Available:** If Spot is unavailable, the strategy decides between:
+        a. **Switching Region:** It uses a UCB1 score to evaluate other regions. The
+           score balances known performance (exploitation) with uncertainty
+           (exploration). If another region's score is significantly higher than
+           the current region's historical performance, it switches.
+        b. **Waiting:** If the current region has a historically high spot
+           availability, it may choose to wait (return NONE), gambling that
+           Spot will become available again soon. This avoids the cost of On-Demand.
+        c. **Using On-Demand:** If no other region looks promising and the current
+           region is historically unreliable, it falls back to On-Demand to ensure
+           progress is made.
+    """
 
-    NAME = "three_tier_ucb"  # REQUIRED: unique identifier
+    NAME = "ucb_strategy"
 
     def solve(self, spec_path: str) -> "Solution":
         """
@@ -26,85 +49,88 @@ class Solution(MultiRegionStrategy):
         )
         super().__init__(args)
 
-        self.num_regions = self.env.get_num_regions()
-
-        self.spot_uptime_stats = [{'up': 0, 'total': 0} for _ in range(self.num_regions)]
-        self.total_spot_observations = 0
-        self.UCB_C = 1.414 
-
-        self.consecutive_spot_failures = [0] * self.num_regions
-
-        self.FAILURE_THRESHOLD_TO_SWITCH = 2
-        self.CAUTION_BUFFER_SECONDS = 2 * 3600.0
-
-        self._cached_work_done = 0.0
-        self._cached_task_done_len = 0
-
+        self.initialized = False
         return self
 
-    def _get_best_ucb_region(self) -> int:
-        """Selects the best region using the UCB1 algorithm."""
-        for i in range(self.num_regions):
-            if self.spot_uptime_stats[i]['total'] == 0:
-                return i
-
-        scores = []
-        log_total_obs = math.log(self.total_spot_observations + 1e-6)
-
-        for i in range(self.num_regions):
-            stats = self.spot_uptime_stats[i]
-            num_pulls = stats['total']
-            
-            mean_uptime = stats['up'] / num_pulls
-            exploration_term = self.UCB_C * ((log_total_obs / num_pulls) ** 0.5)
-            score = mean_uptime + exploration_term
-            scores.append(score)
+    def _initialize_strategy(self):
+        """Initializes strategy-specific state on the first simulation step."""
+        self.num_regions = self.env.get_num_regions()
         
-        if not scores:
-            return self.env.get_current_region()
-
-        return max(range(len(scores)), key=scores.__getitem__)
+        self.region_stats = [
+            {'samples': 0, 'value': 0.0} for _ in range(self.num_regions)
+        ]
+        self.total_steps = 0
+        
+        # --- Hyperparameters ---
+        self.UCB_C = 1.0
+        self.SWITCH_THRESHOLD = 0.15
+        self.WAIT_THRESHOLD = 0.5
+        self.OD_BUFFER_FACTOR = 1.2
+        
+        self.initialized = True
 
     def _step(self, last_cluster_type: ClusterType, has_spot: bool) -> ClusterType:
         """
         Decide next action based on current state.
         """
+        if not self.initialized:
+            self._initialize_strategy()
+
+        # 1. Update UCB statistics for the current region
+        self.total_steps += 1
         current_region = self.env.get_current_region()
-        self.spot_uptime_stats[current_region]['total'] += 1
-        self.total_spot_observations += 1
-        if has_spot:
-            self.spot_uptime_stats[current_region]['up'] += 1
-            self.consecutive_spot_failures[current_region] = 0
-        else:
-            self.consecutive_spot_failures[current_region] += 1
-        
-        if len(self.task_done_time) > self._cached_task_done_len:
-            self._cached_work_done += sum(self.task_done_time[self._cached_task_done_len:])
-            self._cached_task_done_len = len(self.task_done_time)
-        work_done = self._cached_work_done
-        work_remaining = self.task_duration - work_done
-        
-        if work_remaining <= 0:
+        stats = self.region_stats[current_region]
+        current_availability = 1.0 if has_spot else 0.0
+
+        stats['samples'] += 1
+        stats['value'] += (current_availability - stats['value']) / stats['samples']
+
+        # 2. Check for task completion
+        work_done = sum(self.task_done_time)
+        work_left = self.task_duration - work_done
+        if work_left <= 0:
             return ClusterType.NONE
 
-        time_now = self.env.elapsed_seconds
-        time_left = self.deadline - time_now
+        # 3. PANIC MODE: Guarantee completion by switching to On-Demand if deadline is near
+        time_left = self.deadline - self.env.elapsed_seconds
+        time_needed_for_od = work_left + self.restart_overhead
         
-        time_to_finish_safely = work_remaining + self.restart_overhead
-        if time_left <= time_to_finish_safely:
+        if time_left <= time_needed_for_od * self.OD_BUFFER_FACTOR:
             return ClusterType.ON_DEMAND
 
+        # 4. Main Decision Logic
         if has_spot:
             return ClusterType.SPOT
 
-        if self.num_regions > 1 and self.consecutive_spot_failures[current_region] >= self.FAILURE_THRESHOLD_TO_SWITCH:
-            best_region = self._get_best_ucb_region()
-            if best_region != current_region:
-                self.env.switch_region(best_region)
-                return ClusterType.ON_DEMAND
-        
-        time_to_finish_with_caution = work_remaining + self.restart_overhead + self.CAUTION_BUFFER_SECONDS
-        if time_left <= time_to_finish_with_caution:
+        # If spot is NOT available...
+        best_ucb_score = -1.0
+        best_region_to_switch = -1
+
+        for i in range(self.num_regions):
+            if i == current_region:
+                continue
+            
+            istats = self.region_stats[i]
+            if istats['samples'] == 0:
+                ucb_score = float('inf')
+            else:
+                exploitation = istats['value']
+                exploration = self.UCB_C * math.sqrt(
+                    math.log(self.total_steps + 1) / istats['samples']
+                )
+                ucb_score = exploitation + exploration
+            
+            if ucb_score > best_ucb_score:
+                best_ucb_score = ucb_score
+                best_region_to_switch = i
+
+        current_region_value = self.region_stats[current_region]['value']
+
+        if best_region_to_switch != -1 and best_ucb_score > current_region_value + self.SWITCH_THRESHOLD:
+            self.env.switch_region(best_region_to_switch)
             return ClusterType.ON_DEMAND
-        
-        return ClusterType.NONE
+        else:
+            if current_region_value > self.WAIT_THRESHOLD:
+                return ClusterType.NONE
+            else:
+                return ClusterType.ON_DEMAND

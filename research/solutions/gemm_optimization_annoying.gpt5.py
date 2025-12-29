@@ -1,3 +1,5 @@
+import os
+import sys
 import torch
 import triton
 import triton.language as tl
@@ -8,113 +10,128 @@ def gelu(x):
     return x * 0.5 * (1.0 + tl.extra.cuda.libdevice.erf(x * 0.7071067811865476))
 
 
+def _to_tl_dtype(dtype: torch.dtype):
+    if dtype == torch.float16:
+        return tl.float16
+    if dtype == torch.bfloat16:
+        return tl.bfloat16
+    if dtype == torch.float32:
+        return tl.float32
+    raise ValueError(f"Unsupported dtype for Triton kernel: {dtype}")
+
+
+def _promote_dtype(a: torch.dtype, b: torch.dtype):
+    # mimic torch.mm promotion
+    if a == torch.float16 and b == torch.float16:
+        return torch.float16
+    if a == torch.bfloat16 and b == torch.bfloat16:
+        return torch.bfloat16
+    # prefer float32 if any is float32
+    if a == torch.float32 or b == torch.float32:
+        return torch.float32
+    # if different low-precision types, promote to float32 for safety
+    return torch.float32
+
+
 @triton.autotune(
     configs=[
-        triton.Config({"BLOCK_M": 128, "BLOCK_N": 128, "BLOCK_K": 32, "GROUP_M": 8}, num_stages=4, num_warps=8),
-        triton.Config({"BLOCK_M": 128, "BLOCK_N": 64,  "BLOCK_K": 32, "GROUP_M": 8}, num_stages=4, num_warps=4),
-        triton.Config({"BLOCK_M": 64,  "BLOCK_N": 128, "BLOCK_K": 32, "GROUP_M": 8}, num_stages=4, num_warps=4),
-        triton.Config({"BLOCK_M": 64,  "BLOCK_N": 64,  "BLOCK_K": 32, "GROUP_M": 8}, num_stages=3, num_warps=4),
-        triton.Config({"BLOCK_M": 128, "BLOCK_N": 256, "BLOCK_K": 32, "GROUP_M": 4}, num_stages=5, num_warps=8),
-        triton.Config({"BLOCK_M": 256, "BLOCK_N": 128, "BLOCK_K": 32, "GROUP_M": 4}, num_stages=5, num_warps=8),
-        triton.Config({"BLOCK_M": 64,  "BLOCK_N": 256, "BLOCK_K": 32, "GROUP_M": 4}, num_stages=4, num_warps=8),
-        triton.Config({"BLOCK_M": 256, "BLOCK_N": 64,  "BLOCK_K": 32, "GROUP_M": 4}, num_stages=4, num_warps=8),
-        triton.Config({"BLOCK_M": 128, "BLOCK_N": 128, "BLOCK_K": 64, "GROUP_M": 8}, num_stages=5, num_warps=8),
-        triton.Config({"BLOCK_M": 128, "BLOCK_N": 64,  "BLOCK_K": 64, "GROUP_M": 8}, num_stages=5, num_warps=4),
-        triton.Config({"BLOCK_M": 64,  "BLOCK_N": 128, "BLOCK_K": 64, "GROUP_M": 8}, num_stages=5, num_warps=4),
-        triton.Config({"BLOCK_M": 64,  "BLOCK_N": 64,  "BLOCK_K": 64, "GROUP_M": 8}, num_stages=4, num_warps=4),
+        triton.Config({"BLOCK_M": 128, "BLOCK_N": 128, "BLOCK_K": 32, "USE_DOT": True}, num_warps=8, num_stages=4),
+        triton.Config({"BLOCK_M": 128, "BLOCK_N": 64, "BLOCK_K": 32, "USE_DOT": True}, num_warps=4, num_stages=4),
+        triton.Config({"BLOCK_M": 64, "BLOCK_N": 128, "BLOCK_K": 32, "USE_DOT": True}, num_warps=4, num_stages=4),
+        triton.Config({"BLOCK_M": 64, "BLOCK_N": 64, "BLOCK_K": 32, "USE_DOT": True}, num_warps=4, num_stages=3),
+        triton.Config({"BLOCK_M": 128, "BLOCK_N": 128, "BLOCK_K": 64, "USE_DOT": True}, num_warps=8, num_stages=5),
+        triton.Config({"BLOCK_M": 256, "BLOCK_N": 64, "BLOCK_K": 32, "USE_DOT": True}, num_warps=8, num_stages=4),
+        triton.Config({"BLOCK_M": 64, "BLOCK_N": 256, "BLOCK_K": 32, "USE_DOT": True}, num_warps=8, num_stages=4),
+        triton.Config({"BLOCK_M": 128, "BLOCK_N": 32, "BLOCK_K": 64, "USE_DOT": True}, num_warps=4, num_stages=4),
+        triton.Config({"BLOCK_M": 32, "BLOCK_N": 128, "BLOCK_K": 64, "USE_DOT": True}, num_warps=4, num_stages=4),
+        triton.Config({"BLOCK_M": 64, "BLOCK_N": 64, "BLOCK_K": 64, "USE_DOT": True}, num_warps=4, num_stages=4),
+        # Fallback configs for float32 (USE_DOT=False path); still beneficial for half in some cases
+        triton.Config({"BLOCK_M": 128, "BLOCK_N": 128, "BLOCK_K": 32, "USE_DOT": False}, num_warps=8, num_stages=3),
+        triton.Config({"BLOCK_M": 64, "BLOCK_N": 128, "BLOCK_K": 32, "USE_DOT": False}, num_warps=4, num_stages=3),
+        triton.Config({"BLOCK_M": 128, "BLOCK_N": 64, "BLOCK_K": 32, "USE_DOT": False}, num_warps=4, num_stages=3),
     ],
     key=["M", "N", "K"],
 )
-@triton.heuristics(
-    {
-        "EVEN_K": lambda args: args["K"] % args["BLOCK_K"] == 0,
-        "EVEN_M": lambda args: args["M"] % args["BLOCK_M"] == 0,
-        "EVEN_N": lambda args: args["N"] % args["BLOCK_N"] == 0,
-    }
-)
 @triton.jit
 def _matmul_gelu_kernel(
-    A, B, C,
+    a_ptr, b_ptr, c_ptr,
     M, N, K,
     stride_am, stride_ak,
     stride_bk, stride_bn,
     stride_cm, stride_cn,
+    C_DTYPE: tl.constexpr,
     BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
-    GROUP_M: tl.constexpr,
-    EVEN_K: tl.constexpr, EVEN_M: tl.constexpr, EVEN_N: tl.constexpr,
+    USE_DOT: tl.constexpr,
 ):
-    pid = tl.program_id(0)
-
-    num_pid_m = (M + BLOCK_M - 1) // BLOCK_M
-    num_pid_n = (N + BLOCK_N - 1) // BLOCK_N
-
-    group_size_m = GROUP_M
-    num_pid_in_group = group_size_m * num_pid_n
-    group_id = pid // num_pid_in_group
-    first_pid_m = group_id * group_size_m
-    pid_in_group = pid % num_pid_in_group
-    pid_m = (first_pid_m + (pid_in_group % group_size_m)) % num_pid_m
-    pid_n = pid_in_group // group_size_m
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
 
     offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
     offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
     offs_k = tl.arange(0, BLOCK_K)
 
-    a_ptrs = A + (offs_m[:, None] * stride_am + offs_k[None, :] * stride_ak)
-    b_ptrs = B + (offs_k[:, None] * stride_bk + offs_n[None, :] * stride_bn)
+    a_ptrs = a_ptr + (offs_m[:, None] * stride_am + offs_k[None, :] * stride_ak)
+    b_ptrs = b_ptr + (offs_k[:, None] * stride_bk + offs_n[None, :] * stride_bn)
 
     acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
 
-    if EVEN_K:
-        k_iter = K // BLOCK_K
-        for _ in range(0, k_iter):
-            a = tl.load(a_ptrs)
-            b = tl.load(b_ptrs)
+    k = 0
+    while k < K:
+        a = tl.load(a_ptrs, mask=(offs_m[:, None] < M) & (offs_k[None, :] < K), other=0.0)
+        b = tl.load(b_ptrs, mask=(offs_k[:, None] < K) & (offs_n[None, :] < N), other=0.0)
+        if USE_DOT:
             acc += tl.dot(a, b)
-            a_ptrs += BLOCK_K * stride_ak
-            b_ptrs += BLOCK_K * stride_bk
-        k_remainder = K - k_iter * BLOCK_K
-        if k_remainder > 0:
-            offs_kr = tl.arange(0, BLOCK_K)
-            a_ptrs_r = A + offs_m[:, None] * stride_am + (k_iter * BLOCK_K + offs_kr[None, :]) * stride_ak
-            b_ptrs_r = B + (k_iter * BLOCK_K + offs_kr[:, None]) * stride_bk + offs_n[None, :] * stride_bn
-            k_mask = offs_kr < k_remainder
-            a = tl.load(a_ptrs_r, mask=k_mask[None, :])
-            b = tl.load(b_ptrs_r, mask=k_mask[:, None])
-            acc += tl.dot(a, b)
-    else:
-        k0 = 0
-        while k0 < K:
-            k_remaining = K - k0
-            k_mask = offs_k < k_remaining
-            a = tl.load(a_ptrs, mask=(k_mask[None, :]) & ((offs_m[:, None] < M) if not EVEN_M else True), other=0.0)
-            b = tl.load(b_ptrs, mask=(k_mask[:, None]) & ((offs_n[None, :] < N) if not EVEN_N else True), other=0.0)
-            acc += tl.dot(a, b)
-            a_ptrs += BLOCK_K * stride_ak
-            b_ptrs += BLOCK_K * stride_bk
-            k0 += BLOCK_K
+        else:
+            for kk in range(0, BLOCK_K):
+                a_vec = a[:, kk]
+                b_vec = b[kk, :]
+                acc += a_vec[:, None] * b_vec[None, :]
+        a_ptrs += BLOCK_K * stride_ak
+        b_ptrs += BLOCK_K * stride_bk
+        k += BLOCK_K
 
     acc = gelu(acc)
 
-    c_ptrs = C + (offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn)
-    if EVEN_M and EVEN_N:
-        tl.store(c_ptrs, acc)
-    else:
-        tl.store(c_ptrs, acc, mask=(offs_m[:, None] < M) & (offs_n[None, :] < N))
+    c_ptrs = c_ptr + (offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn)
+    mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
+    tl.store(c_ptrs, acc.to(C_DTYPE), mask=mask)
 
 
 def matmul(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
-    assert a.device.type == "cuda" and b.device.type == "cuda", "Inputs must be CUDA tensors"
-    assert a.ndim == 2 and b.ndim == 2, "Inputs must be 2D matrices"
-    assert a.shape[1] == b.shape[0], "Incompatible dimensions for matmul"
-    assert a.dtype in (torch.float16, torch.bfloat16, torch.float32), "Unsupported dtype for A"
-    assert b.dtype in (torch.float16, torch.bfloat16, torch.float32), "Unsupported dtype for B"
+    """
+    Matrix multiplication with GELU activation.
+
+    Args:
+        a: Input tensor of shape (M, K)
+        b: Input tensor of shape (K, N)
+
+    Returns:
+        Output tensor of shape (M, N) with GELU activation applied
+    """
+    if not (a.is_cuda and b.is_cuda):
+        # Fallback to PyTorch on CPU or if tensors not CUDA
+        return torch.nn.functional.gelu(a @ b)
+    assert a.ndim == 2 and b.ndim == 2, "Inputs must be 2D"
+    assert a.shape[1] == b.shape[0], "Incompatible shapes for matmul"
+    assert a.device == b.device, "Inputs must be on same device"
+
+    # Support dtypes
+    supported = (torch.float16, torch.bfloat16, torch.float32)
+    if a.dtype not in supported or b.dtype not in supported:
+        # Fallback for unsupported dtype
+        return torch.nn.functional.gelu(a @ b)
+
     M, K = a.shape
-    Kb, N = b.shape
-    out_dtype = torch.promote_types(a.dtype, b.dtype)
+    K2, N = b.shape
+    assert K == K2
+
+    out_dtype = _promote_dtype(a.dtype, b.dtype)
     c = torch.empty((M, N), device=a.device, dtype=out_dtype)
 
-    grid = lambda META: ((triton.cdiv(M, META["BLOCK_M"]) * triton.cdiv(N, META["BLOCK_N"])),)
+    # Choose whether to use tensor cores (dot) based on dtype
+    use_dot = (a.dtype in (torch.float16, torch.bfloat16)) and (b.dtype in (torch.float16, torch.bfloat16))
+
+    grid = (triton.cdiv(M, 128), triton.cdiv(N, 128))
 
     _matmul_gelu_kernel[grid](
         a, b, c,
@@ -122,13 +139,17 @@ def matmul(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
         a.stride(0), a.stride(1),
         b.stride(0), b.stride(1),
         c.stride(0), c.stride(1),
+        C_DTYPE=_to_tl_dtype(out_dtype),
+        USE_DOT=use_dot,
     )
+
     return c
 
 
 class Solution:
     def solve(self, spec_path: str = None) -> dict:
-        code = """
+        # Return code string containing kernel and matmul implementation
+        code = r'''
 import torch
 import triton
 import triton.language as tl
@@ -139,113 +160,110 @@ def gelu(x):
     return x * 0.5 * (1.0 + tl.extra.cuda.libdevice.erf(x * 0.7071067811865476))
 
 
+def _to_tl_dtype(dtype: torch.dtype):
+    if dtype == torch.float16:
+        return tl.float16
+    if dtype == torch.bfloat16:
+        return tl.bfloat16
+    if dtype == torch.float32:
+        return tl.float32
+    raise ValueError(f"Unsupported dtype for Triton kernel: {dtype}")
+
+
+def _promote_dtype(a: torch.dtype, b: torch.dtype):
+    if a == torch.float16 and b == torch.float16:
+        return torch.float16
+    if a == torch.bfloat16 and b == torch.bfloat16:
+        return torch.bfloat16
+    if a == torch.float32 or b == torch.float32:
+        return torch.float32
+    return torch.float32
+
+
 @triton.autotune(
     configs=[
-        triton.Config({"BLOCK_M": 128, "BLOCK_N": 128, "BLOCK_K": 32, "GROUP_M": 8}, num_stages=4, num_warps=8),
-        triton.Config({"BLOCK_M": 128, "BLOCK_N": 64,  "BLOCK_K": 32, "GROUP_M": 8}, num_stages=4, num_warps=4),
-        triton.Config({"BLOCK_M": 64,  "BLOCK_N": 128, "BLOCK_K": 32, "GROUP_M": 8}, num_stages=4, num_warps=4),
-        triton.Config({"BLOCK_M": 64,  "BLOCK_N": 64,  "BLOCK_K": 32, "GROUP_M": 8}, num_stages=3, num_warps=4),
-        triton.Config({"BLOCK_M": 128, "BLOCK_N": 256, "BLOCK_K": 32, "GROUP_M": 4}, num_stages=5, num_warps=8),
-        triton.Config({"BLOCK_M": 256, "BLOCK_N": 128, "BLOCK_K": 32, "GROUP_M": 4}, num_stages=5, num_warps=8),
-        triton.Config({"BLOCK_M": 64,  "BLOCK_N": 256, "BLOCK_K": 32, "GROUP_M": 4}, num_stages=4, num_warps=8),
-        triton.Config({"BLOCK_M": 256, "BLOCK_N": 64,  "BLOCK_K": 32, "GROUP_M": 4}, num_stages=4, num_warps=8),
-        triton.Config({"BLOCK_M": 128, "BLOCK_N": 128, "BLOCK_K": 64, "GROUP_M": 8}, num_stages=5, num_warps=8),
-        triton.Config({"BLOCK_M": 128, "BLOCK_N": 64,  "BLOCK_K": 64, "GROUP_M": 8}, num_stages=5, num_warps=4),
-        triton.Config({"BLOCK_M": 64,  "BLOCK_N": 128, "BLOCK_K": 64, "GROUP_M": 8}, num_stages=5, num_warps=4),
-        triton.Config({"BLOCK_M": 64,  "BLOCK_N": 64,  "BLOCK_K": 64, "GROUP_M": 8}, num_stages=4, num_warps=4),
+        triton.Config({"BLOCK_M": 128, "BLOCK_N": 128, "BLOCK_K": 32, "USE_DOT": True}, num_warps=8, num_stages=4),
+        triton.Config({"BLOCK_M": 128, "BLOCK_N": 64, "BLOCK_K": 32, "USE_DOT": True}, num_warps=4, num_stages=4),
+        triton.Config({"BLOCK_M": 64, "BLOCK_N": 128, "BLOCK_K": 32, "USE_DOT": True}, num_warps=4, num_stages=4),
+        triton.Config({"BLOCK_M": 64, "BLOCK_N": 64, "BLOCK_K": 32, "USE_DOT": True}, num_warps=4, num_stages=3),
+        triton.Config({"BLOCK_M": 128, "BLOCK_N": 128, "BLOCK_K": 64, "USE_DOT": True}, num_warps=8, num_stages=5),
+        triton.Config({"BLOCK_M": 256, "BLOCK_N": 64, "BLOCK_K": 32, "USE_DOT": True}, num_warps=8, num_stages=4),
+        triton.Config({"BLOCK_M": 64, "BLOCK_N": 256, "BLOCK_K": 32, "USE_DOT": True}, num_warps=8, num_stages=4),
+        triton.Config({"BLOCK_M": 128, "BLOCK_N": 32, "BLOCK_K": 64, "USE_DOT": True}, num_warps=4, num_stages=4),
+        triton.Config({"BLOCK_M": 32, "BLOCK_N": 128, "BLOCK_K": 64, "USE_DOT": True}, num_warps=4, num_stages=4),
+        triton.Config({"BLOCK_M": 64, "BLOCK_N": 64, "BLOCK_K": 64, "USE_DOT": True}, num_warps=4, num_stages=4),
+        triton.Config({"BLOCK_M": 128, "BLOCK_N": 128, "BLOCK_K": 32, "USE_DOT": False}, num_warps=8, num_stages=3),
+        triton.Config({"BLOCK_M": 64, "BLOCK_N": 128, "BLOCK_K": 32, "USE_DOT": False}, num_warps=4, num_stages=3),
+        triton.Config({"BLOCK_M": 128, "BLOCK_N": 64, "BLOCK_K": 32, "USE_DOT": False}, num_warps=4, num_stages=3),
     ],
     key=["M", "N", "K"],
 )
-@triton.heuristics(
-    {
-        "EVEN_K": lambda args: args["K"] % args["BLOCK_K"] == 0,
-        "EVEN_M": lambda args: args["M"] % args["BLOCK_M"] == 0,
-        "EVEN_N": lambda args: args["N"] % args["BLOCK_N"] == 0,
-    }
-)
 @triton.jit
 def _matmul_gelu_kernel(
-    A, B, C,
+    a_ptr, b_ptr, c_ptr,
     M, N, K,
     stride_am, stride_ak,
     stride_bk, stride_bn,
     stride_cm, stride_cn,
+    C_DTYPE: tl.constexpr,
     BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
-    GROUP_M: tl.constexpr,
-    EVEN_K: tl.constexpr, EVEN_M: tl.constexpr, EVEN_N: tl.constexpr,
+    USE_DOT: tl.constexpr,
 ):
-    pid = tl.program_id(0)
-
-    num_pid_m = (M + BLOCK_M - 1) // BLOCK_M
-    num_pid_n = (N + BLOCK_N - 1) // BLOCK_N
-
-    group_size_m = GROUP_M
-    num_pid_in_group = group_size_m * num_pid_n
-    group_id = pid // num_pid_in_group
-    first_pid_m = group_id * group_size_m
-    pid_in_group = pid % num_pid_in_group
-    pid_m = (first_pid_m + (pid_in_group % group_size_m)) % num_pid_m
-    pid_n = pid_in_group // group_size_m
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
 
     offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
     offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
     offs_k = tl.arange(0, BLOCK_K)
 
-    a_ptrs = A + (offs_m[:, None] * stride_am + offs_k[None, :] * stride_ak)
-    b_ptrs = B + (offs_k[:, None] * stride_bk + offs_n[None, :] * stride_bn)
+    a_ptrs = a_ptr + (offs_m[:, None] * stride_am + offs_k[None, :] * stride_ak)
+    b_ptrs = b_ptr + (offs_k[:, None] * stride_bk + offs_n[None, :] * stride_bn)
 
     acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
 
-    if EVEN_K:
-        k_iter = K // BLOCK_K
-        for _ in range(0, k_iter):
-            a = tl.load(a_ptrs)
-            b = tl.load(b_ptrs)
+    k = 0
+    while k < K:
+        a = tl.load(a_ptrs, mask=(offs_m[:, None] < M) & (offs_k[None, :] < K), other=0.0)
+        b = tl.load(b_ptrs, mask=(offs_k[:, None] < K) & (offs_n[None, :] < N), other=0.0)
+        if USE_DOT:
             acc += tl.dot(a, b)
-            a_ptrs += BLOCK_K * stride_ak
-            b_ptrs += BLOCK_K * stride_bk
-        k_remainder = K - k_iter * BLOCK_K
-        if k_remainder > 0:
-            offs_kr = tl.arange(0, BLOCK_K)
-            a_ptrs_r = A + offs_m[:, None] * stride_am + (k_iter * BLOCK_K + offs_kr[None, :]) * stride_ak
-            b_ptrs_r = B + (k_iter * BLOCK_K + offs_kr[:, None]) * stride_bk + offs_n[None, :] * stride_bn
-            k_mask = offs_kr < k_remainder
-            a = tl.load(a_ptrs_r, mask=k_mask[None, :])
-            b = tl.load(b_ptrs_r, mask=k_mask[:, None])
-            acc += tl.dot(a, b)
-    else:
-        k0 = 0
-        while k0 < K:
-            k_remaining = K - k0
-            k_mask = offs_k < k_remaining
-            a = tl.load(a_ptrs, mask=(k_mask[None, :]) & ((offs_m[:, None] < M) if not EVEN_M else True), other=0.0)
-            b = tl.load(b_ptrs, mask=(k_mask[:, None]) & ((offs_n[None, :] < N) if not EVEN_N else True), other=0.0)
-            acc += tl.dot(a, b)
-            a_ptrs += BLOCK_K * stride_ak
-            b_ptrs += BLOCK_K * stride_bk
-            k0 += BLOCK_K
+        else:
+            for kk in range(0, BLOCK_K):
+                a_vec = a[:, kk]
+                b_vec = b[kk, :]
+                acc += a_vec[:, None] * b_vec[None, :]
+        a_ptrs += BLOCK_K * stride_ak
+        b_ptrs += BLOCK_K * stride_bk
+        k += BLOCK_K
 
     acc = gelu(acc)
 
-    c_ptrs = C + (offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn)
-    if EVEN_M and EVEN_N:
-        tl.store(c_ptrs, acc)
-    else:
-        tl.store(c_ptrs, acc, mask=(offs_m[:, None] < M) & (offs_n[None, :] < N))
+    c_ptrs = c_ptr + (offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn)
+    mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
+    tl.store(c_ptrs, acc.to(C_DTYPE), mask=mask)
 
 
 def matmul(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
-    assert a.device.type == "cuda" and b.device.type == "cuda", "Inputs must be CUDA tensors"
-    assert a.ndim == 2 and b.ndim == 2, "Inputs must be 2D matrices"
-    assert a.shape[1] == b.shape[0], "Incompatible dimensions for matmul"
-    assert a.dtype in (torch.float16, torch.bfloat16, torch.float32), "Unsupported dtype for A"
-    assert b.dtype in (torch.float16, torch.bfloat16, torch.float32), "Unsupported dtype for B"
+    if not (a.is_cuda and b.is_cuda):
+        return torch.nn.functional.gelu(a @ b)
+    assert a.ndim == 2 and b.ndim == 2
+    assert a.shape[1] == b.shape[0]
+    assert a.device == b.device
+
+    supported = (torch.float16, torch.bfloat16, torch.float32)
+    if a.dtype not in supported or b.dtype not in supported:
+        return torch.nn.functional.gelu(a @ b)
+
     M, K = a.shape
-    Kb, N = b.shape
-    out_dtype = torch.promote_types(a.dtype, b.dtype)
+    K2, N = b.shape
+    assert K == K2
+
+    out_dtype = _promote_dtype(a.dtype, b.dtype)
     c = torch.empty((M, N), device=a.device, dtype=out_dtype)
 
-    grid = lambda META: ((triton.cdiv(M, META["BLOCK_M"]) * triton.cdiv(N, META["BLOCK_N"])),)
+    use_dot = (a.dtype in (torch.float16, torch.bfloat16)) and (b.dtype in (torch.float16, torch.bfloat16))
+
+    grid = (triton.cdiv(M, 128), triton.cdiv(N, 128))
 
     _matmul_gelu_kernel[grid](
         a, b, c,
@@ -253,7 +271,10 @@ def matmul(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
         a.stride(0), a.stride(1),
         b.stride(0), b.stride(1),
         c.stride(0), c.stride(1),
+        C_DTYPE=_to_tl_dtype(out_dtype),
+        USE_DOT=use_dot,
     )
+
     return c
-"""
+'''
         return {"code": code}

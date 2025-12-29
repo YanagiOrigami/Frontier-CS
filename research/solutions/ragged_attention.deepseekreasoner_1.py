@@ -1,507 +1,182 @@
 import torch
 import triton
 import triton.language as tl
-import math
+from typing import Optional
 
 @triton.jit
-def _ragged_attention_fwd_kernel(
-    Q, K, V, O,
-    row_lens_ptr,
-    stride_qm, stride_qd,
-    stride_km, stride_kd,
-    stride_vm, stride_vd,
-    stride_om, stride_od,
+def _ragged_attention_kernel(
+    Q,  # [M, D] - query matrix
+    K,  # [N, D] - key matrix  
+    V,  # [N, Dv] - value matrix
+    row_lens,  # [M] - row lengths
+    O,  # [M, Dv] - output matrix
     M, N, D, Dv,
+    stride_qm, stride_qd,
+    stride_kn, stride_kd,
+    stride_vn, stride_vd,
+    stride_om, stride_od,
+    scale: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_D: tl.constexpr,
     BLOCK_DV: tl.constexpr,
-    HAS_DV_TILE: tl.constexpr,
+    USE_FP32_ACC: tl.constexpr = True,
 ):
+    # Program ID
     pid_m = tl.program_id(0)
     pid_n = tl.program_id(1)
     
+    # Offsets for this program
     offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
     offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
     offs_d = tl.arange(0, BLOCK_D)
     offs_dv = tl.arange(0, BLOCK_DV)
     
-    q_ptrs = Q + offs_m[:, None] * stride_qm + offs_d[None, :] * stride_qd
-    k_ptrs = K + offs_n[None, :] * stride_km + offs_d[:, None] * stride_kd
-    v_ptrs = V + offs_n[:, None] * stride_vm + offs_dv[None, :] * stride_vd
+    # Load row lengths for this block of queries
+    row_lens_m = tl.load(row_lens + offs_m, mask=offs_m < M, other=0)
     
-    row_lens_ptrs = row_lens_ptr + offs_m
-    row_len = tl.load(row_lens_ptrs, mask=offs_m < M, other=0)
-    
-    max_row_len = tl.max(row_len)
-    if max_row_len <= 0:
-        return
-    
-    q = tl.load(q_ptrs, mask=(offs_m[:, None] < M) & (offs_d[None, :] < D), other=0.0).to(tl.float32)
-    
-    m_i = tl.full([BLOCK_M], float('-inf'), dtype=tl.float32)
+    # Initialize accumulator for softmax
+    m_i = tl.zeros([BLOCK_M], dtype=tl.float32) - float('inf')
     l_i = tl.zeros([BLOCK_M], dtype=tl.float32)
-    acc = tl.zeros([BLOCK_M, BLOCK_DV], dtype=tl.float32)
+    acc = tl.zeros([BLOCK_M, BLOCK_DV], dtype=tl.float32 if USE_FP32_ACC else tl.float16)
     
-    start_n = 0
-    for start_n in range(0, max_row_len, BLOCK_N):
-        offs_n_cur = start_n + tl.arange(0, BLOCK_N)
+    # Load query block [BLOCK_M, D]
+    q_ptrs = Q + (offs_m[:, None] * stride_qm + offs_d[None, :] * stride_qd)
+    q = tl.load(q_ptrs, mask=(offs_m[:, None] < M) & (offs_d[None, :] < D), other=0.0)
+    q = q.to(tl.float32)
+    
+    # Loop over key blocks
+    for start_n in range(0, N, BLOCK_N):
+        n_idx = start_n + offs_n[None, :]
         
-        k = tl.load(
-            k_ptrs, 
-            mask=(offs_n_cur[None, :] < N) & (offs_d[:, None] < D), 
-            other=0.0
-        ).to(tl.float32)
+        # Load key block [BLOCK_N, D]
+        k_ptrs = K + (n_idx * stride_kn + offs_d[:, None] * stride_kd)
+        k = tl.load(k_ptrs, mask=(n_idx < N) & (offs_d[:, None] < D), other=0.0)
+        k = k.to(tl.float32)
         
-        # Compute attention scores
-        s = tl.dot(q, k) * (1.0 / math.sqrt(D))
+        # Compute QK^T [BLOCK_M, BLOCK_N]
+        qk = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
+        qk += tl.dot(q, k, allow_tf32=False)
+        qk *= scale
         
-        # Mask based on row lengths
-        mask_n = offs_n_cur[None, :] < row_len[:, None]
-        mask_m = offs_m[:, None] < M
-        mask = mask_n & mask_m
-        
-        # Apply mask
-        s = tl.where(mask, s, float('-inf'))
+        # Create mask for ragged attention
+        mask = n_idx < row_lens_m[:, None]
+        qk = tl.where(mask, qk, float('-inf'))
         
         # Streaming softmax update
-        m_ij = tl.max(s, axis=1)
-        m_i_new = tl.maximum(m_i, m_ij)
-        
-        p = tl.exp(s - m_i_new[:, None])
+        m_i_new = tl.maximum(m_i, tl.max(qk, axis=1))
         alpha = tl.exp(m_i - m_i_new)
+        beta = tl.exp(qk - m_i_new[:, None])
         
-        l_i = l_i * alpha + tl.sum(p, axis=1)
+        # Update running statistics
+        l_i = l_i * alpha + tl.sum(beta, axis=1)
         
-        if HAS_DV_TILE:
-            v = tl.load(
-                v_ptrs, 
-                mask=(offs_n_cur[:, None] < N) & (offs_dv[None, :] < Dv), 
-                other=0.0
-            ).to(tl.float32)
-            
-            # Update accumulation with proper scaling
-            acc = acc * alpha[:, None]
-            p_scaled = p.to(v.dtype)
-            acc += tl.dot(p_scaled, v)
-        else:
-            # Alternative handling for small Dv
-            v = tl.load(
-                v_ptrs,
-                mask=offs_n_cur[:, None] < N,
-                other=0.0
-            ).to(tl.float32)
-            
-            acc = acc * alpha[:, None]
-            p_scaled = p.to(v.dtype)
-            acc += tl.dot(p_scaled, v)
+        # Load value block [BLOCK_N, Dv]
+        v_ptrs = V + (n_idx[:, None] * stride_vn + offs_dv[None, :] * stride_vd)
+        v = tl.load(v_ptrs, mask=(n_idx[:, None] < N) & (offs_dv[None, :] < Dv), other=0.0)
+        v = v.to(tl.float32 if USE_FP32_ACC else tl.float16)
         
+        # Update accumulator with correction
+        acc = acc * alpha[:, None] + tl.dot(beta, v, allow_tf32=False)
         m_i = m_i_new
     
-    # Final normalization
+    # Normalize and store output
     acc = acc / l_i[:, None]
+    acc = acc.to(tl.float16)
     
-    # Store output
-    o_ptrs = O + offs_m[:, None] * stride_om + offs_dv[None, :] * stride_od
-    tl.store(
-        o_ptrs, 
-        acc.to(tl.float16), 
-        mask=(offs_m[:, None] < M) & (offs_dv[None, :] < Dv)
-    )
+    # Store output [BLOCK_M, Dv]
+    o_ptrs = O + (offs_m[:, None] * stride_om + offs_dv[None, :] * stride_od)
+    tl.store(o_ptrs, acc, mask=(offs_m[:, None] < M) & (offs_dv[None, :] < Dv))
 
-@triton.jit
-def _ragged_attention_fwd_kernel_small_d(
-    Q, K, V, O,
-    row_lens_ptr,
-    stride_qm, stride_qd,
-    stride_km, stride_kd,
-    stride_vm, stride_vd,
-    stride_om, stride_od,
-    M, N, D, Dv,
-    BLOCK_M: tl.constexpr,
-    BLOCK_N: tl.constexpr,
-    BLOCK_D: tl.constexpr,
-):
-    pid_m = tl.program_id(0)
+def ragged_attn(
+    Q: torch.Tensor,
+    K: torch.Tensor, 
+    V: torch.Tensor,
+    row_lens: torch.Tensor
+) -> torch.Tensor:
+    """
+    Ragged attention computation.
     
-    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
-    offs_d = tl.arange(0, BLOCK_D)
-    offs_dv = tl.arange(0, Dv)
+    Args:
+        Q: Query tensor of shape (M, D) - query features (float16)
+        K: Key tensor of shape (N, D) - key features (float16)
+        V: Value tensor of shape (N, Dv) - value features (float16)
+        row_lens: Row lengths tensor of shape (M,) - number of valid K/V rows per Q row (int32 or int64)
     
-    row_lens_ptrs = row_lens_ptr + offs_m
-    row_len = tl.load(row_lens_ptrs, mask=offs_m < M, other=0)
-    
-    max_row_len = tl.max(row_len)
-    if max_row_len <= 0:
-        return
-    
-    # Load Q matrix
-    q_ptrs = Q + offs_m[:, None] * stride_qm + offs_d[None, :] * stride_qd
-    q = tl.load(q_ptrs, mask=(offs_m[:, None] < M) & (offs_d[None, :] < D), other=0.0).to(tl.float32)
-    
-    m_i = tl.full([BLOCK_M], float('-inf'), dtype=tl.float32)
-    l_i = tl.zeros([BLOCK_M], dtype=tl.float32)
-    acc = tl.zeros([BLOCK_M, Dv], dtype=tl.float32)
-    
-    start_n = 0
-    for start_n in range(0, max_row_len, BLOCK_N):
-        offs_n_cur = start_n + tl.arange(0, BLOCK_N)
-        
-        # Load K matrix
-        k_ptrs = K + offs_n_cur[None, :] * stride_km + offs_d[:, None] * stride_kd
-        k = tl.load(
-            k_ptrs,
-            mask=(offs_n_cur[None, :] < N) & (offs_d[:, None] < D),
-            other=0.0
-        ).to(tl.float32)
-        
-        # Load V matrix
-        v_ptrs = V + offs_n_cur[:, None] * stride_vm + offs_dv[None, :] * stride_vd
-        v = tl.load(
-            v_ptrs,
-            mask=(offs_n_cur[:, None] < N) & (offs_dv[None, :] < Dv),
-            other=0.0
-        ).to(tl.float32)
-        
-        # Compute attention scores
-        s = tl.dot(q, k) * (1.0 / math.sqrt(D))
-        
-        # Mask based on row lengths
-        mask_n = offs_n_cur[None, :] < row_len[:, None]
-        mask_m = offs_m[:, None] < M
-        mask = mask_n & mask_m
-        
-        s = tl.where(mask, s, float('-inf'))
-        
-        # Streaming softmax
-        m_ij = tl.max(s, axis=1)
-        m_i_new = tl.maximum(m_i, m_ij)
-        
-        p = tl.exp(s - m_i_new[:, None])
-        alpha = tl.exp(m_i - m_i_new)
-        
-        l_i = l_i * alpha + tl.sum(p, axis=1)
-        
-        # Update accumulation
-        acc = acc * alpha[:, None]
-        p_scaled = p.to(v.dtype)
-        acc += tl.dot(p_scaled, v)
-        
-        m_i = m_i_new
-    
-    # Final normalization and store
-    acc = acc / l_i[:, None]
-    o_ptrs = O + offs_m[:, None] * stride_om + offs_dv[None, :] * stride_od
-    tl.store(
-        o_ptrs,
-        acc.to(tl.float16),
-        mask=(offs_m[:, None] < M) & (offs_dv[None, :] < Dv)
-    )
-
-def ragged_attn(Q: torch.Tensor, K: torch.Tensor, V: torch.Tensor, row_lens: torch.Tensor) -> torch.Tensor:
-    assert Q.dtype == torch.float16 and K.dtype == torch.float16 and V.dtype == torch.float16
-    assert Q.is_cuda and K.is_cuda and V.is_cuda and row_lens.is_cuda
+    Returns:
+        Output tensor of shape (M, Dv) - attention output (float16)
+    """
+    # Check inputs
+    assert Q.dim() == 2 and K.dim() == 2 and V.dim() == 2
+    assert Q.size(1) == K.size(1), "Q and K must have same feature dimension"
+    assert K.size(0) == V.size(0), "K and V must have same sequence length"
+    assert row_lens.size(0) == Q.size(0), "row_lens must match Q batch size"
     
     M, D = Q.shape
-    N, _ = K.shape
-    _, Dv = V.shape
+    N = K.shape[0]
+    Dv = V.shape[1]
     
+    # Output tensor
     O = torch.empty((M, Dv), device=Q.device, dtype=Q.dtype)
     
-    grid = lambda META: (triton.cdiv(M, META['BLOCK_M']), 1)
-    
-    if Dv <= 64:
-        BLOCK_M = 4 if M >= 512 else 2
-        BLOCK_N = 128 if N >= 1024 else 64
-        BLOCK_D = D
-        
-        _ragged_attention_fwd_kernel_small_d[grid](
-            Q, K, V, O,
-            row_lens,
-            Q.stride(0), Q.stride(1),
-            K.stride(0), K.stride(1),
-            V.stride(0), V.stride(1),
-            O.stride(0), O.stride(1),
-            M, N, D, Dv,
-            BLOCK_M=BLOCK_M,
-            BLOCK_N=BLOCK_N,
-            BLOCK_D=BLOCK_D,
-        )
+    # Heuristic for block sizes based on hardware
+    # L4 GPU: 24GB VRAM, 60 SMs
+    if D <= 64:
+        BLOCK_D = 64
+    elif D <= 128:
+        BLOCK_D = 64
     else:
-        BLOCK_M = 4
-        BLOCK_N = 64
-        BLOCK_D = D
-        BLOCK_DV = min(64, Dv)
+        BLOCK_D = 32
         
-        grid_large = lambda META: (
-            triton.cdiv(M, META['BLOCK_M']),
-            triton.cdiv(Dv, META['BLOCK_DV'])
-        )
-        
-        HAS_DV_TILE = Dv > BLOCK_DV
-        
-        _ragged_attention_fwd_kernel[grid_large](
-            Q, K, V, O,
-            row_lens,
-            Q.stride(0), Q.stride(1),
-            K.stride(0), K.stride(1),
-            V.stride(0), V.stride(1),
-            O.stride(0), O.stride(1),
-            M, N, D, Dv,
-            BLOCK_M=BLOCK_M,
-            BLOCK_N=BLOCK_N,
-            BLOCK_D=BLOCK_D,
-            BLOCK_DV=BLOCK_DV,
-            HAS_DV_TILE=HAS_DV_TILE,
-        )
+    if Dv <= 64:
+        BLOCK_DV = 64
+    elif Dv <= 128:
+        BLOCK_DV = 64
+    else:
+        BLOCK_DV = 32
+    
+    # Set block sizes - tuned for L4 GPU
+    BLOCK_M = 64  # Queries per block
+    BLOCK_N = 64  # Keys per block
+    
+    # Ensure block sizes don't exceed dimensions
+    BLOCK_D = min(BLOCK_D, D)
+    BLOCK_DV = min(BLOCK_DV, Dv)
+    
+    # Scale factor
+    scale = 1.0 / (D ** 0.5)
+    
+    # Grid
+    grid = (triton.cdiv(M, BLOCK_M), 1)
+    
+    # Launch kernel
+    _ragged_attention_kernel[grid](
+        Q, K, V, row_lens, O,
+        M, N, D, Dv,
+        Q.stride(0), Q.stride(1),
+        K.stride(0), K.stride(1),
+        V.stride(0), V.stride(1),
+        O.stride(0), O.stride(1),
+        scale=scale,
+        BLOCK_M=BLOCK_M,
+        BLOCK_N=BLOCK_N,
+        BLOCK_D=BLOCK_D,
+        BLOCK_DV=BLOCK_DV,
+        USE_FP32_ACC=True,
+        num_warps=4,
+        num_stages=3,
+    )
     
     return O
 
 class Solution:
     def solve(self, spec_path: str = None) -> dict:
-        return {
-            "code": """
-import torch
-import triton
-import triton.language as tl
-import math
-
-@triton.jit
-def _ragged_attention_fwd_kernel(
-    Q, K, V, O,
-    row_lens_ptr,
-    stride_qm, stride_qd,
-    stride_km, stride_kd,
-    stride_vm, stride_vd,
-    stride_om, stride_od,
-    M, N, D, Dv,
-    BLOCK_M: tl.constexpr,
-    BLOCK_N: tl.constexpr,
-    BLOCK_D: tl.constexpr,
-    BLOCK_DV: tl.constexpr,
-    HAS_DV_TILE: tl.constexpr,
-):
-    pid_m = tl.program_id(0)
-    pid_n = tl.program_id(1)
-    
-    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
-    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
-    offs_d = tl.arange(0, BLOCK_D)
-    offs_dv = tl.arange(0, BLOCK_DV)
-    
-    q_ptrs = Q + offs_m[:, None] * stride_qm + offs_d[None, :] * stride_qd
-    k_ptrs = K + offs_n[None, :] * stride_km + offs_d[:, None] * stride_kd
-    v_ptrs = V + offs_n[:, None] * stride_vm + offs_dv[None, :] * stride_vd
-    
-    row_lens_ptrs = row_lens_ptr + offs_m
-    row_len = tl.load(row_lens_ptrs, mask=offs_m < M, other=0)
-    
-    max_row_len = tl.max(row_len)
-    if max_row_len <= 0:
-        return
-    
-    q = tl.load(q_ptrs, mask=(offs_m[:, None] < M) & (offs_d[None, :] < D), other=0.0).to(tl.float32)
-    
-    m_i = tl.full([BLOCK_M], float('-inf'), dtype=tl.float32)
-    l_i = tl.zeros([BLOCK_M], dtype=tl.float32)
-    acc = tl.zeros([BLOCK_M, BLOCK_DV], dtype=tl.float32)
-    
-    start_n = 0
-    for start_n in range(0, max_row_len, BLOCK_N):
-        offs_n_cur = start_n + tl.arange(0, BLOCK_N)
-        
-        k = tl.load(
-            k_ptrs, 
-            mask=(offs_n_cur[None, :] < N) & (offs_d[:, None] < D), 
-            other=0.0
-        ).to(tl.float32)
-        
-        s = tl.dot(q, k) * (1.0 / math.sqrt(D))
-        
-        mask_n = offs_n_cur[None, :] < row_len[:, None]
-        mask_m = offs_m[:, None] < M
-        mask = mask_n & mask_m
-        
-        s = tl.where(mask, s, float('-inf'))
-        
-        m_ij = tl.max(s, axis=1)
-        m_i_new = tl.maximum(m_i, m_ij)
-        
-        p = tl.exp(s - m_i_new[:, None])
-        alpha = tl.exp(m_i - m_i_new)
-        
-        l_i = l_i * alpha + tl.sum(p, axis=1)
-        
-        if HAS_DV_TILE:
-            v = tl.load(
-                v_ptrs, 
-                mask=(offs_n_cur[:, None] < N) & (offs_dv[None, :] < Dv), 
-                other=0.0
-            ).to(tl.float32)
-            
-            acc = acc * alpha[:, None]
-            p_scaled = p.to(v.dtype)
-            acc += tl.dot(p_scaled, v)
-        else:
-            v = tl.load(
-                v_ptrs,
-                mask=offs_n_cur[:, None] < N,
-                other=0.0
-            ).to(tl.float32)
-            
-            acc = acc * alpha[:, None]
-            p_scaled = p.to(v.dtype)
-            acc += tl.dot(p_scaled, v)
-        
-        m_i = m_i_new
-    
-    acc = acc / l_i[:, None]
-    
-    o_ptrs = O + offs_m[:, None] * stride_om + offs_dv[None, :] * stride_od
-    tl.store(
-        o_ptrs, 
-        acc.to(tl.float16), 
-        mask=(offs_m[:, None] < M) & (offs_dv[None, :] < Dv)
-    )
-
-@triton.jit
-def _ragged_attention_fwd_kernel_small_d(
-    Q, K, V, O,
-    row_lens_ptr,
-    stride_qm, stride_qd,
-    stride_km, stride_kd,
-    stride_vm, stride_vd,
-    stride_om, stride_od,
-    M, N, D, Dv,
-    BLOCK_M: tl.constexpr,
-    BLOCK_N: tl.constexpr,
-    BLOCK_D: tl.constexpr,
-):
-    pid_m = tl.program_id(0)
-    
-    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
-    offs_d = tl.arange(0, BLOCK_D)
-    offs_dv = tl.arange(0, Dv)
-    
-    row_lens_ptrs = row_lens_ptr + offs_m
-    row_len = tl.load(row_lens_ptrs, mask=offs_m < M, other=0)
-    
-    max_row_len = tl.max(row_len)
-    if max_row_len <= 0:
-        return
-    
-    q_ptrs = Q + offs_m[:, None] * stride_qm + offs_d[None, :] * stride_qd
-    q = tl.load(q_ptrs, mask=(offs_m[:, None] < M) & (offs_d[None, :] < D), other=0.0).to(tl.float32)
-    
-    m_i = tl.full([BLOCK_M], float('-inf'), dtype=tl.float32)
-    l_i = tl.zeros([BLOCK_M], dtype=tl.float32)
-    acc = tl.zeros([BLOCK_M, Dv], dtype=tl.float32)
-    
-    start_n = 0
-    for start_n in range(0, max_row_len, BLOCK_N):
-        offs_n_cur = start_n + tl.arange(0, BLOCK_N)
-        
-        k_ptrs = K + offs_n_cur[None, :] * stride_km + offs_d[:, None] * stride_kd
-        k = tl.load(
-            k_ptrs,
-            mask=(offs_n_cur[None, :] < N) & (offs_d[:, None] < D),
-            other=0.0
-        ).to(tl.float32)
-        
-        v_ptrs = V + offs_n_cur[:, None] * stride_vm + offs_dv[None, :] * stride_vd
-        v = tl.load(
-            v_ptrs,
-            mask=(offs_n_cur[:, None] < N) & (offs_dv[None, :] < Dv),
-            other=0.0
-        ).to(tl.float32)
-        
-        s = tl.dot(q, k) * (1.0 / math.sqrt(D))
-        
-        mask_n = offs_n_cur[None, :] < row_len[:, None]
-        mask_m = offs_m[:, None] < M
-        mask = mask_n & mask_m
-        
-        s = tl.where(mask, s, float('-inf'))
-        
-        m_ij = tl.max(s, axis=1)
-        m_i_new = tl.maximum(m_i, m_ij)
-        
-        p = tl.exp(s - m_i_new[:, None])
-        alpha = tl.exp(m_i - m_i_new)
-        
-        l_i = l_i * alpha + tl.sum(p, axis=1)
-        
-        acc = acc * alpha[:, None]
-        p_scaled = p.to(v.dtype)
-        acc += tl.dot(p_scaled, v)
-        
-        m_i = m_i_new
-    
-    acc = acc / l_i[:, None]
-    o_ptrs = O + offs_m[:, None] * stride_om + offs_dv[None, :] * stride_od
-    tl.store(
-        o_ptrs,
-        acc.to(tl.float16),
-        mask=(offs_m[:, None] < M) & (offs_dv[None, :] < Dv)
-    )
-
-def ragged_attn(Q: torch.Tensor, K: torch.Tensor, V: torch.Tensor, row_lens: torch.Tensor) -> torch.Tensor:
-    assert Q.dtype == torch.float16 and K.dtype == torch.float16 and V.dtype == torch.float16
-    assert Q.is_cuda and K.is_cuda and V.is_cuda and row_lens.is_cuda
-    
-    M, D = Q.shape
-    N, _ = K.shape
-    _, Dv = V.shape
-    
-    O = torch.empty((M, Dv), device=Q.device, dtype=Q.dtype)
-    
-    grid = lambda META: (triton.cdiv(M, META['BLOCK_M']), 1)
-    
-    if Dv <= 64:
-        BLOCK_M = 4 if M >= 512 else 2
-        BLOCK_N = 128 if N >= 1024 else 64
-        BLOCK_D = D
-        
-        _ragged_attention_fwd_kernel_small_d[grid](
-            Q, K, V, O,
-            row_lens,
-            Q.stride(0), Q.stride(1),
-            K.stride(0), K.stride(1),
-            V.stride(0), V.stride(1),
-            O.stride(0), O.stride(1),
-            M, N, D, Dv,
-            BLOCK_M=BLOCK_M,
-            BLOCK_N=BLOCK_N,
-            BLOCK_D=BLOCK_D,
-        )
-    else:
-        BLOCK_M = 4
-        BLOCK_N = 64
-        BLOCK_D = D
-        BLOCK_DV = min(64, Dv)
-        
-        grid_large = lambda META: (
-            triton.cdiv(M, META['BLOCK_M']),
-            triton.cdiv(Dv, META['BLOCK_DV'])
-        )
-        
-        HAS_DV_TILE = Dv > BLOCK_DV
-        
-        _ragged_attention_fwd_kernel[grid_large](
-            Q, K, V, O,
-            row_lens,
-            Q.stride(0), Q.stride(1),
-            K.stride(0), K.stride(1),
-            V.stride(0), V.stride(1),
-            O.stride(0), O.stride(1),
-            M, N, D, Dv,
-            BLOCK_M=BLOCK_M,
-            BLOCK_N=BLOCK_N,
-            BLOCK_D=BLOCK_D,
-            BLOCK_DV=BLOCK_DV,
-            HAS_DV_TILE=HAS_DV_TILE,
-        )
-    
-    return O
-"""
-        }
+        """
+        Returns a dict with either:
+        - {"code": "python_code_string"}
+        - {"program_path": "path/to/kernel.py"}
+        """
+        # Return the code as a string
+        import inspect
+        code = inspect.getsource(_ragged_attention_kernel) + "\n\n" + inspect.getsource(ragged_attn)
+        return {"code": code}

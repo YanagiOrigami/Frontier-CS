@@ -1,26 +1,26 @@
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from collections import OrderedDict
+from copy import deepcopy
 
-class _Model(nn.Module):
-    def __init__(self, input_dim: int, num_classes: int, hidden_dim: int = 493, dropout_p: float = 0.3):
+class _Net(nn.Module):
+    def __init__(self, input_dim, num_classes, hidden_dim1=492, hidden_dim2=492, dropout_p=0.3):
         super().__init__()
-        self.layers = nn.Sequential(OrderedDict([
-            ('fc1', nn.Linear(input_dim, hidden_dim)),
-            ('bn1', nn.BatchNorm1d(hidden_dim)),
-            ('act1', nn.GELU()),
-            ('drop1', nn.Dropout(p=dropout_p)),
+        self.layers = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim1),
+            nn.BatchNorm1d(hidden_dim1),
+            nn.GELU(),
+            nn.Dropout(dropout_p),
             
-            ('fc2', nn.Linear(hidden_dim, hidden_dim)),
-            ('bn2', nn.BatchNorm1d(hidden_dim)),
-            ('act2', nn.GELU()),
-            ('drop2', nn.Dropout(p=dropout_p)),
+            nn.Linear(hidden_dim1, hidden_dim2),
+            nn.BatchNorm1d(hidden_dim2),
+            nn.GELU(),
+            nn.Dropout(dropout_p),
             
-            ('fc3', nn.Linear(hidden_dim, num_classes))
-        ]))
+            nn.Linear(hidden_dim2, num_classes)
+        )
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x):
         return self.layers(x)
 
 class Solution:
@@ -44,87 +44,62 @@ class Solution:
         Returns:
             Trained torch.nn.Module ready for evaluation
         """
-        device = torch.device(metadata.get("device", "cpu"))
+        device = metadata.get("device", "cpu")
         num_classes = metadata["num_classes"]
         input_dim = metadata["input_dim"]
 
-        # Model architecture designed to be close to the 500k parameter limit
-        # Total parameters: 498,551
-        model = _Model(
-            input_dim=input_dim,
-            num_classes=num_classes,
-            hidden_dim=493,
-            dropout_p=0.3
-        ).to(device)
-
-        # Training hyperparameters
-        epochs = 300
-        patience = 50
-        max_lr = 6e-3
-        weight_decay = 0.02
-        label_smoothing = 0.1
-
-        # Optimizer, Scheduler, and Loss Function
-        criterion = nn.CrossEntropyLoss(label_smoothing=label_smoothing)
-        optimizer = optim.AdamW(model.parameters(), lr=max_lr, weight_decay=weight_decay)
+        # Model Initialization
+        model = _Net(input_dim, num_classes).to(device)
         
-        scheduler = optim.lr_scheduler.OneCycleLR(
-            optimizer,
-            max_lr=max_lr,
-            epochs=epochs,
-            steps_per_epoch=len(train_loader),
-            pct_start=0.3,
-            div_factor=25.0,
-            final_div_factor=1e4
-        )
+        # Hyperparameters
+        EPOCHS = 300
+        LEARNING_RATE = 1e-3
+        WEIGHT_DECAY = 1e-2
+        LABEL_SMOOTHING = 0.1
 
-        # Training loop with early stopping
-        best_val_acc = 0.0
+        # Setup optimizer, loss function, and learning rate scheduler
+        optimizer = optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
+        criterion = nn.CrossEntropyLoss(label_smoothing=LABEL_SMOOTHING)
+        scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=EPOCHS, eta_min=1e-6)
+
+        best_val_acc = -1.0
         best_model_state = None
-        patience_counter = 0
 
-        for epoch in range(epochs):
+        # Training Loop
+        for epoch in range(EPOCHS):
             # Training phase
             model.train()
             for inputs, targets in train_loader:
                 inputs, targets = inputs.to(device), targets.to(device)
-
+                
                 optimizer.zero_grad()
                 outputs = model(inputs)
                 loss = criterion(outputs, targets)
                 loss.backward()
                 optimizer.step()
-                scheduler.step()
+            
+            scheduler.step()
 
             # Validation phase
             model.eval()
-            correct = 0
-            total = 0
+            val_correct = 0
+            val_total = 0
             with torch.no_grad():
                 for inputs, targets in val_loader:
                     inputs, targets = inputs.to(device), targets.to(device)
                     outputs = model(inputs)
                     _, predicted = torch.max(outputs.data, 1)
-                    total += targets.size(0)
-                    correct += (predicted == targets).sum().item()
+                    val_total += targets.size(0)
+                    val_correct += (predicted == targets).sum().item()
             
-            val_acc = correct / total
-
-            # Early stopping logic
-            if val_acc > best_val_acc:
-                best_val_acc = val_acc
-                best_model_state = {k: v.cpu() for k, v in model.state_dict().items()}
-                patience_counter = 0
-            else:
-                patience_counter += 1
-
-            if patience_counter >= patience:
-                break
+            current_val_acc = val_correct / val_total
+            
+            if current_val_acc > best_val_acc:
+                best_val_acc = current_val_acc
+                best_model_state = deepcopy(model.state_dict())
         
-        # Load best model and return
+        # Load the best model state found during training
         if best_model_state:
             model.load_state_dict(best_model_state)
-        
-        model.to(device)
-        model.eval()
+            
         return model

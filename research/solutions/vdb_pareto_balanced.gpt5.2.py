@@ -1,10 +1,11 @@
 import os
+from typing import Tuple, Optional
+
 import numpy as np
-from typing import Tuple
 
 try:
     import faiss  # type: ignore
-except Exception as e:
+except Exception:
     faiss = None
 
 
@@ -12,102 +13,153 @@ class YourIndexClass:
     def __init__(self, dim: int, **kwargs):
         self.dim = int(dim)
 
-        self.nlist = int(kwargs.get("nlist", 4096))
-        self.nprobe = int(kwargs.get("nprobe", 512))
-        self.n_train = int(kwargs.get("n_train", 200000))
-        self.seed = int(kwargs.get("seed", 123))
-        self.threads = int(kwargs.get("threads", min(8, (os.cpu_count() or 1))))
+        self.M = int(kwargs.get("M", 32))
+        self.ef_construction = int(kwargs.get("ef_construction", 200))
+        self.ef_search = int(kwargs.get("ef_search", 512))
 
-        self._trained = False
-        self._ntotal_added = 0
+        self.rerank = bool(kwargs.get("rerank", True))
+        self.rerank_k = int(kwargs.get("rerank_k", 128))
+        self.rerank_batch_size = int(kwargs.get("rerank_batch_size", 256))
+
+        threads = kwargs.get("threads", None)
+        if threads is None:
+            threads = os.cpu_count() or 1
+        self.threads = int(max(1, threads))
+
+        self._xb_ref: Optional[np.ndarray] = None
+        self._xb_chunks = []
+        self._xb_final: Optional[np.ndarray] = None
+        self._ntotal = 0
 
         if faiss is None:
-            self._xb = None
-            return
-
-        try:
+            self.index = None
+        else:
             faiss.omp_set_num_threads(self.threads)
-        except Exception:
-            pass
-
-        quantizer = faiss.IndexFlatL2(self.dim)
-        self.index = faiss.IndexIVFFlat(quantizer, self.dim, self.nlist, faiss.METRIC_L2)
-        self.index.nprobe = min(self.nprobe, self.nlist)
+            self.index = faiss.IndexHNSWFlat(self.dim, self.M)
+            self.index.hnsw.efConstruction = self.ef_construction
+            self.index.hnsw.efSearch = self.ef_search
 
     def add(self, xb: np.ndarray) -> None:
-        xb = np.asarray(xb, dtype=np.float32)
+        xb = np.asarray(xb, dtype=np.float32, order="C")
         if xb.ndim != 2 or xb.shape[1] != self.dim:
             raise ValueError(f"xb must have shape (N, {self.dim})")
-        if xb.size == 0:
-            return
-        xb = np.ascontiguousarray(xb)
+
+        if self.rerank:
+            if self._ntotal == 0 and xb.flags["C_CONTIGUOUS"] and xb.dtype == np.float32:
+                self._xb_ref = xb
+            else:
+                self._xb_chunks.append(xb)
 
         if faiss is None:
-            if self._xb is None:
-                self._xb = xb.copy()
+            if self._xb_final is None:
+                self._xb_final = xb
             else:
-                self._xb = np.vstack([self._xb, xb])
-            self._ntotal_added = int(self._xb.shape[0])
-            return
+                self._xb_final = np.vstack([self._xb_final, xb])
+        else:
+            faiss.omp_set_num_threads(self.threads)
+            self.index.add(xb)
 
-        if not self._trained:
-            n = xb.shape[0]
-            n_train = min(self.n_train, n)
-            if n_train < self.nlist:
-                n_train = min(n, max(self.nlist, n_train))
-            rs = np.random.RandomState(self.seed)
-            if n_train == n:
-                train_x = xb
+        self._ntotal += xb.shape[0]
+
+    def _ensure_xb(self) -> np.ndarray:
+        if self._xb_final is not None:
+            return self._xb_final
+        if self._xb_ref is not None and not self._xb_chunks:
+            self._xb_final = self._xb_ref
+            return self._xb_final
+        if self._xb_ref is None and not self._xb_chunks:
+            raise RuntimeError("No vectors added")
+        if self._xb_ref is None:
+            self._xb_final = np.vstack(self._xb_chunks)
+        else:
+            self._xb_final = np.vstack([self._xb_ref] + self._xb_chunks)
+        self._xb_chunks.clear()
+        self._xb_ref = None
+        return self._xb_final
+
+    def _rerank_exact(self, xq: np.ndarray, candI: np.ndarray, k: int) -> Tuple[np.ndarray, np.ndarray]:
+        xb = self._ensure_xb()
+
+        nq, k2 = candI.shape
+        D_out = np.empty((nq, k), dtype=np.float32)
+        I_out = np.empty((nq, k), dtype=np.int64)
+
+        bs = int(max(1, self.rerank_batch_size))
+        dim = self.dim
+
+        for i0 in range(0, nq, bs):
+            i1 = min(nq, i0 + bs)
+            q = xq[i0:i1]
+            idx = candI[i0:i1].astype(np.int64, copy=False)
+
+            valid = idx >= 0
+            idx_safe = np.where(valid, idx, 0)
+
+            flat = idx_safe.reshape(-1)
+            vecs = xb[flat].reshape(i1 - i0, k2, dim)
+
+            qnorm = np.sum(q * q, axis=1, dtype=np.float32)[:, None]
+            xnorm = np.sum(vecs * vecs, axis=2, dtype=np.float32)
+            dot = np.sum(vecs * q[:, None, :], axis=2, dtype=np.float32)
+            dist = qnorm + xnorm - (2.0 * dot)
+
+            if not np.all(valid):
+                dist = np.where(valid, dist, np.float32(np.inf))
+
+            if k == 1:
+                j = np.argmin(dist, axis=1)
+                I_out[i0:i1, 0] = idx[np.arange(i1 - i0), j]
+                D_out[i0:i1, 0] = dist[np.arange(i1 - i0), j].astype(np.float32, copy=False)
             else:
-                idx = rs.choice(n, size=n_train, replace=False)
-                train_x = xb[idx]
-            self.index.train(train_x)
-            self._trained = True
-            self.index.nprobe = min(self.nprobe, self.nlist)
+                part = np.argpartition(dist, kth=k - 1, axis=1)[:, :k]
+                part_dist = np.take_along_axis(dist, part, axis=1)
+                order = np.argsort(part_dist, axis=1)
+                top = np.take_along_axis(part, order, axis=1)
+                top_dist = np.take_along_axis(dist, top, axis=1)
 
-        self.index.add(xb)
-        self._ntotal_added += int(xb.shape[0])
+                I_out[i0:i1] = np.take_along_axis(idx, top, axis=1)
+                D_out[i0:i1] = top_dist.astype(np.float32, copy=False)
+
+        bad = I_out < 0
+        if np.any(bad):
+            I_out[bad] = 0
+            D_out[bad] = np.float32(np.inf)
+
+        return D_out, I_out
 
     def search(self, xq: np.ndarray, k: int) -> Tuple[np.ndarray, np.ndarray]:
         k = int(k)
         if k <= 0:
-            raise ValueError("k must be positive")
+            raise ValueError("k must be >= 1")
 
-        xq = np.asarray(xq, dtype=np.float32)
+        xq = np.asarray(xq, dtype=np.float32, order="C")
         if xq.ndim != 2 or xq.shape[1] != self.dim:
             raise ValueError(f"xq must have shape (nq, {self.dim})")
-        nq = int(xq.shape[0])
-        xq = np.ascontiguousarray(xq)
-
-        if nq == 0:
-            return np.empty((0, k), dtype=np.float32), np.empty((0, k), dtype=np.int64)
 
         if faiss is None:
-            if self._xb is None or self._xb.shape[0] == 0:
-                D = np.full((nq, k), np.inf, dtype=np.float32)
-                I = np.full((nq, k), -1, dtype=np.int64)
-                return D, I
-            xb = self._xb
-            xq_norm = (xq * xq).sum(axis=1, keepdims=True)
-            xb_norm = (xb * xb).sum(axis=1, keepdims=True).T
-            d2 = xq_norm + xb_norm - 2.0 * (xq @ xb.T)
-            idx = np.argpartition(d2, kth=min(k - 1, d2.shape[1] - 1), axis=1)[:, :k]
-            row = np.arange(nq)[:, None]
-            dd = d2[row, idx]
-            ord_ = np.argsort(dd, axis=1)
-            I = idx[row, ord_].astype(np.int64, copy=False)
-            D = dd[row, ord_].astype(np.float32, copy=False)
+            xb = self._ensure_xb()
+            qnorm = np.sum(xq * xq, axis=1, dtype=np.float32)[:, None]
+            xnorm = np.sum(xb * xb, axis=1, dtype=np.float32)[None, :]
+            dots = xq @ xb.T
+            dist = qnorm + xnorm - 2.0 * dots.astype(np.float32, copy=False)
+
+            idx = np.argpartition(dist, kth=k - 1, axis=1)[:, :k]
+            part_dist = np.take_along_axis(dist, idx, axis=1)
+            order = np.argsort(part_dist, axis=1)
+            I = np.take_along_axis(idx, order, axis=1).astype(np.int64, copy=False)
+            D = np.take_along_axis(dist, I, axis=1).astype(np.float32, copy=False)
             return D, I
 
-        if not self._trained or self.index.ntotal == 0:
-            D = np.full((nq, k), np.inf, dtype=np.float32)
-            I = np.full((nq, k), -1, dtype=np.int64)
-            return D, I
+        faiss.omp_set_num_threads(self.threads)
 
-        self.index.nprobe = min(self.nprobe, self.nlist)
-        D, I = self.index.search(xq, k)
-        if D.dtype != np.float32:
-            D = D.astype(np.float32, copy=False)
-        if I.dtype != np.int64:
-            I = I.astype(np.int64, copy=False)
-        return D, I
+        if not self.rerank:
+            self.index.hnsw.efSearch = max(self.ef_search, k)
+            D, I = self.index.search(xq, k)
+            return D.astype(np.float32, copy=False), I.astype(np.int64, copy=False)
+
+        k2 = max(k, int(self.rerank_k))
+        self.index.hnsw.efSearch = max(self.ef_search, k2)
+        _, candI = self.index.search(xq, k2)
+        candI = candI.astype(np.int64, copy=False)
+
+        return self._rerank_exact(xq, candI, k)

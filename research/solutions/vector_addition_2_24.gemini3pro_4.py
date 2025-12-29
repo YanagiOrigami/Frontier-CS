@@ -1,4 +1,6 @@
-import typing
+import torch
+import triton
+import triton.language as tl
 
 class Solution:
     def solve(self, spec_path: str = None) -> dict:
@@ -6,54 +8,50 @@ class Solution:
 import triton
 import triton.language as tl
 
-@triton.autotune(
-    configs=[
-        triton.Config({'BLOCK_SIZE': 1024}, num_warps=4),
-        triton.Config({'BLOCK_SIZE': 1024}, num_warps=8),
-        triton.Config({'BLOCK_SIZE': 2048}, num_warps=4),
-        triton.Config({'BLOCK_SIZE': 2048}, num_warps=8),
-        triton.Config({'BLOCK_SIZE': 4096}, num_warps=8),
-    ],
-    key=['n_elements'],
-)
 @triton.jit
 def add_kernel(x_ptr, y_ptr, output_ptr, n_elements, BLOCK_SIZE: tl.constexpr):
+    # Determine the starting index of the block
     pid = tl.program_id(axis=0)
     block_start = pid * BLOCK_SIZE
+    
+    # Generate offsets for the threads in the block
     offsets = block_start + tl.arange(0, BLOCK_SIZE)
+    
+    # Create a mask to prevent out-of-bounds access
     mask = offsets < n_elements
     
-    # Load inputs
-    # Triton handles vectorization automatically for contiguous loads
+    # Load data from x and y with masking
+    # Triton handles vectorized loads automatically for contiguous data
     x = tl.load(x_ptr + offsets, mask=mask)
     y = tl.load(y_ptr + offsets, mask=mask)
     
-    # Compute
+    # Perform element-wise addition
     output = x + y
     
-    # Store output
+    # Store the result to the output pointer
     tl.store(output_ptr + offsets, output, mask=mask)
 
 def add(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
-    """
-    Element-wise addition of two vectors using Triton.
-    
-    Args:
-        x: Input tensor of shape (16777216,)
-        y: Input tensor of shape (16777216,)
-    
-    Returns:
-        Output tensor of shape (16777216,) with x + y
-    """
-    # Pre-allocate output tensor
+    # Ensure inputs are contiguous for maximum memory bandwidth
+    if not x.is_contiguous():
+        x = x.contiguous()
+    if not y.is_contiguous():
+        y = y.contiguous()
+        
     output = torch.empty_like(x)
-    n_elements = output.numel()
+    n_elements = x.numel()
     
-    # Launch kernel with 1D grid
-    # Grid size is calculated dynamically based on the autotuned BLOCK_SIZE
+    # Block size of 1024 is generally optimal for element-wise operations on modern GPUs
+    # to saturate occupancy and memory bandwidth.
+    BLOCK_SIZE = 1024
+    
+    # Grid size calculation
     grid = lambda meta: ((n_elements + meta['BLOCK_SIZE'] - 1) // meta['BLOCK_SIZE'],)
     
-    add_kernel[grid](x, y, output, n_elements)
+    # Launch the kernel
+    # num_warps=4 is standard; increasing to 8 can sometimes help hide latency 
+    # but 4 is usually sufficient for simple bandwidth-bound kernels.
+    add_kernel[grid](x, y, output, n_elements, BLOCK_SIZE=BLOCK_SIZE)
     
     return output
 """

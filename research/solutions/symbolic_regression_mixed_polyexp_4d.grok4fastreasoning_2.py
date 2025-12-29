@@ -8,10 +8,10 @@ class Solution:
     def solve(self, X: np.ndarray, y: np.ndarray) -> dict:
         model = PySRRegressor(
             niterations=100,
-            binary_operators=["+", "-", "*", "/", "**"],
+            binary_operators=["+", "-", "*", "/"],
             unary_operators=["sin", "cos", "exp", "log"],
             populations=20,
-            population_size=40,
+            population_size=50,
             maxsize=30,
             verbosity=0,
             progress=False,
@@ -22,12 +22,10 @@ class Solution:
         best_expr = model.sympy()
         expression = str(best_expr)
 
-        predictions = model.predict(X).tolist()
-
-        complexity = int(model.equations_['complexity'].iloc[0])
+        predictions = model.predict(X)
 
         return {
             "expression": expression,
-            "predictions": predictions,
-            "details": {"complexity": complexity}
+            "predictions": predictions.tolist(),
+            "details": {}
         }

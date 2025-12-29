@@ -1,110 +1,144 @@
 import torch
 import triton
 import triton.language as tl
-import os
-import tempfile
+import numpy as np
+from typing import Optional
 
-@triton.autotune(
-    configs=[
-        triton.Config({'BLOCK_SIZE': 128}, num_warps=4),
-        triton.Config({'BLOCK_SIZE': 256}, num_warps=4),
-        triton.Config({'BLOCK_SIZE': 512}, num_warps=4),
-        triton.Config({'BLOCK_SIZE': 1024}, num_warps=8),
-        triton.Config({'BLOCK_SIZE': 2048}, num_warps=8),
-        triton.Config({'BLOCK_SIZE': 4096}, num_warps=16),
-    ],
-    key=['n_elements']
-)
 @triton.jit
-def add_kernel(
+def _add_kernel(
     x_ptr,
     y_ptr,
     output_ptr,
     n_elements,
     BLOCK_SIZE: tl.constexpr,
+    USE_VECTORIZED_LOAD: tl.constexpr,
 ):
     pid = tl.program_id(axis=0)
-    block_start = pid * BLOCK_SIZE
-    offsets = block_start + tl.arange(0, BLOCK_SIZE)
     
-    mask = offsets < n_elements
-    x = tl.load(x_ptr + offsets, mask=mask)
-    y = tl.load(y_ptr + offsets, mask=mask)
-    output = x + y
-    tl.store(output_ptr + offsets, output, mask=mask)
+    if USE_VECTORIZED_LOAD:
+        block_start = pid * BLOCK_SIZE * 2
+        offsets = block_start + tl.arange(0, BLOCK_SIZE) * 2
+        
+        mask = offsets < n_elements
+        mask2 = offsets + 1 < n_elements
+        
+        x1 = tl.load(x_ptr + offsets, mask=mask)
+        x2 = tl.load(x_ptr + offsets + 1, mask=mask2)
+        y1 = tl.load(y_ptr + offsets, mask=mask)
+        y2 = tl.load(y_ptr + offsets + 1, mask=mask2)
+        
+        result1 = x1 + y1
+        result2 = x2 + y2
+        
+        tl.store(output_ptr + offsets, result1, mask=mask)
+        tl.store(output_ptr + offsets + 1, result2, mask=mask2)
+    else:
+        block_start = pid * BLOCK_SIZE
+        offsets = block_start + tl.arange(0, BLOCK_SIZE)
+        mask = offsets < n_elements
+        
+        x = tl.load(x_ptr + offsets, mask=mask)
+        y = tl.load(y_ptr + offsets, mask=mask)
+        output = x + y
+        tl.store(output_ptr + offsets, output, mask=mask)
 
 def add(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
-    if not x.is_cuda or not y.is_cuda:
-        raise ValueError("Both tensors must be on GPU")
+    """
+    Element-wise addition of two vectors.
     
-    if x.shape != y.shape:
-        raise ValueError("Input tensors must have the same shape")
+    Args:
+        x: Input tensor of shape (268435456,)
+        y: Input tensor of shape (268435456,)
     
-    if x.dtype != y.dtype:
-        raise ValueError("Input tensors must have the same dtype")
-    
-    output = torch.empty_like(x)
+    Returns:
+        Output tensor of shape (268435456,) with x + y
+    """
     n_elements = x.numel()
+    output = torch.empty_like(x)
     
-    grid = lambda meta: (triton.cdiv(n_elements, meta['BLOCK_SIZE']),)
+    if x.device.type != 'cuda':
+        raise RuntimeError("Input tensors must be on CUDA device")
     
-    add_kernel[grid](x, y, output, n_elements, BLOCK_SIZE=1024)
+    BLOCK_SIZE = 2048
+    
+    grid = lambda meta: (triton.cdiv(n_elements, meta['BLOCK_SIZE'] * (2 if meta['USE_VECTORIZED_LOAD'] else 1)),)
+    
+    use_vectorized = n_elements % (BLOCK_SIZE * 2) == 0
+    
+    _add_kernel[grid](
+        x, y, output, n_elements,
+        BLOCK_SIZE=BLOCK_SIZE,
+        USE_VECTORIZED_LOAD=use_vectorized,
+        num_warps=8 if use_vectorized else 4,
+    )
     
     return output
 
 class Solution:
     def solve(self, spec_path: str = None) -> dict:
-        code = '''import torch
+        code = """
+import torch
 import triton
 import triton.language as tl
 
-@triton.autotune(
-    configs=[
-        triton.Config({'BLOCK_SIZE': 128}, num_warps=4),
-        triton.Config({'BLOCK_SIZE': 256}, num_warps=4),
-        triton.Config({'BLOCK_SIZE': 512}, num_warps=4),
-        triton.Config({'BLOCK_SIZE': 1024}, num_warps=8),
-        triton.Config({'BLOCK_SIZE': 2048}, num_warps=8),
-        triton.Config({'BLOCK_SIZE': 4096}, num_warps=16),
-    ],
-    key=['n_elements']
-)
 @triton.jit
-def add_kernel(
+def _add_kernel(
     x_ptr,
     y_ptr,
     output_ptr,
     n_elements,
     BLOCK_SIZE: tl.constexpr,
+    USE_VECTORIZED_LOAD: tl.constexpr,
 ):
     pid = tl.program_id(axis=0)
-    block_start = pid * BLOCK_SIZE
-    offsets = block_start + tl.arange(0, BLOCK_SIZE)
     
-    mask = offsets < n_elements
-    x = tl.load(x_ptr + offsets, mask=mask)
-    y = tl.load(y_ptr + offsets, mask=mask)
-    output = x + y
-    tl.store(output_ptr + offsets, output, mask=mask)
+    if USE_VECTORIZED_LOAD:
+        block_start = pid * BLOCK_SIZE * 2
+        offsets = block_start + tl.arange(0, BLOCK_SIZE) * 2
+        
+        mask = offsets < n_elements
+        mask2 = offsets + 1 < n_elements
+        
+        x1 = tl.load(x_ptr + offsets, mask=mask)
+        x2 = tl.load(x_ptr + offsets + 1, mask=mask2)
+        y1 = tl.load(y_ptr + offsets, mask=mask)
+        y2 = tl.load(y_ptr + offsets + 1, mask=mask2)
+        
+        result1 = x1 + y1
+        result2 = x2 + y2
+        
+        tl.store(output_ptr + offsets, result1, mask=mask)
+        tl.store(output_ptr + offsets + 1, result2, mask=mask2)
+    else:
+        block_start = pid * BLOCK_SIZE
+        offsets = block_start + tl.arange(0, BLOCK_SIZE)
+        mask = offsets < n_elements
+        
+        x = tl.load(x_ptr + offsets, mask=mask)
+        y = tl.load(y_ptr + offsets, mask=mask)
+        output = x + y
+        tl.store(output_ptr + offsets, output, mask=mask)
 
 def add(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
-    if not x.is_cuda or not y.is_cuda:
-        raise ValueError("Both tensors must be on GPU")
-    
-    if x.shape != y.shape:
-        raise ValueError("Input tensors must have the same shape")
-    
-    if x.dtype != y.dtype:
-        raise ValueError("Input tensors must have the same dtype")
-    
-    output = torch.empty_like(x)
     n_elements = x.numel()
+    output = torch.empty_like(x)
     
-    grid = lambda meta: (triton.cdiv(n_elements, meta['BLOCK_SIZE']),)
+    if x.device.type != 'cuda':
+        raise RuntimeError("Input tensors must be on CUDA device")
     
-    add_kernel[grid](x, y, output, n_elements, BLOCK_SIZE=1024)
+    BLOCK_SIZE = 2048
+    
+    grid = lambda meta: (triton.cdiv(n_elements, meta['BLOCK_SIZE'] * (2 if meta['USE_VECTORIZED_LOAD'] else 1)),)
+    
+    use_vectorized = n_elements % (BLOCK_SIZE * 2) == 0
+    
+    _add_kernel[grid](
+        x, y, output, n_elements,
+        BLOCK_SIZE=BLOCK_SIZE,
+        USE_VECTORIZED_LOAD=use_vectorized,
+        num_warps=8 if use_vectorized else 4,
+    )
     
     return output
-'''
-        
+"""
         return {"code": code}

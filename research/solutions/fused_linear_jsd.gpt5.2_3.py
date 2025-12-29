@@ -1,173 +1,184 @@
+import os
 import textwrap
 
 
-class Solution:
-    def solve(self, spec_path: str = None) -> dict:
-        code = r'''
+KERNEL_CODE = r"""
 import math
 import torch
 import triton
 import triton.language as tl
 
-_LOG2 = 0.6931471805599453
-_EPS = 1.0e-20
+__all__ = ["fused_linear_jsd"]
 
 _WCAT_CACHE = {}
-_WCAT_CACHE_ORDER = []
-_WCAT_CACHE_MAX = 4
+_BCAT_CACHE = {}
 
-
-def _cache_get_wcat(W1: torch.Tensor, W2: torch.Tensor) -> torch.Tensor:
-    global _WCAT_CACHE, _WCAT_CACHE_ORDER
-    key = (W1.data_ptr(), W2.data_ptr(), W1.shape, W2.shape, W1.stride(), W2.stride(), W1.dtype, W2.dtype, W1.device)
-    wcat = _WCAT_CACHE.get(key, None)
-    if wcat is not None and wcat.is_cuda and wcat.dtype == torch.float16 and wcat.shape == (W1.shape[0], W1.shape[1] * 2):
-        return wcat
-    K, N = W1.shape
-    wcat = torch.empty((K, 2 * N), device=W1.device, dtype=torch.float16)
-    wcat[:, :N].copy_(W1)
-    wcat[:, N:].copy_(W2)
-    _WCAT_CACHE[key] = wcat
-    _WCAT_CACHE_ORDER.append(key)
-    if len(_WCAT_CACHE_ORDER) > _WCAT_CACHE_MAX:
-        old = _WCAT_CACHE_ORDER.pop(0)
-        _WCAT_CACHE.pop(old, None)
-    return wcat
-
-
-@triton.autotune(
-    configs=[
-        triton.Config({"BLOCK_N": 256}, num_warps=4, num_stages=2),
-        triton.Config({"BLOCK_N": 512}, num_warps=8, num_stages=2),
-        triton.Config({"BLOCK_N": 1024}, num_warps=8, num_stages=2),
-    ],
-    key=["N"],
-)
 @triton.jit
 def _jsd_from_logits_cat_kernel(
-    logits_ptr,  # fp16 [M, 2N]
-    b1_ptr,      # fp32 [N]
-    b2_ptr,      # fp32 [N]
-    out_ptr,     # fp32 [M]
-    stride_lm,
+    LOGITS_CAT_PTR,  # *fp16, [M, 2N]
+    BCAT_PTR,        # *fp32, [2N]
+    OUT_PTR,         # *fp32, [M]
+    STRIDE_LM: tl.constexpr,  # in elements
     N: tl.constexpr,
     BLOCK_N: tl.constexpr,
 ):
     pid_m = tl.program_id(0)
-    row_off = pid_m * stride_lm
-    row_ptr = logits_ptr + row_off
 
-    offs = tl.arange(0, BLOCK_N)
+    tl.multiple_of(STRIDE_LM, 8)
 
-    m1 = tl.full((), -1.0e20, tl.float32)
-    s1 = tl.zeros((), tl.float32)
-    m2 = tl.full((), -1.0e20, tl.float32)
-    s2 = tl.zeros((), tl.float32)
+    row_ptr = LOGITS_CAT_PTR + pid_m * STRIDE_LM
 
-    for n0 in tl.static_range(0, N, BLOCK_N):
-        cols = n0 + offs
-        mask = cols < N
+    m1 = tl.full([], -float("inf"), tl.float32)
+    s1 = tl.zeros([], dtype=tl.float32)
+    m2 = tl.full([], -float("inf"), tl.float32)
+    s2 = tl.zeros([], dtype=tl.float32)
 
-        l1 = tl.load(row_ptr + cols, mask=mask, other=-1.0e20).to(tl.float32)
-        l2 = tl.load(row_ptr + N + cols, mask=mask, other=-1.0e20).to(tl.float32)
-        b1 = tl.load(b1_ptr + cols, mask=mask, other=0.0).to(tl.float32)
-        b2 = tl.load(b2_ptr + cols, mask=mask, other=0.0).to(tl.float32)
+    offs0 = tl.arange(0, BLOCK_N)
 
-        x1 = l1 + b1
-        x2 = l2 + b2
+    for start_n in tl.static_range(0, N, BLOCK_N):
+        offs = start_n + offs0
+        mask = offs < N
 
-        block_max1 = tl.max(x1, axis=0)
-        m1_new = tl.maximum(m1, block_max1)
-        s1 = s1 * tl.exp(m1 - m1_new) + tl.sum(tl.exp(x1 - m1_new), axis=0)
-        m1 = m1_new
+        l1 = tl.load(row_ptr + offs, mask=mask, other=-float("inf")).to(tl.float32)
+        l2 = tl.load(row_ptr + (offs + N), mask=mask, other=-float("inf")).to(tl.float32)
 
-        block_max2 = tl.max(x2, axis=0)
-        m2_new = tl.maximum(m2, block_max2)
-        s2 = s2 * tl.exp(m2 - m2_new) + tl.sum(tl.exp(x2 - m2_new), axis=0)
-        m2 = m2_new
+        b1 = tl.load(BCAT_PTR + offs, mask=mask, other=0.0).to(tl.float32)
+        b2 = tl.load(BCAT_PTR + (offs + N), mask=mask, other=0.0).to(tl.float32)
 
-    s1 = tl.maximum(s1, _EPS)
-    s2 = tl.maximum(s2, _EPS)
-    lse1 = tl.log(s1) + m1
-    lse2 = tl.log(s2) + m2
+        a = l1 + b1
+        b = l2 + b2
 
-    acc = tl.zeros((), tl.float32)
+        block_m1 = tl.max(a, axis=0)
+        block_m2 = tl.max(b, axis=0)
 
-    for n0 in tl.static_range(0, N, BLOCK_N):
-        cols = n0 + offs
-        mask = cols < N
+        exp1 = tl.exp(a - block_m1)
+        exp2 = tl.exp(b - block_m2)
 
-        l1 = tl.load(row_ptr + cols, mask=mask, other=-1.0e20).to(tl.float32)
-        l2 = tl.load(row_ptr + N + cols, mask=mask, other=-1.0e20).to(tl.float32)
-        b1 = tl.load(b1_ptr + cols, mask=mask, other=0.0).to(tl.float32)
-        b2 = tl.load(b2_ptr + cols, mask=mask, other=0.0).to(tl.float32)
+        block_s1 = tl.sum(exp1, axis=0)
+        block_s2 = tl.sum(exp2, axis=0)
 
-        x1 = l1 + b1
-        x2 = l2 + b2
+        new_m1 = tl.maximum(m1, block_m1)
+        new_m2 = tl.maximum(m2, block_m2)
 
-        logp = x1 - lse1
-        logq = x2 - lse2
+        s1 = s1 * tl.exp(m1 - new_m1) + block_s1 * tl.exp(block_m1 - new_m1)
+        s2 = s2 * tl.exp(m2 - new_m2) + block_s2 * tl.exp(block_m2 - new_m2)
+
+        m1 = new_m1
+        m2 = new_m2
+
+    logZ1 = m1 + tl.log(s1)
+    logZ2 = m2 + tl.log(s2)
+
+    acc = tl.zeros([], dtype=tl.float32)
+    LOG2 = 0.6931471805599453
+    EPS = 1e-20
+
+    for start_n in tl.static_range(0, N, BLOCK_N):
+        offs = start_n + offs0
+        mask = offs < N
+
+        l1 = tl.load(row_ptr + offs, mask=mask, other=-float("inf")).to(tl.float32)
+        l2 = tl.load(row_ptr + (offs + N), mask=mask, other=-float("inf")).to(tl.float32)
+
+        b1 = tl.load(BCAT_PTR + offs, mask=mask, other=0.0).to(tl.float32)
+        b2 = tl.load(BCAT_PTR + (offs + N), mask=mask, other=0.0).to(tl.float32)
+
+        a = l1 + b1
+        b = l2 + b2
+
+        logp = a - logZ1
+        logq = b - logZ2
 
         p = tl.exp(logp)
         q = tl.exp(logq)
 
-        pq = tl.maximum(p + q, _EPS)
-        logm = tl.log(pq) - _LOG2
+        pq = p + q
+        pq = tl.maximum(pq, EPS)
+        logm = tl.log(pq) - LOG2
 
-        term = p * (logp - logm) + q * (logq - logm)
+        term = 0.5 * (p * (logp - logm) + q * (logq - logm))
+        term = tl.where(mask, term, 0.0)
         acc += tl.sum(term, axis=0)
 
-    out = 0.5 * acc
-    tl.store(out_ptr + pid_m, out)
+    acc = tl.maximum(acc, 0.0)
+    tl.store(OUT_PTR + pid_m, acc)
 
 
-@torch.no_grad()
-def fused_linear_jsd(X: torch.Tensor, W1: torch.Tensor, B1: torch.Tensor, W2: torch.Tensor, B2: torch.Tensor) -> torch.Tensor:
-    if not (X.is_cuda and W1.is_cuda and W2.is_cuda and B1.is_cuda and B2.is_cuda):
-        logits1 = X @ W1
-        logits2 = X @ W2
-        logits1 = logits1 + B1
-        logits2 = logits2 + B2
-        p = torch.softmax(logits1.float(), dim=-1)
-        q = torch.softmax(logits2.float(), dim=-1)
-        m = 0.5 * (p + q)
-        jsd = 0.5 * (torch.sum(p * (torch.log(p + 1e-20) - torch.log(m + 1e-20)), dim=-1) +
-                     torch.sum(q * (torch.log(q + 1e-20) - torch.log(m + 1e-20)), dim=-1))
-        return jsd.float()
+def _get_wcat(W1: torch.Tensor, W2: torch.Tensor) -> torch.Tensor:
+    key = (int(W1.data_ptr()), int(W2.data_ptr()), int(W1.shape[0]), int(W1.shape[1]))
+    out = _WCAT_CACHE.get(key, None)
+    if out is None or (not out.is_cuda) or out.dtype != torch.float16:
+        out = torch.cat((W1, W2), dim=1).contiguous()
+        _WCAT_CACHE[key] = out
+    return out
 
-    if X.dtype != torch.float16:
-        X = X.to(torch.float16)
-    if W1.dtype != torch.float16:
-        W1 = W1.to(torch.float16)
-    if W2.dtype != torch.float16:
-        W2 = W2.to(torch.float16)
-    if B1.dtype != torch.float32:
-        B1 = B1.to(torch.float32)
-    if B2.dtype != torch.float32:
-        B2 = B2.to(torch.float32)
 
-    X = X.contiguous()
-    W1 = W1.contiguous()
-    W2 = W2.contiguous()
-    B1 = B1.contiguous()
-    B2 = B2.contiguous()
+def _get_bcat(B1: torch.Tensor, B2: torch.Tensor) -> torch.Tensor:
+    key = (int(B1.data_ptr()), int(B2.data_ptr()), int(B1.shape[0]))
+    out = _BCAT_CACHE.get(key, None)
+    if out is None or (not out.is_cuda) or out.dtype != torch.float32:
+        out = torch.cat((B1, B2), dim=0).contiguous()
+        _BCAT_CACHE[key] = out
+    return out
+
+
+def fused_linear_jsd(
+    X: torch.Tensor,
+    W1: torch.Tensor,
+    B1: torch.Tensor,
+    W2: torch.Tensor,
+    B2: torch.Tensor,
+) -> torch.Tensor:
+    assert X.is_cuda and W1.is_cuda and W2.is_cuda and B1.is_cuda and B2.is_cuda
+    assert X.dtype == torch.float16 and W1.dtype == torch.float16 and W2.dtype == torch.float16
+    assert B1.dtype == torch.float32 and B2.dtype == torch.float32
+    assert X.ndim == 2 and W1.ndim == 2 and W2.ndim == 2 and B1.ndim == 1 and B2.ndim == 1
 
     M, K = X.shape
     K1, N = W1.shape
-    if K1 != K or W2.shape != (K, N) or B1.numel() != N or B2.numel() != N:
-        raise ValueError("Shape mismatch")
+    K2, N2 = W2.shape
+    assert K1 == K and K2 == K and N2 == N
+    assert B1.shape[0] == N and B2.shape[0] == N
 
-    wcat = _cache_get_wcat(W1, W2)
-    logits_cat = (X @ wcat).contiguous()  # fp16 [M, 2N]
+    if not X.is_contiguous():
+        X = X.contiguous()
+
+    Wcat = _get_wcat(W1, W2)
+    Bcat = _get_bcat(B1, B2)
+
+    logits_cat = torch.matmul(X, Wcat)
+    if not logits_cat.is_contiguous():
+        logits_cat = logits_cat.contiguous()
 
     out = torch.empty((M,), device=X.device, dtype=torch.float32)
 
+    if N >= 4096 and (N % 512 == 0):
+        BLOCK_N = 512
+        num_warps = 8
+    elif N % 256 == 0:
+        BLOCK_N = 256
+        num_warps = 8
+    else:
+        BLOCK_N = 128
+        num_warps = 4
+
+    stride_lm = logits_cat.stride(0)
+
     grid = (M,)
     _jsd_from_logits_cat_kernel[grid](
-        logits_cat, B1, B2, out,
-        stride_lm=logits_cat.stride(0),
+        logits_cat,
+        Bcat,
+        out,
+        STRIDE_LM=stride_lm,
         N=N,
+        BLOCK_N=BLOCK_N,
+        num_warps=num_warps,
+        num_stages=2,
     )
     return out
-'''
-        return {"code": textwrap.dedent(code).lstrip()}
+"""
+
+
+class Solution:
+    def solve(self, spec_path: str = None) -> dict:
+        return {"code": textwrap.dedent(KERNEL_CODE)}

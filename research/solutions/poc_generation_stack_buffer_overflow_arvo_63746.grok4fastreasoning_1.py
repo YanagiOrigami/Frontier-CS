@@ -1,3 +1,3 @@
 class Solution:
     def solve(self, src_path: str) -> bytes:
-        return b"1.1.1.1/" + b"A" * 48
+        return b"1.2.3.4 AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"

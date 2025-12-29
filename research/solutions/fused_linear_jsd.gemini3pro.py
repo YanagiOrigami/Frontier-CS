@@ -1,235 +1,239 @@
 import torch
 import triton
 import triton.language as tl
+import math
 import os
 
-class Solution:
-    def solve(self, spec_path: str = None) -> dict:
-        return {"program_path": os.path.abspath(__file__)}
-
-@triton.autotune(
-    configs=[
-        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 64, 'BLOCK_K': 64, 'GROUP_SIZE_M': 8}, num_stages=3, num_warps=8),
-        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 64, 'BLOCK_K': 32, 'GROUP_SIZE_M': 8}, num_stages=3, num_warps=8),
-        triton.Config({'BLOCK_M': 32, 'BLOCK_N': 128, 'BLOCK_K': 32, 'GROUP_SIZE_M': 8}, num_stages=3, num_warps=4),
-        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 32, 'BLOCK_K': 64, 'GROUP_SIZE_M': 8}, num_stages=4, num_warps=4),
-    ],
-    key=['M', 'N', 'K'],
-)
 @triton.jit
-def _fused_jsd_kernel(
+def gemm_stats_kernel(
     X_ptr, W1_ptr, B1_ptr, W2_ptr, B2_ptr,
-    Logits_ptr, Out_ptr,
-    M, K, N,
+    L1_ptr, L2_ptr, Stats_ptr,
+    M, N, K,
     stride_xm, stride_xk,
     stride_w1k, stride_w1n,
     stride_w2k, stride_w2n,
-    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr, GROUP_SIZE_M: tl.constexpr
+    stride_l1m, stride_l1n,
+    stride_l2m, stride_l2n,
+    stride_stats_m, stride_stats_n,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+    GROUP_SIZE_M: tl.constexpr
 ):
-    pid = tl.program_id(0)
+    pid = tl.program_id(axis=0)
     num_pid_m = tl.cdiv(M, BLOCK_M)
     num_pid_n = tl.cdiv(N, BLOCK_N)
-    
-    # Swizzle grid to improve L2 cache locality for W
-    pid_m, pid_n = tl.swizzle2d(pid, 1, num_pid_m, 1, GROUP_SIZE_M)
-    # Actually we only parallelize over M. The inner loops handle N and K.
-    # So pid corresponds to a block of M.
-    # The swizzle logic in triton tutorial assumes 2D grid. 
-    # Here we launch 1D grid over M.
-    # We can still apply swizzling if we want, but simple linear PID is safer for reductions within kernel.
-    # Let's revert to simple 1D grid logic.
-    pid_m = pid
-    
-    if pid_m >= num_pid_m:
-        return
+    num_pid_in_group = GROUP_SIZE_M * num_pid_n
+    group_id = pid // num_pid_in_group
+    first_pid_m = group_id * GROUP_SIZE_M
+    group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
+    pid_m = first_pid_m + (pid % group_size_m)
+    pid_n = (pid % num_pid_in_group) // group_size_m
 
     offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
-    mask_m = offs_m < M
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_k = tl.arange(0, BLOCK_K)
 
-    # Pointers to X
-    x_ptrs = X_ptr + (offs_m[:, None] * stride_xm + tl.arange(0, BLOCK_K)[None, :] * stride_xk)
+    x_ptrs = X_ptr + (offs_m[:, None] * stride_xm + offs_k[None, :] * stride_xk)
+    w1_ptrs = W1_ptr + (offs_k[:, None] * stride_w1k + offs_n[None, :] * stride_w1n)
+    w2_ptrs = W2_ptr + (offs_k[:, None] * stride_w2k + offs_n[None, :] * stride_w2n)
 
-    # Initialize stats for Softmax
-    m1 = tl.zeros((BLOCK_M,), dtype=tl.float32) - float('inf')
-    s1 = tl.zeros((BLOCK_M,), dtype=tl.float32)
-    m2 = tl.zeros((BLOCK_M,), dtype=tl.float32) - float('inf')
-    s2 = tl.zeros((BLOCK_M,), dtype=tl.float32)
+    acc1 = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    acc2 = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
 
-    # Pointers for Logits (Temporary Global Memory)
-    # Shape (M, 2, N)
-    logits_base_ptr = Logits_ptr + (offs_m * 2 * N)
+    for k in range(0, tl.cdiv(K, BLOCK_K)):
+        x = tl.load(x_ptrs, mask=offs_k[None, :] < K - k * BLOCK_K, other=0.0)
+        w1 = tl.load(w1_ptrs, mask=offs_k[:, None] < K - k * BLOCK_K, other=0.0)
+        w2 = tl.load(w2_ptrs, mask=offs_k[:, None] < K - k * BLOCK_K, other=0.0)
+        
+        acc1 += tl.dot(x, w1)
+        acc2 += tl.dot(x, w2)
 
-    # -----------------------------------------------------------
-    # Pass 1: Compute Logits, Store them, Update Max/SumExp
-    # -----------------------------------------------------------
-    for start_n in range(0, N, BLOCK_N):
-        offs_n = start_n + tl.arange(0, BLOCK_N)
-        mask_n = offs_n < N
-        
-        # Initialize accumulators with bias
-        # Load Bias: shape (N,). Broadcast to (BLOCK_M, BLOCK_N)
-        b1 = tl.load(B1_ptr + offs_n, mask=mask_n, other=0.0)
-        b2 = tl.load(B2_ptr + offs_n, mask=mask_n, other=0.0)
-        
-        acc1 = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32) + b1[None, :]
-        acc2 = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32) + b2[None, :]
-        
-        # Pointers for W tiles
-        w1_ptrs = W1_ptr + (tl.arange(0, BLOCK_K)[:, None] * stride_w1k + offs_n[None, :] * stride_w1n)
-        w2_ptrs = W2_ptr + (tl.arange(0, BLOCK_K)[:, None] * stride_w2k + offs_n[None, :] * stride_w2n)
-        
-        # Inner Loop over K
-        for start_k in range(0, K, BLOCK_K):
-            # Load X tile
-            # Careful with mask on X loads if K is not multiple of BLOCK_K
-            # But typically K=2048, BLOCK_K=64/32
-            k_mask = (start_k + tl.arange(0, BLOCK_K)) < K
-            x = tl.load(x_ptrs + start_k * stride_xk, mask=mask_m[:, None] & k_mask[None, :], other=0.0)
-            
-            # Load W tiles
-            w1 = tl.load(w1_ptrs + start_k * stride_w1k, mask=k_mask[:, None] & mask_n[None, :], other=0.0)
-            w2 = tl.load(w2_ptrs + start_k * stride_w2k, mask=k_mask[:, None] & mask_n[None, :], other=0.0)
-            
-            # MatMul
-            acc1 += tl.dot(x, w1)
-            acc2 += tl.dot(x, w2)
-        
-        # Store Logits to Global Temp
-        # Logits buffer layout: (M, 2, N) -> M*2*N
-        # We store L1 at offset 0*N, L2 at offset 1*N relative to row base
-        l1_ptrs = logits_base_ptr[:, None] + (0 * N + offs_n[None, :])
-        l2_ptrs = logits_base_ptr[:, None] + (1 * N + offs_n[None, :])
-        
-        # Masked store
-        tl.store(l1_ptrs, acc1, mask=mask_m[:, None] & mask_n[None, :])
-        tl.store(l2_ptrs, acc2, mask=mask_m[:, None] & mask_n[None, :])
-        
-        # Online Softmax Stats Update
-        # Row-wise max of current block
-        block_m1 = tl.max(acc1, axis=1)
-        block_m2 = tl.max(acc2, axis=1)
-        
-        # For masked out columns (padding), we should set them to -inf so they don't affect max?
-        # But we handle mask in load/store. `tl.max` over accumulator might include zeros if padding?
-        # acc1 was initialized with bias. If `mask_n` is false, we shouldn't care.
-        # To be safe, we can apply mask to acc before max?
-        # acc1 = tl.where(mask_n[None, :], acc1, -float('inf'))
-        # But expensive. Assuming N is multiple of BLOCK_N for simplicity or mask handled implicitly.
-        # Correct handling: `tl.max` doesn't support mask. 
-        # But we only care about valid `mask_m`. `mask_n` is mostly for load/store. 
-        # Standard benchmarks usually have N divisible. 
-        # If not, the padding should be -inf.
-        # Let's assume N is multiple or negligible impact.
-        # Actually, safe approach:
-        # acc1 = tl.where(mask_n[None, :], acc1, -float('inf'))
-        
-        # Update Global Stats 1
-        new_m1 = tl.maximum(m1, block_m1)
-        # exp terms
-        s1 = s1 * tl.exp(m1 - new_m1) + tl.sum(tl.exp(acc1 - new_m1[:, None]), axis=1)
-        m1 = new_m1
+        x_ptrs += BLOCK_K * stride_xk
+        w1_ptrs += BLOCK_K * stride_w1k
+        w2_ptrs += BLOCK_K * stride_w2k
 
-        # Update Global Stats 2
-        new_m2 = tl.maximum(m2, block_m2)
-        s2 = s2 * tl.exp(m2 - new_m2) + tl.sum(tl.exp(acc2 - new_m2[:, None]), axis=1)
-        m2 = new_m2
+    # Add bias
+    b1_ptrs = B1_ptr + offs_n
+    b2_ptrs = B2_ptr + offs_n
+    b1 = tl.load(b1_ptrs, mask=offs_n < N, other=0.0)
+    b2 = tl.load(b2_ptrs, mask=offs_n < N, other=0.0)
+    acc1 += b1[None, :]
+    acc2 += b2[None, :]
 
-    # -----------------------------------------------------------
-    # Compute Final Log Normalizers
-    # -----------------------------------------------------------
-    log_z1 = m1 + tl.log(s1)
-    log_z2 = m2 + tl.log(s2)
-
-    # -----------------------------------------------------------
-    # Pass 2: Compute JSD
-    # -----------------------------------------------------------
-    jsd_acc = tl.zeros((BLOCK_M,), dtype=tl.float32)
+    # Store logits
+    l1_ptrs = L1_ptr + (offs_m[:, None] * stride_l1m + offs_n[None, :] * stride_l1n)
+    l2_ptrs = L2_ptr + (offs_m[:, None] * stride_l2m + offs_n[None, :] * stride_l2n)
+    mask_m = offs_m[:, None] < M
+    mask_n = offs_n[None, :] < N
     
-    for start_n in range(0, N, BLOCK_N):
-        offs_n = start_n + tl.arange(0, BLOCK_N)
-        mask_n = offs_n < N
-        
-        # Load Logits back
-        l1_ptrs = logits_base_ptr[:, None] + (0 * N + offs_n[None, :])
-        l2_ptrs = logits_base_ptr[:, None] + (1 * N + offs_n[None, :])
-        
-        l1 = tl.load(l1_ptrs, mask=mask_m[:, None] & mask_n[None, :], other=0.0)
-        l2 = tl.load(l2_ptrs, mask=mask_m[:, None] & mask_n[None, :], other=0.0)
-        
-        # Probabilities
-        # p = exp(l1 - log_z1)
-        # We need to handle padding `mask_n` to avoid contributing to sum.
-        # We can mask `p` and `q`.
-        
-        log_p = l1 - log_z1[:, None]
-        log_q = l2 - log_z2[:, None]
-        
-        p = tl.exp(log_p)
-        q = tl.exp(log_q)
-        
-        # Mask out invalid columns
-        p = tl.where(mask_n[None, :], p, 0.0)
-        q = tl.where(mask_n[None, :], q, 0.0)
-        
-        # Mixture
-        m_mix = 0.5 * (p + q)
-        
-        # KL Terms: 0.5 * p * (log_p - log_m) + 0.5 * q * (log_q - log_m)
-        # log_m = log(m_mix)
-        # Avoid log(0) if p=q=0 (padding). 
-        # m_mix is 0 where padding. log(0) is -inf.
-        # 0 * -inf is NaN. 
-        # Add epsilon or mask?
-        # Safe: use `tl.where(m_mix > 0, ...)`
-        
-        # Or simpler: compute term, then mask result.
-        # term = 0.5 * (p * (log_p - tl.log(m_mix)) + q * (log_q - tl.log(m_mix)))
-        # This is safe ONLY if p, q, m_mix are > 0.
-        # exp outputs > 0.
-        # So valid elements are safe. Padding elements are 0.
-        # To avoid NaN on padding:
-        m_mix_safe = tl.where(mask_n[None, :], m_mix, 1.0) # Avoid log(0)
-        
-        log_m = tl.log(m_mix_safe)
-        
-        term = 0.5 * (p * (log_p - log_m) + q * (log_q - log_m))
-        
-        # Accumulate
-        jsd_acc += tl.sum(term, axis=1)
+    tl.store(l1_ptrs, acc1, mask=mask_m & mask_n)
+    tl.store(l2_ptrs, acc2, mask=mask_m & mask_n)
 
-    # Store result
-    tl.store(Out_ptr + offs_m, jsd_acc, mask=mask_m)
+    # Compute partial stats
+    # Mask out-of-bound values for max/sum calculation
+    acc1_masked = tl.where(mask_n, acc1, -float('inf'))
+    acc2_masked = tl.where(mask_n, acc2, -float('inf'))
+    
+    max1 = tl.max(acc1_masked, axis=1)
+    max2 = tl.max(acc2_masked, axis=1)
 
+    sum_exp1 = tl.sum(tl.exp(acc1_masked - max1[:, None]), axis=1)
+    sum_exp2 = tl.sum(tl.exp(acc2_masked - max2[:, None]), axis=1)
+
+    # Store stats: (M, num_n_tiles, 4)
+    # Stride stats_n = 4.
+    stats_offset = offs_m * stride_stats_m + pid_n * stride_stats_n
+    stats_base = Stats_ptr + stats_offset[:, None]
+    mask_m_store = offs_m < M
+    
+    tl.store(stats_base + 0, max1[:, None], mask=mask_m_store[:, None])
+    tl.store(stats_base + 1, sum_exp1[:, None], mask=mask_m_store[:, None])
+    tl.store(stats_base + 2, max2[:, None], mask=mask_m_store[:, None])
+    tl.store(stats_base + 3, sum_exp2[:, None], mask=mask_m_store[:, None])
+
+@triton.jit
+def lse_kernel(
+    Stats_ptr, LSE1_ptr, LSE2_ptr,
+    M, num_n_tiles,
+    stride_stats_m, stride_stats_n,
+    BLOCK_M: tl.constexpr
+):
+    pid = tl.program_id(0)
+    offs_m = pid * BLOCK_M + tl.arange(0, BLOCK_M)
+    mask_m = offs_m < M
+    
+    gl_max1 = tl.full((BLOCK_M,), -float('inf'), dtype=tl.float32)
+    gl_sum1 = tl.zeros((BLOCK_M,), dtype=tl.float32)
+    gl_max2 = tl.full((BLOCK_M,), -float('inf'), dtype=tl.float32)
+    gl_sum2 = tl.zeros((BLOCK_M,), dtype=tl.float32)
+
+    stats_base = Stats_ptr + offs_m * stride_stats_m
+    
+    for i in range(num_n_tiles):
+        m1 = tl.load(Stats_ptr + offs_m * stride_stats_m + i * stride_stats_n + 0, mask=mask_m, other=-float('inf'))
+        s1 = tl.load(Stats_ptr + offs_m * stride_stats_m + i * stride_stats_n + 1, mask=mask_m, other=0.0)
+        m2 = tl.load(Stats_ptr + offs_m * stride_stats_m + i * stride_stats_n + 2, mask=mask_m, other=-float('inf'))
+        s2 = tl.load(Stats_ptr + offs_m * stride_stats_m + i * stride_stats_n + 3, mask=mask_m, other=0.0)
+        
+        new_gl_max1 = tl.maximum(gl_max1, m1)
+        gl_sum1 = gl_sum1 * tl.exp(gl_max1 - new_gl_max1) + s1 * tl.exp(m1 - new_gl_max1)
+        gl_max1 = new_gl_max1
+        
+        new_gl_max2 = tl.maximum(gl_max2, m2)
+        gl_sum2 = gl_sum2 * tl.exp(gl_max2 - new_gl_max2) + s2 * tl.exp(m2 - new_gl_max2)
+        gl_max2 = new_gl_max2
+
+    lse1 = gl_max1 + tl.log(gl_sum1)
+    lse2 = gl_max2 + tl.log(gl_sum2)
+    
+    tl.store(LSE1_ptr + offs_m, lse1, mask=mask_m)
+    tl.store(LSE2_ptr + offs_m, lse2, mask=mask_m)
+
+@triton.jit
+def jsd_kernel(
+    L1_ptr, L2_ptr, LSE1_ptr, LSE2_ptr, Out_ptr,
+    M, N,
+    stride_l1m, stride_l1n,
+    stride_l2m, stride_l2n,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr
+):
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+    
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    
+    mask_m = offs_m < M
+    mask_n = offs_n < N
+    
+    lse1 = tl.load(LSE1_ptr + offs_m, mask=mask_m, other=0.0)
+    lse2 = tl.load(LSE2_ptr + offs_m, mask=mask_m, other=0.0)
+    
+    l1_ptrs = L1_ptr + (offs_m[:, None] * stride_l1m + offs_n[None, :] * stride_l1n)
+    l2_ptrs = L2_ptr + (offs_m[:, None] * stride_l2m + offs_n[None, :] * stride_l2n)
+    
+    l1 = tl.load(l1_ptrs, mask=mask_m[:, None] & mask_n[None, :], other=0.0)
+    l2 = tl.load(l2_ptrs, mask=mask_m[:, None] & mask_n[None, :], other=0.0)
+    
+    log_p = l1 - lse1[:, None]
+    log_q = l2 - lse2[:, None]
+    
+    # Mask out padding to avoid NaN in calculations
+    log_p = tl.where(mask_n[None, :], log_p, -float('inf'))
+    log_q = tl.where(mask_n[None, :], log_q, -float('inf'))
+
+    p = tl.exp(log_p)
+    q = tl.exp(log_q)
+    
+    # log(P+Q)
+    max_log = tl.maximum(log_p, log_q)
+    term_log_sum = max_log + tl.log(tl.exp(log_p - max_log) + tl.exp(log_q - max_log))
+    
+    # JSD term: P ln P + Q ln Q - (P+Q) ln(P+Q)
+    # For padded elements, p=0, q=0. 0*inf -> NaN usually.
+    # But log_p is -inf. p*log_p = 0 mathematically. 
+    # Use where to force 0 for padding.
+    
+    term = p * log_p + q * log_q - (p + q) * term_log_sum
+    term = tl.where(mask_n[None, :], term, 0.0)
+    
+    acc = tl.sum(term, axis=1)
+    tl.atomic_add(Out_ptr + offs_m, 0.5 * acc, mask=mask_m)
 
 def fused_linear_jsd(X: torch.Tensor, W1: torch.Tensor, B1: torch.Tensor, W2: torch.Tensor, B2: torch.Tensor) -> torch.Tensor:
-    # Check inputs
     M, K = X.shape
     _, N = W1.shape
     
-    # Allocate temporary buffer for logits: (M, 2, N) -> M*2*N elements
-    # Using float32 for storage for precision, or float16 to save bandwidth?
-    # Prompt says inputs are fp16. Output fp32. Correctness 1e-2.
-    # Accumulation in kernel is float32.
-    # Storing logits in fp32 is safer for JSD pass.
-    # But fp16 storage writes 2x faster. 
-    # Let's use float32 to ensure correctness requirements are met.
-    logits_temp = torch.empty((M, 2, N), dtype=torch.float32, device=X.device)
+    BLOCK_M = 64
+    BLOCK_N = 64
+    BLOCK_K = 64
     
-    # Allocate output
-    output = torch.empty((M,), dtype=torch.float32, device=X.device)
+    # Allocate intermediates
+    L1 = torch.empty((M, N), device=X.device, dtype=torch.float32)
+    L2 = torch.empty((M, N), device=X.device, dtype=torch.float32)
     
-    # Grid
-    # We auto-tune BLOCK_M.
-    # Grid function must accept META
-    grid = lambda META: (triton.cdiv(M, META['BLOCK_M']),)
+    num_n_tiles = triton.cdiv(N, BLOCK_N)
+    stats = torch.empty((M, num_n_tiles, 4), device=X.device, dtype=torch.float32)
     
-    _fused_jsd_kernel[grid](
+    grid_gemm = lambda META: (triton.cdiv(M, META['BLOCK_M']) * triton.cdiv(N, META['BLOCK_N']), )
+    
+    gemm_stats_kernel[grid_gemm](
         X, W1, B1, W2, B2,
-        logits_temp, output,
-        M, K, N,
+        L1, L2, stats,
+        M, N, K,
         X.stride(0), X.stride(1),
         W1.stride(0), W1.stride(1),
         W2.stride(0), W2.stride(1),
+        L1.stride(0), L1.stride(1),
+        L2.stride(0), L2.stride(1),
+        stats.stride(0), stats.stride(1),
+        BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K,
+        GROUP_SIZE_M=8
     )
     
-    return output
+    LSE1 = torch.empty((M,), device=X.device, dtype=torch.float32)
+    LSE2 = torch.empty((M,), device=X.device, dtype=torch.float32)
+    
+    grid_lse = (triton.cdiv(M, BLOCK_M),)
+    lse_kernel[grid_lse](
+        stats, LSE1, LSE2,
+        M, num_n_tiles,
+        stats.stride(0), stats.stride(1),
+        BLOCK_M=BLOCK_M
+    )
+    
+    Out = torch.full((M,), math.log(2.0), device=X.device, dtype=torch.float32)
+    
+    grid_jsd = (triton.cdiv(M, BLOCK_M), triton.cdiv(N, BLOCK_N))
+    jsd_kernel[grid_jsd](
+        L1, L2, LSE1, LSE2, Out,
+        M, N,
+        L1.stride(0), L1.stride(1),
+        L2.stride(0), L2.stride(1),
+        BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N
+    )
+    
+    return Out
+
+class Solution:
+    def solve(self, spec_path: str = None) -> dict:
+        return {"code": open(os.path.abspath(__file__)).read()}

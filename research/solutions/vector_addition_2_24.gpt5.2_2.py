@@ -1,61 +1,106 @@
-import os
-import sys
-import inspect
 import torch
 import triton
 import triton.language as tl
 
-_N_ELEMS = 16777216
-
+N_ELEMENTS = 16777216
 
 @triton.jit
-def _add_kernel(x_ptr, y_ptr, out_ptr, BLOCK: tl.constexpr):
-    pid = tl.program_id(axis=0)
-    base = pid * BLOCK
-
-    x_ptr = x_ptr + base
-    y_ptr = y_ptr + base
-    out_ptr = out_ptr + base
-
+def _add_kernel(x_ptr, y_ptr, o_ptr, BLOCK: tl.constexpr, ITERS: tl.constexpr):
     tl.multiple_of(x_ptr, 16)
     tl.multiple_of(y_ptr, 16)
-    tl.multiple_of(out_ptr, 16)
+    tl.multiple_of(o_ptr, 16)
 
-    offs = tl.arange(0, BLOCK)
-    x = tl.load(x_ptr + offs, cache_modifier="cg", eviction_policy="evict_last")
-    y = tl.load(y_ptr + offs, cache_modifier="cg", eviction_policy="evict_last")
-    tl.store(out_ptr + offs, x + y, cache_modifier="cg", eviction_policy="evict_last")
+    pid = tl.program_id(0)
+    base = pid * (BLOCK * ITERS)
+    tl.multiple_of(base, 256)
+
+    r = tl.arange(0, BLOCK)
+    for i in tl.static_range(ITERS):
+        offs = base + i * BLOCK + r
+        x = tl.load(x_ptr + offs, cache_modifier=".cg", eviction_policy="evict_last")
+        y = tl.load(y_ptr + offs, cache_modifier=".cg", eviction_policy="evict_last")
+        tl.store(o_ptr + offs, x + y, cache_modifier=".wb")
 
 
 def add(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     if not (isinstance(x, torch.Tensor) and isinstance(y, torch.Tensor)):
         raise TypeError("x and y must be torch.Tensor")
-    if x.shape != y.shape:
-        raise ValueError("x and y must have the same shape")
-    if x.numel() != _N_ELEMS:
-        raise ValueError(f"Expected {(_N_ELEMS,)} elements, got {x.numel()}")
-    if not x.is_cuda or not y.is_cuda:
-        return x + y
-    if not x.is_contiguous() or not y.is_contiguous():
+    if x.numel() != N_ELEMENTS or y.numel() != N_ELEMENTS:
+        raise AssertionError(f"Expected vectors of length {N_ELEMENTS}")
+    if x.device != y.device:
+        raise AssertionError("x and y must be on the same device")
+    if x.dtype != y.dtype:
+        raise AssertionError("x and y must have the same dtype")
+    if not (x.is_contiguous() and y.is_contiguous()):
         x = x.contiguous()
         y = y.contiguous()
 
-    out = torch.empty_like(x)
-    BLOCK = 4096
-    grid = (_N_ELEMS // BLOCK,)
+    if not x.is_cuda:
+        return x + y
 
-    num_warps = 8
-    num_stages = 4
-    _add_kernel[grid](x, y, out, BLOCK=BLOCK, num_warps=num_warps, num_stages=num_stages)
+    if x.dtype == torch.float64:
+        return x + y
+
+    out = torch.empty_like(x)
+
+    BLOCK = 1024
+    ITERS = 8
+    grid = (N_ELEMENTS // (BLOCK * ITERS),)
+
+    _add_kernel[grid](
+        x, y, out,
+        BLOCK=BLOCK,
+        ITERS=ITERS,
+        num_warps=8,
+        num_stages=1,
+    )
     return out
 
 
+_PROGRAM_CODE = (
+    "import torch\n"
+    "import triton\n"
+    "import triton.language as tl\n"
+    "\n"
+    "N_ELEMENTS = 16777216\n"
+    "\n"
+    "@triton.jit\n"
+    "def _add_kernel(x_ptr, y_ptr, o_ptr, BLOCK: tl.constexpr, ITERS: tl.constexpr):\n"
+    "    tl.multiple_of(x_ptr, 16)\n"
+    "    tl.multiple_of(y_ptr, 16)\n"
+    "    tl.multiple_of(o_ptr, 16)\n"
+    "    pid = tl.program_id(0)\n"
+    "    base = pid * (BLOCK * ITERS)\n"
+    "    tl.multiple_of(base, 256)\n"
+    "    r = tl.arange(0, BLOCK)\n"
+    "    for i in tl.static_range(ITERS):\n"
+    "        offs = base + i * BLOCK + r\n"
+    "        x = tl.load(x_ptr + offs, cache_modifier='.cg', eviction_policy='evict_last')\n"
+    "        y = tl.load(y_ptr + offs, cache_modifier='.cg', eviction_policy='evict_last')\n"
+    "        tl.store(o_ptr + offs, x + y, cache_modifier='.wb')\n"
+    "\n"
+    "def add(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:\n"
+    "    if x.numel() != N_ELEMENTS or y.numel() != N_ELEMENTS:\n"
+    "        raise AssertionError(f'Expected vectors of length {N_ELEMENTS}')\n"
+    "    if x.device != y.device:\n"
+    "        raise AssertionError('x and y must be on the same device')\n"
+    "    if x.dtype != y.dtype:\n"
+    "        raise AssertionError('x and y must have the same dtype')\n"
+    "    if not (x.is_contiguous() and y.is_contiguous()):\n"
+    "        x = x.contiguous()\n"
+    "        y = y.contiguous()\n"
+    "    if not x.is_cuda:\n"
+    "        return x + y\n"
+    "    if x.dtype == torch.float64:\n"
+    "        return x + y\n"
+    "    out = torch.empty_like(x)\n"
+    "    BLOCK = 1024\n"
+    "    ITERS = 8\n"
+    "    grid = (N_ELEMENTS // (BLOCK * ITERS),)\n"
+    "    _add_kernel[grid](x, y, out, BLOCK=BLOCK, ITERS=ITERS, num_warps=8, num_stages=1)\n"
+    "    return out\n"
+)
+
 class Solution:
     def solve(self, spec_path: str = None) -> dict:
-        try:
-            path = os.path.abspath(__file__)
-            if os.path.exists(path):
-                return {"program_path": path}
-        except Exception:
-            pass
-        return {"code": inspect.getsource(sys.modules[__name__])}
+        return {"code": _PROGRAM_CODE}

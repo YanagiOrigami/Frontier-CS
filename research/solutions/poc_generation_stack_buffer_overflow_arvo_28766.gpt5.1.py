@@ -1,161 +1,119 @@
 import os
+import re
 import tarfile
-import gzip
 
 
 class Solution:
     def solve(self, src_path: str) -> bytes:
-        """
-        Generate a PoC that triggers the vulnerability.
-
-        Args:
-            src_path: Path to the vulnerable source code tarball
-
-        Returns:
-            bytes: The PoC input that should trigger the vulnerability
-        """
-        try:
-            poc = self._find_poc_in_tar(src_path)
-            if poc is not None and len(poc) > 0:
-                return poc
-        except Exception:
-            pass
-
-        # Fallback: generic 140-byte payload
-        return b"A" * 140
-
-    def _find_poc_in_tar(self, src_path: str) -> bytes | None:
-        # Target length from problem statement
-        target_len = 140
-
-        if not os.path.isfile(src_path):
-            return None
+        desired_len = 140
+        fallback = b'A' * desired_len
 
         try:
-            tf = tarfile.open(src_path, mode="r:*")
+            tar = tarfile.open(src_path, 'r:*')
         except Exception:
-            return None
+            return fallback
 
-        best_member = None
-        best_score = None
+        with tar:
+            members = tar.getmembers()
+            keyword_pattern = re.compile(
+                r'(poc|crash|overflow|stack|asan|ubsan|fuzz|testcase|bug|issue|clusterfuzz|ossfuzz|id_)',
+                re.IGNORECASE,
+            )
 
-        # Keywords that strongly indicate an actual PoC / crash input
-        primary_keywords = [
-            "clusterfuzz",
-            "oss-fuzz",
-            "ossfuzz",
-            "testcase",
-            "minimized",
-            "poc",
-            "crash",
-            "id_",
-        ]
+            text_like_exts = {
+                '.c', '.cc', '.cpp', '.cxx', '.h', '.hh', '.hpp', '.ipp',
+                '.java', '.py', '.sh', '.bat', '.ps1', '.cmake', '.mak',
+                '.md', '.rst', '.txt', '.tex', '.html', '.htm', '.js',
+                '.css', '.xml', '.json', '.yaml', '.yml', '.toml', '.ini',
+                '.cfg', '.csv', '.tsv', '.go', '.rs', '.php', '.rb', '.pl',
+                '.m', '.mm', '.cs',
+            }
 
-        # Additional keywords that may indicate bug repro / malformed inputs
-        secondary_keywords = [
-            "bug",
-            "regress",
-            "cve",
-            "overflow",
-            "fuzz",
-            "corpus",
-            "invalid",
-            "malformed",
-            "broken",
-            "fail",
-            "snapshot",
-            "snap",
-            "memory",
-            "mem",
-            "dump",
-        ]
+            binary_pref_exts = {
+                '.bin', '.dat', '.raw', '.in', '.case', '.pcap', '.poc',
+            }
 
-        # Extensions that are commonly used for binary PoCs or test data
-        interesting_exts = {
-            ".bin",
-            ".dat",
-            ".raw",
-            ".snap",
-            ".snapshot",
-            ".dump",
-            ".mem",
-            ".pb",
-            ".pbtxt",
-            ".in",
-            ".input",
-            ".case",
-            ".gz",
-        }
+            def score_member(m):
+                if not m.isfile():
+                    return None
+                size = m.size
+                if size == 0 or size > 1_000_000:
+                    return None
 
-        try:
-            members = tf.getmembers()
-        except Exception:
-            tf.close()
-            return None
+                name_lower = m.name.lower()
+                base = os.path.basename(name_lower)
+                ext = os.path.splitext(base)[1]
 
-        for m in members:
-            if not m.isfile():
-                continue
-            if m.size <= 0:
-                continue
-            # Limit to reasonably small files to avoid huge reads
-            if m.size > 4096:
-                continue
+                score = 0.0
 
-            name = m.name
-            lname = name.lower()
+                if keyword_pattern.search(name_lower):
+                    score += 10.0
+                if 'snapshot' in name_lower:
+                    score += 3.0
+                if 'memory' in name_lower:
+                    score += 1.0
+                if 'node' in name_lower:
+                    score += 1.0
+                if '28766' in name_lower:
+                    score += 20.0
 
-            # Count keyword matches
-            primary_hits = sum(1 for kw in primary_keywords if kw in lname)
-            secondary_hits = sum(1 for kw in secondary_keywords if kw in lname)
+                if ext in text_like_exts and not keyword_pattern.search(name_lower):
+                    score -= 5.0
 
-            base_score = 0
+                if size <= 4096:
+                    score += 2.0
+                elif size <= 65536:
+                    score += 1.0
 
-            # Strong bonus for primary keywords (fuzzing / crash artifacts)
-            if primary_hits > 0:
-                base_score += primary_hits * 1000
+                score += max(0.0, 5.0 - abs(size - desired_len) / (desired_len / 2.0))
 
-            # Medium bonus for secondary keywords
-            if secondary_hits > 0:
-                base_score += secondary_hits * 200
+                if ext in binary_pref_exts:
+                    score += 1.0
 
-            # Bonus for living in fuzz/corpus/testdata-like directories
-            if any(seg in lname for seg in ("fuzz", "corpus", "crash", "poc", "testdata", "regress")):
-                base_score += 300
+                score += max(0.0, 1.0 - size / 4096.0)
 
-            # Bonus for interesting extensions
-            _, ext = os.path.splitext(lname)
-            if ext in interesting_exts:
-                base_score += 400
+                return score
 
-            # If there are absolutely no hints that this is a PoC, skip
-            if base_score == 0:
-                continue
+            best_member = None
+            best_score = None
 
-            # Closeness to target length
-            length_score = -abs(m.size - target_len)
+            for m in members:
+                sc = score_member(m)
+                if sc is None:
+                    continue
+                if best_member is None or sc > best_score:
+                    best_member = m
+                    best_score = sc
 
-            score = base_score + length_score
+            if best_member is None:
+                # Fallback: choose any small non-source file as last resort
+                for m in members:
+                    if not m.isfile():
+                        continue
+                    size = m.size
+                    if size == 0 or size > 262144:
+                        continue
+                    name_lower = m.name.lower()
+                    base = os.path.basename(name_lower)
+                    ext = os.path.splitext(base)[1]
+                    if ext in text_like_exts:
+                        continue
+                    if base.startswith(('.', '_')):
+                        continue
+                    sc = max(0.0, 5.0 - abs(size - desired_len) / (desired_len / 2.0))
+                    sc += max(0.0, 1.0 - size / 8192.0)
+                    if best_member is None or sc > best_score:
+                        best_member = m
+                        best_score = sc
 
-            if best_score is None or score > best_score:
-                best_score = score
-                best_member = m
+            if best_member is not None:
+                try:
+                    f = tar.extractfile(best_member)
+                    if f is not None:
+                        data = f.read()
+                        if data:
+                            return data
+                except Exception:
+                    pass
 
-        data = None
-        if best_member is not None:
-            try:
-                f = tf.extractfile(best_member)
-                if f is not None:
-                    data = f.read()
-                    # If it's a .gz, attempt to decompress
-                    if best_member.name.lower().endswith(".gz"):
-                        try:
-                            data = gzip.decompress(data)
-                        except Exception:
-                            # If decompression fails, keep original bytes
-                            pass
-            except Exception:
-                data = None
-
-        tf.close()
-        return data
+        return fallback

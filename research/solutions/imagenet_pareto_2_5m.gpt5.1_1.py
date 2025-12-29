@@ -1,180 +1,149 @@
+import math
 import torch
 import torch.nn as nn
-import torch.optim as optim
-import numpy as np
-import random
-import copy
+import torch.nn.functional as F
 
 
-class MLPNet(nn.Module):
-    def __init__(self, input_dim: int, num_classes: int, hidden_dims=(1280, 1024, 512), dropout: float = 0.15):
+class ResidualMLP(nn.Module):
+    def __init__(self, input_dim: int, num_classes: int, hidden_dim: int, dropout: float = 0.1):
         super().__init__()
         self.input_bn = nn.BatchNorm1d(input_dim)
+        self.fc1 = nn.Linear(input_dim, hidden_dim)
+        self.bn1 = nn.BatchNorm1d(hidden_dim)
 
-        layers = []
-        in_dim = input_dim
-        for h in hidden_dims:
-            layers.append(nn.Linear(in_dim, h))
-            layers.append(nn.BatchNorm1d(h))
-            layers.append(nn.GELU())
-            if dropout > 0.0:
-                layers.append(nn.Dropout(dropout))
-            in_dim = h
-        layers.append(nn.Linear(in_dim, num_classes))
+        self.fc2 = nn.Linear(hidden_dim, hidden_dim)
+        self.bn2 = nn.BatchNorm1d(hidden_dim)
 
-        self.features = nn.Sequential(*layers)
+        self.fc3 = nn.Linear(hidden_dim, hidden_dim)
+        self.bn3 = nn.BatchNorm1d(hidden_dim)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if x.dim() > 2:
-            x = x.view(x.size(0), -1)
+        self.fc_out = nn.Linear(hidden_dim, num_classes)
+
+        self.dropout = nn.Dropout(p=dropout)
+        self.act = nn.GELU()
+
+    def forward(self, x):
         x = self.input_bn(x)
-        x = self.features(x)
-        return x
+        x = self.fc1(x)
+        x = self.bn1(x)
+        x = self.act(x)
+        x = self.dropout(x)
 
+        residual = x
+        out = self.fc2(x)
+        out = self.bn2(out)
+        out = self.act(out)
+        out = self.dropout(out)
+        x = residual + out
 
-def count_parameters(model: nn.Module) -> int:
-    return sum(p.numel() for p in model.parameters() if p.requires_grad)
+        residual = x
+        out = self.fc3(x)
+        out = self.bn3(out)
+        out = self.act(out)
+        out = self.dropout(out)
+        x = residual + out
 
-
-def evaluate(model: nn.Module, data_loader, device: torch.device, criterion=None):
-    model.eval()
-    total_loss = 0.0
-    correct = 0
-    total = 0
-    if data_loader is None:
-        return 0.0, 0.0
-
-    with torch.no_grad():
-        for batch in data_loader:
-            if isinstance(batch, (list, tuple)) and len(batch) >= 2:
-                inputs, targets = batch[0], batch[1]
-            else:
-                continue
-
-            inputs = inputs.to(device)
-            targets = targets.to(device)
-
-            outputs = model(inputs)
-            if criterion is not None:
-                loss = criterion(outputs, targets)
-                total_loss += loss.item() * targets.size(0)
-
-            preds = outputs.argmax(dim=1)
-            correct += (preds == targets).sum().item()
-            total += targets.size(0)
-
-    avg_loss = total_loss / total if (criterion is not None and total > 0) else 0.0
-    acc = correct / total if total > 0 else 0.0
-    return avg_loss, acc
+        logits = self.fc_out(x)
+        return logits
 
 
 class Solution:
+    def _build_model(self, input_dim: int, num_classes: int, param_limit: int | None) -> nn.Module:
+        if param_limit is None or param_limit <= 0:
+            hidden_dim = 512
+            model = ResidualMLP(input_dim, num_classes, hidden_dim)
+            return model
+
+        B = input_dim + num_classes + 9
+        C = 2 * input_dim + num_classes
+        L = float(param_limit)
+        D = B * B + 8.0 * (L - C)
+        if D <= 0:
+            hidden_est = 256
+        else:
+            hidden_est = int((math.sqrt(D) - B) / 4.0)
+
+        hidden_est = max(hidden_est, 64)
+
+        hidden_dim = hidden_est
+        while hidden_dim >= 32:
+            model = ResidualMLP(input_dim, num_classes, hidden_dim)
+            param_count = sum(p.numel() for p in model.parameters() if p.requires_grad)
+            if param_count <= param_limit:
+                return model
+            hidden_dim -= 1
+
+        hidden_dim = 32
+        model = ResidualMLP(input_dim, num_classes, hidden_dim)
+        return model
+
     def solve(self, train_loader, val_loader, metadata: dict = None) -> torch.nn.Module:
         if metadata is None:
-            input_dim = 384
-            num_classes = 128
-            param_limit = 2_500_000
-            device_str = "cpu"
-        else:
-            input_dim = int(metadata.get("input_dim", 384))
-            num_classes = int(metadata.get("num_classes", 128))
-            param_limit = int(metadata.get("param_limit", 2_500_000))
-            device_str = metadata.get("device", "cpu")
+            raise ValueError("metadata must be provided")
 
-        device = torch.device(device_str)
+        input_dim = int(metadata.get("input_dim", 384))
+        num_classes = int(metadata.get("num_classes", 128))
+        param_limit = int(metadata.get("param_limit", 2500000))
+        device_str = metadata.get("device", "cpu")
+        device = torch.device(device_str if torch.cuda.is_available() or device_str == "cpu" else "cpu")
 
-        seed = 42
-        torch.manual_seed(seed)
-        np.random.seed(seed)
-        random.seed(seed)
+        torch.manual_seed(42)
 
-        hidden_options = [
-            (1280, 1024, 512),
-            (1152, 1024, 512),
-            (1024, 1024, 512),
-            (1024, 768, 512),
-            (1024, 768, 384),
-            (1024, 512, 256),
-            (768, 512, 256),
-            (512, 512, 256),
-            (512, 256, 256),
-            (512, 256),
-            (384, 256),
-            (384, 128),
-        ]
-
-        model = None
-        for hidden_dims in hidden_options:
-            candidate = MLPNet(input_dim, num_classes, hidden_dims=hidden_dims, dropout=0.15)
-            if count_parameters(candidate) <= param_limit:
-                model = candidate
-                break
-
-        if model is None:
-            model = MLPNet(input_dim, num_classes, hidden_dims=(256,), dropout=0.1)
-
+        model = self._build_model(input_dim, num_classes, param_limit)
         model.to(device)
 
-        train_samples = None
-        if metadata is not None:
-            train_samples = metadata.get("train_samples", None)
-
-        if train_samples is not None and train_samples < 5000:
-            max_epochs = 160
-        else:
-            max_epochs = 120
-
-        patience = 25
-
-        try:
-            criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
-            val_criterion = nn.CrossEntropyLoss()
-        except TypeError:
-            criterion = nn.CrossEntropyLoss()
-            val_criterion = criterion
-
-        optimizer = optim.AdamW(model.parameters(), lr=3e-3, weight_decay=1e-2)
-        scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max_epochs)
+        criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
+        optimizer = torch.optim.AdamW(model.parameters(), lr=5e-4, weight_decay=1e-2)
+        num_epochs = 200
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=num_epochs, eta_min=1e-5)
 
         best_val_acc = 0.0
         best_state = None
-        epochs_since_improve = 0
+        patience = 40
+        epochs_no_improve = 0
 
-        for epoch in range(max_epochs):
+        for epoch in range(num_epochs):
             model.train()
-            for batch in train_loader:
-                if isinstance(batch, (list, tuple)) and len(batch) >= 2:
-                    inputs, targets = batch[0], batch[1]
-                else:
-                    continue
-
+            for inputs, targets in train_loader:
                 inputs = inputs.to(device)
                 targets = targets.to(device)
 
-                optimizer.zero_grad()
+                optimizer.zero_grad(set_to_none=True)
                 outputs = model(inputs)
                 loss = criterion(outputs, targets)
                 loss.backward()
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
                 optimizer.step()
 
-            if val_loader is not None:
-                _, val_acc = evaluate(model, val_loader, device, criterion=val_criterion)
-                if val_acc > best_val_acc + 1e-4:
-                    best_val_acc = val_acc
-                    best_state = copy.deepcopy(model.state_dict())
-                    epochs_since_improve = 0
-                else:
-                    epochs_since_improve += 1
+            model.eval()
+            correct = 0
+            total = 0
+            with torch.no_grad():
+                for inputs, targets in val_loader:
+                    inputs = inputs.to(device)
+                    targets = targets.to(device)
+                    outputs = model(inputs)
+                    loss = criterion(outputs, targets)
+                    preds = outputs.argmax(dim=1)
+                    correct += (preds == targets).sum().item()
+                    total += targets.numel()
+            val_acc = correct / total if total > 0 else 0.0
 
-                if epochs_since_improve >= patience:
-                    scheduler.step()
-                    break
+            if val_acc > best_val_acc + 1e-4:
+                best_val_acc = val_acc
+                best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
+                epochs_no_improve = 0
+            else:
+                epochs_no_improve += 1
 
             scheduler.step()
+
+            if epochs_no_improve >= patience:
+                break
 
         if best_state is not None:
             model.load_state_dict(best_state)
 
-        model.to("cpu")
+        model.to(device)
+        model.eval()
         return model

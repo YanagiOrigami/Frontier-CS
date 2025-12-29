@@ -1,153 +1,131 @@
 import torch
 import triton
 import triton.language as tl
-import inspect
 
-_flash_attn_kernel_code = """
+class Solution:
+    def solve(self, spec_path: str = None) -> dict:
+        flash_attn_code = """
 import torch
 import triton
 import triton.language as tl
 
 @triton.autotune(
     configs=[
-        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 64, 'num_stages': 3}, num_warps=4),
-        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 128, 'num_stages': 3}, num_warps=4),
-        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'num_stages': 3}, num_warps=4),
-        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 32, 'num_stages': 4}, num_warps=4),
-        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 32, 'num_stages': 5}, num_warps=2),
-        triton.Config({'BLOCK_M': 32, 'BLOCK_N': 64, 'num_stages': 5}, num_warps=2),
-        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 64, 'num_stages': 2}, num_warps=8),
-        triton.Config({'BLOCK_M': 256, 'BLOCK_N': 64, 'num_stages': 3}, num_warps=8),
-        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 256, 'num_stages': 3}, num_warps=8),
-        triton.Config({'BLOCK_M': 256, 'BLOCK_N': 128, 'num_stages': 3}, num_warps=8),
-        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 256, 'num_stages': 3}, num_warps=8),
+        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 64}, num_warps=4, num_stages=3),
+        triton.Config({'BLOCK_M': 256, 'BLOCK_N': 64}, num_warps=8, num_stages=3),
+        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128}, num_warps=8, num_stages=3),
+        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 64}, num_warps=4, num_stages=4),
+        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 32}, num_warps=4, num_stages=4),
+        triton.Config({'BLOCK_M': 256, 'BLOCK_N': 128}, num_warps=8, num_stages=2),
     ],
-    key=['N_CTX', 'D_HEAD', 'causal'],
+    key=['causal', 'M', 'N'],
 )
 @triton.jit
 def _flash_attn_kernel(
-    Q_ptr, K_ptr, V_ptr, O_ptr,
-    stride_qz, stride_qh, stride_qm, stride_qd,
-    stride_kz, stride_kh, stride_kn, stride_kd,
-    stride_vz, stride_vh, stride_vn, stride_vd,
-    stride_oz, stride_oh, stride_om, stride_od,
-    Z, H, N_CTX,
-    D_HEAD: tl.constexpr,
+    Q, K, V, O,
+    stride_qz, stride_qh, stride_qm, stride_qk,
+    stride_kz, stride_kh, stride_kn, stride_kk,
+    stride_vz, stride_vh, stride_vn, stride_vk,
+    stride_oz, stride_oh, stride_om, stride_ok,
+    Z, H, N, M,
+    Dq, Dv,
+    softmax_scale,
+    causal: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
-    causal: tl.constexpr,
+    BLOCK_Dq: tl.constexpr,
+    BLOCK_Dv: tl.constexpr,
 ):
-    # Grid and program IDs
     pid_m = tl.program_id(0)
-    pid_batch_head = tl.program_id(1)
-
-    pid_z = pid_batch_head // H
-    pid_h = pid_batch_head % H
-
-    # Offsets
-    start_m = pid_m * BLOCK_M
-    offs_m = start_m + tl.arange(0, BLOCK_M)
-    offs_d = tl.arange(0, D_HEAD)
-    offs_n = tl.arange(0, BLOCK_N)
-
-    # Base pointers
-    q_base_ptr = Q_ptr + pid_z * stride_qz + pid_h * stride_qh
-    k_base_ptr = K_ptr + pid_z * stride_kz + pid_h * stride_kh
-    v_base_ptr = V_ptr + pid_z * stride_vz + pid_h * stride_vh
-    o_base_ptr = O_ptr + pid_z * stride_oz + pid_h * stride_oh
-
-    # Load Q
-    q_ptrs = q_base_ptr + (offs_m[:, None] * stride_qm + offs_d[None, :] * stride_qd)
-    q_mask = offs_m[:, None] < N_CTX
-    q = tl.load(q_ptrs, mask=q_mask, other=0.0)
-
-    # Initialize accumulators for streaming softmax
-    m_i = tl.full([BLOCK_M], value=float('-inf'), dtype=tl.float32)
-    l_i = tl.zeros([BLOCK_M], dtype=tl.float32)
-    acc = tl.zeros([BLOCK_M, D_HEAD], dtype=tl.float32)
+    pid_zh = tl.program_id(1)
     
-    sm_scale = 1.0 / (D_HEAD ** 0.5)
+    pid_z = pid_zh // H
+    pid_h = pid_zh % H
+    
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_d = tl.arange(0, BLOCK_Dq)
+    
+    q_ptrs = Q + pid_z * stride_qz + pid_h * stride_qh + offs_m[:, None] * stride_qm + offs_d[None, :] * stride_qk
+    
+    m_mask = offs_m < M
+    q = tl.load(q_ptrs, mask=m_mask[:, None], other=0.0)
+    q = (q * softmax_scale).to(Q.dtype.element_ty)
 
-    # Determine loop boundary for causal attention
-    loop_end = N_CTX
-    if causal:
-        loop_end = (start_m + BLOCK_M)
-        
+    m_i = tl.full([BLOCK_M], -float('inf'), dtype=tl.float32)
+    l_i = tl.zeros([BLOCK_M], dtype=tl.float32)
+    acc = tl.zeros([BLOCK_M, BLOCK_Dv], dtype=tl.float32)
+    
+    k_ptrs_base = K + pid_z * stride_kz + pid_h * stride_kh
+    v_ptrs_base = V + pid_z * stride_vz + pid_h * stride_vh
+    
+    offs_n = tl.arange(0, BLOCK_N)
+    
+    loop_end = (pid_m + 1) * BLOCK_M if causal else N
+    
     for start_n in range(0, loop_end, BLOCK_N):
         current_offs_n = start_n + offs_n
+        n_mask = current_offs_n < N
         
-        # Load K (transposed)
-        k_ptrs = k_base_ptr + (offs_d[:, None] * stride_kd + current_offs_n[None, :] * stride_kn)
-        k_mask = current_offs_n[None, :] < N_CTX
-        k = tl.load(k_ptrs, mask=k_mask, other=0.0)
+        k_ptrs = k_ptrs_base + (current_offs_n[:, None] * stride_kn + offs_d[None, :] * stride_kk)
+        k = tl.load(k_ptrs, mask=n_mask[:, None], other=0.0)
+
+        s = tl.dot(q, k, trans_b=True)
         
-        # Load V
-        v_ptrs = v_base_ptr + (current_offs_n[:, None] * stride_vn + offs_d[None, :] * stride_vd)
-        v_mask = current_offs_n[:, None] < N_CTX
-        v = tl.load(v_ptrs, mask=v_mask, other=0.0)
-
-        # Compute S = Q @ K
-        s = tl.dot(q, k)
-        s *= sm_scale
-
         if causal:
             causal_mask = offs_m[:, None] >= current_offs_n[None, :]
-            s = tl.where(causal_mask, s, float('-inf'))
-
-        # Streaming softmax update
+            s = tl.where(causal_mask, s, -float('inf'))
+        
         m_ij = tl.max(s, axis=1)
-        p = tl.exp(s - m_ij[:, None])
-        l_ij = tl.sum(p, axis=1)
-
         m_new = tl.maximum(m_i, m_ij)
+        
         alpha = tl.exp(m_i - m_new)
-        beta = tl.exp(m_ij - m_new)
-        l_new = alpha * l_i + beta * l_ij
-
-        p_scaled = beta[:, None] * p
+        p = tl.exp(s.to(tl.float32) - m_new[:, None])
+        
+        l_i_new = l_i * alpha + tl.sum(p, axis=1)
+        
         acc = acc * alpha[:, None]
-        acc += tl.dot(p_scaled.to(Q_ptr.dtype.element_ty), v)
-
-        l_i = l_new
+        
+        offs_dv = tl.arange(0, BLOCK_Dv)
+        v_ptrs = v_ptrs_base + (current_offs_n[:, None] * stride_vn + offs_dv[None, :] * stride_vk)
+        v = tl.load(v_ptrs, mask=n_mask[:, None], other=0.0)
+        
+        p = p.to(V.dtype.element_ty)
+        acc += tl.dot(p, v)
+        
         m_i = m_new
+        l_i = l_i_new
 
-    # Final normalization
-    o = acc / l_i[:, None]
+    l_i_safe = tl.where(l_i == 0, 1.0, l_i)
+    acc = acc / l_i_safe[:, None]
     
-    # Store O
-    o_ptrs = o_base_ptr + (offs_m[:, None] * stride_om + offs_d[None, :] * stride_od)
-    tl.store(o_ptrs, o.to(Q_ptr.dtype.element_ty), mask=q_mask)
+    offs_dv = tl.arange(0, BLOCK_Dv)
+    o_ptrs = O + pid_z * stride_oz + pid_h * stride_oh + offs_m[:, None] * stride_om + offs_dv[None, :] * stride_ok
+    tl.store(o_ptrs, acc.to(O.dtype.element_ty), mask=m_mask[:, None])
 
 def flash_attn(Q: torch.Tensor, K: torch.Tensor, V: torch.Tensor, causal: bool = True) -> torch.Tensor:
-    Z, H, M, D_HEAD = Q.shape
+    Z, H, M, Dq = Q.shape
+    _, _, N, _ = K.shape
+    _, _, _, Dv = V.shape
     
-    # Ensure tensors are contiguous
-    Q = Q.contiguous()
-    K = K.contiguous()
-    V = V.contiguous()
+    O = torch.empty((Z, H, M, Dv), device=Q.device, dtype=Q.dtype)
 
-    O = torch.empty_like(Q)
-
-    grid = lambda META: (triton.cdiv(M, META['BLOCK_M']), Z * H)
+    softmax_scale = Dq**-0.5
     
+    grid = lambda meta: (triton.cdiv(M, meta['BLOCK_M']), Z * H)
+
     _flash_attn_kernel[grid](
         Q, K, V, O,
         Q.stride(0), Q.stride(1), Q.stride(2), Q.stride(3),
         K.stride(0), K.stride(1), K.stride(2), K.stride(3),
         V.stride(0), V.stride(1), V.stride(2), V.stride(3),
         O.stride(0), O.stride(1), O.stride(2), O.stride(3),
-        Z, H, M,
-        D_HEAD=D_HEAD,
+        Z, H, N, M,
+        Dq, Dv,
+        softmax_scale,
         causal=causal,
+        BLOCK_Dq=Dq,
+        BLOCK_Dv=Dv,
     )
     return O
 """
-
-class Solution:
-    def solve(self, spec_path: str = None) -> dict:
-        """
-        Returns a dict with either:
-        - {"code": "python_code_string"}
-        - {"program_path": "path/to/kernel.py"}
-        """
-        return {"code": _flash_attn_kernel_code}
+        return {"code": flash_attn_code}

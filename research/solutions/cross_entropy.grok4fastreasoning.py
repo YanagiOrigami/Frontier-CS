@@ -5,87 +5,85 @@ import torch
 import triton
 import triton.language as tl
 
+configs = [
+    triton.Config({'BLOCK_N': 256}),
+    triton.Config({'BLOCK_N': 512}),
+    triton.Config({'BLOCK_N': 1024}),
+]
+
+@triton.autotune(
+    configs=configs,
+    key=['N'],
+)
 @triton.jit
 def cross_entropy_kernel(
     logits_ptr,
     targets_ptr,
     output_ptr,
-    M: tl.int32,
-    N: tl.int32,
-    stride_lm: tl.int64,
-    stride_ln: tl.int64,
-    stride_t: tl.int64,
-    stride_o: tl.int64,
-    BLOCK_SIZE: tl.constexpr
+    M,
+    N,
+    STRIDE_M,
+    STRIDE_N,
+    STRIDE_T,
+    STRIDE_O,
+    BLOCK_N: tl.constexpr,
 ):
     pid = tl.program_id(0)
     if pid >= M:
         return
+    m = pid
 
-    target_i = tl.load(targets_ptr + pid * stride_t)
-    target_offset = target_i * stride_ln
-    logit_target = tl.load(logits_ptr + pid * stride_lm + target_offset)
+    target_offset = m * STRIDE_T
+    target = tl.load(targets_ptr + target_offset)
 
-    # Compute row_max
-    partial_max = tl.full((BLOCK_SIZE,), float("-inf"), dtype=tl.float32)
-    row_offset = pid * stride_lm
-    for start in range(0, N, BLOCK_SIZE):
-        col_offsets = start + tl.arange(0, BLOCK_SIZE)
-        mask = col_offsets < N
-        addr = row_offset + col_offsets.to(tl.int64) * stride_ln
-        vals = tl.load(logits_ptr + addr, mask=mask, other=float("-inf"))
-        partial_max = tl.maximum(partial_max, vals)
-    row_max = tl.max(partial_max)
+    # First pass: compute max_logit
+    max_logit = -1e9
+    for start_n in range(0, N, BLOCK_N):
+        col_indices = start_n + tl.arange(0, BLOCK_N)
+        mask = col_indices < N
+        offsets = m * STRIDE_M + col_indices * STRIDE_N
+        chunk = tl.load(logits_ptr + offsets, mask=mask, other=-1e9)
+        local_max = tl.max(chunk, axis=0)
+        max_logit = tl.maximum(max_logit, local_max)
 
-    # Compute sum of exp(val - row_max)
-    partial_sum = tl.zeros((BLOCK_SIZE,), dtype=tl.float32)
-    for start in range(0, N, BLOCK_SIZE):
-        col_offsets = start + tl.arange(0, BLOCK_SIZE)
-        mask = col_offsets < N
-        addr = row_offset + col_offsets.to(tl.int64) * stride_ln
-        vals = tl.load(logits_ptr + addr, mask=mask, other=0.0)
-        mask_f = tl.where(mask, 1.0, 0.0)
-        centered = vals - row_max
-        exps = tl.exp(centered) * mask_f
-        partial_sum += exps
-    row_sum = tl.sum(partial_sum)
+    # Second pass: compute sum_exp
+    sum_exp = 0.0
+    for start_n in range(0, N, BLOCK_N):
+        col_indices = start_n + tl.arange(0, BLOCK_N)
+        mask = col_indices < N
+        offsets = m * STRIDE_M + col_indices * STRIDE_N
+        chunk = tl.load(logits_ptr + offsets, mask=mask, other=0.0)
+        shifted = chunk - max_logit
+        exp_chunk = tl.exp(shifted)
+        local_sum = tl.sum(exp_chunk, axis=0)
+        sum_exp += local_sum
 
-    logsumexp = row_max + tl.log(row_sum)
-    loss = logsumexp - logit_target
+    logsumexp = max_logit + tl.log(sum_exp)
 
-    # Store by thread 0
-    pid_local = tl.arange(0, BLOCK_SIZE)[0]
-    if pid_local == 0:
-        tl.store(output_ptr + pid * stride_o, loss)
+    # Load target logit
+    target_offset_logit = m * STRIDE_M + target * STRIDE_N
+    target_logit = tl.load(logits_ptr + target_offset_logit)
+
+    # Compute loss
+    loss = logsumexp - target_logit
+
+    # Store
+    output_offset = m * STRIDE_O
+    tl.store(output_ptr + output_offset, loss)
 
 def cross_entropy(logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
-    if logits.shape[0] != targets.shape[0]:
-        raise ValueError("Batch sizes must match")
-    if targets.dtype != torch.int64:
-        targets = targets.to(torch.int64)
     M, N = logits.shape
     output = torch.empty((M,), dtype=torch.float32, device=logits.device)
     if M == 0:
         return output
-
-    stride_lm = logits.stride(0)
-    stride_ln = logits.stride(1)
-    stride_t = targets.stride(0)
-    stride_o = output.stride(0)
-
-    BLOCK_SIZE = 1024
+    STRIDE_M = logits.stride(0)
+    STRIDE_N = logits.stride(1)
+    STRIDE_T = targets.stride(0)
+    STRIDE_O = output.stride(0)
     grid = (M,)
     cross_entropy_kernel[grid](
-        logits,
-        targets,
-        output,
-        M,
-        N,
-        tl.int64(stride_lm),
-        tl.int64(stride_ln),
-        tl.int64(stride_t),
-        tl.int64(stride_o),
-        BLOCK_SIZE=BLOCK_SIZE,
+        logits, targets, output, M, N,
+        STRIDE_M, STRIDE_N, STRIDE_T, STRIDE_O
     )
     return output
 """

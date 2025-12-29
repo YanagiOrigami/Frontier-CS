@@ -1,206 +1,143 @@
-import os
-import tarfile
-import gzip
-import bz2
-import lzma
+import typing
+
+
+def _build_huffman_table(bits: typing.List[int], huffval: typing.List[int]) -> typing.Dict[int, typing.Tuple[int, int]]:
+    # Based on JPEG spec / IJG implementation
+    huffsize = []
+    for l in range(1, 17):
+        for _ in range(bits[l - 1]):
+            huffsize.append(l)
+    huffsize.append(0)
+
+    huffcode = []
+    code = 0
+    k = 0
+    si = huffsize[0]
+    while True:
+        while huffsize[k] == si:
+            huffcode.append(code)
+            code += 1
+            k += 1
+        if huffsize[k] == 0:
+            break
+        while huffsize[k] != si:
+            code <<= 1
+            si += 1
+
+    table: typing.Dict[int, typing.Tuple[int, int]] = {}
+    for i, sym in enumerate(huffval):
+        table[sym] = (huffcode[i], huffsize[i])
+    return table
+
+
+def _build_minimal_jpeg() -> bytes:
+    parts = bytearray()
+
+    # SOI
+    parts += b"\xff\xd8"
+
+    # APP0 JFIF
+    parts += b"\xff\xe0"
+    parts += (16).to_bytes(2, "big")  # length (includes these 2 bytes)
+    parts += b"JFIF\x00"  # identifier
+    parts += b"\x01\x01"  # version 1.1
+    parts += b"\x00"      # units: 0 (no units)
+    parts += b"\x00\x01"  # X density
+    parts += b"\x00\x01"  # Y density
+    parts += b"\x00\x00"  # no thumbnail
+
+    # DQT (one 8-bit table, all ones)
+    qt = [1] * 64
+    parts += b"\xff\xdb"
+    parts += (2 + 1 + 64).to_bytes(2, "big")  # length
+    parts += b"\x00"  # Pq=0 (8-bit), Tq=0
+    parts += bytes(qt)
+
+    # SOF0 (baseline, 1x1, 1 component - grayscale)
+    parts += b"\xff\xc0"
+    parts += (2 + 1 + 2 + 2 + 1 + 3).to_bytes(2, "big")  # length
+    parts += b"\x08"              # precision = 8
+    parts += (1).to_bytes(2, "big")  # height
+    parts += (1).to_bytes(2, "big")  # width
+    parts += b"\x01"              # number of components
+    parts += b"\x01"              # component ID 1
+    parts += b"\x11"              # H=1, V=1
+    parts += b"\x00"              # uses quant table 0
+
+    # DHT for DC (minimal: only symbol 0, length 1 -> code '0')
+    bits_dc = [1] + [0] * 15  # one code of length 1
+    val_dc = [0]              # category 0
+    parts += b"\xff\xc4"
+    parts += (2 + 1 + 16 + len(val_dc)).to_bytes(2, "big")
+    parts += b"\x00"  # class=0 (DC), id=0
+    parts += bytes(bits_dc)
+    parts += bytes(val_dc)
+
+    # DHT for AC (minimal: only EOB symbol 0x00, length 2 -> code '00')
+    bits_ac = [0, 1] + [0] * 14  # one code of length 2
+    val_ac = [0x00]              # EOB
+    parts += b"\xff\xc4"
+    parts += (2 + 1 + 16 + len(val_ac)).to_bytes(2, "big")
+    parts += b"\x10"  # class=1 (AC), id=0
+    parts += bytes(bits_ac)
+    parts += bytes(val_ac)
+
+    # SOS
+    parts += b"\xff\xda"
+    parts += (2 + 1 + 2 + 3).to_bytes(2, "big")  # length
+    parts += b"\x01"  # number of components in scan
+    parts += b"\x01"  # component ID 1
+    parts += b"\x00"  # uses DC table 0, AC table 0
+    parts += b"\x00"  # Ss
+    parts += b"\x3f"  # Se
+    parts += b"\x00"  # Ah/Al
+
+    # Build Huffman tables to get codes
+    dc_table = _build_huffman_table(bits_dc, val_dc)
+    ac_table = _build_huffman_table(bits_ac, val_ac)
+    dc_code, dc_len = dc_table[0]       # DC category 0
+    eob_code, eob_len = ac_table[0x00]  # AC EOB
+
+    # Build bit sequence: DC(0) then EOB
+    bits_seq = []
+    for i in range(dc_len - 1, -1, -1):
+        bits_seq.append((dc_code >> i) & 1)
+    for i in range(eob_len - 1, -1, -1):
+        bits_seq.append((eob_code >> i) & 1)
+
+    # Pack bits into bytes with 1-padding and byte stuffing after 0xFF
+    cur = 0
+    bit_count = 0
+    data_bytes = bytearray()
+    for b in bits_seq:
+        cur = (cur << 1) | b
+        bit_count += 1
+        if bit_count == 8:
+            data_bytes.append(cur)
+            if cur == 0xFF:
+                data_bytes.append(0x00)
+            cur = 0
+            bit_count = 0
+
+    if bit_count > 0:
+        # Pad remaining bits with 1s as per JPEG spec
+        cur = (cur << (8 - bit_count)) | ((1 << (8 - bit_count)) - 1)
+        data_bytes.append(cur)
+        if cur == 0xFF:
+            data_bytes.append(0x00)
+
+    parts += data_bytes
+
+    # EOI
+    parts += b"\xff\xd9"
+
+    return bytes(parts)
 
 
 class Solution:
     def solve(self, src_path: str) -> bytes:
-        data = None
-
-        if os.path.isfile(src_path):
-            data = self._extract_from_tar(src_path)
-
-        if data is None and os.path.isdir(src_path):
-            data = self._extract_from_dir(src_path)
-
-        if data is None:
-            try:
-                with open(src_path, "rb") as f:
-                    data = f.read()
-            except Exception:
-                data = b"A"
-
-        if not isinstance(data, (bytes, bytearray)):
-            data = bytes(data)
-
-        if not data:
-            data = b"A"
-
-        return data
-
-    def _extract_from_tar(self, tar_path: str):
-        try:
-            with tarfile.open(tar_path, "r:*") as tf:
-                best_member = None
-                best_score = None
-
-                for m in tf.getmembers():
-                    if not m.isreg() or m.size <= 0:
-                        continue
-                    relpath = m.name.lstrip("./")
-                    score = self._score_file(relpath, m.size)
-                    if best_member is None or score > best_score:
-                        best_member = m
-                        best_score = score
-
-                if best_member is None:
-                    return None
-
-                f = tf.extractfile(best_member)
-                if f is None:
-                    return None
-                data = f.read()
-                return self._maybe_decompress(data)
-        except (tarfile.ReadError, FileNotFoundError, OSError):
-            return None
-
-    def _extract_from_dir(self, root_dir: str):
-        best_path = None
-        best_score = None
-
-        for dirpath, _, filenames in os.walk(root_dir):
-            for fname in filenames:
-                full_path = os.path.join(dirpath, fname)
-                try:
-                    size = os.path.getsize(full_path)
-                except OSError:
-                    continue
-                if size <= 0:
-                    continue
-                relpath = os.path.relpath(full_path, root_dir)
-                relpath_unix = relpath.replace(os.sep, "/")
-                score = self._score_file(relpath_unix, size)
-                if best_path is None or score > best_score:
-                    best_path = full_path
-                    best_score = score
-
-        if best_path is None:
-            return None
-
-        try:
-            with open(best_path, "rb") as f:
-                data = f.read()
-            return self._maybe_decompress(data)
-        except OSError:
-            return None
-
-    def _score_file(self, relpath: str, size: int) -> float:
-        # Normalize
-        path = relpath.replace("\\", "/").lower()
-        base = os.path.basename(path)
-
-        score = 0.0
-
-        # Strong bonus for exact known PoC length
-        if size == 2708:
-            score += 100.0
-
-        # Path-based bonuses
-        tokens = [
-            ("testcase", 80.0),
-            ("minimized", 70.0),
-            ("clusterfuzz", 50.0),
-            ("oss-fuzz", 50.0),
-            ("crash", 40.0),
-            ("poc", 40.0),
-            ("input", 25.0),
-            ("repro", 25.0),
-            ("seed", 15.0),
-            ("fuzz", 10.0),
-            ("id_", 10.0),
-            ("bug", 10.0),
-        ]
-        for tok, w in tokens:
-            if tok in path:
-                score += w
-
-        # Directory hints
-        dir_hints = ["/poc", "/repro", "/crash", "/testcase", "/seeds", "/corpus", "/inputs", "/bugs"]
-        for hint in dir_hints:
-            if hint in path:
-                score += 10.0
-                break
-
-        # Prefer shallow paths
-        depth = path.count("/")
-        if depth <= 1:
-            score += 5.0
-        elif depth <= 3:
-            score += 2.0
-
-        # Extension-based adjustments
-        base_name = base
-        ext = ""
-        if "." in base_name:
-            ext = os.path.splitext(base_name)[1]
-
-        image_exts_jpeg = {".jpg", ".jpeg", ".jpe", ".jfif"}
-        image_exts_other = {".png", ".gif", ".bmp", ".tif", ".tiff", ".webp"}
-        compressed_exts = {".gz", ".bz2", ".xz", ".lzma", ".zip"}
-
-        if ext in image_exts_jpeg:
-            score += 25.0
-        elif ext in image_exts_other:
-            score += 20.0
-
-        if ext in compressed_exts:
-            score -= 5.0
-
-        # Penalize obvious source/text/build scripts/binaries
-        bad_exts = {
-            ".c", ".cc", ".cpp", ".cxx", ".h", ".hpp", ".hh", ".inc",
-            ".py", ".sh", ".bat", ".ps1",
-            ".md", ".txt", ".rst",
-            ".html", ".htm", ".xml", ".json", ".yml", ".yaml", ".toml",
-            ".java", ".class",
-            ".o", ".obj", ".a", ".lib", ".so", ".dylib", ".dll", ".exe",
-            ".jar",
-        }
-        if base_name == "makefile" or ext in bad_exts:
-            score -= 120.0
-
-        # Size heuristic: prefer reasonably small files
-        if size > 10_000_000:
-            score -= 120.0
-        elif size > 1_000_000:
-            score -= 40.0
-        elif size > 100_000:
-            score -= 20.0
-
-        # Closeness to expected PoC size
-        if size > 0:
-            diff_ratio = abs(size - 2708) / 2708.0
-            size_score = max(0.0, 30.0 - diff_ratio * 30.0)
-            score += size_score
-
-        return score
-
-    def _maybe_decompress(self, data: bytes) -> bytes:
-        # Try to transparently decompress common formats based on magic bytes
-        if not data or len(data) < 4:
-            return data
-
-        # gzip
-        if data[:2] == b"\x1f\x8b":
-            try:
-                return gzip.decompress(data)
-            except Exception:
-                return data
-
-        # xz
-        if data[:6] == b"\xfd7zXZ\x00":
-            try:
-                return lzma.decompress(data)
-            except Exception:
-                return data
-
-        # bzip2
-        if data[:3] == b"BZh":
-            try:
-                return bz2.decompress(data)
-            except Exception:
-                return data
-
-        return data
+        # Prefix a few configuration bytes to handle fuzzers that
+        # interpret initial bytes as parameters before the JPEG data.
+        jpeg = _build_minimal_jpeg()
+        prefix = b"\x00\x00\x00\x00"
+        return prefix + jpeg

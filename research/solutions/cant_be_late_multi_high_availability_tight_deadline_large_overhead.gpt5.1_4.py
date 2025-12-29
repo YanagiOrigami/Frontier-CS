@@ -6,12 +6,20 @@ from sky_spot.utils import ClusterType
 
 
 class Solution(MultiRegionStrategy):
-    """Multi-region scheduling strategy with slack-aware Spot/On-Demand selection."""
+    """Your multi-region scheduling strategy."""
 
-    NAME = "my_strategy"
+    NAME = "my_strategy"  # REQUIRED: unique identifier
 
     def solve(self, spec_path: str) -> "Solution":
-        """Initialize the solution from spec_path config."""
+        """
+        Initialize the solution from spec_path config.
+
+        The spec file contains:
+        - deadline: deadline in hours
+        - duration: task duration in hours
+        - overhead: restart overhead in hours
+        - trace_files: list of trace file paths (one per region)
+        """
         with open(spec_path) as f:
             config = json.load(f)
 
@@ -23,37 +31,75 @@ class Solution(MultiRegionStrategy):
         )
         super().__init__(args)
 
-        # Policy parameters (all in seconds).
-        # We work with slack B = time_left - (remaining_work + remaining_restart_overhead).
-        # B_LOW  : when slack falls below this, permanently switch to On-Demand only.
-        # B_HIGH : when slack below this, avoid idling when Spot is unavailable (use OD),
-        #          but still use Spot when available.
-        # Must ensure B_LOW >= restart_overhead for deadline safety.
-        self.buffer_low = 2.0 * self.restart_overhead
-        self.buffer_high = 4.0 * self.restart_overhead
-        if self.buffer_high < self.buffer_low:
-            self.buffer_high = self.buffer_low
+        # Initialize internal state
+        self.lock_to_od = False
+        self._progress_sum = 0.0
+        self._last_td_len = 0
 
-        # Once we lock into On-Demand, we never go back to Spot.
-        self._lock_on_demand = False
+        # Extract scalar versions of key parameters (in seconds)
+        self._task_duration_scalar = self._extract_scalar_attr("task_duration")
+        self._deadline_scalar = self._extract_scalar_attr("deadline")
+        self._restart_overhead_scalar = self._extract_scalar_attr("restart_overhead")
+
+        base_slack = max(0.0, self._deadline_scalar - self._task_duration_scalar)
+        self._initial_slack = base_slack
+
+        if base_slack <= 0.0:
+            commit_slack = 0.0
+        else:
+            # Base commit slack: 25% of initial slack, capped at 3 hours
+            commit_slack = 0.25 * base_slack
+            max_commit = 3.0 * 3600.0
+            if commit_slack > max_commit:
+                commit_slack = max_commit
+            # Ensure room for multiple restart overheads
+            min_commit = 4.0 * self._restart_overhead_scalar
+            if commit_slack < min_commit:
+                commit_slack = min_commit
+            # Don't exceed actual initial slack
+            if commit_slack > base_slack:
+                commit_slack = base_slack
+
+        self.commit_slack = commit_slack
 
         return self
 
-    def _compute_slack(self) -> float:
-        """Compute current slack B (seconds)."""
-        elapsed = self.env.elapsed_seconds
-        time_left = self.deadline - elapsed
-        if time_left < 0.0:
-            time_left = 0.0
+    def _extract_scalar_attr(self, name: str) -> float:
+        """Helper to robustly extract scalar seconds value from strategy attributes."""
+        val = getattr(self, name, 0.0)
+        if isinstance(val, (list, tuple)):
+            if val:
+                val = val[0]
+            else:
+                val = 0.0
+        try:
+            return float(val)
+        except Exception:
+            # Fallbacks if something unexpected happens
+            if name == "task_duration" and hasattr(self, "task_duration_hours"):
+                hrs = getattr(self, "task_duration_hours", [0.0])
+                if isinstance(hrs, (list, tuple)) and hrs:
+                    return float(hrs[0]) * 3600.0
+                return float(hrs) * 3600.0
+            if name == "deadline" and hasattr(self, "deadline_hours"):
+                return float(getattr(self, "deadline_hours", 0.0)) * 3600.0
+            if name == "restart_overhead" and hasattr(self, "restart_overhead_hours"):
+                hrs = getattr(self, "restart_overhead_hours", [0.0])
+                if isinstance(hrs, (list, tuple)) and hrs:
+                    return float(hrs[0]) * 3600.0
+                return float(hrs) * 3600.0
+            return 0.0
 
-        done = sum(self.task_done_time) if self.task_done_time else 0.0
-        remaining_work = self.task_duration - done
-        if remaining_work < 0.0:
-            remaining_work = 0.0
-
-        overhead_remaining = getattr(self, "remaining_restart_overhead", 0.0)
-        remaining_total = remaining_work + overhead_remaining
-        return time_left - remaining_total
+    def _update_progress_sum(self) -> None:
+        """Incrementally track total completed work time."""
+        td = self.task_done_time
+        current_len = len(td)
+        if current_len > self._last_td_len:
+            s = 0.0
+            for v in td[self._last_td_len:]:
+                s += v
+            self._progress_sum += s
+            self._last_td_len = current_len
 
     def _step(self, last_cluster_type: ClusterType, has_spot: bool) -> ClusterType:
         """
@@ -61,33 +107,50 @@ class Solution(MultiRegionStrategy):
 
         Returns: ClusterType.SPOT, ClusterType.ON_DEMAND, or ClusterType.NONE
         """
+        # Defensive initialization (in case solve wasn't called for some reason)
+        if not hasattr(self, "_progress_sum"):
+            self._progress_sum = 0.0
+            self._last_td_len = 0
+        if not hasattr(self, "_task_duration_scalar"):
+            self._task_duration_scalar = self._extract_scalar_attr("task_duration")
+        if not hasattr(self, "_deadline_scalar"):
+            self._deadline_scalar = self._extract_scalar_attr("deadline")
+        if not hasattr(self, "_restart_overhead_scalar"):
+            self._restart_overhead_scalar = self._extract_scalar_attr("restart_overhead")
+        if not hasattr(self, "lock_to_od"):
+            self.lock_to_od = False
+        if not hasattr(self, "commit_slack"):
+            # Conservative default if not set in solve
+            self.commit_slack = 4.0 * self._restart_overhead_scalar
 
-        # If task already done (shouldn't usually be called), do nothing.
-        done = sum(self.task_done_time) if self.task_done_time else 0.0
-        if done >= self.task_duration:
+        # Update progress tracking
+        self._update_progress_sum()
+
+        work_remaining = self._task_duration_scalar - self._progress_sum
+        if work_remaining <= 0.0:
+            # Task already complete; no need to run more
             return ClusterType.NONE
 
-        # Compute current slack.
-        slack = self._compute_slack()
+        elapsed = self.env.elapsed_seconds
+        time_remaining = self._deadline_scalar - elapsed
 
-        # If we've already committed to On-Demand, keep using it.
-        if self._lock_on_demand:
+        # Slack ignoring future overhead
+        slack = time_remaining - work_remaining
+
+        # Account for currently pending restart overhead as "extra work"
+        remaining_overhead = getattr(self, "remaining_restart_overhead", 0.0)
+        effective_slack = slack - remaining_overhead
+
+        # If we're running out of slack, permanently switch to on-demand
+        if (not self.lock_to_od) and (effective_slack <= self.commit_slack or effective_slack <= 0.0):
+            self.lock_to_od = True
+
+        if self.lock_to_od:
             return ClusterType.ON_DEMAND
 
-        # If slack is very small or negative, immediately lock to On-Demand.
-        if slack <= 0.0 or slack <= self.buffer_low:
-            self._lock_on_demand = True
-            return ClusterType.ON_DEMAND
-
-        # Moderate slack zone: avoid idling, but still favor Spot when available.
-        if slack <= self.buffer_high:
-            if has_spot:
-                return ClusterType.SPOT
-            else:
-                return ClusterType.ON_DEMAND
-
-        # Comfortable slack zone: aggressively use Spot; idle when Spot unavailable.
+        # Opportunistic spot usage while we still have comfortable slack
         if has_spot:
             return ClusterType.SPOT
-        else:
-            return ClusterType.NONE
+
+        # Fallback to on-demand when spot is unavailable
+        return ClusterType.ON_DEMAND

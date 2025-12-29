@@ -1,38 +1,6 @@
 import torch
 import torch.nn as nn
 import torch.optim as optim
-import copy
-
-# A deep MLP architecture designed to maximize parameter usage within the 2.5M limit
-# while providing high capacity for the learning task.
-class DeepMLP(nn.Module):
-    def __init__(self, input_dim: int, num_classes: int):
-        super().__init__()
-        # Layer widths were carefully chosen to be just under the 2,500,000 parameter limit.
-        # Total trainable parameters: ~2,490,428
-        w1, w2, w3 = 1440, 990, 450
-        
-        self.layers = nn.Sequential(
-            nn.Linear(input_dim, w1),
-            nn.BatchNorm1d(w1),
-            nn.SiLU(), # Swish activation, often performs better than ReLU/GELU
-            nn.Dropout(0.4), # Tapered dropout for stronger regularization in earlier layers
-
-            nn.Linear(w1, w2),
-            nn.BatchNorm1d(w2),
-            nn.SiLU(),
-            nn.Dropout(0.3),
-
-            nn.Linear(w2, w3),
-            nn.BatchNorm1d(w3),
-            nn.SiLU(),
-            nn.Dropout(0.2),
-
-            nn.Linear(w3, num_classes)
-        )
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.layers(x)
 
 class Solution:
     def solve(self, train_loader, val_loader, metadata: dict = None) -> torch.nn.Module:
@@ -55,72 +23,114 @@ class Solution:
         Returns:
             Trained torch.nn.Module ready for evaluation
         """
-        device = torch.device(metadata.get("device", "cpu"))
+
+        device = torch.device(metadata["device"])
         input_dim = metadata["input_dim"]
         num_classes = metadata["num_classes"]
 
-        model = DeepMLP(input_dim, num_classes).to(device)
-        
-        # Hyperparameters tuned for this specific problem setting
-        EPOCHS = 300  # A high number, but early stopping will find the optimal point
-        MAX_LR = 1.2e-3
-        WEIGHT_DECAY = 1.5e-2 # Strong weight decay for regularization on a small dataset
-        EARLY_STOPPING_PATIENCE = 30 # Ample patience to ensure convergence
+        # --- Model Definition ---
+        # A ResNet-style block for MLPs
+        class ResBlock(nn.Module):
+            def __init__(self, dim, dropout_p=0.3):
+                super().__init__()
+                self.block = nn.Sequential(
+                    nn.Linear(dim, dim),
+                    nn.BatchNorm1d(dim),
+                    nn.ReLU(inplace=True),
+                    nn.Dropout(p=dropout_p),
+                    nn.Linear(dim, dim),
+                    nn.BatchNorm1d(dim)
+                )
+                self.relu = nn.ReLU(inplace=True)
 
-        criterion = nn.CrossEntropyLoss()
-        optimizer = optim.AdamW(model.parameters(), lr=MAX_LR, weight_decay=WEIGHT_DECAY)
-        
-        # OneCycleLR is a powerful scheduler that helps converge faster and to a better minimum
-        scheduler = optim.lr_scheduler.OneCycleLR(
-            optimizer,
-            max_lr=MAX_LR,
-            epochs=EPOCHS,
-            steps_per_epoch=len(train_loader),
-            pct_start=0.25 # Shorter warmup phase
-        )
+            def forward(self, x):
+                identity = x
+                out = self.block(x)
+                out += identity
+                out = self.relu(out)
+                return out
 
-        best_val_loss = float('inf')
+        # The main model architecture, designed to be close to the 2.5M param limit
+        class HighCapacityMLP(nn.Module):
+            def __init__(self, input_dim, num_classes, hidden_dim=990, dropout_p=0.3):
+                super().__init__()
+                self.input_layer = nn.Sequential(
+                    nn.Linear(input_dim, hidden_dim),
+                    nn.BatchNorm1d(hidden_dim),
+                    nn.ReLU(inplace=True),
+                    nn.Dropout(p=dropout_p)
+                )
+                
+                self.res_block = ResBlock(hidden_dim, dropout_p=dropout_p)
+                
+                self.output_layer = nn.Linear(hidden_dim, num_classes)
+
+            def forward(self, x):
+                x = self.input_layer(x)
+                x = self.res_block(x)
+                x = self.output_layer(x)
+                return x
+        
+        model = HighCapacityMLP(input_dim, num_classes).to(device)
+
+        # --- Hyperparameters and Training Setup ---
+        epochs = 300
+        learning_rate = 3e-4
+        weight_decay = 1e-2
+        label_smoothing = 0.1
+        early_stopping_patience = 35
+
+        criterion = nn.CrossEntropyLoss(label_smoothing=label_smoothing)
+        optimizer = optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
+        scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs, eta_min=1e-6)
+
+        best_val_acc = 0.0
         epochs_no_improve = 0
         best_model_state = None
 
-        for epoch in range(EPOCHS):
+        # --- Training Loop ---
+        for epoch in range(epochs):
             # Training phase
             model.train()
             for inputs, targets in train_loader:
                 inputs, targets = inputs.to(device), targets.to(device)
-
+                
                 optimizer.zero_grad()
                 outputs = model(inputs)
                 loss = criterion(outputs, targets)
                 loss.backward()
                 optimizer.step()
-                scheduler.step()
 
             # Validation phase
             model.eval()
-            current_val_loss = 0.0
+            val_correct = 0
+            val_total = 0
             with torch.no_grad():
                 for inputs, targets in val_loader:
                     inputs, targets = inputs.to(device), targets.to(device)
                     outputs = model(inputs)
-                    loss = criterion(outputs, targets)
-                    current_val_loss += loss.item()
+                    _, predicted = torch.max(outputs.data, 1)
+                    val_total += targets.size(0)
+                    val_correct += (predicted == targets).sum().item()
+            
+            current_val_acc = val_correct / val_total
 
-            avg_val_loss = current_val_loss / len(val_loader)
-
-            # Early stopping logic: save the best model and stop if no improvement
-            if avg_val_loss < best_val_loss:
-                best_val_loss = avg_val_loss
+            # Check for improvement and update best model state
+            if current_val_acc > best_val_acc:
+                best_val_acc = current_val_acc
                 epochs_no_improve = 0
-                # Deepcopy the state_dict to ensure it's not a reference
-                best_model_state = copy.deepcopy(model.state_dict())
+                # Use a deepcopy to prevent the state from being modified during continued training
+                best_model_state = {k: v.clone() for k, v in model.state_dict().items()}
             else:
                 epochs_no_improve += 1
-
-            if epochs_no_improve >= EARLY_STOPPING_PATIENCE:
+            
+            # Early stopping
+            if epochs_no_improve >= early_stopping_patience:
                 break
-        
-        # Load the best performing model state before returning
+            
+            scheduler.step()
+
+        # Load the best performing model
         if best_model_state:
             model.load_state_dict(best_model_state)
 

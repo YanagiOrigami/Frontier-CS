@@ -1,168 +1,176 @@
 import math
+import time
 import random
-import copy
 import numpy as np
 import torch
 import torch.nn as nn
-import torch.optim as optim
+import torch.nn.functional as F
 
 
-class ResidualBottleneckBlock(nn.Module):
-    def __init__(self, width, bottleneck, dropout=0.1, use_bn=True):
+def count_parameters(model: nn.Module) -> int:
+    return sum(p.numel() for p in model.parameters() if p.requires_grad)
+
+
+class MLPResBlock(nn.Module):
+    def __init__(self, dim: int, hidden_mult: float = 2.0, dropout: float = 0.1, activation: str = "gelu"):
         super().__init__()
-        self.use_bn = use_bn
-        self.bn1 = nn.BatchNorm1d(width) if use_bn else nn.Identity()
-        self.bn2 = nn.BatchNorm1d(bottleneck) if use_bn else nn.Identity()
-        self.fc1 = nn.Linear(width, bottleneck)
-        self.act = nn.GELU()
-        self.fc2 = nn.Linear(bottleneck, width)
-        self.drop = nn.Dropout(dropout) if dropout and dropout > 0 else nn.Identity()
+        self.norm = nn.LayerNorm(dim)
+        hidden_dim = int(dim * hidden_mult)
+        self.fc1 = nn.Linear(dim, hidden_dim)
+        self.fc2 = nn.Linear(hidden_dim, dim)
+        self.drop1 = nn.Dropout(dropout)
+        self.drop2 = nn.Dropout(dropout)
+        if activation == "relu":
+            self.act = nn.ReLU(inplace=True)
+        elif activation == "silu":
+            self.act = nn.SiLU(inplace=True)
+        else:
+            self.act = nn.GELU()
 
     def forward(self, x):
-        residual = x
-        y = self.bn1(x)
+        y = self.norm(x)
         y = self.fc1(y)
         y = self.act(y)
-        y = self.bn2(y)
+        y = self.drop1(y)
         y = self.fc2(y)
-        y = self.drop(y)
-        return residual + y
+        y = self.drop2(y)
+        return x + y
 
 
-class MLPClassifier(nn.Module):
-    def __init__(self, input_dim, num_classes, width=640, bottleneck=256, num_blocks=2, dropout=0.1, use_bn=True, input_bn=True):
+class MLPNet(nn.Module):
+    def __init__(self, in_dim: int, num_classes: int, dim: int = 320, num_blocks: int = 2, hidden_mult: float = 2.0, dropout: float = 0.1):
         super().__init__()
-        self.input_bn = nn.BatchNorm1d(input_dim) if input_bn else nn.Identity()
-        self.stem = nn.Linear(input_dim, width)
+        self.in_dim = in_dim
+        self.dim = dim
+        if in_dim != dim:
+            self.proj = nn.Linear(in_dim, dim)
+        else:
+            self.proj = nn.Identity()
         blocks = []
         for _ in range(num_blocks):
-            blocks.append(ResidualBottleneckBlock(width, bottleneck, dropout=dropout, use_bn=use_bn))
+            blocks.append(MLPResBlock(dim, hidden_mult=hidden_mult, dropout=dropout, activation="gelu"))
         self.blocks = nn.Sequential(*blocks)
-        self.out_bn = nn.BatchNorm1d(width) if use_bn else nn.Identity()
-        self.out_act = nn.GELU()
-        self.out_drop = nn.Dropout(dropout) if dropout and dropout > 0 else nn.Identity()
-        self.head = nn.Linear(width, num_classes)
-        self.reset_parameters()
-
-    def reset_parameters(self):
-        for m in self.modules():
-            if isinstance(m, nn.Linear):
-                nn.init.xavier_uniform_(m.weight)
-                if m.bias is not None:
-                    nn.init.zeros_(m.bias)
-            elif isinstance(m, nn.BatchNorm1d):
-                nn.init.ones_(m.weight)
-                nn.init.zeros_(m.bias)
+        self.norm_final = nn.LayerNorm(dim)
+        self.head = nn.Linear(dim, num_classes)
 
     def forward(self, x):
-        x = x.float()
-        x = self.input_bn(x)
-        x = self.stem(x)
+        x = self.proj(x)
         x = self.blocks(x)
-        x = self.out_bn(x)
-        x = self.out_act(x)
-        x = self.out_drop(x)
+        x = self.norm_final(x)
         x = self.head(x)
         return x
 
 
-def count_trainable_parameters(model: nn.Module) -> int:
-    return sum(p.numel() for p in model.parameters() if p.requires_grad)
-
-
-def cosine_warmup_lambda(epoch, total_epochs, warmup_epochs):
-    if epoch < warmup_epochs:
-        return float(epoch + 1) / float(max(1, warmup_epochs))
-    progress = (epoch - warmup_epochs) / float(max(1, total_epochs - warmup_epochs))
-    return 0.5 * (1.0 + math.cos(math.pi * progress))
-
-
-def evaluate(model, data_loader, device):
+def evaluate_accuracy(model: nn.Module, loader, device: torch.device) -> float:
     model.eval()
     correct = 0
     total = 0
     with torch.no_grad():
-        for inputs, targets in data_loader:
+        for inputs, targets in loader:
             inputs = inputs.to(device)
             targets = targets.to(device)
             outputs = model(inputs)
             preds = outputs.argmax(dim=1)
             correct += (preds == targets).sum().item()
             total += targets.numel()
-    acc = correct / total if total > 0 else 0.0
-    return acc
+    return correct / total if total > 0 else 0.0
+
+
+def mixup_data(x, y, alpha: float):
+    if alpha <= 0.0 or x.size(0) < 2:
+        return x, y, y, 1.0
+    lam = np.random.beta(alpha, alpha)
+    index = torch.randperm(x.size(0), device=x.device)
+    mixed_x = lam * x + (1 - lam) * x[index, :]
+    y_a, y_b = y, y[index]
+    return mixed_x, y_a, y_b, float(lam)
 
 
 class Solution:
-    def _select_architecture(self, input_dim, num_classes, param_limit):
-        # Search for the largest width under parameter limit using 2 residual bottleneck blocks
-        candidate_widths = [768, 736, 704, 672, 640, 608, 576, 544, 512, 480, 448, 416, 384]
-        ratios = [0.5, 0.4, 0.33, 0.25]
-        for w in candidate_widths:
-            for r in ratios:
-                b = max(64, int(round((w * r) / 32.0)) * 32)
-                model = MLPClassifier(input_dim, num_classes, width=w, bottleneck=b, num_blocks=2, dropout=0.1, use_bn=True, input_bn=True)
-                params = count_trainable_parameters(model)
-                if params <= param_limit:
-                    return w, b, 2
-        # Fallback conservative architecture
-        w = 512
-        b = 192
-        model = MLPClassifier(input_dim, num_classes, width=w, bottleneck=b, num_blocks=2, dropout=0.1, use_bn=True, input_bn=True)
-        if count_trainable_parameters(model) <= param_limit:
-            return w, b, 2
-        # Last resort - reduce blocks
-        for w in [512, 480, 448, 416, 384]:
-            b = max(64, int(round((w * 0.33) / 32.0)) * 32)
-            model = MLPClassifier(input_dim, num_classes, width=w, bottleneck=b, num_blocks=1, dropout=0.1, use_bn=True, input_bn=True)
-            if count_trainable_parameters(model) <= param_limit:
-                return w, b, 1
-        # Minimal model
-        return 384, 128, 1
-
     def solve(self, train_loader, val_loader, metadata: dict = None) -> torch.nn.Module:
         if metadata is None:
             metadata = {}
         input_dim = int(metadata.get("input_dim", 384))
         num_classes = int(metadata.get("num_classes", 128))
         param_limit = int(metadata.get("param_limit", 1_000_000))
-        device = torch.device(metadata.get("device", "cpu"))
+        device_str = metadata.get("device", "cpu")
+        device = torch.device(device_str if torch.cuda.is_available() and device_str != "cpu" else "cpu")
+        train_samples = int(metadata.get("train_samples", 2048))
+        # Choose architecture under param budget
+        # Prefer deeper (2 blocks) with width as large as possible
+        chosen_model = None
+        chosen_dim = None
+        chosen_blocks = None
 
-        seed = 42
-        random.seed(seed)
-        np.random.seed(seed)
-        torch.manual_seed(seed)
+        def build_and_check(dim: int, blocks: int, dropout: float):
+            model = MLPNet(in_dim=input_dim, num_classes=num_classes, dim=dim, num_blocks=blocks, hidden_mult=2.0, dropout=dropout)
+            return model, count_parameters(model)
 
-        width, bottleneck, num_blocks = self._select_architecture(input_dim, num_classes, param_limit)
-        model = MLPClassifier(input_dim, num_classes, width=width, bottleneck=bottleneck, num_blocks=num_blocks, dropout=0.1, use_bn=True, input_bn=True).to(device)
+        # Search strategy: try 2 blocks with descending dims; then 1 block
+        dims_list = [512, 480, 448, 432, 416, 400, 384, 368, 352, 336, 320, 304, 288, 272, 256, 240, 224, 208, 192]
+        found = False
+        for blocks in [3, 2, 1]:
+            for dim in dims_list:
+                # Use modest dropout; more dropout when dim smaller to regularize less capacity
+                dropout = 0.12 if dim >= 320 else 0.15
+                model, params = build_and_check(dim, blocks, dropout)
+                if params <= param_limit:
+                    chosen_model = model
+                    chosen_dim = dim
+                    chosen_blocks = blocks
+                    found = True
+                    break
+            if found:
+                break
 
-        # Ensure parameter constraint
-        if count_trainable_parameters(model) > param_limit:
-            # As a hard safety fallback, use a simpler baseline if selection somehow failed
-            model = nn.Sequential(
+        if chosen_model is None:
+            # Fallback minimal model
+            chosen_model = nn.Sequential(
                 nn.Linear(input_dim, 512),
-                nn.GELU(),
-                nn.BatchNorm1d(512),
+                nn.ReLU(),
                 nn.Linear(512, num_classes),
-            ).to(device)
+            )
 
-        epochs = 160
-        warmup_epochs = max(5, epochs // 16)
-        lr = 3e-3
-        weight_decay = 2e-2
-        optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
-        scheduler = optim.lr_scheduler.LambdaLR(
-            optimizer, lr_lambda=lambda e: cosine_warmup_lambda(e, epochs, warmup_epochs)
-        )
+        model = chosen_model.to(device)
 
-        criterion = nn.CrossEntropyLoss(label_smoothing=0.05)
-
-        best_state = copy.deepcopy(model.state_dict())
-        best_val_acc = 0.0
-
+        # Training setup
+        # Hyperparameters
+        epochs = 160 if train_samples <= 4096 else 120
+        lr_max = 0.003 if chosen_dim is None or chosen_dim >= 320 else 0.004
+        weight_decay = 5e-4
+        label_smoothing = 0.05
+        grad_clip = 1.0
+        use_mixup = True
         mixup_alpha = 0.2
-        mixup_prob = 0.4
-        mixup_until = int(epochs * 0.6)
+        mixup_prob = 0.6
+
+        optimizer = torch.optim.AdamW(model.parameters(), lr=lr_max, weight_decay=weight_decay)
+        steps_per_epoch = max(1, len(train_loader))
+        scheduler = torch.optim.lr_scheduler.OneCycleLR(
+            optimizer,
+            max_lr=lr_max,
+            epochs=epochs,
+            steps_per_epoch=steps_per_epoch,
+            pct_start=0.15,
+            anneal_strategy='cos',
+            div_factor=20.0,
+            final_div_factor=1000.0,
+        )
+        criterion = nn.CrossEntropyLoss(label_smoothing=label_smoothing)
+
+        # Early stopping and checkpointing
+        best_val_acc = -1.0
+        best_state = None
+        patience = 25
+        epochs_no_improve = 0
+
+        # Seed for reproducibility
+        torch.manual_seed(1337)
+        random.seed(1337)
+        np.random.seed(1337)
+
+        start_time = time.time()
+        time_limit = 3400.0  # seconds, to be safe under 1 hour total
 
         for epoch in range(epochs):
             model.train()
@@ -170,32 +178,41 @@ class Solution:
                 inputs = inputs.to(device)
                 targets = targets.to(device)
 
-                apply_mixup = (epoch < mixup_until) and (random.random() < mixup_prob) and (inputs.size(0) > 1)
-                if apply_mixup:
-                    lam = np.random.beta(mixup_alpha, mixup_alpha)
-                    index = torch.randperm(inputs.size(0), device=device)
-                    mixed_inputs = lam * inputs + (1 - lam) * inputs[index, :]
-                    y_a, y_b = targets, targets[index]
-                    outputs = model(mixed_inputs)
-                    loss = lam * criterion(outputs, y_a) + (1 - lam) * criterion(outputs, y_b)
+                if use_mixup and (epoch < int(0.75 * epochs)) and (random.random() < mixup_prob):
+                    mixed_x, y_a, y_b, lam = mixup_data(inputs, targets, alpha=mixup_alpha)
+                    outputs = model(mixed_x)
+                    loss = lam * criterion(outputs, y_a) + (1.0 - lam) * criterion(outputs, y_b)
                 else:
                     outputs = model(inputs)
                     loss = criterion(outputs, targets)
 
-                optimizer.zero_grad()
+                optimizer.zero_grad(set_to_none=True)
                 loss.backward()
-                nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                if grad_clip is not None and grad_clip > 0:
+                    nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
                 optimizer.step()
+                scheduler.step()
 
-            scheduler.step()
+                if (time.time() - start_time) > time_limit:
+                    break
 
             # Validation
-            val_acc = evaluate(model, val_loader, device)
+            val_acc = evaluate_accuracy(model, val_loader, device)
             if val_acc > best_val_acc:
                 best_val_acc = val_acc
-                best_state = copy.deepcopy(model.state_dict())
+                best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+                epochs_no_improve = 0
+            else:
+                epochs_no_improve += 1
 
-        model.load_state_dict(best_state)
-        model.to(device)
+            if epochs_no_improve >= patience or (time.time() - start_time) > time_limit:
+                break
+
+        # Load best weights
+        if best_state is not None:
+            model.load_state_dict(best_state)
+
+        # Ensure model on CPU for evaluator if device was something else
+        model.to(torch.device("cpu"))
         model.eval()
         return model

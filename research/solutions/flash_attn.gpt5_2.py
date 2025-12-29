@@ -1,175 +1,172 @@
+import math
 import os
 import textwrap
 
 class Solution:
     def solve(self, spec_path: str = None) -> dict:
         code = textwrap.dedent("""
-            import torch
-            import triton
-            import triton.language as tl
+        import math
+        import torch
+        import triton
+        import triton.language as tl
 
-            @triton.jit
-            def _flash_attn_fwd_kernel(
-                Q_ptr, K_ptr, V_ptr, O_ptr,
-                Z, H, M, N, D, Dv,
-                stride_qz, stride_qh, stride_qm, stride_qd,
-                stride_kz, stride_kh, stride_kn, stride_kd,
-                stride_vz, stride_vh, stride_vn, stride_vd,
-                stride_oz, stride_oh, stride_om, stride_od,
-                sm_scale: tl.float32,
-                causal: tl.constexpr,
-                BLOCK_M: tl.constexpr,
-                BLOCK_N: tl.constexpr,
-                BLOCK_DMODEL: tl.constexpr,
-                BLOCK_DVALUE: tl.constexpr,
-            ):
-                pid_m = tl.program_id(0)
-                pid_bh = tl.program_id(1)
+        @triton.jit
+        def _flash_attn_fwd_kernel(
+            Q_ptr, K_ptr, V_ptr, Out_ptr,
+            stride_qz, stride_qh, stride_qm, stride_qd,
+            stride_kz, stride_kh, stride_kn, stride_kd,
+            stride_vz, stride_vh, stride_vn, stride_vd,
+            stride_oz, stride_oh, stride_om, stride_od,
+            Z, H, M, N,
+            Dq, Dv,
+            sm_scale,
+            BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
+            D_HEAD: tl.constexpr, D_VALUE: tl.constexpr,
+            CAUSAL: tl.constexpr
+        ):
+            pid_m = tl.program_id(axis=0)
+            pid_zh = tl.program_id(axis=1)
 
-                h = pid_bh % H
-                z = pid_bh // H
+            z = pid_zh // H
+            h = pid_zh % H
 
-                offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
-                offs_n = tl.arange(0, BLOCK_N)
-                offs_d = tl.arange(0, BLOCK_DMODEL)
-                offs_dv = tl.arange(0, BLOCK_DVALUE)
+            offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+            mask_m = offs_m < M
 
-                row_mask = offs_m < M
+            offs_dq = tl.arange(0, D_HEAD)
+            mask_dq = offs_dq < Dq
 
-                # Base pointers
-                Q_ptr_zh = Q_ptr + z * stride_qz + h * stride_qh
-                K_ptr_zh = K_ptr + z * stride_kz + h * stride_kh
-                V_ptr_zh = V_ptr + z * stride_vz + h * stride_vh
-                O_ptr_zh = O_ptr + z * stride_oz + h * stride_oh
+            offs_dv = tl.arange(0, D_VALUE)
+            mask_dv = offs_dv < Dv
 
-                # Load Q block [BM, D]
-                q_ptrs = Q_ptr_zh + (offs_m[:, None] * stride_qm + offs_d[None, :] * stride_qd)
-                q = tl.load(q_ptrs, mask=(row_mask[:, None] & (offs_d[None, :] < D)), other=0.0).to(tl.float32)
+            q_ptrs = Q_ptr + z * stride_qz + h * stride_qh + offs_m[:, None] * stride_qm + offs_dq[None, :] * stride_qd
+            q = tl.load(q_ptrs, mask=mask_m[:, None] & mask_dq[None, :], other=0.0).to(tl.float32)
 
-                # Initialize streaming softmax state
-                m_i = tl.full((BLOCK_M,), -float('inf'), tl.float32)
-                l_i = tl.zeros((BLOCK_M,), tl.float32)
-                acc = tl.zeros((BLOCK_M, BLOCK_DVALUE), tl.float32)
+            m_i = tl.full((BLOCK_M,), -float('inf'), dtype=tl.float32)
+            l_i = tl.zeros((BLOCK_M,), dtype=tl.float32)
+            o = tl.zeros((BLOCK_M, D_VALUE), dtype=tl.float32)
 
-                # Iterate over K/V blocks
-                n_start = 0
-                while n_start < N:
-                    cols = n_start + offs_n
-                    col_mask = cols < N
+            k_base_ptr = K_ptr + z * stride_kz + h * stride_kh
+            v_base_ptr = V_ptr + z * stride_vz + h * stride_vh
 
-                    # Load K block [BN, D]
-                    k_ptrs = K_ptr_zh + (cols[:, None] * stride_kn + offs_d[None, :] * stride_kd)
-                    k = tl.load(k_ptrs, mask=(col_mask[:, None] & (offs_d[None, :] < D)), other=0.0).to(tl.float32)
+            for start_n in range(0, N, BLOCK_N):
+                offs_n = start_n + tl.arange(0, BLOCK_N)
+                mask_n = offs_n < N
 
-                    # Compute QK^T
-                    qk = tl.dot(q, tl.trans(k)) * sm_scale
+                k_ptrs = k_base_ptr + offs_n[:, None] * stride_kn + offs_dq[None, :] * stride_kd
+                k = tl.load(k_ptrs, mask=mask_n[:, None] & mask_dq[None, :], other=0.0).to(tl.float32)
 
-                    # Valid mask for attention
-                    valid = (row_mask[:, None] & col_mask[None, :])
-                    if causal:
-                        valid = valid & (offs_m[:, None] >= cols[None, :])
+                s = tl.dot(q, tl.trans(k)) * sm_scale
 
-                    # Apply mask with -inf to invalid positions
-                    qk = tl.where(valid, qk, -float('inf'))
+                # Validity mask for rows and columns
+                valid = mask_m[:, None] & mask_n[None, :]
 
-                    # Row-wise max
-                    row_max = tl.max(qk, axis=1)
+                if CAUSAL:
+                    # Causal mask: col <= row
+                    valid = valid & (offs_n[None, :] <= offs_m[:, None])
 
-                    # Update running max
-                    m_i_new = tl.maximum(m_i, row_max)
+                # Apply masks: invalid positions get -inf
+                s = tl.where(valid, s, -float('inf'))
 
-                    # Shifted scores and safe mask to avoid NaNs
-                    qk_shifted = qk - m_i_new[:, None]
-                    qk_shifted = tl.where(valid, qk_shifted, -float('inf'))
+                m_ij = tl.max(s, axis=1)
+                m_new = tl.maximum(m_i, m_ij)
 
-                    # Exponentiate
-                    p = tl.exp(qk_shifted)
+                p = tl.exp(s - m_new[:, None])
+                alpha = tl.exp(m_i - m_new)
 
-                    # Load V block [BN, Dv]
-                    v_ptrs = V_ptr_zh + (cols[:, None] * stride_vn + offs_dv[None, :] * stride_vd)
-                    v = tl.load(v_ptrs, mask=(col_mask[:, None] & (offs_dv[None, :] < Dv)), other=0.0).to(tl.float32)
+                l_i = l_i * alpha + tl.sum(p, axis=1)
+                o = o * alpha[:, None]
 
-                    # Compute P @ V -> [BM, Dv]
-                    pv = tl.dot(p, v)
+                v_ptrs = v_base_ptr + offs_n[:, None] * stride_vn + offs_dv[None, :] * stride_vd
+                v = tl.load(v_ptrs, mask=mask_n[:, None] & mask_dv[None, :], other=0.0).to(tl.float32)
 
-                    # Update l_i
-                    # alpha = exp(m_i - m_i_new), but handle m_i == m_i_new to avoid NaNs when both -inf
-                    same = m_i_new == m_i
-                    alpha = tl.exp(m_i - m_i_new)
-                    alpha = tl.where(same, 1.0, alpha)
-                    p_sum = tl.sum(p, axis=1)
-                    l_i_new = l_i * alpha + p_sum
+                o += tl.dot(p, v)
+                m_i = m_new
 
-                    # Normalize and update acc
-                    inv_l = tl.where(l_i_new > 0, 1.0 / l_i_new, 0.0)
-                    acc = acc * ((l_i * alpha) * inv_l)[:, None] + pv * inv_l[:, None]
+            o = o / l_i[:, None]
 
-                    # Update running stats
-                    l_i = l_i_new
-                    m_i = m_i_new
+            out_ptrs = Out_ptr + z * stride_oz + h * stride_oh + offs_m[:, None] * stride_om + offs_dv[None, :] * stride_od
+            tl.store(out_ptrs, o.to(tl.float16), mask=mask_m[:, None] & mask_dv[None, :])
 
-                    n_start += BLOCK_N
+        def _next_power_of_2(x: int) -> int:
+            if x <= 0:
+                return 1
+            return 1 << (x - 1).bit_length()
 
-                # Store output [BM, Dv]
-                o = acc
-                o = o.to(tl.float16)
-                o_ptrs = O_ptr_zh + (offs_m[:, None] * stride_om + offs_dv[None, :] * stride_od)
-                tl.store(o_ptrs, o, mask=(row_mask[:, None] & (offs_dv[None, :] < Dv)))
+        def _pick_config(M, N, Dq, Dv):
+            # Heuristic configuration
+            # Larger BM for longer sequences, BN fixed at 64 for good balance
+            BLOCK_M = 128 if M >= 512 else 64
+            BLOCK_N = 64
+            # Warp selection
+            if Dq <= 64 and Dv <= 64:
+                num_warps = 4
+                num_stages = 2
+            else:
+                num_warps = 8
+                num_stages = 2
+            return BLOCK_M, BLOCK_N, num_warps, num_stages
 
+        def _torch_flash_attn(Q, K, V, causal=True):
+            # Fallback for environments without Triton or unsupported shapes
+            dtype = Q.dtype
+            Z, H, M, Dq = Q.shape
+            N = K.shape[2]
+            scale = 1.0 / math.sqrt(Dq)
+            q = Q.float()
+            k = K.float()
+            v = V.float()
+            attn_scores = torch.matmul(q, k.transpose(-2, -1)) * scale
+            if causal:
+                idx_i = torch.arange(M, device=Q.device).view(1, 1, M, 1)
+                idx_j = torch.arange(N, device=Q.device).view(1, 1, 1, N)
+                mask = idx_j <= idx_i
+                attn_scores = attn_scores.masked_fill(~mask, float('-inf'))
+            attn_probs = torch.softmax(attn_scores, dim=-1)
+            out = torch.matmul(attn_probs, v)
+            return out.to(dtype)
 
-            def _next_power_of_two(x: int) -> int:
-                if x <= 1:
-                    return 1
-                return 1 << ((x - 1).bit_length())
+        def flash_attn(Q: torch.Tensor, K: torch.Tensor, V: torch.Tensor, causal: bool = True) -> torch.Tensor:
+            if not (Q.is_cuda and K.is_cuda and V.is_cuda):
+                return _torch_flash_attn(Q, K, V, causal)
+            assert Q.dtype == torch.float16 and K.dtype == torch.float16 and V.dtype == torch.float16, "Inputs must be float16"
+            assert Q.is_contiguous() and K.is_contiguous() and V.is_contiguous(), "Inputs must be contiguous"
+            Z, H, M, Dq = Q.shape
+            Zk, Hk, N, Dk = K.shape
+            Zv, Hv, Nv, Dv = V.shape
+            assert Z == Zk == Zv and H == Hk == Hv and Dq == Dk and N == Nv, "Shape mismatch"
+            # Allocate output
+            Out = torch.empty((Z, H, M, Dv), device=Q.device, dtype=torch.float16)
 
-            def flash_attn(Q: torch.Tensor, K: torch.Tensor, V: torch.Tensor, causal: bool = True) -> torch.Tensor:
-                assert Q.is_cuda and K.is_cuda and V.is_cuda, "Inputs must be on CUDA"
-                assert Q.dtype == torch.float16 and K.dtype == torch.float16 and V.dtype == torch.float16, "Inputs must be float16"
-                assert Q.dim() == 4 and K.dim() == 4 and V.dim() == 4, "Expected 4D tensors (Z,H,Len,Dim)"
-                Z, H, M, D = Q.shape
-                Zk, Hk, N, Dk = K.shape
-                Zv, Hv, Nv, Dv = V.shape
-                assert Z == Zk == Zv and H == Hk == Hv and D == Dk and N == Nv, "Shape mismatch"
-                # Allocate output
-                O = torch.empty((Z, H, M, Dv), device=Q.device, dtype=torch.float16)
+            BLOCK_M, BLOCK_N, num_warps, num_stages = _pick_config(M, N, Dq, Dv)
+            # Choose compile-time dimensions for head/value dims; pad to next power of 2 for vectorization
+            # But still load/store with masks to handle real dims
+            D_HEAD = _next_power_of_2(Dq) if Dq <= 128 else Dq
+            D_VALUE = _next_power_of_2(Dv) if Dv <= 128 else Dv
 
-                # Strides (assume row-major but get actual strides)
-                stride_qz, stride_qh, stride_qm, stride_qd = Q.stride()
-                stride_kz, stride_kh, stride_kn, stride_kd = K.stride()
-                stride_vz, stride_vh, stride_vn, stride_vd = V.stride()
-                stride_oz, stride_oh, stride_om, stride_od = O.stride()
+            # Limit to reasonable max to avoid register pressure
+            if D_HEAD > 128 or D_VALUE > 128:
+                # Fallback if too large to ensure stability
+                return _torch_flash_attn(Q, K, V, causal)
 
-                # Tiling parameters
-                # Choose BLOCK_M to be large; BLOCK_N moderate; D-model/value to next power-of-two for efficient dot
-                BLOCK_M = 128 if M >= 128 else (64 if M >= 64 else 32)
-                BLOCK_N = 64 if N >= 64 else (32 if N >= 32 else 16)
-                BLOCK_DMODEL = min(128, _next_power_of_two(int(D)))
-                BLOCK_DVALUE = min(128, _next_power_of_two(int(Dv)))
+            grid = (triton.cdiv(M, BLOCK_M), Z * H)
+            sm_scale = 1.0 / math.sqrt(Dq)
 
-                num_warps = 4 if BLOCK_M <= 128 else 8
-                num_stages = 3
-
-                grid = (triton.cdiv(M, BLOCK_M), Z * H)
-
-                sm_scale = (1.0 / (D ** 0.5))
-
-                _flash_attn_fwd_kernel[grid](
-                    Q, K, V, O,
-                    Z, H, M, N, D, Dv,
-                    stride_qz, stride_qh, stride_qm, stride_qd,
-                    stride_kz, stride_kh, stride_kn, stride_kd,
-                    stride_vz, stride_vh, stride_vn, stride_vd,
-                    stride_oz, stride_oh, stride_om, stride_od,
-                    sm_scale,
-                    causal,
-                    BLOCK_M=BLOCK_M,
-                    BLOCK_N=BLOCK_N,
-                    BLOCK_DMODEL=BLOCK_DMODEL,
-                    BLOCK_DVALUE=BLOCK_DVALUE,
-                    num_warps=num_warps,
-                    num_stages=num_stages,
-                )
-
-                return O
+            _flash_attn_fwd_kernel[grid](
+                Q, K, V, Out,
+                Q.stride(0), Q.stride(1), Q.stride(2), Q.stride(3),
+                K.stride(0), K.stride(1), K.stride(2), K.stride(3),
+                V.stride(0), V.stride(1), V.stride(2), V.stride(3),
+                Out.stride(0), Out.stride(1), Out.stride(2), Out.stride(3),
+                Z, H, M, N,
+                Dq, Dv,
+                sm_scale,
+                BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N,
+                D_HEAD=D_HEAD, D_VALUE=D_VALUE,
+                CAUSAL=causal,
+                num_warps=num_warps,
+                num_stages=num_stages
+            )
+            return Out
         """)
         return {"code": code}

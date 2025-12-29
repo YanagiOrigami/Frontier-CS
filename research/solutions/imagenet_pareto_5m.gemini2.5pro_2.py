@@ -1,56 +1,59 @@
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.optim.lr_scheduler import CosineAnnealingLR
-import copy
+from copy import deepcopy
 
 class ResBlock(nn.Module):
     """
-    A residual block with two linear layers, batch normalization, SiLU activation, and dropout.
+    A residual block for an MLP, including LayerNorm/BatchNorm, activation, and dropout.
     """
-    def __init__(self, dim, dropout_rate=0.25):
+    def __init__(self, dim, dropout_p=0.3):
         super().__init__()
         self.block = nn.Sequential(
             nn.Linear(dim, dim),
             nn.BatchNorm1d(dim),
-            nn.SiLU(),
-            nn.Dropout(p=dropout_rate),
+            nn.ReLU(inplace=True),
+            nn.Dropout(p=dropout_p),
             nn.Linear(dim, dim),
             nn.BatchNorm1d(dim),
         )
-        self.silu = nn.SiLU()
-        self.dropout = nn.Dropout(p=dropout_rate)
+        self.relu = nn.ReLU(inplace=True)
 
     def forward(self, x):
         identity = x
         out = self.block(x)
         out += identity
-        out = self.silu(out)
-        out = self.dropout(out)
+        out = self.relu(out)
         return out
 
-class ParetoModel(nn.Module):
+class DeepMLP(nn.Module):
     """
-    A deep MLP model with residual connections, designed to maximize capacity
-    within a given parameter budget.
+    A deep MLP with residual connections, designed to maximize parameter count under a budget.
     """
-    def __init__(self, input_dim, num_classes, hidden_dim, num_blocks, dropout_rate):
+    def __init__(self, input_dim, num_classes, hidden_dim=1054, dropout_p=0.3):
         super().__init__()
-        self.initial_projection = nn.Sequential(
+        self.initial_layer = nn.Sequential(
             nn.Linear(input_dim, hidden_dim),
             nn.BatchNorm1d(hidden_dim),
-            nn.SiLU(),
+            nn.ReLU(inplace=True),
         )
-        
-        self.blocks = nn.Sequential(
-            *[ResBlock(hidden_dim, dropout_rate) for _ in range(num_blocks)]
+        self.res_blocks = nn.Sequential(
+            ResBlock(hidden_dim, dropout_p),
+            ResBlock(hidden_dim, dropout_p),
         )
-        
         self.head = nn.Linear(hidden_dim, num_classes)
+        
+        # Parameter count for this architecture with hidden_dim=1054:
+        # Initial Layer: (384 * 1054 + 1054) + (2 * 1054) = 407,858
+        # ResBlock 1: 2 * (1054 * 1054 + 1054) + 2 * (2 * 1054) = 2,228,156
+        # ResBlock 2: 2,228,156
+        # Head: (1054 * 128 + 128) = 135,040
+        # Total: 407,858 + 2,228,156 + 2,228,156 + 135,040 = 4,999,210
+        # This is safely under the 5,000,000 parameter limit.
 
     def forward(self, x):
-        x = self.initial_projection(x)
-        x = self.blocks(x)
+        x = self.initial_layer(x)
+        x = self.res_blocks(x)
         x = self.head(x)
         return x
 
@@ -60,53 +63,41 @@ class Solution:
         Train a model and return it.
         """
         device = torch.device(metadata.get("device", "cpu"))
-
-        # Model parameters from metadata
+        
         input_dim = metadata["input_dim"]
         num_classes = metadata["num_classes"]
-        param_limit = metadata["param_limit"]
 
-        # Tuned architecture hyperparameters to be close to the 5M parameter limit
-        HIDDEN_DIM = 512
-        NUM_BLOCKS = 9
-        DROPOUT_RATE = 0.25
-
-        model = ParetoModel(
+        model = DeepMLP(
             input_dim=input_dim,
             num_classes=num_classes,
-            hidden_dim=HIDDEN_DIM,
-            num_blocks=NUM_BLOCKS,
-            dropout_rate=DROPOUT_RATE
+            hidden_dim=1054,
+            dropout_p=0.3
         ).to(device)
 
-        # Sanity check for parameter count, with a fallback if miscalculated
-        param_count = sum(p.numel() for p in model.parameters() if p.requires_grad)
-        if param_count > param_limit:
-            # This fallback uses 8 blocks instead of 9, reducing parameters
-            model = ParetoModel(
-                input_dim=input_dim,
-                num_classes=num_classes,
-                hidden_dim=512,
-                num_blocks=8,
-                dropout_rate=DROPOUT_RATE
-            ).to(device)
+        # Training Hyperparameters
+        epochs = 250
+        max_lr = 1.5e-3
+        weight_decay = 1e-2
+        label_smoothing = 0.1
+        patience = 35
 
-        # Tuned training hyperparameters
-        EPOCHS = 300
-        LEARNING_RATE = 0.001
-        WEIGHT_DECAY = 0.01
-        LABEL_SMOOTHING = 0.1
-
-        criterion = nn.CrossEntropyLoss(label_smoothing=LABEL_SMOOTHING)
-        optimizer = optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
+        criterion = nn.CrossEntropyLoss(label_smoothing=label_smoothing)
+        optimizer = optim.AdamW(model.parameters(), lr=max_lr, weight_decay=weight_decay)
         
-        total_steps = EPOCHS * len(train_loader)
-        scheduler = CosineAnnealingLR(optimizer, T_max=total_steps)
+        steps_per_epoch = len(train_loader)
+        scheduler = optim.lr_scheduler.OneCycleLR(
+            optimizer,
+            max_lr=max_lr,
+            epochs=epochs,
+            steps_per_epoch=steps_per_epoch,
+            pct_start=0.3
+        )
 
-        best_val_acc = -1.0
+        best_val_acc = 0.0
         best_model_state = None
+        patience_counter = 0
 
-        for epoch in range(EPOCHS):
+        for epoch in range(epochs):
             model.train()
             for inputs, targets in train_loader:
                 inputs, targets = inputs.to(device), targets.to(device)
@@ -118,26 +109,30 @@ class Solution:
                 optimizer.step()
                 scheduler.step()
             
-            # Validation phase to select the best model checkpoint
             model.eval()
-            correct = 0
-            total = 0
+            val_correct = 0
+            val_total = 0
             with torch.no_grad():
                 for inputs, targets in val_loader:
                     inputs, targets = inputs.to(device), targets.to(device)
                     outputs = model(inputs)
                     _, predicted = torch.max(outputs.data, 1)
-                    total += targets.size(0)
-                    correct += (predicted == targets).sum().item()
+                    val_total += targets.size(0)
+                    val_correct += (predicted == targets).sum().item()
             
-            val_acc = correct / total
+            val_acc = val_correct / val_total
+
             if val_acc > best_val_acc:
                 best_val_acc = val_acc
-                best_model_state = copy.deepcopy(model.state_dict())
+                best_model_state = deepcopy(model.state_dict())
+                patience_counter = 0
+            else:
+                patience_counter += 1
 
-        # Load the best model state found during training
+            if patience_counter >= patience:
+                break
+        
         if best_model_state:
             model.load_state_dict(best_model_state)
-        
-        model.eval()
+            
         return model

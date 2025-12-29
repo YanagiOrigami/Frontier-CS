@@ -2,138 +2,65 @@ import numpy as np
 
 class Solution:
     def __init__(self, **kwargs):
-        self.use_pysr = kwargs.get("use_pysr", False)
-        self.random_state = kwargs.get("random_state", 42)
-        self.pysr_params = kwargs.get("pysr_params", {})
-        self._tiny = 1e-12
+        self.drop_tol = kwargs.get("drop_tol", 1e-10)
+        self.coef_one_tol = kwargs.get("coef_one_tol", 1e-8)
+        self.extra_threshold_ratio = kwargs.get("extra_threshold_ratio", 1e-6)
 
-    def solve(self, X: np.ndarray, y: np.ndarray) -> dict:
-        X = np.asarray(X, dtype=float)
-        y = np.asarray(y, dtype=float).ravel()
-        x1, x2 = X[:, 0], X[:, 1]
+    def _format_number(self, x):
+        return f"{x:.12g}"
 
-        best = {
-            "expression": None,
-            "predictions": None,
-            "mse": np.inf,
-            "method": None
+    def _build_expression(self, coeffs, feature_names):
+        core_map = {
+            "sin_sum": "sin(x1 + x2)",
+            "sq_diff": "(x1 - x2)**2",
+            "x1": "x1",
+            "x2": "x2",
+            "const": None,
+            "x1x2": "x1*x2",
+            "x1_sq": "x1**2",
+            "x2_sq": "x2**2",
+            "cos_sum": "cos(x1 + x2)",
+            "sin_x1": "sin(x1)",
+            "sin_x2": "sin(x2)",
         }
 
-        # Candidate 1: Canonical McCormick expression
-        canonical_expr = "sin(x1 + x2) + (x1 - x2)**2 - 1.5*x1 + 2.5*x2 + 1"
-        preds = self._eval_expr(canonical_expr, x1, x2)
-        if preds is not None:
-            mse = self._mse(y, preds)
-            if mse < best["mse"]:
-                best.update(expression=canonical_expr, predictions=preds, mse=mse, method="canonical")
+        terms = []
+        for name, c in zip(feature_names, coeffs):
+            if abs(c) < self.drop_tol:
+                continue
 
-        # If canonical is already very good, return early
-        y_var = np.var(y) + self._tiny
-        if best["mse"] / y_var < 1e-6:
-            return {
-                "expression": best["expression"],
-                "predictions": best["predictions"].tolist(),
-                "details": {"method": best["method"], "mse": float(best["mse"])}
-            }
+            if name == "const":
+                term = self._format_number(abs(c))
+                sign = "-" if c < 0 else "+"
+                terms.append((sign, term))
+                continue
 
-        # Candidate 2: Fit McCormick-basis linear regression
-        expr_mc, preds_mc, mse_mc = self._fit_mccormick_basis(x1, x2, y)
-        if mse_mc < best["mse"]:
-            best.update(expression=expr_mc, predictions=preds_mc, mse=mse_mc, method="mccormick_basis")
+            core = core_map[name]
+            abs_c = abs(c)
+            sign = "-" if c < 0 else "+"
 
-        # Optional PySR if requested or if fit is poor
-        if self.use_pysr or (best["mse"] / y_var > 1e-3):
-            expr_sr, preds_sr, mse_sr = self._try_pysr(X, y)
-            if expr_sr is not None and mse_sr < best["mse"]:
-                best.update(expression=expr_sr, predictions=preds_sr, mse=mse_sr, method="pysr")
+            if abs(abs_c - 1.0) < self.coef_one_tol:
+                term = core
+            else:
+                term = f"{self._format_number(abs_c)}*{core}"
 
-        return {
-            "expression": best["expression"],
-            "predictions": best["predictions"].tolist(),
-            "details": {"method": best["method"], "mse": float(best["mse"])}
-        }
+            terms.append((sign, term))
 
-    def _fit_mccormick_basis(self, x1, x2, y):
-        # Features tailored to McCormick form
-        f1 = np.sin(x1 + x2)
-        f2 = (x1 - x2) ** 2
-        f3 = x1
-        f4 = x2
-        f5 = np.ones_like(x1)
-        A = np.column_stack([f1, f2, f3, f4, f5])
-
-        coefs, _, _, _ = np.linalg.lstsq(A, y, rcond=None)
-        # Drop near-zero coefficients to simplify expression
-        mask = np.abs(coefs) > 1e-10
-        terms = ["sin(x1 + x2)", "(x1 - x2)**2", "x1", "x2", "1"]
-        expr = self._build_linear_expression(coefs, terms, mask)
-
-        preds = self._eval_expr(expr, x1, x2)
-        mse = self._mse(y, preds)
-        return expr, preds, mse
-
-    def _build_linear_expression(self, coefs, term_strs, mask=None):
-        def fmt_num(v):
-            # Prefer clean numbers
-            if np.isfinite(v):
-                # Snap to integers or halves if close
-                rounded_int = np.round(v)
-                if np.isclose(v, rounded_int, atol=1e-9, rtol=0):
-                    return str(int(rounded_int))
-                half = np.round(v * 2) / 2.0
-                if np.isclose(v, half, atol=1e-9, rtol=0):
-                    return f"{half:.12g}"
-                return f"{v:.12g}"
+        if not terms:
             return "0"
 
-        pieces = []
-        for c, t in zip(coefs, term_strs):
-            if mask is not None and not mask[list(term_strs).index(t)]:
-                continue
-            if abs(c) < 1e-12:
-                continue
-            if t == "1":
-                pieces.append(c)
+        first_sign, first_term = terms[0]
+        expr = f"-{first_term}" if first_sign == "-" else first_term
+        for sgn, trm in terms[1:]:
+            if sgn == "+":
+                expr += f" + {trm}"
             else:
-                if np.isclose(abs(c), 1.0, atol=1e-10, rtol=0):
-                    pieces.append(np.sign(c) * 1.0 * (0 if t == "1" else 1))
-                    # Append with sign handled later; store marker as tuple
-                    pieces[-1] = ("term", np.sign(c), t, None)
-                else:
-                    pieces.append(("term", np.sign(c), t, abs(c)))
-
-        # Convert to string with correct signs
-        expr = ""
-        first = True
-        for p in pieces:
-            if isinstance(p, tuple) and p[0] == "term":
-                sign = p[1]
-                term = p[2]
-                mag = p[3]
-                if mag is None:
-                    term_str = term
-                else:
-                    term_str = f"{fmt_num(mag)}*{term}"
-                if first:
-                    expr = f"-{term_str}" if sign < 0 else term_str
-                    first = False
-                else:
-                    expr += f" - {term_str}" if sign < 0 else f" + {term_str}"
-            else:
-                # Constant
-                c = float(p)
-                if first:
-                    expr = fmt_num(c)
-                    first = False
-                else:
-                    expr += f" - {fmt_num(-c)}" if c < 0 else f" + {fmt_num(c)}"
-
-        if expr == "":
-            expr = "0"
+                expr += f" - {trm}"
         return expr
 
-    def _eval_expr(self, expr, x1, x2):
-        local_dict = {
+    def _evaluate_expression(self, expression, x1, x2):
+        env = {
+            "__builtins__": {},
             "x1": x1,
             "x2": x2,
             "sin": np.sin,
@@ -141,44 +68,53 @@ class Solution:
             "exp": np.exp,
             "log": np.log,
         }
-        try:
-            return eval(expr, {"__builtins__": {}}, local_dict)
-        except Exception:
-            return None
+        return eval(expression, env, {})
 
-    def _mse(self, y_true, y_pred):
-        if y_pred is None:
-            return np.inf
-        diff = y_true - y_pred
-        return float(np.mean(diff * diff))
+    def solve(self, X: np.ndarray, y: np.ndarray) -> dict:
+        x1 = X[:, 0].astype(float)
+        x2 = X[:, 1].astype(float)
+        y = y.astype(float)
 
-    def _try_pysr(self, X, y):
-        try:
-            from pysr import PySRRegressor
-        except Exception:
-            return None, None, np.inf
+        # Base McCormick-like features
+        base_features = [
+            ("sin_sum", np.sin(x1 + x2)),
+            ("sq_diff", (x1 - x2) ** 2),
+            ("x1", x1),
+            ("x2", x2),
+            ("const", np.ones_like(y)),
+        ]
 
-        params = dict(
-            niterations=40,
-            binary_operators=["+", "-", "*", "/"],
-            unary_operators=["sin", "cos", "exp", "log"],
-            populations=8,
-            population_size=33,
-            maxsize=25,
-            verbosity=0,
-            progress=False,
-            random_state=self.random_state,
-            warm_start=False,
-        )
-        params.update(self.pysr_params)
+        A_base = np.column_stack([f for _, f in base_features])
+        coeffs_base, _, _, _ = np.linalg.lstsq(A_base, y, rcond=None)
+        pred_base = A_base @ coeffs_base
+        mse_base = np.mean((y - pred_base) ** 2)
+        var_y = np.mean((y - y.mean()) ** 2) + 1e-12
 
-        try:
-            model = PySRRegressor(**params)
-            model.fit(X, y, variable_names=["x1", "x2"])
-            expr_sympy = model.sympy()
-            expression = str(expr_sympy)
-            preds = model.predict(X)
-            mse = self._mse(y, preds)
-            return expression, preds, mse
-        except Exception:
-            return None, None, np.inf
+        use_extra = mse_base / var_y > self.extra_threshold_ratio
+
+        if use_extra:
+            extra_features = [
+                ("x1x2", x1 * x2),
+                ("x1_sq", x1 ** 2),
+                ("x2_sq", x2 ** 2),
+                ("cos_sum", np.cos(x1 + x2)),
+                ("sin_x1", np.sin(x1)),
+                ("sin_x2", np.sin(x2)),
+            ]
+            all_features = base_features + extra_features
+            A_all = np.column_stack([f for _, f in all_features])
+            coeffs_all, _, _, _ = np.linalg.lstsq(A_all, y, rcond=None)
+            feature_names = [n for n, _ in all_features]
+            coeffs = coeffs_all
+        else:
+            feature_names = [n for n, _ in base_features]
+            coeffs = coeffs_base
+
+        expression = self._build_expression(coeffs, feature_names)
+        predictions = self._evaluate_expression(expression, x1, x2)
+
+        return {
+            "expression": expression,
+            "predictions": predictions.tolist(),
+            "details": {}
+        }

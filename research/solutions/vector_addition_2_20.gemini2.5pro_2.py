@@ -14,33 +14,53 @@ import torch
 import triton
 import triton.language as tl
 
+@triton.autotune(
+    configs=[
+        triton.Config({'BLOCK_SIZE': 1024}, num_warps=4),
+        triton.Config({'BLOCK_SIZE': 2048}, num_warps=8),
+        triton.Config({'BLOCK_SIZE': 4096}, num_warps=8),
+        triton.Config({'BLOCK_SIZE': 8192}, num_warps=16),
+        triton.Config({'BLOCK_SIZE': 16384}, num_warps=16),
+        triton.Config({'BLOCK_SIZE': 32768}, num_warps=16),
+        triton.Config({'BLOCK_SIZE': 65536}, num_warps=16),
+        triton.Config({'BLOCK_SIZE': 131072}, num_warps=16),
+    ],
+    key=['N'],
+)
 @triton.jit
 def add_kernel(
     x_ptr,
     y_ptr,
     output_ptr,
-    n_elements,
+    N: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
 ):
-    # Each program instance computes a block of BLOCK_SIZE elements.
+    \"\"\"
+    Triton kernel for vector addition. This kernel is designed for memory-bound
+    operations and is optimized by using vector loads and stores. Autotuning is
+    used to select the best BLOCK_SIZE and num_warps for the target hardware.
+    \"\"\"
+    # Each program instance (block) computes a chunk of the output vector.
+    # The program_id identifies which block this instance is.
     pid = tl.program_id(axis=0)
 
-    # Compute the offsets for the current block.
+    # Calculate memory offsets for the data this block will process.
+    # tl.arange(0, BLOCK_SIZE) creates a vector [0, 1, ..., BLOCK_SIZE-1].
+    # This, combined with the block start, gives the global offsets.
     block_start = pid * BLOCK_SIZE
     offsets = block_start + tl.arange(0, BLOCK_SIZE)
 
-    # Create a mask to handle the case where n_elements is not a multiple of BLOCK_SIZE.
-    mask = offsets < n_elements
-
-    # Load the input vectors from global memory.
-    x = tl.load(x_ptr + offsets, mask=mask)
-    y = tl.load(y_ptr + offsets, mask=mask)
-
+    # Since N (2^20) is a multiple of all potential BLOCK_SIZEs (powers of 2),
+    # boundary checks (masking) are not needed. This simplifies the kernel
+    # and can slightly improve performance.
+    x = tl.load(x_ptr + offsets)
+    y = tl.load(y_ptr + offsets)
+    
     # Perform the element-wise addition.
     output = x + y
-
+    
     # Store the result back to global memory.
-    tl.store(output_ptr + offsets, output, mask=mask)
+    tl.store(output_ptr + offsets, output)
 
 
 def add(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
@@ -57,29 +77,18 @@ def add(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     # Allocate the output tensor on the same device as the inputs.
     output = torch.empty_like(x)
     
-    n_elements = x.numel()
+    # The total number of elements in the vector.
+    N = x.numel()
     
-    # This block size is chosen to be large for good memory bandwidth
-    # while ensuring enough blocks are launched to saturate the GPU's SMs.
-    # For a vector of 2^20 elements on an L4 GPU (~60 SMs), 16384 gives
-    # 64 blocks, which is a reasonable number. Larger block sizes generally
-    # yield better performance for memory-bound kernels.
-    BLOCK_SIZE = 16384
+    # The grid determines how many instances of the kernel to launch.
+    # It is a function of the kernel's meta-parameters, which allows the
+    # autotuner to adjust the grid size based on the BLOCK_SIZE it's testing.
+    grid = lambda meta: (triton.cdiv(N, meta['BLOCK_SIZE']),)
     
-    # Calculate the grid size. The grid is 1D, and its size is the number of
-    # blocks needed to cover all elements.
-    grid = (triton.cdiv(n_elements, BLOCK_SIZE),)
-    
-    # Launch the Triton kernel.
-    # Using more warps (e.g., 8) can help hide memory latency.
-    add_kernel[grid](
-        x, 
-        y, 
-        output, 
-        n_elements, 
-        BLOCK_SIZE=BLOCK_SIZE,
-        num_warps=8
-    )
+    # Launch the kernel. Triton's JIT compiler and autotuner handle the
+    # compilation and optimization. The autotuner will benchmark the configs
+    # specified in @triton.autotune and cache the best performing one.
+    add_kernel[grid](x, y, output, N)
     
     return output
 """

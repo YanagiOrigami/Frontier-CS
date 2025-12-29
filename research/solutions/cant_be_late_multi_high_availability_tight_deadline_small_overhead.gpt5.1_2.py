@@ -6,9 +6,9 @@ from sky_spot.utils import ClusterType
 
 
 class Solution(MultiRegionStrategy):
-    """Multi-region scheduling strategy with spot-first, safe on-demand fallback."""
+    """Multi-region scheduling strategy with hard-deadline guarantee."""
 
-    NAME = "my_strategy"
+    NAME = "cant_be_late_strategy"
 
     def solve(self, spec_path: str) -> "Solution":
         with open(spec_path) as f:
@@ -21,71 +21,104 @@ class Solution(MultiRegionStrategy):
             inter_task_overhead=[0.0],
         )
         super().__init__(args)
-
-        # Cached total work done so far (seconds)
-        self._cached_segments_len = 0
-        self._cached_work_done = 0.0
-
-        # Whether we've permanently committed to on-demand
-        self._committed_to_od = False
-
-        # Safe buffer time for switching to on-demand (seconds), initialized lazily
-        self._safe_od_buffer = None
-
         return self
 
-    def _update_work_done_cache(self) -> None:
-        """Incrementally maintain total work done from task_done_time segments."""
-        segments = self.task_done_time
-        cur_len = len(segments)
-        if cur_len > self._cached_segments_len:
-            total_new = 0.0
-            for i in range(self._cached_segments_len, cur_len):
-                total_new += segments[i]
-            self._cached_work_done += total_new
-            self._cached_segments_len = cur_len
+    # ---------- Internal helpers ----------
 
-    def _ensure_safe_buffer(self) -> None:
-        """Initialize the safe on-demand buffer if not set."""
-        if self._safe_od_buffer is None:
-            gap = getattr(self.env, "gap_seconds", 1.0)
-            # Require enough slack for one full restart_overhead plus a couple of gaps
-            self._safe_od_buffer = self.restart_overhead + 2.0 * gap
+    def _initialize_if_needed(self) -> None:
+        if getattr(self, "_initialized", False):
+            return
+        self._initialized = True
+
+        # Initialize completed work tracking.
+        td_list = getattr(self, "task_done_time", None)
+        if td_list:
+            self._last_task_done_len = len(td_list)
+            self._completed_work = float(sum(td_list))
+        else:
+            self._last_task_done_len = 0
+            self._completed_work = 0.0
+
+        # Helper to extract scalar seconds from possibly list-valued fields.
+        def _to_scalar_seconds(value, default=0.0):
+            if isinstance(value, (list, tuple)):
+                if not value:
+                    return float(default)
+                value = value[0]
+            try:
+                return float(value)
+            except (TypeError, ValueError):
+                return float(default)
+
+        # Cache key configuration values in seconds.
+        self._task_duration_total = _to_scalar_seconds(
+            getattr(self, "task_duration", None), default=0.0
+        )
+        self._restart_overhead = _to_scalar_seconds(
+            getattr(self, "restart_overhead", None), default=0.0
+        )
+        self._deadline = _to_scalar_seconds(
+            getattr(self, "deadline", None), default=0.0
+        )
+
+        gap = getattr(self.env, "gap_seconds", None)
+        if gap is None:
+            gap = 60.0  # fallback
+        self._gap_seconds = float(gap)
+
+        # Safety slack to guarantee deadline even with restart overhead
+        base_margin = max(self._restart_overhead, self._gap_seconds)
+        # Large enough to cover worst-case single-step slack drop and restart.
+        self._safe_slack = 4.0 * base_margin + self._restart_overhead
+
+        self._force_on_demand = False
+
+    def _update_completed_work(self) -> None:
+        td_list = getattr(self, "task_done_time", None)
+        if not td_list:
+            return
+        curr_len = len(td_list)
+        if curr_len > self._last_task_done_len:
+            new_segments = td_list[self._last_task_done_len : curr_len]
+            # Each segment is work-time in seconds.
+            self._completed_work += float(sum(new_segments))
+            self._last_task_done_len = curr_len
+
+    # ---------- Core decision logic ----------
 
     def _step(self, last_cluster_type: ClusterType, has_spot: bool) -> ClusterType:
-        # Update cached work done and buffer
-        self._update_work_done_cache()
-        self._ensure_safe_buffer()
+        self._initialize_if_needed()
+        self._update_completed_work()
 
-        # Remaining work and time (seconds)
-        remaining_work = self.task_duration - self._cached_work_done
+        remaining_work = self._task_duration_total - self._completed_work
         if remaining_work <= 0.0:
-            # Task finished: do not run any more instances
+            # Job complete: avoid incurring any more cost.
             return ClusterType.NONE
 
-        elapsed = self.env.elapsed_seconds
-        remaining_time = self.deadline - elapsed
+        elapsed = float(self.env.elapsed_seconds)
+        time_left = self._deadline - elapsed
 
-        if remaining_time <= 0.0:
-            # Already at/past deadline but not done; just use on-demand
-            self._committed_to_od = True
+        if time_left <= 0.0:
+            # Past deadline; nothing can fix lateness, but run ON_DEMAND to finish ASAP.
+            self._force_on_demand = True
             return ClusterType.ON_DEMAND
 
-        # If we've already committed, stay on on-demand to guarantee completion
-        if self._committed_to_od:
+        slack = time_left - remaining_work
+
+        if slack <= 0.0:
+            # Already behind ideal schedule: must use ON_DEMAND exclusively.
+            self._force_on_demand = True
+
+        # If we're close enough to the deadline that only ON_DEMAND can safely finish in time,
+        # permanently switch to ON_DEMAND.
+        if not self._force_on_demand and slack <= self._safe_slack:
+            self._force_on_demand = True
+
+        if self._force_on_demand:
             return ClusterType.ON_DEMAND
 
-        # Decide whether we must now commit to on-demand to safely meet deadline
-        # Safe commit condition: even if we start a fresh on-demand instance now
-        # and pay one full restart_overhead, we can still finish by deadline.
-        # We add a small discrete-time safety buffer (self._safe_od_buffer).
-        if remaining_time <= remaining_work + self._safe_od_buffer:
-            self._committed_to_od = True
-            return ClusterType.ON_DEMAND
-
-        # Otherwise, still safely in the spot-favorable region.
+        # Plenty of slack left: use cheap SPOT when available, otherwise wait.
         if has_spot:
             return ClusterType.SPOT
-
-        # Spot unavailable and we still have slack: wait (no cluster) to save cost.
-        return ClusterType.NONE
+        else:
+            return ClusterType.NONE

@@ -1,129 +1,7 @@
-import numpy as np
 import pandas as pd
-from collections import defaultdict
-from typing import List, Any, Dict, Tuple, Optional
-
+import numpy as np
 
 class Solution:
-    def _normalize_merge_group(self, group: Any, original_cols: List[Any]) -> List[Any]:
-        if group is None:
-            return []
-        if isinstance(group, (str, int)):
-            group = [group]
-        out = []
-        for x in group:
-            if isinstance(x, (int, np.integer)):
-                idx = int(x)
-                if 0 <= idx < len(original_cols):
-                    out.append(original_cols[idx])
-            else:
-                out.append(x)
-        return out
-
-    def _apply_col_merge(self, df: pd.DataFrame, col_merge: Optional[list]) -> pd.DataFrame:
-        if not col_merge:
-            return df
-
-        original_cols = list(df.columns)
-        used = set()
-        df2 = df
-
-        for raw_group in col_merge:
-            group = self._normalize_merge_group(raw_group, original_cols)
-            if len(group) < 2:
-                continue
-
-            grp_cols = []
-            for c in group:
-                if c in df2.columns and c not in used:
-                    grp_cols.append(c)
-            if len(grp_cols) < 2:
-                for c in grp_cols:
-                    used.add(c)
-                continue
-
-            try:
-                pos = min(df2.columns.get_loc(c) for c in grp_cols)
-            except Exception:
-                pos = 0
-
-            s = df2[grp_cols].astype(str)
-            merged = s[grp_cols[0]].str.cat([s[c] for c in grp_cols[1:]], sep="")
-
-            new_name = grp_cols[0]
-            if new_name in df2.columns and new_name not in grp_cols:
-                base = str(new_name)
-                k = 2
-                while f"{base}__m{k}" in df2.columns:
-                    k += 1
-                new_name = f"{base}__m{k}"
-
-            df2 = df2.drop(columns=grp_cols)
-            df2.insert(pos, new_name, merged)
-
-            for c in grp_cols:
-                used.add(c)
-
-        return df2
-
-    def _collision_from_counts(self, counts: np.ndarray, n: int) -> float:
-        if n <= 0:
-            return 0.0
-        ss = float(np.dot(counts, counts))
-        return ss / float(n * n)
-
-    def _prefix_collision(self, col_strings: np.ndarray, k: int) -> float:
-        n = int(col_strings.shape[0])
-        if n <= 0:
-            return 0.0
-        d = {}
-        if k == 1:
-            for s in col_strings:
-                if s:
-                    p = s[0]
-                else:
-                    p = ""
-                d[p] = d.get(p, 0) + 1
-        elif k == 2:
-            for s in col_strings:
-                if len(s) >= 2:
-                    p = s[:2]
-                elif s:
-                    p = s
-                else:
-                    p = ""
-                d[p] = d.get(p, 0) + 1
-        else:
-            for s in col_strings:
-                p = s[:k] if s else ""
-                d[p] = d.get(p, 0) + 1
-        ss = 0
-        for v in d.values():
-            ss += v * v
-        return float(ss) / float(n * n)
-
-    def _mean_len(self, col_strings: np.ndarray) -> float:
-        n = int(col_strings.shape[0])
-        if n <= 0:
-            return 0.0
-        total = 0
-        for s in col_strings:
-            total += len(s)
-        return float(total) / float(n)
-
-    def _adjacent_equal_rate(self, col_strings: np.ndarray) -> float:
-        n = int(col_strings.shape[0])
-        if n <= 1:
-            return 0.0
-        eq = 0
-        prev = col_strings[0]
-        for i in range(1, n):
-            cur = col_strings[i]
-            if cur == prev:
-                eq += 1
-            prev = cur
-        return float(eq) / float(n - 1)
-
     def solve(
         self,
         df: pd.DataFrame,
@@ -135,176 +13,133 @@ class Solution:
         distinct_value_threshold: float = 0.7,
         parallel: bool = True,
     ) -> pd.DataFrame:
-        df2 = self._apply_col_merge(df, col_merge)
-        cols = list(df2.columns)
-        m = len(cols)
-        n = len(df2)
-        if m <= 1 or n <= 1:
-            return df2
+        # Apply column merges first
+        def unique_name(base, existing):
+            if base not in existing:
+                return base
+            k = 1
+            while True:
+                cand = f"{base}__{k}"
+                if cand not in existing:
+                    return cand
+                k += 1
 
-        max_sample = 6000
-        if early_stop is not None:
-            try:
-                max_sample = min(max_sample, int(early_stop))
-            except Exception:
-                pass
-        max_sample = max(500, max_sample)
+        df_work = df.copy()
+        if col_merge:
+            existing_cols = set(df_work.columns)
+            for idx, group in enumerate(col_merge):
+                if not group:
+                    continue
+                group = [c for c in group if c in df_work.columns]
+                if len(group) <= 1:
+                    continue
+                merge_name_base = f"__MERGED__{idx}"
+                new_name = unique_name(merge_name_base, existing_cols)
+                # Concatenate values as strings without separator
+                new_series = df_work[group].astype(str).agg(''.join, axis=1)
+                df_work[new_name] = new_series
+                df_work.drop(columns=group, inplace=True)
+                existing_cols.add(new_name)
 
-        n_sample = min(n, max_sample)
-        rng = np.random.default_rng(0)
+        col_names = list(df_work.columns)
+        M = len(col_names)
+        if M <= 1:
+            return df_work
 
-        if n_sample < n:
-            idx = rng.choice(n, size=n_sample, replace=False)
-            sample_df = df2.iloc[idx]
+        N = len(df_work)
+        # Determine sample size
+        target_sample = max(1000, int(row_stop) * 2000)
+        sample_n = min(N, min(target_sample, max(1, int(early_stop))))
+        if sample_n >= N:
+            sample_idx = np.arange(N, dtype=np.int64)
         else:
-            sample_df = df2
-
-        n_adj = min(n, min(5000, max(500, n_sample)))
-        adj_df = df2.iloc[:n_adj]
-
-        sample_arr = sample_df.astype(str).to_numpy(dtype=object, copy=False)
-        adj_arr = adj_df.astype(str).to_numpy(dtype=object, copy=False)
-
-        metrics: Dict[Any, Dict[str, float]] = {}
-        codes_map: Dict[Any, np.ndarray] = {}
-        mult_map: Dict[Any, int] = {}
-
-        n_s = int(sample_arr.shape[0])
-
-        for j, c in enumerate(cols):
-            col_strings = sample_arr[:, j]
-            codes, uniques = pd.factorize(col_strings, sort=False)
-            codes = codes.astype(np.int32, copy=False)
-            codes_shift = (codes + 1).astype(np.int32, copy=False)
-
-            nunique = int(len(uniques))
-            distinct_ratio = float(nunique) / float(n_s) if n_s > 0 else 1.0
-
-            counts = np.bincount(codes_shift, minlength=(nunique + 1))
-            coll_full = self._collision_from_counts(counts, n_s)
-
-            mean_len = self._mean_len(col_strings)
-            coll_p1 = self._prefix_collision(col_strings, 1)
-            coll_p2 = self._prefix_collision(col_strings, 2)
-
-            adj_strings = adj_arr[:, j]
-            adj_eq = self._adjacent_equal_rate(adj_strings)
-
-            static_priority = (
-                mean_len * (0.62 * coll_full + 0.23 * coll_p1 + 0.05 * coll_p2)
-                + (mean_len * adj_eq) * 0.10
-            )
-
-            metrics[c] = {
-                "distinct_ratio": distinct_ratio,
-                "mean_len": mean_len,
-                "coll_full": coll_full,
-                "coll_p1": coll_p1,
-                "coll_p2": coll_p2,
-                "adj_eq": adj_eq,
-                "priority": static_priority,
-            }
-
-            codes_map[c] = codes_shift
-            mult_map[c] = int(codes_shift.max()) + 1
-
-        base_sorted = sorted(
-            cols,
-            key=lambda c: (
-                metrics[c]["distinct_ratio"],
-                -metrics[c]["priority"],
-                -metrics[c]["mean_len"],
-            ),
-        )
-
-        max_greedy = 10 + max(0, int(col_stop)) * 6
-        max_greedy = int(np.clip(max_greedy, 10, 24))
-        max_greedy = min(max_greedy, m)
-
-        cand_k = 22 + max(0, int(col_stop)) * 4
-        cand_k = int(np.clip(cand_k, 18, 40))
-
-        group = np.zeros(n_s, dtype=np.int32)
-        groups_count = 1
-        L = 0.0
-        selected: List[Any] = []
-        remaining = set(cols)
-
-        # Put constant columns first (exactly one distinct in sample)
-        constant_cols = [c for c in base_sorted if metrics[c]["distinct_ratio"] <= (1.0 / max(2, n_s))]
-        for c in constant_cols:
-            selected.append(c)
-            remaining.remove(c)
-            L += metrics[c]["mean_len"]
-        # constants don't change grouping
-
-        for _ in range(max_greedy - len(selected)):
-            if not remaining:
-                break
-            matched_rows = n_s - groups_count
-            if matched_rows < max(2, int(0.03 * n_s)):
-                break
-
-            rem_list = [c for c in base_sorted if c in remaining]
-            if len(rem_list) > cand_k:
-                candidates = rem_list[:cand_k]
+            # Evenly spaced indices
+            if sample_n <= 1:
+                sample_idx = np.array([0], dtype=np.int64)
             else:
-                candidates = rem_list
+                step = (N - 1) / (sample_n - 1)
+                idx_float = np.round(np.arange(sample_n) * step).astype(np.int64)
+                # Ensure within bounds
+                idx_float[idx_float < 0] = 0
+                idx_float[idx_float >= N] = N - 1
+                sample_idx = idx_float
 
-            best_c = None
-            best_score = None
-            best_groups = None
+        # Precompute codes and lengths for each column on sample
+        col_codes = {}
+        col_lens = {}
+        col_total_len = {}
+        base_score = {}
 
-            group_i64 = group.astype(np.int64, copy=False)
+        # Helper to convert to strings for sample
+        for name in col_names:
+            # Extract sample values
+            vals = df_work[name].to_numpy()
+            sample_vals = vals[sample_idx]
+            # Convert to string explicitly
+            s_str = [str(x) for x in sample_vals]
+            lens = np.fromiter((len(x) for x in s_str), dtype=np.int32, count=len(s_str))
+            codes, _ = pd.factorize(s_str, sort=False)
+            codes = codes.astype(np.int64, copy=False)
+            col_codes[name] = codes
+            col_lens[name] = lens
+            total_len = lens.sum(dtype=np.int64)
+            col_total_len[name] = float(total_len)
+
+            # Base score when no grouping
+            if codes.size > 0:
+                counts = np.bincount(codes)
+                sums = np.bincount(codes, weights=lens.astype(np.float64), minlength=len(counts))
+                # Avoid division by zero, though counts should be >=1 for present codes
+                with np.errstate(divide='ignore', invalid='ignore'):
+                    penalty = np.sum(sums / counts)
+                base_score[name] = col_total_len[name] - penalty
+            else:
+                base_score[name] = 0.0
+
+        # Greedy ordering with group-aware scoring
+        remaining = col_names.copy()
+        selected = []
+        n = sample_idx.shape[0]
+        g_id = np.zeros(n, dtype=np.int64)
+
+        # Determine candidate evaluation count per step
+        topk_const = max(6, int(col_stop) * 6)
+
+        while remaining:
+            # Select top-k candidates by base_score as a fast prefilter
+            rem_sorted = sorted(remaining, key=lambda c: (base_score.get(c, 0.0), col_total_len.get(c, 0.0)), reverse=True)
+            k = min(len(remaining), topk_const)
+            candidates = rem_sorted[:k]
+
+            best_name = None
+            best_val = -1e300
+
+            # Evaluate exact incremental contribution for candidates under current grouping
             for c in candidates:
-                codes_c = codes_map[c].astype(np.int64, copy=False)
-                mult = int(mult_map[c])
+                codes = col_codes[c]
+                lens = col_lens[c].astype(np.float64, copy=False)
+                total_len = col_total_len[c]
+                pair = (g_id.astype(np.int64) << 32) | codes.astype(np.int64, copy=False)
+                uniq, inv, cnt = np.unique(pair, return_inverse=True, return_counts=True)
+                sum_len = np.bincount(inv, weights=lens, minlength=len(uniq))
+                with np.errstate(divide='ignore', invalid='ignore'):
+                    penalty = np.sum(sum_len / cnt)
+                score = float(total_len) - float(penalty)
+                if score > best_val:
+                    best_val = score
+                    best_name = c
 
-                pair = group_i64 * mult + codes_c
-                groups_prime = int(np.unique(pair).size)
+            if best_name is None:
+                best_name = rem_sorted[0]
 
-                score = float(n_s - groups_prime) * float(L + metrics[c]["mean_len"])
+            selected.append(best_name)
+            remaining.remove(best_name)
 
-                if best_score is None or score > best_score:
-                    best_score = score
-                    best_c = c
-                    best_groups = groups_prime
+            # Update grouping with selected column
+            codes_sel = col_codes[best_name]
+            pair = (g_id.astype(np.int64) << 32) | codes_sel.astype(np.int64, copy=False)
+            _, new_gid = np.unique(pair, return_inverse=True)
+            g_id = new_gid.astype(np.int64, copy=False)
 
-            if best_c is None:
-                break
-
-            codes_c = codes_map[best_c].astype(np.int64, copy=False)
-            mult = int(mult_map[best_c])
-            pair = group.astype(np.int64, copy=False) * mult + codes_c
-            _, inv = np.unique(pair, return_inverse=True)
-            group = inv.astype(np.int32, copy=False)
-            groups_count = int(group.max()) + 1
-
-            selected.append(best_c)
-            remaining.remove(best_c)
-            L += metrics[best_c]["mean_len"]
-
-        remaining_list = [c for c in cols if c in remaining]
-        remaining_sorted = sorted(
-            remaining_list,
-            key=lambda c: (
-                metrics[c]["distinct_ratio"],
-                -metrics[c]["priority"],
-                -metrics[c]["mean_len"],
-            ),
-        )
-
-        final_order = selected + remaining_sorted
-
-        seen = set()
-        final_order2 = []
-        for c in final_order:
-            if c in df2.columns and c not in seen:
-                final_order2.append(c)
-                seen.add(c)
-        for c in df2.columns:
-            if c not in seen:
-                final_order2.append(c)
-                seen.add(c)
-
-        return df2.loc[:, final_order2]
+        # Return DataFrame with reordered columns
+        return df_work.loc[:, selected]

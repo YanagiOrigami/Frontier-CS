@@ -1,5 +1,6 @@
 import json
 from argparse import Namespace
+from typing import List
 
 from sky_spot.strategies.multi_strategy import MultiRegionStrategy
 from sky_spot.utils import ClusterType
@@ -30,7 +31,6 @@ class Solution(MultiRegionStrategy):
             inter_task_overhead=[0.0],
         )
         super().__init__(args)
-        self.num_regions = len(config["trace_files"])
         return self
 
     def _step(self, last_cluster_type: ClusterType, has_spot: bool) -> ClusterType:
@@ -50,18 +50,29 @@ class Solution(MultiRegionStrategy):
 
         Returns: ClusterType.SPOT, ClusterType.ON_DEMAND, or ClusterType.NONE
         """
-        progress = sum(self.task_done_time)
+        if self.env.elapsed_seconds >= self.deadline:
+            return ClusterType.NONE
+
+        progress: float = sum(self.task_done_time)
         if progress >= self.task_duration:
             return ClusterType.NONE
+
+        remaining_work = self.task_duration - progress
+        remaining_time = self.deadline - self.env.elapsed_seconds
+
+        # If tight on time, prefer ON_DEMAND to guarantee progress
+        if remaining_work > remaining_time * 0.9:  # Buffer for overheads
+            return ClusterType.ON_DEMAND
 
         if has_spot:
             return ClusterType.SPOT
         else:
-            # No spot available. Check if this is a preemption (last was SPOT)
-            if last_cluster_type == ClusterType.SPOT:
-                # Switch to another region to avoid potential prolonged outage
-                current = self.env.get_current_region()
-                new_region = (current + 1) % self.env.get_num_regions()
+            # Occasionally switch regions if no spot and time allows
+            num_regions = self.env.get_num_regions()
+            current_region = self.env.get_current_region()
+            if remaining_time > remaining_work * 2 and num_regions > 1:  # Plenty of slack
+                new_region = (current_region + 1) % num_regions
                 self.env.switch_region(new_region)
-            # Use on-demand to make progress
-            return ClusterType.ON_DEMAND
+                return ClusterType.NONE  # Wait one step in new region
+            else:
+                return ClusterType.ON_DEMAND

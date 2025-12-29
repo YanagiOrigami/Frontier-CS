@@ -1,141 +1,135 @@
 import os
 import sys
-import subprocess
-import tempfile
 import tarfile
+import tempfile
+import subprocess
 import glob
+import shutil
 
 class Solution:
     def solve(self, src_path: str) -> bytes:
-        # Create a temporary directory for build and execution
         with tempfile.TemporaryDirectory() as temp_dir:
-            # Extract source code
             try:
-                if src_path.endswith('.tar.gz') or src_path.endswith('.tgz'):
-                    with tarfile.open(src_path, "r:gz") as tar:
-                        tar.extractall(path=temp_dir)
-                elif src_path.endswith('.tar'):
-                    with tarfile.open(src_path, "r:") as tar:
-                        tar.extractall(path=temp_dir)
-                else:
-                    # Attempt to treat as tar if extension is unknown but file exists
-                    try:
-                        with tarfile.open(src_path, "r:") as tar:
-                            tar.extractall(path=temp_dir)
-                    except:
-                        pass
+                with tarfile.open(src_path) as tar:
+                    tar.extractall(path=temp_dir)
             except Exception:
                 return b""
 
-            # Locate source files and fuzzer candidates
-            lib_srcs = []
-            include_dirs = set()
-            fuzzer_src = None
-            candidate_fuzzers = []
+            extracted_root = temp_dir
+            entries = os.listdir(temp_dir)
+            if len(entries) == 1 and os.path.isdir(os.path.join(temp_dir, entries[0])):
+                extracted_root = os.path.join(temp_dir, entries[0])
 
-            for root, dirs, files in os.walk(temp_dir):
-                for file in files:
-                    file_path = os.path.join(root, file)
-                    norm_path = os.path.normpath(file_path)
-                    
-                    if file.endswith(".c"):
-                        # Check for libFuzzer entry point
+            fuzzer_src = None
+            target_func = "polygonToCellsExperimental"
+            
+            for root, dirs, files in os.walk(extracted_root):
+                for f in files:
+                    if f.endswith(".c") and "fuzzer" in f.lower():
+                        fpath = os.path.join(root, f)
                         try:
-                            with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
-                                content = f.read()
-                                if "LLVMFuzzerTestOneInput" in content:
-                                    candidate_fuzzers.append(file_path)
-                                else:
-                                    # Heuristic: Library sources are usually in h3lib/lib
-                                    # We exclude tests, apps, examples to avoid multiple main() definitions
-                                    if "h3lib" in norm_path and "lib" in norm_path:
-                                        lib_srcs.append(file_path)
-                        except IOError:
+                            with open(fpath, "r", errors="ignore") as fp:
+                                content = fp.read()
+                                if target_func in content and "LLVMFuzzerTestOneInput" in content:
+                                    fuzzer_src = fpath
+                                    break
+                        except:
                             pass
-                    
-                    # Collect include directories (looking for h3api.h)
-                    if file == "h3api.h":
-                        include_dirs.add(root)
+                if fuzzer_src: break
             
-            # Select the most relevant fuzzer based on keywords
-            # The vulnerability is in polygonToCells (experimental)
-            keywords = ["polygonToCells", "polyfill", "experimental"]
-            
-            for f in candidate_fuzzers:
-                base = os.path.basename(f)
-                if any(k in base for k in keywords):
-                    fuzzer_src = f
-                    break
-            
-            # Fallback to first available fuzzer
-            if not fuzzer_src and candidate_fuzzers:
-                fuzzer_src = candidate_fuzzers[0]
-            
+            if not fuzzer_src:
+                for root, dirs, files in os.walk(extracted_root):
+                     if any(x in root for x in ["test", "benchmark"]): continue
+                     for f in files:
+                        if f.endswith(".c"):
+                            fpath = os.path.join(root, f)
+                            try:
+                                with open(fpath, "r", errors="ignore") as fp:
+                                    content = fp.read()
+                                    if target_func in content and "LLVMFuzzerTestOneInput" in content:
+                                        fuzzer_src = fpath
+                                        break
+                            except:
+                                pass
+                     if fuzzer_src: break
+
             if not fuzzer_src:
                 return b""
 
-            # Construct build command
-            fuzzer_bin = os.path.join(temp_dir, "fuzzer_bin")
-            cmd = [
-                "clang",
-                "-fsanitize=address,fuzzer",
-                "-O2", "-g",
-                "-o", fuzzer_bin,
-                fuzzer_src
-            ] + lib_srcs
+            include_dirs = []
+            header_found = False
+            for root, dirs, files in os.walk(extracted_root):
+                if "h3api.h" in files:
+                    include_dirs.append(root)
+                    header_found = True
             
+            if not header_found:
+                for root, dirs, files in os.walk(extracted_root):
+                    if "h3api.h.in" in files:
+                        try:
+                            in_path = os.path.join(root, "h3api.h.in")
+                            out_path = os.path.join(root, "h3api.h")
+                            with open(in_path, "r") as fin:
+                                data = fin.read()
+                                data = data.replace("@H3_VERSION_MAJOR@", "3")
+                                data = data.replace("@H3_VERSION_MINOR@", "7")
+                                data = data.replace("@H3_VERSION_PATCH@", "0")
+                            with open(out_path, "w") as fout:
+                                fout.write(data)
+                            include_dirs.append(root)
+                        except:
+                            pass
+                        break
+
+            lib_srcs = []
+            for root, dirs, files in os.walk(extracted_root):
+                if any(x in root for x in ["app", "test", "fuzzer", "example", "benchmark"]):
+                    continue
+                for f in files:
+                    if f.endswith(".c"):
+                        lib_srcs.append(os.path.join(root, f))
+            
+            include_dirs = list(set(include_dirs))
+            for root, dirs, files in os.walk(extracted_root):
+                if any(f.endswith(".h") for f in files):
+                    if root not in include_dirs:
+                        include_dirs.append(root)
+
+            fuzzer_bin = os.path.join(temp_dir, "harness")
+            cmd = ["clang", "-fsanitize=address,fuzzer", "-O2", "-g", "-fno-omit-frame-pointer"]
             for inc in include_dirs:
                 cmd.append(f"-I{inc}")
-            
-            # Add other header locations inside h3lib if needed
-            extra_includes = set()
-            for root, dirs, files in os.walk(temp_dir):
-                if "h3lib" in root and any(f.endswith(".h") for f in files):
-                    extra_includes.add(root)
-            for inc in extra_includes:
-                if inc not in include_dirs:
-                    cmd.append(f"-I{inc}")
+            cmd.extend(lib_srcs)
+            cmd.append(fuzzer_src)
+            cmd.extend(["-o", fuzzer_bin, "-lm"])
 
-            # Compile the fuzzer
             try:
-                subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                subprocess.run(cmd, cwd=temp_dir, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             except subprocess.CalledProcessError:
                 return b""
 
-            # Run the fuzzer
-            corpus_dir = os.path.join(temp_dir, "corpus")
-            os.makedirs(corpus_dir, exist_ok=True)
-            
-            # We use parallel workers to increase the chance of finding the crash quickly
-            # within the constraints.
-            fuzz_cmd = [
-                fuzzer_bin,
-                corpus_dir,
-                "-max_total_time=60",      # Limit execution time
-                "-rss_limit_mb=2560",      # Memory limit
-                "-workers=4",              # Parallel workers
-                "-jobs=4",
-                "-print_final_stats=0"
-            ]
-            
+            run_cmd = [fuzzer_bin, "-max_total_time=60", "-print_final_stats=1"]
             try:
-                # Fuzzer returns non-zero on crash, which is expected
-                subprocess.run(fuzz_cmd, cwd=temp_dir, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            except Exception:
+                subprocess.run(run_cmd, cwd=temp_dir, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            except:
                 pass
             
-            # Retrieve crash artifacts
-            # libFuzzer writes artifacts like crash-<sha1> or leak-<sha1> to CWD
             crashes = glob.glob(os.path.join(temp_dir, "crash-*"))
-            crashes += glob.glob(os.path.join(temp_dir, "leak-*"))
+            if not crashes:
+                return b""
             
-            if crashes:
-                # Sort by size (smallest first) to maximize score
-                crashes.sort(key=os.path.getsize)
-                try:
-                    with open(crashes[0], "rb") as f:
-                        return f.read()
-                except IOError:
-                    pass
+            target = crashes[0]
             
-            return b""
+            min_cmd = [fuzzer_bin, "-minimize_crash=1", "-max_total_time=15", target]
+            try:
+                subprocess.run(min_cmd, cwd=temp_dir, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            except:
+                pass
+            
+            mins = glob.glob(os.path.join(temp_dir, "minimized-from-*"))
+            if mins:
+                mins.sort(key=os.path.getsize)
+                target = mins[0]
+            
+            with open(target, "rb") as f:
+                return f.read()

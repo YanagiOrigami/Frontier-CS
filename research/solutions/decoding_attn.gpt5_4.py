@@ -1,155 +1,146 @@
-import os
-import textwrap
+import torch
+import triton
+import triton.language as tl
+import math
+from typing import Dict, Any
+
 
 class Solution:
     def solve(self, spec_path: str = None) -> dict:
-        code = textwrap.dedent("""
-            import torch
-            import triton
-            import triton.language as tl
+        code = r'''
+import torch
+import triton
+import triton.language as tl
+import math
 
-            @triton.autotune(
-                configs=[
-                    triton.Config({'BLOCK_K': 64,  'BLOCK_DQ': 64,  'BLOCK_DV': 64},  num_warps=4, num_stages=3),
-                    triton.Config({'BLOCK_K': 128, 'BLOCK_DQ': 64,  'BLOCK_DV': 64},  num_warps=4, num_stages=3),
-                    triton.Config({'BLOCK_K': 256, 'BLOCK_DQ': 64,  'BLOCK_DV': 64},  num_warps=8, num_stages=4),
-                    triton.Config({'BLOCK_K': 128, 'BLOCK_DQ': 64,  'BLOCK_DV': 128}, num_warps=8, num_stages=4),
-                    triton.Config({'BLOCK_K': 256, 'BLOCK_DQ': 64,  'BLOCK_DV': 128}, num_warps=8, num_stages=4),
-                    triton.Config({'BLOCK_K': 64,  'BLOCK_DQ': 128, 'BLOCK_DV': 64},  num_warps=4, num_stages=3),
-                    triton.Config({'BLOCK_K': 128, 'BLOCK_DQ': 128, 'BLOCK_DV': 64},  num_warps=4, num_stages=3),
-                    triton.Config({'BLOCK_K': 256, 'BLOCK_DQ': 128, 'BLOCK_DV': 64},  num_warps=8, num_stages=4),
-                ],
-                key=['N', 'Dq', 'Dv'],
-            )
-            @triton.jit
-            def _decoding_attn_kernel(
-                Q_ptr, K_ptr, V_ptr, O_ptr,
-                stride_qz, stride_qh, stride_qm, stride_qd,
-                stride_kz, stride_kh, stride_kn, stride_kd,
-                stride_vz, stride_vh, stride_vn, stride_vd,
-                stride_oz, stride_oh, stride_om, stride_od,
-                Z, H, M, N, Dq, Dv,
-                sm_scale: tl.constexpr,
-                BLOCK_K: tl.constexpr, BLOCK_DQ: tl.constexpr, BLOCK_DV: tl.constexpr
-            ):
-                pid = tl.program_id(axis=0)
-                m_id = pid % M
-                tmp = pid // M
-                h_id = tmp % H
-                z_id = tmp // H
 
-                # Load query vector q of size Dq
-                offs_dq = tl.arange(0, BLOCK_DQ)
-                q_base = Q_ptr + z_id * stride_qz + h_id * stride_qh + m_id * stride_qm
-                q = tl.load(q_base + offs_dq * stride_qd, mask=offs_dq < Dq, other=0.0)
-                q = q.to(tl.float32)
+@triton.autotune(
+    configs=[
+        triton.Config({'BLOCK_M': 1, 'BLOCK_N': 64}, num_warps=2, num_stages=2),
+        triton.Config({'BLOCK_M': 1, 'BLOCK_N': 128}, num_warps=4, num_stages=2),
+        triton.Config({'BLOCK_M': 1, 'BLOCK_N': 256}, num_warps=4, num_stages=3),
+        triton.Config({'BLOCK_M': 2, 'BLOCK_N': 128}, num_warps=4, num_stages=2),
+        triton.Config({'BLOCK_M': 4, 'BLOCK_N': 128}, num_warps=4, num_stages=2),
+        triton.Config({'BLOCK_M': 2, 'BLOCK_N': 256}, num_warps=8, num_stages=3),
+        triton.Config({'BLOCK_M': 4, 'BLOCK_N': 256}, num_warps=8, num_stages=3),
+    ],
+    key=['N'],
+)
+@triton.jit
+def _decoding_attn_fwd(
+    Q_ptr, K_ptr, V_ptr, O_ptr,
+    Z, H, M, N,
+    stride_qz, stride_qh, stride_qm, stride_qd,
+    stride_kz, stride_kh, stride_kn, stride_kd,
+    stride_vz, stride_vh, stride_vn, stride_vd,
+    stride_oz, stride_oh, stride_om, stride_od,
+    sm_scale,
+    D_HEAD_Q: tl.constexpr, D_HEAD_V: tl.constexpr,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
+):
+    pid_m = tl.program_id(0)
+    pid_zh = tl.program_id(1)
 
-                # Loop over value dimension in tiles so we can support any Dv
-                dv_start = 0
-                while dv_start < Dv:
-                    offs_dv = dv_start + tl.arange(0, BLOCK_DV)
-                    dv_mask = offs_dv < Dv
+    h = pid_zh % H
+    z = pid_zh // H
 
-                    out_acc = tl.zeros([BLOCK_DV], dtype=tl.float32)
-                    m_i = tl.full([1], -float('inf'), dtype=tl.float32)
-                    l_i = tl.zeros([1], dtype=tl.float32)
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = tl.arange(0, BLOCK_N)
+    offs_dq = tl.arange(0, D_HEAD_Q)
+    offs_dv = tl.arange(0, D_HEAD_V)
 
-                    n_start = 0
-                    while n_start < N:
-                        offs_n = n_start + tl.arange(0, BLOCK_K)
-                        n_mask = offs_n < N
+    # Pointers for Q [BLOCK_M, D_HEAD_Q]
+    q_ptrs = Q_ptr + z * stride_qz + h * stride_qh \
+             + offs_m[:, None] * stride_qm + offs_dq[None, :] * stride_qd
+    q_mask = (offs_m[:, None] < M)
 
-                        # Load K tile [BLOCK_K, BLOCK_DQ]
-                        k_ptrs = (
-                            K_ptr
-                            + z_id * stride_kz
-                            + h_id * stride_kh
-                            + offs_n[:, None] * stride_kn
-                            + offs_dq[None, :] * stride_kd
-                        )
-                        k = tl.load(k_ptrs, mask=n_mask[:, None] & (offs_dq[None, :] < Dq), other=0.0)
-                        k = k.to(tl.float32)
+    q = tl.load(q_ptrs, mask=q_mask, other=0.0).to(tl.float32)
 
-                        # Compute scores = K @ q
-                        scores = tl.sum(k * q[None, :], axis=1)
-                        scores = scores * sm_scale
-                        # Mask out-of-bounds
-                        scores = tl.where(n_mask, scores, -float('inf'))
+    # init online softmax state
+    m_i = tl.full((BLOCK_M,), -float('inf'), dtype=tl.float32)
+    l_i = tl.zeros((BLOCK_M,), dtype=tl.float32)
+    acc = tl.zeros((BLOCK_M, D_HEAD_V), dtype=tl.float32)
 
-                        # Online softmax update
-                        block_max = tl.max(scores, axis=0)
-                        m_prev = m_i
-                        m_i = tl.maximum(m_i, block_max)
-                        alpha = tl.exp(m_prev - m_i)
+    n_start = 0
+    while n_start < N:
+        n_idx = n_start + offs_n
+        k_ptrs = K_ptr + z * stride_kz + h * stride_kh \
+                 + n_idx[:, None] * stride_kn + offs_dq[None, :] * stride_kd
+        v_ptrs = V_ptr + z * stride_vz + h * stride_vh \
+                 + n_idx[:, None] * stride_vn + offs_dv[None, :] * stride_vd
 
-                        p = tl.exp(scores - m_i)
-                        # p zeros for masked positions already handled by -inf
-                        sum_p = tl.sum(p, axis=0)
-                        l_i = l_i * alpha + sum_p
+        k_mask = (n_idx[:, None] < N)
+        v_mask = (n_idx[:, None] < N)
 
-                        # Load V tile [BLOCK_K, BLOCK_DV]
-                        v_ptrs = (
-                            V_ptr
-                            + z_id * stride_vz
-                            + h_id * stride_vh
-                            + offs_n[:, None] * stride_vn
-                            + offs_dv[None, :] * stride_vd
-                        )
-                        v = tl.load(v_ptrs, mask=n_mask[:, None] & dv_mask[None, :], other=0.0)
-                        v = v.to(tl.float32)
+        k = tl.load(k_ptrs, mask=k_mask, other=0.0).to(tl.float32)   # [BLOCK_N, D_HEAD_Q]
+        # scores: [BLOCK_M, BLOCK_N]
+        scores = tl.dot(q, tl.trans(k)) * sm_scale
 
-                        contrib = tl.sum(v * p[:, None], axis=0)
-                        out_acc = out_acc * alpha + contrib
+        # mask scores for out-of-bounds n
+        valid_n = (n_idx < N)[None, :]
+        scores = tl.where(valid_n, scores, -float('inf'))
 
-                        n_start += BLOCK_K
+        m_ij = tl.max(scores, axis=1)
+        p = tl.exp(scores - m_ij[:, None])
+        l_ij = tl.sum(p, axis=1)
 
-                    # Normalize and store
-                    out = out_acc / l_i
-                    o_ptrs = (
-                        O_ptr
-                        + z_id * stride_oz
-                        + h_id * stride_oh
-                        + m_id * stride_om
-                        + offs_dv * stride_od
-                    )
-                    tl.store(o_ptrs, out.to(tl.float16), mask=dv_mask)
+        v = tl.load(v_ptrs, mask=v_mask, other=0.0).to(tl.float32)   # [BLOCK_N, D_HEAD_V]
+        acc_ij = tl.dot(p, v)  # [BLOCK_M, D_HEAD_V]
 
-                    dv_start += BLOCK_DV
+        m_new = tl.maximum(m_i, m_ij)
+        alpha = tl.exp(m_i - m_new)
+        beta = tl.exp(m_ij - m_new)
 
-            def decoding_attn(Q: torch.Tensor, K: torch.Tensor, V: torch.Tensor) -> torch.Tensor:
-                assert Q.is_cuda and K.is_cuda and V.is_cuda, "Tensors must be on CUDA device"
-                assert Q.dtype in (torch.float16, torch.bfloat16), "Q must be float16/bfloat16"
-                assert K.dtype == Q.dtype and V.dtype == Q.dtype, "K and V must have same dtype as Q"
-                assert Q.shape[0] == K.shape[0] == V.shape[0], "Z must match"
-                assert Q.shape[1] == K.shape[1] == V.shape[1], "H must match"
-                assert Q.shape[3] == K.shape[3], "Dq must match between Q and K"
-                Z, H, M, Dq = Q.shape
-                _, _, N, _ = K.shape
-                _, _, _, Dv = V.shape
+        l_i = alpha * l_i + beta * l_ij
+        acc = alpha[:, None] * acc + beta[:, None] * acc_ij
+        m_i = m_new
 
-                # Allocate output
-                O = torch.empty((Z, H, M, Dv), device=Q.device, dtype=torch.float16)
+        n_start += BLOCK_N
 
-                # Strides (in elements)
-                stride_qz, stride_qh, stride_qm, stride_qd = Q.stride()
-                stride_kz, stride_kh, stride_kn, stride_kd = K.stride()
-                stride_vz, stride_vh, stride_vn, stride_vd = V.stride()
-                stride_oz, stride_oh, stride_om, stride_od = O.stride()
+    # Normalize
+    out = acc / l_i[:, None]
 
-                # scale
-                sm_scale = 1.0 / (Dq ** 0.5)
+    o_ptrs = O_ptr + z * stride_oz + h * stride_oh \
+             + offs_m[:, None] * stride_om + offs_dv[None, :] * stride_od
+    o_mask = (offs_m[:, None] < M)
+    tl.store(o_ptrs, out.to(tl.float16), mask=o_mask)
 
-                grid = (Z * H * M,)
 
-                _decoding_attn_kernel[grid](
-                    Q, K, V, O,
-                    stride_qz, stride_qh, stride_qm, stride_qd,
-                    stride_kz, stride_kh, stride_kn, stride_kd,
-                    stride_vz, stride_vh, stride_vn, stride_vd,
-                    stride_oz, stride_oh, stride_om, stride_od,
-                    Z, H, M, N, Dq, Dv,
-                    sm_scale,
-                )
-                return O
-        """)
+def decoding_attn(Q: torch.Tensor, K: torch.Tensor, V: torch.Tensor) -> torch.Tensor:
+    """
+    Decoding attention computation.
+    
+    Args:
+        Q: Input tensor of shape (Z, H, M, Dq) - query tensor (float16)
+        K: Input tensor of shape (Z, H, N, Dq) - key tensor (float16)
+        V: Input tensor of shape (Z, H, N, Dv) - value tensor (float16)
+    
+    Returns:
+        Output tensor of shape (Z, H, M, Dv) - attention output (float16)
+    """
+    assert Q.dtype in (torch.float16, torch.bfloat16), "Q must be float16 or bfloat16"
+    assert K.dtype == Q.dtype and V.dtype == Q.dtype, "K and V must match Q dtype"
+    assert Q.device.type == K.device.type == V.device.type, "Q, K, V must be on the same device"
+    Z, H, M, Dq = Q.shape
+    Zk, Hk, N, Dqk = K.shape
+    Zv, Hv, Nv, Dv = V.shape
+    assert Z == Zk == Zv and H == Hk == Hv and Dq == Dqk and N == Nv, "Shape mismatch"
+    assert Q.is_cuda and K.is_cuda and V.is_cuda, "Use CUDA tensors"
+    O = torch.empty((Z, H, M, Dv), device=Q.device, dtype=Q.dtype)
+    sm_scale = 1.0 / math.sqrt(Dq)
+
+    grid = lambda META: (triton.cdiv(M, META['BLOCK_M']), Z * H)
+
+    _decoding_attn_fwd[grid](
+        Q, K, V, O,
+        Z, H, M, N,
+        Q.stride(0), Q.stride(1), Q.stride(2), Q.stride(3),
+        K.stride(0), K.stride(1), K.stride(2), K.stride(3),
+        V.stride(0), V.stride(1), V.stride(2), V.stride(3),
+        O.stride(0), O.stride(1), O.stride(2), O.stride(3),
+        sm_scale,
+        D_HEAD_Q=Dq, D_HEAD_V=Dv,
+    )
+    return O
+'''
         return {"code": code}

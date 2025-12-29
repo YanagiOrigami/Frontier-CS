@@ -4,114 +4,90 @@ from typing import Tuple
 
 class YourIndexClass:
     """
-    A FAISS-based vector index optimized for the low-latency tier.
+    A vector database index designed for the low-latency tier, prioritizing
+    query speed while maintaining high recall. This implementation uses Faiss's
+    IndexHNSWFlat, a state-of-the-art graph-based index for Approximate
+    Nearest Neighbor (ANN) search on CPUs.
 
-    This implementation uses an Inverted File with Product Quantization (IVFPQ)
-    to achieve very fast search speeds, which is essential to meet the strict
-    latency constraint of 2.31ms. The hyperparameters are aggressively tuned
-    for speed over recall.
-
-    Index structure:
-    - IVF (Inverted File): Partitions the vector space into `nlist` cells.
-      At search time, only a small subset of these cells (`nprobe`) are visited.
-    - PQ (Product Quantization): Compresses vectors stored in the index. This
-      reduces the memory footprint and dramatically speeds up distance
-      calculations, as they are computed from compact codes and lookup tables.
+    The parameters are aggressively tuned to meet the strict latency constraint
+    of 2.31ms per query on the SIFT1M dataset.
     """
-
     def __init__(self, dim: int, **kwargs):
         """
-        Initialize the index for vectors of dimension `dim`.
+        Initializes the HNSW index.
 
         Args:
-            dim: Vector dimensionality.
-            **kwargs: Optional parameters (not used in this implementation,
-                      but included for API compatibility).
+            dim: The dimensionality of the vectors.
+            **kwargs: Optional parameters to override the defaults for HNSW.
+                - M (int): Number of connections per node in the graph.
+                           Default: 32.
+                - efConstruction (int): Graph construction quality/speed tradeoff.
+                                        Default: 400.
+                - efSearch (int): Search-time quality/speed tradeoff. This is the
+                                  most critical parameter for latency. Default: 48.
         """
         self.dim = dim
-        self.is_trained = False
 
-        # --- Hyperparameter Tuning for Low Latency ---
-        # These parameters are critical for balancing search speed and recall.
-        # They have been selected to prioritize meeting the stringent latency
-        # target of the low-latency tier.
+        # HNSW parameters are tuned for the low-latency requirement.
+        # A higher M and efConstruction create a better graph, allowing for good
+        # recall even with a low efSearch.
+        self.M = int(kwargs.get('M', 32))
+        self.efConstruction = int(kwargs.get('efConstruction', 400))
+        
+        # efSearch is set aggressively low to ensure latency is under the 2.31ms
+        # threshold. This is the primary knob for controlling the speed vs.
+        # recall trade-off.
+        self.efSearch = int(kwargs.get('efSearch', 48))
 
-        # nlist: Number of IVF cells (Voronoi partitions). A moderate number
-        # is chosen to balance the cost of the coarse quantization search
-        # and the number of vectors scanned per cell.
-        nlist = 1024
+        # IndexHNSWFlat stores full vectors, providing the best possible precision
+        # for distance calculations, which helps maximize recall.
+        self.index = faiss.IndexHNSWFlat(self.dim, self.M, faiss.METRIC_L2)
+        self.index.hnsw.efConstruction = self.efConstruction
 
-        # m: Number of subquantizers for Product Quantization.
-        # The 128-dimensional vector is split into `m` sub-vectors, and each
-        # is quantized separately. A higher `m` results in shorter sub-vectors,
-        # leading to faster (but less accurate) distance approximations.
-        # `m=32` is chosen for maximum speed (128 / 32 = 4-dim sub-vectors).
-        m = 32
-
-        # nbits: Number of bits per subquantizer code. 8 is the standard,
-        # yielding 2^8 = 256 centroids for each sub-space.
-        nbits = 8
-
-        # --- Index Construction ---
-        # The coarse quantizer for IVF. This index is used to assign vectors
-        # to their respective Voronoi cells.
-        quantizer = faiss.IndexFlatL2(self.dim)
-
-        # The main index combines IVF and PQ.
-        # faiss.METRIC_L2 is the default and is used for SIFT1M.
-        self.index = faiss.IndexIVFPQ(quantizer, self.dim, nlist, m, nbits)
-
-        # nprobe: The number of IVF cells to probe at search time. This is the
-        # most important search-time parameter for the speed/recall trade-off.
-        # A very low value is required to meet the latency goal, as hinted by
-        # the problem description ("nprobe=2-5"). We choose 5 to maximize
-        # recall within this aggressive range.
-        self.nprobe = 5
+        # Use faiss.ParameterSpace to set search-time parameters.
+        self.params = faiss.ParameterSpace()
+        self.params.set_index_parameter(self.index, "efSearch", self.efSearch)
 
     def add(self, xb: np.ndarray) -> None:
         """
-        Add vectors to the index.
-
-        If the index has not been trained yet, it will be trained on the
-        first batch of vectors provided.
+        Adds vectors to the index. The HNSW graph is built incrementally.
 
         Args:
-            xb: Base vectors, shape (N, dim), dtype float32.
+            xb: A numpy array of shape (N, dim) and dtype float32 containing
+                the vectors to be added.
         """
-        if not self.is_trained:
-            # The IVFPQ index requires a training step to learn the Voronoi
-            # cells (for IVF) and the codebooks (for PQ). We train on the
-            # provided base vectors.
-            if xb.shape[0] > 0:
-                self.index.train(xb)
-                self.is_trained = True
-
-        # After training, add the vectors to the index.
-        if xb.shape[0] > 0:
-            self.index.add(xb)
+        if xb.dtype != np.float32:
+            xb = xb.astype(np.float32)
+        
+        self.index.add(xb)
 
     def search(self, xq: np.ndarray, k: int) -> Tuple[np.ndarray, np.ndarray]:
         """
-        Search for k nearest neighbors of query vectors.
+        Performs a batch search for the k-nearest neighbors for each query vector.
 
         Args:
-            xq: Query vectors, shape (nq, dim), dtype float32.
-            k: Number of nearest neighbors to return.
+            xq: A numpy array of shape (nq, dim) and dtype float32 containing
+                the query vectors.
+            k: The number of nearest neighbors to retrieve for each query.
 
         Returns:
-            (distances, indices):
-                - distances: shape (nq, k), L2-squared distances.
-                - indices: shape (nq, k), indices of the neighbors.
+            A tuple (distances, indices):
+                - distances: A (nq, k) numpy array of L2-squared distances.
+                - indices: A (nq, k) numpy array of indices of the neighbors.
         """
-        if xq.shape[0] == 0:
-            return np.array([[]], dtype='float32'), np.array([[]], dtype='int64')
+        if self.index.ntotal == 0:
+            # Handle search on an empty index to avoid runtime errors.
+            nq = xq.shape[0]
+            distances = np.full((nq, k), -1.0, dtype=np.float32)
+            indices = np.full((nq, k), -1, dtype=np.int64)
+            return distances, indices
 
-        # Set the number of probes for this specific search query. This allows
-        # dynamic adjustment, but here we use the fixed value optimized for this tier.
-        self.index.nprobe = self.nprobe
+        if xq.dtype != np.float32:
+            xq = xq.astype(np.float32)
 
-        # FAISS's search method is highly optimized for batch processing,
-        # which is crucial for meeting the average query time constraint.
-        distances, indices = self.index.search(xq, k)
+        # The search is performed using the efSearch parameter set during init.
+        distances, indices = self.index.search(xq, k, params=self.params)
 
+        # Faiss with METRIC_L2 returns L2-squared distances, which is acceptable
+        # and avoids the computational cost of a square root operation.
         return distances, indices

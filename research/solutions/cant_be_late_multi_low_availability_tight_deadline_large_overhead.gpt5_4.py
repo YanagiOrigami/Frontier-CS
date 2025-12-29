@@ -1,13 +1,12 @@
 import json
 from argparse import Namespace
-from typing import List, Optional
 
 from sky_spot.strategies.multi_strategy import MultiRegionStrategy
 from sky_spot.utils import ClusterType
 
 
 class Solution(MultiRegionStrategy):
-    NAME = "cb_late_multiregion_ema_v1"
+    NAME = "cant_be_late_rr"
 
     def solve(self, spec_path: str) -> "Solution":
         with open(spec_path) as f:
@@ -20,122 +19,97 @@ class Solution(MultiRegionStrategy):
             inter_task_overhead=[0.0],
         )
         super().__init__(args)
-        self._internal_initialized = False
+
+        # Strategy state
+        self._initialized = False
+        self._commit_to_od = False
+        self._recency_window_seconds = None
+        self._last_true_ts = None  # per-region last observed spot-true timestamp
+        self._rr_next = 0
+        self._commit_margin = None
         return self
 
-    # -------- Internal helpers --------
-    def _init_internal(self):
-        if self._internal_initialized:
+    def _init_once(self):
+        if self._initialized:
             return
-        self._internal_initialized = True
+        num_regions = self.env.get_num_regions()
+        self._last_true_ts = [-1.0] * num_regions
+        self._rr_next = self.env.get_current_region()
+        # Recency window: prefer regions with spot observed within this window
+        # Choose 6 hours as a heuristic window
+        self._recency_window_seconds = 6.0 * 3600.0
+        # Commit margin: one step worth of time as a safety buffer
+        self._commit_margin = max(self.env.gap_seconds, 60.0)
+        self._initialized = True
 
-        self._num_regions: int = max(1, int(self.env.get_num_regions()))
-        self._region_scores: List[float] = [0.5 for _ in range(self._num_regions)]
-        self._ema_alpha: float = 0.2
+    def _update_region_stats(self, has_spot: bool):
+        # Update last-seen timestamp for spot in current region
+        if has_spot:
+            idx = self.env.get_current_region()
+            self._last_true_ts[idx] = self.env.elapsed_seconds
 
-        self._rr_next: int = 0  # round-robin pointer for tie-breaking
-        self._last_switch_elapsed: float = -1e18  # elapsed_seconds when we last switched
-        self._switch_cooldown_seconds: float = self.env.gap_seconds  # avoid thrashing
+    def _should_commit_to_od(self, last_cluster_type: ClusterType) -> bool:
+        # Remaining work and time
+        work_done = sum(self.task_done_time) if self.task_done_time else 0.0
+        remaining_work = max(0.0, self.task_duration - work_done)
+        remaining_time = max(0.0, self.deadline - self.env.elapsed_seconds)
 
-        # Cached progress sum to avoid O(n^2) accumulation
-        self._done_total: float = 0.0
-        self._done_len: int = 0
+        # If already committed, keep it
+        if self._commit_to_od:
+            return True
 
-        # Fallback to ON_DEMAND once threshold reached
-        self._od_commit: bool = False
+        # If already on OD and we keep running it, no new overhead
+        overhead_needed = 0.0 if last_cluster_type == ClusterType.ON_DEMAND else self.restart_overhead
 
-        # Safety buffers
-        gap = float(self.env.gap_seconds)
-        self._search_margin_time: float = self.restart_overhead + 2.0 * gap
-        self._od_buffer_time: float = self.restart_overhead + 1.75 * gap
+        # Commit to OD if not enough slack to wait for spot
+        # Safety buffer adds one step to account for discretization/overheads within step
+        return remaining_time <= (remaining_work + overhead_needed + self._commit_margin)
 
-    def _update_done_total(self):
-        if self._done_len != len(self.task_done_time):
-            # Incremental sum to keep it efficient
-            for i in range(self._done_len, len(self.task_done_time)):
-                self._done_total += float(self.task_done_time[i])
-            self._done_len = len(self.task_done_time)
+    def _choose_region_when_waiting(self):
+        # Prefer the region with the most recent spot observation within the recency window.
+        now = self.env.elapsed_seconds
+        current = self.env.get_current_region()
+        num_regions = self.env.get_num_regions()
 
-    def _update_region_score(self, region_idx: int, has_spot: bool):
-        # Exponential moving average update using current observation (has_spot) for this region
-        s = self._region_scores[region_idx]
-        observed = 1.0 if has_spot else 0.0
-        self._region_scores[region_idx] = (1.0 - self._ema_alpha) * s + self._ema_alpha * observed
+        # Candidates within recency window excluding current region
+        best_idx = -1
+        best_ts = -1.0
+        window = self._recency_window_seconds
+        for i in range(num_regions):
+            if i == current:
+                continue
+            ts = self._last_true_ts[i]
+            if ts >= 0.0 and (now - ts) <= window:
+                if ts > best_ts:
+                    best_ts = ts
+                    best_idx = i
 
-    def _best_alternative_region(self, current_idx: int) -> int:
-        # Return the highest scored region different from current; break ties by round-robin preference
-        n = self._num_regions
-        if n <= 1:
-            return current_idx
-        # Sort indices by score descending; stable tie-breaker uses index order starting from rr pointer
-        indices = list(range(n))
-        # Rotate by round-robin pointer for consistent tie-breaking
-        rr = self._rr_next % n
-        rotated = indices[rr:] + indices[:rr]
-        rotated_scores = sorted(rotated, key=lambda i: self._region_scores[i], reverse=True)
-        for idx in rotated_scores:
-            if idx != current_idx:
-                return idx
-        # Fallback to next in round-robin
-        return (current_idx + 1) % n
+        if best_idx != -1:
+            target = best_idx
+        else:
+            # Round-robin to diversify search
+            target = (current + 1) % num_regions
 
-    # -------- Core decision logic --------
+        if target != current:
+            self.env.switch_region(target)
+
+        # Update next RR base
+        self._rr_next = (target + 1) % num_regions
+
     def _step(self, last_cluster_type: ClusterType, has_spot: bool) -> ClusterType:
-        # Initialize internal state if needed
-        self._init_internal()
+        self._init_once()
+        self._update_region_stats(has_spot)
 
-        # Update cached progress
-        self._update_done_total()
-
-        # Compute essential quantities
-        current_region = int(self.env.get_current_region())
-        gap = float(self.env.gap_seconds)
-        now = float(self.env.elapsed_seconds)
-        total_needed = float(self.task_duration)
-        done = self._done_total
-        remaining_work = max(0.0, total_needed - done)
-        time_left = max(0.0, float(self.deadline) - now)
-        slack = time_left - remaining_work
-
-        # If done, stop
-        if remaining_work <= 1e-9:
-            return ClusterType.NONE
-
-        # Update region score with current observation
-        self._update_region_score(current_region, has_spot)
-
-        # Determine if we must commit to On-Demand to guarantee completion
-        # Use a conservative buffer to account for one restart and potential timestep boundary mismatch
-        if not self._od_commit:
-            if time_left <= remaining_work + self._od_buffer_time:
-                self._od_commit = True
-
-        # If committed to On-Demand, always run ON_DEMAND
-        if self._od_commit:
+        # If we must commit to OD to guarantee deadline, do it and never switch back
+        if self._should_commit_to_od(last_cluster_type):
+            self._commit_to_od = True
             return ClusterType.ON_DEMAND
 
-        # Prefer Spot when sufficiently safe
+        # Not committed to OD: prefer spot when available
         if has_spot:
             return ClusterType.SPOT
 
-        # No Spot available in current region.
-        # Decide between searching other regions (by switching) vs using On-Demand vs waiting (NONE).
-        # If slack is insufficient, use On-Demand to avoid missing deadline.
-        if slack <= self._search_margin_time:
-            return ClusterType.ON_DEMAND
-
-        # We have enough slack to try searching for Spot in another region.
-        # Avoid rapid thrashing: enforce a minimal cooldown between switches.
-        if now - self._last_switch_elapsed >= self._switch_cooldown_seconds:
-            target_region = self._best_alternative_region(current_region)
-            if target_region != current_region:
-                self.env.switch_region(target_region)
-                self._last_switch_elapsed = now
-                # advance round-robin pointer for future tie-breaking
-                self._rr_next = (target_region + 1) % self._num_regions
-                # Return NONE this step to avoid risking a SPOT action without guaranteed availability info.
-                return ClusterType.NONE
-
-        # If we recently switched or no better region exists, simply wait this step (NONE) if slack allows.
-        # This avoids unnecessary On-Demand cost and gives time for Spot to reappear.
+        # Spot not available here; still have slack.
+        # Proactively search other regions by switching while idling.
+        self._choose_region_when_waiting()
         return ClusterType.NONE

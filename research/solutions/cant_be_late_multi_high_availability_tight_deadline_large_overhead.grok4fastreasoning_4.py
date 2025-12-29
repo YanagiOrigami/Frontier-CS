@@ -50,23 +50,6 @@ class Solution(MultiRegionStrategy):
         Returns: ClusterType.SPOT, ClusterType.ON_DEMAND, or ClusterType.NONE
         """
         # Your decision logic here
-        done_work = sum(self.task_done_time)
-        if done_work >= self.task_duration:
-            return ClusterType.NONE
-
-        remaining_work = self.task_duration - done_work
-        remaining_wall = self.deadline - self.env.elapsed_seconds
-        if remaining_wall <= 0:
-            return ClusterType.NONE
-
-        effective_remaining_wall = remaining_wall - self.remaining_restart_overhead
-        if effective_remaining_wall <= 0:
-            return ClusterType.NONE
-
-        required_rate = remaining_work / effective_remaining_wall
-        if required_rate > 1.0:
-            return ClusterType.ON_DEMAND
-        elif has_spot:
+        if has_spot:
             return ClusterType.SPOT
-        else:
-            return ClusterType.ON_DEMAND
+        return ClusterType.ON_DEMAND

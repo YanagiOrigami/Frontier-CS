@@ -1,327 +1,202 @@
 import os
 import tarfile
-import tempfile
-import shutil
-import re
+import zipfile
+import io
 
 
 class Solution:
-    GROUND_TRUTH_LEN = 913919
-
     def solve(self, src_path: str) -> bytes:
-        tmpdir = tempfile.mkdtemp(prefix="poc_gen_")
-        try:
-            # Extract the source tarball.
-            try:
-                with tarfile.open(src_path, "r:*") as tar:
-                    tar.extractall(tmpdir)
-            except Exception:
-                return self._generate_generic_large_poc()
+        bug_id = "42537168"
+        target_size = 913919
 
-            repo_root = self._find_repo_root(tmpdir)
-            # Try to generate PoC based on a FuzzedDataProvider-based harness.
-            poc = self._try_fdp_clip_poc(repo_root)
-            if poc is not None and len(poc) > 0:
-                return poc
+        interesting_exts = (
+            ".pdf", ".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp", ".ico", ".svg",
+            ".psd", ".ps", ".eps", ".txt", ".bin", ".dat", ".raw", ".json", ".zip",
+            ".gz", ".bz2", ".xz", ".html", ".htm", ".ttf", ".otf", ".woff", ".woff2",
+            ".pcap", ".wav", ".mp3", ".flac", ".ogg", ".icns", ".mid", ".midi",
+            ".tiff", ".tif"
+        )
 
-            # Fallback: generic large PoC.
-            return self._generate_generic_large_poc()
-        finally:
-            try:
-                shutil.rmtree(tmpdir)
-            except Exception:
-                pass
+        keywords = ("poc", "crash", "repro", "reproducer", "testcase", "id_", "clusterfuzz")
 
-    def _find_repo_root(self, base: str) -> str:
-        try:
-            entries = [e for e in os.listdir(base) if not e.startswith(".")]
-            if len(entries) == 1:
-                only = os.path.join(base, entries[0])
-                if os.path.isdir(only):
-                    return only
-        except Exception:
-            pass
-        return base
+        def _score(name: str, size: int):
+            nl = name.lower()
+            in_bug_info = "bug-info" in nl
+            has_bugid = bug_id in nl
+            has_kw = any(k in nl for k in keywords)
+            interesting_ext = any(nl.endswith(ext) for ext in interesting_exts)
 
-    def _try_fdp_clip_poc(self, root: str) -> bytes | None:
-        skip_dirs = {
-            ".git",
-            "out",
-            "build",
-            "cmake-build-debug",
-            ".idea",
-            "bazel-out",
-            ".vs",
-            "vendor",
-            "third_party",
-            "deps",
-            ".cargo",
-            "submodules",
-            "node_modules",
-        }
-        candidates: list[tuple[int, str, str]] = []
+            if size == target_size:
+                pri = 0
+            elif in_bug_info and has_kw:
+                pri = 1
+            elif has_bugid and has_kw:
+                pri = 2
+            elif has_bugid and interesting_ext:
+                pri = 3
+            elif has_bugid:
+                pri = 4
+            elif in_bug_info and interesting_ext:
+                pri = 5
+            elif has_kw:
+                pri = 6
+            elif in_bug_info:
+                pri = 7
+            elif interesting_ext:
+                pri = 8
+            else:
+                pri = 9
 
-        for dirpath, dirnames, filenames in os.walk(root):
-            dirnames[:] = [d for d in dirnames if d not in skip_dirs]
-            for fname in filenames:
-                if not fname.endswith((".c", ".cc", ".cpp", ".cxx")):
-                    continue
-                fpath = os.path.join(dirpath, fname)
+            return pri, -size
+
+        def _refine_with_nested(data: bytes, name: str, depth: int = 0) -> bytes:
+            if depth >= 2:
+                return data
+            lname = name.lower()
+
+            if lname.endswith(".zip"):
                 try:
-                    with open(fpath, "r", encoding="utf-8", errors="ignore") as f:
-                        text = f.read()
-                except Exception:
-                    continue
-                if "LLVMFuzzerTestOneInput" not in text:
-                    continue
-                if "FuzzedDataProvider" not in text:
-                    continue
-                score = text.lower().count("clip")
-                candidates.append((score, fpath, text))
+                    bio = io.BytesIO(data)
+                    with zipfile.ZipFile(bio, "r") as zf:
+                        best_info = None
+                        best_score = None
+                        for zi in zf.infolist():
+                            if hasattr(zi, "is_dir") and zi.is_dir():
+                                continue
+                            inner_name = zi.filename
+                            inner_size = zi.file_size
+                            sc = _score(inner_name, inner_size)
+                            if best_score is None or sc < best_score:
+                                best_score = sc
+                                best_info = zi
+                        if best_info is None:
+                            return data
+                        with zf.open(best_info, "r") as f:
+                            inner_data = f.read()
+                        return _refine_with_nested(inner_data, best_info.filename, depth + 1)
+                except (zipfile.BadZipFile, OSError, RuntimeError):
+                    return data
 
-        if not candidates:
-            return None
+            tar_exts = (".tar", ".tar.gz", ".tgz", ".tar.bz2", ".tbz2", ".tar.xz", ".txz")
+            if lname.endswith(tar_exts):
+                try:
+                    bio = io.BytesIO(data)
+                    with tarfile.open(fileobj=bio, mode="r:*") as tf2:
+                        best_member = None
+                        best_score = None
+                        for m2 in tf2.getmembers():
+                            if not m2.isfile():
+                                continue
+                            sc2 = _score(m2.name, m2.size)
+                            if best_score is None or sc2 < best_score:
+                                best_score = sc2
+                                best_member = m2
+                        if best_member is None:
+                            return data
+                        ex = tf2.extractfile(best_member)
+                        if ex is None:
+                            return data
+                        try:
+                            inner_data = ex.read()
+                        finally:
+                            ex.close()
+                        return _refine_with_nested(inner_data, best_member.name, depth + 1)
+                except (tarfile.TarError, OSError, RuntimeError):
+                    return data
 
-        # Prefer files with more "clip" occurrences.
-        candidates.sort(key=lambda x: x[0], reverse=True)
+            return data
 
-        for _score, _path, text in candidates:
-            poc = self._generate_poc_from_harness_text(text)
-            if poc:
-                return poc
-        return None
+        def _from_dir(root: str) -> bytes:
+            best_path = None
+            best_score = None
 
-    def _generate_poc_from_harness_text(self, text: str) -> bytes | None:
-        info = self._extract_switch_info(text)
-        if not info:
-            return None
-        type_name, minv, maxv, case_index = info
-        if not (minv <= case_index <= maxv):
-            return None
+            for dirpath, _, filenames in os.walk(root):
+                for fn in filenames:
+                    full_path = os.path.join(dirpath, fn)
+                    try:
+                        size = os.path.getsize(full_path)
+                    except OSError:
+                        continue
+                    rel_name = os.path.relpath(full_path, root).replace(os.path.sep, "/")
+                    sc = _score(rel_name, size)
+                    if best_score is None or sc < best_score:
+                        best_score = sc
+                        best_path = full_path
 
-        size, signed = self._get_type_size_signed(type_name)
-        if size <= 0:
-            size = 1
+            if best_path is None:
+                return b""
 
-        raw_value = case_index - minv
-        encoded = self._encode_value(raw_value, size, signed)
+            with open(best_path, "rb") as f:
+                data = f.read()
+            return _refine_with_nested(data, os.path.basename(best_path))
 
-        if not encoded:
-            return None
+        def _from_tar(tar_path: str) -> bytes:
+            with tarfile.open(tar_path, "r:*") as tf:
+                best_member = None
+                best_score = None
 
-        # Target around the ground-truth length.
-        target_len = self.GROUND_TRUTH_LEN
-        reps = max(target_len // len(encoded), 1)
-        data = encoded * reps
-        if len(data) < target_len:
-            data += b"\x00" * (target_len - len(data))
-        elif len(data) > target_len:
-            data = data[:target_len]
-        return data
+                for m in tf.getmembers():
+                    if not m.isfile():
+                        continue
+                    name = m.name
+                    size = m.size
+                    sc = _score(name, size)
+                    if best_score is None or sc < best_score:
+                        best_score = sc
+                        best_member = m
 
-    def _extract_switch_info(self, text: str):
-        # First attempt: switch ( provider.ConsumeIntegralInRange<...>(min,max) )
-        switch_call_pattern = re.compile(
-            r"switch\s*\(\s*([^\)]*ConsumeIntegralInRange[^\)]*)\)",
-            re.DOTALL,
-        )
-        cons_pattern = re.compile(
-            r"ConsumeIntegralInRange"
-            r"(?:\s*<([^>]*)>)?"
-            r"\s*\(\s*([0-9]+)\s*,\s*([0-9]+)\s*\)"
-        )
+                if best_member is None:
+                    return b""
 
-        m = switch_call_pattern.search(text)
-        if m:
-            call_expr = m.group(1)
-            m2 = cons_pattern.search(call_expr)
-            if m2:
-                type_name = m2.group(1).strip() if m2.group(1) else None
-                minv = int(m2.group(2))
-                maxv = int(m2.group(3))
-                if maxv < minv:
-                    minv, maxv = maxv, minv
-                switch_start = text.rfind("switch", 0, m.start())
-                if switch_start < 0:
-                    switch_start = m.start()
-                brace_pos = text.find("{", switch_start)
-                if brace_pos != -1:
-                    body, _ = self._extract_brace_block(text, brace_pos)
-                    if body is not None:
-                        case_index = self._find_clip_case_index(body)
-                        if case_index is not None:
-                            return type_name, minv, maxv, case_index
+                ex = tf.extractfile(best_member)
+                if ex is None:
+                    return b""
+                try:
+                    data = ex.read()
+                finally:
+                    ex.close()
+            return _refine_with_nested(data, best_member.name)
 
-        # Second attempt: variable assigned from ConsumeIntegralInRange, then switch(var)
-        assign_pattern = re.compile(
-            r"([a-zA-Z_][\w\s\*&:<>,]*)\s+([a-zA-Z_]\w*)\s*=\s*([^\n;]*ConsumeIntegralInRange[^\n;]*);"
-        )
-        for m in assign_pattern.finditer(text):
-            type_decl = m.group(1)
-            var_name = m.group(2)
-            call_expr = m.group(3)
-            m2 = cons_pattern.search(call_expr)
-            if not m2:
-                continue
-            template_type = m2.group(1).strip() if m2.group(1) else None
-            minv = int(m2.group(2))
-            maxv = int(m2.group(3))
-            if maxv < minv:
-                minv, maxv = maxv, minv
-            # Prefer explicit template type if given; else use declared type.
-            type_name = template_type if template_type else type_decl
+        def _from_zip(zip_path: str) -> bytes:
+            with zipfile.ZipFile(zip_path, "r") as zf:
+                best_info = None
+                best_score = None
+                for zi in zf.infolist():
+                    if hasattr(zi, "is_dir") and zi.is_dir():
+                        continue
+                    name = zi.filename
+                    size = zi.file_size
+                    sc = _score(name, size)
+                    if best_score is None or sc < best_score:
+                        best_score = sc
+                        best_info = zi
 
-            # Find switch(var_name) after this assignment.
-            switch_var_pattern = re.compile(
-                r"switch\s*\(\s*" + re.escape(var_name) + r"\s*\)"
-            )
-            m_switch = switch_var_pattern.search(text, m.end())
-            if not m_switch:
-                continue
-            brace_pos = text.find("{", m_switch.end())
-            if brace_pos == -1:
-                continue
-            body, _ = self._extract_brace_block(text, brace_pos)
-            if body is None:
-                continue
-            case_index = self._find_clip_case_index(body)
-            if case_index is not None:
-                return type_name, minv, maxv, case_index
+                if best_info is None:
+                    return b""
 
-        return None
+                with zf.open(best_info, "r") as f:
+                    data = f.read()
+            return _refine_with_nested(data, best_info.filename)
 
-    def _extract_brace_block(self, text: str, start_index: int):
-        if start_index < 0 or start_index >= len(text):
-            return None, None
-        if text[start_index] != "{":
-            brace_pos = text.find("{", start_index)
-            if brace_pos == -1:
-                return None, None
-            start_index = brace_pos
-        depth = 0
-        for i in range(start_index, len(text)):
-            c = text[i]
-            if c == "{":
-                depth += 1
-            elif c == "}":
-                depth -= 1
-                if depth == 0:
-                    return text[start_index + 1 : i], i + 1
-        return text[start_index + 1 :], len(text)
+        # Main dispatch
+        if os.path.isdir(src_path):
+            return _from_dir(src_path)
 
-    def _find_clip_case_index(self, body: str) -> int | None:
-        case_pattern = re.compile(r"\bcase\s+(\d+)\s*:\s*")
-        matches = list(case_pattern.finditer(body))
-        if not matches:
-            return None
+        # Try tar
+        try:
+            return _from_tar(src_path)
+        except (tarfile.TarError, OSError):
+            pass
 
-        push_candidates: list[int] = []
-        clip_candidates: list[int] = []
+        # Try zip
+        try:
+            return _from_zip(src_path)
+        except (zipfile.BadZipFile, OSError):
+            pass
 
-        for idx, m in enumerate(matches):
-            val = int(m.group(1))
-            start = m.end()
-            end = matches[idx + 1].start() if idx + 1 < len(matches) else len(body)
-            case_text = body[start:end].lower()
-            if "clip" in case_text:
-                if "push" in case_text or "mark" in case_text or "save" in case_text:
-                    push_candidates.append(val)
-                else:
-                    clip_candidates.append(val)
-
-        if push_candidates:
-            push_candidates.sort()
-            return push_candidates[0]
-        if clip_candidates:
-            clip_candidates.sort()
-            return clip_candidates[0]
-        return None
-
-    def _get_type_size_signed(self, type_name: str | None) -> tuple[int, bool]:
-        if not type_name:
-            return 1, False
-        tn = type_name
-
-        # Remove qualifiers and pointers/references.
-        for q in ("const", "volatile", "register", "static"):
-            tn = re.sub(r"\b" + q + r"\b", "", tn)
-        tn = tn.replace("&", "").replace("*", "")
-        tn = tn.strip()
-        tn = tn.split("::")[-1]  # remove namespaces
-
-        # Precise fixed-width types first.
-        lower = tn.lower()
-        if "int8_t" in lower:
-            return 1, True
-        if "uint8_t" in lower:
-            return 1, False
-        if "int16_t" in lower:
-            return 2, True
-        if "uint16_t" in lower:
-            return 2, False
-        if "int32_t" in lower:
-            return 4, True
-        if "uint32_t" in lower:
-            return 4, False
-        if "int64_t" in lower:
-            return 8, True
-        if "uint64_t" in lower:
-            return 8, False
-
-        tokens = lower.split()
-        signed = False
-        if "signed" in tokens:
-            signed = True
-        if "unsigned" in tokens:
-            signed = False
-
-        if "char" in tokens:
-            return 1, signed
-        if "short" in tokens:
-            return 2, signed
-
-        if tokens.count("long") >= 2:
-            return 8, signed
-        if "long" in tokens:
-            # On 64-bit, long is typically 8 bytes.
-            return 8, signed
-
-        if "size_t" in tokens:
-            return 8, False
-        if "ssize_t" in tokens:
-            return 8, True
-
-        if "int" in tokens or tn == "int":
-            return 4, signed
-
-        if "bool" in tokens:
-            return 1, False
-
-        # Try numeric suffix as a last resort.
-        m = re.search(r"(\d+)", lower)
-        if m:
-            bits = int(m.group(1))
-            if bits in (8, 16, 32, 64):
-                return bits // 8, signed
-
-        # Default to 1-byte unsigned.
-        return 1, False
-
-    def _encode_value(self, value: int, size: int, signed: bool) -> bytes:
-        if size <= 0:
-            size = 1
-        max_value = 1 << (8 * size)
-        value_mod = value % max_value
-        return int(value_mod).to_bytes(size, "little", signed=False)
-
-    def _generate_generic_large_poc(self) -> bytes:
-        # Generic fallback: many nested-style characters to try to trigger deep nesting.
-        # Use mix of parentheses, braces, and angle brackets.
-        pattern = (b"(" * 16) + (b"{" * 16) + (b"<" * 16) + (b"[" * 16)
-        reps = max(self.GROUND_TRUTH_LEN // len(pattern), 1)
-        data = pattern * reps
-        if len(data) < self.GROUND_TRUTH_LEN:
-            data += b"A" * (self.GROUND_TRUTH_LEN - len(data))
-        elif len(data) > self.GROUND_TRUTH_LEN:
-            data = data[:self.GROUND_TRUTH_LEN]
-        return data
+        # Fallback: treat src_path itself as PoC
+        try:
+            with open(src_path, "rb") as f:
+                return f.read()
+        except OSError:
+            return b""

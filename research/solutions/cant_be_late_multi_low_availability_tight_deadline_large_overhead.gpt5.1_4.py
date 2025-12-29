@@ -6,14 +6,12 @@ from sky_spot.utils import ClusterType
 
 
 class Solution(MultiRegionStrategy):
-    """Your multi-region scheduling strategy."""
+    """Multi-region scheduling strategy using spot-first then on-demand fallback."""
 
-    NAME = "slack_safe_spot_strategy"
+    NAME = "my_strategy"
 
     def solve(self, spec_path: str) -> "Solution":
-        """
-        Initialize the solution from spec_path config.
-        """
+        """Initialize the solution from spec_path config."""
         with open(spec_path) as f:
             config = json.load(f)
 
@@ -25,74 +23,72 @@ class Solution(MultiRegionStrategy):
         )
         super().__init__(args)
 
-        # Internal tracking for efficient progress computation
-        self._done_seconds = 0.0
-        self._last_task_segments = 0
-        self._fail_safe = False
+        # Internal strategy state
+        self._mode_spot_first = 0  # 0: prefer spot, 1: committed to on-demand
+        self._mode = self._mode_spot_first
+        self._base_region = 0  # stick to initial region; avoid region-switch overheads
+
+        # Track accumulated work efficiently without re-summing full list
+        self._work_done = 0.0
+        self._last_task_done_len = 0
+
+        # Conservative safety guard time (seconds) when deciding to commit to on-demand
+        # Use ~3 hours or 3 * overhead, whichever is larger
+        three_hours = 3 * 3600.0
+        self._commit_guard = max(3 * self.restart_overhead, three_hours)
+
         return self
 
-    def _update_done_progress(self) -> None:
-        """Incrementally track total work done without summing entire list each step."""
-        segments = self.task_done_time
-        curr_len = len(segments)
-        if curr_len > self._last_task_segments:
-            total_new = 0.0
-            for i in range(self._last_task_segments, curr_len):
-                total_new += segments[i]
-            self._done_seconds += total_new
-            self._last_task_segments = curr_len
+    def _update_work_done(self) -> None:
+        """Incrementally update accumulated work from task_done_time list."""
+        td = self.task_done_time
+        n = len(td)
+        if n > self._last_task_done_len:
+            # Sum only new segments
+            s = 0.0
+            for i in range(self._last_task_done_len, n):
+                s += td[i]
+            self._work_done += s
+            self._last_task_done_len = n
+
+    def _should_commit_to_ondemand(self, time_left: float, work_remaining: float) -> bool:
+        """Decide if we must switch to on-demand to safely meet deadline."""
+        # Time needed if we switch to on-demand now (worst case: pay full restart_overhead once)
+        needed_time = work_remaining + self.restart_overhead
+        # Commit when remaining slack is no more than needed_time plus a guard buffer
+        return time_left <= needed_time + self._commit_guard
 
     def _step(self, last_cluster_type: ClusterType, has_spot: bool) -> ClusterType:
-        """
-        Decide next action based on current state.
-        """
-        # Update cached progress
-        self._update_done_progress()
+        """Decide next action based on current state."""
+        # Update internal work accounting
+        self._update_work_done()
 
-        # If task already completed, no need to run further
-        if self._done_seconds >= self.task_duration:
-            self._fail_safe = True
+        # If already completed, do nothing further
+        work_remaining = self.task_duration - self._work_done
+        if work_remaining <= 0:
             return ClusterType.NONE
 
-        # Once we commit to on-demand, we never switch back
-        if self._fail_safe:
+        # Basic time bookkeeping
+        time_elapsed = self.env.elapsed_seconds
+        time_left = self.deadline - time_elapsed
+
+        # Hard fail-safe: if somehow past deadline, just use on-demand
+        if time_left <= 0:
             return ClusterType.ON_DEMAND
 
-        remaining_work = self.task_duration - self._done_seconds
-        time_left = self.deadline - self.env.elapsed_seconds
-
-        if time_left <= 0.0:
-            # Out of time; choose on-demand as best-effort
-            self._fail_safe = True
+        # Once committed, always use on-demand
+        if self._mode != self._mode_spot_first:
             return ClusterType.ON_DEMAND
 
-        # Time to finish if we commit to on-demand now and never switch again
-        if self.env.cluster_type == ClusterType.ON_DEMAND:
-            overhead_now = self.remaining_restart_overhead
-        else:
-            overhead_now = self.restart_overhead
-        finish_time_if_commit_now = overhead_now + remaining_work
-
-        # Time to finish if we gamble this step (worst-case: waste the entire step),
-        # then commit to on-demand next step (paying full restart overhead).
-        finish_time_if_delay_one_step = (
-            self.env.gap_seconds + self.restart_overhead + remaining_work
-        )
-
-        # If even committing now cannot meet the deadline, still choose ON_DEMAND
-        if time_left < finish_time_if_commit_now:
-            self._fail_safe = True
+        # Still in spot-first phase: check if it's time to commit to on-demand
+        if self._should_commit_to_ondemand(time_left, work_remaining):
+            self._mode = 1  # committed to on-demand
             return ClusterType.ON_DEMAND
 
-        # If we can only meet the deadline by committing now (not after 1 more step),
-        # switch to on-demand and stay there.
-        if time_left < finish_time_if_delay_one_step:
-            self._fail_safe = True
-            return ClusterType.ON_DEMAND
-
-        # It is safe to continue chasing Spot this step.
+        # Spot-first phase and still safe to gamble on spot
         if has_spot:
+            # Prefer running on spot when available
             return ClusterType.SPOT
-        else:
-            # No Spot available; wait to preserve budget while we still have slack
-            return ClusterType.NONE
+
+        # Spot not available and not yet time to commit: wait (no cost, spend slack)
+        return ClusterType.NONE

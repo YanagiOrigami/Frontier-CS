@@ -1,146 +1,128 @@
-import numpy as np
 import os
-import threading
+import numpy as np
+from typing import Tuple
 
 try:
     import faiss
-except Exception:
+except Exception:  # pragma: no cover
     faiss = None
 
 
 class YourIndexClass:
     def __init__(self, dim: int, **kwargs):
         self.dim = int(dim)
+        self.nlist = int(kwargs.get("nlist", 8192))
+        self.m = int(kwargs.get("m", 16))  # PQ subquantizers
+        self.nbits = int(kwargs.get("nbits", 8))
+        self.nprobe = int(kwargs.get("nprobe", 6))
+        self.use_opq = bool(kwargs.get("use_opq", True))
+        self.train_size = int(kwargs.get("train_size", 200000))
+        self.random_seed = int(kwargs.get("random_seed", 123))
+        self.n_threads = int(kwargs.get("n_threads", os.cpu_count() or 8))
+        self.metric = faiss.METRIC_L2 if faiss is not None else None
+
         self.index = None
-        self.next_id = 0
-        self.metric = kwargs.get("metric", "l2")
-        self.nlist = int(kwargs.get("nlist", 4096))
-        self.nprobe = int(kwargs.get("nprobe", 16))
-        self.hnsw_m = int(kwargs.get("hnsw_m", 32))
-        self.hnsw_ef_search = int(kwargs.get("hnsw_ef_search", 64))
-        self.hnsw_ef_construction = int(kwargs.get("hnsw_ef_construction", 40))
-        self.train_samples = int(kwargs.get("train_samples", 50000))
-        self.random_seed = int(kwargs.get("seed", 12345))
-        self._lock = threading.Lock()
+        self.ntotal = 0
+        self.trained = False
+        self._rng = np.random.RandomState(self.random_seed)
 
         if faiss is not None:
             try:
-                nt = os.cpu_count() or 1
-                faiss.omp_set_num_threads(nt)
+                faiss.omp_set_num_threads(self.n_threads)
             except Exception:
                 pass
 
-        # Fallback buffers if faiss is unavailable
-        self._xb_fallback = None
+    def _ensure_faiss_available(self):
+        if faiss is None:
+            raise RuntimeError("faiss is required but not available in the environment.")
 
-    def _ensure_faiss_index(self, xb: np.ndarray):
-        if self.index is not None or faiss is None:
-            return
+    def _create_index(self):
+        self._ensure_faiss_available()
 
-        d = self.dim
-        rng = np.random.RandomState(self.random_seed)
-        nb = xb.shape[0]
-        nsamp = min(self.train_samples, nb)
-        if nsamp < self.nlist:
-            # ensure at least nlist samples for training
-            nsamp = self.nlist
+        quantizer = faiss.IndexFlatL2(self.dim)
+        ivfpq = faiss.IndexIVFPQ(quantizer, self.dim, self.nlist, self.m, self.nbits)
+        ivfpq.metric_type = faiss.METRIC_L2
+        try:
+            ivfpq.use_precomputed_table = 1
+        except Exception:
+            pass
+        try:
+            ivfpq.precomputed_table_type = 1  # auto
+        except Exception:
+            pass
+        try:
+            ivfpq.by_residual = True
+        except Exception:
+            pass
 
-        if nsamp == nb:
-            xtrain = xb.copy()
+        if self.use_opq:
+            opq = faiss.OPQMatrix(self.dim, self.m)
+            self.index = faiss.IndexPreTransform(opq, ivfpq)
         else:
-            idx = rng.choice(nb, size=nsamp, replace=False)
-            xtrain = xb[idx].copy()
+            self.index = ivfpq
 
-        quantizer = faiss.IndexHNSWFlat(d, self.hnsw_m)
-        quantizer.hnsw.efConstruction = self.hnsw_ef_construction
-        metric = faiss.METRIC_L2
+    def _set_nprobe(self, nprobe: int):
+        try:
+            ivf = faiss.extract_index_ivf(self.index)
+            ivf.nprobe = int(nprobe)
+        except Exception:
+            try:
+                ps = faiss.ParameterSpace()
+                ps.set_index_parameter(self.index, "nprobe", int(nprobe))
+            except Exception:
+                pass
 
-        ivf = faiss.IndexIVFFlat(quantizer, d, self.nlist, metric)
-        # Train
-        ivf.train(xtrain)
-        # tune coarse search
-        quantizer.hnsw.efSearch = self.hnsw_ef_search
-        ivf.nprobe = self.nprobe
-
-        self.index = ivf
+    def _sample_training(self, xb: np.ndarray, size: int) -> np.ndarray:
+        n = xb.shape[0]
+        size = int(min(max(1024, size), n))
+        if size == n:
+            return xb
+        idx = self._rng.choice(n, size=size, replace=False)
+        return xb[idx].copy()
 
     def add(self, xb: np.ndarray) -> None:
+        self._ensure_faiss_available()
         if not isinstance(xb, np.ndarray):
-            xb = np.array(xb, dtype=np.float32, copy=False)
+            xb = np.asarray(xb, dtype=np.float32)
         if xb.dtype != np.float32:
             xb = xb.astype(np.float32, copy=False)
         if xb.ndim != 2 or xb.shape[1] != self.dim:
-            xb = xb.reshape(-1, self.dim).astype(np.float32, copy=False)
-        xb = np.ascontiguousarray(xb)
+            raise ValueError("xb must have shape (N, dim) with dim=%d" % self.dim)
 
-        if faiss is None:
-            # fallback: store for brute-force
-            with self._lock:
-                if self._xb_fallback is None:
-                    self._xb_fallback = xb.copy()
-                else:
-                    self._xb_fallback = np.vstack([self._xb_fallback, xb])
-                self.next_id += xb.shape[0]
-            return
+        if self.index is None:
+            self._create_index()
+            xtrain = self._sample_training(xb, self.train_size)
+            self.index.train(xtrain)
+            self.trained = True
+            self._set_nprobe(self.nprobe)
 
-        with self._lock:
-            if self.index is None:
-                self._ensure_faiss_index(xb)
+        self.index.add(xb)
+        self.ntotal += xb.shape[0]
 
-            nb = xb.shape[0]
-            ids = np.arange(self.next_id, self.next_id + nb, dtype=np.int64)
-            self.index.add_with_ids(xb, ids)
-            self.next_id += nb
+    def search(self, xq: np.ndarray, k: int) -> Tuple[np.ndarray, np.ndarray]:
+        self._ensure_faiss_available()
+        if self.index is None or not self.trained or self.ntotal == 0:
+            raise RuntimeError("Index is not trained or contains no vectors. Call add() first.")
 
-    def search(self, xq: np.ndarray, k: int):
         if not isinstance(xq, np.ndarray):
-            xq = np.array(xq, dtype=np.float32, copy=False)
+            xq = np.asarray(xq, dtype=np.float32)
         if xq.dtype != np.float32:
             xq = xq.astype(np.float32, copy=False)
         if xq.ndim != 2 or xq.shape[1] != self.dim:
-            xq = xq.reshape(-1, self.dim).astype(np.float32, copy=False)
-        xq = np.ascontiguousarray(xq)
-        nq = xq.shape[0]
-        k = int(k)
+            raise ValueError("xq must have shape (nq, dim) with dim=%d" % self.dim)
 
-        if faiss is None or self.index is None:
-            # fallback brute-force
-            if self._xb_fallback is None or self._xb_fallback.shape[0] == 0:
-                D = np.full((nq, k), np.inf, dtype=np.float32)
-                I = np.full((nq, k), -1, dtype=np.int64)
-                return D, I
-            xb = self._xb_fallback
-            # compute distances
-            # L2-squared distances: ||x||^2 + ||y||^2 - 2 x.y
-            xq_norms = (xq ** 2).sum(axis=1, keepdims=True)
-            xb_norms = (xb ** 2).sum(axis=1, keepdims=True).T
-            distances = xq_norms + xb_norms - 2.0 * (xq @ xb.T)
-            # select top-k smallest
-            if k >= distances.shape[1]:
-                idx = np.argsort(distances, axis=1)[:, :k]
-            else:
-                idx = np.argpartition(distances, kth=k - 1, axis=1)[:, :k]
-                # sort within top-k
-                row_idx = np.arange(nq)[:, None]
-                topk_dist = distances[row_idx, idx]
-                order = np.argsort(topk_dist, axis=1)
-                idx = idx[row_idx, order]
-            D = distances[np.arange(nq)[:, None], idx].astype(np.float32, copy=False)
-            I = idx.astype(np.int64, copy=False)
-            return D, I
+        self._set_nprobe(self.nprobe)
 
-        # Ensure parameters at search time
-        self.index.nprobe = self.nprobe
-        if isinstance(self.index.quantizer, faiss.IndexHNSWFlat):
-            self.index.quantizer.hnsw.efSearch = self.hnsw_ef_search
+        D, I = self.index.search(xq, int(k))
+        if D is None or I is None:
+            # Fallback to empty results if FAISS returns None (shouldn't happen)
+            nq = xq.shape[0]
+            D = np.full((nq, k), np.float32(np.inf), dtype=np.float32)
+            I = np.full((nq, k), -1, dtype=np.int64)
+        else:
+            if D.dtype != np.float32:
+                D = D.astype(np.float32, copy=False)
+            if I.dtype != np.int64:
+                I = I.astype(np.int64, copy=False)
 
-        D, I = self.index.search(xq, k)
-        if not isinstance(D, np.ndarray):
-            D = np.array(D, dtype=np.float32, copy=False).reshape(nq, k)
-        if not isinstance(I, np.ndarray):
-            I = np.array(I, dtype=np.int64, copy=False).reshape(nq, k)
-        if D.dtype != np.float32:
-            D = D.astype(np.float32, copy=False)
-        if I.dtype != np.int64:
-            I = I.astype(np.int64, copy=False)
         return D, I

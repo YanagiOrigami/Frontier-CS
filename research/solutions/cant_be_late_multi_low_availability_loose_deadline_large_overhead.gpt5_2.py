@@ -6,7 +6,7 @@ from sky_spot.utils import ClusterType
 
 
 class Solution(MultiRegionStrategy):
-    NAME = "cant_be_late_safe_wait_spot"
+    NAME = "cbmrs_jit_v1"
 
     def solve(self, spec_path: str) -> "Solution":
         with open(spec_path) as f:
@@ -19,41 +19,58 @@ class Solution(MultiRegionStrategy):
             inter_task_overhead=[0.0],
         )
         super().__init__(args)
-
-        # Internal state for efficiency and policy
-        self._done_sum = 0.0
-        self._done_len = 0
-        self._commit_to_od = False
+        # Internal state initialization
+        self._accum_done = 0.0
+        self._last_len = 0
+        self._od_locked = False
+        self._margin_sec = None  # initialized on first step
         return self
 
-    def _step(self, last_cluster_type: ClusterType, has_spot: bool) -> ClusterType:
-        # Update cached progress efficiently to avoid O(n) sum at each step
-        if self._done_len != len(self.task_done_time):
-            if self._done_len < len(self.task_done_time):
-                self._done_sum += sum(self.task_done_time[self._done_len :])
-            else:
-                # In case environment ever shrinks the list (unlikely), recompute once
-                self._done_sum = sum(self.task_done_time)
-            self._done_len = len(self.task_done_time)
+    def _update_done(self):
+        new_len = len(self.task_done_time)
+        if new_len > self._last_len:
+            # Incrementally accumulate new segments
+            for i in range(self._last_len, new_len):
+                self._accum_done += self.task_done_time[i]
+            self._last_len = new_len
 
-        remaining_work = max(0.0, self.task_duration - self._done_sum)
+    def _should_lock_od(self, time_left: float, work_left: float) -> bool:
+        # Latest time to start OD and still finish: time_left <= work_left + overhead + margin
+        margin = self._margin_sec if self._margin_sec is not None else 0.0
+        return time_left <= (work_left + self.restart_overhead + margin)
+
+    def _step(self, last_cluster_type: ClusterType, has_spot: bool) -> ClusterType:
+        # Initialize margin adaptively at first call
+        if self._margin_sec is None:
+            # Safety buffer to avoid missing deadline due to discretization/overheads
+            # Use 20% of step or at least 60s; capped not to exceed restart_overhead excessively
+            base_margin = max(60.0, 0.2 * float(self.env.gap_seconds))
+            # Don't exceed restart_overhead too much to avoid unnecessary early OD
+            self._margin_sec = min(base_margin, self.restart_overhead)
+
+        # Update accumulated done work efficiently
+        self._update_done()
+
+        work_left = max(0.0, self.task_duration - self._accum_done)
+        if work_left <= 0.0:
+            return ClusterType.NONE
+
+        # If we've already locked to OD fallback, stay on OD to avoid extra overhead/risk
+        if self._od_locked or last_cluster_type == ClusterType.ON_DEMAND:
+            self._od_locked = True
+            return ClusterType.ON_DEMAND
+
+        # Compute remaining wall-clock time
         time_left = self.deadline - self.env.elapsed_seconds
 
-        # If we've committed to on-demand, continue until completion to avoid extra overheads
-        if self._commit_to_od:
+        # If it's time to lock OD to guarantee finishing, do it
+        if self._should_lock_od(time_left, work_left):
+            self._od_locked = True
             return ClusterType.ON_DEMAND
 
-        # Determine if we must switch to On-Demand now to guarantee finishing
-        # Conservative rule: ensure we always have time for one restart overhead + remaining work
-        must_switch_to_od = time_left <= (remaining_work + self.restart_overhead)
-
-        if must_switch_to_od:
-            self._commit_to_od = True
-            return ClusterType.ON_DEMAND
-
-        # Prefer spot if available; otherwise pause (NONE) while we still have enough slack
+        # Opportunistically use SPOT when available
         if has_spot:
             return ClusterType.SPOT
 
-        # No spot available and still safe: wait to save cost
+        # Otherwise wait (NONE) to save cost; rely on OD fallback when necessary
         return ClusterType.NONE

@@ -1,12 +1,11 @@
 import json
 from argparse import Namespace
-
 from sky_spot.strategies.multi_strategy import MultiRegionStrategy
 from sky_spot.utils import ClusterType
 
 
 class Solution(MultiRegionStrategy):
-    NAME = "cant_be_late_fallback_v1"
+    NAME = "cbl_rr_v3"
 
     def solve(self, spec_path: str) -> "Solution":
         with open(spec_path) as f:
@@ -19,71 +18,86 @@ class Solution(MultiRegionStrategy):
             inter_task_overhead=[0.0],
         )
         super().__init__(args)
+
         # Internal state
-        self._commit_on_demand = False
-        self._done_sum = 0.0
-        self._last_len = 0
+        self._initialized = False
+        self._od_committed = False
         return self
 
-    def _update_progress_cache(self):
-        l = len(self.task_done_time)
-        if l > self._last_len:
-            # Incremental sum of new segments
-            self._done_sum += sum(self.task_done_time[self._last_len:])
-            self._last_len = l
+    def _lazy_init(self):
+        if self._initialized:
+            return
+        self._initialized = True
+        self._num_regions = self.env.get_num_regions()
+        self._reg_seen = [0] * self._num_regions
+        self._reg_true_cnt = [0] * self._num_regions
+        self._reg_last_true_time = [-1.0] * self._num_regions
 
-    def _safe_progress_for_choice(self, choose_type: ClusterType, last_type: ClusterType, g: float) -> float:
-        # Progress realized in the current step if we choose choose_type
-        # Overhead rules:
-        # - If we continue with the same type as last step, progress = g - remaining_restart_overhead (clipped at 0)
-        # - If we switch types (or from NONE), progress = g - restart_overhead (clipped at 0)
-        if choose_type == last_type and choose_type != ClusterType.NONE:
-            overhead = getattr(self, "remaining_restart_overhead", 0.0) or 0.0
-        else:
-            overhead = self.restart_overhead
-        prog = g - overhead
-        return prog if prog > 0.0 else 0.0
+    def _pick_region_on_no_spot(self, current_region: int):
+        # Prefer the region with the most recent known True availability.
+        best_idx = -1
+        best_time = -1.0
+        for i in range(self._num_regions):
+            if i == current_region:
+                continue
+            t = self._reg_last_true_time[i]
+            if t > best_time:
+                best_time = t
+                best_idx = i
+        if best_idx >= 0 and best_time >= 0.0:
+            return best_idx
+        # Fallback: round-robin
+        return (current_region + 1) % self._num_regions
 
     def _step(self, last_cluster_type: ClusterType, has_spot: bool) -> ClusterType:
-        # Update cached progress
-        self._update_progress_cache()
+        self._lazy_init()
 
-        # If done, no need to run further
-        remaining_work = self.task_duration - self._done_sum
+        # Update region stats
+        now = self.env.elapsed_seconds
+        cur_region = self.env.get_current_region()
+        if 0 <= cur_region < self._num_regions:
+            self._reg_seen[cur_region] += 1
+            if has_spot:
+                self._reg_true_cnt[cur_region] += 1
+                self._reg_last_true_time[cur_region] = now
+
+        # If already finished, do nothing
+        work_done = sum(self.task_done_time)
+        remaining_work = max(0.0, self.task_duration - work_done)
         if remaining_work <= 0.0:
             return ClusterType.NONE
 
-        g = self.env.gap_seconds
-        T = self.deadline - self.env.elapsed_seconds  # time remaining
+        gap = self.env.gap_seconds
+        time_left = self.deadline - now
+        eps = 1e-6
 
-        # If we've committed to on-demand, stick with it
-        if self._commit_on_demand:
+        # If already committed to on-demand, stick to it
+        if self._od_committed:
             return ClusterType.ON_DEMAND
 
-        # Helper to decide safe postponement
-        # After taking an action this step, time left = T - g
-        # To be safe for fallback next step (worst-case), require:
-        # (T - g) >= (remaining_work_after_step) + restart_overhead
-        # since starting OD next step will incur overhead.
+        # Time needed if we switch to OD now
+        overhead_to_od = 0.0 if last_cluster_type == ClusterType.ON_DEMAND else self.restart_overhead
+        od_time_needed = remaining_work + overhead_to_od
+
+        # Commit to OD if we no longer have buffer
+        if time_left <= od_time_needed + eps:
+            self._od_committed = True
+            return ClusterType.ON_DEMAND
+
+        # Prefer Spot if available and not urgent
         if has_spot:
-            # Consider running on spot this step
-            progress_now_spot = self._safe_progress_for_choice(ClusterType.SPOT, last_cluster_type, g)
-            T_after = T - g
-            S_after = remaining_work - progress_now_spot
-            if S_after < 0.0:
-                S_after = 0.0
-            if T_after >= S_after + self.restart_overhead:
-                return ClusterType.SPOT
-            else:
-                # Not safe to spend this step on spot; commit to OD now
-                self._commit_on_demand = True
-                return ClusterType.ON_DEMAND
+            return ClusterType.SPOT
+
+        # Spot not available in current region. Decide whether to wait, switch region, or use OD.
+        # If we can afford to wait one step and still finish with OD afterwards, then wait (NONE) and try another region.
+        # Otherwise, commit to OD now.
+        if time_left - gap > (remaining_work + self.restart_overhead) + eps:
+            # Try a different region next step
+            if self._num_regions > 1:
+                next_region = self._pick_region_on_no_spot(cur_region)
+                if next_region != cur_region:
+                    self.env.switch_region(next_region)
+            return ClusterType.NONE
         else:
-            # Spot unavailable: decide to idle or start OD
-            T_after = T - g
-            # If we idle, remaining work unchanged; next step starting OD incurs overhead
-            if T_after >= remaining_work + self.restart_overhead:
-                return ClusterType.NONE
-            else:
-                self._commit_on_demand = True
-                return ClusterType.ON_DEMAND
+            self._od_committed = True
+            return ClusterType.ON_DEMAND

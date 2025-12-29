@@ -1,5 +1,4 @@
 import json
-import random
 from argparse import Namespace
 
 from sky_spot.strategies.multi_strategy import MultiRegionStrategy
@@ -7,7 +6,7 @@ from sky_spot.utils import ClusterType
 
 
 class Solution(MultiRegionStrategy):
-    NAME = "deadline_rr_v2"
+    NAME = "cant_be_late_slack_mr_v1"
 
     def solve(self, spec_path: str) -> "Solution":
         with open(spec_path) as f:
@@ -20,67 +19,116 @@ class Solution(MultiRegionStrategy):
             inter_task_overhead=[0.0],
         )
         super().__init__(args)
-
-        # Internal state
-        self.od_committed = False
-        self._num_regions = self.env.get_num_regions()
-        self._rr_next = (self.env.get_current_region() + 1) % max(1, self._num_regions)
-        # Guard time before deadline when we must ensure OD can finish safely
-        self.guard_time = max(2.0 * self.env.gap_seconds, 6.0 * self.restart_overhead)
+        # Internal initialization
+        self._initialized = False
         return self
 
+    # Helpers
+    def _ensure_init(self):
+        if self._initialized:
+            return
+        n = self.env.get_num_regions()
+        self._num_regions = n
+        # Per-region stats
+        self._region_obs = [0] * n
+        self._region_spot_true = [0] * n
+        self._region_streak = [0] * n
+        self._initialized = True
+
+    def _total_task_duration(self):
+        td = self.task_duration
+        if isinstance(td, (list, tuple)):
+            return float(sum(td))
+        return float(td)
+
+    def _remaining_work(self):
+        done = sum(self.task_done_time) if self.task_done_time else 0.0
+        return max(0.0, self._total_task_duration() - done)
+
+    def _update_region_stats(self, region_idx: int, has_spot: bool):
+        self._region_obs[region_idx] += 1
+        if has_spot:
+            self._region_spot_true[region_idx] += 1
+            self._region_streak[region_idx] += 1
+        else:
+            self._region_streak[region_idx] = 0
+
+    def _region_score(self, idx: int):
+        # Laplace smoothing + mild bonus for recent streak
+        obs = self._region_obs[idx]
+        trues = self._region_spot_true[idx]
+        rate = (trues + 1.0) / (obs + 2.0)
+        streak_bonus = 0.05 * min(self._region_streak[idx], 20)
+        return rate + streak_bonus
+
+    def _pick_best_region(self, current_idx: int):
+        # Choose region with highest score
+        best = current_idx
+        best_score = self._region_score(current_idx)
+        for i in range(self._num_regions):
+            sc = self._region_score(i)
+            if sc > best_score + 1e-12 or (abs(sc - best_score) <= 1e-12 and i < best):
+                best = i
+                best_score = sc
+        return best
+
     def _step(self, last_cluster_type: ClusterType, has_spot: bool) -> ClusterType:
-        # If we've already committed to OD, keep using it to avoid extra overheads.
-        if last_cluster_type == ClusterType.ON_DEMAND:
-            self.od_committed = True
-        if self.od_committed:
-            return ClusterType.ON_DEMAND
+        self._ensure_init()
 
-        # Compute remaining work and time
-        work_done = sum(self.task_done_time) if self.task_done_time else 0.0
-        work_remaining = max(0.0, self.task_duration - work_done)
-        time_remaining = max(0.0, self.deadline - self.env.elapsed_seconds)
+        # Update region stats with current observation
+        cur_region = self.env.get_current_region()
+        self._update_region_stats(cur_region, has_spot)
 
-        # If already finished or nothing meaningful to do, pause
-        if work_remaining <= 0.0 or time_remaining <= 0.0:
+        # Basic parameters
+        gap = float(self.env.gap_seconds)
+        t_left = float(self.deadline - self.env.elapsed_seconds)
+        rem = self._remaining_work()
+        if rem <= 0.0:
             return ClusterType.NONE
 
-        # Estimate extra overhead if switching to OD now
+        # Safety margin: conservative but not too large
+        # Ensures we have buffer for rounding/overhead uncertainty
+        margin = max(2.0 * float(self.restart_overhead), 0.2 * gap)
+
+        # If already on OD, keep it (avoid extra overhead/switching)
         if last_cluster_type == ClusterType.ON_DEMAND:
-            extra_overhead_if_od_now = self.remaining_restart_overhead
-        else:
-            # Worst-case: a full restart overhead if we switch to OD
-            extra_overhead_if_od_now = self.restart_overhead
+            return ClusterType.ON_DEMAND
 
-        # Time required to finish if we switch to OD now and stay
-        od_time_needed = extra_overhead_if_od_now + work_remaining
-        slack_if_od_now = time_remaining - od_time_needed
+        # Compute whether we must commit to OD now
+        # Time needed to finish on OD if we start OD now
+        # If already in OD (handled above), needed = remaining_restart_overhead + rem
+        # Else switching to OD: overhead + rem
+        t_need_od_now = float(self.restart_overhead) + rem
 
-        # Decide whether we must commit to OD to meet the deadline
-        # If spot is not available and waiting one more step makes OD infeasible with guard, commit now.
-        if not has_spot:
-            if slack_if_od_now - self.env.gap_seconds <= self.guard_time:
-                self.od_committed = True
-                return ClusterType.ON_DEMAND
-        else:
-            # If spot is available but we're too close to the deadline, commit to OD to avoid preemption risk.
-            if slack_if_od_now <= self.guard_time:
-                self.od_committed = True
-                return ClusterType.ON_DEMAND
+        # Panic: if not enough time left, go OD immediately
+        if t_left <= t_need_od_now + margin:
+            return ClusterType.ON_DEMAND
 
-        # Not committing to OD now
+        # We have enough slack to consider Spot/None
+        # Decide action for this step with worst-case bounds to guarantee feasibility
         if has_spot:
-            # Use spot when available
-            return ClusterType.SPOT
-
-        # Spot not available and we still have time to wait: try another region and wait one step
-        if self._num_regions > 1:
-            current = self.env.get_current_region()
-            # Rotate regions to search for available spot
-            next_region = self._rr_next
-            if self._num_regions > 0:
-                if next_region == current:
-                    next_region = (current + 1) % self._num_regions
-                self.env.switch_region(next_region)
-                self._rr_next = (next_region + 1) % self._num_regions
-        return ClusterType.NONE
+            # If last cluster already Spot: no new launch overhead this step
+            if last_cluster_type == ClusterType.SPOT:
+                # Safe to run one more Spot step only if after spending one gap, we can still finish with OD
+                if (t_left - gap) >= (rem + float(self.restart_overhead) + margin):
+                    return ClusterType.SPOT
+                else:
+                    return ClusterType.ON_DEMAND
+            else:
+                # Launching new Spot instance incurs overhead for this step as well
+                # Worst-case this step costs gap + restart_overhead in time, then OD next
+                if (t_left - (gap + float(self.restart_overhead))) >= (rem + float(self.restart_overhead) + margin):
+                    return ClusterType.SPOT
+                else:
+                    return ClusterType.ON_DEMAND
+        else:
+            # Spot not available now
+            # We can wait (NONE) only if after one gap we can still finish with OD
+            if (t_left - gap) >= (rem + float(self.restart_overhead) + margin):
+                # While waiting, move to the best region to increase chances next step
+                best_region = self._pick_best_region(cur_region)
+                if best_region != cur_region:
+                    self.env.switch_region(best_region)
+                return ClusterType.NONE
+            else:
+                return ClusterType.ON_DEMAND

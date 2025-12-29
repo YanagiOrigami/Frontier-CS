@@ -1,47 +1,68 @@
 import pandas as pd
 import random
-from typing import List, Dict, Tuple
-import multiprocessing as mp
+from typing import List
 
 class TrieNode:
     def __init__(self):
-        self.children: Dict[str, 'TrieNode'] = {}
+        self.children: dict[str, 'TrieNode'] = {}
 
-def insert_and_get_lcp(s: str, root: TrieNode) -> int:
-    node = root
-    lcp_len = 0
-    for char in s:
-        if char in node.children:
-            node = node.children[char]
-            lcp_len += 1
-        else:
-            break
+def compute_hit_rate(df: pd.DataFrame, order: List[str]) -> float:
+    N = len(df)
+    if N < 2:
+        return 0.0
+    sample_size = min(4096, N)
+    if sample_size < 2:
+        return 0.0
+    if sample_size == N:
+        indices = list(range(N))
     else:
-        lcp_len = len(s)
-    # Insert the remaining part
-    current = node
-    for j in range(lcp_len, len(s)):
-        ch = s[j]
-        if ch not in current.children:
-            current.children[ch] = TrieNode()
-        current = current.children[ch]
-    return lcp_len
-
-def compute_hit_rate_strs(col_strs: Dict[str, List[str]], order: List[str], num_samples: int) -> float:
+        indices = random.sample(range(N), sample_size)
+    indices.sort()
     strings = []
-    total_len = 0
-    for r in range(num_samples):
-        row_str = "".join(col_strs[c][r] for c in order)
-        strings.append(row_str)
-        total_len += len(row_str)
+    col_indices = [df.columns.get_loc(c) for c in order]
+    for idx in indices:
+        row_values = df.iloc[idx, col_indices].astype(str).values
+        s = ''.join(row_values)
+        strings.append(s)
+    total_len = sum(len(s) for s in strings)
     if total_len == 0:
         return 0.0
+    sum_lcp = 0
     root = TrieNode()
-    prefix_sum = 0
-    insert_and_get_lcp(strings[0], root)
-    for s in strings[1:]:
-        prefix_sum += insert_and_get_lcp(s, root)
-    return prefix_sum / total_len
+    for i, s in enumerate(strings):
+        if i == 0:
+            node = root
+            for c in s:
+                if c not in node.children:
+                    node.children[c] = TrieNode()
+                node = node.children[c]
+            continue
+        node = root
+        lcp_len = 0
+        for c in s:
+            if c in node.children:
+                node = node.children[c]
+                lcp_len += 1
+            else:
+                break
+        sum_lcp += lcp_len
+        for c in s[lcp_len:]:
+            if c not in node.children:
+                node.children[c] = TrieNode()
+            node = node.children[c]
+    return sum_lcp / total_len
+
+def apply_merges(df: pd.DataFrame, col_merge: list) -> pd.DataFrame:
+    df = df.copy()
+    cols_to_drop = set()
+    for group in col_merge or []:
+        if len(group) > 1:
+            merged_name = '_'.join(group)
+            df[merged_name] = df[group].apply(lambda row: ''.join(row.astype(str).values), axis=1)
+            cols_to_drop.update(group)
+    if cols_to_drop:
+        df = df.drop(columns=list(cols_to_drop))
+    return df
 
 class Solution:
     def solve(
@@ -55,72 +76,23 @@ class Solution:
         distinct_value_threshold: float = 0.7,
         parallel: bool = True,
     ) -> pd.DataFrame:
-        df = df.copy()
-        current_cols = list(df.columns)
-        N = len(df)
-        if N <= 1:
+        df = apply_merges(df, col_merge)
+        cols = list(df.columns)
+        M = len(cols)
+        if M <= 1:
             return df
-        
-        if col_merge is not None:
-            merged_groups = []
-            for group in col_merge:
-                if not group:
-                    continue
-                merged_name = '_'.join(group)
-                df[merged_name] = df[group].apply(lambda x: ''.join(x.astype(str)), axis=1)
-                merged_groups.append(merged_name)
-                df.drop(columns=group, inplace=True)
-            current_cols = list(df.columns)
-        
-        frac_dict = {col: df[col].nunique() / N for col in current_cols}
-        
-        sample_size = min(N, row_stop * 500)
-        if sample_size < N:
-            sample_rows = random.sample(range(N), sample_size)
-        else:
-            sample_rows = list(range(N))
-        
-        col_strs = {col: [str(df.iloc[i][col]) for i in sample_rows] for col in current_cols}
-        num_samples = len(sample_rows)
-        
-        beam_width = 10
-        beam: List[Tuple[float, List[str]]] = [(0.0, [])]
-        total_evals = 0
-        
-        for _ in range(len(current_cols)):
-            new_orders_to_eval = []
-            for _, partial_order in beam:
-                remaining = [c for c in current_cols if c not in partial_order]
-                remaining.sort(key=lambda c: frac_dict[c])
-                for cand in remaining:
-                    new_orders_to_eval.append(partial_order + [cand])
-            
-            num_to_eval = len(new_orders_to_eval)
-            total_evals += num_to_eval
-            if total_evals > early_stop:
-                break
-            
-            if parallel and num_to_eval > 1:
-                with mp.Pool(processes=min(8, mp.cpu_count())) as pool:
-                    scores = pool.starmap(
-                        compute_hit_rate_strs,
-                        [(col_strs, ord_, num_samples) for ord_ in new_orders_to_eval]
-                    )
-            else:
-                scores = [
-                    compute_hit_rate_strs(col_strs, ord_, num_samples)
-                    for ord_ in new_orders_to_eval
-                ]
-            
-            new_beam = list(zip(scores, new_orders_to_eval))
-            new_beam.sort(key=lambda x: x[0], reverse=True)
-            beam = new_beam[:beam_width]
-            if len(beam) == 0:
-                break
-        
-        if beam:
-            best_order = max(beam, key=lambda x: x[0])[1]
-        else:
-            best_order = current_cols  # fallback
-        
-        return df[best_order]
+        remaining = set(cols)
+        current_order = []
+        for _ in range(M):
+            best_score = -1.0
+            best_col = None
+            for cand in list(remaining):
+                temp_order = current_order + [cand]
+                score = compute_hit_rate(df, temp_order)
+                if score > best_score:
+                    best_score = score
+                    best_col = cand
+            if best_col is not None:
+                current_order.append(best_col)
+                remaining.remove(best_col)
+        return df[current_order]

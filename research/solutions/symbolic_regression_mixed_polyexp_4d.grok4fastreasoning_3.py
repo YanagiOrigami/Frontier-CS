@@ -8,11 +8,11 @@ class Solution:
     def solve(self, X: np.ndarray, y: np.ndarray) -> dict:
         model = PySRRegressor(
             niterations=100,
-            binary_operators=["+", "-", "*", "/"],
+            binary_operators=["+", "-", "*", "/", "**"],
             unary_operators=["sin", "cos", "exp", "log"],
-            populations=20,
-            population_size=40,
-            maxsize=30,
+            populations=10,
+            population_size=50,
+            maxsize=40,
             verbosity=0,
             progress=False,
             random_state=42,

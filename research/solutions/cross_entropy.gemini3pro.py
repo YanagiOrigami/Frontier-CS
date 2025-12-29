@@ -12,87 +12,98 @@ import triton.language as tl
 
 @triton.autotune(
     configs=[
-        triton.Config({}, num_warps=4),
-        triton.Config({}, num_warps=8),
-        triton.Config({}, num_warps=16),
-        triton.Config({}, num_warps=32),
+        triton.Config({'BLOCK_SIZE': 1024}, num_warps=4),
+        triton.Config({'BLOCK_SIZE': 2048}, num_warps=8),
+        triton.Config({'BLOCK_SIZE': 4096}, num_warps=8),
+        triton.Config({'BLOCK_SIZE': 8192}, num_warps=16),
     ],
-    key=['N'],
+    key=['N']
 )
 @triton.jit
-def cross_entropy_kernel(
+def _cross_entropy_kernel(
     logits_ptr, targets_ptr, out_ptr,
     stride_logits_m, stride_logits_n,
-    stride_targets,
+    stride_targets_m,
     N,
     BLOCK_SIZE: tl.constexpr
 ):
-    # Program ID
-    row_idx = tl.program_id(0)
+    # Map the program instance to the row of the input
+    pid = tl.program_id(0)
     
-    # Pointers
-    logits_row_ptr = logits_ptr + row_idx * stride_logits_m
-    target_ptr_row = targets_ptr + row_idx * stride_targets
-    output_ptr_row = out_ptr + row_idx
+    # Calculate pointers to the start of the row
+    row_logits_ptr = logits_ptr + pid * stride_logits_m
     
-    # Load entire row of logits
-    # We use a block size that covers N (calculated in wrapper)
-    cols = tl.arange(0, BLOCK_SIZE)
-    mask = cols < N
+    # Load the target class index for this sample
+    target_idx = tl.load(targets_ptr + pid * stride_targets_m)
     
-    # Load data
-    # Cast to float32 for precision in exp/sum
-    # Use -inf for padding so it doesn't affect max calculation or sum_exp
-    logits = tl.load(logits_row_ptr + cols * stride_logits_n, mask=mask, other=-float('inf')).to(tl.float32)
+    # Load the logit corresponding to the target class
+    # We do this separately because it's a scalar load and critical for the final subtraction
+    target_val = tl.load(row_logits_ptr + target_idx * stride_logits_n)
     
-    # 1. Compute Max for numerical stability
-    max_val = tl.max(logits, 0)
+    # Online Softmax / LogSumExp computation
+    # We iterate over the row in blocks to compute max and sum-exp safely
     
-    # 2. Compute Sum of Exponentials
-    # shifted = logits - max_val
-    # padded values: -inf - max_val = -inf -> exp(-inf) = 0
-    shifted_logits = logits - max_val
-    sum_exp = tl.sum(tl.exp(shifted_logits), 0)
+    m_i = -float('inf')  # Running max
+    s_i = 0.0            # Running sum of exponentials (shifted by m_i)
     
-    # 3. Compute LogSumExp
-    # log(sum(exp(x - m))) + m
-    log_sum_exp = max_val + tl.log(sum_exp)
+    for off in range(0, N, BLOCK_SIZE):
+        cols = off + tl.arange(0, BLOCK_SIZE)
+        mask = cols < N
+        
+        # Load a block of logits
+        val = tl.load(row_logits_ptr + cols * stride_logits_n, mask=mask, other=-float('inf'))
+        
+        # Compute local max in this block
+        block_max = tl.max(val, 0)
+        
+        # Update global max
+        new_m_i = tl.maximum(m_i, block_max)
+        
+        # Update running sum:
+        # s_new = s_old * exp(m_old - m_new) + sum(exp(val - m_new))
+        s_i = s_i * tl.exp(m_i - new_m_i) + tl.sum(tl.exp(val - new_m_i), 0)
+        
+        m_i = new_m_i
+        
+    # Final cross entropy loss = log(sum(exp(x_j))) - x_target
+    # log_sum_exp = m_i + log(s_i)
+    loss = m_i + tl.log(s_i) - target_val
     
-    # 4. Get the target class logit
-    target_idx = tl.load(target_ptr_row)
-    
-    # Load specific logit from global memory
-    # Accessing via logits_row_ptr + target_idx * stride
-    target_logit = tl.load(logits_row_ptr + target_idx * stride_logits_n).to(tl.float32)
-    
-    # 5. Compute Loss
-    # loss = -target_logit + log_sum_exp
-    loss = log_sum_exp - target_logit
-    
-    # Store result
-    tl.store(output_ptr_row, loss)
+    # Store the result
+    tl.store(out_ptr + pid, loss)
 
 def cross_entropy(logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+    \"\"\"
+    Cross entropy loss computation using Triton.
+    
+    Args:
+        logits: Input tensor of shape (M, N)
+        targets: Input tensor of shape (M,)
+    
+    Returns:
+        Output tensor of shape (M,)
+    \"\"\"
+    # Ensure inputs are on CUDA
+    if logits.device.type != 'cuda':
+        logits = logits.cuda()
+    if targets.device.type != 'cuda':
+        targets = targets.cuda()
+
     M, N = logits.shape
     
     # Allocate output
-    output = torch.empty((M,), dtype=torch.float32, device=logits.device)
+    out = torch.empty(M, dtype=torch.float32, device=logits.device)
     
-    # Determine Block Size
-    # Use next power of 2 to handle the reduction efficiently in one block if possible
-    BLOCK_SIZE = triton.next_power_of_2(N)
-    
-    # Launch Kernel
+    # Grid: One kernel instance per row (sample)
     grid = (M,)
     
-    cross_entropy_kernel[grid](
-        logits, targets, output,
+    _cross_entropy_kernel[grid](
+        logits, targets, out,
         logits.stride(0), logits.stride(1),
         targets.stride(0),
-        N,
-        BLOCK_SIZE=BLOCK_SIZE
+        N
     )
     
-    return output
+    return out
 """
         }

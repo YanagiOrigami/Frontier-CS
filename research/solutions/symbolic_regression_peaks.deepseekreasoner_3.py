@@ -10,49 +10,33 @@ class Solution:
             niterations=200,
             binary_operators=["+", "-", "*", "/", "**"],
             unary_operators=["sin", "cos", "exp", "log"],
-            populations=32,
+            populations=12,
             population_size=50,
             maxsize=30,
-            parsimony=0.003,
-            ncycles_per_iteration=800,
-            nprocs=8,
             verbosity=0,
             progress=False,
             random_state=42,
+            loss="loss(x, y) = (x - y)^2",
+            early_stop_condition="stop_if(loss, complexity) = loss < 1e-8 && complexity < 10",
             deterministic=True,
-            early_stop_condition=1e-8,
-            constraints={
-                '**': (4, 1),
-                'log': 1,
-                'exp': 4
-            },
-            complexity_of_operators={
-                '**': 3,
-                'exp': 2,
-                'log': 2,
-                'sin': 2,
-                'cos': 2
-            }
+            max_evals=200000,
         )
         
         model.fit(X, y, variable_names=["x1", "x2"])
         
         best_expr = model.sympy()
-        expression = str(best_expr).replace('**', '**').replace('exp', 'exp').replace('log', 'log')
+        expression = str(best_expr)
         
-        predictions = model.predict(X)
-        
-        binary_ops = ['+', '-', '*', '/', '**']
-        unary_ops = ['sin', 'cos', 'exp', 'log']
-        expr_str = expression
-        complexity = 0
-        for op in binary_ops:
-            complexity += 2 * expr_str.count(op)
-        for op in unary_ops:
-            complexity += expr_str.count(op)
+        try:
+            predictions = model.predict(X)
+        except:
+            try:
+                predictions = [float(best_expr.subs({"x1": xi[0], "x2": xi[1]})) for xi in X]
+            except:
+                predictions = None
         
         return {
             "expression": expression,
-            "predictions": predictions.tolist(),
-            "details": {"complexity": complexity}
+            "predictions": predictions.tolist() if predictions is not None else None,
+            "details": {}
         }

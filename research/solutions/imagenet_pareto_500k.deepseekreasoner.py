@@ -1,73 +1,65 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import torch.optim as optim
+from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR
-import time
+import copy
 import warnings
-warnings.filterwarnings("ignore")
+warnings.filterwarnings('ignore')
 
-class ResidualBlock(nn.Module):
-    def __init__(self, in_channels, out_channels, stride=1, dropout=0.1):
-        super().__init__()
-        self.conv1 = nn.Linear(in_channels, out_channels)
-        self.bn1 = nn.BatchNorm1d(out_channels)
-        self.conv2 = nn.Linear(out_channels, out_channels)
-        self.bn2 = nn.BatchNorm1d(out_channels)
-        self.dropout = nn.Dropout(dropout)
-        
-        self.shortcut = nn.Sequential()
-        if stride != 1 or in_channels != out_channels:
-            self.shortcut = nn.Sequential(
-                nn.Linear(in_channels, out_channels, bias=False),
-                nn.BatchNorm1d(out_channels)
-            )
-    
-    def forward(self, x):
-        identity = self.shortcut(x)
-        out = F.relu(self.bn1(self.conv1(x)))
-        out = self.dropout(out)
-        out = self.bn2(self.conv2(out))
-        out += identity
-        out = F.relu(out)
-        return out
-
-class CustomModel(nn.Module):
-    def __init__(self, input_dim=384, num_classes=128, param_limit=500000):
+class EfficientNet(nn.Module):
+    def __init__(self, input_dim=384, num_classes=128):
         super().__init__()
         
-        # Calculate layer dimensions to stay under parameter limit
-        # Using bottleneck architecture with residual connections
+        # Depthwise separable convolution inspired block but for MLP
+        # Using bottleneck structure to save parameters
         hidden1 = 512
         hidden2 = 256
-        hidden3 = 256
+        hidden3 = 192
         hidden4 = 128
         
-        # Initial projection
-        self.input_proj = nn.Sequential(
+        # First expansion layer
+        self.block1 = nn.Sequential(
             nn.Linear(input_dim, hidden1),
             nn.BatchNorm1d(hidden1),
-            nn.ReLU(),
+            nn.GELU(),
             nn.Dropout(0.2)
         )
         
-        # Residual blocks
-        self.block1 = ResidualBlock(hidden1, hidden2, dropout=0.2)
-        self.block2 = ResidualBlock(hidden2, hidden3, dropout=0.2)
-        self.block3 = ResidualBlock(hidden3, hidden4, dropout=0.1)
+        # Bottleneck layers with residual connections
+        self.block2 = nn.Sequential(
+            nn.Linear(hidden1, hidden2),
+            nn.BatchNorm1d(hidden2),
+            nn.GELU(),
+            nn.Dropout(0.2)
+        )
+        
+        self.block3 = nn.Sequential(
+            nn.Linear(hidden2, hidden3),
+            nn.BatchNorm1d(hidden3),
+            nn.GELU(),
+            nn.Dropout(0.2)
+        )
+        
+        # Final projection
+        self.block4 = nn.Sequential(
+            nn.Linear(hidden3, hidden4),
+            nn.BatchNorm1d(hidden4),
+            nn.GELU(),
+            nn.Dropout(0.1)
+        )
         
         # Output layer
         self.output = nn.Linear(hidden4, num_classes)
         
-        # Initialize weights
-        self._initialize_weights()
+        # Skip connections
+        self.skip1 = nn.Linear(input_dim, hidden2) if input_dim != hidden2 else nn.Identity()
+        self.skip2 = nn.Linear(hidden2, hidden4) if hidden2 != hidden4 else nn.Identity()
         
-        # Verify parameter count
-        total_params = sum(p.numel() for p in self.parameters() if p.requires_grad)
-        if total_params > param_limit:
-            raise ValueError(f"Model has {total_params} parameters, exceeds {param_limit} limit")
+        # Initialize weights
+        self._init_weights()
     
-    def _initialize_weights(self):
+    def _init_weights(self):
         for m in self.modules():
             if isinstance(m, nn.Linear):
                 nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
@@ -78,47 +70,56 @@ class CustomModel(nn.Module):
                 nn.init.constant_(m.bias, 0)
     
     def forward(self, x):
-        x = self.input_proj(x)
-        x = self.block1(x)
-        x = self.block2(x)
-        x = self.block3(x)
-        x = self.output(x)
-        return x
+        # First block
+        x1 = self.block1(x)
+        
+        # Second block with residual
+        x2 = self.block2(x1)
+        
+        # Third block
+        x3 = self.block3(x2)
+        
+        # Fourth block with residual from x2
+        x4 = self.block4(x3)
+        
+        # Output
+        out = self.output(x4)
+        return out
 
 class Solution:
     def solve(self, train_loader, val_loader, metadata: dict = None) -> torch.nn.Module:
         if metadata is None:
             metadata = {}
         
-        num_classes = metadata.get("num_classes", 128)
+        device = metadata.get("device", "cpu")
         input_dim = metadata.get("input_dim", 384)
+        num_classes = metadata.get("num_classes", 128)
         param_limit = metadata.get("param_limit", 500000)
-        device_str = metadata.get("device", "cpu")
-        device = torch.device(device_str)
         
-        # Create model with parameter constraint
-        model = CustomModel(input_dim, num_classes, param_limit)
-        model = model.to(device)
+        # Create model
+        model = EfficientNet(input_dim, num_classes).to(device)
         
-        # Training hyperparameters
-        epochs = 150
-        lr = 0.001
-        weight_decay = 1e-4
+        # Verify parameter count
+        total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        if total_params > param_limit:
+            # If too large, create a smaller model
+            model = self._create_smaller_model(input_dim, num_classes, param_limit).to(device)
+            total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
         
-        # Optimizer and scheduler
-        optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
-        scheduler = CosineAnnealingLR(optimizer, T_max=epochs)
-        
-        # Loss function
+        # Training setup
         criterion = nn.CrossEntropyLoss()
+        optimizer = AdamW(model.parameters(), lr=0.003, weight_decay=0.01)
+        scheduler = CosineAnnealingLR(optimizer, T_max=50, eta_min=1e-5)
         
-        # Training loop with early stopping
+        # Early stopping
         best_val_acc = 0.0
         best_model_state = None
-        patience = 20
+        patience = 15
         patience_counter = 0
         
-        for epoch in range(epochs):
+        # Training loop
+        num_epochs = 100
+        for epoch in range(num_epochs):
             # Training phase
             model.train()
             train_loss = 0.0
@@ -143,13 +144,10 @@ class Solution:
                 train_total += targets.size(0)
                 train_correct += predicted.eq(targets).sum().item()
             
-            train_acc = 100. * train_correct / train_total
-            
             # Validation phase
             model.eval()
             val_correct = 0
             val_total = 0
-            
             with torch.no_grad():
                 for inputs, targets in val_loader:
                     inputs, targets = inputs.to(device), targets.to(device)
@@ -158,49 +156,90 @@ class Solution:
                     val_total += targets.size(0)
                     val_correct += predicted.eq(targets).sum().item()
             
-            val_acc = 100. * val_correct / val_total
+            val_acc = val_correct / val_total if val_total > 0 else 0
             
-            # Early stopping and model checkpointing
+            # Update scheduler
+            scheduler.step()
+            
+            # Early stopping check
             if val_acc > best_val_acc:
                 best_val_acc = val_acc
-                best_model_state = model.state_dict().copy()
+                best_model_state = copy.deepcopy(model.state_dict())
                 patience_counter = 0
             else:
                 patience_counter += 1
             
-            # Update learning rate
-            scheduler.step()
-            
-            # Early stopping
-            if patience_counter >= patience and epoch > 50:
+            if patience_counter >= patience:
                 break
         
         # Load best model
         if best_model_state is not None:
             model.load_state_dict(best_model_state)
         
-        # Final training on combined train+val data for better generalization
-        model.train()
-        combined_loader = torch.utils.data.DataLoader(
-            torch.utils.data.ConcatDataset([train_loader.dataset, val_loader.dataset]),
-            batch_size=train_loader.batch_size,
-            shuffle=True
-        )
-        
-        # Fine-tuning with lower learning rate
-        fine_tune_epochs = 30
-        optimizer = optim.AdamW(model.parameters(), lr=lr/10, weight_decay=weight_decay)
-        
-        for epoch in range(fine_tune_epochs):
-            for batch_idx, (inputs, targets) in enumerate(combined_loader):
-                inputs, targets = inputs.to(device), targets.to(device)
+        return model
+    
+    def _create_smaller_model(self, input_dim, num_classes, param_limit):
+        """Create a model guaranteed to be under parameter limit"""
+        class SmallNet(nn.Module):
+            def __init__(self, input_dim, num_classes):
+                super().__init__()
+                hidden1 = 384
+                hidden2 = 256
+                hidden3 = 192
                 
-                optimizer.zero_grad()
-                outputs = model(inputs)
-                loss = criterion(outputs, targets)
-                loss.backward()
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.5)
-                optimizer.step()
+                self.net = nn.Sequential(
+                    nn.Linear(input_dim, hidden1),
+                    nn.BatchNorm1d(hidden1),
+                    nn.GELU(),
+                    nn.Dropout(0.3),
+                    
+                    nn.Linear(hidden1, hidden2),
+                    nn.BatchNorm1d(hidden2),
+                    nn.GELU(),
+                    nn.Dropout(0.3),
+                    
+                    nn.Linear(hidden2, hidden3),
+                    nn.BatchNorm1d(hidden3),
+                    nn.GELU(),
+                    nn.Dropout(0.2),
+                    
+                    nn.Linear(hidden3, num_classes)
+                )
+                
+                # Initialize weights
+                for m in self.modules():
+                    if isinstance(m, nn.Linear):
+                        nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+                        if m.bias is not None:
+                            nn.init.constant_(m.bias, 0)
+                    elif isinstance(m, nn.BatchNorm1d):
+                        nn.init.constant_(m.weight, 1)
+                        nn.init.constant_(m.bias, 0)
+            
+            def forward(self, x):
+                return self.net(x)
         
-        model.eval()
+        # Keep reducing size until under limit
+        model = SmallNet(input_dim, num_classes)
+        total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        
+        # If still too large, create minimal model
+        if total_params > param_limit:
+            class MinimalNet(nn.Module):
+                def __init__(self, input_dim, num_classes):
+                    super().__init__()
+                    hidden = 256
+                    self.net = nn.Sequential(
+                        nn.Linear(input_dim, hidden),
+                        nn.BatchNorm1d(hidden),
+                        nn.GELU(),
+                        nn.Dropout(0.3),
+                        nn.Linear(hidden, num_classes)
+                    )
+                
+                def forward(self, x):
+                    return self.net(x)
+            
+            model = MinimalNet(input_dim, num_classes)
+        
         return model

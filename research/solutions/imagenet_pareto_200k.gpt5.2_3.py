@@ -1,273 +1,452 @@
-import math
-import copy
 import os
-from typing import Optional, Dict, Tuple
-
+import math
+import random
+import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 
-class _InputNorm(nn.Module):
-    def __init__(self, mean: torch.Tensor, std: torch.Tensor, eps: float = 1e-6):
+def _set_seeds(seed: int = 0):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+
+
+def _collect_xy(loader):
+    xs = []
+    ys = []
+    for batch in loader:
+        if isinstance(batch, (list, tuple)) and len(batch) >= 2:
+            x, y = batch[0], batch[1]
+        else:
+            raise ValueError("Dataloader batch must be (inputs, targets).")
+        if not torch.is_tensor(x):
+            x = torch.as_tensor(x)
+        if not torch.is_tensor(y):
+            y = torch.as_tensor(y)
+        x = x.detach().to(dtype=torch.float32).view(x.shape[0], -1).cpu()
+        y = y.detach().to(dtype=torch.long).view(-1).cpu()
+        xs.append(x)
+        ys.append(y)
+    return torch.cat(xs, dim=0), torch.cat(ys, dim=0)
+
+
+def _mean_invstd(X: torch.Tensor, eps: float = 1e-6):
+    mean = X.mean(dim=0)
+    var = X.var(dim=0, unbiased=False)
+    inv_std = torch.rsqrt(var + eps)
+    return mean, inv_std
+
+
+def _acc_from_logits(logits: torch.Tensor, y: torch.Tensor) -> float:
+    return (logits.argmax(dim=1) == y).float().mean().item()
+
+
+def _confusion_free_bincount(y: torch.Tensor, minlength: int):
+    if y.numel() == 0:
+        return torch.zeros(minlength, dtype=torch.long, device=y.device)
+    return torch.bincount(y, minlength=minlength)
+
+
+def _fit_nearest_mean_from_norm(Xn: torch.Tensor, y: torch.Tensor, num_classes: int):
+    d = Xn.shape[1]
+    sums = torch.zeros((num_classes, d), dtype=Xn.dtype, device=Xn.device)
+    sums.index_add_(0, y, Xn)
+    counts = _confusion_free_bincount(y, num_classes).to(dtype=Xn.dtype, device=Xn.device).clamp_min(1.0)
+    mu = sums / counts.unsqueeze(1)
+    W = (2.0 * mu).t().contiguous()  # d x C
+    b = -(mu * mu).sum(dim=1).contiguous()  # C
+    return W, b
+
+
+def _fit_lda_from_norm(Xn: torch.Tensor, y: torch.Tensor, num_classes: int, alpha: float):
+    d = Xn.shape[1]
+    sums = torch.zeros((num_classes, d), dtype=Xn.dtype, device=Xn.device)
+    sums.index_add_(0, y, Xn)
+    counts = _confusion_free_bincount(y, num_classes).to(dtype=Xn.dtype, device=Xn.device).clamp_min(1.0)
+    mu = sums / counts.unsqueeze(1)  # C x d
+
+    Xc = Xn - mu[y]  # N x d
+    S = (Xc.t() @ Xc) / max(1, Xc.shape[0])
+    S = 0.5 * (S + S.t())
+    diag = torch.diagonal(S, 0)
+    diag.add_(alpha)
+
+    try:
+        L = torch.linalg.cholesky(S)
+        W = torch.cholesky_solve(mu.t(), L)  # d x C
+    except Exception:
+        S2 = S.clone()
+        torch.diagonal(S2, 0).add_(alpha * 10.0 + 1e-4)
+        L = torch.linalg.cholesky(S2)
+        W = torch.cholesky_solve(mu.t(), L)
+
+    b = (-0.5 * (mu * W.t()).sum(dim=1)).contiguous()  # C
+    W = W.contiguous()
+    return W, b
+
+
+def _fit_ridge_onehot_from_norm(Xn: torch.Tensor, y: torch.Tensor, num_classes: int, lam: float, fit_bias: bool = True):
+    N, d = Xn.shape
+    if fit_bias:
+        ones = torch.ones((N, 1), dtype=Xn.dtype, device=Xn.device)
+        Xa = torch.cat([Xn, ones], dim=1)
+    else:
+        Xa = Xn
+    p = Xa.shape[1]
+
+    A = Xa.t() @ Xa
+    reg = lam * float(N)
+    if reg > 0:
+        diag = torch.diagonal(A, 0)
+        if fit_bias:
+            diag[:-1].add_(reg)
+        else:
+            diag.add_(reg)
+
+    sums = torch.zeros((num_classes, p), dtype=Xn.dtype, device=Xn.device)
+    sums.index_add_(0, y, Xa)
+    XtY = sums.t().contiguous()  # p x C
+
+    try:
+        Waug = torch.linalg.solve(A, XtY)  # p x C
+    except Exception:
+        A2 = A.clone()
+        torch.diagonal(A2, 0).add_(1e-3)
+        Waug = torch.linalg.solve(A2, XtY)
+
+    if fit_bias:
+        W = Waug[:-1, :].contiguous()
+        b = Waug[-1, :].contiguous()
+    else:
+        W = Waug.contiguous()
+        b = torch.zeros((num_classes,), dtype=Xn.dtype, device=Xn.device)
+
+    return W, b
+
+
+def _fit_elm_from_norm(Xn: torch.Tensor, y: torch.Tensor, num_classes: int, hidden_dim: int, lam: float, seed: int = 0, fit_bias: bool = True):
+    g = torch.Generator(device=Xn.device)
+    g.manual_seed(seed)
+
+    N, d = Xn.shape
+    W1 = torch.randn((d, hidden_dim), dtype=Xn.dtype, device=Xn.device, generator=g) * (1.0 / math.sqrt(d))
+    b1 = torch.randn((hidden_dim,), dtype=Xn.dtype, device=Xn.device, generator=g) * 0.1
+
+    H = F.gelu(Xn @ W1 + b1)
+    if fit_bias:
+        ones = torch.ones((N, 1), dtype=Xn.dtype, device=Xn.device)
+        Ha = torch.cat([H, ones], dim=1)
+    else:
+        Ha = H
+    m = Ha.shape[1]
+
+    HtH = Ha.t() @ Ha
+    reg = lam * float(N)
+    if reg > 0:
+        diag = torch.diagonal(HtH, 0)
+        if fit_bias:
+            diag[:-1].add_(reg)
+        else:
+            diag.add_(reg)
+
+    sums = torch.zeros((num_classes, m), dtype=Xn.dtype, device=Xn.device)
+    sums.index_add_(0, y, Ha)
+    HtY = sums.t().contiguous()  # m x C
+
+    try:
+        Beta = torch.linalg.solve(HtH, HtY)  # m x C
+    except Exception:
+        HtH2 = HtH.clone()
+        torch.diagonal(HtH2, 0).add_(1e-3)
+        Beta = torch.linalg.solve(HtH2, HtY)
+
+    if fit_bias:
+        BetaW = Beta[:-1, :].contiguous()  # hidden x C
+        Betab = Beta[-1, :].contiguous()   # C
+    else:
+        BetaW = Beta.contiguous()
+        Betab = torch.zeros((num_classes,), dtype=Xn.dtype, device=Xn.device)
+
+    return W1.contiguous(), b1.contiguous(), BetaW, Betab
+
+
+class FixedLinearClassifier(nn.Module):
+    def __init__(self, mean: torch.Tensor, inv_std: torch.Tensor, W: torch.Tensor, b: torch.Tensor):
         super().__init__()
-        self.register_buffer("mean", mean.detach().clone())
-        self.register_buffer("std", std.detach().clone())
-        self.eps = eps
+        self.register_buffer("mean", mean.detach().to(dtype=torch.float32))
+        self.register_buffer("inv_std", inv_std.detach().to(dtype=torch.float32))
+        self.register_buffer("W", W.detach().to(dtype=torch.float32))  # d x C
+        self.register_buffer("b", b.detach().to(dtype=torch.float32))  # C
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return (x - self.mean) / (self.std + self.eps)
+    def forward(self, x):
+        if not torch.is_tensor(x):
+            x = torch.as_tensor(x)
+        x = x.to(dtype=torch.float32).view(x.shape[0], -1)
+        x = (x - self.mean) * self.inv_std
+        return x @ self.W + self.b
 
 
-class _MLPRes(nn.Module):
-    def __init__(self, input_dim: int, num_classes: int, hidden_dim: int, dropout: float = 0.10,
-                 mean: Optional[torch.Tensor] = None, std: Optional[torch.Tensor] = None):
+class ELMClassifier(nn.Module):
+    def __init__(self, mean: torch.Tensor, inv_std: torch.Tensor, W1: torch.Tensor, b1: torch.Tensor, BetaW: torch.Tensor, Betab: torch.Tensor):
         super().__init__()
-        self.input_dim = int(input_dim)
-        self.num_classes = int(num_classes)
-        self.hidden_dim = int(hidden_dim)
+        self.register_buffer("mean", mean.detach().to(dtype=torch.float32))
+        self.register_buffer("inv_std", inv_std.detach().to(dtype=torch.float32))
+        self.register_buffer("W1", W1.detach().to(dtype=torch.float32))
+        self.register_buffer("b1", b1.detach().to(dtype=torch.float32))
+        self.register_buffer("BetaW", BetaW.detach().to(dtype=torch.float32))
+        self.register_buffer("Betab", Betab.detach().to(dtype=torch.float32))
 
-        if mean is None:
-            mean = torch.zeros(self.input_dim, dtype=torch.float32)
-        if std is None:
-            std = torch.ones(self.input_dim, dtype=torch.float32)
+    def forward(self, x):
+        if not torch.is_tensor(x):
+            x = torch.as_tensor(x)
+        x = x.to(dtype=torch.float32).view(x.shape[0], -1)
+        x = (x - self.mean) * self.inv_std
+        h = F.gelu(x @ self.W1 + self.b1)
+        return h @ self.BetaW + self.Betab
 
-        self.inorm = _InputNorm(mean.float(), std.float())
 
-        self.drop_in = nn.Dropout(p=min(0.05, dropout))
-        self.fc1 = nn.Linear(self.input_dim, self.hidden_dim, bias=True)
-        self.ln1 = nn.LayerNorm(self.hidden_dim)
+class ResidualMLP(nn.Module):
+    def __init__(self, input_dim: int, num_classes: int, hidden_dim: int, mean: torch.Tensor, inv_std: torch.Tensor, dropout: float = 0.1):
+        super().__init__()
+        self.register_buffer("mean", mean.detach().to(dtype=torch.float32))
+        self.register_buffer("inv_std", inv_std.detach().to(dtype=torch.float32))
+        self.fc1 = nn.Linear(input_dim, hidden_dim, bias=True)
+        self.ln1 = nn.LayerNorm(hidden_dim)
+        self.fc2 = nn.Linear(hidden_dim, hidden_dim, bias=True)
+        self.ln2 = nn.LayerNorm(hidden_dim)
+        self.drop = nn.Dropout(dropout)
+        self.out = nn.Linear(hidden_dim, num_classes, bias=True)
 
-        self.drop1 = nn.Dropout(p=dropout)
-        self.fc2 = nn.Linear(self.hidden_dim, self.hidden_dim, bias=True)
-        self.ln2 = nn.LayerNorm(self.hidden_dim)
-        self.drop2 = nn.Dropout(p=dropout)
-
-        self.fc3 = nn.Linear(self.hidden_dim, self.num_classes, bias=True)
-
-        self.act = nn.GELU()
-
-        self._init_weights()
-
-    def _init_weights(self):
-        for m in self.modules():
-            if isinstance(m, nn.Linear):
-                nn.init.kaiming_normal_(m.weight, nonlinearity="relu")
-                if m.bias is not None:
-                    nn.init.zeros_(m.bias)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if x.dim() > 2:
-            x = x.view(x.size(0), -1)
-        x = x.float()
-        x = self.inorm(x)
-        x = self.drop_in(x)
-
-        h = self.fc1(x)
-        h = self.ln1(h)
-        h = self.act(h)
-
-        r = self.drop1(h)
-        r = self.fc2(r)
-        r = self.ln2(r)
-        r = self.drop2(r)
-
-        h = self.act(h + r)
-        logits = self.fc3(h)
-        return logits
+    def forward(self, x):
+        if not torch.is_tensor(x):
+            x = torch.as_tensor(x)
+        x = x.to(dtype=torch.float32).view(x.shape[0], -1)
+        x = (x - self.mean) * self.inv_std
+        h = F.gelu(self.ln1(self.fc1(x)))
+        r = F.gelu(self.ln2(self.fc2(h)))
+        h = h + self.drop(r)
+        h = self.drop(h)
+        return self.out(h)
 
 
 def _count_trainable_params(model: nn.Module) -> int:
     return sum(p.numel() for p in model.parameters() if p.requires_grad)
 
 
-@torch.no_grad()
-def _accuracy(model: nn.Module, loader, device: torch.device) -> float:
+def _choose_hidden_dim(input_dim: int, num_classes: int, param_limit: int, use_layernorm: bool = True) -> int:
+    # ResidualMLP params:
+    # fc1: input_dim*h + h
+    # fc2: h*h + h
+    # out: h*num_classes + num_classes
+    # layernorms: 2 LNs -> 4h params if use_layernorm
+    # total = h*(input_dim + h + num_classes + 2 (biases fc1,fc2) + 4 (LN) ) + num_classes + ??? => h*(input_dim + h + num_classes + 6) + num_classes
+    add = 6 if use_layernorm else 2
+    lo, hi = 16, 4096
+    best = lo
+    while lo <= hi:
+        mid = (lo + hi) // 2
+        total = mid * (input_dim + mid + num_classes + add) + num_classes
+        if total <= param_limit:
+            best = mid
+            lo = mid + 1
+        else:
+            hi = mid - 1
+    return best
+
+
+def _train_mlp(train_loader, val_loader, input_dim: int, num_classes: int, param_limit: int, device: str):
+    Xtr, ytr = _collect_xy(train_loader)
+    mean, inv_std = _mean_invstd(Xtr)
+
+    hidden = _choose_hidden_dim(input_dim, num_classes, param_limit, use_layernorm=True)
+    hidden = min(hidden, 512)
+    model = ResidualMLP(input_dim, num_classes, hidden, mean, inv_std, dropout=0.1).to(device=device)
+    if _count_trainable_params(model) > param_limit:
+        hidden = max(32, hidden - 8)
+        model = ResidualMLP(input_dim, num_classes, hidden, mean, inv_std, dropout=0.1).to(device=device)
+
+    optimizer = torch.optim.AdamW(model.parameters(), lr=2e-3, weight_decay=1e-3)
+    steps_per_epoch = max(1, len(train_loader))
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max(1, 80 * steps_per_epoch))
+    criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
+
+    best_state = None
+    best_acc = -1.0
+    patience = 20
+    bad = 0
+    max_epochs = 80
+
+    for epoch in range(max_epochs):
+        model.train()
+        for xb, yb in train_loader:
+            if not torch.is_tensor(xb):
+                xb = torch.as_tensor(xb)
+            if not torch.is_tensor(yb):
+                yb = torch.as_tensor(yb)
+            xb = xb.to(device=device, dtype=torch.float32).view(xb.shape[0], -1)
+            yb = yb.to(device=device, dtype=torch.long).view(-1)
+
+            optimizer.zero_grad(set_to_none=True)
+            logits = model(xb)
+            loss = criterion(logits, yb)
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            optimizer.step()
+            scheduler.step()
+
+        model.eval()
+        with torch.inference_mode():
+            correct = 0
+            total = 0
+            for xb, yb in val_loader:
+                if not torch.is_tensor(xb):
+                    xb = torch.as_tensor(xb)
+                if not torch.is_tensor(yb):
+                    yb = torch.as_tensor(yb)
+                xb = xb.to(device=device, dtype=torch.float32).view(xb.shape[0], -1)
+                yb = yb.to(device=device, dtype=torch.long).view(-1)
+                pred = model(xb).argmax(dim=1)
+                correct += (pred == yb).sum().item()
+                total += yb.numel()
+            acc = correct / max(1, total)
+
+        if acc > best_acc + 1e-6:
+            best_acc = acc
+            best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+            bad = 0
+        else:
+            bad += 1
+            if bad >= patience:
+                break
+
+    if best_state is not None:
+        model.load_state_dict(best_state, strict=True)
     model.eval()
-    correct = 0
-    total = 0
-    for xb, yb in loader:
-        xb = xb.to(device, non_blocking=False)
-        yb = yb.to(device, non_blocking=False)
-        logits = model(xb)
-        pred = logits.argmax(dim=1)
-        correct += (pred == yb).sum().item()
-        total += yb.numel()
-    return float(correct) / float(total if total > 0 else 1)
-
-
-def _compute_mean_std(train_loader, input_dim: int, device: torch.device) -> Tuple[torch.Tensor, torch.Tensor]:
-    n = 0
-    sum_x = torch.zeros(input_dim, dtype=torch.float64, device=device)
-    sum_x2 = torch.zeros(input_dim, dtype=torch.float64, device=device)
-    for xb, _ in train_loader:
-        xb = xb.to(device, non_blocking=False)
-        if xb.dim() > 2:
-            xb = xb.view(xb.size(0), -1)
-        xb = xb.double()
-        if xb.size(1) != input_dim:
-            xb = xb[:, :input_dim] if xb.size(1) > input_dim else torch.nn.functional.pad(xb, (0, input_dim - xb.size(1)))
-        bs = xb.size(0)
-        n += bs
-        sum_x += xb.sum(dim=0)
-        sum_x2 += (xb * xb).sum(dim=0)
-    if n <= 0:
-        mean = torch.zeros(input_dim, dtype=torch.float32, device=device)
-        std = torch.ones(input_dim, dtype=torch.float32, device=device)
-        return mean, std
-    mean = sum_x / float(n)
-    var = (sum_x2 / float(n)) - mean * mean
-    var = torch.clamp(var, min=1e-12)
-    std = torch.sqrt(var)
-    return mean.float(), std.float()
+    return model, best_acc
 
 
 class Solution:
     def solve(self, train_loader, val_loader, metadata: dict = None) -> torch.nn.Module:
         if metadata is None:
             metadata = {}
+        device = metadata.get("device", "cpu")
+        input_dim = int(metadata.get("input_dim", 384))
+        num_classes = int(metadata.get("num_classes", 128))
+        param_limit = int(metadata.get("param_limit", 200000))
 
         try:
             torch.set_num_threads(min(8, os.cpu_count() or 8))
         except Exception:
             pass
+        _set_seeds(0)
 
-        device_str = metadata.get("device", "cpu")
-        device = torch.device(device_str)
+        Xtr, ytr = _collect_xy(train_loader)
+        Xva, yva = _collect_xy(val_loader)
 
-        num_classes = int(metadata.get("num_classes", 128))
-        input_dim = int(metadata.get("input_dim", 384))
-        param_limit = int(metadata.get("param_limit", 200000))
+        # Selection normalization on train
+        mean_tr, invstd_tr = _mean_invstd(Xtr)
+        Xtrn = (Xtr - mean_tr) * invstd_tr
+        Xvan = (Xva - mean_tr) * invstd_tr
 
-        # Compute normalization from training data
-        mean, std = _compute_mean_std(train_loader, input_dim=input_dim, device=device)
+        best = {"name": None, "score": -1.0, "params": None}
 
-        # Pick largest hidden_dim satisfying hard param limit (with 2 LayerNorms + 3 Linear)
-        # params = input_dim*h + h*h + h*num_classes + (biases: 2h + num_classes) + (LayerNorm: 4h)
-        # total = input_dim*h + h*h + h*num_classes + (6h + num_classes)
-        def param_estimate(h: int) -> int:
-            return int(input_dim * h + h * h + h * num_classes + (6 * h + num_classes))
+        # Nearest mean
+        W_nm, b_nm = _fit_nearest_mean_from_norm(Xtrn, ytr, num_classes)
+        acc_nm = _acc_from_logits(Xvan @ W_nm + b_nm, yva)
+        best = {"name": "nm", "score": acc_nm, "params": (W_nm, b_nm)} if acc_nm > best["score"] else best
 
-        hidden_dim = 256
-        if param_estimate(hidden_dim) > param_limit:
-            best = None
-            for h in range(512, 31, -8):
-                if param_estimate(h) <= param_limit:
-                    best = h
-                    break
-            hidden_dim = best if best is not None else 64
+        # LDA sweep
+        alphas = [1e-4, 3e-4, 1e-3, 3e-3, 1e-2, 3e-2, 1e-1]
+        for a in alphas:
+            W_lda, b_lda = _fit_lda_from_norm(Xtrn, ytr, num_classes, alpha=float(a))
+            acc_lda = _acc_from_logits(Xvan @ W_lda + b_lda, yva)
+            if acc_lda > best["score"]:
+                best = {"name": "lda", "score": acc_lda, "params": (float(a), W_lda, b_lda)}
 
-        model = _MLPRes(
-            input_dim=input_dim,
-            num_classes=num_classes,
-            hidden_dim=hidden_dim,
-            dropout=0.10,
-            mean=mean.cpu(),
-            std=std.cpu(),
-        ).to(device)
+        # Ridge sweep (with bias)
+        lams = [0.0, 1e-6, 3e-6, 1e-5, 3e-5, 1e-4, 3e-4, 1e-3, 3e-3, 1e-2, 3e-2, 1e-1]
+        for lam in lams:
+            W_r, b_r = _fit_ridge_onehot_from_norm(Xtrn, ytr, num_classes, lam=float(lam), fit_bias=True)
+            acc_r = _acc_from_logits(Xvan @ W_r + b_r, yva)
+            if acc_r > best["score"]:
+                best = {"name": "ridge", "score": acc_r, "params": (float(lam), W_r, b_r)}
 
-        # Hard constraint check
-        if _count_trainable_params(model) > param_limit:
-            # Fallback to smaller hidden
-            for h in range(hidden_dim - 8, 31, -8):
-                model = _MLPRes(
-                    input_dim=input_dim,
-                    num_classes=num_classes,
-                    hidden_dim=h,
-                    dropout=0.10,
-                    mean=mean.cpu(),
-                    std=std.cpu(),
-                ).to(device)
-                if _count_trainable_params(model) <= param_limit:
-                    hidden_dim = h
-                    break
+        # If linear is not strong enough, try ELM (still closed-form output)
+        if best["score"] < 0.80:
+            elm_hidden = 512
+            elm_lams = [1e-4, 3e-4, 1e-3, 3e-3, 1e-2, 3e-2]
+            for lam in elm_lams:
+                W1, b1, BetaW, Betab = _fit_elm_from_norm(Xtrn, ytr, num_classes, hidden_dim=elm_hidden, lam=float(lam), seed=0, fit_bias=True)
+                Hv = F.gelu(Xvan @ W1 + b1)
+                acc_e = _acc_from_logits(Hv @ BetaW + Betab, yva)
+                if acc_e > best["score"]:
+                    best = {"name": "elm", "score": acc_e, "params": (elm_hidden, float(lam), 0, W1, b1, BetaW, Betab)}
 
-        # If still over (shouldn't happen), return a tiny linear model
-        if _count_trainable_params(model) > param_limit:
-            lin = nn.Linear(input_dim, num_classes).to(device)
-            return lin
+        # If still low, train a small MLP
+        mlp_model = None
+        mlp_acc = -1.0
+        if best["score"] < 0.74:
+            mlp_model, mlp_acc = _train_mlp(train_loader, val_loader, input_dim, num_classes, param_limit, device)
+            if mlp_acc > best["score"]:
+                best = {"name": "mlp", "score": mlp_acc, "params": None}
 
-        # Training hyperparams
-        max_epochs = int(metadata.get("max_epochs", 90))
-        patience = int(metadata.get("patience", 12))
-        min_epochs = int(metadata.get("min_epochs", 20))
+        # Refit chosen closed-form model on train+val
+        if best["name"] in ("nm", "lda", "ridge", "elm"):
+            Xall = torch.cat([Xtr, Xva], dim=0)
+            yall = torch.cat([ytr, yva], dim=0)
+            mean_all, invstd_all = _mean_invstd(Xall)
+            Xalln = (Xall - mean_all) * invstd_all
 
-        lr = float(metadata.get("lr", 5e-3))
-        weight_decay = float(metadata.get("weight_decay", 2e-2))
-        label_smoothing = float(metadata.get("label_smoothing", 0.10))
-        noise_std = float(metadata.get("noise_std", 0.01))
+            if best["name"] == "nm":
+                W, b = _fit_nearest_mean_from_norm(Xalln, yall, num_classes)
+                model = FixedLinearClassifier(mean_all, invstd_all, W, b).to(device=device)
+                model.eval()
+                return model
 
-        criterion = nn.CrossEntropyLoss(label_smoothing=label_smoothing)
+            if best["name"] == "lda":
+                alpha = float(best["params"][0])
+                W, b = _fit_lda_from_norm(Xalln, yall, num_classes, alpha=alpha)
+                model = FixedLinearClassifier(mean_all, invstd_all, W, b).to(device=device)
+                model.eval()
+                return model
 
-        optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay, betas=(0.9, 0.99))
+            if best["name"] == "ridge":
+                lam = float(best["params"][0])
+                W, b = _fit_ridge_onehot_from_norm(Xalln, yall, num_classes, lam=lam, fit_bias=True)
+                model = FixedLinearClassifier(mean_all, invstd_all, W, b).to(device=device)
+                model.eval()
+                return model
 
-        steps_per_epoch = None
-        try:
-            steps_per_epoch = len(train_loader)
-        except Exception:
-            steps_per_epoch = None
+            if best["name"] == "elm":
+                hidden_dim, lam, seed = int(best["params"][0]), float(best["params"][1]), int(best["params"][2])
+                W1, b1, BetaW, Betab = _fit_elm_from_norm(Xalln, yall, num_classes, hidden_dim=hidden_dim, lam=lam, seed=seed, fit_bias=True)
+                model = ELMClassifier(mean_all, invstd_all, W1, b1, BetaW, Betab).to(device=device)
+                model.eval()
+                return model
 
-        per_batch_scheduler = False
-        if steps_per_epoch is not None and steps_per_epoch > 0:
-            scheduler = torch.optim.lr_scheduler.OneCycleLR(
-                optimizer,
-                max_lr=lr,
-                epochs=max_epochs,
-                steps_per_epoch=steps_per_epoch,
-                pct_start=0.12,
-                div_factor=15.0,
-                final_div_factor=200.0,
-                anneal_strategy="cos",
-                cycle_momentum=False,
-            )
-            per_batch_scheduler = True
-        else:
-            scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max_epochs, eta_min=lr * 0.05)
+        # MLP fallback (already trained)
+        if mlp_model is not None:
+            if _count_trainable_params(mlp_model) <= param_limit:
+                mlp_model.eval()
+                return mlp_model
+            # If somehow exceeded, fallback to nearest mean refit
+            Xall = torch.cat([Xtr, Xva], dim=0)
+            yall = torch.cat([ytr, yva], dim=0)
+            mean_all, invstd_all = _mean_invstd(Xall)
+            Xalln = (Xall - mean_all) * invstd_all
+            W, b = _fit_nearest_mean_from_norm(Xalln, yall, num_classes)
+            model = FixedLinearClassifier(mean_all, invstd_all, W, b).to(device=device)
+            model.eval()
+            return model
 
-        best_state = copy.deepcopy(model.state_dict())
-        best_acc = -1.0
-        best_epoch = -1
-        bad_epochs = 0
-
-        for epoch in range(max_epochs):
-            model.train()
-            for xb, yb in train_loader:
-                xb = xb.to(device, non_blocking=False)
-                yb = yb.to(device, non_blocking=False)
-
-                if xb.dim() > 2:
-                    xb = xb.view(xb.size(0), -1)
-                xb = xb.float()
-
-                if noise_std > 0.0:
-                    xb = xb + (noise_std * torch.randn_like(xb))
-
-                optimizer.zero_grad(set_to_none=True)
-                logits = model(xb)
-                loss = criterion(logits, yb)
-                loss.backward()
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-                optimizer.step()
-                if per_batch_scheduler:
-                    scheduler.step()
-
-            if not per_batch_scheduler:
-                scheduler.step()
-
-            val_acc = _accuracy(model, val_loader, device=device)
-
-            improved = val_acc > (best_acc + 1e-4)
-            if improved:
-                best_acc = val_acc
-                best_epoch = epoch
-                best_state = copy.deepcopy(model.state_dict())
-                bad_epochs = 0
-            else:
-                bad_epochs += 1
-
-            if epoch + 1 >= min_epochs and bad_epochs >= patience:
-                break
-
-        model.load_state_dict(best_state)
-        model.to("cpu")
+        # Should not happen; fallback to nearest mean on combined
+        Xall = torch.cat([Xtr, Xva], dim=0)
+        yall = torch.cat([ytr, yva], dim=0)
+        mean_all, invstd_all = _mean_invstd(Xall)
+        Xalln = (Xall - mean_all) * invstd_all
+        W, b = _fit_nearest_mean_from_norm(Xalln, yall, num_classes)
+        model = FixedLinearClassifier(mean_all, invstd_all, W, b).to(device=device)
         model.eval()
         return model

@@ -1,87 +1,95 @@
 import torch
 import torch.nn as nn
-from torch.optim.lr_scheduler import ReduceLROnPlateau
+import copy
+
+class ResidualBlock(nn.Module):
+    def __init__(self, dim, drop_prob=0.1):
+        super().__init__()
+        self.fc1 = nn.Linear(dim, dim)
+        self.bn1 = nn.BatchNorm1d(dim)
+        self.fc2 = nn.Linear(dim, dim)
+        self.bn2 = nn.BatchNorm1d(dim)
+        self.relu = nn.ReLU(inplace=True)
+        self.dropout = nn.Dropout(drop_prob)
+
+    def forward(self, x):
+        residual = x
+        out = self.fc1(x)
+        out = self.bn1(out)
+        out = self.relu(out)
+        out = self.dropout(out)
+        out = self.fc2(out)
+        out = self.bn2(out)
+        out += residual
+        out = self.relu(out)
+        return out
+
+class ResMLP(nn.Module):
+    def __init__(self, input_dim, num_classes, hidden_dim=1054, num_blocks=2, drop_prob=0.1):
+        super().__init__()
+        self.proj = nn.Linear(input_dim, hidden_dim)
+        self.bn_proj = nn.BatchNorm1d(hidden_dim)
+        self.relu = nn.ReLU(inplace=True)
+        self.blocks = nn.ModuleList([
+            ResidualBlock(hidden_dim, drop_prob) for _ in range(num_blocks)
+        ])
+        self.head = nn.Linear(hidden_dim, num_classes)
+
+    def forward(self, x):
+        x = self.proj(x)
+        x = self.bn_proj(x)
+        x = self.relu(x)
+        for block in self.blocks:
+            x = block(x)
+        x = self.head(x)
+        return x
 
 class Solution:
     def solve(self, train_loader, val_loader, metadata: dict = None) -> torch.nn.Module:
-        device = metadata["device"]
         input_dim = metadata["input_dim"]
         num_classes = metadata["num_classes"]
-        h = 1024
-
-        model = nn.Sequential(
-            nn.Linear(input_dim, h),
-            nn.BatchNorm1d(h),
-            nn.ReLU(),
-            nn.Linear(h, h),
-            nn.BatchNorm1d(h),
-            nn.ReLU(),
-            nn.Linear(h, h),
-            nn.BatchNorm1d(h),
-            nn.ReLU(),
-            nn.Linear(h, h),
-            nn.BatchNorm1d(h),
-            nn.ReLU(),
-            nn.Linear(h, h),
-            nn.BatchNorm1d(h),
-            nn.ReLU(),
-            nn.Linear(h, num_classes)
-        )
-        model.to(device)
-
+        device = metadata["device"]
+        model = ResMLP(input_dim, num_classes).to(device)
         optimizer = torch.optim.Adam(model.parameters(), lr=0.001, weight_decay=1e-4)
-        scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=10, verbose=False)
         criterion = nn.CrossEntropyLoss()
-
-        best_val_acc = 0.0
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='max', factor=0.5, patience=10)
+        best_val_acc = -1.0
         best_state = None
-        epochs_no_improve = 0
-        num_epochs = 200
-        patience = 20
-
-        for epoch in range(num_epochs):
+        patience_counter = 0
+        patience = 30
+        for epoch in range(1, 501):
             model.train()
-            train_loss = 0.0
+            running_loss = 0.0
+            num_batches = 0
             for inputs, targets in train_loader:
-                inputs = inputs.to(device)
-                targets = targets.to(device)
+                inputs, targets = inputs.to(device), targets.to(device)
                 optimizer.zero_grad()
                 outputs = model(inputs)
                 loss = criterion(outputs, targets)
                 loss.backward()
                 optimizer.step()
-                train_loss += loss.item()
-
+                running_loss += loss.item()
+                num_batches += 1
             model.eval()
-            val_correct = 0
-            val_total = 0
-            val_loss = 0.0
+            correct = 0
+            total = 0
             with torch.no_grad():
                 for inputs, targets in val_loader:
-                    inputs = inputs.to(device)
-                    targets = targets.to(device)
+                    inputs, targets = inputs.to(device), targets.to(device)
                     outputs = model(inputs)
-                    loss = criterion(outputs, targets)
-                    val_loss += loss.item()
-                    preds = outputs.argmax(dim=1)
-                    val_correct += (preds == targets).sum().item()
-                    val_total += targets.size(0)
-            val_acc = val_correct / val_total if val_total > 0 else 0.0
-            avg_val_loss = val_loss / len(val_loader) if len(val_loader) > 0 else 0.0
-
-            scheduler.step(avg_val_loss)
-
+                    pred = outputs.argmax(dim=1)
+                    correct += (pred == targets).sum().item()
+                    total += targets.size(0)
+            val_acc = correct / total if total > 0 else 0.0
+            scheduler.step(val_acc)
             if val_acc > best_val_acc:
                 best_val_acc = val_acc
-                best_state = model.state_dict().copy()
-                epochs_no_improve = 0
+                best_state = copy.deepcopy(model.state_dict())
+                patience_counter = 0
             else:
-                epochs_no_improve += 1
-
-            if epochs_no_improve >= patience:
+                patience_counter += 1
+            if patience_counter >= patience:
                 break
-
         if best_state is not None:
             model.load_state_dict(best_state)
-
         return model

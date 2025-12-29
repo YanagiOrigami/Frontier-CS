@@ -1,16 +1,11 @@
-import os
-
 class Solution:
     def solve(self, src_path: str) -> bytes:
-        """
-        Generate a PoC that triggers the vulnerability.
-        
-        The vulnerability description matches a stack buffer overflow in floating point number parsing
-        (specifically in mruby's mrb_str_to_dbl or similar implementations like in Fluent Bit).
-        The bug occurs when a leading minus sign is present, the parser advances the pointer,
-        checks for "infinity", fails, and then proceeds to copy the number into a stack buffer
-        (likely of size 16 or small size) with an incorrect offset or length calculation.
-        
-        A 16-byte valid float string starting with '-' triggers this.
-        """
-        return b"-0.0000000000001"
+        # The vulnerability is a stack buffer overflow in a number parsing function
+        # (likely mruby's mrb_read_float or similar in cJSON/Fluent Bit).
+        # It is triggered by a leading minus sign followed by a long number that is
+        # not "Infinity". The parser advances the pointer past the minus sign
+        # and then overflows a small stack buffer when copying the digits.
+        # Ground truth length is 16 bytes.
+        # A JSON/Ruby array containing a negative float of sufficient length fits the criteria.
+        # [-1.11111111111] is exactly 16 bytes.
+        return b'[-1.11111111111]'

@@ -2,329 +2,391 @@ import numpy as np
 
 class Solution:
     def __init__(self, **kwargs):
-        self.max_poly_deg = kwargs.get("max_poly_deg", 3)
-        self.max_poly_deg_aniso = kwargs.get("max_poly_deg_aniso", 2)
-        self.max_terms = kwargs.get("max_terms", 14)
-        self.ridge_alpha = kwargs.get("ridge_alpha", 1e-8)
-        self.include_intercept = kwargs.get("include_intercept", True)
-        self.random_state = kwargs.get("random_state", 42)
-
-    def _format_float(self, x):
-        return f"{x:.12g}"
-
-    def _build_monomials(self, X, maxdeg):
-        n = X.shape[0]
-        x1, x2, x3, x4 = X[:, 0], X[:, 1], X[:, 2], X[:, 3]
-        # Precompute powers 0..3
-        def powers(v):
-            return [np.ones_like(v), v, v * v, v * v * v]
-        p1 = powers(x1)
-        p2 = powers(x2)
-        p3 = powers(x3)
-        p4 = powers(x4)
-
-        monomials = []
-        # Iterate exponents e1..e4 with sum <= maxdeg
-        for e1 in range(0, maxdeg + 1):
-            for e2 in range(0, maxdeg + 1 - e1):
-                for e3 in range(0, maxdeg + 1 - e1 - e2):
-                    e4 = 0
-                    while e1 + e2 + e3 + e4 <= maxdeg:
-                        degsum = e1 + e2 + e3 + e4
-                        # compose string
-                        parts = []
-                        if e1 > 0:
-                            if e1 == 1:
-                                parts.append("x1")
-                            else:
-                                parts.append(f"x1**{e1}")
-                        if e2 > 0:
-                            if e2 == 1:
-                                parts.append("x2")
-                            else:
-                                parts.append(f"x2**{e2}")
-                        if e3 > 0:
-                            if e3 == 1:
-                                parts.append("x3")
-                            else:
-                                parts.append(f"x3**{e3}")
-                        if e4 > 0:
-                            if e4 == 1:
-                                parts.append("x4")
-                            else:
-                                parts.append(f"x4**{e4}")
-                        mon_str = " * ".join(parts) if parts else "1"
-
-                        vec = p1[e1] * p2[e2] * p3[e3] * p4[e4]
-                        monomials.append({
-                            "deg": degsum,
-                            "exps": (e1, e2, e3, e4),
-                            "name": mon_str,
-                            "vec": vec.astype(np.float64, copy=False)
-                        })
-                        e4 += 1
-                        if e4 > maxdeg:
-                            break
-        return monomials
-
-    def _build_envelopes(self, X):
-        # Build envelope functions of form exp(-(a1*x1**2 + a2*x2**2 + a3*x3**2 + a4*x4**2))
-        # Include identity envelope "1"
-        n = X.shape[0]
-        x1, x2, x3, x4 = X[:, 0], X[:, 1], X[:, 2], X[:, 3]
-        x1sq = x1 * x1
-        x2sq = x2 * x2
-        x3sq = x3 * x3
-        x4sq = x4 * x4
-
-        # Typical scale to set gamma ranges
-        s2 = float(np.mean(x1sq + x2sq + x3sq + x4sq)) + 1e-12
-
-        iso_scales = np.array([0.2, 0.5, 1.0, 2.0, 5.0], dtype=np.float64) / s2
-        aniso_bases = np.array([0.5, 1.0, 2.0], dtype=np.float64) / s2
-
-        envelopes = []
-        # Identity envelope
-        envelopes.append({
-            "name": "1",
-            "vec": np.ones(n, dtype=np.float64),
-            "type": "none",
-            "gvec": (0.0, 0.0, 0.0, 0.0)
-        })
-
-        # Isotropic
-        for g in iso_scales:
-            # exp(-g*(x1**2 + x2**2 + x3**2 + x4**2))
-            argvec = g * (x1sq + x2sq + x3sq + x4sq)
-            vec = np.exp(-argvec)
-            g1 = self._format_float(g)
-            env_name = f"exp(-({g1}*x1**2 + {g1}*x2**2 + {g1}*x3**2 + {g1}*x4**2))"
-            envelopes.append({
-                "name": env_name,
-                "vec": vec,
-                "type": "iso",
-                "gvec": (g, g, g, g)
-            })
-
-        # Anisotropic: for each base gamma, choose subsets of variables to apply it to
-        # We exclude the empty mask
-        seen_gvecs = set()
-        for gb in aniso_bases:
-            for mask in range(1, 1 << 4):
-                g1 = gb if (mask & 1) else 0.0
-                g2 = gb if (mask & 2) else 0.0
-                g3 = gb if (mask & 4) else 0.0
-                g4 = gb if (mask & 8) else 0.0
-                gvec = (float(g1), float(g2), float(g3), float(g4))
-                if gvec in seen_gvecs:
-                    continue
-                seen_gvecs.add(gvec)
-                argvec = g1 * x1sq + g2 * x2sq + g3 * x3sq + g4 * x4sq
-                vec = np.exp(-argvec)
-                parts = []
-                if g1 != 0.0:
-                    parts.append(f"{self._format_float(g1)}*x1**2")
-                if g2 != 0.0:
-                    parts.append(f"{self._format_float(g2)}*x2**2")
-                if g3 != 0.0:
-                    parts.append(f"{self._format_float(g3)}*x3**2")
-                if g4 != 0.0:
-                    parts.append(f"{self._format_float(g4)}*x4**2")
-                inside = " + ".join(parts) if parts else "0"
-                env_name = f"exp(-({inside}))"
-                envelopes.append({
-                    "name": env_name,
-                    "vec": vec,
-                    "type": "anis",
-                    "gvec": gvec
-                })
-        return envelopes
-
-    def _generate_features(self, X):
-        # Create features as monomials multiplied by envelopes.
-        # - For env "none": monomials up to degree self.max_poly_deg
-        # - For isotropic envelopes: monomials up to degree self.max_poly_deg
-        # - For anisotropic envelopes: monomials up to degree self.max_poly_deg_aniso
-        monomials_deg3 = self._build_monomials(X, self.max_poly_deg)
-        monomials_deg2 = self._build_monomials(X, self.max_poly_deg_aniso)
-        envelopes = self._build_envelopes(X)
-
-        # Map from feature string to column vector (to avoid duplicates)
-        names = []
-        cols = []
-
-        # Utility to add feature
-        def add_feature(monom, env):
-            if env["name"] == "1":
-                fe_name = monom["name"]
-                vec = monom["vec"]
-            elif monom["name"] == "1":
-                fe_name = env["name"]
-                vec = env["vec"]
-            else:
-                fe_name = f"({monom['name']})*({env['name']})"
-                vec = monom["vec"] * env["vec"]
-            # skip non-finite or zero-variance columns
-            if not np.all(np.isfinite(vec)):
-                return
-            if np.max(np.abs(vec)) < 1e-15:
-                return
-            names.append(fe_name)
-            cols.append(vec)
-
-        for env in envelopes:
-            if env["type"] == "none":
-                # pure monomials up to deg3
-                for mon in monomials_deg3:
-                    add_feature(mon, env)
-            elif env["type"] == "iso":
-                for mon in monomials_deg3:
-                    add_feature(mon, env)
-            else:  # anis
-                for mon in monomials_deg2:
-                    add_feature(mon, env)
-
-        # Convert to array
-        if len(cols) == 0:
-            Z = np.zeros((X.shape[0], 1), dtype=np.float64)
-            names = ["1"]
-        else:
-            Z = np.column_stack(cols).astype(np.float64, copy=False)
-        return Z, names
-
-    def _omp_ridge(self, Z, y, names, max_terms, alpha, include_intercept=True):
-        n, m = Z.shape
-        # Normalize columns for selection step
-        col_norms = np.sqrt(np.sum(Z * Z, axis=0)) + 1e-12
-
-        selected = []
-        # Start with intercept if present
-        if include_intercept:
-            # try finding index of constant "1"
-            try:
-                idx_bias = names.index("1")
-            except ValueError:
-                idx_bias = None
-            if idx_bias is not None:
-                selected.append(idx_bias)
-
-        # Initialize
-        if len(selected) > 0:
-            Zs = Z[:, selected]
-            AtA = Zs.T @ Zs
-            if alpha > 0:
-                AtA = AtA + alpha * np.eye(len(selected))
-            Aty = Zs.T @ y
-            try:
-                coefs = np.linalg.solve(AtA, Aty)
-            except np.linalg.LinAlgError:
-                coefs = np.linalg.lstsq(Zs, y, rcond=None)[0]
-            resid = y - Zs @ coefs
-            best_sse = float(np.dot(resid, resid))
-        else:
-            coefs = np.array([])
-            resid = y.copy()
-            best_sse = float(np.dot(resid, resid))
-
-        max_iters = min(max_terms, m)
-        for _ in range(max_iters - len(selected)):
-            # Correlations
-            corr = (Z.T @ resid) / col_norms
-            # Mask out already selected
-            corr[selected] = 0.0
-            j = int(np.argmax(np.abs(corr)))
-            if j in selected:
-                break
-            selected.append(j)
-            # Refit ridge on selected set
-            Zs = Z[:, selected]
-            AtA = Zs.T @ Zs
-            if alpha > 0:
-                AtA = AtA + alpha * np.eye(len(selected))
-            Aty = Zs.T @ y
-            try:
-                coefs = np.linalg.solve(AtA, Aty)
-            except np.linalg.LinAlgError:
-                coefs = np.linalg.lstsq(Zs, y, rcond=None)[0]
-            resid = y - Zs @ coefs
-            sse = float(np.dot(resid, resid))
-            # Early stopping if improvement is tiny
-            if best_sse - sse < 1e-10 * (1.0 + best_sse):
-                best_sse = sse
-                break
-            best_sse = sse
-
-        # Final pruning: drop near-zero coefficients
-        if len(selected) > 0:
-            mask_nz = np.abs(coefs) > 1e-10
-            if not np.all(mask_nz):
-                selected = [j for k, j in enumerate(selected) if mask_nz[k]]
-                if selected:
-                    Zs = Z[:, selected]
-                    AtA = Zs.T @ Zs
-                    if alpha > 0:
-                        AtA = AtA + alpha * np.eye(len(selected))
-                    Aty = Zs.T @ y
-                    try:
-                        coefs = np.linalg.solve(AtA, Aty)
-                    except np.linalg.LinAlgError:
-                        coefs = np.linalg.lstsq(Zs, y, rcond=None)[0]
-                else:
-                    coefs = np.array([])
-                    resid = y.copy()
-        return selected, coefs
-
-    def _compose_expression(self, names, coefs):
-        terms = []
-        for c, name in zip(coefs, names):
-            if abs(c) < 1e-12:
-                continue
-            cstr = self._format_float(c)
-            if name == "1":
-                term = cstr
-            else:
-                term = f"{cstr}*({name})"
-            terms.append(term)
-        if not terms:
-            return "0"
-        # Combine with + and - cleanly
-        expr = terms[0]
-        for t in terms[1:]:
-            if t.startswith("-"):
-                expr += " - " + t[1:]
-            else:
-                expr += " + " + t
-        return expr
+        pass
 
     def solve(self, X: np.ndarray, y: np.ndarray) -> dict:
-        X = np.asarray(X, dtype=np.float64)
-        y = np.asarray(y, dtype=np.float64).ravel()
+        X = np.asarray(X, dtype=float)
+        y = np.asarray(y, dtype=float).reshape(-1)
         n, d = X.shape
         if d != 4:
-            raise ValueError("Expected X to have shape (n, 4).")
-        # Generate features
-        Z, names = self._generate_features(X)
+            raise ValueError("X must have 4 columns for x1, x2, x3, x4.")
+        # Standardization parameters
+        mu = X.mean(axis=0)
+        sigma = X.std(axis=0)
+        sigma = np.where(sigma < 1e-12, 1.0, sigma)
 
-        # Run OMP with ridge refit
-        selected, coefs = self._omp_ridge(
-            Z, y, names, max_terms=self.max_terms, alpha=self.ridge_alpha, include_intercept=self.include_intercept
-        )
+        Z = (X - mu) / sigma
 
-        if len(selected) == 0:
-            # Fallback to simple linear regression on [x1, x2, x3, x4, 1]
-            A = np.column_stack([X, np.ones(X.shape[0])])
-            coeffs, _, _, _ = np.linalg.lstsq(A, y, rcond=None)
-            a, b, c, d, e = coeffs
-            expression = f"{self._format_float(a)}*x1 + {self._format_float(b)}*x2 + {self._format_float(c)}*x3 + {self._format_float(d)}*x4 + {self._format_float(e)}"
-            preds = (A @ coeffs).tolist()
-            return {"expression": expression, "predictions": preds, "details": {}}
+        # Feature builders for Z-space
+        pairs = [(0,1),(0,2),(0,3),(1,2),(1,3),(2,3)]
+        def build_plin_z(Z):
+            n = Z.shape[0]
+            return np.column_stack([np.ones(n), Z])
 
-        # Compose final expression
-        sel_names = [names[j] for j in selected]
-        expression = self._compose_expression(sel_names, coefs)
+        def build_pfull_z(Z):
+            n = Z.shape[0]
+            z1, z2, z3, z4 = Z[:,0], Z[:,1], Z[:,2], Z[:,3]
+            cross = [Z[:,i]*Z[:,j] for (i,j) in pairs]
+            squares = [Z[:,i]**2 for i in range(4)]
+            return np.column_stack([np.ones(n), z1, z2, z3, z4] + cross + squares)
 
-        # Predictions
-        preds = (Z[:, selected] @ coefs).astype(np.float64, copy=False)
+        def build_qm_z(Z):
+            n = Z.shape[0]
+            squares = [Z[:,i]**2 for i in range(4)]
+            cross = [Z[:,i]*Z[:,j] for (i,j) in pairs]
+            return np.column_stack(squares + cross)
+
+        P_lin_z = build_plin_z(Z)      # shape (n,5) -> [1, z1..z4]
+        P_full_z = build_pfull_z(Z)    # shape (n,15) -> [1, z1..z4, z1z2..z3z4, z1^2..z4^2]
+        Qm_z = build_qm_z(Z)           # shape (n,10) -> [z1^2..z4^2, z1z2..z3z4]
+
+        # Baseline least squares for A (linear part)
+        try:
+            a0 = np.linalg.lstsq(P_lin_z, y, rcond=None)[0]
+        except Exception:
+            a0 = np.zeros(P_lin_z.shape[1])
+        base_pred = P_lin_z @ a0
+        base_mse = float(np.mean((base_pred - y)**2))
+
+        # Initialize B and D (exponential components)
+        r0 = y - base_pred
+        try:
+            b0 = np.linalg.lstsq(P_full_z, r0, rcond=None)[0]
+        except Exception:
+            b0 = np.zeros(P_full_z.shape[1])
+        d0 = np.full(Qm_z.shape[1], 0.1)
+
+        # Training: minimize MSE of A + B*exp(-Q)
+        def train_model(P_lin, P_full, Qm, y, restarts=6, steps=800, seed=42):
+            rng = np.random.default_rng(seed)
+            n = y.shape[0]
+            best = {
+                "a": a0.copy(),
+                "b": b0.copy(),
+                "d": d0.copy(),
+                "mse": base_mse
+            }
+            # Hyperparameters
+            beta1, beta2 = 0.9, 0.999
+            eps = 1e-8
+            lam_a = 1e-6
+            lam_b = 1e-6
+            lam_d = 1e-6
+            alpha_neg = 1e-3  # penalty for negative d entries
+            gamma_qneg = 1e-4  # penalty for negative Q(x) across dataset
+            # Learning rates
+            lr_a0 = 0.03
+            lr_b0 = 0.03
+            lr_d0 = 0.01
+
+            for r in range(restarts):
+                a = a0.copy()
+                b = b0.copy()
+                d = d0.copy()
+                # Add small noise to break symmetry
+                a += 0.01 * rng.standard_normal(size=a.shape)
+                b += 0.01 * rng.standard_normal(size=b.shape)
+                d += 0.01 * rng.standard_normal(size=d.shape)
+
+                ma = np.zeros_like(a)
+                va = np.zeros_like(a)
+                mb = np.zeros_like(b)
+                vb = np.zeros_like(b)
+                md = np.zeros_like(d)
+                vd = np.zeros_like(d)
+
+                lr_a, lr_b, lr_d = lr_a0, lr_b0, lr_d0
+
+                best_local_mse = float('inf')
+                no_improve = 0
+                patience = max(200, steps // 3)
+
+                for t in range(1, steps + 1):
+                    # Optional lr decay
+                    if t % 200 == 0:
+                        lr_a *= 0.8
+                        lr_b *= 0.8
+                        lr_d *= 0.8
+
+                    Tq = Qm @ d  # shape (n,)
+                    # Clip to avoid overflow in exp during training
+                    Tq_clipped = np.clip(Tq, -60.0, 60.0)
+                    E = np.exp(-Tq_clipped)  # shape (n,)
+
+                    A = P_lin @ a
+                    B = P_full @ b
+                    f = A + B * E
+                    rvec = f - y
+
+                    mse = float(np.mean(rvec**2))
+
+                    if mse < best_local_mse - 1e-12:
+                        best_local_mse = mse
+                        no_improve = 0
+                    else:
+                        no_improve += 1
+
+                    if mse < best["mse"] - 1e-12:
+                        best["mse"] = mse
+                        best["a"] = a.copy()
+                        best["b"] = b.copy()
+                        best["d"] = d.copy()
+
+                    if no_improve > patience:
+                        break
+
+                    # Gradients
+                    # dL/da
+                    ga = (P_lin.T @ rvec) / n + lam_a * a
+                    # dL/db
+                    gb = (P_full.T @ (rvec * E)) / n + lam_b * b
+                    # dL/dd
+                    # Using un-clipped Tq for penalty only; but gradient w.r.t exp uses clipped E; approximate
+                    gd = - (Qm.T @ (rvec * B * E)) / n + lam_d * d
+
+                    # Penalty: discourage negative d (promote positive)
+                    gd += 2.0 * alpha_neg * np.where(d < 0.0, d, 0.0)
+
+                    # Penalty: discourage negative Q over data (Gaussian-like)
+                    # gradient of mean(min(Tq, 0)^2) wrt d = (2/n) * sum_{s with Tq_s<0} Tq_s * Qm_s
+                    mask_neg = Tq < 0.0
+                    if np.any(mask_neg):
+                        Tneg = Tq[mask_neg]
+                        Qneg = Qm[mask_neg, :]
+                        gd += (2.0 * gamma_qneg / n) * (Qneg.T @ Tneg)
+
+                    # Adam updates
+                    ma = beta1 * ma + (1 - beta1) * ga
+                    va = beta2 * va + (1 - beta2) * (ga * ga)
+                    mb = beta1 * mb + (1 - beta1) * gb
+                    vb = beta2 * vb + (1 - beta2) * (gb * gb)
+                    md = beta1 * md + (1 - beta1) * gd
+                    vd = beta2 * vd + (1 - beta2) * (gd * gd)
+
+                    ma_hat = ma / (1 - beta1**t)
+                    va_hat = va / (1 - beta2**t)
+                    mb_hat = mb / (1 - beta1**t)
+                    vb_hat = vb / (1 - beta2**t)
+                    md_hat = md / (1 - beta1**t)
+                    vd_hat = vd / (1 - beta2**t)
+
+                    a = a - lr_a * ma_hat / (np.sqrt(va_hat) + eps)
+                    b = b - lr_b * mb_hat / (np.sqrt(vb_hat) + eps)
+                    d = d - lr_d * md_hat / (np.sqrt(vd_hat) + eps)
+
+                # End steps
+            # End restarts
+            return best["a"], best["b"], best["d"], best["mse"]
+
+        a_z, b_z, d_z, mse_tr = train_model(P_lin_z, P_full_z, Qm_z, y, restarts=6, steps=900, seed=42)
+
+        # Map trained parameters from z-space to x-space for a compact expression
+        # Basis orders:
+        # For polynomial degree 2 in x:
+        # idx: 0->1, 1->x1, 2->x2, 3->x3, 4->x4, 5->x1x2,6->x1x3,7->x1x4,8->x2x3,9->x2x4,10->x3x4, 11->x1^2,12->x2^2,13->x3^2,14->x4^2
+        def map_Az_to_Ax(a_z, mu, sigma):
+            ax = np.zeros(5, dtype=float)
+            ax[0] += a_z[0]
+            for i in range(4):
+                s = sigma[i]
+                m = mu[i]
+                ai = a_z[1 + i]
+                ax[0] += ai * (-m / s)
+                ax[1 + i] += ai * (1.0 / s)
+            return ax
+
+        # Map B_z (degree 2 in z) to B_x (degree 2 in x)
+        def map_Bz_to_Bx(b_z, mu, sigma):
+            bx = np.zeros(15, dtype=float)
+            # constant term
+            bx[0] += b_z[0]
+            # linear terms
+            for i in range(4):
+                s = sigma[i]; m = mu[i]; coeff = b_z[1 + i]
+                bx[0] += coeff * (-m / s)
+                bx[1 + i] += coeff * (1.0 / s)
+            # cross terms z_i*z_j
+            cross_base = 5
+            for idx, (i, j) in enumerate(pairs):
+                coeff = b_z[cross_base + idx]
+                si, sj = sigma[i], sigma[j]
+                mi, mj = mu[i], mu[j]
+                # constant
+                bx[0] += coeff * (mi * mj / (si * sj))
+                # linear x_i
+                bx[1 + i] += coeff * (-mj / (si * sj))
+                # linear x_j
+                bx[1 + j] += coeff * (-mi / (si * sj))
+                # pair x_i*x_j
+                bx[5 + idx] += coeff * (1.0 / (si * sj))
+            # squares z_i^2
+            sq_base = 11
+            for i in range(4):
+                coeff = b_z[sq_base + i]
+                si = sigma[i]; mi = mu[i]
+                bx[0] += coeff * ((mi**2) / (si**2))
+                bx[1 + i] += coeff * ((-2.0 * mi) / (si**2))
+                bx[11 + i] += coeff * (1.0 / (si**2))
+            return bx
+
+        # Map d_z (Q in z) to q_x (Q in x) with basis [1, x1..x4, x1x2.., x1^2..]
+        def map_dz_to_qx(d_z, mu, sigma):
+            qx = np.zeros(15, dtype=float)
+            # squares z_i^2 (indices 0..3)
+            for i in range(4):
+                coeff = d_z[i]
+                si = sigma[i]; mi = mu[i]
+                qx[0] += coeff * ((mi**2) / (si**2))
+                qx[1 + i] += coeff * ((-2.0 * mi) / (si**2))
+                qx[11 + i] += coeff * (1.0 / (si**2))
+            # cross z_i*z_j (indices 4..9)
+            for idx, (i, j) in enumerate(pairs):
+                coeff = d_z[4 + idx]
+                si, sj = sigma[i], sigma[j]
+                mi, mj = mu[i], mu[j]
+                qx[0] += coeff * (mi * mj / (si * sj))
+                qx[1 + i] += coeff * (-mj / (si * sj))
+                qx[1 + j] += coeff * (-mi / (si * sj))
+                qx[5 + idx] += coeff * (1.0 / (si * sj))
+            return qx
+
+        a_x = map_Az_to_Ax(a_z, mu, sigma)
+        b_x = map_Bz_to_Bx(b_z, mu, sigma)
+        q_x = map_dz_to_qx(d_z, mu, sigma)
+
+        # Build predictions using x-space compact representation
+        x1, x2, x3, x4 = X[:,0], X[:,1], X[:,2], X[:,3]
+
+        # P_lin_x: [1, x1, x2, x3, x4]
+        P_lin_x = np.column_stack([np.ones(n), x1, x2, x3, x4])
+
+        # P_full_x: [1, x1..x4, x1x2..x3x4, x1^2..x4^2]
+        cross_x = [x1*x2, x1*x3, x1*x4, x2*x3, x2*x4, x3*x4]
+        squares_x = [x1**2, x2**2, x3**2, x4**2]
+        P_full_x = np.column_stack([np.ones(n), x1, x2, x3, x4] + cross_x + squares_x)
+
+        # Q_x features: [1, x1, x2, x3, x4, pairs(6), squares(4)]
+        Qx = np.column_stack([np.ones(n), x1, x2, x3, x4] + cross_x + squares_x)
+        Tq = Qx @ q_x
+        # Clip extreme to avoid overflow in returned predictions (expression may overflow on evaluation engine, but predictions are just for convenience)
+        Tq_clip = np.clip(Tq, -700.0, 700.0)
+        E = np.exp(-Tq_clip)
+        preds = (P_lin_x @ a_x) + (P_full_x @ b_x) * E
+
+        # If model failed to improve over baseline, fallback to polynomial degree 2 only (no exp)
+        if float(np.mean((preds - y)**2)) >= base_mse * 0.999:
+            # Fit full quadratic polynomial in x directly
+            try:
+                # Build X_poly as P_full_x (degree 2) for y
+                coef_poly, *_ = np.linalg.lstsq(P_full_x, y, rcond=None)
+            except Exception:
+                coef_poly = np.zeros(15, dtype=float)
+                coef_poly[0] = np.mean(y)
+            # Expression builder for polynomial only
+            def poly_full_str(coefs):
+                terms = []
+                thr = 1e-12 * (1.0 + float(np.max(np.abs(coefs))))
+                c0 = coefs[0]
+                if abs(c0) > thr:
+                    terms.append(f"({c0:.12g})")
+                names = ["x1","x2","x3","x4"]
+                for i in range(4):
+                    ci = coefs[1+i]
+                    if abs(ci) > thr:
+                        terms.append(f"({ci:.12g})*{names[i]}")
+                pair_names = [("x1","x2"),("x1","x3"),("x1","x4"),("x2","x3"),("x2","x4"),("x3","x4")]
+                for idx, (u, v) in enumerate(pair_names):
+                    ci = coefs[5+idx]
+                    if abs(ci) > thr:
+                        terms.append(f"({ci:.12g})*{u}*{v}")
+                for i in range(4):
+                    ci = coefs[11+i]
+                    if abs(ci) > thr:
+                        terms.append(f"({ci:.12g})*{names[i]}**2")
+                if not terms:
+                    return "0"
+                return " + ".join(terms)
+            expression = poly_full_str(coef_poly)
+            predictions = (P_full_x @ coef_poly).tolist()
+            return {
+                "expression": expression,
+                "predictions": predictions,
+                "details": {}
+            }
+
+        # Build final expression string using x-space coefficients
+        def poly_lin_str(ax):
+            terms = []
+            thr = 1e-12 * (1.0 + float(np.max(np.abs(ax))))
+            c0 = ax[0]
+            if abs(c0) > thr:
+                terms.append(f"({c0:.12g})")
+            names = ["x1","x2","x3","x4"]
+            for i in range(4):
+                ci = ax[1+i]
+                if abs(ci) > thr:
+                    terms.append(f"({ci:.12g})*{names[i]}")
+            if not terms:
+                return "0"
+            return " + ".join(terms)
+
+        def poly_full_str(bx):
+            terms = []
+            thr = 1e-12 * (1.0 + float(np.max(np.abs(bx))))
+            c0 = bx[0]
+            if abs(c0) > thr:
+                terms.append(f"({c0:.12g})")
+            names = ["x1","x2","x3","x4"]
+            for i in range(4):
+                ci = bx[1+i]
+                if abs(ci) > thr:
+                    terms.append(f"({ci:.12g})*{names[i]}")
+            pair_names = [("x1","x2"),("x1","x3"),("x1","x4"),("x2","x3"),("x2","x4"),("x3","x4")]
+            for idx, (u, v) in enumerate(pair_names):
+                ci = bx[5+idx]
+                if abs(ci) > thr:
+                    terms.append(f"({ci:.12g})*{u}*{v}")
+            for i in range(4):
+                ci = bx[11+i]
+                if abs(ci) > thr:
+                    terms.append(f"({ci:.12g})*{names[i]}**2")
+            if not terms:
+                return "0"
+            return " + ".join(terms)
+
+        def q_str(qx):
+            # qx basis: [1, x1, x2, x3, x4, pairs(6), squares(4)]
+            terms = []
+            thr = 1e-12 * (1.0 + float(np.max(np.abs(qx))))
+            c0 = qx[0]
+            if abs(c0) > thr:
+                terms.append(f"({c0:.12g})")
+            names = ["x1","x2","x3","x4"]
+            for i in range(4):
+                ci = qx[1+i]
+                if abs(ci) > thr:
+                    terms.append(f"({ci:.12g})*{names[i]}")
+            pair_names = [("x1","x2"),("x1","x3"),("x1","x4"),("x2","x3"),("x2","x4"),("x3","x4")]
+            for idx, (u, v) in enumerate(pair_names):
+                ci = qx[5+idx]
+                if abs(ci) > thr:
+                    terms.append(f"({ci:.12g})*{u}*{v}")
+            for i in range(4):
+                ci = qx[11+i]
+                if abs(ci) > thr:
+                    terms.append(f"({ci:.12g})*{names[i]}**2")
+            if not terms:
+                return "0"
+            return " + ".join(terms)
+
+        A_str = poly_lin_str(a_x)
+        B_str = poly_full_str(b_x)
+        Q_str = q_str(q_x)
+
+        if B_str.strip() == "0":
+            expression = A_str
+        else:
+            expression = f"({A_str}) + ({B_str})*exp(-({Q_str}))"
 
         return {
             "expression": expression,

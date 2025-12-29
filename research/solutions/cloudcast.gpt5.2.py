@@ -1,25 +1,98 @@
 import json
 import os
-from typing import Dict, List, Tuple, Set, Optional
+from typing import Dict, Any
 
-ALGO_TEMPLATE = r'''
-import math
+
+class Solution:
+    def solve(self, spec_path: str = None) -> dict:
+        num_vms = 2
+        assumed_data_vol = 300.0
+        ingress_limit = {"aws": 10.0, "gcp": 16.0, "azure": 16.0}
+        egress_limit = {"aws": 5.0, "gcp": 7.0, "azure": 16.0}
+
+        if spec_path:
+            try:
+                with open(spec_path, "r", encoding="utf-8") as f:
+                    spec = json.load(f)
+                if isinstance(spec, dict) and "num_vms" in spec:
+                    try:
+                        num_vms = int(spec["num_vms"])
+                    except Exception:
+                        pass
+
+                cfg_files = spec.get("config_files", []) if isinstance(spec, dict) else []
+                base_dir = os.path.dirname(os.path.abspath(spec_path))
+                data_vols = []
+                ingress_candidates = []
+                egress_candidates = []
+
+                for cf in cfg_files:
+                    try:
+                        cfg_path = cf
+                        if not os.path.isabs(cfg_path):
+                            cfg_path = os.path.join(base_dir, cfg_path)
+                        with open(cfg_path, "r", encoding="utf-8") as f:
+                            cfg = json.load(f)
+                        if isinstance(cfg, dict):
+                            dv = cfg.get("data_vol", None)
+                            if dv is not None:
+                                try:
+                                    data_vols.append(float(dv))
+                                except Exception:
+                                    pass
+                            il = cfg.get("ingress_limit", None)
+                            el = cfg.get("egress_limit", None)
+                            if isinstance(il, dict):
+                                ingress_candidates.append(il)
+                            if isinstance(el, dict):
+                                egress_candidates.append(el)
+                    except Exception:
+                        continue
+
+                if data_vols:
+                    data_vols_sorted = sorted(data_vols)
+                    assumed_data_vol = float(data_vols_sorted[len(data_vols_sorted) // 2])
+
+                if ingress_candidates:
+                    # Use first; typically consistent
+                    il0 = ingress_candidates[0]
+                    for k in ingress_limit:
+                        if k in il0:
+                            try:
+                                ingress_limit[k] = float(il0[k])
+                            except Exception:
+                                pass
+
+                if egress_candidates:
+                    el0 = egress_candidates[0]
+                    for k in egress_limit:
+                        if k in el0:
+                            try:
+                                egress_limit[k] = float(el0[k])
+                            except Exception:
+                                pass
+            except Exception:
+                pass
+
+        code = f'''import math
+import heapq
+from collections import defaultdict
+from typing import Dict, List, Tuple, Optional
 import networkx as nx
 
-NUM_VMS = __NUM_VMS__
-INGRESS_LIMIT = __INGRESS_LIMIT__
-EGRESS_LIMIT = __EGRESS_LIMIT__
+NUM_VMS = {int(num_vms)}
+ASSUMED_DATA_VOL = {float(assumed_data_vol)}
+INGRESS_LIMIT = {json.dumps({k: float(v) for k, v in ingress_limit.items()})}
+EGRESS_LIMIT = {json.dumps({k: float(v) for k, v in egress_limit.items()})}
 
-_INSTANCE_RATE_PER_HOUR = 0.54
-_INST_COEFF = (NUM_VMS * _INSTANCE_RATE_PER_HOUR / 3600.0) * 8.0  # $/(GB) multiplier for (|V| * max(|P_e|/f_e))
-
+INSTANCE_HOURLY_RATE = 0.54
 
 class BroadCastTopology:
-    def __init__(self, src: str, dsts: list, num_partitions: int):
+    def __init__(self, src: str, dsts: List[str], num_partitions: int):
         self.src = src
         self.dsts = dsts
         self.num_partitions = int(num_partitions)
-        self.paths = {dst: {str(i): None for i in range(self.num_partitions)} for dst in dsts}
+        self.paths = {{dst: {{str(i): None for i in range(self.num_partitions)}} for dst in dsts}}
 
     def append_dst_partition_path(self, dst: str, partition: int, path: list):
         partition = str(partition)
@@ -27,7 +100,7 @@ class BroadCastTopology:
             self.paths[dst][partition] = []
         self.paths[dst][partition].append(path)
 
-    def set_dst_partition_paths(self, dst: str, partition: int, paths: list):
+    def set_dst_partition_paths(self, dst: str, partition: int, paths: List[list]):
         partition = str(partition)
         self.paths[dst][partition] = paths
 
@@ -37,506 +110,430 @@ class BroadCastTopology:
 
 def _provider(node: str) -> str:
     if not node:
-        return ""
+        return "aws"
     i = node.find(":")
     if i <= 0:
         return node.lower()
     return node[:i].lower()
 
 
-def _get_lim(d: dict, k: str, default: float) -> float:
-    try:
-        v = d.get(k, default)
-        v = float(v)
-        if v > 0:
-            return v
-    except Exception:
-        pass
-    return float(default)
+def _build_adjacency(G: nx.DiGraph):
+    adj = {{}}
+    radj = {{}}
+    nodes = list(G.nodes)
+    for u in nodes:
+        adj[u] = []
+        radj[u] = []
+    for u, nbrs in G.adj.items():
+        au = adj.get(u)
+        if au is None:
+            au = []
+            adj[u] = au
+        for v, ed in nbrs.items():
+            if v == u:
+                continue
+            try:
+                cost = float(ed.get("cost", 0.0))
+            except Exception:
+                cost = 0.0
+            try:
+                thr = float(ed.get("throughput", 1.0))
+            except Exception:
+                thr = 1.0
+            if thr <= 0:
+                thr = 1e-9
+            au.append((v, cost, thr))
+            rv = radj.get(v)
+            if rv is None:
+                rv = []
+                radj[v] = rv
+            rv.append((u, cost, thr))
+    return adj, radj
 
 
-def _tree_build_arborescence(src: str, dsts: list, G: nx.DiGraph, weight_attr: str) -> Tuple[dict, Set[Tuple[str, str]], Set[str], float]:
-    tree_nodes = set([src])
-    parent = {}
-    edges = set()
+def _dijkstra(adj, src: str, weight_mode: str, theta: float):
+    # weight_mode: "cost" or "hybrid"
+    dist = {{}}
+    parent = {{}}
+    h = [(0.0, src)]
+    dist[src] = 0.0
+    parent[src] = None
+    eps = 1e-12
+    while h:
+        d, u = heapq.heappop(h)
+        if d != dist.get(u, None):
+            continue
+        for v, cost, thr in adj.get(u, ()):
+            if weight_mode == "cost":
+                w = cost
+            else:
+                w = cost + theta / (thr + eps)
+            nd = d + w
+            od = dist.get(v)
+            if od is None or nd < od:
+                dist[v] = nd
+                parent[v] = u
+                heapq.heappush(h, (nd, v))
+    return dist, parent
 
-    remaining = set(dsts)
-    if src in remaining:
-        remaining.remove(src)
-    remaining = {d for d in remaining if d not in tree_nodes}
 
-    while remaining:
+def _reconstruct_path_nodes(parent: Dict[str, Optional[str]], src: str, dst: str) -> Optional[List[str]]:
+    if src == dst:
+        return [src]
+    if dst not in parent:
+        return None
+    path = []
+    cur = dst
+    seen = set()
+    while cur != src:
+        if cur is None or cur in seen:
+            return None
+        seen.add(cur)
+        path.append(cur)
+        cur = parent.get(cur)
+        if cur is None:
+            return None
+    path.append(src)
+    path.reverse()
+    return path
+
+
+def _nodes_to_edges(G: nx.DiGraph, nodes: List[str]) -> List[list]:
+    if not nodes or len(nodes) == 1:
+        return []
+    edges = []
+    for i in range(len(nodes) - 1):
+        u = nodes[i]
+        v = nodes[i + 1]
+        if u == v:
+            continue
+        ed = G[u][v]
+        edges.append([u, v, ed])
+    return edges
+
+
+def _edgeset_from_nodes(nodes: List[str]) -> List[Tuple[str, str]]:
+    if not nodes or len(nodes) < 2:
+        return []
+    res = []
+    for i in range(len(nodes) - 1):
+        u = nodes[i]
+        v = nodes[i + 1]
+        if u != v:
+            res.append((u, v))
+    return res
+
+
+def _approx_objective(G: nx.DiGraph,
+                      hub_counts: Dict[str, int],
+                      tree_edges_by_hub: Dict[str, List[Tuple[str, str]]],
+                      s_partition: float) -> float:
+    edge_counts = defaultdict(int)
+    used_edges = set()
+    for h, m in hub_counts.items():
+        if m <= 0:
+            continue
+        for e in tree_edges_by_hub[h]:
+            edge_counts[e] += m
+            used_edges.add(e)
+
+    if not used_edges:
+        return float("inf")
+
+    out_deg = defaultdict(int)
+    in_deg = defaultdict(int)
+    used_nodes = set()
+    for u, v in used_edges:
+        out_deg[u] += 1
+        in_deg[v] += 1
+        used_nodes.add(u)
+        used_nodes.add(v)
+
+    # Compute transfer time surrogate: max over edges of (|P_e| / f_e)
+    t = 0.0
+    egress_cost = 0.0
+    for (u, v), cnt in edge_counts.items():
+        if cnt <= 0:
+            continue
         try:
-            dist, paths = nx.multi_source_dijkstra(G, tree_nodes, weight=weight_attr)
+            ed = G[u][v]
         except Exception:
-            dist = {}
-            paths = {}
-
-        best_dst = None
-        best_dist = float("inf")
-        for d in remaining:
-            dd = dist.get(d, None)
-            if dd is not None and dd < best_dist:
-                best_dist = dd
-                best_dst = d
-
-        if best_dst is None:
-            break
-
-        path_nodes = paths.get(best_dst)
-        if not path_nodes or len(path_nodes) < 2:
-            remaining.remove(best_dst)
-            continue
-
-        last_in_tree_idx = 0
-        for i, n in enumerate(path_nodes):
-            if n in tree_nodes:
-                last_in_tree_idx = i
-        sub = path_nodes[last_in_tree_idx:]
-
-        # Add only new nodes in a parent-tree manner
-        a = sub[0]
-        for b in sub[1:]:
-            if b in tree_nodes:
-                a = b
-                continue
-            if a == b:
-                a = b
-                continue
-            if not G.has_edge(a, b):
-                a = b
-                continue
-            parent[b] = a
-            edges.add((a, b))
-            tree_nodes.add(b)
-            a = b
-
-        # Some other destinations might have been added as intermediate nodes
-        remaining = {d for d in remaining if d not in tree_nodes}
-
-    # Fallback: connect any remaining destination directly from src using Dijkstra
-    for d in list(remaining):
-        if d == src:
-            remaining.discard(d)
-            continue
-        if d in tree_nodes:
-            remaining.discard(d)
             continue
         try:
-            pn = nx.dijkstra_path(G, src, d, weight=weight_attr)
+            c = float(ed.get("cost", 0.0))
         except Exception:
-            pn = None
-        if not pn or len(pn) < 2:
-            continue
-        last_in_tree_idx = 0
-        for i, n in enumerate(pn):
-            if n in tree_nodes:
-                last_in_tree_idx = i
-        sub = pn[last_in_tree_idx:]
-        a = sub[0]
-        for b in sub[1:]:
-            if b in tree_nodes:
-                a = b
-                continue
-            if a == b:
-                a = b
-                continue
-            if not G.has_edge(a, b):
-                a = b
-                continue
-            parent[b] = a
-            edges.add((a, b))
-            tree_nodes.add(b)
-            a = b
-
-    nodes = set(tree_nodes)
-    cost_sum = 0.0
-    for u, v in edges:
+            c = 0.0
         try:
-            cost_sum += float(G[u][v].get("cost", 0.0))
+            thr = float(ed.get("throughput", 1.0))
         except Exception:
-            pass
-    return parent, edges, nodes, cost_sum
+            thr = 1.0
+        if thr <= 0:
+            thr = 1e-9
+
+        pu = _provider(u)
+        pv = _provider(v)
+        el = float(EGRESS_LIMIT.get(pu, 8.0)) * float(NUM_VMS)
+        il = float(INGRESS_LIMIT.get(pv, 16.0)) * float(NUM_VMS)
+
+        od = out_deg.get(u, 1)
+        idg = in_deg.get(v, 1)
+        share_out = el / od if od > 0 else el
+        share_in = il / idg if idg > 0 else il
+
+        eff = min(thr, share_out, share_in)
+        if eff <= 0:
+            eff = 1e-9
+
+        te = cnt / eff
+        if te > t:
+            t = te
+        egress_cost += cnt * c
+
+    # Convert surrogate into dollar estimate
+    # Egress: sum(|P_e| * s_partition * c_e)
+    # Instance: |V| * NUM_VMS * (r/3600) * t_seconds; t_seconds = t * s_partition * 8
+    nodes_count = len(used_nodes)
+    instance_coef = float(NUM_VMS) * float(INSTANCE_HOURLY_RATE) / 3600.0
+    t_seconds = t * s_partition * 8.0
+    inst_cost = nodes_count * instance_coef * t_seconds
+    eg_cost = egress_cost * s_partition
+    return eg_cost + inst_cost
 
 
-def _compute_degrees(edges: Set[Tuple[str, str]]) -> Tuple[dict, dict]:
-    outdeg = {}
-    indeg = {}
-    for u, v in edges:
-        outdeg[u] = outdeg.get(u, 0) + 1
-        indeg[v] = indeg.get(v, 0) + 1
-    return outdeg, indeg
-
-
-def _effective_throughput(u: str, v: str, edata: dict, outdeg: dict, indeg: dict) -> float:
-    try:
-        tp = float(edata.get("throughput", 0.0))
-    except Exception:
-        tp = 0.0
-    if tp <= 0:
-        tp = 1e-9
-
-    pu = _provider(u)
-    pv = _provider(v)
-    out_d = outdeg.get(u, 0)
-    in_d = indeg.get(v, 0)
-
-    out_share = float("inf")
-    in_share = float("inf")
-
-    if out_d > 0:
-        out_lim = _get_lim(EGRESS_LIMIT, pu, 1e9) * float(NUM_VMS)
-        out_share = out_lim / float(out_d)
-    if in_d > 0:
-        in_lim = _get_lim(INGRESS_LIMIT, pv, 1e9) * float(NUM_VMS)
-        in_share = in_lim / float(in_d)
-
-    f = tp
-    if out_share < f:
-        f = out_share
-    if in_share < f:
-        f = in_share
-    if f <= 0:
-        return 1e-9
-    return f
-
-
-def _max_ratio(edges: Set[Tuple[str, str]], G: nx.DiGraph, loads: dict, outdeg: dict, indeg: dict) -> float:
-    mr = 0.0
-    for (u, v) in edges:
-        l = loads.get((u, v), 0)
-        if l <= 0:
-            continue
-        edata = G[u][v]
-        f = _effective_throughput(u, v, edata, outdeg, indeg)
-        r = float(l) / float(f)
-        if r > mr:
-            mr = r
-    return mr
-
-
-def _node_count_from_edges(edges: Set[Tuple[str, str]], src: str) -> int:
-    nodes = set([src])
-    for u, v in edges:
-        nodes.add(u)
-        nodes.add(v)
-    return len(nodes)
-
-
-def _build_paths_from_parent(src: str, dsts: list, parent: dict) -> dict:
-    paths = {}
-    for dst in dsts:
-        if dst == src:
-            paths[dst] = []
-            continue
-        cur = dst
-        rev = []
-        seen = set()
-        ok = True
-        while cur != src:
-            if cur in seen:
-                ok = False
-                break
-            seen.add(cur)
-            p = parent.get(cur)
-            if p is None:
-                ok = False
-                break
-            rev.append((p, cur))
-            cur = p
-        if not ok:
-            paths[dst] = None
-        else:
-            rev.reverse()
-            paths[dst] = rev
-    return paths
-
-
-def _prepare_base_weights(G: nx.DiGraph) -> Tuple[float, float]:
-    total_c = 0.0
-    cnt_c = 0
-    total_t = 0.0
-    cnt_t = 0
-    for _, _, d in G.edges(data=True):
-        try:
-            c = float(d.get("cost", 0.0))
-            if c >= 0:
-                total_c += c
-                cnt_c += 1
-        except Exception:
-            pass
-        try:
-            t = float(d.get("throughput", 0.0))
-            if t > 0:
-                total_t += t
-                cnt_t += 1
-        except Exception:
-            pass
-    avg_c = total_c / cnt_c if cnt_c else 0.05
-    avg_t = total_t / cnt_t if cnt_t else 10.0
-    if avg_c <= 0:
-        avg_c = 0.05
-    if avg_t <= 0:
-        avg_t = 10.0
-    return avg_c, avg_t
-
-
-def search_algorithm(src: str, dsts: list, G: nx.DiGraph, num_partitions: int) -> BroadCastTopology:
+def search_algorithm(src: str, dsts: List[str], G: nx.DiGraph, num_partitions: int) -> BroadCastTopology:
     num_partitions = int(num_partitions)
     bc = BroadCastTopology(src, dsts, num_partitions)
 
     if num_partitions <= 0:
         return bc
-
-    # Precompute base weights
-    avg_cost, avg_tp = _prepare_base_weights(G)
-
-    # Base: cost-only
-    for u, v, d in G.edges(data=True):
-        try:
-            d["w0"] = float(d.get("cost", 0.0))
-        except Exception:
-            d["w0"] = 0.0
-
-    parent0, edges0, nodes0, cost0 = _tree_build_arborescence(src, dsts, G, "w0")
-    paths0 = _build_paths_from_parent(src, dsts, parent0)
-
-    # If base tree failed for any destination, fall back to per-destination shortest path (cost)
-    if any(paths0.get(d) is None for d in dsts):
+    if not dsts:
+        return bc
+    if src not in G:
+        # Fallback: keep None paths (evaluator likely fails), but try to set empty
         for dst in dsts:
-            if dst == src:
-                paths0[dst] = []
-                continue
-            try:
-                pn = nx.dijkstra_path(G, src, dst, weight="w0")
-            except Exception:
-                pn = None
-            if not pn or len(pn) < 2:
-                paths0[dst] = []
-                continue
-            pe = []
-            for i in range(len(pn) - 1):
-                pe.append((pn[i], pn[i + 1]))
-                edges0.add((pn[i], pn[i + 1]))
-                nodes0.add(pn[i])
-                nodes0.add(pn[i + 1])
-            paths0[dst] = pe
-        cost0 = 0.0
-        for u, v in edges0:
-            try:
-                cost0 += float(G[u][v].get("cost", 0.0))
-            except Exception:
-                pass
-
-    # Identify bottlenecks in the base tree using an approximate effective throughput
-    out0, in0 = _compute_degrees(edges0)
-    ratios0 = []
-    for (u, v) in edges0:
-        edata = G[u][v]
-        f = _effective_throughput(u, v, edata, out0, in0)
-        ratios0.append(((float(num_partitions) / float(f)), (u, v)))
-    ratios0.sort(reverse=True, key=lambda x: x[0])
-    top_m = min(max(1, len(ratios0) // 4), 12)
-    bottlenecks = set([e for _, e in ratios0[:top_m]])
-
-    # Alternative: bias away from bottlenecks and mildly toward high throughput
-    eps = 1e-9
-    lam = avg_cost * avg_tp * 0.25
-    if lam < avg_cost * 0.02:
-        lam = avg_cost * 0.02
-    if lam > 0.3:
-        lam = 0.3
-    penalty_bn = max(0.02, avg_cost * 2.0)
-
-    for u, v, d in G.edges(data=True):
-        try:
-            c = float(d.get("cost", 0.0))
-        except Exception:
-            c = 0.0
-        try:
-            t = float(d.get("throughput", 0.0))
-        except Exception:
-            t = 0.0
-        if t <= 0:
-            t = 1e-9
-        w = c + (lam / (t + eps))
-        if (u, v) in bottlenecks:
-            w += penalty_bn
-        d["w1"] = w
-
-    parent1, edges1, nodes1, cost1 = _tree_build_arborescence(src, dsts, G, "w1")
-    paths1 = _build_paths_from_parent(src, dsts, parent1)
-
-    # If alternative tree is invalid, disable it
-    if any(paths1.get(d) is None for d in dsts):
-        edges1 = set()
-        nodes1 = set([src])
-        cost1 = float("inf")
-        paths1 = {d: None for d in dsts}
-
-    # If tree1 isn't usable or is identical, just use tree0 for all partitions
-    if not edges1 or edges1 == edges0 or not math.isfinite(cost1):
-        for dst in dsts:
-            pe = paths0.get(dst) or []
-            out = []
-            for (u, v) in pe:
-                out.append([u, v, G[u][v]])
             for p in range(num_partitions):
-                bc.set_dst_partition_paths(dst, p, out)
+                bc.set_dst_partition_paths(dst, p, [])
         return bc
 
-    # Evaluate splitting partitions between the two trees
-    best_x = 0
+    adj, radj = _build_adjacency(G)
+
+    # Assumed partition size (GB) for objective calibration
+    s_partition = float(ASSUMED_DATA_VOL) / float(num_partitions) if num_partitions > 0 else float(ASSUMED_DATA_VOL)
+
+    # Hybrid weight parameter: scale throughput importance with partition size
+    # (Large partition => more sensitive to throughput)
+    theta = 0.05 * max(0.25, min(4.0, (s_partition / 30.0)))
+
+    # Dijkstra from source once (hybrid)
+    dist_src, par_src = _dijkstra(adj, src, "hybrid", theta)
+
+    # Select candidate hubs using reverse distances (cost-only) from a subset of destinations
+    dst_sample = list(dsts)
+    if len(dst_sample) > 15:
+        step = max(1, len(dst_sample) // 15)
+        dst_sample = dst_sample[::step][:15]
+
+    sum_cost_to_dsts = defaultdict(float)
+    reach_count = defaultdict(int)
+
+    for d in dst_sample:
+        if d not in G:
+            continue
+        dist_rev, _ = _dijkstra(radj, d, "cost", theta=0.0)  # distances to d in original graph
+        for n, dd in dist_rev.items():
+            sum_cost_to_dsts[n] += dd
+            reach_count[n] += 1
+
+    nodes = list(G.nodes)
+    hub_candidates = []
+    for n in nodes:
+        if n not in dist_src:
+            continue
+        rc = reach_count.get(n, 0)
+        if rc <= 0:
+            continue
+        # Require reachability to most sampled destinations
+        if rc < max(1, int(0.6 * len(dst_sample))):
+            continue
+        pu = _provider(n)
+        cap = float(EGRESS_LIMIT.get(pu, 8.0)) * float(NUM_VMS)
+        # lower is better
+        sc = (sum_cost_to_dsts.get(n, 0.0) / max(1, rc)) / max(0.5, cap)
+        hub_candidates.append((sc, n))
+
+    hub_candidates.sort(key=lambda x: x[0])
+
+    # Keep small set
+    hubs = []
+    hubs.append(src)
+    seen = {src}
+    max_hubs = 8
+    for _, n in hub_candidates:
+        if n in seen:
+            continue
+        hubs.append(n)
+        seen.add(n)
+        if len(hubs) >= max_hubs:
+            break
+
+    # Always include a few destinations as possible hubs (sometimes good in sparse graphs)
+    for d in dsts[: min(3, len(dsts))]:
+        if d in G and d not in seen and d in dist_src:
+            hubs.append(d)
+            seen.add(d)
+        if len(hubs) >= max_hubs:
+            break
+
+    # Precompute per-hub: per-dst full path edges and hub tree edge set
+    paths_by_hub_dst_edges: Dict[str, Dict[str, List[list]]] = {}
+    tree_edges_by_hub: Dict[str, List[Tuple[str, str]]] = {}
+
+    # Build src->hub node paths once using par_src
+    src_to_hub_nodes: Dict[str, Optional[List[str]]] = {}
+    for h in hubs:
+        pn = _reconstruct_path_nodes(par_src, src, h)
+        src_to_hub_nodes[h] = pn
+
+    # Precompute hub->* dijkstra (hybrid) per hub
+    for h in list(hubs):
+        if h not in G:
+            continue
+        pn_src_h = src_to_hub_nodes.get(h)
+        if pn_src_h is None:
+            # unreachable hub from src
+            continue
+
+        dist_h, par_h = _dijkstra(adj, h, "hybrid", theta)
+        per_dst_edges = {}
+        tree_edges = set()
+
+        # src->hub edges
+        for e in _edgeset_from_nodes(pn_src_h):
+            tree_edges.add(e)
+
+        ok = True
+        for d in dsts:
+            if d not in G:
+                ok = False
+                break
+            pn_h_d = _reconstruct_path_nodes(par_h, h, d)
+            if pn_h_d is None:
+                ok = False
+                break
+
+            # concatenate nodes: src->hub then hub->dst (skip duplicated hub)
+            if len(pn_src_h) == 0:
+                full_nodes = pn_h_d
+            else:
+                if pn_src_h[-1] == pn_h_d[0]:
+                    full_nodes = pn_src_h + pn_h_d[1:]
+                else:
+                    full_nodes = pn_src_h + pn_h_d
+
+            if not full_nodes or full_nodes[0] != src or full_nodes[-1] != d:
+                ok = False
+                break
+
+            # edges for bc
+            edge_list = _nodes_to_edges(G, full_nodes)
+            per_dst_edges[d] = edge_list
+
+            # edgeset for objective
+            for e in _edgeset_from_nodes(full_nodes):
+                tree_edges.add(e)
+
+        if not ok:
+            continue
+
+        paths_by_hub_dst_edges[h] = per_dst_edges
+        tree_edges_by_hub[h] = list(tree_edges)
+
+    if src not in paths_by_hub_dst_edges:
+        # Fallback: pure cost-based shortest paths per dst (no hub)
+        for dst in dsts:
+            try:
+                path_nodes = nx.dijkstra_path(G, src, dst, weight="cost")
+                edge_list = _nodes_to_edges(G, path_nodes)
+            except Exception:
+                edge_list = []
+            for p in range(num_partitions):
+                bc.set_dst_partition_paths(dst, p, edge_list)
+        return bc
+
+    # Reduce hubs to those with valid precomputations
+    hubs = [h for h in hubs if h in paths_by_hub_dst_edges]
+    if src not in hubs:
+        hubs = [src] + hubs
+
+    # Evaluate configurations: single hub, best pair, best triple
     best_obj = float("inf")
-    n = num_partitions
+    best_counts = {src: num_partitions}
 
-    for x in range(0, n + 1):
-        use0 = (n - x) > 0
-        use1 = x > 0
-
-        if use0 and use1:
-            union_edges = edges0 | edges1
-        elif use0:
-            union_edges = edges0
-        else:
-            union_edges = edges1
-
-        outdeg, indeg = _compute_degrees(union_edges)
-
-        loads = {}
-        if use0:
-            for e in edges0:
-                loads[e] = loads.get(e, 0) + (n - x)
-        if use1:
-            for e in edges1:
-                loads[e] = loads.get(e, 0) + x
-
-        mr = _max_ratio(union_edges, G, loads, outdeg, indeg)
-        node_cnt = _node_count_from_edges(union_edges, src)
-
-        # Egress cost per GB: partitions * sum(edge cost) for each tree
-        egress = 0.0
-        if use0:
-            egress += float(n - x) * float(cost0)
-        if use1:
-            egress += float(x) * float(cost1)
-
-        inst = _INST_COEFF * float(node_cnt) * float(mr)
-        obj = egress + inst
-
+    def try_counts(counts: Dict[str, int]):
+        nonlocal best_obj, best_counts
+        # normalize counts to sum == num_partitions
+        total = sum(max(0, int(v)) for v in counts.values())
+        if total != num_partitions:
+            return
+        obj = _approx_objective(G, counts, tree_edges_by_hub, s_partition)
         if obj < best_obj:
             best_obj = obj
-            best_x = x
+            best_counts = dict(counts)
 
-    # Assign first best_x partitions to tree1, rest to tree0
+    # Single hub
+    for h in hubs:
+        try_counts({h: num_partitions})
+
+    # Pairs
+    top_hubs = hubs[: min(len(hubs), 6)]
+    if len(top_hubs) >= 2 and num_partitions >= 2:
+        splits = sorted(set([num_partitions // 2, max(1, int(round(num_partitions * 0.33))), max(1, int(round(num_partitions * 0.67)))]))
+        for i in range(len(top_hubs)):
+            for j in range(i + 1, len(top_hubs)):
+                h1 = top_hubs[i]
+                h2 = top_hubs[j]
+                for m1 in splits:
+                    m1 = max(1, min(num_partitions - 1, int(m1)))
+                    m2 = num_partitions - m1
+                    try_counts({h1: m1, h2: m2})
+
+    # Triples
+    if len(top_hubs) >= 3 and num_partitions >= 3:
+        m = num_partitions // 3
+        base_splits = [(m, m, num_partitions - 2 * m),
+                       (m, num_partitions - 2 * m, m),
+                       (num_partitions - 2 * m, m, m)]
+        for a in range(len(top_hubs)):
+            for b in range(a + 1, len(top_hubs)):
+                for c in range(b + 1, len(top_hubs)):
+                    ha, hb, hc = top_hubs[a], top_hubs[b], top_hubs[c]
+                    for x, y, z in base_splits:
+                        if x <= 0 or y <= 0 or z <= 0:
+                            continue
+                        if x + y + z != num_partitions:
+                            continue
+                        try_counts({ha: x, hb: y, hc: z})
+
+    # Assign partitions to hubs based on best_counts
+    hub_list = []
+    for h, m in sorted(best_counts.items(), key=lambda kv: (-kv[1], kv[0])):
+        if m > 0:
+            hub_list.extend([h] * int(m))
+    if len(hub_list) != num_partitions:
+        hub_list = [src] * num_partitions
+
+    # Build topology
     for dst in dsts:
-        pe0 = paths0.get(dst) or []
-        pe1 = paths1.get(dst) or pe0
-
-        out0_list = []
-        for (u, v) in pe0:
-            out0_list.append([u, v, G[u][v]])
-
-        out1_list = []
-        for (u, v) in pe1:
-            out1_list.append([u, v, G[u][v]])
-
         for p in range(num_partitions):
-            if p < best_x:
-                bc.set_dst_partition_paths(dst, p, out1_list)
-            else:
-                bc.set_dst_partition_paths(dst, p, out0_list)
+            h = hub_list[p]
+            if h not in paths_by_hub_dst_edges:
+                h = src
+            edge_list = paths_by_hub_dst_edges[h].get(dst)
+            if edge_list is None:
+                # fallback to src hub path
+                edge_list = paths_by_hub_dst_edges[src].get(dst, [])
+            bc.set_dst_partition_paths(dst, p, edge_list)
 
     return bc
 '''
-
-
-def _render_algorithm_code(num_vms: int, ingress_limit: Dict, egress_limit: Dict) -> str:
-    code = ALGO_TEMPLATE
-    code = code.replace("__NUM_VMS__", str(int(num_vms)))
-    code = code.replace("__INGRESS_LIMIT__", repr({k.lower(): float(v) for k, v in (ingress_limit or {}).items()}))
-    code = code.replace("__EGRESS_LIMIT__", repr({k.lower(): float(v) for k, v in (egress_limit or {}).items()}))
-    return code
-
-
-def _read_json(path: str):
-    with open(path, "r", encoding="utf-8") as f:
-        return json.load(f)
-
-
-def _load_spec_params(spec_path: Optional[str]):
-    default_ingress = {"aws": 10.0, "gcp": 16.0, "azure": 16.0}
-    default_egress = {"aws": 5.0, "gcp": 7.0, "azure": 16.0}
-    num_vms = 2
-
-    if not spec_path or not os.path.exists(spec_path):
-        return num_vms, default_ingress, default_egress
-
-    try:
-        spec = _read_json(spec_path)
-        if isinstance(spec, dict):
-            nv = spec.get("num_vms", None)
-            if nv is not None:
-                try:
-                    num_vms = int(nv)
-                except Exception:
-                    pass
-
-            cfgs = spec.get("config_files", [])
-            base_dir = os.path.dirname(os.path.abspath(spec_path))
-            ingress = dict(default_ingress)
-            egress = dict(default_egress)
-
-            if isinstance(cfgs, list):
-                for cf in cfgs:
-                    if not isinstance(cf, str):
-                        continue
-                    cf_path = cf
-                    if not os.path.isabs(cf_path):
-                        cf_path = os.path.join(base_dir, cf_path)
-                    if not os.path.exists(cf_path):
-                        continue
-                    try:
-                        cfg = _read_json(cf_path)
-                    except Exception:
-                        continue
-                    if isinstance(cfg, dict):
-                        il = cfg.get("ingress_limit", None)
-                        el = cfg.get("egress_limit", None)
-                        if isinstance(il, dict):
-                            for k, v in il.items():
-                                try:
-                                    ingress[str(k).lower()] = float(v)
-                                except Exception:
-                                    pass
-                        if isinstance(el, dict):
-                            for k, v in el.items():
-                                try:
-                                    egress[str(k).lower()] = float(v)
-                                except Exception:
-                                    pass
-            return num_vms, ingress, egress
-    except Exception:
-        pass
-
-    return num_vms, default_ingress, default_egress
-
-
-# Provide module-level definitions as a fallback (in case the harness imports them directly).
-# These use default parameters (num_vms=2, standard per-provider limits).
-_default_code = _render_algorithm_code(
-    2,
-    {"aws": 10.0, "gcp": 16.0, "azure": 16.0},
-    {"aws": 5.0, "gcp": 7.0, "azure": 16.0},
-)
-_exec_ns = {}
-exec(_default_code, _exec_ns)
-BroadCastTopology = _exec_ns["BroadCastTopology"]
-search_algorithm = _exec_ns["search_algorithm"]
-
-
-class Solution:
-    def solve(self, spec_path: str = None) -> dict:
-        num_vms, ingress, egress = _load_spec_params(spec_path)
-        code = _render_algorithm_code(num_vms, ingress, egress)
         return {"code": code}

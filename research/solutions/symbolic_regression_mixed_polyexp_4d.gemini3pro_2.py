@@ -1,8 +1,11 @@
 import numpy as np
 import pandas as pd
 import sympy
-import os
 from pysr import PySRRegressor
+import warnings
+
+# Suppress warnings to keep output clean
+warnings.filterwarnings("ignore")
 
 class Solution:
     def __init__(self, **kwargs):
@@ -10,67 +13,89 @@ class Solution:
 
     def solve(self, X: np.ndarray, y: np.ndarray) -> dict:
         """
-        Solves the symbolic regression problem using PySR.
+        Solves the symbolic regression problem for the Mixed PolyExp 4D dataset.
         """
-        # Unique temporary file for this execution
-        temp_file = f"hall_of_fame_{os.getpid()}.csv"
-        
+        # Ensure inputs are standard numpy arrays
+        X = np.array(X, dtype=np.float32)
+        y = np.array(y, dtype=np.float32)
+        n_samples = X.shape[0]
+
+        # Subsample data if too large to ensure execution within time limits
+        # Using 2000 points is usually sufficient for symbolic regression to find the structure
+        if n_samples > 2000:
+            rng = np.random.RandomState(42)
+            indices = rng.choice(n_samples, 2000, replace=False)
+            X_fit = X[indices]
+            y_fit = y[indices]
+        else:
+            X_fit = X
+            y_fit = y
+
         try:
-            # Initialize PySRRegressor with settings optimized for 4D PolyExp
-            # Using 8 vCPUs via procs=8 and multiprocessing=True
+            # Configure PySRRegressor
+            # Optimized for 8 vCPUs and the specific problem type (Poly + Exp)
             model = PySRRegressor(
-                niterations=150,  # Sufficient search depth
-                binary_operators=["+", "-", "*", "/"],
-                unary_operators=["sin", "cos", "exp", "log"],
-                populations=20,
+                niterations=60,                # Sufficient iterations for convergence
+                binary_operators=["+", "-", "*", "/", "^"],
+                unary_operators=["exp", "sin", "cos", "log"],
+                populations=16,                # 2 populations per CPU core
                 population_size=50,
-                maxsize=50,  # Allow for complex mixed expressions
-                ncycles_per_iteration=500,
-                model_selection="best",
+                maxsize=45,                    # Allow for enough complexity (4D + interactions)
+                procs=8,
+                multiprocessing=True,
+                denoise=False,
+                optimizer_algorithm="Nelder-Mead",
+                optimizer_nrestarts=3,
                 verbosity=0,
                 progress=False,
                 random_state=42,
-                procs=8,
-                multiprocessing=True,
-                timeout_in_seconds=300,  # Time limit safeguard
-                temp_equation_file=temp_file
+                parsimony_coefficient=0.001,   # Slight penalty to prefer simpler equations
+                model_selection="best",        # Select best model based on score (accuracy vs complexity)
+                constraints={
+                    "^": ((-1, 3), (-1, 3)),   # Limit power complexity to avoid overfitting
+                },
+                complexity_of_operators={
+                    "exp": 2, "log": 3, "sin": 3, "cos": 3, "^": 1
+                },
+                temp_equation_file=False,
+                delete_tempfiles=True
             )
 
-            # Fit the model to the data
-            model.fit(X, y, variable_names=["x1", "x2", "x3", "x4"])
-            
-            # Retrieve the best expression found
-            best_expr = model.sympy()
-            expression = str(best_expr)
-            
-            # Generate predictions
+            # Fit the model
+            model.fit(X_fit, y_fit, variable_names=["x1", "x2", "x3", "x4"])
+
+            # Retrieve the best symbolic expression
+            best_sympy = model.sympy()
+            expression = str(best_sympy)
+
+            # Generate predictions on the full dataset
             predictions = model.predict(X)
-            
-            # Ensure predictions are a flat list
-            if isinstance(predictions, np.ndarray):
-                predictions = predictions.flatten().tolist()
-            elif not isinstance(predictions, list):
-                predictions = list(predictions)
+
+            # Safety check for invalid predictions
+            if np.any(np.isnan(predictions)) or np.any(np.isinf(predictions)):
+                raise ValueError("PySR predictions contain NaN or Inf.")
 
         except Exception:
-            # Fallback to Linear Regression if symbolic regression fails
-            A = np.column_stack([X, np.ones(X.shape[0])])
-            coeffs, _, _, _ = np.linalg.lstsq(A, y, rcond=None)
+            # Fallback to Linear Regression if symbolic regression fails or times out
+            # Construct design matrix with bias
+            X_bias = np.c_[X, np.ones(n_samples)]
             
-            terms = [f"{coeffs[i]}*x{i+1}" for i in range(X.shape[1])]
-            terms.append(str(coeffs[-1]))
+            # Least squares solution
+            coeffs, _, _, _ = np.linalg.lstsq(X_bias, y, rcond=None)
+            
+            # Construct linear expression string
+            terms = []
+            for i, var in enumerate(["x1", "x2", "x3", "x4"]):
+                terms.append(f"({coeffs[i]} * {var})")
+            terms.append(str(coeffs[4]))
             expression = " + ".join(terms)
-            predictions = (A @ coeffs).tolist()
+            
+            # Compute predictions
+            predictions = X_bias @ coeffs
 
-        # Clean up temporary file
-        if os.path.exists(temp_file):
-            try:
-                os.remove(temp_file)
-            except OSError:
-                pass
-
+        # Ensure prediction format is a list
         return {
             "expression": expression,
-            "predictions": predictions,
+            "predictions": predictions.tolist(),
             "details": {}
         }

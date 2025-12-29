@@ -6,7 +6,7 @@ from sky_spot.utils import ClusterType
 
 
 class Solution(MultiRegionStrategy):
-    NAME = "safety_first_v1"
+    NAME = "cant_be_late_heuristic_v1"
 
     def solve(self, spec_path: str) -> "Solution":
         with open(spec_path) as f:
@@ -19,42 +19,64 @@ class Solution(MultiRegionStrategy):
             inter_task_overhead=[0.0],
         )
         super().__init__(args)
-
-        self._commit_to_od = False
+        # Internal state
+        self._committed_on_demand = False
+        self._initialized = False
         return self
 
-    def _step(self, last_cluster_type: ClusterType, has_spot: bool) -> ClusterType:
-        # Remaining work
-        done = sum(self.task_done_time) if self.task_done_time else 0.0
-        remaining_work = max(0.0, self.task_duration - done)
+    def _init_once(self):
+        if self._initialized:
+            return
+        # Lazy init with environment info
+        self._initialized = True
+        self._region_count = max(1, int(self.env.get_num_regions()))
+        self._safety_margin = float(self.env.gap_seconds)  # commit earlier by one gap
+        self._last_region = self.env.get_current_region() if hasattr(self.env, "get_current_region") else 0
 
-        if remaining_work <= 0.0:
+    def _remaining_work_seconds(self) -> float:
+        done = sum(self.task_done_time) if hasattr(self, "task_done_time") and self.task_done_time else 0.0
+        rem = max(self.task_duration - done, 0.0)
+        return rem
+
+    def _should_commit_on_demand(self, now: float, rem: float) -> bool:
+        # Latest time to commit to OD to be safe: deadline - rem - restart_overhead - safety_margin
+        commit_by = self.deadline - rem - self.restart_overhead - self._safety_margin
+        return now >= commit_by
+
+    def _rotate_region_on_spot_miss(self):
+        if self._region_count <= 1:
+            return
+        cur = self.env.get_current_region()
+        if cur is None:
+            cur = self._last_region if hasattr(self, "_last_region") else 0
+        nxt = (int(cur) + 1) % self._region_count
+        self.env.switch_region(nxt)
+        self._last_region = nxt
+
+    def _step(self, last_cluster_type: ClusterType, has_spot: bool) -> ClusterType:
+        self._init_once()
+
+        # If already committed to On-Demand, keep using it to avoid extra overheads and guarantee finish.
+        if self._committed_on_demand:
+            return ClusterType.ON_DEMAND
+
+        now = float(self.env.elapsed_seconds)
+        rem = self._remaining_work_seconds()
+
+        # If no work left, do nothing
+        if rem <= 0.0:
             return ClusterType.NONE
 
-        time_left = self.deadline - self.env.elapsed_seconds
-        gap = self.env.gap_seconds
-        # Overhead to switch to on-demand (if not already on OD)
-        od_switch_overhead = self.restart_overhead
-
-        # If already committed to OD (or already on OD), stay on OD to avoid extra overheads
-        if self._commit_to_od or last_cluster_type == ClusterType.ON_DEMAND:
-            self._commit_to_od = True
+        # Decide if we must commit to On-Demand to guarantee finishing before deadline.
+        if self._should_commit_on_demand(now, rem):
+            self._committed_on_demand = True
             return ClusterType.ON_DEMAND
 
-        # Safety rule: If taking one more non-OD step (SPOT or NONE) could make it impossible
-        # to finish on OD (with restart overhead), then switch to OD now.
-        # Worst-case next step yields zero progress: time_left - gap must still >= remaining_work + od_switch_overhead
-        if (time_left - gap) < (remaining_work + od_switch_overhead):
-            self._commit_to_od = True
-            return ClusterType.ON_DEMAND
-
-        # Prefer Spot when available
+        # Prefer Spot when available.
         if has_spot:
+            # Stay in current region if spot available; switching could incur restart overheads.
             return ClusterType.SPOT
 
-        # If Spot not available, wait if safe; otherwise switch to OD
-        if (time_left - gap) >= (remaining_work + od_switch_overhead):
-            return ClusterType.NONE
-
-        self._commit_to_od = True
-        return ClusterType.ON_DEMAND
+        # Spot not available now, wait (NONE) and try another region next step to find spot.
+        self._rotate_region_on_spot_miss()
+        return ClusterType.NONE

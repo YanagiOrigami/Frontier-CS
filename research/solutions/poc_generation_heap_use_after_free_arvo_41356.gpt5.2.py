@@ -1,379 +1,584 @@
 import os
 import re
+import sys
 import tarfile
-import zipfile
 import tempfile
-import shutil
+import subprocess
+import time
+import random
+import struct
 from pathlib import Path
-from typing import Iterable, Optional, List, Tuple
+from typing import List, Tuple, Optional, Set, Dict
 
 
 class Solution:
-    def solve(self, src_path: str) -> bytes:
-        p = Path(src_path)
-        if p.is_dir():
-            root = str(p)
-            poc = self._find_best_poc(root)
-            if poc is not None:
-                return poc
-            poc = self._find_embedded_poc(root)
-            if poc is not None:
-                return poc
-            poc = self._synthesize_poc(root)
-            if poc is not None:
-                return poc
-            return b"A" * 60
+    def __init__(self):
+        self._rng = random.Random(1337)
+        self._prog_path: Optional[str] = None
+        self._cwd: Optional[str] = None
+        self._use_file: bool = False
+        self._timeout = 0.6
+        self._tokens: List[bytes] = []
+        self._binary_mode: bool = False
 
-        tmpdir = tempfile.mkdtemp(prefix="arvo_src_")
-        try:
-            root = self._extract_to_dir(str(p), tmpdir)
-            poc = self._find_best_poc(root)
-            if poc is not None:
-                return poc
-            poc = self._find_embedded_poc(root)
-            if poc is not None:
-                return poc
-            poc = self._synthesize_poc(root)
-            if poc is not None:
-                return poc
-            return b"A" * 60
-        finally:
-            shutil.rmtree(tmpdir, ignore_errors=True)
+    def _safe_extract_tar(self, tar_path: str, dst: str) -> None:
+        def is_within_directory(directory: str, target: str) -> bool:
+            abs_directory = os.path.abspath(directory)
+            abs_target = os.path.abspath(target)
+            return os.path.commonpath([abs_directory]) == os.path.commonpath([abs_directory, abs_target])
 
-    def _extract_to_dir(self, archive_path: str, out_dir: str) -> str:
-        ap = Path(archive_path)
-        suffixes = "".join(ap.suffixes).lower()
-
-        extracted_root = out_dir
-
-        if suffixes.endswith(".zip"):
-            with zipfile.ZipFile(archive_path, "r") as zf:
-                for info in zf.infolist():
-                    name = info.filename
-                    if not name or name.endswith("/"):
-                        continue
-                    if name.startswith("/") or name.startswith("\\") or ".." in Path(name).parts:
-                        continue
-                    target = Path(out_dir) / name
-                    target.parent.mkdir(parents=True, exist_ok=True)
-                    with zf.open(info, "r") as fin, open(target, "wb") as fout:
-                        shutil.copyfileobj(fin, fout, length=1024 * 1024)
-        else:
-            with tarfile.open(archive_path, "r:*") as tf:
+        with tarfile.open(tar_path, "r:*") as tf:
+            for member in tf.getmembers():
+                member_path = os.path.join(dst, member.name)
+                if not is_within_directory(dst, member_path):
+                    continue
                 try:
-                    tf.extractall(out_dir, filter="data")
-                except TypeError:
-                    safe_members = []
-                    for m in tf.getmembers():
-                        name = m.name
-                        if not name or name.endswith("/"):
-                            continue
-                        if name.startswith("/") or name.startswith("\\") or ".." in Path(name).parts:
-                            continue
-                        if m.issym() or m.islnk():
-                            continue
-                        safe_members.append(m)
-                    tf.extractall(out_dir, members=safe_members)
+                    tf.extract(member, dst)
+                except Exception:
+                    pass
 
-        extracted_root = self._canonical_root_dir(out_dir)
-        return extracted_root
-
-    def _canonical_root_dir(self, out_dir: str) -> str:
-        try:
-            entries = [p for p in Path(out_dir).iterdir() if p.name not in (".", "..")]
-        except Exception:
-            return out_dir
-        dirs = [e for e in entries if e.is_dir()]
-        files = [e for e in entries if e.is_file()]
-        if len(dirs) == 1 and not files:
+    def _find_project_root(self, tmpdir: str) -> str:
+        entries = [p for p in Path(tmpdir).iterdir() if p.name not in (".", "..")]
+        dirs = [p for p in entries if p.is_dir()]
+        if len(dirs) == 1 and all(not p.is_file() for p in entries if p != dirs[0]):
             return str(dirs[0])
-        return out_dir
+        return tmpdir
 
-    def _iter_files(self, root: str) -> Iterable[Path]:
-        rootp = Path(root)
-        stack = [rootp]
-        while stack:
-            d = stack.pop()
-            try:
-                with os.scandir(d) as it:
-                    for ent in it:
-                        name = ent.name
-                        if name in (".git", ".svn", ".hg", "build", "dist", "out", "cmake-build-debug", "cmake-build-release"):
-                            continue
-                        try:
-                            if ent.is_dir(follow_symlinks=False):
-                                stack.append(Path(ent.path))
-                            elif ent.is_file(follow_symlinks=False):
-                                yield Path(ent.path)
-                        except Exception:
-                            continue
-            except Exception:
-                continue
-
-    def _read_bytes_limited(self, path: Path, limit: int = 1024 * 1024) -> Optional[bytes]:
+    def _read_text(self, path: str, max_bytes: int = 2_000_000) -> str:
         try:
-            st = path.stat()
-            if st.st_size <= 0:
-                return None
-            if st.st_size > limit:
-                return None
             with open(path, "rb") as f:
-                return f.read(limit + 1)
+                data = f.read(max_bytes)
+            return data.decode("utf-8", errors="ignore")
         except Exception:
-            return None
+            return ""
 
-    def _read_text_limited(self, path: Path, limit: int = 1024 * 1024) -> Optional[str]:
-        b = self._read_bytes_limited(path, limit=limit)
-        if b is None:
-            return None
-        for enc in ("utf-8", "latin-1"):
-            try:
-                return b.decode(enc, errors="replace")
-            except Exception:
+    def _collect_sources(self, root: str) -> List[str]:
+        ex_dirs = {"test", "tests", "testing", "benchmark", "benchmarks", "examples", "example", "fuzz", "fuzzer", "third_party", "thirdparty", ".git"}
+        srcs = []
+        for p in Path(root).rglob("*"):
+            if not p.is_file():
                 continue
+            lp = str(p).lower()
+            parts = {x.lower() for x in p.parts}
+            if parts & ex_dirs:
+                continue
+            if p.suffix.lower() in (".c", ".cc", ".cpp", ".cxx", ".c++"):
+                srcs.append(str(p))
+        return srcs
+
+    def _detect_main_files(self, srcs: List[str]) -> List[str]:
+        mains = []
+        main_re = re.compile(r"\bint\s+main\s*\(", re.M)
+        for s in srcs:
+            txt = self._read_text(s)
+            if main_re.search(txt):
+                mains.append(s)
+        return mains
+
+    def _extract_tokens_from_sources(self, srcs: List[str]) -> Tuple[List[bytes], bool, Dict[str, int]]:
+        tokens: Set[bytes] = set()
+        binary_mode = False
+        style: Dict[str, int] = {"json": 0, "xml": 0, "newick": 0, "cmd": 0, "binary": 0, "paren": 0}
+        strlit_re = re.compile(r"\"((?:\\.|[^\"\\])*)\"")
+        cmp_re = re.compile(r"(?:==\s*\"([^\"]+)\"|strcmp\s*\([^,]+,\s*\"([^\"]+)\"\s*\))")
+        for s in srcs:
+            txt = self._read_text(s)
+            if not txt:
+                continue
+            if ("istream::read" in txt) or (".read(" in txt) or ("fread(" in txt) or ("read(" in txt and "std::cin" in txt):
+                binary_mode = True
+                style["binary"] += 1
+            for m in strlit_re.finditer(txt):
+                val = m.group(1)
+                if not val:
+                    continue
+                low = val.lower()
+                if "json" in low:
+                    style["json"] += 2
+                if "xml" in low:
+                    style["xml"] += 2
+                if "newick" in low or "phylo" in low or "tree" in low:
+                    style["newick"] += 2
+                if "expected ')'" in low or "expected )" in low or "expected ','" in low or "expected ," in low:
+                    style["paren"] += 2
+                if "usage" in low or "command" in low:
+                    style["cmd"] += 1
+
+                if 1 <= len(val) <= 24:
+                    if any(c in val for c in "\n\r\t"):
+                        continue
+                    b = val.encode("utf-8", errors="ignore")
+                    if b:
+                        tokens.add(b)
+
+            for m in cmp_re.finditer(txt):
+                v = m.group(1) or m.group(2)
+                if not v:
+                    continue
+                low = v.lower()
+                if low in ("add", "insert", "remove", "delete", "del", "push", "pop", "new", "free", "node", "child", "parent", "set", "get", "put"):
+                    style["cmd"] += 3
+                if 1 <= len(v) <= 24:
+                    tokens.add(v.encode("utf-8", errors="ignore"))
+
+            if "Node::add" in txt or "::add(" in txt:
+                style["cmd"] += 1
+            if "(" in txt and ")" in txt and "," in txt:
+                style["paren"] += 1
+
+        common = [
+            b"add", b"ADD", b"insert", b"remove", b"delete", b"del",
+            b"node", b"child", b"parent", b"root", b"tree",
+            b"\n", b" ", b"\t", b",", b";", b"(", b")", b"{", b"}", b"[", b"]", b":", b"\"",
+        ]
+        for c in common:
+            tokens.add(c)
+        tok_list = sorted(tokens, key=lambda x: (len(x), x))[:400]
+        return tok_list, binary_mode, style
+
+    def _compile_with_gxx(self, root: str, srcs: List[str], main_file: Optional[str], out_path: str) -> bool:
+        if not srcs:
+            return False
+        use_srcs = list(srcs)
+        if main_file:
+            mains = self._detect_main_files(srcs)
+            for mf in mains:
+                if mf != main_file and mf in use_srcs:
+                    use_srcs.remove(mf)
+
+        cxx = os.environ.get("CXX", "g++")
+        flags_base = [
+            "-O1", "-g",
+            "-fsanitize=address",
+            "-fno-omit-frame-pointer",
+            "-fno-sanitize-recover=all",
+        ]
+        includes = ["-I", root]
+        stds = ["-std=c++17", "-std=gnu++17", "-std=c++20", "-std=gnu++20"]
+        extras = [
+            [],
+            ["-pthread"],
+            ["-pthread", "-Wno-narrowing", "-Wno-sign-compare", "-Wno-unused-result"],
+        ]
+
+        for std in stds:
+            for extra in extras:
+                cmd = [cxx, std] + flags_base + extra + includes + use_srcs + ["-o", out_path]
+                try:
+                    r = subprocess.run(cmd, cwd=root, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=120)
+                    if r.returncode == 0 and os.path.exists(out_path):
+                        return True
+                except Exception:
+                    continue
+        return False
+
+    def _compile_with_clangxx(self, root: str, srcs: List[str], main_file: Optional[str], out_path: str) -> bool:
+        if not srcs:
+            return False
+        use_srcs = list(srcs)
+        if main_file:
+            mains = self._detect_main_files(srcs)
+            for mf in mains:
+                if mf != main_file and mf in use_srcs:
+                    use_srcs.remove(mf)
+
+        clang = "clang++"
+        try:
+            subprocess.run([clang, "--version"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=5)
+        except Exception:
+            return False
+
+        flags_base = [
+            "-O1", "-g",
+            "-fsanitize=address",
+            "-fno-omit-frame-pointer",
+            "-fno-sanitize-recover=all",
+        ]
+        includes = ["-I", root]
+        stds = ["-std=c++17", "-std=gnu++17", "-std=c++20", "-std=gnu++20"]
+        extras = [
+            [],
+            ["-pthread"],
+            ["-pthread", "-Wno-narrowing", "-Wno-sign-compare", "-Wno-unused-result"],
+        ]
+
+        for std in stds:
+            for extra in extras:
+                cmd = [clang, std] + flags_base + extra + includes + use_srcs + ["-o", out_path]
+                try:
+                    r = subprocess.run(cmd, cwd=root, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=120)
+                    if r.returncode == 0 and os.path.exists(out_path):
+                        return True
+                except Exception:
+                    continue
+        return False
+
+    def _build_program(self, root: str) -> Optional[str]:
+        srcs = self._collect_sources(root)
+        if not srcs:
+            return None
+        mains = self._detect_main_files(srcs)
+        main_file = mains[0] if mains else None
+
+        out_path = os.path.join(root, "poc_prog_asan")
+        ok = self._compile_with_gxx(root, srcs, main_file, out_path)
+        if not ok:
+            ok = self._compile_with_clangxx(root, srcs, main_file, out_path)
+        if ok:
+            try:
+                os.chmod(out_path, 0o755)
+            except Exception:
+                pass
+            return out_path
+
         return None
 
-    def _looks_like_source_code(self, data: bytes) -> bool:
-        if not data:
-            return False
-        head = data[:4096]
-        if b"#include" in head or b"int main" in head or b"namespace " in head:
+    def _decide_input_mode(self, prog: str, root: str, main_file: Optional[str]) -> bool:
+        txt = self._read_text(main_file) if main_file else ""
+        if "argv[1]" in txt or "argc" in txt and ("< 2" in txt or "<= 1" in txt):
             return True
-        if b"class " in head and b"{" in head and b";" in head:
+
+        env = os.environ.copy()
+        env["ASAN_OPTIONS"] = "detect_leaks=0:halt_on_error=1:abort_on_error=1"
+        env["UBSAN_OPTIONS"] = "halt_on_error=1:abort_on_error=1"
+        try:
+            r = subprocess.run([prog], cwd=root, input=b"", stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env, timeout=0.4)
+            out = (r.stdout + r.stderr).decode("utf-8", errors="ignore").lower()
+            if "usage" in out and ("file" in out or "path" in out or "argv" in out):
+                return True
+        except Exception:
+            pass
+        return False
+
+    def _run(self, data: bytes) -> Tuple[int, bytes, bytes]:
+        env = os.environ.copy()
+        env["ASAN_OPTIONS"] = "detect_leaks=0:halt_on_error=1:abort_on_error=1:allocator_may_return_null=1"
+        env["UBSAN_OPTIONS"] = "halt_on_error=1:abort_on_error=1"
+        env["MSAN_OPTIONS"] = env.get("MSAN_OPTIONS", "")
+        try:
+            if self._use_file:
+                with tempfile.NamedTemporaryFile(prefix="poc_in_", delete=False) as f:
+                    f.write(data)
+                    f.flush()
+                    in_path = f.name
+                try:
+                    r = subprocess.run([self._prog_path, in_path], cwd=self._cwd, input=b"", stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env, timeout=self._timeout)
+                    return r.returncode, r.stdout, r.stderr
+                finally:
+                    try:
+                        os.unlink(in_path)
+                    except Exception:
+                        pass
+            else:
+                r = subprocess.run([self._prog_path], cwd=self._cwd, input=data, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env, timeout=self._timeout)
+                return r.returncode, r.stdout, r.stderr
+        except subprocess.TimeoutExpired as e:
+            out = e.stdout or b""
+            err = e.stderr or b""
+            return 124, out, err
+        except Exception as e:
+            return 125, b"", (str(e).encode("utf-8", errors="ignore"))
+
+    def _is_target_crash(self, rc: int, err: bytes) -> bool:
+        if rc == 0 or rc == 124:
+            return False
+        s = err.decode("utf-8", errors="ignore").lower()
+        if "addresssanitizer" not in s and "asan" not in s:
+            return False
+        if ("double-free" in s) or ("attempting double-free" in s) or ("heap-use-after-free" in s) or ("use-after-free" in s) or ("invalid free" in s):
+            return True
+        if ("free" in s and "previously freed" in s) or ("freed heap region" in s):
             return True
         return False
 
-    def _is_probably_text(self, data: bytes) -> bool:
-        if not data:
-            return False
-        sample = data[:4096]
-        if b"\x00" in sample:
-            return False
-        nonprint = 0
-        for c in sample:
-            if c in (9, 10, 13):
-                continue
-            if 32 <= c <= 126:
-                continue
-            nonprint += 1
-        return nonprint <= max(4, len(sample) // 50)
+    def _mutate(self, data: bytes) -> bytes:
+        if len(data) == 0:
+            data = b"\n"
+        op = self._rng.randrange(0, 10)
+        b = bytearray(data)
 
-    def _score_candidate(self, path: Path, data: bytes, target_len: int = 60) -> int:
-        name = path.name.lower()
-        spath = str(path).lower()
-        size = len(data)
+        if op == 0:
+            pos = self._rng.randrange(0, len(b))
+            b[pos] ^= 1 << self._rng.randrange(0, 8)
+            return bytes(b)
+        if op == 1:
+            pos = self._rng.randrange(0, len(b) + 1)
+            ins = self._rng.randrange(0, 256)
+            b[pos:pos] = bytes([ins])
+            return bytes(b)
+        if op == 2:
+            if len(b) > 1:
+                pos = self._rng.randrange(0, len(b))
+                del b[pos]
+            return bytes(b)
+        if op == 3:
+            pos = self._rng.randrange(0, len(b) + 1)
+            ln = self._rng.randrange(1, 9)
+            chunk = bytes(self._rng.randrange(0, 256) for _ in range(ln))
+            b[pos:pos] = chunk
+            return bytes(b)
+        if op == 4:
+            if self._tokens:
+                tok = self._rng.choice(self._tokens)
+            else:
+                tok = b"add"
+            pos = self._rng.randrange(0, len(b) + 1)
+            b[pos:pos] = tok
+            return bytes(b)
+        if op == 5:
+            if len(b) > 4:
+                i = self._rng.randrange(0, len(b) - 1)
+                j = self._rng.randrange(i + 1, min(len(b), i + 32))
+                del b[i:j]
+            return bytes(b)
+        if op == 6:
+            if self._tokens:
+                tok = self._rng.choice(self._tokens)
+            else:
+                tok = b"\n"
+            b.extend(tok)
+            return bytes(b)
+        if op == 7:
+            if len(b) > 8:
+                pos = self._rng.randrange(0, len(b) - 4)
+                val = self._rng.getrandbits(32)
+                b[pos:pos + 4] = struct.pack("<I", val)
+            else:
+                b.extend(struct.pack("<I", self._rng.getrandbits(32)))
+            return bytes(b)
+        if op == 8:
+            if self._tokens:
+                t1 = self._rng.choice(self._tokens)
+                t2 = self._rng.choice(self._tokens)
+                pos = self._rng.randrange(0, len(b) + 1)
+                b[pos:pos] = t1 + b" " + t2 + b"\n"
+            else:
+                b.extend(b"\n")
+            return bytes(b)
+        if op == 9:
+            if len(b) > 1:
+                i = self._rng.randrange(0, len(b))
+                j = self._rng.randrange(0, len(b))
+                if i > j:
+                    i, j = j, i
+                b[i:j] = b[i:j][::-1]
+            return bytes(b)
 
-        score = 0
+        return bytes(b)
 
-        if size == target_len:
-            score += 100000
-        score += max(0, 5000 - 50 * abs(size - target_len))
+    def _ddmin(self, data: bytes, test_fn, max_time: float) -> bytes:
+        start = time.monotonic()
+        if not test_fn(data):
+            return data
+        n = 2
+        cur = data
+        while len(cur) >= 2 and time.monotonic() - start < max_time:
+            chunk_len = max(1, len(cur) // n)
+            reduced = False
+            i = 0
+            while i < len(cur) and time.monotonic() - start < max_time:
+                j = min(len(cur), i + chunk_len)
+                cand = cur[:i] + cur[j:]
+                if cand and test_fn(cand):
+                    cur = cand
+                    reduced = True
+                    n = max(2, n - 1)
+                    break
+                i = j
+            if not reduced:
+                if n >= len(cur):
+                    break
+                n = min(len(cur), n * 2)
+        if time.monotonic() - start < max_time:
+            i = 0
+            while i < len(cur) and time.monotonic() - start < max_time:
+                cand = cur[:i] + cur[i + 1:]
+                if cand and test_fn(cand):
+                    cur = cand
+                else:
+                    i += 1
+        return cur
 
-        keywords = [
-            ("crash", 25000),
-            ("repro", 20000),
-            ("poc", 20000),
-            ("uaf", 18000),
-            ("useafterfree", 18000),
-            ("doublefree", 18000),
-            ("asan", 15000),
-            ("ubsan", 12000),
-            ("msan", 12000),
-            ("corpus", 9000),
-            ("seed", 9000),
-            ("fuzz", 9000),
-            ("testcase", 7000),
-            ("test", 4000),
-            ("input", 4000),
-            ("sample", 2500),
-            ("41356", 25000),
-            ("arvo", 8000),
-        ]
-        for kw, w in keywords:
-            if kw in name:
-                score += w
-            if kw in spath and kw not in name:
-                score += w // 2
+    def _gen_newick(self, children: int) -> bytes:
+        # Create a node with many children; a binary-tree parser might throw on >2
+        names = [b"a", b"b", b"c", b"d", b"e", b"f", b"g", b"h", b"i", b"j"]
+        self._rng.shuffle(names)
+        parts = []
+        for i in range(children):
+            nm = names[i % len(names)]
+            if self._rng.random() < 0.2:
+                nm = nm + str(self._rng.randrange(0, 100)).encode()
+            parts.append(nm)
+        s = b"(" + b",".join(parts) + b");\n"
+        return s
 
-        ext = path.suffix.lower()
-        input_exts = {".poc", ".in", ".inp", ".txt", ".dat", ".bin", ".raw", ".json", ".xml", ".yaml", ".yml", ".csv"}
-        source_exts = {".c", ".cc", ".cpp", ".cxx", ".h", ".hpp", ".hh", ".hxx", ".inc", ".ipp", ".java", ".rs", ".go", ".py", ".js", ".ts", ".md", ".rst"}
-        if ext in input_exts:
-            score += 2500
-        if ext in source_exts:
-            score -= 15000
+    def _gen_json_dup(self) -> bytes:
+        # Duplicate keys might trigger exception during insertion into a node/map
+        k = b"a"
+        if self._rng.random() < 0.3:
+            k = b"key"
+        v1 = str(self._rng.randrange(0, 10)).encode()
+        v2 = str(self._rng.randrange(0, 10)).encode()
+        return b'{"' + k + b'":' + v1 + b',"' + k + b'":' + v2 + b'}\n'
 
-        if self._looks_like_source_code(data):
-            score -= 50000
+    def _gen_cmd_script(self, cmd_add: bytes) -> bytes:
+        # Script-like inputs: repeat adds to overflow constraint or create duplicate
+        names = [b"a", b"b", b"c", b"d", b"e"]
+        self._rng.shuffle(names)
+        lines = []
+        for i in range(6):
+            a = names[i % len(names)]
+            b = names[(i + 1) % len(names)]
+            if self._rng.random() < 0.35:
+                b = a
+            if self._rng.random() < 0.2:
+                a = str(self._rng.randrange(0, 5)).encode()
+            if self._rng.random() < 0.2:
+                b = str(self._rng.randrange(0, 5)).encode()
+            lines.append(cmd_add + b" " + a + b" " + b)
+        return b"\n".join(lines) + b"\n"
 
-        if self._is_probably_text(data):
-            score += 500
+    def _gen_binary_guess(self) -> bytes:
+        # Heuristic binary structure: [count][(parent,name_len,name)*]
+        cnt = self._rng.randrange(3, 10)
+        out = bytearray()
+        out += struct.pack("<I", cnt)
+        for i in range(cnt):
+            parent = self._rng.randrange(0, max(1, i))
+            name = (b"A" * self._rng.randrange(1, 9)) + bytes([self._rng.randrange(48, 58)])
+            out += struct.pack("<I", parent)
+            out += struct.pack("<I", len(name))
+            out += name
+        return bytes(out)
 
-        if 0 < size <= 512:
-            score += 2000
-        if 0 < size <= 128:
-            score += 2000
-        if 0 < size <= 64:
-            score += 2500
+    def solve(self, src_path: str) -> bytes:
+        with tempfile.TemporaryDirectory(prefix="poc_build_") as td:
+            self._safe_extract_tar(src_path, td)
+            root = self._find_project_root(td)
 
-        return score
+            srcs = self._collect_sources(root)
+            mains = self._detect_main_files(srcs)
+            main_file = mains[0] if mains else None
 
-    def _find_best_poc(self, root: str) -> Optional[bytes]:
-        candidates: List[Tuple[int, Path, bytes]] = []
-        for fp in self._iter_files(root):
-            try:
-                st = fp.stat()
-            except Exception:
-                continue
-            if st.st_size <= 0 or st.st_size > 1024 * 1024:
-                continue
+            self._tokens, self._binary_mode, style = self._extract_tokens_from_sources(srcs)
 
-            data = self._read_bytes_limited(fp, limit=1024 * 1024)
-            if not data:
-                continue
+            prog = self._build_program(root)
+            if not prog:
+                # Fallback: common patterns (60-ish bytes)
+                return (b"(a,b,c,d,e,f,g,h,i,j);\n" * 2)[:60]
 
-            score = self._score_candidate(fp, data, target_len=60)
-            if score > 0:
-                candidates.append((score, fp, data))
+            self._prog_path = prog
+            self._cwd = root
+            self._use_file = self._decide_input_mode(prog, root, main_file)
 
-        if not candidates:
-            return None
+            cmd_add = b"add"
+            for t in self._tokens:
+                if t.lower() == b"add":
+                    cmd_add = t
+                    break
+            if cmd_add.lower() != b"add":
+                for t in self._tokens:
+                    if t.lower() in (b"insert", b"push", b"put", b"append"):
+                        cmd_add = t
+                        break
 
-        candidates.sort(key=lambda x: (x[0], -len(x[2])), reverse=True)
-        best = candidates[0][2]
+            def test_crash(d: bytes) -> bool:
+                rc, out, err = self._run(d)
+                return self._is_target_crash(rc, err)
 
-        return best
+            seeds: List[bytes] = []
+            seeds.extend([b"", b"\n", b"0\n", b"1\n", b"2\n", b"3\n"])
+            seeds.append(self._gen_json_dup())
+            seeds.append(b'{"a":1,"a":2}\n')
+            seeds.append(b'{"a":{"b":1},"a":{"c":2}}\n')
+            seeds.append(b"<a><b/></a>\n")
+            seeds.append(b"<a><b></b><b></b><b></b></a>\n")
+            seeds.append(b"(a,b,c);\n")
+            seeds.append(b"(a,b,c,d);\n")
+            seeds.append(self._gen_newick(3))
+            seeds.append(self._gen_newick(4))
+            seeds.append(self._gen_newick(8))
+            seeds.append(self._gen_cmd_script(cmd_add))
+            seeds.append((cmd_add + b" a b\n" + cmd_add + b" a c\n" + cmd_add + b" a d\n"))
+            if self._binary_mode:
+                for _ in range(10):
+                    seeds.append(self._gen_binary_guess())
+            # Add keyword-heavy seed
+            kw = []
+            for t in self._tokens:
+                tl = t.lower()
+                if tl.isalpha() and 2 <= len(tl) <= 8:
+                    kw.append(tl)
+                if len(kw) >= 12:
+                    break
+            if kw:
+                seeds.append(b" ".join(kw) + b"\n" + b" ".join(kw[::-1]) + b"\n")
 
-    def _find_embedded_poc(self, root: str) -> Optional[bytes]:
-        best_score = -1
-        best_bytes = None
-
-        interesting_markers = ("poc", "repro", "crash", "41356", "use after free", "double free", "uaf")
-        str_lit_re = re.compile(r'"([^"\\]*(?:\\.[^"\\]*)*)"', re.DOTALL)
-        raw_re = re.compile(r'R"([^\s()\\]{0,16})\((.*?)\)\1"', re.DOTALL)
-
-        for fp in self._iter_files(root):
-            ext = fp.suffix.lower()
-            if ext not in (".c", ".cc", ".cpp", ".cxx", ".h", ".hpp", ".hh", ".hxx"):
-                continue
-            try:
-                if fp.stat().st_size > 512 * 1024:
+            for sd in seeds:
+                if len(sd) == 0:
                     continue
-            except Exception:
-                continue
-            txt = self._read_text_limited(fp, limit=512 * 1024)
-            if not txt:
-                continue
-            low = txt.lower()
-            if not any(m in low for m in interesting_markers):
-                continue
+                if test_crash(sd):
+                    minimized = self._ddmin(sd, test_crash, max_time=6.0)
+                    return minimized
 
-            for m in raw_re.finditer(txt):
-                s = m.group(2)
-                if s is None:
+            corpus: List[bytes] = [s for s in seeds if s]
+            if not corpus:
+                corpus = [b"\n"]
+
+            start = time.monotonic()
+            time_budget = 24.0
+            best_crash: Optional[bytes] = None
+
+            seen: Set[int] = set()
+            it = 0
+            while time.monotonic() - start < time_budget:
+                it += 1
+                if it % 25 == 0 and (time.monotonic() - start) < time_budget * 0.5:
+                    if style.get("newick", 0) + style.get("paren", 0) >= style.get("json", 0):
+                        corpus.append(self._gen_newick(self._rng.randrange(3, 12)))
+                    if style.get("json", 0) > 0:
+                        corpus.append(self._gen_json_dup())
+                    if style.get("cmd", 0) > 0:
+                        corpus.append(self._gen_cmd_script(cmd_add))
+                    if self._binary_mode:
+                        corpus.append(self._gen_binary_guess())
+                    if len(corpus) > 300:
+                        corpus = corpus[-300:]
+
+                parent = corpus[self._rng.randrange(0, len(corpus))]
+                child = self._mutate(parent)
+                if len(child) > 8192:
+                    child = child[:8192]
+                h = hash(child[:64] + bytes([len(child) & 0xFF]))
+                if h in seen:
                     continue
-                if 1 <= len(s) <= 4096:
-                    b = s.encode("utf-8", errors="ignore")
-                    sc = self._score_candidate(fp, b, target_len=60) + max(0, 3000 - 30 * abs(len(b) - 60))
-                    if sc > best_score:
-                        best_score = sc
-                        best_bytes = b
+                seen.add(h)
+                if len(seen) > 6000:
+                    seen = set(list(seen)[-2000:])
 
-            for m in str_lit_re.finditer(txt):
-                s = m.group(1)
-                if s is None:
-                    continue
-                if len(s) < 4 or len(s) > 256:
-                    continue
-                if "\\n" not in s and "\\x" not in s and "\\0" not in s and "\\t" not in s and "\\r" not in s:
-                    continue
-                try:
-                    b = bytes(s, "utf-8").decode("unicode_escape").encode("latin-1", errors="ignore")
-                except Exception:
-                    continue
-                if not b or len(b) > 4096:
-                    continue
-                sc = self._score_candidate(fp, b, target_len=60) + max(0, 3000 - 30 * abs(len(b) - 60))
-                if sc > best_score:
-                    best_score = sc
-                    best_bytes = b
+                rc, out, err = self._run(child)
+                if self._is_target_crash(rc, err):
+                    best_crash = child
+                    break
 
-        return best_bytes
+                if rc != 124:
+                    key = (rc << 24) ^ (hash(err[:120]) & 0xFFFFFF)
+                    if key not in seen and len(child) <= 4096:
+                        corpus.append(child)
+                        if len(corpus) > 400:
+                            corpus = corpus[-400:]
 
-    def _synthesize_poc(self, root: str) -> Optional[bytes]:
-        commands = set()
-        numeric_add_like = set()
-        file_texts: List[str] = []
+            if best_crash:
+                minimized = self._ddmin(best_crash, test_crash, max_time=10.0)
+                return minimized
 
-        cmd_patterns = [
-            re.compile(r'==\s*"([A-Za-z0-9_\-]{1,24})"'),
-            re.compile(r'!\s*strcmp\s*\(\s*\w+\s*,\s*"([A-Za-z0-9_\-]{1,24})"\s*\)'),
-            re.compile(r'strcmp\s*\(\s*\w+\s*,\s*"([A-Za-z0-9_\-]{1,24})"\s*\)\s*==\s*0'),
-        ]
-
-        for fp in self._iter_files(root):
-            ext = fp.suffix.lower()
-            if ext not in (".c", ".cc", ".cpp", ".cxx", ".h", ".hpp", ".hh", ".hxx"):
-                continue
-            try:
-                if fp.stat().st_size > 256 * 1024:
-                    continue
-            except Exception:
-                continue
-            txt = self._read_text_limited(fp, limit=256 * 1024)
-            if not txt:
-                continue
-            low = txt.lower()
-            if "main" not in low and "fuzz" not in low and "stdin" not in low and "argv" not in low:
-                continue
-            file_texts.append(txt)
-
-        for txt in file_texts:
-            for pat in cmd_patterns:
-                for m in pat.finditer(txt):
-                    c = m.group(1)
-                    if c:
-                        commands.add(c)
-
-        add_candidates = []
-        for c in commands:
-            lc = c.lower()
-            if lc in ("add", "insert", "append", "push", "put", "set", "new", "node", "edge", "child", "attach"):
-                add_candidates.append(c)
-            elif "add" in lc or "insert" in lc:
-                numeric_add_like.add(c)
-
-        add_candidates.extend(sorted(numeric_add_like))
-        add_candidates = list(dict.fromkeys(add_candidates))
-
-        if not add_candidates:
-            for c in commands:
-                lc = c.lower()
-                if lc.startswith("a") or "node" in lc:
-                    add_candidates.append(c)
-            add_candidates = list(dict.fromkeys(add_candidates))
-
-        if not add_candidates:
-            return None
-
-        add_cmd = add_candidates[0]
-
-        poc_variants = [
-            f"{add_cmd} 1\n{add_cmd} 1\n".encode("ascii", errors="ignore"),
-            f"{add_cmd} 0\n{add_cmd} 0\n".encode("ascii", errors="ignore"),
-            f"{add_cmd}\n{add_cmd}\n".encode("ascii", errors="ignore"),
-            f"{add_cmd} a\n{add_cmd} a\n".encode("ascii", errors="ignore"),
-        ]
-
-        best = None
-        best_len = 10**9
-        for v in poc_variants:
-            if not v:
-                continue
-            if len(v) < best_len:
-                best_len = len(v)
-                best = v
-
-        if best is None:
-            return None
-        return best[:4096]
+            # Last resort: return a multi-pattern payload (not too large)
+            fallback = (
+                b"(a,b,c,d,e,f,g,h,i,j);\n"
+                b'{"a":1,"a":2}\n'
+                + self._gen_cmd_script(cmd_add)
+                + b"<a><b></b><b></b><b></b><b></b></a>\n"
+            )
+            if len(fallback) < 60:
+                fallback = (fallback * (60 // max(1, len(fallback)) + 1))[:60]
+            return fallback[:512]

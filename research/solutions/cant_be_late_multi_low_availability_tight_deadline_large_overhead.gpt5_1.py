@@ -1,13 +1,12 @@
 import json
 from argparse import Namespace
-from typing import List, Optional
 
 from sky_spot.strategies.multi_strategy import MultiRegionStrategy
 from sky_spot.utils import ClusterType
 
 
 class Solution(MultiRegionStrategy):
-    NAME = "cant_be_late_mr_budget_v2"
+    NAME = "cant_be_late_v1"
 
     def solve(self, spec_path: str) -> "Solution":
         with open(spec_path) as f:
@@ -20,123 +19,118 @@ class Solution(MultiRegionStrategy):
             inter_task_overhead=[0.0],
         )
         super().__init__(args)
-
-        # Strategy state initialization
+        # Internal state (initialized on first _step call)
         self._initialized = False
-        self._done_sum_cache = 0.0
-        self._done_len_cache = 0
-        self._committed_to_od = False
-        self._region_stats = []
-        self._region_last_good: List[float] = []
-        self._last_rotate_at = -1.0
-        self._rotate_index = 0
-        self._last_region = None
         return self
 
-    def _init_runtime(self):
-        if self._initialized:
-            return
+    def _init_run_state(self):
+        # Called at the beginning of each scenario/run
         self._initialized = True
+        self._progress_sum = 0.0
+        self._progress_len = 0
+        self._last_elapsed = self.env.elapsed_seconds
+        self._committed_to_od = False
+        # Round-robin region rotation pointer
         try:
-            num_regions = self.env.get_num_regions()
+            cur = self.env.get_current_region()
         except Exception:
-            num_regions = 1
-        self._num_regions = max(1, int(num_regions))
+            cur = 0
+        self._rr_next_region = cur
+        self._last_region = cur
+
+    def _update_progress_sum(self):
+        # Incremental update to avoid O(n) sum at each step
+        if self._progress_len < len(self.task_done_time):
+            # Sum only new entries
+            new_items = self.task_done_time[self._progress_len :]
+            if new_items:
+                self._progress_sum += float(sum(new_items))
+                self._progress_len = len(self.task_done_time)
+
+    def _maybe_reset_state(self):
+        # Detect new run by elapsed time going backwards or zero with empty progress
+        if not self._initialized:
+            self._init_run_state()
+            return
+        if self.env.elapsed_seconds < self._last_elapsed:
+            self._init_run_state()
+
+    def _safe_to_wait_one_step(self, time_left, remaining, extra_margin):
+        # Check if it's safe to spend one step waiting (NONE) and still be able to
+        # finish on OD afterwards (including one restart overhead).
+        # After waiting one step, time_left' = time_left - gap_seconds
+        # We require: time_left - gap_seconds >= remaining + restart_overhead + extra_margin
+        return (time_left - self.env.gap_seconds) >= (remaining + self.restart_overhead + extra_margin)
+
+    def _commit_needed(self, time_left, remaining, extra_margin):
+        # Commit to OD if time left is tight relative to remaining work
+        # Condition: time_left <= remaining + restart_overhead + extra_margin
+        return time_left <= (remaining + self.restart_overhead + extra_margin)
+
+    def _rotate_region_on_wait(self):
+        # Rotate to next region in round-robin order when waiting for Spot
         try:
-            current_region = self.env.get_current_region()
+            n = self.env.get_num_regions()
         except Exception:
-            current_region = 0
-        self._rotate_index = current_region if 0 <= current_region < self._num_regions else 0
-        self._last_region = current_region
-        self._region_stats = [{'success': 0, 'fail': 0} for _ in range(self._num_regions)]
-        self._region_last_good = [-1.0 for _ in range(self._num_regions)]
-        self._gap = float(getattr(self.env, 'gap_seconds', 1.0))
-        # Small buffer to avoid tight edge at deadline; tuned for safety without being too aggressive
-        self._base_buffer = max(30.0, min(self._gap * 1.0, self.restart_overhead * 0.5))
+            n = 1
+        if n <= 1:
+            return  # Nothing to do
+        cur = self.env.get_current_region()
+        # Initialize next pointer if out of range
+        if not isinstance(self._rr_next_region, int) or not (0 <= self._rr_next_region < n):
+            self._rr_next_region = cur
 
-    def _update_done_cache(self):
-        if self._done_len_cache != len(self.task_done_time):
-            for i in range(self._done_len_cache, len(self.task_done_time)):
-                self._done_sum_cache += float(self.task_done_time[i])
-            self._done_len_cache = len(self.task_done_time)
-
-    def _remaining_work(self) -> float:
-        self._update_done_cache()
-        remaining = self.task_duration - self._done_sum_cache
-        return max(0.0, remaining)
-
-    def _remaining_time(self) -> float:
-        return max(0.0, self.deadline - float(self.env.elapsed_seconds))
-
-    def _choose_next_region(self, current_region: int) -> int:
-        # If only one region, do not switch
-        if self._num_regions <= 1:
-            return current_region
-
-        # Prefer region with most recent success, else simple round-robin
-        # Time window weight is small; this is a heuristic
-        now = float(self.env.elapsed_seconds)
-        best_region = current_region
-        best_time = -1.0
-        for idx in range(self._num_regions):
-            last_good = self._region_last_good[idx]
-            if last_good > best_time and idx != current_region:
-                best_time = last_good
-                best_region = idx
-
-        # If no region has any recent success recorded, rotate round-robin
-        if best_time < 0:
-            nxt = (current_region + 1) % self._num_regions
-            return nxt
-        return best_region
-
-    def _commit_check(self) -> bool:
-        # Decide to permanently switch to On-Demand to guarantee completion
-        remaining_work = self._remaining_work()
-        remaining_time = self._remaining_time()
-        # We need at least (overhead + remaining_work + buffer) seconds to safely finish on OD.
-        needed = self.restart_overhead + remaining_work + self._base_buffer
-        return remaining_time <= needed
+        # Choose next different region
+        nxt = (cur + 1) % n
+        if nxt == cur:
+            return
+        self.env.switch_region(nxt)
+        self._rr_next_region = (nxt + 1) % n
+        self._last_region = nxt
 
     def _step(self, last_cluster_type: ClusterType, has_spot: bool) -> ClusterType:
-        self._init_runtime()
+        self._maybe_reset_state()
 
-        # Update region stats based on current has_spot observation
-        try:
-            current_region = self.env.get_current_region()
-        except Exception:
-            current_region = 0
-        self._last_region = current_region
+        # Maintain incremental progress sum
+        self._update_progress_sum()
 
-        if has_spot:
-            self._region_stats[current_region]['success'] += 1
-            self._region_last_good[current_region] = float(self.env.elapsed_seconds)
-        else:
-            self._region_stats[current_region]['fail'] += 1
+        # Cache elapsed for next reset detection
+        self._last_elapsed = self.env.elapsed_seconds
 
-        # If already committed to OD, keep using OD to avoid additional overheads and risks.
+        # Compute remaining work and time left
+        remaining = max(self.task_duration - self._progress_sum, 0.0)
+        time_left = max(self.deadline - self.env.elapsed_seconds, 0.0)
+
+        # If job already done (safety)
+        if remaining <= 0.0:
+            return ClusterType.NONE
+
+        # Safety extra margins
+        # Commit buffer encourages earlier switch to OD to guarantee finish.
+        # We use one gap as buffer to cover discrete steps plus a small extra.
+        commit_extra_margin = self.env.gap_seconds * 1.0
+        wait_extra_margin = self.env.gap_seconds * 0.2
+
+        # If already committed to OD, keep using OD until finish
         if self._committed_to_od:
             return ClusterType.ON_DEMAND
 
-        # If we must commit now to ensure finishing before deadline
-        if self._commit_check():
+        # Decide if we should commit to OD right now
+        # Even if spot is available, if the remaining time is tight, commit to OD to guarantee finish.
+        if self._commit_needed(time_left, remaining, commit_extra_margin):
             self._committed_to_od = True
             return ClusterType.ON_DEMAND
 
-        # If Spot is available, use it.
+        # If Spot is available, use it to save cost
         if has_spot:
             return ClusterType.SPOT
 
-        # Spot not available and we still have slack: pause and switch region to hunt for spot next step.
-        next_region = self._choose_next_region(current_region)
-        if next_region != current_region:
-            try:
-                self.env.switch_region(next_region)
-                self._last_rotate_at = float(self.env.elapsed_seconds)
-                self._rotate_index = next_region
-            except Exception:
-                # If switch fails for any reason, just continue without switching
-                pass
+        # Spot not available: decide whether to wait for spot (NONE) or commit to OD
+        # If it's not safe to wait one step and still finish on OD, commit now
+        if not self._safe_to_wait_one_step(time_left, remaining, wait_extra_margin):
+            self._committed_to_od = True
+            return ClusterType.ON_DEMAND
 
-        # Wait for spot; no cost while we have slack
+        # Safe to wait; rotate region to try another spot market
+        self._rotate_region_on_wait()
         return ClusterType.NONE

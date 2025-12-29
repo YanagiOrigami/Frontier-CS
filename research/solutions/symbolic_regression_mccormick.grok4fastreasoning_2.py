@@ -8,7 +8,7 @@ class Solution:
     def solve(self, X: np.ndarray, y: np.ndarray) -> dict:
         model = PySRRegressor(
             niterations=40,
-            binary_operators=["+", "-", "*", "/"],
+            binary_operators=["+", "-", "*", "/", "**"],
             unary_operators=["sin", "cos", "exp", "log"],
             populations=15,
             population_size=33,
@@ -22,10 +22,14 @@ class Solution:
         best_expr = model.sympy()
         expression = str(best_expr)
 
-        predictions = model.predict(X)
+        predictions = model.predict(X).tolist()
+
+        details = {
+            "complexity": int(model.equations_['complexity'].iloc[0])
+        }
 
         return {
             "expression": expression,
-            "predictions": predictions.tolist(),
-            "details": {}
+            "predictions": predictions,
+            "details": details
         }

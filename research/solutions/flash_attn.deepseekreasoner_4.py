@@ -1,300 +1,168 @@
 import torch
 import triton
 import triton.language as tl
+from typing import Optional
 
 @triton.jit
-def _flash_attn_fwd_kernel(
-    Q, K, V, Out,
+def _fwd_kernel(
+    Q_ptr, K_ptr, V_ptr, O_ptr,
     stride_qz, stride_qh, stride_qm, stride_qd,
     stride_kz, stride_kh, stride_kn, stride_kd,
     stride_vz, stride_vh, stride_vn, stride_vd,
     stride_oz, stride_oh, stride_om, stride_od,
     Z, H, M, N, Dq, Dv,
-    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_D: tl.constexpr,
+    scale: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_D: tl.constexpr,
     CAUSAL: tl.constexpr,
-    IS_TRAINING: tl.constexpr
+    USE_BLOCK_PTR: tl.constexpr
 ):
-    # -----------------------------------------------------------
-    # Program ID
-    pid_z = tl.program_id(0)  # batch
-    pid_h = tl.program_id(1)  # head
-    pid_m = tl.program_id(2)  # query block idx
-
-    # -----------------------------------------------------------
-    # Create block pointers for Q
-    q_offset = pid_z * stride_qz + pid_h * stride_qh
-    q_ptrs = Q + q_offset + (pid_m * BLOCK_M + tl.arange(0, BLOCK_M))[:, None] * stride_qm + tl.arange(0, BLOCK_D)[None, :] * stride_qd
+    pid_bh = tl.program_id(0)
+    pid_m = tl.program_id(1)
     
-    # -----------------------------------------------------------
-    # Initialize pointers to K, V
-    k_offset = pid_z * stride_kz + pid_h * stride_kh
-    v_offset = pid_z * stride_vz + pid_h * stride_vh
+    batch_id = pid_bh // H
+    head_id = pid_bh % H
     
-    # -----------------------------------------------------------
-    # Initialize accumulator and stats
-    o = tl.zeros([BLOCK_M, BLOCK_D], dtype=tl.float32)
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = tl.arange(0, BLOCK_N)
+    offs_dq = tl.arange(0, BLOCK_D)
+    offs_dv = tl.arange(0, BLOCK_D)
+    
+    q_offset = batch_id * stride_qz + head_id * stride_qh
+    k_offset = batch_id * stride_kz + head_id * stride_kh
+    v_offset = batch_id * stride_vz + head_id * stride_vh
+    o_offset = batch_id * stride_oz + head_id * stride_oh
+    
+    if USE_BLOCK_PTR:
+        q_block_ptr = tl.make_block_ptr(
+            base=Q_ptr + q_offset,
+            shape=(M, Dq),
+            strides=(stride_qm, stride_qd),
+            offsets=(pid_m * BLOCK_M, 0),
+            block_shape=(BLOCK_M, BLOCK_D),
+            order=(1, 0)
+        )
+        q = tl.load(q_block_ptr, boundary_check=(0, 1))
+    else:
+        q_ptrs = Q_ptr + q_offset + offs_m[:, None] * stride_qm + offs_dq[None, :] * stride_qd
+        q = tl.load(q_ptrs, mask=offs_m[:, None] < M, other=0.0)
+    
     m_i = tl.full([BLOCK_M], float('-inf'), dtype=tl.float32)
     l_i = tl.zeros([BLOCK_M], dtype=tl.float32)
+    o_i = tl.zeros([BLOCK_M, BLOCK_D], dtype=tl.float32)
     
-    # -----------------------------------------------------------
-    # Load Q block
-    q = tl.load(q_ptrs, mask=(pid_m * BLOCK_M + tl.arange(0, BLOCK_M))[:, None] < M, other=0.0)
-    q = q.to(tl.float32)
+    num_n_blocks = tl.cdiv(N, BLOCK_N)
     
-    scale = 1.0 / tl.sqrt(Dq)
-    q = q * scale
-    
-    # -----------------------------------------------------------
-    # Loop over K, V blocks
-    lo = 0
-    hi = N
-    for block_n in range(lo, hi, BLOCK_N):
-        # -------------------------------------------------------
-        # Compute K block pointer and load K
-        k_ptrs = K + k_offset + (block_n + tl.arange(0, BLOCK_N))[:, None] * stride_kn + tl.arange(0, BLOCK_D)[None, :] * stride_kd
-        k = tl.load(k_ptrs, mask=(block_n + tl.arange(0, BLOCK_N))[:, None] < N, other=0.0)
-        k = k.to(tl.float32)
+    for n_block_id in range(num_n_blocks):
+        n_start = n_block_id * BLOCK_N
         
-        # -------------------------------------------------------
-        # Compute QK^T
-        s = tl.dot(q, tl.trans(k))
+        if USE_BLOCK_PTR:
+            k_block_ptr = tl.make_block_ptr(
+                base=K_ptr + k_offset,
+                shape=(N, Dq),
+                strides=(stride_kn, stride_kd),
+                offsets=(n_start, 0),
+                block_shape=(BLOCK_N, BLOCK_D),
+                order=(1, 0)
+            )
+            v_block_ptr = tl.make_block_ptr(
+                base=V_ptr + v_offset,
+                shape=(N, Dv),
+                strides=(stride_vn, stride_vd),
+                offsets=(n_start, 0),
+                block_shape=(BLOCK_N, BLOCK_D),
+                order=(1, 0)
+            )
+            k = tl.load(k_block_ptr, boundary_check=(0, 1))
+            v = tl.load(v_block_ptr, boundary_check=(0, 1))
+        else:
+            n_offs = n_start + offs_n
+            k_ptrs = K_ptr + k_offset + n_offs[:, None] * stride_kn + offs_dq[None, :] * stride_kd
+            v_ptrs = V_ptr + v_offset + n_offs[:, None] * stride_vn + offs_dv[None, :] * stride_vd
+            k = tl.load(k_ptrs, mask=n_offs[:, None] < N, other=0.0)
+            v = tl.load(v_ptrs, mask=n_offs[:, None] < N, other=0.0)
         
-        # -------------------------------------------------------
-        # Apply causal masking if needed
+        s_ij = tl.dot(q, tl.trans(k))
+        s_ij = s_ij * scale
+        
         if CAUSAL:
-            q_idx = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
-            k_idx = block_n + tl.arange(0, BLOCK_N)
-            mask = q_idx[:, None] >= k_idx[None, :]
-            s = tl.where(mask, s, float('-inf'))
+            m_offs = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+            n_offs = n_start + offs_n
+            mask = m_offs[:, None] >= n_offs[None, :]
+            s_ij = tl.where(mask, s_ij, float('-inf'))
         
-        # -------------------------------------------------------
-        # Compute statistics for this block
-        m_ij = tl.max(s, axis=1)
-        p = tl.exp(s - m_ij[:, None])
+        m_ij = tl.max(s_ij, 1)
+        m_ij = tl.maximum(m_i, m_ij)
         
-        # -------------------------------------------------------
-        # Update accumulator and stats
-        m_new = tl.maximum(m_i, m_ij)
-        alpha = tl.exp(m_i - m_new)
-        beta = tl.exp(m_ij - m_new)
+        p_ij = tl.exp(s_ij - m_ij[:, None])
         
-        l_i = l_i * alpha + tl.sum(p * beta[:, None], axis=1)
+        l_ij = tl.sum(p_ij, 1)
+        alpha = tl.exp(m_i - m_ij)
+        l_i = l_i * alpha + l_ij
         
-        # Load V block
-        v_ptrs = V + v_offset + (block_n + tl.arange(0, BLOCK_N))[:, None] * stride_vn + tl.arange(0, BLOCK_D)[None, :] * stride_vd
-        v = tl.load(v_ptrs, mask=(block_n + tl.arange(0, BLOCK_N))[:, None] < N, other=0.0)
-        v = v.to(tl.float32)
+        o_i = o_i * alpha[:, None] + tl.dot(p_ij.to(v.dtype), v)
         
-        # Update output accumulator
-        o = o * alpha[:, None] + tl.dot(p.to(tl.float32), v) * beta[:, None]
-        m_i = m_new
+        m_i = m_ij
     
-    # -----------------------------------------------------------
-    # Write output
-    o = o / l_i[:, None]
-    o = o.to(tl.float16)
+    o_i = o_i / l_i[:, None]
     
-    out_offset = pid_z * stride_oz + pid_h * stride_oh
-    out_ptrs = Out + out_offset + (pid_m * BLOCK_M + tl.arange(0, BLOCK_M))[:, None] * stride_om + tl.arange(0, BLOCK_D)[None, :] * stride_od
-    tl.store(out_ptrs, o, mask=(pid_m * BLOCK_M + tl.arange(0, BLOCK_M))[:, None] < M)
+    if USE_BLOCK_PTR:
+        o_block_ptr = tl.make_block_ptr(
+            base=O_ptr + o_offset,
+            shape=(M, Dv),
+            strides=(stride_om, stride_od),
+            offsets=(pid_m * BLOCK_M, 0),
+            block_shape=(BLOCK_M, BLOCK_D),
+            order=(1, 0)
+        )
+        tl.store(o_block_ptr, o_i, boundary_check=(0, 1))
+    else:
+        o_ptrs = O_ptr + o_offset + offs_m[:, None] * stride_om + offs_dv[None, :] * stride_od
+        tl.store(o_ptrs, o_i, mask=offs_m[:, None] < M)
 
 def flash_attn(Q: torch.Tensor, K: torch.Tensor, V: torch.Tensor, causal: bool = True) -> torch.Tensor:
-    """
-    Flash attention computation with optional causal masking.
-    
-    Args:
-        Q: Input tensor of shape (Z, H, M, Dq) - query tensor (float16)
-        K: Input tensor of shape (Z, H, N, Dq) - key tensor (float16)
-        V: Input tensor of shape (Z, H, N, Dv) - value tensor (float16)
-        causal: Whether to apply causal masking (default True)
-    
-    Returns:
-        Output tensor of shape (Z, H, M, Dv) - attention output (float16)
-    """
-    assert Q.dtype == torch.float16
-    assert K.dtype == torch.float16
-    assert V.dtype == torch.float16
-    assert Q.is_cuda and K.is_cuda and V.is_cuda
-    
     Z, H, M, Dq = Q.shape
-    _, _, N, _ = K.shape
-    _, _, _, Dv = V.shape
+    N = K.shape[2]
+    Dv = V.shape[3]
     
-    # Allocate output
-    Out = torch.empty((Z, H, M, Dv), device=Q.device, dtype=torch.float16)
+    assert K.shape[0] == Z and K.shape[1] == H and K.shape[3] == Dq
+    assert V.shape[0] == Z and V.shape[1] == H and V.shape[2] == N
     
-    # Choose kernel parameters
-    BLOCK_M = 128 if M >= 2048 else 64
+    scale = 1.0 / (Dq ** 0.5)
+    O = torch.empty((Z, H, M, Dv), device=Q.device, dtype=Q.dtype)
+    
+    BLOCK_M = 128
     BLOCK_N = 64
-    BLOCK_D = min(64, Dq, Dv)
+    BLOCK_D = 64 if Dq <= 64 else 128
     
-    # Ensure divisibility
-    while Dq % BLOCK_D != 0 or Dv % BLOCK_D != 0:
-        BLOCK_D //= 2
-    BLOCK_D = max(BLOCK_D, 16)
+    grid = (Z * H, triton.cdiv(M, BLOCK_M))
     
-    # Compute grid
-    grid = (Z, H, triton.cdiv(M, BLOCK_M))
+    use_block_ptr = M >= 512 and N >= 512
     
-    # Launch kernel
-    _flash_attn_fwd_kernel[grid](
-        Q, K, V, Out,
+    _fwd_kernel[grid](
+        Q, K, V, O,
         Q.stride(0), Q.stride(1), Q.stride(2), Q.stride(3),
         K.stride(0), K.stride(1), K.stride(2), K.stride(3),
         V.stride(0), V.stride(1), V.stride(2), V.stride(3),
-        Out.stride(0), Out.stride(1), Out.stride(2), Out.stride(3),
+        O.stride(0), O.stride(1), O.stride(2), O.stride(3),
         Z, H, M, N, Dq, Dv,
-        BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_D=BLOCK_D,
+        scale,
+        BLOCK_M=BLOCK_M,
+        BLOCK_N=BLOCK_N,
+        BLOCK_D=BLOCK_D,
         CAUSAL=causal,
-        IS_TRAINING=False,
-        num_warps=8 if BLOCK_D >= 64 else 4,
-        num_stages=3
+        USE_BLOCK_PTR=use_block_ptr,
+        num_stages=3,
+        num_warps=4
     )
     
-    return Out
+    return O
 
 class Solution:
     def solve(self, spec_path: str = None) -> dict:
-        return {"code": """import torch
-import triton
-import triton.language as tl
-
-@triton.jit
-def _flash_attn_fwd_kernel(
-    Q, K, V, Out,
-    stride_qz, stride_qh, stride_qm, stride_qd,
-    stride_kz, stride_kh, stride_kn, stride_kd,
-    stride_vz, stride_vh, stride_vn, stride_vd,
-    stride_oz, stride_oh, stride_om, stride_od,
-    Z, H, M, N, Dq, Dv,
-    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_D: tl.constexpr,
-    CAUSAL: tl.constexpr,
-    IS_TRAINING: tl.constexpr
-):
-    # -----------------------------------------------------------
-    # Program ID
-    pid_z = tl.program_id(0)  # batch
-    pid_h = tl.program_id(1)  # head
-    pid_m = tl.program_id(2)  # query block idx
-
-    # -----------------------------------------------------------
-    # Create block pointers for Q
-    q_offset = pid_z * stride_qz + pid_h * stride_qh
-    q_ptrs = Q + q_offset + (pid_m * BLOCK_M + tl.arange(0, BLOCK_M))[:, None] * stride_qm + tl.arange(0, BLOCK_D)[None, :] * stride_qd
+        return {"code": self._get_code()}
     
-    # -----------------------------------------------------------
-    # Initialize pointers to K, V
-    k_offset = pid_z * stride_kz + pid_h * stride_kh
-    v_offset = pid_z * stride_vz + pid_h * stride_vh
-    
-    # -----------------------------------------------------------
-    # Initialize accumulator and stats
-    o = tl.zeros([BLOCK_M, BLOCK_D], dtype=tl.float32)
-    m_i = tl.full([BLOCK_M], float('-inf'), dtype=tl.float32)
-    l_i = tl.zeros([BLOCK_M], dtype=tl.float32)
-    
-    # -----------------------------------------------------------
-    # Load Q block
-    q = tl.load(q_ptrs, mask=(pid_m * BLOCK_M + tl.arange(0, BLOCK_M))[:, None] < M, other=0.0)
-    q = q.to(tl.float32)
-    
-    scale = 1.0 / tl.sqrt(Dq)
-    q = q * scale
-    
-    # -----------------------------------------------------------
-    # Loop over K, V blocks
-    lo = 0
-    hi = N
-    for block_n in range(lo, hi, BLOCK_N):
-        # -------------------------------------------------------
-        # Compute K block pointer and load K
-        k_ptrs = K + k_offset + (block_n + tl.arange(0, BLOCK_N))[:, None] * stride_kn + tl.arange(0, BLOCK_D)[None, :] * stride_kd
-        k = tl.load(k_ptrs, mask=(block_n + tl.arange(0, BLOCK_N))[:, None] < N, other=0.0)
-        k = k.to(tl.float32)
-        
-        # -------------------------------------------------------
-        # Compute QK^T
-        s = tl.dot(q, tl.trans(k))
-        
-        # -------------------------------------------------------
-        # Apply causal masking if needed
-        if CAUSAL:
-            q_idx = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
-            k_idx = block_n + tl.arange(0, BLOCK_N)
-            mask = q_idx[:, None] >= k_idx[None, :]
-            s = tl.where(mask, s, float('-inf'))
-        
-        # -------------------------------------------------------
-        # Compute statistics for this block
-        m_ij = tl.max(s, axis=1)
-        p = tl.exp(s - m_ij[:, None])
-        
-        # -------------------------------------------------------
-        # Update accumulator and stats
-        m_new = tl.maximum(m_i, m_ij)
-        alpha = tl.exp(m_i - m_new)
-        beta = tl.exp(m_ij - m_new)
-        
-        l_i = l_i * alpha + tl.sum(p * beta[:, None], axis=1)
-        
-        # Load V block
-        v_ptrs = V + v_offset + (block_n + tl.arange(0, BLOCK_N))[:, None] * stride_vn + tl.arange(0, BLOCK_D)[None, :] * stride_vd
-        v = tl.load(v_ptrs, mask=(block_n + tl.arange(0, BLOCK_N))[:, None] < N, other=0.0)
-        v = v.to(tl.float32)
-        
-        # Update output accumulator
-        o = o * alpha[:, None] + tl.dot(p.to(tl.float32), v) * beta[:, None]
-        m_i = m_new
-    
-    # -----------------------------------------------------------
-    # Write output
-    o = o / l_i[:, None]
-    o = o.to(tl.float16)
-    
-    out_offset = pid_z * stride_oz + pid_h * stride_oh
-    out_ptrs = Out + out_offset + (pid_m * BLOCK_M + tl.arange(0, BLOCK_M))[:, None] * stride_om + tl.arange(0, BLOCK_D)[None, :] * stride_od
-    tl.store(out_ptrs, o, mask=(pid_m * BLOCK_M + tl.arange(0, BLOCK_M))[:, None] < M)
-
-def flash_attn(Q: torch.Tensor, K: torch.Tensor, V: torch.Tensor, causal: bool = True) -> torch.Tensor:
-    assert Q.dtype == torch.float16
-    assert K.dtype == torch.float16
-    assert V.dtype == torch.float16
-    assert Q.is_cuda and K.is_cuda and V.is_cuda
-    
-    Z, H, M, Dq = Q.shape
-    _, _, N, _ = K.shape
-    _, _, _, Dv = V.shape
-    
-    # Allocate output
-    Out = torch.empty((Z, H, M, Dv), device=Q.device, dtype=torch.float16)
-    
-    # Choose kernel parameters
-    BLOCK_M = 128 if M >= 2048 else 64
-    BLOCK_N = 64
-    BLOCK_D = min(64, Dq, Dv)
-    
-    # Ensure divisibility
-    while Dq % BLOCK_D != 0 or Dv % BLOCK_D != 0:
-        BLOCK_D //= 2
-    BLOCK_D = max(BLOCK_D, 16)
-    
-    # Compute grid
-    grid = (Z, H, triton.cdiv(M, BLOCK_M))
-    
-    # Launch kernel
-    _flash_attn_fwd_kernel[grid](
-        Q, K, V, Out,
-        Q.stride(0), Q.stride(1), Q.stride(2), Q.stride(3),
-        K.stride(0), K.stride(1), K.stride(2), K.stride(3),
-        V.stride(0), V.stride(1), V.stride(2), V.stride(3),
-        Out.stride(0), Out.stride(1), Out.stride(2), Out.stride(3),
-        Z, H, M, N, Dq, Dv,
-        BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_D=BLOCK_D,
-        CAUSAL=causal,
-        IS_TRAINING=False,
-        num_warps=8 if BLOCK_D >= 64 else 4,
-        num_stages=3
-    )
-    
-    return Out
-"""}
+    def _get_code(self) -> str:
+        import inspect
+        return inspect.getsource(flash_attn)

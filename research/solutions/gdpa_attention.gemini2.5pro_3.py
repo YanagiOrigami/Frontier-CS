@@ -1,128 +1,120 @@
 import torch
 import triton
 import triton.language as tl
+import math
 
-class Solution:
-    def solve(self, spec_path: str = None) -> dict:
-        gdpa_attn_code = """
+_GDPA_ATTN_KERNEL_CODE = """
 import torch
 import triton
 import triton.language as tl
+import math
 
 @triton.autotune(
     configs=[
-        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 64, 'num_stages': 2, 'num_warps': 4}),
-        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 32, 'num_stages': 2, 'num_warps': 4}),
-        triton.Config({'BLOCK_M': 32, 'BLOCK_N': 128, 'num_stages': 2, 'num_warps': 4}),
-        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 64, 'num_stages': 3, 'num_warps': 8}),
-        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 128, 'num_stages': 3, 'num_warps': 8}),
-        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'num_stages': 3, 'num_warps': 8}),
-        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 64, 'num_stages': 4, 'num_warps': 8}),
-        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 128, 'num_stages': 4, 'num_warps': 8}),
-        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'num_stages': 4, 'num_warps': 8}),
-        triton.Config({'BLOCK_M': 256, 'BLOCK_N': 64, 'num_stages': 3, 'num_warps': 8}),
-        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 256, 'num_stages': 3, 'num_warps': 8}),
-        triton.Config({'BLOCK_M': 256, 'BLOCK_N': 128, 'num_stages': 2, 'num_warps': 8}),
-        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 256, 'num_stages': 2, 'num_warps': 8}),
+        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 64, 'BLOCK_Dq': 64, 'BLOCK_Dv': 64}, num_stages=4, num_warps=4),
+        triton.Config({'BLOCK_M': 256, 'BLOCK_N': 64, 'BLOCK_Dq': 64, 'BLOCK_Dv': 64}, num_stages=3, num_warps=8),
+        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 256, 'BLOCK_Dq': 64, 'BLOCK_Dv': 64}, num_stages=3, num_warps=8),
+        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_Dq': 64, 'BLOCK_Dv': 64}, num_stages=3, num_warps=8),
+        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 64, 'BLOCK_Dq': 64, 'BLOCK_Dv': 64}, num_stages=3, num_warps=8),
+        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 128, 'BLOCK_Dq': 64, 'BLOCK_Dv': 64}, num_stages=4, num_warps=4),
+        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 32, 'BLOCK_Dq': 64, 'BLOCK_Dv': 64}, num_stages=5, num_warps=4),
+        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 32, 'BLOCK_Dq': 64, 'BLOCK_Dv': 64}, num_stages=5, num_warps=4),
+        triton.Config({'BLOCK_M': 256, 'BLOCK_N': 128, 'BLOCK_Dq': 64, 'BLOCK_Dv': 64}, num_stages=3, num_warps=8),
     ],
     key=['M', 'N', 'Dq', 'Dv'],
 )
 @triton.jit
-def _gdpa_attn_kernel(
+def _gdpa_forward_kernel(
     Q_ptr, K_ptr, V_ptr, GQ_ptr, GK_ptr, O_ptr,
-    stride_qz, stride_qh, stride_qm, stride_qd,
-    stride_kz, stride_kh, stride_kn, stride_kd,
-    stride_vz, stride_vh, stride_vn, stride_vd,
-    stride_gqz, stride_gqh, stride_gqm, stride_gqd,
-    stride_gkz, stride_gkh, stride_gkn, stride_gkd,
-    stride_oz, stride_oh, stride_om, stride_od,
+    q_stride_z, q_stride_h, q_stride_m, q_stride_d,
+    k_stride_z, k_stride_h, k_stride_n, k_stride_d,
+    v_stride_z, v_stride_h, v_stride_n, v_stride_d,
+    gq_stride_z, gq_stride_h, gq_stride_m, gq_stride_d,
+    gk_stride_z, gk_stride_h, gk_stride_n, gk_stride_d,
+    o_stride_z, o_stride_h, o_stride_m, o_stride_d,
     Z, H, M, N,
     Dq, Dv,
-    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_Dq: tl.constexpr, BLOCK_Dv: tl.constexpr,
+    scale,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
+    BLOCK_Dq: tl.constexpr, BLOCK_Dv: tl.constexpr
 ):
-    start_m = tl.program_id(0)
+    pid_m = tl.program_id(0)
     pid_zh = tl.program_id(1)
-
-    offs_qm = start_m * BLOCK_M + tl.arange(0, BLOCK_M)
-    offs_n = tl.arange(0, BLOCK_N)
-    offs_d_qk = tl.arange(0, BLOCK_Dq)
-    offs_d_v = tl.arange(0, BLOCK_Dv)
-
+    
     pid_z = pid_zh // H
     pid_h = pid_zh % H
 
-    Q_ptr += pid_z * stride_qz + pid_h * stride_qh
-    K_ptr += pid_z * stride_kz + pid_h * stride_kh
-    V_ptr += pid_z * stride_vz + pid_h * stride_vh
-    GQ_ptr += pid_z * stride_gqz + pid_h * stride_gqh
-    GK_ptr += pid_z * stride_gkz + pid_h * stride_gkh
-    O_ptr += pid_z * stride_oz + pid_h * stride_oh
+    Q_ptr += pid_z * q_stride_z + pid_h * q_stride_h
+    K_ptr += pid_z * k_stride_z + pid_h * k_stride_h
+    V_ptr += pid_z * v_stride_z + pid_h * v_stride_h
+    GQ_ptr += pid_z * gq_stride_z + pid_h * gq_stride_h
+    GK_ptr += pid_z * gk_stride_z + pid_h * gk_stride_h
+    O_ptr += pid_z * o_stride_z + pid_h * o_stride_h
 
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_d_q = tl.arange(0, BLOCK_Dq)
+    offs_d_v = tl.arange(0, BLOCK_Dv)
+    
+    q_ptrs = Q_ptr + (offs_m[:, None] * q_stride_m + offs_d_q[None, :] * q_stride_d)
+    gq_ptrs = GQ_ptr + (offs_m[:, None] * gq_stride_m + offs_d_q[None, :] * gq_stride_d)
+    
+    m_mask = offs_m < M
+    q = tl.load(q_ptrs, mask=m_mask[:, None], other=0.0)
+    gq = tl.load(gq_ptrs, mask=m_mask[:, None], other=0.0)
+    qg = (q * tl.sigmoid(gq.to(tl.float32))).to(q.dtype)
+    
     acc = tl.zeros([BLOCK_M, BLOCK_Dv], dtype=tl.float32)
-    m_i = tl.full([BLOCK_M], -float('inf'), dtype=tl.float32)
+    m_i = tl.zeros([BLOCK_M], dtype=tl.float32) - float('inf')
     l_i = tl.zeros([BLOCK_M], dtype=tl.float32)
 
-    q_ptrs = Q_ptr + (offs_qm[:, None] * stride_qm + offs_d_qk[None, :] * stride_qd)
-    gq_ptrs = GQ_ptr + (offs_qm[:, None] * stride_gqm + offs_d_qk[None, :] * stride_gqd)
-    
-    mask_qm = offs_qm[:, None] < M
-    q = tl.load(q_ptrs, mask=mask_qm, other=0.0)
-    gq = tl.load(gq_ptrs, mask=mask_qm, other=0.0)
-
-    q_gated = q * tl.sigmoid(gq.to(tl.float32))
-    scale = Dq**-0.5
-    q_scaled = (q_gated * scale).to(q.dtype)
-
     for start_n in range(0, N, BLOCK_N):
-        offs_kn = start_n + offs_n
-        mask_kn = offs_kn < N
+        offs_n = start_n + tl.arange(0, BLOCK_N)
+        n_mask = offs_n < N
 
-        k_ptrs = K_ptr + (offs_kn[None, :] * stride_kn + offs_d_qk[:, None] * stride_kd)
-        gk_ptrs = GK_ptr + (offs_kn[None, :] * stride_gkn + offs_d_qk[:, None] * stride_gkd)
-        
-        k = tl.load(k_ptrs, mask=mask_kn[None, :], other=0.0)
-        gk = tl.load(gk_ptrs, mask=mask_kn[None, :], other=0.0)
-        
-        k_gated = k * tl.sigmoid(gk.to(tl.float32))
+        k_ptrs = K_ptr + (offs_n[None, :] * k_stride_n + offs_d_q[:, None] * k_stride_d)
+        gk_ptrs = GK_ptr + (offs_n[None, :] * gk_stride_n + offs_d_q[:, None] * gk_stride_d)
+        v_ptrs = V_ptr + (offs_n[:, None] * v_stride_n + offs_d_v[None, :] * v_stride_d)
 
-        s = tl.dot(q_scaled, k_gated, allow_tf32=True)
-        s += tl.where(mask_kn[None, :], 0, -float('inf'))
+        k = tl.load(k_ptrs, mask=n_mask[None, :], other=0.0)
+        gk = tl.load(gk_ptrs, mask=n_mask[None, :], other=0.0)
+        kg = (k * tl.sigmoid(gk.to(tl.float32))).to(k.dtype)
+        
+        v = tl.load(v_ptrs, mask=n_mask[:, None], other=0.0)
 
-        m_ij = tl.max(s, 1)
-        p = tl.exp(s - m_ij[:, None])
-        l_ij = tl.sum(p, 1)
+        s = tl.dot(qg, kg) * scale
+        s = tl.where(n_mask[None, :], s, -float('inf'))
 
-        m_new = tl.maximum(m_i, m_ij)
-        alpha = tl.exp(m_i - m_new)
-        beta = tl.exp(m_ij - m_new)
+        m_i_new = tl.maximum(m_i, tl.max(s, 1))
+        p_new = tl.exp(s - m_i_new[:, None])
+        alpha = tl.exp(m_i - m_i_new)
         
-        l_new = alpha * l_i + beta * l_ij
+        l_i = alpha * l_i + tl.sum(p_new, 1)
         
-        acc_scaled = acc * (alpha / l_new)[:, None]
+        acc = acc * alpha[:, None]
         
-        p_scaled = p * (beta / l_new)[:, None]
+        p_new = p_new.to(v.dtype)
+        acc += tl.dot(p_new, v)
         
-        v_ptrs = V_ptr + (offs_kn[:, None] * stride_vn + offs_d_v[None, :] * stride_vd)
-        v = tl.load(v_ptrs, mask=mask_kn[:, None], other=0.0)
-        
-        p_typed = p_scaled.to(v.dtype)
-        acc = acc_scaled + tl.dot(p_typed, v, allow_tf32=True)
+        m_i = m_i_new
 
-        l_i = l_new
-        m_i = m_new
+    acc = acc / l_i[:, None]
 
-    o_ptrs = O_ptr + (offs_qm[:, None] * stride_om + offs_d_v[None, :] * stride_od)
-    tl.store(o_ptrs, acc.to(O_ptr.dtype.element_ty), mask=mask_qm)
+    o_ptrs = O_ptr + (offs_m[:, None] * o_stride_m + offs_d_v[None, :] * o_stride_d)
+    tl.store(o_ptrs, acc.to(Q_ptr.dtype.element_ty), mask=m_mask[:, None])
+
 
 def gdpa_attn(Q: torch.Tensor, K: torch.Tensor, V: torch.Tensor, GQ: torch.Tensor, GK: torch.Tensor) -> torch.Tensor:
     Z, H, M, Dq = Q.shape
     _, _, N, Dv = V.shape
     
-    O = torch.empty((Z, H, M, Dv), device=Q.device, dtype=Q.dtype)
-
-    grid = lambda meta: (triton.cdiv(M, meta['BLOCK_M']), Z * H)
+    O = torch.empty((Z, H, M, Dv), device=Q.device, dtype=V.dtype)
     
-    _gdpa_attn_kernel[grid](
+    scale = 1.0 / math.sqrt(Dq)
+    
+    def grid(metas):
+        return (triton.cdiv(M, metas['BLOCK_M']), Z * H)
+
+    _gdpa_forward_kernel[grid](
         Q, K, V, GQ, GK, O,
         Q.stride(0), Q.stride(1), Q.stride(2), Q.stride(3),
         K.stride(0), K.stride(1), K.stride(2), K.stride(3),
@@ -132,9 +124,16 @@ def gdpa_attn(Q: torch.Tensor, K: torch.Tensor, V: torch.Tensor, GQ: torch.Tenso
         O.stride(0), O.stride(1), O.stride(2), O.stride(3),
         Z, H, M, N,
         Dq, Dv,
-        BLOCK_Dq=Dq, BLOCK_Dv=Dv
+        scale,
     )
-
     return O
 """
-        return {"code": gdpa_attn_code}
+
+class Solution:
+    def solve(self, spec_path: str = None) -> dict:
+        """
+        Returns a dict with either:
+        - {"code": "python_code_string"}
+        - {"program_path": "path/to/kernel.py"}
+        """
+        return {"code": _GDPA_ATTN_KERNEL_CODE}

@@ -1,103 +1,119 @@
 import pandas as pd
 import random
-from collections import Counter
 
 class Solution:
-    def solve(
-        self,
-        df: pd.DataFrame,
-        early_stop: int = 100000,
-        row_stop: int = 4,
-        col_stop: int = 2,
-        col_merge: list = None,
-        one_way_dep: list = None,
-        distinct_value_threshold: float = 0.7,
-        parallel: bool = True,
-    ) -> pd.DataFrame:
-        # Apply column merges
-        if col_merge is not None:
-            df = self._apply_merges(df, col_merge)
-        
-        # Precompute column strings
-        cols = df.columns.tolist()
-        M = len(cols)
-        if M == 0:
-            return df
-        
-        col_strings = {col: df[col].astype(str).tolist() for col in cols}
-        N = len(df)
-        
-        # Heuristic initial order
-        init_order = self._heuristic_order(col_strings, distinct_value_threshold)
-        
-        best_order = init_order
-        if early_stop > 0 and M > 1:
-            eval_rows = min(row_stop, N) if row_stop > 0 else N
-            subset_indices = list(range(eval_rows))
-            best_score = self._evaluate_order(col_strings, init_order, subset_indices)
-            current_order, current_score = init_order, best_score
-            
-            for _ in range(early_stop):
-                i, j = random.sample(range(M), 2)
-                new_order = current_order.copy()
-                new_order[i], new_order[j] = new_order[j], new_order[i]
-                new_score = self._evaluate_order(col_strings, new_order, subset_indices)
-                if new_score > current_score:
-                    current_order, current_score = new_order, new_score
-                    if new_score > best_score:
-                        best_order, best_score = new_order, new_score
-        
-        return df[best_order]
-    
-    def _apply_merges(self, df: pd.DataFrame, col_merge: list) -> pd.DataFrame:
-        df = df.copy()
-        for group in col_merge:
-            if not all(col in df.columns for col in group):
-                continue
-            new_name = "__".join(group)
-            df[new_name] = df[group].apply(lambda row: ''.join(row.astype(str)), axis=1)
-            df.drop(columns=group, inplace=True)
-        return df
-    
-    def _heuristic_order(self, col_strings: dict, threshold: float) -> list:
-        cols = list(col_strings.keys())
-        if not cols:
-            return cols
-        N = len(next(iter(col_strings.values())))
-        metrics = []
-        for col in cols:
-            strings = col_strings[col]
-            freq = Counter(strings)
-            match_prob = sum((c / N) ** 2 for c in freq.values())
-            avg_len = sum(len(s) for s in strings) / N
-            metrics.append((col, match_prob, avg_len))
-        metrics.sort(key=lambda x: (-x[1], -x[2]))
-        return [m[0] for m in metrics]
-    
-    def _evaluate_order(self, col_strings: dict, order: list, row_indices: list) -> float:
-        rows = sorted(row_indices)
-        if not rows:
-            return 0.0
-        col_lists = [col_strings[col] for col in order]
-        trie = {}
+    @staticmethod
+    def evaluate_permutation(rows, perm):
         total_lcp = 0
-        total_len = 0
-        for r in rows:
-            parts = [col_lists[c][r] for c in range(len(order))]
-            s = ''.join(parts)
-            total_len += len(s)
-            node = trie
+        root = {}
+        for row in rows:
+            current = root
             lcp = 0
-            for ch in s:
-                if ch in node:
-                    node = node[ch]
-                    lcp += 1
+            matched = True
+            for col_idx in perm:
+                val = row[col_idx]
+                if matched and val in current:
+                    lcp += len(val)
+                    current = current[val]
                 else:
-                    break
+                    if matched:
+                        matched = False
+                    if val not in current:
+                        current[val] = {}
+                    current = current[val]
             total_lcp += lcp
-            node = trie
-            for ch in s:
-                if ch not in node:
-                    node[ch] = {}
-                node = node[ch]
-        return total_lcp / total_len if total_len > 0 else 0.0
+        return total_lcp
+
+    def solve(self, df, early_stop=100000, row_stop=4, col_stop=2, col_merge=None, one_way_dep=None, distinct_value_threshold=0.7, parallel=True):
+        if col_merge is not None:
+            new_data = {}
+            cols_to_drop = set()
+            for group in col_merge:
+                new_col_name = '_'.join(group)
+                merged_series = df[group[0]].astype(str)
+                for col in group[1:]:
+                    merged_series += df[col].astype(str)
+                new_data[new_col_name] = merged_series
+                cols_to_drop.update(group)
+            for col in df.columns:
+                if col not in cols_to_drop:
+                    new_data[col] = df[col]
+            df = pd.DataFrame(new_data)
+
+        if len(df.columns) == 1:
+            return df
+
+        columns = list(df.columns)
+        M = len(columns)
+
+        rows = []
+        for _, row in df.iterrows():
+            rows.append([str(val) for val in row])
+
+        eval_count = 0
+        def evaluate(perm):
+            nonlocal eval_count
+            eval_count += 1
+            return Solution.evaluate_permutation(rows, perm)
+
+        remaining = list(range(M))
+        perm = []
+        for step in range(M):
+            if eval_count >= early_stop:
+                break
+            best_col = None
+            best_score = -1
+            for col in remaining:
+                candidate_perm = perm + [col]
+                score = evaluate(candidate_perm)
+                if score > best_score:
+                    best_score = score
+                    best_col = col
+            if best_col is None:
+                break
+            perm.append(best_col)
+            remaining.remove(best_col)
+
+        if len(perm) < M:
+            perm = perm + [c for c in range(M) if c not in perm]
+
+        current_perm = perm
+        current_score = evaluate(current_perm)
+
+        improved = True
+        while improved and eval_count < early_stop:
+            improved = False
+            swaps = [(i, j) for i in range(M) for j in range(i+1, M)]
+            best_swap = None
+            best_new_score = current_score
+
+            for i, j in swaps:
+                if eval_count >= early_stop:
+                    break
+                new_perm = current_perm.copy()
+                new_perm[i], new_perm[j] = new_perm[j], new_perm[i]
+                new_score = evaluate(new_perm)
+                if new_score > best_new_score:
+                    best_new_score = new_score
+                    best_swap = (i, j)
+
+            if best_new_score > current_score:
+                i, j = best_swap
+                current_perm[i], current_perm[j] = current_perm[j], current_perm[i]
+                current_score = best_new_score
+                improved = True
+
+        max_restarts = 20
+        for _ in range(max_restarts):
+            if eval_count >= early_stop:
+                break
+            random_perm = list(range(M))
+            random.shuffle(random_perm)
+            random_score = evaluate(random_perm)
+            if random_score > current_score:
+                current_perm = random_perm
+                current_score = random_score
+
+        reordered_columns = [columns[i] for i in current_perm]
+        result_df = df[reordered_columns]
+        return result_df

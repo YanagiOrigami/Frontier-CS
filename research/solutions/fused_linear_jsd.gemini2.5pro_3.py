@@ -4,219 +4,179 @@ import triton.language as tl
 
 class Solution:
     def solve(self, spec_path: str = None) -> dict:
-        kernel_code = """
+        code = """
 import torch
 import triton
 import triton.language as tl
 
-AUTOTUNER_CONFIGS = [
-    # Basic configs
-    triton.Config({'BLOCK_N': 512, 'BLOCK_K': 64, 'num_stages': 3, 'num_warps': 8}),
-    triton.Config({'BLOCK_N': 1024, 'BLOCK_K': 64, 'num_stages': 3, 'num_warps': 8}),
-    triton.Config({'BLOCK_N': 2048, 'BLOCK_K': 32, 'num_stages': 3, 'num_warps': 8}),
-    triton.Config({'BLOCK_N': 4096, 'BLOCK_K': 32, 'num_stages': 3, 'num_warps': 8}),
-    triton.Config({'BLOCK_N': 1024, 'BLOCK_K': 128, 'num_stages': 3, 'num_warps': 8}),
-    triton.Config({'BLOCK_N': 512, 'BLOCK_K': 128, 'num_stages': 3, 'num_warps': 8}),
-    # More aggressive configs
-    triton.Config({'BLOCK_N': 2048, 'BLOCK_K': 64, 'num_stages': 4, 'num_warps': 8}),
-    triton.Config({'BLOCK_N': 4096, 'BLOCK_K': 64, 'num_stages': 2, 'num_warps': 8}),
-    # Large block N configs
-    triton.Config({'BLOCK_N': 4096, 'BLOCK_K': 16, 'num_stages': 4, 'num_warps': 4}),
-    triton.Config({'BLOCK_N': 4096, 'BLOCK_K': 32, 'num_stages': 4, 'num_warps': 8}),
-]
-
 @triton.autotune(
-    configs=AUTOTUNER_CONFIGS,
-    key=['N', 'K'],
+    configs=[
+        # Basic configurations, balanced tile sizes
+        triton.Config({'BLOCK_M': 16, 'BLOCK_N': 64, 'BLOCK_K': 64, 'num_stages': 3, 'num_warps': 4}),
+        triton.Config({'BLOCK_M': 32, 'BLOCK_N': 64, 'BLOCK_K': 64, 'num_stages': 3, 'num_warps': 4}),
+        triton.Config({'BLOCK_M': 16, 'BLOCK_N': 128, 'BLOCK_K': 64, 'num_stages': 3, 'num_warps': 4}),
+        triton.Config({'BLOCK_M': 32, 'BLOCK_N': 128, 'BLOCK_K': 64, 'num_stages': 4, 'num_warps': 4}),
+        triton.Config({'BLOCK_M': 16, 'BLOCK_N': 64, 'BLOCK_K': 128, 'num_stages': 3, 'num_warps': 8}),
+        triton.Config({'BLOCK_M': 32, 'BLOCK_N': 64, 'BLOCK_K': 128, 'num_stages': 4, 'num_warps': 8}),
+        
+        # Wider N-tile configs
+        triton.Config({'BLOCK_M': 16, 'BLOCK_N': 256, 'BLOCK_K': 32, 'num_stages': 3, 'num_warps': 8}),
+        triton.Config({'BLOCK_M': 16, 'BLOCK_N': 256, 'BLOCK_K': 64, 'num_stages': 4, 'num_warps': 8}),
+        triton.Config({'BLOCK_M': 32, 'BLOCK_N': 256, 'BLOCK_K': 64, 'num_stages': 3, 'num_warps': 8}),
+
+        # Deeper K-tile config
+        triton.Config({'BLOCK_M': 16, 'BLOCK_N': 128, 'BLOCK_K': 128, 'num_stages': 2, 'num_warps': 8}),
+    ],
+    key=['M', 'N', 'K'],
 )
 @triton.jit
-def _jsd_lse_kernel(
-    X, W1, B1, W2, B2, LSE1, LSE2,
-    stride_x_m, stride_x_k,
-    stride_w1_k, stride_w1_n,
-    stride_w2_k, stride_w2_n,
+def _fused_jsd_kernel(
+    X_ptr, W1_ptr, B1_ptr, W2_ptr, B2_ptr, Y_ptr,
     M, N, K,
-    BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+    stride_xm, stride_xk,
+    stride_w1k, stride_w1n,
+    stride_w2k, stride_w2n,
+    stride_ym,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
 ):
+    # This kernel assumes that K and N are perfectly divisible by BLOCK_K and BLOCK_N.
+    # This holds true for the problem constraints and chosen autotuner configs.
+    
     pid_m = tl.program_id(0)
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    mask_m = offs_m < M
 
-    # Online reduction state for LSE
-    row_max1 = -float('inf')
-    row_sum_exp1 = 0.0
-    row_max2 = -float('inf')
-    row_sum_exp2 = 0.0
+    # Pass 1: Compute Log-Sum-Exp for both branches
+    m1 = tl.full([BLOCK_M], value=float('-inf'), dtype=tl.float32)
+    s1 = tl.zeros([BLOCK_M], dtype=tl.float32)
+    m2 = tl.full([BLOCK_M], value=float('-inf'), dtype=tl.float32)
+    s2 = tl.zeros([BLOCK_M], dtype=tl.float32)
+    
+    offs_k = tl.arange(0, BLOCK_K)
 
-    # Loop over N in blocks
-    for n_offset in range(0, N, BLOCK_N):
-        n_block_range = tl.arange(0, BLOCK_N)
-        n_block = n_offset + n_block_range
-        n_mask = n_block < N
+    for n_idx in range(0, tl.cdiv(N, BLOCK_N)):
+        n_start = n_idx * BLOCK_N
+        offs_n = n_start + tl.arange(0, BLOCK_N)
 
-        # Accumulators for logits
-        acc1 = tl.zeros((1, BLOCK_N), dtype=tl.float32)
-        acc2 = tl.zeros((1, BLOCK_N), dtype=tl.float32)
-
-        # Loop over K in blocks to compute dot product
-        for k_offset in range(0, K, BLOCK_K):
-            k_block_range = tl.arange(0, BLOCK_K)
-            k_block = k_offset + k_block_range
-            k_mask = k_block < K
-
-            # Load X tile (1, BLOCK_K)
-            x_ptrs = X + pid_m * stride_x_m + k_block[None, :]
-            x_tile = tl.load(x_ptrs, mask=k_mask[None, :], other=0.0)
-
-            # Load W tiles (BLOCK_K, BLOCK_N)
-            w1_ptrs = W1 + k_block[:, None] * stride_w1_k + n_block[None, :] * stride_w1_n
-            w2_ptrs = W2 + k_block[:, None] * stride_w2_k + n_block[None, :] * stride_w2_n
+        acc1 = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
+        acc2 = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
+        
+        for k_idx in range(0, tl.cdiv(K, BLOCK_K)):
+            k_start = k_idx * BLOCK_K
+            cur_offs_k = k_start + offs_k
             
-            w1_tile = tl.load(w1_ptrs, mask=(k_mask[:, None] & n_mask[None, :]), other=0.0)
-            w2_tile = tl.load(w2_ptrs, mask=(k_mask[:, None] & n_mask[None, :]), other=0.0)
-
-            # Accumulate using Tensor Cores
-            acc1 += tl.dot(x_tile, w1_tile, out_dtype=tl.float32)
-            acc2 += tl.dot(x_tile, w2_tile, out_dtype=tl.float32)
-
-        # Add bias
-        b1_ptrs = B1 + n_block
-        b2_ptrs = B2 + n_block
-        b1 = tl.load(b1_ptrs, mask=n_mask, other=0.0)
-        b2 = tl.load(b2_ptrs, mask=n_mask, other=0.0)
-
-        logits1_tile = acc1 + b1
-        logits2_tile = acc2 + b2
-
-        # Mask out-of-bounds logits for reduction
-        logits1_tile = tl.where(n_mask[None, :], logits1_tile, -float('inf'))
-        logits2_tile = tl.where(n_mask[None, :], logits2_tile, -float('inf'))
-        
-        # --- Online LSE Reduction for this tile ---
-        tile_max1 = tl.max(logits1_tile, axis=1)
-        new_max1 = tl.maximum(row_max1, tile_max1)
-        row_sum_exp1 = row_sum_exp1 * tl.exp(row_max1 - new_max1) + tl.sum(tl.exp(logits1_tile - new_max1), axis=1)
-        row_max1 = new_max1
-
-        tile_max2 = tl.max(logits2_tile, axis=1)
-        new_max2 = tl.maximum(row_max2, tile_max2)
-        row_sum_exp2 = row_sum_exp2 * tl.exp(row_max2 - new_max2) + tl.sum(tl.exp(logits2_tile - new_max2), axis=1)
-        row_max2 = new_max2
-
-    # Finalize LSE
-    lse1 = row_max1 + tl.log(row_sum_exp1)
-    lse2 = row_max2 + tl.log(row_sum_exp2)
-
-    # Store results
-    tl.store(LSE1 + pid_m, lse1)
-    tl.store(LSE2 + pid_m, lse2)
-
-
-@triton.autotune(
-    configs=AUTOTUNER_CONFIGS,
-    key=['N', 'K'],
-)
-@triton.jit
-def _jsd_calc_kernel(
-    X, W1, B1, W2, B2, LSE1, LSE2, JSD,
-    stride_x_m, stride_x_k,
-    stride_w1_k, stride_w1_n,
-    stride_w2_k, stride_w2_n,
-    M, N, K,
-    BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
-):
-    pid_m = tl.program_id(0)
-
-    # Load LSE for the current row
-    lse1 = tl.load(LSE1 + pid_m)
-    lse2 = tl.load(LSE2 + pid_m)
-
-    # Accumulator for JSD
-    jsd_sum = 0.0
-
-    # Loop over N in blocks
-    for n_offset in range(0, N, BLOCK_N):
-        n_block_range = tl.arange(0, BLOCK_N)
-        n_block = n_offset + n_block_range
-        n_mask = n_block < N
-
-        # Recompute logits tile (same as first kernel)
-        acc1 = tl.zeros((1, BLOCK_N), dtype=tl.float32)
-        acc2 = tl.zeros((1, BLOCK_N), dtype=tl.float32)
-        for k_offset in range(0, K, BLOCK_K):
-            k_block_range = tl.arange(0, BLOCK_K)
-            k_block = k_offset + k_block_range
-            k_mask = k_block < K
+            x_ptrs = X_ptr + offs_m[:, None] * stride_xm + cur_offs_k[None, :] * stride_xk
+            x = tl.load(x_ptrs, mask=mask_m[:, None], other=0.0)
             
-            x_ptrs = X + pid_m * stride_x_m + k_block[None, :]
-            x_tile = tl.load(x_ptrs, mask=k_mask[None, :], other=0.0)
-
-            w1_ptrs = W1 + k_block[:, None] * stride_w1_k + n_block[None, :] * stride_w1_n
-            w2_ptrs = W2 + k_block[:, None] * stride_w2_k + n_block[None, :] * stride_w2_n
-
-            w1_tile = tl.load(w1_ptrs, mask=(k_mask[:, None] & n_mask[None, :]), other=0.0)
-            w2_tile = tl.load(w2_ptrs, mask=(k_mask[:, None] & n_mask[None, :]), other=0.0)
+            w1_ptrs = W1_ptr + cur_offs_k[:, None] * stride_w1k + offs_n[None, :] * stride_w1n
+            w1 = tl.load(w1_ptrs)
             
-            acc1 += tl.dot(x_tile, w1_tile, out_dtype=tl.float32)
-            acc2 += tl.dot(x_tile, w2_tile, out_dtype=tl.float32)
+            w2_ptrs = W2_ptr + cur_offs_k[:, None] * stride_w2k + offs_n[None, :] * stride_w2n
+            w2 = tl.load(w2_ptrs)
+            
+            acc1 += tl.dot(x, w1)
+            acc2 += tl.dot(x, w2)
 
-        b1_ptrs = B1 + n_block
-        b2_ptrs = B2 + n_block
-        b1 = tl.load(b1_ptrs, mask=n_mask, other=0.0)
-        b2 = tl.load(b2_ptrs, mask=n_mask, other=0.0)
-        logits1_tile = acc1 + b1
-        logits2_tile = acc2 + b2
+        b1_ptrs = B1_ptr + offs_n
+        b1 = tl.load(b1_ptrs)
+        logits1 = acc1 + b1[None, :]
 
-        # --- JSD Calculation for this tile ---
-        log_p_tile = logits1_tile - lse1
-        log_q_tile = logits2_tile - lse2
-        p_tile = tl.exp(log_p_tile)
-        q_tile = tl.exp(log_q_tile)
-        
-        m_tile = 0.5 * (p_tile + q_tile)
-        # Add epsilon for numerical stability of log
-        log_m_tile = tl.log(m_tile + 1e-9) 
-        
-        kl_p_term = p_tile * (log_p_tile - log_m_tile)
-        kl_q_term = q_tile * (log_q_tile - log_m_tile)
-        
-        jsd_tile = 0.5 * (kl_p_term + kl_q_term)
-        jsd_tile = tl.where(n_mask[None, :], jsd_tile, 0.0)
-        
-        jsd_sum += tl.sum(jsd_tile, axis=1)
+        b2_ptrs = B2_ptr + offs_n
+        b2 = tl.load(b2_ptrs)
+        logits2 = acc2 + b2[None, :]
 
-    # Store final JSD for the row
-    tl.store(JSD + pid_m, jsd_sum)
+        # Update running max and sum for LSE using stable online algorithm
+        tile_m1 = tl.max(logits1, axis=1)
+        new_m1 = tl.maximum(m1, tile_m1)
+        s1 = s1 * tl.exp(m1 - new_m1) + tl.sum(tl.exp(logits1 - new_m1[:, None]), axis=1)
+        m1 = new_m1
+        
+        tile_m2 = tl.max(logits2, axis=1)
+        new_m2 = tl.maximum(m2, tile_m2)
+        s2 = s2 * tl.exp(m2 - new_m2) + tl.sum(tl.exp(logits2 - new_m2[:, None]), axis=1)
+        m2 = new_m2
+
+    lse1 = m1 + tl.log(s1)
+    lse2 = m2 + tl.log(s2)
+
+    # Pass 2: Compute JSD by recomputing logits
+    jsd = tl.zeros([BLOCK_M], dtype=tl.float32)
+    LOG_HALF = -0.6931471805599453
+
+    for n_idx in range(0, tl.cdiv(N, BLOCK_N)):
+        n_start = n_idx * BLOCK_N
+        offs_n = n_start + tl.arange(0, BLOCK_N)
+
+        # Recompute logits to save memory vs storing them
+        acc1 = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
+        acc2 = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
+
+        for k_idx in range(0, tl.cdiv(K, BLOCK_K)):
+            k_start = k_idx * BLOCK_K
+            cur_offs_k = k_start + offs_k
+
+            x_ptrs = X_ptr + offs_m[:, None] * stride_xm + cur_offs_k[None, :] * stride_xk
+            x = tl.load(x_ptrs, mask=mask_m[:, None], other=0.0)
+            
+            w1_ptrs = W1_ptr + cur_offs_k[:, None] * stride_w1k + offs_n[None, :] * stride_w1n
+            w1 = tl.load(w1_ptrs)
+            
+            w2_ptrs = W2_ptr + cur_offs_k[:, None] * stride_w2k + offs_n[None, :] * stride_w2n
+            w2 = tl.load(w2_ptrs)
+
+            acc1 += tl.dot(x, w1)
+            acc2 += tl.dot(x, w2)
+        
+        b1_ptrs = B1_ptr + offs_n
+        b1 = tl.load(b1_ptrs)
+        logits1 = acc1 + b1[None, :]
+
+        b2_ptrs = B2_ptr + offs_n
+        b2 = tl.load(b2_ptrs)
+        logits2 = acc2 + b2[None, :]
+
+        log_p = logits1 - lse1[:, None]
+        log_q = logits2 - lse2[:, None]
+
+        p = tl.exp(log_p)
+        q = tl.exp(log_q)
+
+        # Stable computation of log(0.5 * (p + q))
+        max_log_pq = tl.maximum(log_p, log_q)
+        log_sum_exp_pq = max_log_pq + tl.log(tl.exp(log_p - max_log_pq) + tl.exp(log_q - max_log_pq))
+        log_m = LOG_HALF + log_sum_exp_pq
+        
+        kl_p = p * (log_p - log_m)
+        kl_q = q * (log_q - log_m)
+        
+        # Handle cases where p or q are 0
+        kl_p = tl.where(p > 0, kl_p, 0.0)
+        kl_q = tl.where(q > 0, kl_q, 0.0)
+
+        jsd_tile = 0.5 * (kl_p + kl_q)
+        jsd += tl.sum(jsd_tile, axis=1)
+
+    y_ptrs = Y_ptr + offs_m * stride_ym
+    tl.store(y_ptrs, jsd, mask=mask_m)
 
 
 def fused_linear_jsd(X: torch.Tensor, W1: torch.Tensor, B1: torch.Tensor, W2: torch.Tensor, B2: torch.Tensor) -> torch.Tensor:
     M, K = X.shape
-    _K, N = W1.shape
+    _, N = W1.shape
+
+    Y = torch.empty(M, device=X.device, dtype=torch.float32)
     
-    # Allocate intermediate and output tensors
-    LSE1 = torch.empty((M,), dtype=torch.float32, device='cuda')
-    LSE2 = torch.empty((M,), dtype=torch.float32, device='cuda')
-    JSD = torch.empty((M,), dtype=torch.float32, device='cuda')
-
-    # Grid of M programs, one for each row of X
-    grid = lambda META: (M, )
-
-    # Pass 1: Compute log-sum-exp for both branches
-    _jsd_lse_kernel[grid](
-        X, W1, B1, W2, B2, LSE1, LSE2,
+    # Grid is 1D, covering the M dimension
+    grid = lambda meta: (triton.cdiv(M, meta['BLOCK_M']),)
+    
+    _fused_jsd_kernel[grid](
+        X, W1, B1, W2, B2, Y,
+        M, N, K,
         X.stride(0), X.stride(1),
         W1.stride(0), W1.stride(1),
         W2.stride(0), W2.stride(1),
-        M, N, K
+        Y.stride(0),
     )
-
-    # Pass 2: Recompute logits and compute JSD
-    _jsd_calc_kernel[grid](
-        X, W1, B1, W2, B2, LSE1, LSE2, JSD,
-        X.stride(0), X.stride(1),
-        W1.stride(0), W1.stride(1),
-        W2.stride(0), W2.stride(1),
-        M, N, K
-    )
-
-    return JSD
+    return Y
 """
-        return {"code": kernel_code}
+        return {"code": code}

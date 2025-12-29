@@ -1,225 +1,293 @@
 import os
 import re
-import io
-import sys
 import tarfile
-import zipfile
-import tempfile
-from typing import Optional, Tuple, List
+from dataclasses import dataclass
+from typing import Dict, Iterable, List, Optional, Tuple
+
+
+@dataclass
+class HarnessFeatures:
+    min_len: int = 0
+    prefer_mp4: bool = False
+    prefer_u8_len: bool = False
+    prefer_u32_len: bool = False
+    u32_big_endian: bool = False
+    needs_cstring: bool = False
+    has_off_by_one_size: bool = False
+    relevance: int = 0
 
 
 class Solution:
-    def _safe_extract_tar(self, tf: tarfile.TarFile, path: str) -> None:
-        base = os.path.abspath(path)
-        for m in tf.getmembers():
-            name = m.name
-            if not name or name == ".":
-                continue
-            dest = os.path.abspath(os.path.join(path, name))
-            if not (dest == base or dest.startswith(base + os.sep)):
-                continue
-            try:
-                tf.extract(m, path=path, set_attrs=False)
-            except Exception:
-                pass
+    _SRC_EXTS = (".c", ".cc", ".cpp", ".cxx", ".h", ".hpp", ".hh", ".inc", ".ipp")
 
-    def _extract_src(self, src_path: str) -> Tuple[str, Optional[tempfile.TemporaryDirectory]]:
-        if os.path.isdir(src_path):
-            return src_path, None
+    def solve(self, src_path: str) -> bytes:
+        files = list(self._iter_source_texts(src_path))
+        if not files:
+            return b"A" * 8 + b"\x00"
 
-        tmp = tempfile.TemporaryDirectory()
-        out_dir = tmp.name
+        harnesses: List[Tuple[str, str]] = []
+        global_kw_score = 0
+        global_mp4_hint = 0
 
-        lower = src_path.lower()
-        try:
-            if lower.endswith(".zip"):
-                with zipfile.ZipFile(src_path, "r") as zf:
-                    for zi in zf.infolist():
-                        if zi.is_dir():
-                            continue
-                        name = zi.filename
-                        if not name or name.endswith("/") or name.startswith("/") or ".." in name.split("/"):
-                            continue
-                        dest = os.path.join(out_dir, name)
-                        os.makedirs(os.path.dirname(dest), exist_ok=True)
-                        try:
-                            with zf.open(zi, "r") as rf, open(dest, "wb") as wf:
-                                wf.write(rf.read())
-                        except Exception:
-                            pass
-            else:
-                with tarfile.open(src_path, "r:*") as tf:
-                    self._safe_extract_tar(tf, out_dir)
-        except Exception:
-            return out_dir, tmp
+        for name, text in files:
+            t_low = text.lower()
+            if "llvmfuzzertestoneinput" in text:
+                harnesses.append((name, text))
 
-        # pick likely root
-        try:
-            entries = [e for e in os.listdir(out_dir) if not e.startswith(".")]
-            if len(entries) == 1:
-                root = os.path.join(out_dir, entries[0])
-                if os.path.isdir(root):
-                    return root, tmp
-        except Exception:
-            pass
-        return out_dir, tmp
+            if any(k in t_low for k in ("dash_client", "dash client", "dashclient")):
+                global_kw_score += 3
+            if any(k in t_low for k in ("mp4", "isom", "isobmff", "fourcc", "atom", "box", "moov", "ftyp", "sidx", "mdat", "trak")):
+                global_mp4_hint += 1
 
-    def _binaryness_score(self, data: bytes) -> float:
-        if not data:
-            return 0.0
-        nonprint = 0
-        for b in data:
-            if b in (9, 10, 13):
-                continue
-            if 32 <= b <= 126:
-                continue
-            nonprint += 1
-        return nonprint / max(1, len(data))
+        best = HarnessFeatures()
+        best_name = ""
+        for name, text in harnesses:
+            feat = self._analyze_harness(text)
+            feat.relevance += self._relevance_score(name, text)
+            if feat.has_off_by_one_size:
+                feat.relevance += 50
+            if feat.prefer_mp4:
+                feat.relevance += 10
+            if feat.prefer_u8_len or feat.prefer_u32_len:
+                feat.relevance += 5
+            if feat.needs_cstring:
+                feat.relevance += 2
+            if feat.min_len:
+                feat.relevance += min(10, feat.min_len // 4)
 
-    def _is_code_file(self, path: str) -> bool:
-        ext = os.path.splitext(path)[1].lower()
-        return ext in {
-            ".c", ".cc", ".cpp", ".cxx", ".h", ".hpp", ".hh", ".hxx",
-            ".py", ".md", ".rst", ".txt", ".json", ".yaml", ".yml", ".toml",
-            ".cmake", ".mk", ".in", ".sh", ".bat", ".ps1", ".bazel", ".bzl",
-            ".html", ".css", ".js", ".ts", ".java", ".kt", ".go", ".rs",
-        }
+            if (feat.relevance > best.relevance) or (feat.relevance == best.relevance and feat.min_len and (best.min_len == 0 or feat.min_len < best.min_len)):
+                best = feat
+                best_name = name
 
-    def _candidate_name_score(self, rel: str) -> int:
-        r = rel.lower().replace("\\", "/")
+        if best.relevance == 0:
+            best.min_len = 9
+            best.needs_cstring = True
+            if global_mp4_hint >= 3:
+                best.prefer_mp4 = True
+
+        total = max(9, best.min_len if best.min_len > 0 else 9)
+
+        if best.prefer_mp4:
+            if total < 9:
+                total = 9
+            return self._gen_mp4_box(total, b"free")
+        if best.prefer_u8_len:
+            total = max(total, 2)
+            if total > 256:
+                total = 256
+            return self._gen_u8_len(total)
+        if best.prefer_u32_len:
+            total = max(total, 5)
+            if total > 1_000_000:
+                total = 1_000_000
+            return self._gen_u32_len(total, big_endian=best.u32_big_endian)
+
+        if best.needs_cstring:
+            return b"A" * (total - 1) + b"\x00"
+        return b"A" * total
+
+    def _relevance_score(self, name: str, text: str) -> int:
         score = 0
-        kws = [
-            "clusterfuzz", "testcase", "minimized", "poc", "crash", "repro", "reproducer",
-            "asan", "ubsan", "msan", "fuzz", "corpus", "artifact", "failure",
-        ]
-        for k in kws:
-            if k in r:
-                score += 10
-        dirs = ["fuzz", "fuzzer", "corpus", "testcase", "testcases", "repro", "reproducer", "artifacts", "crashers"]
-        for d in dirs:
-            if f"/{d}/" in f"/{r}/":
-                score += 10
-        ext = os.path.splitext(r)[1]
-        if ext in (".bin", ".dat", ".poc", ".raw", ".mpd", ".xml", ".m3u8", ".mp4", ".m4s", ".init", ".seg"):
+        nlow = name.lower()
+        tlow = text.lower()
+        if "dash" in nlow:
+            score += 3
+        if "fuzz" in nlow:
+            score += 4
+        if any(k in tlow for k in ("dash_client", "dash client", "dashclient")):
             score += 5
-        if self._is_code_file(r):
-            score -= 15
+        if any(k in tlow for k in ("mp4", "isom", "isobmff", "fourcc", "atom", "box")):
+            score += 2
         return score
 
-    def _find_embedded_poc(self, root: str) -> Optional[bytes]:
-        best = None
-        best_key = None  # (size, -name_score, -binaryness)
-        size_limit = 4096
+    def _analyze_harness(self, text: str) -> HarnessFeatures:
+        feat = HarnessFeatures()
+        t = text
 
-        def consider(rel_path: str, data: bytes):
-            nonlocal best, best_key
-            if not data or len(data) > size_limit:
-                return
-            name_score = self._candidate_name_score(rel_path)
-            bin_score = self._binaryness_score(data)
-            key = (len(data), -name_score, -bin_score)
-            if best is None or key < best_key:
-                best = data
-                best_key = key
+        feat.min_len = self._infer_min_len_requirements(t)
 
-        # prioritize exact 9-byte files if present
-        exact9: List[Tuple[int, int, float, bytes]] = []
+        tlow = t.lower()
+        mp4_hints = (
+            "fourcc" in tlow
+            or "isom" in tlow
+            or "isobmff" in tlow
+            or "mp4" in tlow
+            or "atom" in tlow
+            or ("box" in tlow and ("size" in tlow or "type" in tlow))
+            or any(x in tlow for x in ("moov", "ftyp", "sidx", "mdat", "trak"))
+        )
+        if mp4_hints:
+            feat.prefer_mp4 = True
 
+        # u8 length prefix hints
+        if re.search(r"\b\w*len\w*\s*=\s*(?:Data|data)\s*\[\s*0\s*\]", t) and re.search(r"(?:Data|data)\s*\+\s*1", t):
+            feat.prefer_u8_len = True
+
+        # u32 length prefix hints
+        if re.search(r"\*\s*\(\s*(?:u?int32_t|uint32_t)\s*\*\s*\)\s*(?:Data|data)\b", t) or re.search(r"\bmemcpy\s*\(\s*&\s*\w*len\w*\s*,\s*(?:Data|data)\s*,\s*4\s*\)", t):
+            feat.prefer_u32_len = True
+            if any(x in tlow for x in ("ntohl", "be32toh", "big_endian", "read_be32")):
+                feat.u32_big_endian = True
+
+        # C-string usage hints
+        if re.search(r"\b(str(?:len|cmp|cpy|chr|str|nlen|casecmp)|sscanf|atoi|atol)\s*\(\s*\(?\s*(?:const\s+)?char\s*\*\s*\)?\s*(?:Data|data)\b", t):
+            feat.needs_cstring = True
+        if re.search(r"\b(?:Data|data)\b\s*;\s*$", t, flags=re.MULTILINE) and ("char *" in t or "const char *" in t):
+            feat.needs_cstring = True
+        if "reinterpret_cast<const char*>(" in t and any(x in t for x in ("strlen(", "strcmp(", "strcpy(", "sscanf(", "strstr(")):
+            feat.needs_cstring = True
+
+        # Off-by-one via allocating Size and then writing at [Size]
+        if re.search(r"\bmalloc\s*\(\s*Size\s*\)", t) and re.search(r"\[\s*Size\s*\]\s*=\s*(?:0|'\\0'|\"\\0\")", t):
+            feat.has_off_by_one_size = True
+        if re.search(r"\bnew\s+char\s*\[\s*Size\s*\]", t) and re.search(r"\[\s*Size\s*\]\s*=\s*(?:0|'\\0'|\"\\0\")", t):
+            feat.has_off_by_one_size = True
+
+        return feat
+
+    def _infer_min_len_requirements(self, t: str) -> int:
+        min_len = 0
+
+        for m in re.finditer(r"if\s*\(\s*(?:Size|size|Len|len|data_size)\s*<\s*(\d+)\s*\)\s*return\b", t):
+            v = int(m.group(1))
+            if v > min_len:
+                min_len = v
+        for m in re.finditer(r"if\s*\(\s*(?:Size|size|Len|len|data_size)\s*<=\s*(\d+)\s*\)\s*return\b", t):
+            v = int(m.group(1)) + 1
+            if v > min_len:
+                min_len = v
+
+        max_need = 0
+
+        for m in re.finditer(r"\b(?:Data|data)\s*\[\s*(\d+)\s*\]", t):
+            idx = int(m.group(1))
+            if idx + 1 > max_need:
+                max_need = idx + 1
+
+        for m in re.finditer(r"\bmemcpy\s*\([^;]*?,\s*(?:Data|data)\s*,\s*(\d+)\s*\)", t):
+            ln = int(m.group(1))
+            if ln > max_need:
+                max_need = ln
+
+        for m in re.finditer(r"\bmemcpy\s*\([^;]*?,\s*(?:Data|data)\s*\+\s*(\d+)\s*,\s*(\d+)\s*\)", t):
+            off = int(m.group(1))
+            ln = int(m.group(2))
+            if off + ln > max_need:
+                max_need = off + ln
+
+        for m in re.finditer(r"\*\s*\(\s*(?:u?int16_t|uint16_t)\s*\*\s*\)\s*\(\s*(?:Data|data)\s*(?:\+\s*(\d+))?\s*\)", t):
+            off = int(m.group(1)) if m.group(1) else 0
+            if off + 2 > max_need:
+                max_need = off + 2
+        for m in re.finditer(r"\*\s*\(\s*(?:u?int32_t|uint32_t)\s*\*\s*\)\s*\(\s*(?:Data|data)\s*(?:\+\s*(\d+))?\s*\)", t):
+            off = int(m.group(1)) if m.group(1) else 0
+            if off + 4 > max_need:
+                max_need = off + 4
+        for m in re.finditer(r"\*\s*\(\s*(?:u?int64_t|uint64_t)\s*\*\s*\)\s*\(\s*(?:Data|data)\s*(?:\+\s*(\d+))?\s*\)", t):
+            off = int(m.group(1)) if m.group(1) else 0
+            if off + 8 > max_need:
+                max_need = off + 8
+
+        if max_need > min_len:
+            min_len = max_need
+
+        if min_len <= 0:
+            min_len = 0
+        return min_len
+
+    def _gen_u8_len(self, total_len: int) -> bytes:
+        if total_len < 2:
+            total_len = 2
+        n = total_len - 1
+        if n > 255:
+            n = 255
+            total_len = 256
+        return bytes([n]) + (b"A" * n)
+
+    def _gen_u32_len(self, total_len: int, big_endian: bool) -> bytes:
+        if total_len < 5:
+            total_len = 5
+        n = total_len - 4
+        if n < 0:
+            n = 0
+        if big_endian:
+            hdr = n.to_bytes(4, "big", signed=False)
+        else:
+            hdr = n.to_bytes(4, "little", signed=False)
+        return hdr + (b"A" * n)
+
+    def _gen_mp4_box(self, total_len: int, typ: bytes) -> bytes:
+        if total_len < 9:
+            total_len = 9
+        if len(typ) != 4:
+            typ = (typ + b"    ")[:4]
+        size = total_len.to_bytes(4, "big", signed=False)
+        payload_len = total_len - 8
+        if payload_len < 1:
+            payload_len = 1
+            total_len = 9
+            size = total_len.to_bytes(4, "big", signed=False)
+        payload = b"A" * payload_len
+        return size + typ + payload
+
+    def _iter_source_texts(self, src_path: str) -> Iterable[Tuple[str, str]]:
+        if os.path.isdir(src_path):
+            yield from self._iter_dir_source_texts(src_path)
+            return
+
+        if tarfile.is_tarfile(src_path):
+            yield from self._iter_tar_source_texts(src_path)
+            return
+
+        return
+
+    def _iter_dir_source_texts(self, root: str) -> Iterable[Tuple[str, str]]:
         for dirpath, _, filenames in os.walk(root):
             for fn in filenames:
+                if not fn.endswith(self._SRC_EXTS):
+                    continue
                 p = os.path.join(dirpath, fn)
                 try:
                     st = os.stat(p)
-                except Exception:
-                    continue
-                if st.st_size <= 0 or st.st_size > max(size_limit, 1024 * 1024):
-                    continue
-
-                rel = os.path.relpath(p, root)
-                lower = fn.lower()
-                if st.st_size <= size_limit and (st.st_size == 9 or any(k in lower for k in ("clusterfuzz", "testcase", "minimized", "poc", "crash", "repro"))):
-                    try:
-                        with open(p, "rb") as f:
-                            data = f.read()
-                        if len(data) == 9:
-                            exact9.append((len(data), -self._candidate_name_score(rel), -self._binaryness_score(data), data))
-                        else:
-                            consider(rel, data)
-                    except Exception:
-                        pass
-
-                # inspect zips that look relevant
-                if lower.endswith(".zip") and any(k in lower for k in ("corpus", "seed", "poc", "crash", "testcase", "clusterfuzz", "repro")) and st.st_size <= 50 * 1024 * 1024:
-                    try:
-                        with zipfile.ZipFile(p, "r") as zf:
-                            for zi in zf.infolist():
-                                if zi.is_dir():
-                                    continue
-                                if zi.file_size <= 0 or zi.file_size > size_limit:
-                                    continue
-                                zrel = rel + "::" + zi.filename
-                                try:
-                                    data = zf.read(zi)
-                                except Exception:
-                                    continue
-                                if len(data) == 9:
-                                    exact9.append((len(data), -self._candidate_name_score(zrel), -self._binaryness_score(data), data))
-                                else:
-                                    consider(zrel, data)
-                    except Exception:
-                        pass
-
-        if exact9:
-            exact9.sort()
-            return exact9[0][3]
-        return best
-
-    def _find_token_in_sources(self, root: str, token: bytes) -> bool:
-        max_read = 1_000_000
-        exts = (".c", ".cc", ".cpp", ".cxx", ".h", ".hpp", ".hh", ".hxx", ".inc", ".inl", ".m", ".mm")
-        for dirpath, _, filenames in os.walk(root):
-            for fn in filenames:
-                if not fn.lower().endswith(exts):
-                    continue
-                p = os.path.join(dirpath, fn)
-                try:
+                    if st.st_size > 2_000_000:
+                        continue
                     with open(p, "rb") as f:
-                        data = f.read(max_read)
-                    if token in data:
-                        return True
-                except Exception:
+                        data = f.read()
+                except OSError:
                     continue
-        return False
-
-    def _fallback_poc(self, root: str) -> bytes:
-        # Prefer a URL-like 8-byte string (plus NUL) if the sources mention URL schemes.
-        if self._find_token_in_sources(root, b"http://"):
-            base = b"http://a"  # 8 bytes
-        elif self._find_token_in_sources(root, b"https://"):
-            base = b"https://"  # 8 bytes
-        elif self._find_token_in_sources(root, b"file://"):
-            base = b"file://a"  # 8 bytes
-        elif self._find_token_in_sources(root, b"rtsp://"):
-            base = b"rtsp://a"  # 8 bytes
-        else:
-            base = b"AAAAAAAA"  # 8 bytes
-
-        if len(base) < 8:
-            base = base + (b"A" * (8 - len(base)))
-        elif len(base) > 8:
-            base = base[:8]
-        return base + b"\x00"  # 9 bytes total
-
-    def solve(self, src_path: str) -> bytes:
-        root, tmp = self._extract_src(src_path)
-        try:
-            poc = self._find_embedded_poc(root)
-            if poc is not None and len(poc) > 0:
-                return poc
-            return self._fallback_poc(root)
-        finally:
-            if tmp is not None:
+                if b"\x00" in data:
+                    continue
                 try:
-                    tmp.cleanup()
+                    text = data.decode("utf-8", errors="ignore")
                 except Exception:
-                    pass
+                    text = data.decode("latin-1", errors="ignore")
+                yield (os.path.relpath(p, root), text)
+
+    def _iter_tar_source_texts(self, tar_path: str) -> Iterable[Tuple[str, str]]:
+        try:
+            with tarfile.open(tar_path, "r:*") as tf:
+                for m in tf.getmembers():
+                    if not m.isfile():
+                        continue
+                    name = m.name
+                    base = os.path.basename(name)
+                    if not base.endswith(self._SRC_EXTS):
+                        continue
+                    if m.size <= 0 or m.size > 2_000_000:
+                        continue
+                    try:
+                        f = tf.extractfile(m)
+                        if f is None:
+                            continue
+                        data = f.read()
+                    except Exception:
+                        continue
+                    if b"\x00" in data:
+                        continue
+                    try:
+                        text = data.decode("utf-8", errors="ignore")
+                    except Exception:
+                        text = data.decode("latin-1", errors="ignore")
+                    yield (name, text)
+        except Exception:
+            return

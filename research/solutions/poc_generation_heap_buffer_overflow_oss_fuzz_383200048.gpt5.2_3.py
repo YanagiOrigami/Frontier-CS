@@ -1,524 +1,409 @@
 import os
 import re
 import io
-import sys
 import tarfile
+import base64
+import gzip
+import bz2
+import lzma
 import zipfile
-import shutil
-import stat
-import tempfile
-import subprocess
-import random
-from typing import Optional, List, Tuple
+from typing import List, Tuple, Optional
 
 
 class Solution:
-    def __init__(self) -> None:
-        self._rng = random.Random(0)
+    BUG_ID = "383200048"
+
+    _BIN_EXTS = {
+        ".bin", ".dat", ".raw", ".poc", ".crash", ".repro", ".input",
+        ".elf", ".so", ".exe", ".dll", ".dylib",
+        ".upx", ".packed", ".pack",
+        ".corpus", ".seed",
+    }
+    _COMP_EXTS = {".gz", ".xz", ".lzma", ".bz2", ".zip", ".b64", ".base64"}
+    _TEXT_EXTS = {
+        ".c", ".cc", ".cpp", ".cxx", ".h", ".hpp", ".hh",
+        ".py", ".txt", ".md", ".rst", ".java", ".js", ".go", ".rs", ".sh",
+        ".cmake", ".in", ".m4", ".yml", ".yaml", ".toml", ".json",
+    }
+
+    _KW_STRONG = ("clusterfuzz", "testcase", "crash", "poc", "repro", "oss-fuzz", "ossfuzz", "minimized", "regress")
+    _KW_MED = ("fuzz", "corpus", "seed", "artifact", "issue", "bug")
 
     def solve(self, src_path: str) -> bytes:
-        with tempfile.TemporaryDirectory() as td:
-            src_dir = self._prepare_source(src_path, td)
-            poc = self._try_find_existing_poc(src_dir)
-            if poc is not None:
-                return poc
-
-            upx_bin = self._build_upx(src_dir, td)
-            if upx_bin is None:
-                return self._fallback_bytes()
-
-            base = self._make_base_packed_elf(upx_bin, td)
-            if base is None:
-                return self._fallback_bytes()
-
-            crash = self._find_crashing_mutation(upx_bin, base, td)
-            if crash is None:
-                return self._fallback_bytes()
-
-            minimized = self._minimize_prefix(upx_bin, crash, td, cap=512)
-            return minimized
-
-    def _fallback_bytes(self) -> bytes:
-        # Minimal ELF header-ish + padding to 512 bytes; unlikely to work, but ensures output.
-        b = bytearray(512)
-        b[0:4] = b"\x7fELF"
-        b[4] = 2  # 64-bit
-        b[5] = 1  # little
-        b[6] = 1
-        b[0x10:0x12] = (3).to_bytes(2, "little")  # ET_DYN
-        b[0x12:0x14] = (0x3E).to_bytes(2, "little")  # EM_X86_64
-        b[0x14:0x18] = (1).to_bytes(4, "little")  # EV_CURRENT
-        return bytes(b)
-
-    def _prepare_source(self, src_path: str, td: str) -> str:
-        if os.path.isdir(src_path):
-            return os.path.abspath(src_path)
-
-        sp = os.path.abspath(src_path)
-        out_dir = os.path.join(td, "src")
-        os.makedirs(out_dir, exist_ok=True)
-
-        if tarfile.is_tarfile(sp):
-            with tarfile.open(sp, "r:*") as tf:
-                tf.extractall(out_dir)
-        elif zipfile.is_zipfile(sp):
-            with zipfile.ZipFile(sp, "r") as zf:
-                zf.extractall(out_dir)
-        else:
-            # treat as single file; copy into out_dir
-            shutil.copy2(sp, out_dir)
-
-        # find likely root
-        entries = [os.path.join(out_dir, e) for e in os.listdir(out_dir)]
-        dirs = [e for e in entries if os.path.isdir(e)]
-        if len(dirs) == 1:
-            return dirs[0]
-        # If multiple, pick one containing CMakeLists or configure scripts
-        best = None
-        for d in dirs:
-            if os.path.exists(os.path.join(d, "CMakeLists.txt")):
-                best = d
-                break
-        if best:
-            return best
-        return out_dir
-
-    def _try_find_existing_poc(self, src_dir: str) -> Optional[bytes]:
-        patterns = [
-            re.compile(r"383200048"),
-            re.compile(r"clusterfuzz", re.I),
-            re.compile(r"testcase", re.I),
-            re.compile(r"minimized", re.I),
-            re.compile(r"crash", re.I),
-            re.compile(r"poc", re.I),
-            re.compile(r"repro", re.I),
-        ]
-        priority_dirs = ["poc", "pocs", "test", "tests", "testdata", "corpus", "fuzz", "regression", "artifacts"]
-        candidates: List[Tuple[int, str, int]] = []  # (score, path, size)
-
-        for pd in priority_dirs:
-            p = os.path.join(src_dir, pd)
-            if os.path.isdir(p):
-                for root, _, files in os.walk(p):
-                    for fn in files:
-                        full = os.path.join(root, fn)
-                        try:
-                            st = os.stat(full)
-                        except OSError:
-                            continue
-                        if st.st_size <= 0 or st.st_size > 2_000_000:
-                            continue
-                        score = 0
-                        for r in patterns:
-                            if r.search(fn):
-                                score += 10
-                        if score > 0:
-                            candidates.append((score, full, st.st_size))
-
-        # also scan a few top-level files
-        for root, _, files in os.walk(src_dir):
-            rel_depth = os.path.relpath(root, src_dir).count(os.sep)
-            if rel_depth > 3:
-                continue
-            for fn in files:
-                if len(fn) > 200:
-                    continue
-                full = os.path.join(root, fn)
-                try:
-                    st = os.stat(full)
-                except OSError:
-                    continue
-                if st.st_size <= 0 or st.st_size > 2_000_000:
-                    continue
-                score = 0
-                for r in patterns:
-                    if r.search(fn) or r.search(os.path.relpath(full, src_dir)):
-                        score += 10
-                if score > 0:
-                    candidates.append((score, full, st.st_size))
-
-        if not candidates:
-            return None
-
-        candidates.sort(key=lambda x: (-x[0], x[2]))
-        for _, path, size in candidates[:50]:
-            try:
-                with open(path, "rb") as f:
-                    data = f.read()
-            except OSError:
-                continue
-            # Heuristic: accept if it looks like ELF or contains UPX signature, else skip
-            if data.startswith(b"\x7fELF") or b"UPX!" in data or b"UPX0" in data or b"UPX1" in data:
-                return data
-
-        # fallback: smallest candidate
-        _, path, _ = candidates[0]
-        try:
-            with open(path, "rb") as f:
-                return f.read()
-        except OSError:
-            return None
-
-    def _which(self, exe: str) -> Optional[str]:
-        p = shutil.which(exe)
-        return p
-
-    def _run(self, args: List[str], cwd: Optional[str] = None, env: Optional[dict] = None, timeout: int = 60) -> Tuple[int, bytes, bytes]:
-        try:
-            cp = subprocess.run(
-                args,
-                cwd=cwd,
-                env=env,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                timeout=timeout,
-                check=False,
-            )
-            return cp.returncode, cp.stdout, cp.stderr
-        except subprocess.TimeoutExpired as e:
-            out = e.stdout if e.stdout is not None else b""
-            err = e.stderr if e.stderr is not None else b""
-            return 124, out, err
-        except Exception as e:
-            return 125, b"", (str(e).encode("utf-8", "ignore"))
-
-    def _build_upx(self, src_dir: str, td: str) -> Optional[str]:
-        cmake = self._which("cmake")
-        if not cmake:
-            return None
-
-        ninja = self._which("ninja")
-        gen = ["-GNinja"] if ninja else []
-
-        build_dir = os.path.join(td, "build_upx")
-        os.makedirs(build_dir, exist_ok=True)
-
-        def find_upx_exe() -> Optional[str]:
-            best = None
-            for root, _, files in os.walk(build_dir):
-                for fn in files:
-                    if fn not in ("upx", "upx.exe"):
-                        continue
-                    p = os.path.join(root, fn)
-                    try:
-                        st = os.stat(p)
-                    except OSError:
-                        continue
-                    if not (st.st_mode & stat.S_IXUSR):
-                        # still might be executable on windows; keep anyway
-                        pass
-                    if best is None or len(p) < len(best):
-                        best = p
-            return best
-
-        env = os.environ.copy()
-        env.setdefault("ASAN_OPTIONS", "abort_on_error=1:detect_leaks=0:allocator_may_return_null=1:handle_abort=1")
-        env.setdefault("UBSAN_OPTIONS", "halt_on_error=1:print_stacktrace=1")
-
-        # Try ASAN build first
-        cflags = "-O1 -g -fno-omit-frame-pointer -fsanitize=address"
-        cxxflags = cflags
-        ldflags = "-fsanitize=address"
-
-        cfg_args = [
-            cmake,
-            "-S",
-            src_dir,
-            "-B",
-            build_dir,
-            "-DCMAKE_BUILD_TYPE=RelWithDebInfo",
-            f"-DCMAKE_C_FLAGS={cflags}",
-            f"-DCMAKE_CXX_FLAGS={cxxflags}",
-            f"-DCMAKE_EXE_LINKER_FLAGS={ldflags}",
-            "-DBUILD_TESTING=OFF",
-        ] + gen
-
-        rc, _, _ = self._run(cfg_args, cwd=build_dir, env=env, timeout=120)
-        if rc == 0:
-            rc2, _, _ = self._run([cmake, "--build", build_dir, "-j", "8"], cwd=build_dir, env=env, timeout=300)
-            if rc2 == 0:
-                upx = find_upx_exe()
-                if upx:
-                    return upx
-
-        # Fallback: normal build
-        shutil.rmtree(build_dir, ignore_errors=True)
-        os.makedirs(build_dir, exist_ok=True)
-        cfg_args2 = [
-            cmake,
-            "-S",
-            src_dir,
-            "-B",
-            build_dir,
-            "-DCMAKE_BUILD_TYPE=Release",
-            "-DBUILD_TESTING=OFF",
-        ] + gen
-        rc, _, _ = self._run(cfg_args2, cwd=build_dir, env=env, timeout=120)
-        if rc != 0:
-            return None
-        rc2, _, _ = self._run([cmake, "--build", build_dir, "-j", "8"], cwd=build_dir, env=env, timeout=300)
-        if rc2 != 0:
-            return None
-        return find_upx_exe()
-
-    def _make_base_packed_elf(self, upx_bin: str, td: str) -> Optional[bytes]:
-        cc = self._which("gcc") or self._which("clang") or self._which("cc")
-        if not cc:
-            return None
-
-        work = os.path.join(td, "work")
-        os.makedirs(work, exist_ok=True)
-
-        c_path = os.path.join(work, "a.c")
-        so_path = os.path.join(work, "liba.so")
-        packed_path = os.path.join(work, "liba_packed.so")
-
-        c_code = r"""
-#include <stdint.h>
-__attribute__((constructor)) static void init_ctor(void) { volatile int x = 0; x++; }
-int foo(int x) { return x + 1; }
-static uint8_t blob[8192] = {1,2,3,4,5,6,7,8,9};
-int bar(void) { return blob[0] + blob[1]; }
-"""
-        try:
-            with open(c_path, "w", encoding="utf-8") as f:
-                f.write(c_code)
-        except OSError:
-            return None
-
-        # Build a small shared library
-        args = [
-            cc,
-            "-shared",
-            "-fPIC",
-            "-O2",
-            "-Wl,--build-id=none",
-            "-o",
-            so_path,
-            c_path,
-        ]
-        rc, _, _ = self._run(args, cwd=work, timeout=60)
-        if rc != 0 or not os.path.exists(so_path):
-            # Try building an executable if shared fails
-            exe_path = os.path.join(work, "a.out")
-            args2 = [cc, "-O2", "-Wl,--build-id=none", "-o", exe_path, c_path]
-            rc2, _, _ = self._run(args2, cwd=work, timeout=60)
-            if rc2 != 0 or not os.path.exists(exe_path):
-                return None
-            in_path = exe_path
-            packed_path = os.path.join(work, "a_packed.out")
-        else:
-            in_path = so_path
-
-        # Pack with UPX
-        for pack_args in (
-            [upx_bin, "-q", "--best", "-o", packed_path, in_path],
-            [upx_bin, "-q", "-o", packed_path, in_path],
-            [upx_bin, "-q", "--lzma", "-o", packed_path, in_path],
-            [upx_bin, "-q", "--force", "-o", packed_path, in_path],
-        ):
-            rc, _, _ = self._run(pack_args, cwd=work, timeout=60)
-            if rc == 0 and os.path.exists(packed_path):
-                try:
-                    with open(packed_path, "rb") as f:
-                        data = f.read()
-                    if len(data) > 0 and (data.startswith(b"\x7fELF") or b"UPX!" in data):
-                        return data
-                except OSError:
-                    pass
-        return None
-
-    def _asan_target_crash(self, out: bytes, err: bytes) -> bool:
-        blob = out + b"\n" + err
-        if b"AddressSanitizer" not in blob and b"asan" not in blob.lower():
-            return False
-        if b"heap-buffer-overflow" not in blob and b"buffer overflow" not in blob.lower():
-            return False
-        # Prefer matching likely files/symbols if present
-        if (b"p_lx_elf" in blob) or (b"un_DT_INIT" in blob) or (b"p_unix" in blob):
-            return True
-        # Still accept ASAN heap-buffer-overflow even without symbols
-        return True
-
-    def _crashes(self, upx_bin: str, data: bytes, td: str) -> bool:
-        work = os.path.join(td, "crashcheck")
-        os.makedirs(work, exist_ok=True)
-        in_path = os.path.join(work, "in.bin")
-        out_path = os.path.join(work, "out.bin")
-
-        try:
-            with open(in_path, "wb") as f:
-                f.write(data)
-        except OSError:
-            return False
-
-        env = os.environ.copy()
-        env.setdefault("ASAN_OPTIONS", "abort_on_error=1:detect_leaks=0:allocator_may_return_null=1:handle_abort=1")
-        env.setdefault("UBSAN_OPTIONS", "halt_on_error=1:print_stacktrace=1")
-
-        # Try -t first (no output file), then -d
-        for args in (
-            [upx_bin, "-q", "-t", in_path],
-            [upx_bin, "-q", "-d", "-o", out_path, in_path],
-        ):
-            rc, out, err = self._run(args, cwd=work, env=env, timeout=5)
-            if rc != 0 and self._asan_target_crash(out, err):
-                return True
-        return False
-
-    def _find_all(self, data: bytes, needle: bytes) -> List[int]:
-        res = []
-        start = 0
-        while True:
-            i = data.find(needle, start)
-            if i < 0:
-                break
-            res.append(i)
-            start = i + 1
-        return res
-
-    def _find_crashing_mutation(self, upx_bin: str, base: bytes, td: str) -> Optional[bytes]:
-        if self._crashes(upx_bin, base, td):
-            return base
-
-        b = bytearray(base)
-        n = len(b)
-
-        upx_positions = self._find_all(base, b"UPX!")
-        sec_positions = []
-        for s in (b"UPX0", b"UPX1", b"UPX2"):
-            sec_positions.extend(self._find_all(base, s))
-
-        windows: List[Tuple[int, int]] = []
-        for p in upx_positions:
-            windows.append((max(0, p), min(n, p + 256)))
-        for p in sec_positions:
-            windows.append((max(0, p - 64), min(n, p + 256)))
-        if not windows:
-            windows.append((0, min(n, 512)))
-
-        # Build candidate offsets with a bias towards header areas
-        offsets = []
-        for a, z in windows:
-            for o in range(a, z):
-                offsets.append(o)
-        # De-dup while keeping order
+        candidates: List[Tuple[float, int, str, bytes]] = []
         seen = set()
-        offsets2 = []
-        for o in offsets:
-            if o not in seen:
-                seen.add(o)
-                offsets2.append(o)
-        offsets = offsets2
 
-        # Stage 1: Target repeated small byte values in window (likely method codes)
-        for a, z in windows:
-            win = base[a:z]
-            positions_by_val = {}
-            for i, bv in enumerate(win):
-                if bv == 0:
-                    continue
-                if 1 <= bv <= 32:
-                    positions_by_val.setdefault(bv, []).append(a + i)
-            for v, pos_list in sorted(positions_by_val.items(), key=lambda x: -len(x[1])):
-                if len(pos_list) < 2:
-                    continue
-                # mutate the 2nd and 3rd occurrence
-                for idx in pos_list[1:4]:
-                    for newv in ((v + 1) & 0xFF, (v ^ 1) & 0xFF, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 0xFF):
-                        if newv == v:
-                            continue
-                        bb = bytearray(base)
-                        bb[idx] = newv
-                        if self._crashes(upx_bin, bytes(bb), td):
-                            return bytes(bb)
+        def add_candidate(name: str, data: bytes):
+            if not data:
+                return
+            h = (len(data), data[:32], data[-32:] if len(data) >= 32 else data)
+            if h in seen:
+                return
+            seen.add(h)
+            score = self._score_candidate(name, data)
+            candidates.append((score, len(data), name, data))
 
-        # Stage 2: Single-byte systematic mutations near UPX header
-        byte_values = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 0x10, 0x20, 0x40, 0x80, 0xFF]
-        max_trials = 2500
-        trials = 0
-        for o in offsets:
-            orig = base[o]
-            for v in byte_values:
-                if v == orig:
+        def maybe_decompress(name: str, data: bytes) -> List[Tuple[str, bytes]]:
+            out = []
+            lname = name.lower()
+            ext = os.path.splitext(lname)[1]
+            try:
+                if lname.endswith(".gz"):
+                    out.append((name[:-3], self._safe_decompress(gzip.decompress, data, 10_000_000)))
+                elif lname.endswith(".bz2"):
+                    out.append((name[:-4], self._safe_decompress(bz2.decompress, data, 10_000_000)))
+                elif lname.endswith(".xz") or lname.endswith(".lzma"):
+                    out.append((name.rsplit(".", 1)[0], self._safe_decompress(lzma.decompress, data, 10_000_000)))
+                elif lname.endswith(".zip"):
+                    out.extend(self._extract_zip(name, data, 10_000_000))
+                elif lname.endswith(".b64") or lname.endswith(".base64"):
+                    d = self._try_b64(data.decode("ascii", "ignore"))
+                    if d is not None:
+                        out.append((name.rsplit(".", 1)[0], d))
+            except Exception:
+                pass
+            return [(n, d) for (n, d) in out if d]
+
+        def scan_text_for_embedded(name: str, text: str):
+            for idx, blob in enumerate(self._extract_embedded_blobs(text)):
+                add_candidate(f"{name}#embedded[{idx}]", blob)
+
+        def handle_file(name: str, data: bytes):
+            if not data:
+                return
+            add_candidate(name, data)
+            for n2, d2 in maybe_decompress(name, data):
+                add_candidate(n2, d2)
+            if self._looks_textual(data) or name.lower().endswith(tuple(self._TEXT_EXTS)):
+                try:
+                    txt = data.decode("utf-8", "ignore")
+                except Exception:
+                    return
+                scan_text_for_embedded(name, txt)
+
+        if os.path.isdir(src_path):
+            self._scan_dir(src_path, handle_file)
+        else:
+            self._scan_tar(src_path, handle_file)
+
+        if candidates:
+            candidates.sort(key=lambda x: (-x[0], x[1], x[2]))
+            return candidates[0][3]
+
+        return self._fallback_elf_512()
+
+    def _scan_dir(self, root: str, handle_file):
+        max_bin = 6_000_000
+        max_text = 250_000
+        max_files = 6000
+        count = 0
+
+        for dirpath, _, filenames in os.walk(root):
+            for fn in filenames:
+                count += 1
+                if count > max_files:
+                    return
+                path = os.path.join(dirpath, fn)
+                rel = os.path.relpath(path, root).replace("\\", "/")
+                lname = rel.lower()
+                try:
+                    st = os.stat(path)
+                except Exception:
                     continue
-                bb = bytearray(base)
-                bb[o] = v
-                trials += 1
-                if self._crashes(upx_bin, bytes(bb), td):
-                    return bytes(bb)
-                if trials >= max_trials:
+                size = st.st_size
+                if size <= 0:
+                    continue
+
+                ext = os.path.splitext(lname)[1]
+                is_text = ext in self._TEXT_EXTS
+                interesting = (
+                    self.BUG_ID in lname
+                    or any(k in lname for k in self._KW_STRONG)
+                    or ext in self._BIN_EXTS
+                    or ext in self._COMP_EXTS
+                    or (128 <= size <= 4096 and not is_text)
+                )
+                if not interesting:
+                    continue
+
+                if is_text and size > max_text:
+                    continue
+                if (not is_text) and size > max_bin:
+                    continue
+
+                try:
+                    with open(path, "rb") as f:
+                        data = f.read()
+                except Exception:
+                    continue
+                handle_file(rel, data)
+
+    def _scan_tar(self, tar_path: str, handle_file):
+        max_bin = 6_000_000
+        max_text = 250_000
+        max_members = 12000
+
+        try:
+            tf = tarfile.open(tar_path, mode="r:*")
+        except Exception:
+            return
+
+        with tf:
+            n = 0
+            for m in tf:
+                n += 1
+                if n > max_members:
                     break
-            if trials >= max_trials:
-                break
+                if not m.isfile():
+                    continue
+                name = m.name.replace("\\", "/")
+                lname = name.lower()
+                size = m.size
+                if size <= 0:
+                    continue
 
-        # Stage 3: 32-bit field clobbering in likely header windows
-        dwords = [0, 1, 0x10, 0x100, 0x1000, 0x10000, 0x7FFFFFFF, 0xFFFFFFFF, 0x80000000]
-        trials = 0
-        for a, z in windows:
-            for o in range(a, min(z, n - 4)):
-                if (o - a) % 4 != 0:
+                ext = os.path.splitext(lname)[1]
+                is_text = ext in self._TEXT_EXTS
+
+                interesting = (
+                    self.BUG_ID in lname
+                    or any(k in lname for k in self._KW_STRONG)
+                    or ext in self._BIN_EXTS
+                    or ext in self._COMP_EXTS
+                    or (128 <= size <= 4096 and not is_text)
+                )
+                if not interesting and is_text and (("fuzz" in lname) or ("test" in lname) or ("oss-fuzz" in lname) or (self.BUG_ID in lname)):
+                    interesting = True
+
+                if not interesting:
                     continue
-                orig_dw = int.from_bytes(base[o:o + 4], "little", signed=False)
-                if orig_dw == 0:
+
+                if is_text and size > max_text:
                     continue
-                for dw in dwords:
-                    if dw == orig_dw:
+                if (not is_text) and size > max_bin:
+                    continue
+
+                try:
+                    f = tf.extractfile(m)
+                    if f is None:
                         continue
-                    bb = bytearray(base)
-                    bb[o:o + 4] = int(dw & 0xFFFFFFFF).to_bytes(4, "little", signed=False)
-                    trials += 1
-                    if self._crashes(upx_bin, bytes(bb), td):
-                        return bytes(bb)
-                    if trials >= 1200:
-                        break
-                if trials >= 1200:
-                    break
-            if trials >= 1200:
-                break
+                    data = f.read()
+                except Exception:
+                    continue
+                handle_file(name, data)
 
-        # Stage 4: Random multi-byte mutations around UPX! region
-        focus_regions = []
-        for a, z in windows:
-            focus_regions.append((a, z))
-        if not focus_regions:
-            focus_regions = [(0, min(n, 1024))]
+    def _score_candidate(self, name: str, data: bytes) -> float:
+        lname = name.lower()
+        n = len(data)
 
-        for _ in range(1500):
-            bb = bytearray(base)
-            a, z = focus_regions[self._rng.randrange(len(focus_regions))]
-            k = self._rng.randrange(1, 5)
-            for _j in range(k):
-                o = self._rng.randrange(a, z)
-                bb[o] = self._rng.randrange(0, 256)
-            if self._crashes(upx_bin, bytes(bb), td):
-                return bytes(bb)
+        score = 0.0
 
+        if self.BUG_ID in lname:
+            score += 2000.0
+
+        for k in self._KW_STRONG:
+            if k in lname:
+                score += 600.0
+        for k in self._KW_MED:
+            if k in lname:
+                score += 120.0
+
+        ext = os.path.splitext(lname)[1]
+        if ext in self._BIN_EXTS:
+            score += 240.0
+        if ext in self._COMP_EXTS:
+            score += 80.0
+
+        if self._looks_elf(data):
+            score += 350.0
+            et = self._elf_type(data)
+            if et == 3:
+                score += 300.0
+
+        if b"UPX!" in data:
+            score += 500.0
+        if b"UPX0" in data or b"UPX1" in data:
+            score += 220.0
+
+        if n == 512:
+            score += 350.0
+        score -= min(200.0, abs(n - 512) / 3.0)
+        score -= min(200.0, n / 2500.0)
+
+        if self._looks_textual(data):
+            score -= 180.0
+
+        return score
+
+    def _looks_textual(self, data: bytes) -> bool:
+        if not data:
+            return True
+        if b"\x00" in data:
+            return False
+        sample = data[:4096]
+        bad = 0
+        for b in sample:
+            if b in (9, 10, 13):
+                continue
+            if 32 <= b <= 126:
+                continue
+            bad += 1
+        return (bad / max(1, len(sample))) < 0.02
+
+    def _looks_elf(self, data: bytes) -> bool:
+        return len(data) >= 16 and data[:4] == b"\x7fELF"
+
+    def _elf_type(self, data: bytes) -> Optional[int]:
+        if not self._looks_elf(data) or len(data) < 20:
+            return None
+        ei_class = data[4]
+        ei_data = data[5]
+        if ei_data == 1:
+            endian = "little"
+        elif ei_data == 2:
+            endian = "big"
+        else:
+            return None
+        try:
+            e_type = int.from_bytes(data[16:18], endian)
+        except Exception:
+            return None
+        if e_type in (1, 2, 3, 4):
+            return e_type
         return None
 
-    def _minimize_prefix(self, upx_bin: str, data: bytes, td: str, cap: int = 512) -> bytes:
-        if len(data) <= cap:
-            # Try reduce further with prefix binary search if small
-            return self._minimize_prefix_binary(upx_bin, data, td, hi=len(data))
+    def _safe_decompress(self, fn, data: bytes, max_out: int) -> bytes:
+        out = fn(data)
+        if out is None:
+            return b""
+        if len(out) > max_out:
+            return b""
+        return out
 
-        pref = data[:cap]
-        if not self._crashes(upx_bin, pref, td):
-            return data
+    def _extract_zip(self, name: str, data: bytes, max_total: int) -> List[Tuple[str, bytes]]:
+        out = []
+        try:
+            with zipfile.ZipFile(io.BytesIO(data)) as zf:
+                total = 0
+                for zi in zf.infolist():
+                    if zi.is_dir():
+                        continue
+                    if zi.file_size <= 0 or zi.file_size > max_total:
+                        continue
+                    if total + zi.file_size > max_total:
+                        break
+                    try:
+                        b = zf.read(zi)
+                    except Exception:
+                        continue
+                    total += len(b)
+                    out.append((f"{name}:{zi.filename}", b))
+        except Exception:
+            return []
+        return out
 
-        # Now reduce <=cap
-        return self._minimize_prefix_binary(upx_bin, pref, td, hi=cap)
+    def _try_b64(self, s: str) -> Optional[bytes]:
+        ss = re.sub(r"\s+", "", s)
+        if len(ss) < 80:
+            return None
+        if len(ss) % 4 != 0:
+            return None
+        if not re.fullmatch(r"[A-Za-z0-9+/]*={0,2}", ss):
+            return None
+        try:
+            return base64.b64decode(ss, validate=True)
+        except Exception:
+            return None
 
-    def _minimize_prefix_binary(self, upx_bin: str, data: bytes, td: str, hi: int) -> bytes:
-        lo = 1
-        best = hi
-        # sanity
-        if not self._crashes(upx_bin, data[:hi], td):
-            return data[:hi]
-        while lo <= hi:
-            mid = (lo + hi) // 2
-            if self._crashes(upx_bin, data[:mid], td):
-                best = mid
-                hi = mid - 1
-            else:
-                lo = mid + 1
-        return data[:best]
+    def _extract_embedded_blobs(self, text: str) -> List[bytes]:
+        blobs = []
+
+        for m in re.finditer(r"(?s)(?:^|[^A-Za-z0-9+/=])([A-Za-z0-9+/=\r\n]{160,})(?:$|[^A-Za-z0-9+/=])", text):
+            s = m.group(1)
+            d = self._try_b64(s)
+            if d and 16 <= len(d) <= 10_000_000:
+                blobs.append(d)
+
+        for m in re.finditer(r"(?:[A-Za-z0-9+/]{80,}={0,2})", text):
+            d = self._try_b64(m.group(0))
+            if d and 16 <= len(d) <= 10_000_000:
+                blobs.append(d)
+
+        for m in re.finditer(r"(?s)(?:0x[0-9a-fA-F]{2}\s*,\s*){64,}0x[0-9a-fA-F]{2}", text):
+            block = m.group(0)
+            hexes = re.findall(r"0x([0-9a-fA-F]{2})", block)
+            if len(hexes) >= 64:
+                try:
+                    blobs.append(bytes(int(h, 16) for h in hexes))
+                except Exception:
+                    pass
+
+        for m in re.finditer(r"(?:\\x[0-9a-fA-F]{2}){64,}", text):
+            seq = m.group(0)
+            hs = re.findall(r"\\x([0-9a-fA-F]{2})", seq)
+            if len(hs) >= 64:
+                try:
+                    blobs.append(bytes(int(h, 16) for h in hs))
+                except Exception:
+                    pass
+
+        dedup = []
+        seen = set()
+        for b in blobs:
+            k = (len(b), b[:32], b[-32:] if len(b) >= 32 else b)
+            if k in seen:
+                continue
+            seen.add(k)
+            dedup.append(b)
+        return dedup
+
+    def _fallback_elf_512(self) -> bytes:
+        # Minimal 32-bit little-endian ET_DYN ELF with one PT_LOAD, plus "UPX!" marker.
+        data = bytearray(b"\x00" * 512)
+        data[0:4] = b"\x7fELF"
+        data[4] = 1  # EI_CLASS: 32-bit
+        data[5] = 1  # EI_DATA: little
+        data[6] = 1  # EI_VERSION
+        data[7] = 0  # EI_OSABI
+        # e_type (ET_DYN=3), e_machine (EM_386=3), e_version=1
+        data[16:18] = (3).to_bytes(2, "little")
+        data[18:20] = (3).to_bytes(2, "little")
+        data[20:24] = (1).to_bytes(4, "little")
+        # e_entry
+        data[24:28] = (0).to_bytes(4, "little")
+        # e_phoff: 52
+        data[28:32] = (52).to_bytes(4, "little")
+        # e_shoff: 0
+        data[32:36] = (0).to_bytes(4, "little")
+        # e_flags: 0
+        data[36:40] = (0).to_bytes(4, "little")
+        # e_ehsize: 52
+        data[40:42] = (52).to_bytes(2, "little")
+        # e_phentsize: 32, e_phnum: 1
+        data[42:44] = (32).to_bytes(2, "little")
+        data[44:46] = (1).to_bytes(2, "little")
+        # e_shentsize, e_shnum, e_shstrndx: 0
+        data[46:52] = b"\x00" * 6
+
+        # Program header at offset 52 (Elf32_Phdr, 32 bytes)
+        ph = 52
+        # p_type PT_LOAD=1
+        data[ph + 0:ph + 4] = (1).to_bytes(4, "little")
+        # p_offset
+        data[ph + 4:ph + 8] = (0).to_bytes(4, "little")
+        # p_vaddr, p_paddr
+        data[ph + 8:ph + 12] = (0x08048000).to_bytes(4, "little")
+        data[ph + 12:ph + 16] = (0x08048000).to_bytes(4, "little")
+        # p_filesz, p_memsz
+        data[ph + 16:ph + 20] = (512).to_bytes(4, "little")
+        data[ph + 20:ph + 24] = (512).to_bytes(4, "little")
+        # p_flags: R-X
+        data[ph + 24:ph + 28] = (5).to_bytes(4, "little")
+        # p_align
+        data[ph + 28:ph + 32] = (0x1000).to_bytes(4, "little")
+
+        marker_off = 0x100
+        data[marker_off:marker_off + 4] = b"UPX!"
+        data[marker_off + 4:marker_off + 8] = b"UPX0"
+        data[marker_off + 8:marker_off + 12] = b"UPX1"
+        return bytes(data)

@@ -1,5 +1,6 @@
 import pandas as pd
 import numpy as np
+from concurrent.futures import ThreadPoolExecutor
 
 class Solution:
     def solve(
@@ -15,84 +16,97 @@ class Solution:
     ) -> pd.DataFrame:
         """
         Reorder columns in the DataFrame to maximize prefix hit rate.
+        Strategy:
+        1. Apply column merges.
+        2. Sort columns based on heuristics:
+           - Primary: Cardinality (Ascending). Low cardinality minimizes branching in the prefix tree.
+           - Secondary: Collision Score (Descending). Higher concentration (skew) preserves larger groups.
+           - Tertiary: Average Length (Descending). Longer strings contribute more to LCP score.
         """
-        # Work on a copy to avoid side effects on the input DataFrame
-        df_processed = df.copy()
+        
+        # Work on a copy to avoid modifying the input inplace unexpectedly
+        df_res = df.copy()
         
         # 1. Apply Column Merges
         if col_merge:
-            cols_to_drop = set()
-            new_columns = {}
-            
             for group in col_merge:
-                # Identify valid columns in the group that exist in the DataFrame
-                valid_group = [c for c in group if c in df_processed.columns]
-                if not valid_group:
+                # Identify valid columns in this group that exist in current dataframe
+                valid_cols = [c for c in group if c in df_res.columns]
+                
+                # Need at least 1 column to process
+                if not valid_cols:
                     continue
                 
-                # Mark these columns for removal
-                cols_to_drop.update(valid_group)
+                # Concatenate columns as strings
+                # Start with first column
+                merged_series = df_res[valid_cols[0]].astype(str)
+                for c in valid_cols[1:]:
+                    merged_series = merged_series + df_res[c].astype(str)
                 
-                # Concatenate columns
-                # Start with the first column converted to string
-                current_series = df_processed[valid_group[0]].astype(str)
-                for col in valid_group[1:]:
-                    current_series = current_series.str.cat(df_processed[col].astype(str))
+                # Generate new column name. Use concatenation of names to ensure uniqueness.
+                new_col_name = "".join([str(c) for c in valid_cols])
                 
-                # Create a unique name for the merged column
-                new_col_name = "_".join(map(str, valid_group))
-                new_columns[new_col_name] = current_series
-            
-            # Remove original columns and append merged ones
-            df_processed.drop(columns=list(cols_to_drop), inplace=True)
-            for name, series in new_columns.items():
-                df_processed[name] = series
+                # Handle potential name collision
+                if new_col_name in df_res.columns and new_col_name not in valid_cols:
+                    base_name = new_col_name
+                    suffix = 1
+                    while new_col_name in df_res.columns:
+                        new_col_name = f"{base_name}_{suffix}"
+                        suffix += 1
+                
+                # Assign merged series
+                df_res[new_col_name] = merged_series
+                
+                # Drop original columns (excluding the new one if it overwrites)
+                cols_to_drop = [c for c in valid_cols if c != new_col_name]
+                if cols_to_drop:
+                    df_res.drop(columns=cols_to_drop, inplace=True)
 
-        # 2. Convert to string for scoring metric calculation
-        # The optimization target depends on the string representation
-        df_str = df_processed.astype(str)
+        # 2. Calculate Metrics for Sorting
+        cols = list(df_res.columns)
         
-        # 3. Compute Column Scores
-        # We define a score for each column based on how much it would contribute 
-        # to the prefix match length if it were placed first.
-        # Score = Sum over unique values v: (Frequency(v) - 1) * Length(v)
-        # This favors columns with low cardinality (high frequency) and longer string representations.
-        column_scores = []
-        
-        for col in df_str.columns:
-            vc = df_str[col].value_counts()
+        def get_col_metric(col_name):
+            # Metrics must be based on string representation
+            s = df_res[col_name].astype(str)
+            N = len(s)
             
-            if vc.empty:
-                column_scores.append((0, 0, col))
-                continue
-                
+            if N == 0:
+                return (col_name, 0, 0.0, 0.0)
+            
+            # Value counts
+            vc = s.value_counts(normalize=False, sort=False)
             counts = vc.values
-            # Calculate string lengths of the values
-            lengths = vc.index.map(len).values
+            probs = counts / N
             
-            # Only values that appear more than once contribute to matches
-            mask = counts > 1
-            if mask.any():
-                rel_counts = counts[mask]
-                rel_lengths = lengths[mask]
-                
-                # Primary metric: Total length of overlaps contributed
-                score = np.sum((rel_counts - 1) * rel_lengths)
-                
-                # Secondary metric: Total number of pairwise overlaps (redundancy)
-                # This breaks ties by preferring columns that group more rows together
-                redundancy = np.sum(rel_counts - 1)
-            else:
-                score = 0
-                redundancy = 0
+            # Metric 1: Cardinality (Ascending)
+            # Fewer unique values means we split the dataset into fewer groups,
+            # keeping more rows together for subsequent matches.
+            card = len(vc)
             
-            column_scores.append((score, redundancy, col))
+            # Metric 2: Collision Score (Descending)
+            # sum(p^2). Higher score means the distribution is more skewed (e.g. 90/10 vs 50/50).
+            # A more skewed distribution preserves a larger main group.
+            coll_score = np.sum(probs * probs)
+            
+            # Metric 3: Weighted Average Length (Descending)
+            # If structural properties are similar, prefer longer strings to boost LCP.
+            lengths = vc.index.astype(str).str.len().values
+            avg_len = np.sum(probs * lengths)
+            
+            return (col_name, card, coll_score, avg_len)
+
+        # Compute metrics
+        # Use parallel processing if efficient
+        if parallel and len(cols) > 10:
+            with ThreadPoolExecutor(max_workers=8) as executor:
+                metrics = list(executor.map(get_col_metric, cols))
+        else:
+            metrics = [get_col_metric(c) for c in cols]
         
-        # 4. Sort Columns
-        # Sort by Score DESC, then Redundancy DESC
-        column_scores.sort(key=lambda x: (x[0], x[1]), reverse=True)
+        # 3. Sort Columns
+        # Sort key: (Cardinality ASC, Collision Score DESC, Avg Length DESC)
+        metrics.sort(key=lambda x: (x[1], -x[2], -x[3]))
         
-        ordered_cols = [x[2] for x in column_scores]
+        sorted_cols = [x[0] for x in metrics]
         
-        # 5. Return DataFrame with reordered columns
-        return df_processed[ordered_cols]
+        return df_res[sorted_cols]

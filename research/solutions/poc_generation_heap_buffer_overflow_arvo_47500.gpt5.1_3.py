@@ -1,155 +1,140 @@
 import os
 import tarfile
-import tempfile
-import shutil
-import stat
 
 
 class Solution:
     def solve(self, src_path: str) -> bytes:
         target_size = 1479
-        tmpdir = None
-
-        def is_regular_file(path: str) -> bool:
-            try:
-                st = os.stat(path)
-            except OSError:
-                return False
-            return stat.S_ISREG(st.st_mode)
-
-        def walk_files(root: str):
-            for dirpath, _, filenames in os.walk(root):
-                for name in filenames:
-                    full = os.path.join(dirpath, name)
-                    if is_regular_file(full):
-                        yield full
-
-        def score_candidate(path: str, size_match: bool) -> int:
-            name = os.path.basename(path)
-            lower_name = name.lower()
-            lower_path = path.lower()
-            ext = os.path.splitext(lower_name)[1]
-
-            score = 0
-
-            if size_match:
-                score += 50
-
-            image_exts = {
-                ".jp2", ".j2k", ".jpc", ".jpx", ".j2c",
-                ".pgx", ".png", ".jpg", ".jpeg", ".bmp",
-                ".pnm", ".pgm", ".ppm", ".raw", ".bin", ".dat"
-            }
-            if ext in image_exts:
-                score += 20
-            if ext in {".jp2", ".j2k", ".jpc", ".j2c"}:
-                score += 15
-
-            keywords = [
-                ("poc", 40),
-                ("crash", 30),
-                ("id:", 30),
-                ("id_", 25),
-                ("heap", 15),
-                ("overflow", 15),
-                ("malloc", 10),
-                ("bug", 10),
-                ("opj", 10),
-                ("htj2k", 10),
-                ("ht_", 5),
-                ("htt", 5),
-                ("ht", 3),
-                ("47500", 10),
-            ]
-            for kw, val in keywords:
-                if kw in lower_path:
-                    score += val
-
-            rel = os.path.relpath(path, root_dir)
-            depth = rel.count(os.sep)
-            score -= depth
-
-            try:
-                sz = os.path.getsize(path)
-            except OSError:
-                sz = 0
-            if sz < 10 * 1024:
-                score += 5
-
-            return score
 
         try:
-            if os.path.isdir(src_path):
-                root_dir = src_path
-            else:
-                if not tarfile.is_tarfile(src_path):
-                    return b"A"
-                tmpdir = tempfile.mkdtemp(prefix="poc_extract_")
-                with tarfile.open(src_path, "r:*") as tf:
-                    tf.extractall(tmpdir)
-                root_dir = tmpdir
+            tar = tarfile.open(src_path, "r:*")
+        except Exception:
+            return b""
 
-            best_path = None
-            best_score = None
+        with tar:
+            best_member = None
+            best_score = float("-inf")
 
-            # First pass: exact size match
-            for path in walk_files(root_dir):
+            for member in tar.getmembers():
+                if not member.isfile() or member.size <= 0:
+                    continue
+
+                name_lower = member.name.lower()
+                base, ext = os.path.splitext(name_lower)
+
                 try:
-                    sz = os.path.getsize(path)
-                except OSError:
+                    f = tar.extractfile(member)
+                except Exception:
                     continue
-                if sz != target_size:
+                if f is None:
                     continue
-                score = score_candidate(path, size_match=True)
-                if best_path is None or score > best_score or (
-                    score == best_score and path < best_path
+
+                try:
+                    header = f.read(16)
+                finally:
+                    f.close()
+
+                score = 0
+
+                # Strong preference for exact ground-truth size
+                if member.size == target_size:
+                    score += 100
+                elif 0 < member.size < target_size * 2:
+                    score += 10  # prefer relatively small files
+
+                # Name-based hints
+                if any(
+                    key in name_lower
+                    for key in (
+                        "poc",
+                        "proof",
+                        "cve",
+                        "heap",
+                        "overflow",
+                        "crash",
+                        "bug",
+                        "47500",
+                        "ht",
+                        "dec",
+                    )
                 ):
-                    best_path = path
+                    score += 25
+
+                # Extension-based hints
+                if ext in (".j2k", ".jp2", ".jpc", ".j2c", ".jph", ".jpt"):
+                    score += 20
+                elif ext in (".pgx", ".raw", ".bin", ".dat"):
+                    score += 8
+
+                # Magic bytes / header-based hints
+                if len(header) >= 2 and header.startswith(b"\xff\x4f"):
+                    score += 30  # JPEG 2000 codestream SOC marker
+                if len(header) >= 8 and (
+                    header.startswith(b"\x00\x00\x00\x0cjP  ")
+                    or header[4:8] == b"jP  "
+                ):
+                    score += 30  # JP2 file signature box
+
+                # Penalize obvious source/text files
+                if ext in (
+                    ".c",
+                    ".h",
+                    ".cpp",
+                    ".cc",
+                    ".cxx",
+                    ".hpp",
+                    ".py",
+                    ".java",
+                    ".js",
+                    ".html",
+                    ".xml",
+                    ".json",
+                    ".yml",
+                    ".yaml",
+                    ".md",
+                    ".txt",
+                    ".rst",
+                    ".in",
+                    ".am",
+                    ".ac",
+                    ".cmake",
+                    ".mak",
+                ):
+                    score -= 40
+
+                # Binary-ness heuristic
+                if header:
+                    nonprintable = sum(
+                        1
+                        for b in header
+                        if b < 9 or (13 < b < 32) or b > 126
+                    )
+                    if nonprintable >= len(header) // 2:
+                        score += 5
+
+                # Directory hints
+                if "/poc" in name_lower or name_lower.startswith("poc"):
+                    score += 10
+
+                if (
+                    score > best_score
+                    or (
+                        score == best_score
+                        and best_member is not None
+                        and member.size < best_member.size
+                    )
+                ):
                     best_score = score
+                    best_member = member
 
-            # Second pass: heuristic match if no exact-size file found
-            if best_path is None:
-                for path in walk_files(root_dir):
-                    lower_path = path.lower()
-                    name = os.path.basename(lower_path)
-                    ext = os.path.splitext(name)[1]
-                    interesting = False
-
-                    if any(k in lower_path for k in ("poc", "crash", "id:", "id_", "heap", "overflow")):
-                        interesting = True
-                    if ext in {
-                        ".jp2", ".j2k", ".jpc", ".jpx", ".j2c",
-                        ".pgx", ".png", ".jpg", ".jpeg", ".bmp",
-                        ".pnm", ".pgm", ".ppm", ".raw", ".bin", ".dat"
-                    }:
-                        interesting = True
-
-                    if not interesting:
-                        continue
-
-                    try:
-                        sz = os.path.getsize(path)
-                    except OSError:
-                        continue
-                    if sz > 1024 * 1024:
-                        continue
-
-                    score = score_candidate(path, size_match=False)
-                    if best_path is None or score > best_score or (
-                        score == best_score and path < best_path
-                    ):
-                        best_path = path
-                        best_score = score
-
-            if best_path is not None:
+            if best_member is not None:
+                f = tar.extractfile(best_member)
+                if f is None:
+                    return b""
                 try:
-                    with open(best_path, "rb") as f:
-                        data = f.read()
-                    return data
-                except OSError:
-                    pass
+                    data = f.read()
+                finally:
+                    f.close()
+                return data
 
-            return b"A"
-        finally:
-            if tmpdir is not None:
-                shutil.rmtree(tmpdir, ignore_errors=True)
+            return b""

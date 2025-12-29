@@ -1,158 +1,181 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
-
-class ResidualBlock(nn.Module):
-    def __init__(self, dim: int, dropout: float = 0.2):
-        super().__init__()
-        self.fc = nn.Linear(dim, dim)
-        self.bn = nn.BatchNorm1d(dim)
-        self.act = nn.GELU()
-        self.dropout = nn.Dropout(dropout)
-
-    def forward(self, x):
-        residual = x
-        out = self.fc(x)
-        out = self.bn(out)
-        out = self.act(out)
-        out = self.dropout(out)
-        return residual + out
-
-
-class MLPNet(nn.Module):
-    def __init__(self, input_dim: int, num_classes: int, dropout: float = 0.2):
-        super().__init__()
-        hidden1 = 512
-        hidden2 = 256
-
-        self.fc1 = nn.Linear(input_dim, hidden1)
-        self.bn1 = nn.BatchNorm1d(hidden1)
-
-        self.fc2 = nn.Linear(hidden1, hidden2)
-        self.bn2 = nn.BatchNorm1d(hidden2)
-
-        self.block1 = ResidualBlock(hidden2, dropout=dropout)
-        self.block2 = ResidualBlock(hidden2, dropout=dropout)
-
-        self.dropout = nn.Dropout(dropout)
-        self.out = nn.Linear(hidden2, num_classes)
-
-    def forward(self, x):
-        x = self.fc1(x)
-        x = self.bn1(x)
-        x = F.gelu(x)
-        x = self.dropout(x)
-
-        x = self.fc2(x)
-        x = self.bn2(x)
-        x = F.gelu(x)
-        x = self.dropout(x)
-
-        x = self.block1(x)
-        x = self.block2(x)
-
-        x = self.out(x)
-        return x
+import random
+import numpy as np
+from copy import deepcopy
 
 
 class Solution:
+    def _set_seed(self, seed: int = 42):
+        torch.manual_seed(seed)
+        random.seed(seed)
+        np.random.seed(seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(seed)
+
+    def _make_mlp(self, input_dim, num_classes, hidden_sizes, dropout: float = 0.15):
+        if not hidden_sizes:
+            return nn.Linear(input_dim, num_classes)
+
+        layers = []
+        in_dim = input_dim
+        for h in hidden_sizes:
+            layers.append(nn.Linear(in_dim, h))
+            layers.append(nn.BatchNorm1d(h))
+            layers.append(nn.GELU())
+            if dropout and dropout > 0:
+                layers.append(nn.Dropout(dropout))
+            in_dim = h
+        layers.append(nn.Linear(in_dim, num_classes))
+        return nn.Sequential(*layers)
+
+    def _build_model(self, input_dim, num_classes, param_limit):
+        # Largest-to-smallest candidate configurations
+        candidate_configs = [
+            [622, 256, 256],  # ~499,914 params with BN
+            [576, 256, 256],
+            [512, 256, 256],
+            [512, 256],
+            [384, 256],
+            [384, 128],
+            [256, 128],
+            [256],
+            [128],
+            [],
+        ]
+        dropout = 0.15
+        for cfg in candidate_configs:
+            model = self._make_mlp(input_dim, num_classes, cfg, dropout=dropout)
+            param_count = sum(p.numel() for p in model.parameters() if p.requires_grad)
+            if param_count <= param_limit:
+                return model
+        # Fallback (should not normally be needed)
+        return self._make_mlp(input_dim, num_classes, [], dropout=0.0)
+
     def solve(self, train_loader, val_loader, metadata: dict = None) -> torch.nn.Module:
         if metadata is None:
             metadata = {}
         input_dim = metadata.get("input_dim", 384)
         num_classes = metadata.get("num_classes", 128)
-        device = metadata.get("device", "cpu")
         param_limit = metadata.get("param_limit", 500000)
+        device_str = metadata.get("device", "cpu")
+        device = torch.device(device_str)
 
-        torch.manual_seed(42)
+        self._set_seed(42)
 
-        model = MLPNet(input_dim=input_dim, num_classes=num_classes, dropout=0.2)
-        param_count = sum(p.numel() for p in model.parameters() if p.requires_grad)
-        if param_count > param_limit:
-            # In extremely unlikely case of mismatch, fall back to smaller baseline model
-            hidden_dim = 384
-            model = nn.Sequential(
-                nn.Linear(input_dim, hidden_dim),
-                nn.ReLU(),
-                nn.Linear(hidden_dim, num_classes),
-            )
-
+        # Build model under param_limit (and implicitly under 500k hard limit)
+        model = self._build_model(input_dim, num_classes, param_limit)
         model.to(device)
 
-        criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
-        optimizer = torch.optim.AdamW(model.parameters(), lr=5e-4, weight_decay=1e-2)
-        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-            optimizer, mode="max", factor=0.5, patience=5, min_lr=1e-5, verbose=False
+        # Enforce hard 500k parameter limit defensively
+        hard_limit = 500000
+        param_count = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        if param_count > hard_limit:
+            # Fallback to a smaller model if metadata was misleading
+            model = self._make_mlp(input_dim, num_classes, [], dropout=0.0)
+            model.to(device)
+
+        # Training hyperparameters
+        max_epochs = 200
+        patience = 25
+        base_lr = 1e-3
+        weight_decay = 1e-2
+
+        optimizer = torch.optim.AdamW(model.parameters(), lr=base_lr, weight_decay=weight_decay)
+
+        try:
+            criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
+        except TypeError:
+            criterion = nn.CrossEntropyLoss()
+
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer, T_max=max_epochs, eta_min=1e-5
         )
 
-        num_epochs = 120
-        patience = 20
+        best_state = deepcopy(model.state_dict())
         best_val_acc = 0.0
-        best_state_dict = None
         epochs_no_improve = 0
+        has_val = val_loader is not None
 
-        for epoch in range(num_epochs):
+        for epoch in range(max_epochs):
+            # Training phase
             model.train()
-            total = 0
-            correct = 0
-            running_loss = 0.0
+            train_loss = 0.0
+            train_correct = 0
+            train_total = 0
 
-            for inputs, targets in train_loader:
+            for batch in train_loader:
+                if isinstance(batch, (list, tuple)) and len(batch) >= 2:
+                    inputs, targets = batch[:2]
+                else:
+                    continue
+
                 inputs = inputs.to(device)
                 targets = targets.to(device)
 
-                optimizer.zero_grad()
+                optimizer.zero_grad(set_to_none=True)
                 outputs = model(inputs)
                 loss = criterion(outputs, targets)
                 loss.backward()
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
+                nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
                 optimizer.step()
 
                 batch_size = targets.size(0)
-                running_loss += loss.item() * batch_size
-                _, preds = outputs.max(1)
-                correct += (preds == targets).sum().item()
-                total += batch_size
+                train_loss += loss.item() * batch_size
+                train_total += batch_size
+                train_correct += (outputs.argmax(dim=1) == targets).sum().item()
 
-            model.eval()
-            val_total = 0
-            val_correct = 0
-            val_loss = 0.0
-            with torch.no_grad():
-                for inputs, targets in val_loader:
-                    inputs = inputs.to(device)
-                    targets = targets.to(device)
-                    outputs = model(inputs)
-                    loss = criterion(outputs, targets)
+            if train_total > 0:
+                train_loss /= train_total
 
-                    batch_size = targets.size(0)
-                    val_loss += loss.item() * batch_size
-                    _, preds = outputs.max(1)
-                    val_correct += (preds == targets).sum().item()
-                    val_total += batch_size
-
-            if val_total > 0:
-                val_loss /= val_total
-                val_acc = val_correct / val_total
-            else:
+            # Validation phase
+            if has_val:
+                model.eval()
                 val_loss = 0.0
-                val_acc = 0.0
+                val_correct = 0
+                val_total = 0
+                with torch.no_grad():
+                    for batch in val_loader:
+                        if isinstance(batch, (list, tuple)) and len(batch) >= 2:
+                            inputs, targets = batch[:2]
+                        else:
+                            continue
 
-            scheduler.step(val_acc)
+                        inputs = inputs.to(device)
+                        targets = targets.to(device)
 
-            if val_acc > best_val_acc + 1e-4:
-                best_val_acc = val_acc
-                best_state_dict = {k: v.cpu().clone() for k, v in model.state_dict().items()}
-                epochs_no_improve = 0
+                        outputs = model(inputs)
+                        loss = criterion(outputs, targets)
+
+                        batch_size = targets.size(0)
+                        val_loss += loss.item() * batch_size
+                        val_total += batch_size
+                        val_correct += (outputs.argmax(dim=1) == targets).sum().item()
+
+                if val_total > 0:
+                    val_loss /= val_total
+                    val_acc = val_correct / val_total
+                else:
+                    val_loss = 0.0
+                    val_acc = 0.0
+
+                if val_acc > best_val_acc + 1e-4:
+                    best_val_acc = val_acc
+                    best_state = deepcopy(model.state_dict())
+                    epochs_no_improve = 0
+                else:
+                    epochs_no_improve += 1
             else:
-                epochs_no_improve += 1
-                if epochs_no_improve >= patience:
-                    break
+                # No validation set: keep last model
+                best_state = deepcopy(model.state_dict())
 
-        if best_state_dict is not None:
-            model.load_state_dict(best_state_dict)
+            scheduler.step()
 
-        model.to("cpu")
+            if has_val and epochs_no_improve >= patience:
+                break
+
+        model.load_state_dict(best_state)
+        model.to(device)
         model.eval()
         return model

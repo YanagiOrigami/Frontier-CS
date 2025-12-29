@@ -5,144 +5,173 @@ import triton.language as tl
 class Solution:
     def solve(self, spec_path: str = None) -> dict:
         return {
-            "code": r"""
+            "code": """
 import torch
 import triton
 import triton.language as tl
+import math
 
 @triton.autotune(
     configs=[
-        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 64}, num_stages=3, num_warps=8),
-        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 64}, num_stages=4, num_warps=4),
-        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 64}, num_stages=4, num_warps=4),
+        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 64}, num_warps=4, num_stages=2),
+        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 64}, num_warps=4, num_stages=2),
+        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 32}, num_warps=4, num_stages=2),
     ],
-    key=['M', 'N', 'DQK', 'DV'],
+    key=['N_CTX', 'D_HEAD'],
 )
 @triton.jit
 def _gdpa_kernel(
     Q, K, V, GQ, GK, Out,
-    stride_qz, stride_qh, stride_qm, stride_qk,
-    stride_kz, stride_kh, stride_kn, stride_kk,
-    stride_vz, stride_vh, stride_vn, stride_vk,
-    stride_gqz, stride_gqh, stride_gqm, stride_gqk,
-    stride_gkz, stride_gkh, stride_gkn, stride_gkk,
-    stride_oz, stride_oh, stride_om, stride_ov,
+    stride_z_q, stride_h_q, stride_m_q, stride_d_q,
+    stride_z_k, stride_h_k, stride_n_k, stride_d_k,
+    stride_z_v, stride_h_v, stride_n_v, stride_d_v,
+    stride_z_gq, stride_h_gq, stride_m_gq, stride_d_gq,
+    stride_z_gk, stride_h_gk, stride_n_gk, stride_d_gk,
+    stride_z_o, stride_h_o, stride_m_o, stride_d_o,
+    Z, H, N_CTX, D_HEAD,
     sm_scale,
-    Z, H, M, N, 
-    DQK, DV,
-    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, 
-    BLOCK_DQK: tl.constexpr, BLOCK_DV: tl.constexpr
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr
 ):
-    start_m = tl.program_id(0)
-    off_hz = tl.program_id(1)
+    tl_m = tl.program_id(0)
+    tl_zh = tl.program_id(1)
+    tl_h = tl_zh % H
+    tl_z = tl_zh // H
+
+    # Offsets
+    off_q = tl_z * stride_z_q + tl_h * stride_h_q
+    off_k = tl_z * stride_z_k + tl_h * stride_h_k
+    off_v = tl_z * stride_z_v + tl_h * stride_h_v
+    off_gq = tl_z * stride_z_gq + tl_h * stride_h_gq
+    off_gk = tl_z * stride_z_gk + tl_h * stride_h_gk
+    off_o = tl_z * stride_z_o + tl_h * stride_h_o
+
+    # Block Pointers
+    # Q, GQ: (M, D) - Row Major
+    Q_ptr = tl.make_block_ptr(
+        base=Q + off_q,
+        shape=(N_CTX, D_HEAD),
+        strides=(stride_m_q, stride_d_q),
+        offsets=(tl_m * BLOCK_M, 0),
+        block_shape=(BLOCK_M, D_HEAD),
+        order=(1, 0)
+    )
+    GQ_ptr = tl.make_block_ptr(
+        base=GQ + off_gq,
+        shape=(N_CTX, D_HEAD),
+        strides=(stride_m_gq, stride_d_gq),
+        offsets=(tl_m * BLOCK_M, 0),
+        block_shape=(BLOCK_M, D_HEAD),
+        order=(1, 0)
+    )
     
-    i_z = off_hz // H
-    i_h = off_hz % H
+    # K, GK: (D, N) - Column Major (transposed load for dot product)
+    K_ptr = tl.make_block_ptr(
+        base=K + off_k,
+        shape=(D_HEAD, N_CTX),
+        strides=(stride_d_k, stride_n_k),
+        offsets=(0, 0),
+        block_shape=(D_HEAD, BLOCK_N),
+        order=(0, 1)
+    )
+    GK_ptr = tl.make_block_ptr(
+        base=GK + off_gk,
+        shape=(D_HEAD, N_CTX),
+        strides=(stride_d_gk, stride_n_gk),
+        offsets=(0, 0),
+        block_shape=(D_HEAD, BLOCK_N),
+        order=(0, 1)
+    )
 
-    q_offset = i_z * stride_qz + i_h * stride_qh
-    k_offset = i_z * stride_kz + i_h * stride_kh
-    v_offset = i_z * stride_vz + i_h * stride_vh
-    gq_offset = i_z * stride_gqz + i_h * stride_gqh
-    gk_offset = i_z * stride_gkz + i_h * stride_gkh
-    o_offset = i_z * stride_oz + i_h * stride_oh
+    # V: (N, D) - Row Major
+    V_ptr = tl.make_block_ptr(
+        base=V + off_v,
+        shape=(N_CTX, D_HEAD),
+        strides=(stride_n_v, stride_d_v),
+        offsets=(0, 0),
+        block_shape=(BLOCK_N, D_HEAD),
+        order=(1, 0)
+    )
 
-    offs_m = start_m * BLOCK_M + tl.arange(0, BLOCK_M)
-    offs_dqk = tl.arange(0, BLOCK_DQK)
-    offs_dv = tl.arange(0, BLOCK_DV)
+    # Output
+    O_ptr = tl.make_block_ptr(
+        base=Out + off_o,
+        shape=(N_CTX, D_HEAD),
+        strides=(stride_m_o, stride_d_o),
+        offsets=(tl_m * BLOCK_M, 0),
+        block_shape=(BLOCK_M, D_HEAD),
+        order=(1, 0)
+    )
 
-    mask_m = offs_m < M
-    mask_dqk = offs_dqk < DQK
-    mask_dv = offs_dv < DV
-
-    Q_ptrs = Q + q_offset + offs_m[:, None] * stride_qm + offs_dqk[None, :] * stride_qk
-    GQ_ptrs = GQ + gq_offset + offs_m[:, None] * stride_gqm + offs_dqk[None, :] * stride_gqk
-
-    # Load Q and GQ
-    q = tl.load(Q_ptrs, mask=mask_m[:, None] & mask_dqk[None, :], other=0.0)
-    gq = tl.load(GQ_ptrs, mask=mask_m[:, None] & mask_dqk[None, :], other=0.0)
-
-    # Apply gating to Q: Qg = Q * sigmoid(GQ)
+    # Load Q, GQ
+    # boundary_check=(0,1) handles cases where sizes are not multiples of block
+    q = tl.load(Q_ptr, boundary_check=(0,1))
+    gq = tl.load(GQ_ptr, boundary_check=(0,1))
+    
+    # Gate Q
     q = q * tl.sigmoid(gq)
-    # Apply scale
-    q = q * sm_scale
+    q = (q * sm_scale).to(tl.float16)
 
-    # Initialize stats
-    m_i = tl.full([BLOCK_M], float("-inf"), dtype=tl.float32)
+    # Accumulators
+    m_i = tl.zeros([BLOCK_M], dtype=tl.float32) - float('inf')
     l_i = tl.zeros([BLOCK_M], dtype=tl.float32)
-    acc = tl.zeros([BLOCK_M, BLOCK_DV], dtype=tl.float32)
+    acc = tl.zeros([BLOCK_M, D_HEAD], dtype=tl.float32)
 
-    K_base = K + k_offset
-    GK_base = GK + gk_offset
-    V_base = V + v_offset
-
-    offs_n = tl.arange(0, BLOCK_N)
-    
-    for start_n in range(0, N, BLOCK_N):
-        cols = start_n + offs_n
-        mask_n = cols < N
-        
+    # Loop over K, V (N dimension)
+    for start_n in range(0, N_CTX, BLOCK_N):
         # Load K, GK
-        # Transposed access: K is loaded as (BLOCK_N, DQK) to perform dot(Q, K.T)
-        K_ptrs = K_base + cols[:, None] * stride_kn + offs_dqk[None, :] * stride_kk
-        GK_ptrs = GK_base + cols[:, None] * stride_gkn + offs_dqk[None, :] * stride_gkk
+        k = tl.load(K_ptr, boundary_check=(0,1))
+        gk = tl.load(GK_ptr, boundary_check=(0,1))
         
-        k = tl.load(K_ptrs, mask=mask_n[:, None] & mask_dqk[None, :], other=0.0)
-        gk = tl.load(GK_ptrs, mask=mask_n[:, None] & mask_dqk[None, :], other=0.0)
-        
-        # Apply gating to K: Kg = K * sigmoid(GK)
+        # Load V
+        v = tl.load(V_ptr, boundary_check=(0,1))
+
+        # Gate K
         k = k * tl.sigmoid(gk)
         
-        # Compute Q K^T
-        qk = tl.dot(q, tl.trans(k))
+        # Compute Attention Scores: Q (M, D) @ K (D, N) -> (M, N)
+        qk = tl.dot(q, k)
         
-        # Mask padded elements
-        qk = tl.where(mask_n[None, :], qk, float("-inf"))
+        # Mask out-of-bounds columns if necessary
+        if start_n + BLOCK_N > N_CTX:
+            offs_n = start_n + tl.arange(0, BLOCK_N)
+            mask_n = offs_n[None, :] < N_CTX
+            qk = tl.where(mask_n, qk, float('-inf'))
         
-        # Online Softmax
+        # Softmax stats
         m_ij = tl.max(qk, 1)
         p = tl.exp(qk - m_ij[:, None])
         l_ij = tl.sum(p, 1)
-        
+
+        # Update stats
         m_new = tl.maximum(m_i, m_ij)
-        
         alpha = tl.exp(m_i - m_new)
         beta = tl.exp(m_ij - m_new)
+
+        l_i = l_i * alpha + l_ij * beta
         
-        l_new = l_i * alpha + l_ij * beta
-        
-        # Load V
-        V_ptrs = V_base + cols[:, None] * stride_vn + offs_dv[None, :] * stride_vk
-        v = tl.load(V_ptrs, mask=mask_n[:, None] & mask_dv[None, :], other=0.0)
-        
-        # Accumulate Output
-        p_w = p * beta[:, None]
-        acc = acc * alpha[:, None]
-        # Cast to fp16 for accumulation if necessary, but keep acc in fp32
-        acc = tl.dot(p_w.to(tl.float16), v, acc)
-        
-        l_i = l_new
+        # Update accumulator: acc (M, D) + P (M, N) @ V (N, D)
+        p = p.to(tl.float16)
+        pv = tl.dot(p, v)
+        acc = acc * alpha[:, None] + pv * beta[:, None]
         m_i = m_new
+
+        # Advance pointers
+        K_ptr = tl.advance(K_ptr, (0, BLOCK_N))
+        GK_ptr = tl.advance(GK_ptr, (0, BLOCK_N))
+        V_ptr = tl.advance(V_ptr, (BLOCK_N, 0))
 
     # Finalize
     acc = acc / l_i[:, None]
-    
-    # Store
-    O_ptrs = Out + o_offset + offs_m[:, None] * stride_om + offs_dv[None, :] * stride_ov
-    tl.store(O_ptrs, acc.to(tl.float16), mask=mask_m[:, None] & mask_dv[None, :])
+    tl.store(O_ptr, acc.to(tl.float16), boundary_check=(0,1))
 
 def gdpa_attn(Q, K, V, GQ, GK):
     Z, H, M, Dq = Q.shape
     _, _, N, _ = K.shape
-    _, _, _, Dv = V.shape
     
-    Out = torch.empty((Z, H, M, Dv), device=Q.device, dtype=Q.dtype)
-    
-    BLOCK_DQK = triton.next_power_of_2(Dq)
-    BLOCK_DV = triton.next_power_of_2(Dv)
+    sm_scale = 1.0 / math.sqrt(Dq)
+    Out = torch.empty_like(Q)
     
     grid = lambda META: (triton.cdiv(M, META['BLOCK_M']), Z * H)
-    
-    sm_scale = 1.0 / (Dq ** 0.5)
     
     _gdpa_kernel[grid](
         Q, K, V, GQ, GK, Out,
@@ -152,10 +181,8 @@ def gdpa_attn(Q, K, V, GQ, GK):
         GQ.stride(0), GQ.stride(1), GQ.stride(2), GQ.stride(3),
         GK.stride(0), GK.stride(1), GK.stride(2), GK.stride(3),
         Out.stride(0), Out.stride(1), Out.stride(2), Out.stride(3),
-        sm_scale,
-        Z, H, M, N,
-        Dq, Dv,
-        BLOCK_DQK=BLOCK_DQK, BLOCK_DV=BLOCK_DV
+        Z, H, M, Dq,
+        sm_scale
     )
     
     return Out

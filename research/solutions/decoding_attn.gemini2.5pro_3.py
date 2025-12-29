@@ -1,7 +1,6 @@
 import torch
 import triton
 import triton.language as tl
-import math
 
 class Solution:
     def solve(self, spec_path: str = None) -> dict:
@@ -12,107 +11,109 @@ import triton.language as tl
 
 @triton.autotune(
     configs=[
-        triton.Config({'BLOCK_N': 64}, num_warps=2),
-        triton.Config({'BLOCK_N': 128}, num_warps=2),
-        triton.Config({'BLOCK_N': 256}, num_warps=4),
-        triton.Config({'BLOCK_N': 512}, num_warps=4),
-        triton.Config({'BLOCK_N': 1024}, num_warps=8),
+        triton.Config({'BLOCK_N': 64}, num_warps=2, num_stages=3),
+        triton.Config({'BLOCK_N': 128}, num_warps=2, num_stages=2),
+        triton.Config({'BLOCK_N': 128}, num_warps=4, num_stages=2),
+        triton.Config({'BLOCK_N': 256}, num_warps=4, num_stages=2),
+        triton.Config({'BLOCK_N': 256}, num_warps=8, num_stages=3),
+        triton.Config({'BLOCK_N': 512}, num_warps=4, num_stages=2),
+        triton.Config({'BLOCK_N': 512}, num_warps=8, num_stages=2),
+        triton.Config({'BLOCK_N': 1024}, num_warps=8, num_stages=2),
     ],
-    key=['N_CTX', 'D_HEAD'],
+    key=['N', 'D_HEAD_KQ', 'D_HEAD_V'],
 )
 @triton.jit
 def _decoding_attn_kernel(
-    # Pointers to matrices
     Q, K, V, O,
-    # Stride variables for tensors
+    sm_scale,
     stride_qz, stride_qh, stride_qm, stride_qd,
     stride_kz, stride_kh, stride_kn, stride_kd,
     stride_vz, stride_vh, stride_vn, stride_vd,
     stride_oz, stride_oh, stride_om, stride_od,
-    # Other metadata
-    Z, H, N_CTX,
-    # Compile-time constants
-    D_HEAD: tl.constexpr,
+    Z, H, N,
+    D_HEAD_KQ: tl.constexpr,
+    D_HEAD_V: tl.constexpr,
     BLOCK_N: tl.constexpr,
 ):
     \"\"\"
-    Triton kernel for single-query attention. Fuses score computation,
-    softmax, and value aggregation into a single pass over K and V.
+    Triton kernel for decoding attention.
+    Computes attention for a single query vector per head against a sequence of keys/values.
+    This kernel is launched with a 1D grid of size Z * H.
+    Each instance computes the output for one attention head.
     \"\"\"
-    # Each program instance computes attention for one attention head.
-    # The grid is 1D, so we recover the Z and H indices from the program ID.
-    pid = tl.program_id(0)
-    h = pid % H
-    z = pid // H
+    # 1. Get program IDs and calculate batch/head indices
+    pid_zh = tl.program_id(0)
+    pid_z = pid_zh // H
+    pid_h = pid_zh % H
 
-    # Pointers to the start of the data for this (z, h) pair.
-    q_ptr = Q + z * stride_qz + h * stride_qh
-    k_ptr = K + z * stride_kz + h * stride_kh
-    v_ptr = V + z * stride_vz + h * stride_vh
-    o_ptr = O + z * stride_oz + h * stride_oh
+    # 2. Setup pointers to the start of the relevant slices
+    q_offset = pid_z * stride_qz + pid_h * stride_qh
+    k_offset = pid_z * stride_kz + pid_h * stride_kh
+    v_offset = pid_z * stride_vz + pid_h * stride_vh
+    o_offset = pid_z * stride_oz + pid_h * stride_oh
 
-    # Load the single query vector for this head.
-    # It's small (D_HEAD=64) and can be kept in registers.
-    offs_d = tl.arange(0, D_HEAD)
-    q = tl.load(q_ptr + offs_d)
-    
-    # Use float32 for accumulators to maintain precision.
-    q = q.to(tl.float32)
-    acc = tl.zeros([D_HEAD], dtype=tl.float32)
-    m_i = -float('inf')  # Running max for stable softmax
-    l_i = 0.0            # Running sum for stable softmax
+    Q_ptr = Q + q_offset
+    K_ptr = K + k_offset
+    V_ptr = V + v_offset
+    O_ptr = O + o_offset
 
-    # Scale factor for dot products.
-    sm_scale = (D_HEAD * 1.0) ** -0.5
+    # 3. Load query vector and initialize accumulators
+    # q is loaded once, converted to float32, and reused across all K/V blocks
+    offs_d_kq = tl.arange(0, D_HEAD_KQ)
+    q = tl.load(Q_ptr + offs_d_kq * stride_qd).to(tl.float32)
 
-    # Loop over the key/value sequence in blocks of size BLOCK_N.
-    # This is the main loop for the reduction over the sequence length.
-    for start_n in range(0, N_CTX, BLOCK_N):
-        # Offsets for the current block of K and V.
+    # Accumulators for online softmax calculation, in high precision
+    acc = tl.zeros([D_HEAD_V], dtype=tl.float32)
+    l_i = tl.zeros([1], dtype=tl.float32)
+    m_i = tl.full([1], -float('inf'), dtype=tl.float32)
+
+    # 4. Main loop over the sequence length N in blocks
+    for start_n in range(0, N, BLOCK_N):
+        # -- a. Define offsets and mask for the current block
         offs_n = start_n + tl.arange(0, BLOCK_N)
-        mask_n = offs_n < N_CTX
-        
-        # Load a block of K. Shape: (BLOCK_N, D_HEAD)
-        k_ptrs = k_ptr + offs_n[:, None] * stride_kn + offs_d[None, :]
+        mask_n = offs_n < N
+
+        # -- b. Load a block of keys (K)
+        k_ptrs = K_ptr + (offs_n[:, None] * stride_kn + offs_d_kq[None, :] * stride_kd)
         k = tl.load(k_ptrs, mask=mask_n[:, None], other=0.0)
+
+        # -- c. Compute scores S = Q @ K.T
+        s_j = tl.sum(q[None, :] * k.to(tl.float32), axis=1) * sm_scale
+        # Mask out-of-bounds scores before max operation
+        s_j = tl.where(mask_n, s_j, -float('inf'))
+
+        # -- d. Update softmax statistics (m, l)
+        m_j = tl.max(s_j, axis=0)
+        m_new = tl.maximum(m_i, m_j)
         
-        # Compute scores for the current block: S = Q @ K^T.
-        s_ij = tl.sum(q[None, :] * k.to(tl.float32), 1) * sm_scale
-        s_ij = tl.where(mask_n, s_ij, -float('inf'))
-        
-        # --- Online softmax calculation ---
-        # 1. Get the max of the current block scores
-        m_ij = tl.max(s_ij, 0)
-        # 2. Find the new global max
-        m_new = tl.maximum(m_i, m_ij)
-        # 3. Rescale the running sum and accumulator
         alpha = tl.exp(m_i - m_new)
+        p_j = tl.exp(s_j - m_new)
+        
+        l_i = l_i * alpha + tl.sum(p_j, axis=0)
+
+        # -- e. Rescale the accumulator
         acc = acc * alpha
-        l_i = l_i * alpha
-        # 4. Compute probabilities for the current block
-        p_ij = tl.exp(s_ij - m_new)
-        # 5. Update the running sum
-        l_i += tl.sum(p_ij, 0)
-        
-        # 6. Load the corresponding block of V. Shape: (BLOCK_N, D_HEAD)
-        v_ptrs = v_ptr + offs_n[:, None] * stride_vn + offs_d[None, :]
+
+        # -- f. Load a block of values (V)
+        offs_d_v = tl.arange(0, D_HEAD_V)
+        v_ptrs = V_ptr + (offs_n[:, None] * stride_vn + offs_d_v[None, :] * stride_vd)
         v = tl.load(v_ptrs, mask=mask_n[:, None], other=0.0)
+
+        # -- g. Update accumulator with the contribution of the current block
+        p_j = p_j.to(v.dtype)
+        acc += tl.dot(p_j[None, :], v)
         
-        # 7. Update the accumulator with the weighted values (p @ V).
-        p_ij = p_ij.to(v.dtype)
-        acc += tl.sum(p_ij[:, None] * v.to(tl.float32), 0)
-        
-        # 8. Update the global max
+        # -- h. Update the max value for the next iteration
         m_i = m_new
 
-    # Final normalization of the accumulator.
-    # Add a small epsilon to l_i to avoid division by zero.
-    l_i = tl.where(l_i == 0.0, 1.0, l_i)
-    acc = acc / l_i
+    # 5. Finalize the output
+    # Normalize the accumulator by the softmax denominator
+    o = acc / l_i
     
-    # Store the final output.
-    o_ptrs = o_ptr + offs_d
-    tl.store(o_ptrs, acc.to(Q.dtype.element_ty))
+    # 6. Store the final output vector
+    offs_d_out = tl.arange(0, D_HEAD_V)
+    o_ptrs = O_ptr + offs_d_out * stride_od
+    tl.store(o_ptrs, o.to(O.dtype.element_tl))
 
 
 def decoding_attn(Q: torch.Tensor, K: torch.Tensor, V: torch.Tensor) -> torch.Tensor:
@@ -127,32 +128,36 @@ def decoding_attn(Q: torch.Tensor, K: torch.Tensor, V: torch.Tensor) -> torch.Te
     Returns:
         Output tensor of shape (Z, H, M, Dv) - attention output (float16)
     \"\"\"
-    # Extract dimensions from input tensors.
+    # 1. Get tensor shapes
     Z, H, M, Dq = Q.shape
-    _Z, _H, N, _Dq = K.shape
-    __Z, __H, _N, Dv = V.shape
+    _, _, N, _ = K.shape
+    _, _, _, Dv = V.shape
+
+    # This kernel is specialized for M=1 (single query per head)
+    assert M == 1, "This kernel is specialized for M=1 decoding."
     
-    # This kernel is specialized for the decoding case (M=1).
-    assert M == 1, "The 'M' dimension of Q must be 1 for this decoding kernel."
-    assert Dq == Dv, "Query and Value head dimensions must be equal."
-    
-    # Create the output tensor.
+    # 2. Allocate output tensor
     O = torch.empty((Z, H, M, Dv), device=Q.device, dtype=Q.dtype)
 
-    # The grid size is the total number of attention heads to compute.
+    # 3. Set up grid and scaling factor
+    # Grid is 1D, with one program per batch entry and head
     grid = (Z * H,)
+    sm_scale = Dq**-0.5
 
-    # Launch the Triton kernel.
+    # 4. Launch the Triton kernel
     _decoding_attn_kernel[grid](
         Q, K, V, O,
+        sm_scale,
         Q.stride(0), Q.stride(1), Q.stride(2), Q.stride(3),
         K.stride(0), K.stride(1), K.stride(2), K.stride(3),
         V.stride(0), V.stride(1), V.stride(2), V.stride(3),
         O.stride(0), O.stride(1), O.stride(2), O.stride(3),
         Z, H, N,
-        D_HEAD=Dq,
+        D_HEAD_KQ=Dq,
+        D_HEAD_V=Dv,
     )
     
+    # 5. Return the result
     return O
 """
         return {"code": kernel_code}

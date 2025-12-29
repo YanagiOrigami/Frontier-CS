@@ -1,7 +1,7 @@
 import numpy as np
 import pandas as pd
-from pysr import PySRRegressor
 import sympy
+from pysr import PySRRegressor
 
 class Solution:
     def __init__(self, **kwargs):
@@ -9,58 +9,63 @@ class Solution:
 
     def solve(self, X: np.ndarray, y: np.ndarray) -> dict:
         """
-        Solves the symbolic regression problem for the Ripple Dataset using PySR.
+        Solves the symbolic regression problem using PySR.
         """
-        # Configure PySRRegressor
-        # Optimized for Ripple dataset: standard arithmetic + trig functions for waves
-        # CPU constrained environment: Limit iterations but use parallel processing
-        model = PySRRegressor(
-            niterations=50,
-            binary_operators=["+", "-", "*", "/"],
-            unary_operators=["sin", "cos", "exp"],  # Log omitted to avoid domain errors on oscillations
-            populations=20,
-            population_size=35,
-            maxsize=40,  # Allow complexity for nested trig/polynomials
-            verbosity=0,
-            progress=False,
-            random_state=42,
-            procs=8,
-            multithreading=True,
-            model_selection="best",
-            denoise=False,
-            deterministic=True
-        )
-
         try:
+            # Configure PySRRegressor
+            # Utilizing 8 vCPUs with specific population settings for efficiency
+            model = PySRRegressor(
+                niterations=40,
+                binary_operators=["+", "-", "*", "/"],
+                unary_operators=["sin", "cos", "exp", "log"],
+                population_size=40,
+                populations=16,
+                maxsize=45,
+                procs=8,
+                multiprocessing=True,
+                verbosity=0,
+                progress=False,
+                random_state=42,
+                deterministic=True,
+                model_selection="best",
+                temp_equation_file=None,
+                delete_tempfiles=True
+            )
+
             # Fit the model to the data
+            # variable_names are set to ensure the output expression uses x1, x2
             model.fit(X, y, variable_names=["x1", "x2"])
 
-            # Extract the best symbolic expression converted to SymPy then string
+            # Retrieve the best symbolic expression found
             best_expr = model.sympy()
             expression = str(best_expr)
-            
+
             # Generate predictions
             predictions = model.predict(X)
-
-        except Exception:
-            # Fallback strategy: Quadratic Regression
-            # Provides a better baseline than linear for curved surfaces if PySR fails
-            x1, x2 = X[:, 0], X[:, 1]
-            ones = np.ones_like(x1)
-            # A*x1^2 + B*x2^2 + C*x1*x2 + D*x1 + E*x2 + F
-            A_mat = np.column_stack([x1**2, x2**2, x1*x2, x1, x2, ones])
-            coeffs, _, _, _ = np.linalg.lstsq(A_mat, y, rcond=None)
             
-            # Construct prediction
-            predictions = A_mat @ coeffs
-            
-            # Construct valid expression string
-            terms = ["x1**2", "x2**2", "x1*x2", "x1", "x2", "1"]
-            parts = [f"({c})*{t}" if t != "1" else f"({c})" for c, t in zip(coeffs, terms)]
-            expression = " + ".join(parts)
+            # Convert predictions to list if numpy array
+            if isinstance(predictions, np.ndarray):
+                predictions = predictions.tolist()
 
-        return {
-            "expression": expression,
-            "predictions": predictions.tolist(),
-            "details": {}
-        }
+            return {
+                "expression": expression,
+                "predictions": predictions,
+                "details": {}
+            }
+
+        except Exception as e:
+            # Robust fallback: Linear Regression using numpy
+            # Solves y = w1*x1 + w2*x2 + b
+            N = len(y)
+            A = np.column_stack([X, np.ones(N)])
+            w, _, _, _ = np.linalg.lstsq(A, y, rcond=None)
+            
+            # w contains [slope_x1, slope_x2, intercept]
+            expression = f"({w[0]}) * x1 + ({w[1]}) * x2 + ({w[2]})"
+            predictions = (A @ w).tolist()
+
+            return {
+                "expression": expression,
+                "predictions": predictions,
+                "details": {"fallback_error": str(e)}
+            }

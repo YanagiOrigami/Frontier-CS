@@ -4,179 +4,158 @@ import triton.language as tl
 
 class Solution:
     def solve(self, spec_path: str = None) -> dict:
-        """
-        Returns a dict with the Python code for the ragged attention kernel.
-        """
-        
-        ragged_attn_code = """
+        code = """
 import torch
 import triton
 import triton.language as tl
 
 @triton.autotune(
     configs=[
-        # Basic configurations
-        triton.Config({'BLOCK_N': 32}, num_warps=2, num_stages=1),
-        triton.Config({'BLOCK_N': 64}, num_warps=4, num_stages=2),
-        triton.Config({'BLOCK_N': 128}, num_warps=4, num_stages=2),
-        triton.Config({'BLOCK_N': 256}, num_warps=8, num_stages=2),
-        # Configurations for larger N, potentially more latency-bound
-        triton.Config({'BLOCK_N': 512}, num_warps=8, num_stages=2),
-        triton.Config({'BLOCK_N': 1024}, num_warps=8, num_stages=2),
-        # More aggressive configs
-        triton.Config({'BLOCK_N': 128}, num_warps=8, num_stages=3),
-        triton.Config({'BLOCK_N': 256}, num_warps=8, num_stages=3),
+        triton.Config({'BLOCK_M': 16, 'BLOCK_N': 64}, num_warps=4),
+        triton.Config({'BLOCK_M': 32, 'BLOCK_N': 32}, num_warps=4),
+        triton.Config({'BLOCK_M': 32, 'BLOCK_N': 64}, num_warps=4),
+        triton.Config({'BLOCK_M': 32, 'BLOCK_N': 128}, num_warps=8),
+        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 32}, num_warps=4),
+        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 64}, num_warps=8),
+        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 128}, num_warps=8),
+        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 32}, num_warps=8),
+        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 64}, num_warps=8),
     ],
-    key=['N', 'D', 'Dv'],
+    key=['M', 'N', 'D', 'Dv'],
 )
 @triton.jit
-def _ragged_attn_fwd_kernel(
+def _ragged_kernel(
     Q, K, V, O,
     ROW_LENS,
     stride_qm, stride_qd,
     stride_kn, stride_kd,
-    stride_vn, stride_vd,
-    stride_om, stride_od,
+    stride_vn, stride_vdv,
+    stride_om, stride_odv,
     M, N, D, Dv,
-    BLOCK_N: tl.constexpr,
-    BLOCK_D: tl.constexpr,
+    # These are fixed for this problem, so they are compile-time constants
+    BLOCK_D: tl.constexpr, 
     BLOCK_DV: tl.constexpr,
+    # These are tuned by autotuner, so they are also compile-time constants
+    BLOCK_M: tl.constexpr, 
+    BLOCK_N: tl.constexpr,
 ):
-    '''
-    Triton kernel for ragged attention forward pass.
-    Each program computes one row of the output tensor O.
-    '''
-    # Get the program ID, which corresponds to the query row index.
-    pid_m = tl.program_id(0)
-    
-    # Load the specific row length for this query. This is the core of ragged attention.
-    row_len = tl.load(ROW_LENS + pid_m)
+    pid_m = tl.program_id(axis=0)
 
-    # If row_len is 0, there's nothing to compute. Store zeros and exit.
-    if row_len == 0:
-        o_offs = pid_m * stride_om + tl.arange(0, BLOCK_DV)
-        tl.store(O + o_offs, tl.zeros([BLOCK_DV], dtype=O.dtype.element_ty))
-        return
+    # offsets for the M dimension (query rows)
+    m_offsets = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    m_mask = m_offsets < M
 
-    # Pointers to the Q vector for the current row.
-    q_offs = pid_m * stride_qm + tl.arange(0, BLOCK_D)
-    q = tl.load(Q + q_offs)
+    # load row lengths for the current block of queries
+    row_lens_ptrs = ROW_LENS + m_offsets
+    current_row_lens = tl.load(row_lens_ptrs, mask=m_mask, other=0)
 
-    # Initialize accumulator for the output row and softmax statistics.
-    # Accumulation is done in float32 for numerical stability.
-    acc = tl.zeros([BLOCK_DV], dtype=tl.float32)
-    m_i = -float('inf')
-    l_i = 0.0
-    
-    # Attention scale factor.
+    # initialize pointers to Q and load the block of Q
+    # this block of Q will be reused for all blocks of K and V
+    d_offsets = tl.arange(0, BLOCK_D)
+    q_ptrs = Q + m_offsets[:, None] * stride_qm + d_offsets[None, :] * stride_qd
+    q = tl.load(q_ptrs, mask=m_mask[:, None])
+
+    # initialize accumulators for the streaming softmax
+    # acc holds the output, l_i is the normalization factor, m_i is the max score
+    acc = tl.zeros((BLOCK_M, BLOCK_DV), dtype=tl.float32)
+    l_i = tl.zeros((BLOCK_M,), dtype=tl.float32)
+    m_i = tl.full((BLOCK_M,), -float('inf'), dtype=tl.float32)
+
     scale = (D ** -0.5)
-    
-    # Loop over the key/value sequence in blocks of BLOCK_N.
-    # The loop bound is the dynamic `row_len`, which varies per program.
-    for start_n in range(0, row_len, BLOCK_N):
-        # -- Load K and V blocks from HBM --
-        offs_n = start_n + tl.arange(0, BLOCK_N)
-        
-        # Pointers to K block.
-        k_offs = offs_n[:, None] * stride_kn + tl.arange(0, BLOCK_D)[None, :]
-        k_mask = offs_n[:, None] < row_len
-        k = tl.load(K + k_offs, mask=k_mask, other=0.0)
-        
-        # Pointers to V block.
-        v_offs = offs_n[:, None] * stride_vn + tl.arange(0, BLOCK_DV)[None, :]
-        v_mask = offs_n[:, None] < row_len
-        v = tl.load(V + v_offs, mask=v_mask, other=0.0)
-        
-        # -- Compute attention scores (Q @ K^T) --
-        # q is (BLOCK_D,), k is (BLOCK_N, BLOCK_D). Transposing k gives (BLOCK_D, BLOCK_N).
-        # The result of the dot product is a (BLOCK_N,) tensor of scores.
-        s = tl.dot(q, tl.trans(k), out_dtype=tl.float32)
-        s *= scale
-        
-        # Apply the ragged mask. Scores for j >= row_len should be -inf.
-        # This is critical because tl.load with `other=0.0` results in 0-filled vectors for
-        # padded elements, leading to a score of 0, not -inf.
-        s = tl.where(offs_n < row_len, s, -float('inf'))
-        
-        # -- Streaming softmax update (numerically stable) --
-        # Find the new max score for the current block.
-        m_ij = tl.max(s, 0)
-        # Correctly update the global max.
-        m_new = tl.maximum(m_i, m_ij)
-        
-        # Rescale the current accumulator and l_i based on the new max.
-        alpha = tl.exp(m_i - m_new)
-        acc = acc * alpha
-        l_i = l_i * alpha
-        
-        # Compute probabilities for the current block and update l_i.
-        p = tl.exp(s - m_new)
-        l_i += tl.sum(p, 0)
-        
-        # Update accumulator with new values.
-        # Cast p to the value tensor's dtype (float16) to leverage tensor cores.
-        acc += tl.dot(p.to(V.dtype.element_ty), v)
-        
-        # Update the max for the next iteration.
-        m_i = m_new
 
-    # -- Finalize and write output --
-    # Normalize the accumulator.
-    # Guard against division by zero if all scores are -inf (e.g., row_len=0 handled above).
-    acc = acc / l_i
+    # loop over K and V in blocks of size BLOCK_N
+    for start_n in range(0, N, BLOCK_N):
+        # offsets for the N dimension (key/value rows)
+        n_offsets = start_n + tl.arange(0, BLOCK_N)
+        n_mask = n_offsets < N
 
-    # Write the final output row to HBM.
-    o_offs = pid_m * stride_om + tl.arange(0, BLOCK_DV)
-    tl.store(O + o_offs, acc.to(O.dtype.element_ty))
+        # load K
+        k_ptrs = K + n_offsets[:, None] * stride_kn + d_offsets[None, :] * stride_kd
+        k = tl.load(k_ptrs, mask=n_mask[:, None])
 
+        # compute attention scores
+        # scores are accumulated in float32
+        scores = tl.dot(q, tl.trans(k)) * scale
+        
+        # apply the ragged mask
+        # this ensures each query row only attends to its specified number of keys
+        ragged_mask = n_offsets[None, :] < current_row_lens[:, None]
+        # set scores for masked-out elements to -inf
+        scores = tl.where(ragged_mask, scores, -float('inf'))
+
+        # --- streaming softmax update ---
+        # 1. find the new max score for the row
+        block_m_i = tl.max(scores, axis=1)
+        new_m_i = tl.maximum(m_i, block_m_i)
+        
+        # 2. rescale previous accumulator and normalization factor
+        exp_diff = tl.exp(m_i - new_m_i)
+        
+        # 3. compute probabilities for the current block
+        p = tl.exp(scores - new_m_i[:, None])
+        
+        # 4. update normalization factor and accumulator
+        l_i = l_i * exp_diff + tl.sum(p, axis=1)
+        acc = acc * exp_diff[:, None]
+        
+        # 5. update max score
+        m_i = new_m_i
+        
+        # load V
+        dv_offsets = tl.arange(0, BLOCK_DV)
+        v_ptrs = V + n_offsets[:, None] * stride_vn + dv_offsets[None, :] * stride_vdv
+        v = tl.load(v_ptrs, mask=n_mask[:, None])
+
+        # update output accumulator
+        p = p.to(v.dtype) # cast probabilities to float16 for matmul
+        acc += tl.dot(p, v)
+
+    # finalize the output by dividing by the normalization factor
+    # handle case where l_i is 0 (e.g., row_len is 0) to avoid NaN
+    l_i_safe = tl.where(l_i == 0, 1, l_i)
+    acc = acc / l_i_safe[:, None]
+
+    # write the output block to global memory
+    dv_offsets = tl.arange(0, BLOCK_DV)
+    o_ptrs = O + m_offsets[:, None] * stride_om + dv_offsets[None, :] * stride_odv
+    tl.store(o_ptrs, acc.to(O.dtype.element_ty), mask=m_mask[:, None])
 
 def ragged_attn(Q: torch.Tensor, K: torch.Tensor, V: torch.Tensor, row_lens: torch.Tensor) -> torch.Tensor:
-    """
-    Ragged attention computation.
-    
-    Args:
-        Q: Query tensor of shape (M, D) - query features (float16)
-        K: Key tensor of shape (N, D) - key features (float16)
-        V: Value tensor of shape (N, Dv) - value features (float16)
-        row_lens: Row lengths tensor of shape (M,) - number of valid K/V rows per Q row (int32 or int64)
-    
-    Returns:
-        Output tensor of shape (M, Dv) - attention output (float16)
-    """
     M, D = Q.shape
     N, D_k = K.shape
     N_v, Dv = V.shape
-    
-    # Basic input validation.
-    assert D == D_k, "Q and K must have the same feature dimension D"
-    assert N == N_v, "K and V must have the same sequence length N"
-    assert Q.is_cuda and K.is_cuda and V.is_cuda and row_lens.is_cuda, "All tensors must be on a CUDA device"
-    assert Q.dtype == torch.float16 and K.dtype == torch.float16 and V.dtype == torch.float16, "Q, K, V must be float16"
 
-    # Allocate the output tensor.
-    O = torch.empty((M, Dv), device=Q.device, dtype=torch.float16)
+    # Assertions for correctness
+    assert D == D_k, "Query and Key dimensions must match"
+    assert N == N_v, "Key and Value sequence lengths must match"
+    assert Q.is_cuda and K.is_cuda and V.is_cuda and row_lens.is_cuda
+    assert Q.dtype == torch.float16 and K.dtype == torch.float16 and V.dtype == torch.float16
+
+    # Allocate output tensor
+    O = torch.empty((M, Dv), device=Q.device, dtype=Q.dtype)
+
+    # Grid definition
+    # The grid is 1D, with one program per BLOCK_M rows of Q.
+    grid = lambda META: (triton.cdiv(M, META['BLOCK_M']),)
     
-    # The grid is defined by the number of query rows (M).
-    # Each program in the grid computes one row of the output.
-    grid = (M, )
-    
-    # Triton kernels often expect int32 for indices and offsets.
-    if row_lens.dtype != torch.int32:
-        row_lens = row_lens.to(torch.int32)
-    
-    # Launch the Triton kernel.
-    _ragged_attn_fwd_kernel[grid](
+    # Kernel dimensions are fixed in the problem statement
+    BLOCK_D = 64
+    BLOCK_DV = 64
+
+    # Launch the kernel
+    _ragged_kernel[grid](
         Q, K, V, O,
         row_lens,
+        # Strides
         Q.stride(0), Q.stride(1),
         K.stride(0), K.stride(1),
         V.stride(0), V.stride(1),
         O.stride(0), O.stride(1),
+        # Matrix dimensions
         M, N, D, Dv,
-        BLOCK_D=D,
-        BLOCK_DV=Dv
+        # Compile-time constants
+        BLOCK_D=BLOCK_D, BLOCK_DV=BLOCK_DV,
     )
-    
     return O
 """
-        return {"code": ragged_attn_code}
+        return {"code": code}

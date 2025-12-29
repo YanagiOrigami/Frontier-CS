@@ -1,278 +1,295 @@
 import os
 import tarfile
 import tempfile
-import shutil
 import subprocess
+import glob
 import random
+import time
 
 
 class Solution:
     def solve(self, src_path: str) -> bytes:
-        workdir = tempfile.mkdtemp(prefix="arvo781_")
         try:
-            self._extract_tarball(src_path, workdir)
-            src_root = self._detect_root(workdir)
-            binary = self._build_and_find_binary(src_root)
-            if binary is not None:
-                poc = self._find_poc_via_fuzz(binary)
-                if poc is not None:
+            return self._solve_internal(src_path)
+        except Exception:
+            return b"AAAAAAAA"
+
+    def _solve_internal(self, src_path: str) -> bytes:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            self._extract_tarball(src_path, tmpdir)
+            project_root = self._find_project_root(tmpdir)
+
+            driver_path = None
+            # Try with ASan first
+            for use_asan in (True, False):
+                try:
+                    driver_path = self._build_driver(project_root, use_asan=use_asan)
+                    if driver_path is not None:
+                        break
+                except Exception:
+                    driver_path = None
+
+            if driver_path is not None:
+                poc = self._fuzz_for_crash(driver_path)
+                if poc is not None and len(poc) > 0:
                     return poc
-            return self._fallback_poc()
-        finally:
-            shutil.rmtree(workdir, ignore_errors=True)
 
-    def _extract_tarball(self, src_path: str, workdir: str) -> None:
+        return b"AAAAAAAA"
+
+    def _extract_tarball(self, src_path: str, dst_dir: str) -> None:
+        with tarfile.open(src_path, "r:*") as tf:
+            tf.extractall(dst_dir)
+
+    def _find_project_root(self, tmpdir: str) -> str:
+        entries = [e for e in os.listdir(tmpdir) if not e.startswith(".")]
+        root = tmpdir
+        if len(entries) == 1:
+            candidate = os.path.join(tmpdir, entries[0])
+            if os.path.isdir(candidate):
+                root = candidate
+
+        cmake_dir = self._find_cmake_dir(root)
+        if cmake_dir is not None:
+            root = cmake_dir
+        return root
+
+    def _find_cmake_dir(self, base: str) -> str | None:
+        best_with_header = None
+        best_any = None
+        for dirpath, dirnames, filenames in os.walk(base):
+            if "CMakeLists.txt" in filenames:
+                if "pcre2.h" in filenames:
+                    if best_with_header is None or len(dirpath) < len(best_with_header):
+                        best_with_header = dirpath
+                if best_any is None or len(dirpath) < len(best_any):
+                    best_any = dirpath
+        return best_with_header or best_any
+
+    def _build_driver(self, project_root: str, use_asan: bool) -> str | None:
+        build_dir = os.path.join(
+            project_root, "aeg_build_asan" if use_asan else "aeg_build"
+        )
+        os.makedirs(build_dir, exist_ok=True)
+
+        # Configure with CMake
+        cmake_cmd = ["cmake", "..", "-DBUILD_SHARED_LIBS=OFF"]
+        # These options are specific to PCRE2 but harmless if unused
+        cmake_cmd += [
+            "-DPCRE2_BUILD_TESTS=OFF",
+            "-DPCRE2_BUILD_PCRE2GREP=OFF",
+            "-DPCRE2_BUILD_PCRE2TEST=OFF",
+        ]
+
+        if use_asan:
+            asan_flags = "-fsanitize=address -fno-omit-frame-pointer"
+            cmake_cmd.append(f"-DCMAKE_C_FLAGS={asan_flags}")
+            cmake_cmd.append("-DCMAKE_EXE_LINKER_FLAGS=-fsanitize=address")
+
+        subprocess.run(
+            cmake_cmd,
+            cwd=build_dir,
+            check=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=300,
+        )
+
+        # Build
+        build_cmd = ["cmake", "--build", ".", "-j", str(max(1, os.cpu_count() or 1))]
+        subprocess.run(
+            build_cmd,
+            cwd=build_dir,
+            check=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=600,
+        )
+
+        # Locate PCRE2 library
+        libs = sorted(
+            glob.glob(os.path.join(build_dir, "**", "libpcre2-8.*"), recursive=True)
+        )
+        if not libs:
+            # Fallback: any libpcre2-8*
+            libs = sorted(
+                glob.glob(os.path.join(build_dir, "**", "libpcre2-8*"), recursive=True)
+            )
+        if not libs:
+            return None
+        lib_path = libs[0]
+
+        driver_c_path = os.path.join(build_dir, "aeg_driver.c")
+        self._write_driver_c(driver_c_path)
+
+        driver_path = os.path.join(build_dir, "aeg_driver")
+        cc = os.environ.get("CC", "gcc")
+        compile_cmd = [cc]
+        if use_asan:
+            compile_cmd += ["-fsanitize=address", "-fno-omit-frame-pointer"]
+        compile_cmd += [
+            driver_c_path,
+            lib_path,
+            "-o",
+            driver_path,
+            "-I",
+            project_root,
+            "-I",
+            os.path.join(project_root, "src"),
+            "-lm",
+            "-lpthread",
+        ]
+        if use_asan:
+            compile_cmd.append("-fsanitize=address")
+
+        subprocess.run(
+            compile_cmd,
+            cwd=build_dir,
+            check=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=300,
+        )
+
+        # Quick sanity run
         try:
-            with tarfile.open(src_path, "r:*") as tf:
-                tf.extractall(path=workdir)
-        except Exception:
-            # If extraction fails, leave directory empty; fallback PoC will be used.
-            pass
-
-    def _detect_root(self, workdir: str) -> str:
-        try:
-            entries = [os.path.join(workdir, e) for e in os.listdir(workdir)]
-            dirs = [e for e in entries if os.path.isdir(e)]
-            files = [e for e in entries if os.path.isfile(e)]
-            if len(dirs) == 1 and not files:
-                return dirs[0]
-        except Exception:
-            pass
-        return workdir
-
-    def _build_and_find_binary(self, src_root: str):
-        env = os.environ.copy()
-        san_flags = "-fsanitize=address,undefined -fno-omit-frame-pointer -g -O1"
-        cc = shutil.which("clang") or shutil.which("gcc") or "gcc"
-        cxx = shutil.which("clang++") or shutil.which("g++") or "g++"
-        env["CC"] = cc
-        env["CXX"] = cxx
-
-        def append_flag(name: str):
-            prev = env.get(name, "")
-            if san_flags not in prev:
-                if prev:
-                    env[name] = prev + " " + san_flags
-                else:
-                    env[name] = san_flags
-
-        append_flag("CFLAGS")
-        append_flag("CXXFLAGS")
-        append_flag("LDFLAGS")
-
-        # 1. Run build.sh if present
-        build_sh = self._find_script(src_root, "build.sh")
-        if build_sh:
-            self._run_cmd(["bash", build_sh], cwd=os.path.dirname(build_sh), env=env, timeout=300)
-            bins = self._find_candidate_binaries(src_root)
-            if bins:
-                return bins[0]
-
-        # 2. CMake
-        if os.path.exists(os.path.join(src_root, "CMakeLists.txt")):
-            build_dir = os.path.join(src_root, "build")
-            os.makedirs(build_dir, exist_ok=True)
-            if self._run_cmd(["cmake", ".."], cwd=build_dir, env=env, timeout=300):
-                self._run_cmd(["cmake", "--build", ".", "-j", "8"], cwd=build_dir, env=env, timeout=600)
-                bins = self._find_candidate_binaries(build_dir)
-                if not bins:
-                    bins = self._find_candidate_binaries(src_root)
-                if bins:
-                    return bins[0]
-
-        # 3. Autoconf configure + make
-        configure = os.path.join(src_root, "configure")
-        if os.path.exists(configure) and os.path.isfile(configure):
-            try:
-                os.chmod(configure, 0o755)
-            except Exception:
-                pass
-            self._run_cmd(["./configure"], cwd=src_root, env=env, timeout=300)
-            self._run_cmd(["make", "-j", "8"], cwd=src_root, env=env, timeout=600)
-            bins = self._find_candidate_binaries(src_root)
-            if bins:
-                return bins[0]
-
-        # 4. Make only
-        makefile = os.path.join(src_root, "Makefile")
-        if os.path.exists(makefile):
-            self._run_cmd(["make", "-j", "8"], cwd=src_root, env=env, timeout=600)
-            bins = self._find_candidate_binaries(src_root)
-            if bins:
-                return bins[0]
-
-        # 5. As a last resort, search any executable already present
-        bins = self._find_candidate_binaries(src_root)
-        if bins:
-            return bins[0]
-
-        return None
-
-    def _find_script(self, root: str, name: str):
-        best = None
-        best_depth = None
-        for dirpath, _, filenames in os.walk(root):
-            if name in filenames:
-                path = os.path.join(dirpath, name)
-                depth = path.count(os.sep)
-                if best is None or depth < best_depth:
-                    best = path
-                    best_depth = depth
-        return best
-
-    def _run_cmd(self, cmd, cwd=None, env=None, timeout=300) -> bool:
-        try:
-            proc = subprocess.run(
-                cmd,
-                cwd=cwd,
-                env=env,
+            subprocess.run(
+                [driver_path],
+                input=b"a",
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
-                timeout=timeout,
-                check=False,
-            )
-            return proc.returncode == 0
-        except Exception:
-            return False
-
-    def _find_candidate_binaries(self, base: str):
-        bins = []
-        for dirpath, _, filenames in os.walk(base):
-            for fn in filenames:
-                path = os.path.join(dirpath, fn)
-                if not os.path.isfile(path):
-                    continue
-                lower = fn.lower()
-                if lower.endswith((".a", ".so", ".dylib", ".dll", ".o", ".lo", ".la", ".obj")):
-                    continue
-                try:
-                    st = os.stat(path)
-                except Exception:
-                    continue
-                if not (st.st_mode & 0o111):
-                    continue
-                try:
-                    with open(path, "rb") as f:
-                        head = f.read(4)
-                    if head != b"\x7fELF":
-                        continue
-                except Exception:
-                    continue
-                bins.append(path)
-
-        def score(p: str):
-            name = os.path.basename(p).lower()
-            s = 0
-            keywords = ["fuzz", "test", "pcre", "regex", "runner", "poc", "demo", "main"]
-            for i, k in enumerate(keywords):
-                if k in name:
-                    s -= 10 * (len(keywords) - i)
-            depth = p.count(os.sep)
-            s += depth
-            try:
-                size_mb = os.path.getsize(p) // (1024 * 1024)
-                s += size_mb
-            except Exception:
-                pass
-            return s
-
-        bins.sort(key=score)
-        return bins
-
-    def _find_poc_via_fuzz(self, binary: str):
-        patterns = [
-            "()", "(a)", "(b)", "(.)",
-            "(a)(b)", "(a)(b)(c)", "((a))", "((a)(b))",
-            "(a*)", "(a+)", "(a?)",
-            "((a)*)", "((a)+)", "(a|b)", "((a|b))",
-            "(ab)", "(ab)(cd)", "((ab))",
-            "(a)(?:b)", "(?:a)(b)", "((?:a)(b))",
-            "((a)(b)(c))", "(a(b(c)))",
-            "()()",
-            "()()()",
-            "()()()()",
-            "(a)(a)(a)(a)",
-        ]
-        subjects = [b"", b"a", b"b", b"ab", b"aaa", b"abcd", b"1234"]
-
-        candidates = []
-        for p in patterns:
-            pb = p.encode("ascii", errors="ignore")
-            candidates.append(pb)
-            candidates.append(pb + b"\n")
-            for s in subjects:
-                candidates.append(pb + b"\n" + s)
-                candidates.append(pb + b"\n" + s + b"\n")
-                candidates.append(s + b"\n" + pb)
-                candidates.append(s + b"\n" + pb + b"\n")
-
-        # Deduplicate while preserving order
-        seen = set()
-        unique_candidates = []
-        for c in candidates:
-            if c not in seen:
-                seen.add(c)
-                unique_candidates.append(c)
-
-        # Try deterministic candidates
-        for data in unique_candidates:
-            if self._triggers_bug(binary, data):
-                return data
-
-        # Random fuzzing as a backup
-        rng = random.Random(781)
-        charset = b"().*+?|[]{}^$\\ab01"
-        max_iters = 300
-        for _ in range(max_iters):
-            length = rng.randint(1, 16)
-            p = bytes(rng.choice(charset) for _ in range(length))
-            # Ensure we have some parentheses
-            if b"(" not in p:
-                p = b"(" + p + b")"
-            s = bytes(rng.choice(b"ab01") for _ in range(rng.randint(0, 8)))
-            choice = rng.randint(0, 4)
-            if choice == 0:
-                data = p
-            elif choice == 1:
-                data = p + b"\n" + s
-            elif choice == 2:
-                data = s + b"\n" + p
-            elif choice == 3:
-                data = p + b"\n"
-            else:
-                data = p + b"\n" + s + b"\n"
-
-            if self._triggers_bug(binary, data):
-                return data
-
-        return None
-
-    def _triggers_bug(self, binary: str, data: bytes) -> bool:
-        try:
-            proc = subprocess.run(
-                [binary],
-                input=data,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
                 timeout=2,
                 check=False,
             )
-        except subprocess.TimeoutExpired:
-            return False
         except Exception:
-            return False
+            return None
 
-        rc = proc.returncode
-        out = proc.stdout + proc.stderr
-        if b"ERROR: AddressSanitizer" in out or b"SUMMARY: AddressSanitizer" in out:
-            return True
-        if b"runtime error:" in out and b"UndefinedBehaviorSanitizer" in out:
-            return True
-        if rc < 0:
-            # killed by signal (e.g., SIGSEGV)
-            return True
-        return False
+        return driver_path
 
-    def _fallback_poc(self) -> bytes:
-        # Generic short regex with multiple capturing groups
-        return b"()()()()"
+    def _write_driver_c(self, path: str) -> None:
+        code = r'''
+#include <stdio.h>
+#include <stdlib.h>
+
+#define PCRE2_CODE_UNIT_WIDTH 8
+#include "pcre2.h"
+
+int main(void) {
+    size_t cap = 1024;
+    size_t len = 0;
+    unsigned char *buf = (unsigned char *)malloc(cap);
+    if (buf == NULL) return 0;
+
+    int ch;
+    while ((ch = getchar()) != EOF) {
+        if (len == cap) {
+            cap *= 2;
+            unsigned char *nbuf = (unsigned char *)realloc(buf, cap);
+            if (nbuf == NULL) {
+                free(buf);
+                return 0;
+            }
+            buf = nbuf;
+        }
+        buf[len++] = (unsigned char)ch;
+    }
+
+    if (len == 0) {
+        free(buf);
+        return 0;
+    }
+
+    int errorcode = 0;
+    PCRE2_SIZE erroroffset = 0;
+    PCRE2_SPTR pattern = (PCRE2_SPTR)buf;
+
+    pcre2_code *re = pcre2_compile(
+        pattern, len, 0, &errorcode, &erroroffset, NULL);
+    if (re == NULL) {
+        free(buf);
+        return 0;
+    }
+
+    PCRE2_SPTR subject = (PCRE2_SPTR)buf;
+    PCRE2_SIZE subject_length = len;
+
+    /* Make the external ovector definitely larger than the number of
+       capturing parentheses in typical patterns. */
+    pcre2_match_data *match_data = pcre2_match_data_create(64, NULL);
+    if (match_data == NULL) {
+        pcre2_code_free(re);
+        free(buf);
+        return 0;
+    }
+
+    (void)pcre2_match(re, subject, subject_length, 0, 0, match_data, NULL);
+
+    pcre2_match_data_free(match_data);
+    pcre2_code_free(re);
+    free(buf);
+    return 0;
+}
+'''
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(code)
+
+    def _run_input(self, driver_path: str, data: bytes, timeout: float = 0.5) -> bool:
+        try:
+            result = subprocess.run(
+                [driver_path],
+                input=data,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=timeout,
+            )
+        except subprocess.TimeoutExpired:
+            return True
+        except Exception:
+            return True
+        return result.returncode != 0
+
+    def _fuzz_for_crash(self, driver_path: str) -> bytes | None:
+        # Deterministic randomness
+        random.seed(0)
+
+        seed_patterns = [
+            b"()",
+            b"(a)",
+            b"(a)*",
+            b"(a)+",
+            b"(a)?",
+            b"(a){1,2}",
+            b"(ab)",
+            b"((a))",
+            b"((a)+)",
+            b"((a+)+)",
+            b"(a(b(c)))",
+            b"(.+)",
+            b"(.*)",
+            b"(a.*)",
+            b"(a|b)",
+            b"(a(b|c))",
+            b"^$",
+            b".*",
+            b"a*",
+            b"a+",
+            b"(a*)*",
+        ]
+
+        for pat in seed_patterns:
+            if self._run_input(driver_path, pat):
+                return pat
+
+        alphabet = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789.*+?^${}()[]|\\"
+        start_time = time.time()
+        time_budget = 20.0
+        max_iters = 20000
+
+        for _ in range(max_iters):
+            if time.time() - start_time > time_budget:
+                break
+            length = random.randint(1, 32)
+            data = bytes(random.choice(alphabet) for _ in range(length))
+            if self._run_input(driver_path, data):
+                return data
+
+        return None

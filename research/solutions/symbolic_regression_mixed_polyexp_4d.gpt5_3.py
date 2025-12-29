@@ -2,306 +2,312 @@ import numpy as np
 
 class Solution:
     def __init__(self, **kwargs):
-        self.max_terms = int(kwargs.get("max_terms", 14))
-        self.max_poly_degree = int(kwargs.get("max_poly_degree", 4))
-        self.single_max_degree = int(kwargs.get("single_max_degree", 5))
-        self.random_state = int(kwargs.get("random_state", 42))
-        self.min_improvement = float(kwargs.get("min_improvement", 1e-6))
-        self.normalize_features = True
+        self.max_base_terms = kwargs.get("max_base_terms", 8)
+        self.max_phi_terms = kwargs.get("max_phi_terms", 10)
+        self.alpha = kwargs.get("alpha", 1e-8)
+        self.random_state = kwargs.get("random_state", 42)
 
     def solve(self, X: np.ndarray, y: np.ndarray) -> dict:
+        X = np.asarray(X, dtype=float)
+        y = np.asarray(y, dtype=float).ravel()
         n, d = X.shape
-        rng = np.random.RandomState(self.random_state)
+        if d != 4:
+            # Fallback: simple linear model if dimensions unexpected
+            return self._simple_linear_solution(X, y)
 
-        # Build feature dictionary
-        Phi, features = self._build_feature_matrix(X)
+        # Standard deviations for scaling; avoid zeros
+        scales = np.std(X, axis=0)
+        scales = np.where(scales <= 1e-12, 1.0, scales)
 
-        # Normalize feature columns for stable selection
-        col_norms = np.sqrt(np.mean(Phi**2, axis=0) + 1e-18)
-        if self.normalize_features:
-            Phi_norm = Phi / col_norms
-        else:
-            Phi_norm = Phi.copy()
+        # Build base polynomial (degree <= 2) monomials
+        A_base, base_terms = self._build_base_features(X)
 
-        # Orthogonal Matching Pursuit for sparsity
-        k_max = min(self.max_terms * 2, Phi_norm.shape[1])
-        sel_idx, coefs_norm = self._omp(Phi_norm, y, k_max)
+        # Candidates for exponential damping over scaled radius r2 = sum((xi/si)^2)
+        # r2 has expected scale ~ number of dimensions (4), so s in [0.125, 2.0] is reasonable.
+        s_candidates = [None, 0.125, 0.25, 0.5, 1.0, 2.0]
 
-        if len(sel_idx) == 0:
-            c0 = float(np.mean(y))
-            expression = f"{self._fmt(c0)}"
-            preds = np.full(n, c0)
-            return {
-                "expression": expression,
-                "predictions": preds.tolist(),
-                "details": {}
-            }
+        best = None
+        y_mean = np.mean(y)
+        y_centered = y - y_mean
 
-        # Keep top 'max_terms' by absolute normalized coefficients
-        order = np.argsort(-np.abs(coefs_norm))
-        keep = order[: self.max_terms]
-        sel_idx = [sel_idx[i] for i in keep]
-
-        # Refit least squares on selected features (un-normalized)
-        Phi_sel = Phi[:, sel_idx]
-        coef_sel, _, _, _ = np.linalg.lstsq(Phi_sel, y, rcond=None)
-
-        # Optional pruning of near-zero coefficients
-        abs_coef = np.abs(coef_sel)
-        if abs_coef.size > 0:
-            thresh = np.max(abs_coef) * 1e-8
-            mask = abs_coef >= thresh
-            if not np.all(mask):
-                sel_idx = [idx for idx, m in zip(sel_idx, mask) if m]
-                Phi_sel = Phi[:, sel_idx]
-                coef_sel = coef_sel[mask]
-
-        # Final predictions
-        preds = Phi_sel @ coef_sel
-
-        # Build expression string
-        terms = []
-        for idx, c in zip(sel_idx, coef_sel):
-            if abs(c) < 1e-14:
-                continue
-            term_str = self._feature_to_string(features[idx])
-            # Combine coefficient and term
-            if term_str == "1":
-                term_full = f"{self._fmt(c)}"
+        for s in s_candidates:
+            if s is None:
+                A = A_base
             else:
-                term_full = f"{self._fmt(c)}*{term_str}"
-            terms.append(term_full)
+                r2 = np.sum((X / scales) ** 2, axis=1)
+                phi = np.exp(-s * r2)
+                A_phi = A_base * phi[:, None]
+                A = np.hstack([A_base, A_phi])
 
-        if not terms:
-            # Fallback
-            c0 = float(np.mean(y))
-            expression = f"{self._fmt(c0)}"
+            # Ridge regression
+            w_ridge = self._ridge_regression(A, y_centered, self.alpha)
+
+            # MSE
+            preds = A @ w_ridge + y_mean
+            mse = np.mean((y - preds) ** 2)
+
+            best = self._update_best(best, mse, s, w_ridge, A_base, base_terms, X, y_centered, y_mean, scales)
+
+        # After finding best s, perform feature selection and final refit
+        if best["s"] is None:
+            # No exponential, only base terms
+            A_base = best["A_base"]
+            base_terms = best["base_terms"]
+            w_ridge = best["w"]
+            # Select top-K base features
+            base_idx = self._select_top_k(A_base, w_ridge, k=min(self.max_base_terms, A_base.shape[1]))
+            # Ensure constant term (index 0) included
+            if 0 not in base_idx:
+                base_idx = np.unique(np.r_[0, base_idx])
+            A_sel = A_base[:, base_idx]
+            w_final = self._least_squares(A_sel, y_centered)
+            preds = A_sel @ w_final + y_mean
+            expr = self._build_expression_no_phi(base_terms, base_idx, w_final, y_mean)
         else:
-            # Assemble with proper sign handling
-            expression = self._sum_terms_with_signs(terms)
+            s = best["s"]
+            A_base = best["A_base"]
+            base_terms = best["base_terms"]
+            r2 = np.sum((X / scales) ** 2, axis=1)
+            phi_vec = np.exp(-s * r2)
+            A_phi = A_base * phi_vec[:, None]
+
+            # Split weights into base and phi parts from ridge solution
+            w = best["w"]
+            w_base = w[:A_base.shape[1]]
+            w_phi = w[A_base.shape[1]:]
+
+            # Select top-K base and phi features
+            base_idx = self._select_top_k(A_base, w_base, k=min(self.max_base_terms, A_base.shape[1]))
+            phi_idx = self._select_top_k(A_phi, w_phi, k=min(self.max_phi_terms, A_phi.shape[1]))
+
+            # Ensure constant term included in both when beneficial
+            if 0 not in base_idx:
+                base_idx = np.unique(np.r_[0, base_idx])
+            if 0 not in phi_idx:
+                phi_idx = np.unique(np.r_[0, phi_idx])
+
+            # Refit least squares on selected features
+            A_sel = np.hstack([A_base[:, base_idx], A_phi[:, phi_idx]])
+            w_final = self._least_squares(A_sel, y_centered)
+            preds = A_sel @ w_final + y_mean
+
+            # Split final weights
+            w_base_final = w_final[:len(base_idx)]
+            w_phi_final = w_final[len(base_idx):]
+
+            expr = self._build_expression_with_phi(
+                base_terms=base_terms,
+                base_idx=base_idx,
+                w_base=w_base_final,
+                phi_terms=base_terms,
+                phi_idx=phi_idx,
+                w_phi=w_phi_final,
+                y_mean=y_mean,
+                s=s,
+                scales=scales
+            )
 
         return {
-            "expression": expression,
+            "expression": expr,
             "predictions": preds.tolist(),
             "details": {}
         }
 
-    def _build_feature_matrix(self, X):
-        n, d = X.shape
-        # Basic sets
+    def _simple_linear_solution(self, X, y):
+        n = X.shape[0]
+        A = np.column_stack([X, np.ones(n)])
+        w, _, _, _ = np.linalg.lstsq(A, y, rcond=None)
+        a, b, c, d, e = w
+        expr = (
+            f"{self._fmt(a)}*x1 + {self._fmt(b)}*x2 + {self._fmt(c)}*x3 + {self._fmt(d)}*x4 + {self._fmt(e)}"
+        )
+        preds = A @ w
+        return {
+            "expression": expr,
+            "predictions": preds.tolist(),
+            "details": {}
+        }
+
+    def _build_base_features(self, X):
         x1 = X[:, 0]
         x2 = X[:, 1]
         x3 = X[:, 2]
         x4 = X[:, 3]
 
-        # Scales for adaptive Gaussian widths
-        r2 = x1**2 + x2**2 + x3**2 + x4**2
-        r2_scale = float(np.mean(r2) + 1e-12)
-        # Global alphas (including 0 for pure polynomial)
-        # Choosing a range of decays relative to scale
-        base_vals = [0.0, 0.25, 0.5, 1.0, 2.0]
-        alphas_global = [v / r2_scale for v in base_vals]
+        cols = []
+        terms = []
 
-        # Single-variable alphas (exclude 0)
-        xs2 = np.maximum(np.mean(X**2, axis=0), 1e-12)
-        single_base_vals = [0.5, 1.0, 2.0]
-        alphas_single = [ [v / xs2[i] for v in single_base_vals] for i in range(4) ]
+        # Constant
+        cols.append(np.ones_like(x1))
+        terms.append("1")
 
-        features = []
-        columns = []
+        # Linear
+        cols.extend([x1, x2, x3, x4])
+        terms.extend(["x1", "x2", "x3", "x4"])
 
-        # Precompute exp(-alpha*r2) for all global alphas
-        exp_global = [np.exp(-ag * r2) if ag != 0.0 else np.ones(n) for ag in alphas_global]
+        # Pairwise products
+        cross_pairs = [
+            (x1 * x2, "x1*x2"),
+            (x1 * x3, "x1*x3"),
+            (x1 * x4, "x1*x4"),
+            (x2 * x3, "x2*x3"),
+            (x2 * x4, "x2*x4"),
+            (x3 * x4, "x3*x4"),
+        ]
+        for col, name in cross_pairs:
+            cols.append(col)
+            terms.append(name)
 
-        # Generate polynomial monomials up to max degree
-        mono_exps = self._generate_monomial_exponents(self.max_poly_degree)
-        mono_cache = {}
-        for e in mono_exps:
-            mono = self._compute_monomial(X, e, cache=mono_cache)
-            # For each global alpha
-            for ag, eglob in zip(alphas_global, exp_global):
-                col = mono * eglob
-                columns.append(col)
-                features.append({
-                    "type": "global_poly_exp",
-                    "exponents": e,
-                    "alpha": ag
-                })
+        # Squares
+        squares = [
+            (x1 * x1, "x1**2"),
+            (x2 * x2, "x2**2"),
+            (x3 * x3, "x3**2"),
+            (x4 * x4, "x4**2"),
+        ]
+        for col, name in squares:
+            cols.append(col)
+            terms.append(name)
 
-        # Single-variable Gaussian-damped univariate polynomials
-        for i in range(4):
-            xi = X[:, i]
-            xi2 = xi**2
-            for a in alphas_single[i]:
-                eg = np.exp(-a * xi2)
-                for deg in range(0, self.single_max_degree + 1):
-                    if deg == 0:
-                        mono = np.ones(n)
-                    else:
-                        mono = xi**deg
-                    col = mono * eg
-                    columns.append(col)
-                    features.append({
-                        "type": "single_poly_exp",
-                        "var": i,
-                        "degree": deg,
-                        "alpha": a
-                    })
+        A = np.column_stack(cols)
+        return A, terms
 
-        Phi = np.column_stack(columns) if columns else np.empty((n, 0))
-        return Phi, features
+    def _ridge_regression(self, A, y, alpha):
+        AtA = A.T @ A
+        n_features = AtA.shape[0]
+        reg = alpha * np.eye(n_features)
+        try:
+            w = np.linalg.solve(AtA + reg, A.T @ y)
+        except np.linalg.LinAlgError:
+            # Fallback to least squares if singular
+            w, _, _, _ = np.linalg.lstsq(A, y, rcond=None)
+        return w
 
-    def _generate_monomial_exponents(self, max_degree):
-        exps = []
-        # Enumerate e1+e2+e3+e4 <= max_degree
-        for deg in range(0, max_degree + 1):
-            for e1 in range(0, deg + 1):
-                for e2 in range(0, deg - e1 + 1):
-                    for e3 in range(0, deg - e1 - e2 + 1):
-                        e4 = deg - e1 - e2 - e3
-                        exps.append((e1, e2, e3, e4))
-        return exps
+    def _least_squares(self, A, y):
+        w, _, _, _ = np.linalg.lstsq(A, y, rcond=None)
+        return w
 
-    def _compute_monomial(self, X, exps, cache=None):
-        if cache is None:
-            cache = {}
-        key = tuple(exps)
-        if key in cache:
-            return cache[key]
-        res = np.ones(X.shape[0])
-        for i, power in enumerate(exps):
-            if power == 0:
-                continue
-            res = res * (X[:, i] ** power)
-        cache[key] = res
-        return res
+    def _update_best(self, best, mse, s, w, A_base, base_terms, X, y_centered, y_mean, scales):
+        if best is None or mse < best["mse"]:
+            return {
+                "mse": mse,
+                "s": s,
+                "w": w,
+                "A_base": A_base,
+                "base_terms": base_terms,
+                "X": X,
+                "y_centered": y_centered,
+                "y_mean": y_mean,
+                "scales": scales,
+            }
+        return best
 
-    def _omp(self, Phi, y, k_max):
-        n, m = Phi.shape
-        if m == 0:
-            return [], np.array([])
-        residual = y.copy()
-        selected = []
-        coefs = []
-        available = np.ones(m, dtype=bool)
-        prev_error = np.mean(residual**2)
+    def _select_top_k(self, A, w, k):
+        # Importance based on absolute contribution: |w| * std(col)
+        stds = np.std(A, axis=0)
+        importance = np.abs(w) * (stds + 1e-12)
+        # Always consider absolute coefficients even if std is zero (constant)
+        importance = np.where(stds <= 1e-18, np.abs(w), importance)
+        idx_sorted = np.argsort(-importance)
+        k = max(1, min(k, A.shape[1]))
+        return np.sort(idx_sorted[:k])
 
-        for _ in range(k_max):
-            # Correlations with available features
-            # Phi is assumed normalized by column RMS; still compute correlations directly
-            corr = Phi.T @ residual
-            corr_abs = np.abs(corr)
-            corr_abs[~available] = -np.inf
-            j = int(np.argmax(corr_abs))
-            if not np.isfinite(corr_abs[j]):
-                break
-            available[j] = False
-            selected.append(j)
-
-            # Refit coefficients using least squares on selected subset
-            Phi_sel = Phi[:, selected]
-            coef, _, _, _ = np.linalg.lstsq(Phi_sel, y, rcond=None)
-            coefs = coef
-
-            # Update residual
-            residual = y - Phi_sel @ coef
-            curr_error = np.mean(residual**2)
-
-            # Early stopping if little improvement
-            if prev_error - curr_error < self.min_improvement * max(prev_error, 1.0):
-                break
-            prev_error = curr_error
-
-        # If nothing selected, return empty
-        if len(selected) == 0:
-            return [], np.array([])
-
-        # Final coefficients (normalized space) for selected features
-        Phi_sel = Phi[:, selected]
-        coef, _, _, _ = np.linalg.lstsq(Phi_sel, y, rcond=None)
-        return selected, coef
-
-    def _feature_to_string(self, feat):
-        if feat["type"] == "global_poly_exp":
-            exps = feat["exponents"]
-            alpha = feat["alpha"]
-            mono_str = self._monomial_string(exps)
-            if alpha == 0.0:
-                if mono_str == "":
-                    return "1"
-                return mono_str
-            r2_str = "(x1**2 + x2**2 + x3**2 + x4**2)"
-            exp_str = f"exp(-{self._fmt(alpha)}*{r2_str})"
-            if mono_str == "":
-                return exp_str
-            else:
-                return f"{mono_str}*{exp_str}"
-        elif feat["type"] == "single_poly_exp":
-            i = feat["var"]
-            deg = feat["degree"]
-            alpha = feat["alpha"]
-            xi = f"x{i+1}"
-            mono = "1" if deg == 0 else (xi if deg == 1 else f"{xi}**{deg}")
-            exp_str = f"exp(-{self._fmt(alpha)}*({xi}**2))"
-            if mono == "1":
-                return exp_str
-            else:
-                return f"{mono}*{exp_str}"
-        else:
-            return "1"
-
-    def _monomial_string(self, exps):
-        parts = []
-        varnames = ["x1", "x2", "x3", "x4"]
-        for v, p in zip(varnames, exps):
-            if p == 0:
-                continue
-            elif p == 1:
-                parts.append(v)
-            else:
-                parts.append(f"{v}**{p}")
-        return "*".join(parts)
-
-    def _fmt(self, x):
-        # Format float with reasonable precision
-        if np.isfinite(x):
-            return f"{float(x):.12g}"
-        else:
+    def _fmt(self, v):
+        if not np.isfinite(v):
             return "0"
+        if abs(v) < 1e-14:
+            return "0"
+        return format(float(v), ".12g")
 
-    def _sum_terms_with_signs(self, terms):
-        # terms: list of strings like "c*term" where c may be negative
+    def _combine_terms(self, coeffs, terms):
+        # terms: list of strings, same length as coeffs
+        # Build an expression string with proper +/-
         expr = ""
-        for i, t in enumerate(terms):
-            # Extract coefficient sign if possible
-            # Split at first '*' to get coefficient
-            coef_str = None
-            rest = None
-            if "*" in t:
-                coef_str, rest = t.split("*", 1)
+        first = True
+        for c, t in zip(coeffs, terms):
+            if abs(c) < 1e-14:
+                continue
+            c_abs = self._fmt(abs(c))
+            if t == "1":
+                term_str = f"{c_abs}"
             else:
-                coef_str, rest = t, None
-            try:
-                coef_val = float(coef_str)
-                sign = "-" if coef_val < 0 else "+"
-                coef_abs = self._fmt(abs(coef_val))
-                if rest is None or rest == "":
-                    term_body = coef_abs
+                term_str = f"{c_abs}*{t}"
+            if first:
+                if c < 0:
+                    expr = "-" + term_str
                 else:
-                    term_body = f"{coef_abs}*{rest}"
-            except Exception:
-                # Fallback: cannot parse numeric coefficient reliably
-                sign = "+"
-                term_body = t
+                    expr = term_str
+                first = False
+            else:
+                if c < 0:
+                    expr += " - " + term_str
+                else:
+                    expr += " + " + term_str
+        if expr == "":
+            expr = "0"
+        return expr
 
-            if i == 0:
-                if sign == "-":
-                    expr += f"-{term_body}"
-                else:
-                    expr += term_body
+    def _phi_str(self, s, scales):
+        s1 = self._fmt(scales[0])
+        s2 = self._fmt(scales[1])
+        s3 = self._fmt(scales[2])
+        s4 = self._fmt(scales[3])
+        s_const = self._fmt(s)
+        r2 = f"((x1/{s1})**2 + (x2/{s2})**2 + (x3/{s3})**2 + (x4/{s4})**2)"
+        return f"exp(-{s_const}*{r2})"
+
+    def _build_expression_no_phi(self, base_terms, base_idx, w_base, y_mean):
+        # Build base polynomial expression plus intercept y_mean
+        # Terms: base_idx maps into base_terms and w_base
+        selected_terms = [base_terms[i] for i in base_idx]
+        expr_poly = self._combine_terms(w_base, selected_terms)
+        intercept = self._fmt(y_mean)
+        if expr_poly == "0":
+            return f"{intercept}"
+        if intercept == "0":
+            return expr_poly
+        # Combine with intercept
+        if intercept.startswith("-"):
+            return f"{expr_poly} - {self._fmt(abs(float(intercept)))}"
+        else:
+            return f"{expr_poly} + {intercept}"
+
+    def _build_expression_with_phi(self, base_terms, base_idx, w_base, phi_terms, phi_idx, w_phi, y_mean, s, scales):
+        # Build base polynomial
+        base_selected = [base_terms[i] for i in base_idx]
+        expr_base = self._combine_terms(w_base, base_selected)
+
+        # Build inner polynomial for phi
+        phi_selected = [phi_terms[i] for i in phi_idx]
+        expr_inner = self._combine_terms(w_phi, phi_selected)
+
+        phi = self._phi_str(s, scales)
+        # Build final expression: base + (inner) * phi + y_mean
+        # Start with intercept
+        intercept = self._fmt(y_mean)
+
+        parts = []
+
+        if expr_base != "0":
+            parts.append(expr_base)
+
+        if expr_inner != "0":
+            parts.append(f"({expr_inner})*{phi}")
+
+        if not parts:
+            # Both zero: return just intercept
+            return f"{intercept}"
+
+        expr = parts[0]
+        for p in parts[1:]:
+            # Add with plus
+            expr = f"{expr} + {p}"
+
+        # Add intercept
+        if intercept != "0":
+            if intercept.startswith("-"):
+                expr = f"{expr} - {self._fmt(abs(float(intercept)))}"
             else:
-                if sign == "-":
-                    expr += f" - {term_body}"
-                else:
-                    expr += f" + {term_body}"
-        return expr if expr else "0"
+                expr = f"{expr} + {intercept}"
+
+        return expr

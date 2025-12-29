@@ -1,6 +1,4 @@
-import torch
-import triton
-import triton.language as tl
+import typing
 
 class Solution:
     def solve(self, spec_path: str = None) -> dict:
@@ -8,33 +6,62 @@ class Solution:
 import torch
 import triton
 import triton.language as tl
+import sys
+
+# Dynamic lookup for erf implementation to ensure compatibility across Triton versions
+# while satisfying the requirement to use specialized implementations if available.
+def get_erf_impl():
+    try:
+        # Try the specifically requested libdevice path first
+        from triton.language.extra.cuda import libdevice
+        return libdevice.erf
+    except ImportError:
+        pass
+    try:
+        # Fallback to standard math module in newer Triton
+        return tl.math.erf
+    except AttributeError:
+        pass
+    # Final fallback
+    return tl.erf
+
+erf_impl = get_erf_impl()
 
 @triton.jit
 def gelu(x):
-    # Implements GELU approximation: 0.5 * x * (1 + erf(x / sqrt(2)))
-    # 1 / sqrt(2) approx 0.7071067811865476
-    return x * 0.5 * (1.0 + tl.erf(x * 0.7071067811865476))
+    """
+    GELU activation function: 0.5 * x * (1 + erf(x / sqrt(2)))
+    """
+    return x * 0.5 * (1.0 + erf_impl(x * 0.7071067811865476))
 
-def get_autotune_config():
+def get_configs():
     configs = []
-    # Configurations optimized for L4 GPU
-    # Covering small K (skewed) and large GEMM cases
-    for num_stages in [2, 3, 4]:
-        for block_m in [32, 64, 128]:
-            for block_n in [64, 128, 256]:
-                for block_k in [32, 64]:
-                    for num_warps in [4, 8]:
-                        # Skip configs that use too many resources or are inefficient
-                        if block_m * block_n < 2048 and num_warps == 8:
-                            continue
-                        configs.append(triton.Config(
-                            {'BLOCK_SIZE_M': block_m, 'BLOCK_SIZE_N': block_n, 'BLOCK_SIZE_K': block_k, 'GROUP_SIZE_M': 8},
-                            num_stages=num_stages, num_warps=num_warps
-                        ))
+    # Optimization for L4 (Ada Lovelace)
+    # Balanced configurations for various M, N and skewed K
+    
+    # High throughput configs for large matrices
+    configs.append(triton.Config({'BLOCK_M': 128, 'BLOCK_N': 256, 'BLOCK_K': 64, 'GROUP_SIZE_M': 8}, num_stages=3, num_warps=8))
+    configs.append(triton.Config({'BLOCK_M': 64, 'BLOCK_N': 256, 'BLOCK_K': 64, 'GROUP_SIZE_M': 8}, num_stages=4, num_warps=4))
+    configs.append(triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 64, 'GROUP_SIZE_M': 8}, num_stages=4, num_warps=4))
+    
+    # Configs for smaller shapes and better occupancy
+    configs.append(triton.Config({'BLOCK_M': 128, 'BLOCK_N': 64, 'BLOCK_K': 32, 'GROUP_SIZE_M': 8}, num_stages=4, num_warps=4))
+    configs.append(triton.Config({'BLOCK_M': 64, 'BLOCK_N': 128, 'BLOCK_K': 32, 'GROUP_SIZE_M': 8}, num_stages=4, num_warps=4))
+    configs.append(triton.Config({'BLOCK_M': 64, 'BLOCK_N': 64, 'BLOCK_K': 32, 'GROUP_SIZE_M': 8}, num_stages=4, num_warps=4))
+    
+    # Large K specific configs (larger BLOCK_K)
+    configs.append(triton.Config({'BLOCK_M': 64, 'BLOCK_N': 128, 'BLOCK_K': 128, 'GROUP_SIZE_M': 8}, num_stages=3, num_warps=4))
+    configs.append(triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 128, 'GROUP_SIZE_M': 8}, num_stages=3, num_warps=8))
+    
+    # Small K specific configs
+    # When K is small (e.g. 32), BLOCK_K=16 or 32 ensures efficient loops
+    configs.append(triton.Config({'BLOCK_M': 64, 'BLOCK_N': 64, 'BLOCK_K': 16, 'GROUP_SIZE_M': 8}, num_stages=2, num_warps=2))
+    configs.append(triton.Config({'BLOCK_M': 32, 'BLOCK_N': 32, 'BLOCK_K': 16, 'GROUP_SIZE_M': 8}, num_stages=2, num_warps=2))
+    
     return configs
 
 @triton.autotune(
-    configs=get_autotune_config(),
+    configs=get_configs(),
     key=['M', 'N', 'K'],
 )
 @triton.jit
@@ -44,13 +71,13 @@ def matmul_kernel(
     stride_am, stride_ak,
     stride_bk, stride_bn,
     stride_cm, stride_cn,
-    BLOCK_SIZE_M: tl.constexpr, BLOCK_SIZE_N: tl.constexpr, BLOCK_SIZE_K: tl.constexpr,
-    GROUP_SIZE_M: tl.constexpr,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+    GROUP_SIZE_M: tl.constexpr
 ):
-    # PID mapping and L2 cache swizzling
+    # Program ID
     pid = tl.program_id(axis=0)
-    num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
-    num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
+    num_pid_m = tl.cdiv(M, BLOCK_M)
+    num_pid_n = tl.cdiv(N, BLOCK_N)
     num_pid_in_group = GROUP_SIZE_M * num_pid_n
     group_id = pid // num_pid_in_group
     first_pid_m = group_id * GROUP_SIZE_M
@@ -58,64 +85,58 @@ def matmul_kernel(
     pid_m = first_pid_m + (pid % group_size_m)
     pid_n = (pid % num_pid_in_group) // group_size_m
 
-    # Offsets
-    offs_am = (pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M))
-    offs_bn = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N))
-    offs_k = tl.arange(0, BLOCK_SIZE_K)
-
-    # Pointers
+    # Compute pointers
+    offs_am = (pid_m * BLOCK_M + tl.arange(0, BLOCK_M)) % M
+    offs_bn = (pid_n * BLOCK_N + tl.arange(0, BLOCK_N)) % N
+    offs_k = tl.arange(0, BLOCK_K)
+    
     a_ptrs = a_ptr + (offs_am[:, None] * stride_am + offs_k[None, :] * stride_ak)
     b_ptrs = b_ptr + (offs_k[:, None] * stride_bk + offs_bn[None, :] * stride_bn)
 
-    # Accumulator
-    accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+    # Accumulate in Float32 for precision
+    accumulator = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
 
-    # Masks for M and N boundaries
-    mask_m = offs_am < M
-    mask_n = offs_bn < N
-
-    # Loop over K
-    for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
-        # Mask for K boundary
-        current_k = k * BLOCK_SIZE_K
-        mask_k = (current_k + offs_k) < K
+    # Inner loop
+    for k in range(0, tl.cdiv(K, BLOCK_K)):
+        # Handle masking for K dimension (critical for K-skewed where K might be small/unaligned)
+        k_remaining = K - k * BLOCK_K
         
-        # Load blocks with masking (zero padding)
-        a = tl.load(a_ptrs, mask=mask_m[:, None] & mask_k[None, :], other=0.0)
-        b = tl.load(b_ptrs, mask=mask_k[:, None] & mask_n[None, :], other=0.0)
-        
-        # Accumulate
+        if k_remaining < BLOCK_K:
+            a = tl.load(a_ptrs, mask=offs_k[None, :] < k_remaining, other=0.0)
+            b = tl.load(b_ptrs, mask=offs_k[:, None] < k_remaining, other=0.0)
+        else:
+            a = tl.load(a_ptrs)
+            b = tl.load(b_ptrs)
+            
         accumulator += tl.dot(a, b)
-        
-        # Advance pointers
-        a_ptrs += BLOCK_SIZE_K * stride_ak
-        b_ptrs += BLOCK_SIZE_K * stride_bk
+        a_ptrs += BLOCK_K * stride_ak
+        b_ptrs += BLOCK_K * stride_bk
 
-    # Apply GELU activation
-    c = gelu(accumulator)
-
+    # Apply GELU
+    accumulator = gelu(accumulator)
+    
     # Store result
-    offs_cm = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
-    offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+    offs_cm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_cn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
     c_ptrs = c_ptr + stride_cm * offs_cm[:, None] + stride_cn * offs_cn[None, :]
     c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
     
-    # Store with implicit cast to output dtype
-    tl.store(c_ptrs, c, mask=c_mask)
+    # Triton handles casting to c_ptr dtype automatically
+    tl.store(c_ptrs, accumulator, mask=c_mask)
 
 def matmul(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     # Validation
-    assert a.shape[1] == b.shape[0], "Incompatible dimensions"
     M, K = a.shape
-    _, N = b.shape
+    K2, N = b.shape
+    assert K == K2, f"Incompatible dimensions: {a.shape} and {b.shape}"
     
-    # Allocating output with same dtype as input
+    # Output allocation (preserve dtype)
     c = torch.empty((M, N), device=a.device, dtype=a.dtype)
     
     # Grid definition
-    grid = lambda META: (triton.cdiv(M, META['BLOCK_SIZE_M']) * triton.cdiv(N, META['BLOCK_SIZE_N']), )
+    grid = lambda META: (triton.cdiv(M, META['BLOCK_M']) * triton.cdiv(N, META['BLOCK_N']), )
     
-    # Launch kernel
+    # Kernel launch
     matmul_kernel[grid](
         a, b, c,
         M, N, K,
@@ -123,7 +144,6 @@ def matmul(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
         b.stride(0), b.stride(1),
         c.stride(0), c.stride(1)
     )
-    
     return c
 """
         return {"code": code}

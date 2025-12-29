@@ -3,348 +3,407 @@ import tarfile
 import tempfile
 import subprocess
 import stat
-from typing import Optional, List, Tuple
+import random
+import string
+import shutil
+import time
 
 
 class Solution:
     def solve(self, src_path: str) -> bytes:
-        project_root = None
-        temp_dir = None
-
+        random.seed(time.time())
+        tmpdir = tempfile.mkdtemp(prefix="pocgen_")
         try:
-            if os.path.isdir(src_path):
-                project_root = src_path
-            else:
-                temp_dir = tempfile.mkdtemp(prefix="pocgen_")
-                try:
-                    with tarfile.open(src_path, "r:*") as tar:
-                        tar.extractall(temp_dir)
-                except Exception:
-                    return b"()()()()"
-                project_root = self._find_project_root(temp_dir)
-
-            exe_path = self._build_project(project_root)
-            candidate_inputs = self._generate_candidate_inputs(project_root)
-
-            if not exe_path or not os.path.exists(exe_path):
-                # Fallback: return a reasonable 8-byte candidate
-                for data in candidate_inputs:
-                    if len(data) == 8:
-                        return data
-                return b"()()()()"
-
-            for data in candidate_inputs:
-                if not data:
-                    continue
-                try:
-                    proc = subprocess.run(
-                        [exe_path],
-                        input=data,
-                        stdout=subprocess.PIPE,
-                        stderr=subprocess.PIPE,
-                        timeout=5,
-                    )
-                except Exception:
-                    continue
-
-                if self._is_crash(proc.returncode, proc.stderr):
-                    return data
-
-            # If we failed to find a crashing input, return a short, plausible PoC
-            for data in candidate_inputs:
-                if len(data) == 8:
-                    return data
-            return b"()()()()"
-        finally:
-            # We intentionally do not remove temp_dir to avoid issues if cleanup fails;
-            # the environment is ephemeral.
-            pass
-
-    def _find_project_root(self, base: str) -> str:
-        try:
-            entries = [
-                os.path.join(base, e) for e in os.listdir(base) if not e.startswith(".")
-            ]
-        except FileNotFoundError:
-            return base
-        dirs = [e for e in entries if os.path.isdir(e)]
-        files = [e for e in entries if os.path.isfile(e)]
-        if len(dirs) == 1 and not files:
-            return dirs[0]
-        return base
-
-    def _make_sanitizer_env(self) -> dict:
-        env = os.environ.copy()
-        extra = "-fsanitize=address -fno-omit-frame-pointer -g"
-        for key in ("CFLAGS", "CXXFLAGS", "LDFLAGS"):
-            old = env.get(key, "")
-            if extra not in old:
-                env[key] = (old + " " + extra).strip()
-        return env
-
-    def _run_command(
-        self, args: List[str], cwd: str, timeout: int = 300, env: Optional[dict] = None
-    ) -> Optional[subprocess.CompletedProcess]:
-        try:
-            return subprocess.run(
-                args,
-                cwd=cwd,
-                env=env,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                timeout=timeout,
-            )
+            self._extract_tarball(src_path, tmpdir)
+            root = self._detect_project_root(tmpdir)
+            executables = self._build_and_find_executables(root)
+            for exe in executables:
+                poc = self._find_poc_for_exe(exe)
+                if poc is not None:
+                    return poc
         except Exception:
-            return None
+            pass
+        finally:
+            try:
+                shutil.rmtree(tmpdir, ignore_errors=True)
+            except Exception:
+                pass
+        return b"A" * 8
 
-    def _build_project(self, root_dir: str) -> Optional[str]:
-        env = self._make_sanitizer_env()
+    @staticmethod
+    def _extract_tarball(src_path: str, dst_dir: str) -> None:
+        with tarfile.open(src_path, "r:*") as tar:
+            def is_within_directory(directory, target):
+                abs_directory = os.path.abspath(directory)
+                abs_target = os.path.abspath(target)
+                prefix = os.path.commonprefix([abs_directory, abs_target])
+                return prefix == abs_directory
 
-        # 1. build.sh at root
-        build_sh = os.path.join(root_dir, "build.sh")
-        if os.path.isfile(build_sh):
-            r = self._run_command(["bash", build_sh], cwd=root_dir, timeout=600, env=env)
-            if r and r.returncode == 0:
-                exe = self._find_executable(root_dir)
-                if exe:
-                    return exe
+            def safe_extract(tar_obj, path=".", members=None):
+                for member in tar_obj.getmembers():
+                    member_path = os.path.join(path, member.name)
+                    if not is_within_directory(path, member_path):
+                        continue
+                tar_obj.extractall(path, members)
 
-        # 2. configure + make
-        configure = os.path.join(root_dir, "configure")
-        makefile = os.path.join(root_dir, "Makefile")
-        if os.path.isfile(configure):
-            if not os.path.isfile(makefile):
-                r_conf = self._run_command(
-                    ["bash", "configure"], cwd=root_dir, timeout=600, env=env
+            safe_extract(tar, dst_dir)
+
+    @staticmethod
+    def _detect_project_root(tmpdir: str) -> str:
+        entries = [e for e in os.listdir(tmpdir) if not e.startswith(".")]
+        if len(entries) == 1:
+            single = os.path.join(tmpdir, entries[0])
+            if os.path.isdir(single):
+                return single
+        return tmpdir
+
+    def _build_and_find_executables(self, root: str):
+        build_sh = None
+        for dirpath, _, filenames in os.walk(root):
+            if "build.sh" in filenames:
+                build_sh = os.path.join(dirpath, "build.sh")
+                break
+
+        if build_sh is not None:
+            try:
+                st = os.stat(build_sh)
+                os.chmod(build_sh, st.st_mode | stat.S_IXUSR)
+            except Exception:
+                pass
+            try:
+                subprocess.run(
+                    ["bash", build_sh],
+                    cwd=os.path.dirname(build_sh),
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    timeout=180,
+                    check=False,
                 )
-                if not r_conf or r_conf.returncode != 0:
-                    r_conf = None
-            r_make = self._run_command(
-                ["make", "-j4"], cwd=root_dir, timeout=600, env=env
-            )
-            if r_make and r_make.returncode == 0:
-                exe = self._find_executable(root_dir)
-                if exe:
-                    return exe
+            except Exception:
+                pass
+        else:
+            # Fallback generic build attempts
+            try:
+                if os.path.exists(os.path.join(root, "configure")):
+                    subprocess.run(
+                        ["sh", "configure"],
+                        cwd=root,
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                        timeout=120,
+                        check=False,
+                    )
+                    subprocess.run(
+                        ["make", "-j4"],
+                        cwd=root,
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                        timeout=300,
+                        check=False,
+                    )
+                elif os.path.exists(os.path.join(root, "CMakeLists.txt")):
+                    build_dir = os.path.join(root, "build")
+                    os.makedirs(build_dir, exist_ok=True)
+                    subprocess.run(
+                        ["cmake", ".."],
+                        cwd=build_dir,
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                        timeout=120,
+                        check=False,
+                    )
+                    subprocess.run(
+                        ["make", "-j4"],
+                        cwd=build_dir,
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                        timeout=300,
+                        check=False,
+                    )
+                else:
+                    subprocess.run(
+                        ["make", "-j4"],
+                        cwd=root,
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                        timeout=300,
+                        check=False,
+                    )
+            except Exception:
+                pass
 
-        # 3. Makefile only
-        if os.path.isfile(makefile):
-            r_make = self._run_command(
-                ["make", "-j4"], cwd=root_dir, timeout=600, env=env
-            )
-            if r_make and r_make.returncode == 0:
-                exe = self._find_executable(root_dir)
-                if exe:
-                    return exe
+        executables = []
+        for dirpath, _, filenames in os.walk(root):
+            for fname in filenames:
+                path = os.path.join(dirpath, fname)
+                try:
+                    if not os.path.isfile(path):
+                        continue
+                    st = os.stat(path)
+                    if not (st.st_mode & stat.S_IXUSR):
+                        continue
+                    with open(path, "rb") as f:
+                        magic = f.read(4)
+                    if magic != b"\x7fELF":
+                        continue
+                    executables.append(path)
+                except Exception:
+                    continue
 
-        # 4. CMake project
-        cmakelists = os.path.join(root_dir, "CMakeLists.txt")
-        if os.path.isfile(cmakelists):
-            build_dir = os.path.join(root_dir, "build")
-            os.makedirs(build_dir, exist_ok=True)
-            r_cmake = self._run_command(
-                ["cmake", ".."], cwd=build_dir, timeout=600, env=env
-            )
-            if r_cmake and r_cmake.returncode == 0:
-                r_build = self._run_command(
-                    ["cmake", "--build", ".", "--", "-j4"],
-                    cwd=build_dir,
-                    timeout=600,
-                    env=env,
-                )
-                if r_build and r_build.returncode == 0:
-                    exe = self._find_executable(build_dir)
-                    if not exe:
-                        exe = self._find_executable(root_dir)
-                    if exe:
-                        return exe
+        executables.sort(key=lambda p: os.path.getsize(p), reverse=True)
+        return executables
 
-        # 5. Fallback simple compilation
-        exe = self._compile_simple(root_dir, env)
-        return exe
+    def _find_poc_for_exe(self, exe_path: str):
+        # Stage 1: deterministic patterns
+        static_patterns = self._generate_static_patterns()
+        max_total_runs = 700
+        runs = 0
 
-    def _compile_simple(self, root_dir: str, env: dict) -> Optional[str]:
-        c_files: List[str] = []
-        cpp_files: List[str] = []
-        for dirpath, dirnames, filenames in os.walk(root_dir):
-            base = os.path.basename(dirpath)
-            if base in (".git", "__pycache__"):
-                continue
-            for f in filenames:
-                full = os.path.join(dirpath, f)
-                if f.endswith(".c"):
-                    c_files.append(full)
-                elif f.endswith((".cc", ".cpp", ".cxx")):
-                    cpp_files.append(full)
+        for pat in static_patterns:
+            if runs >= max_total_runs:
+                return None
+            variants = self._generate_input_variants_from_pattern(pat)
+            for data in variants:
+                if runs >= max_total_runs:
+                    return None
+                runs += 1
+                if self._run_and_is_crash(exe_path, data):
+                    return data
 
-        exe_path = os.path.join(root_dir, "a.out")
-
-        # Prefer C++ if present
-        if cpp_files:
-            cmd = ["c++", "-O1", "-g", "-std=c++11"] + cpp_files + ["-o", exe_path]
-            r = self._run_command(cmd, cwd=root_dir, timeout=600, env=env)
-            if r and r.returncode == 0 and os.path.isfile(exe_path):
-                return exe_path
-
-        if c_files:
-            cmd = ["cc", "-O1", "-g", "-std=c11"] + c_files + ["-o", exe_path]
-            r = self._run_command(cmd, cwd=root_dir, timeout=600, env=env)
-            if r and r.returncode == 0 and os.path.isfile(exe_path):
-                return exe_path
+        # Stage 2: random fuzzing with regex-like patterns
+        max_random = max_total_runs - runs
+        for _ in range(max_random):
+            pattern = self._generate_random_regex_pattern()
+            data = self._generate_random_input_from_pattern(pattern)
+            if self._run_and_is_crash(exe_path, data):
+                return data
 
         return None
 
-    def _find_executable(self, search_root: str) -> Optional[str]:
-        best_path = None
-        best_score = None
-
-        for dirpath, dirnames, filenames in os.walk(search_root):
-            base_dir = os.path.basename(dirpath)
-            if base_dir in (".git", "__pycache__"):
-                continue
-            if base_dir.endswith(".dSYM"):
-                continue
-
-            for f in filenames:
-                full = os.path.join(dirpath, f)
-                try:
-                    st = os.stat(full)
-                except OSError:
-                    continue
-
-                if not stat.S_ISREG(st.st_mode):
-                    continue
-                if not (st.st_mode & 0o111):
-                    continue
-                name_lower = f.lower()
-                if name_lower.endswith(
-                    (".sh", ".py", ".pl", ".rb", ".bat", ".cmd", ".ps1")
-                ):
-                    continue
-                if name_lower.endswith((".a", ".so", ".dylib", ".dll", ".la", ".o")):
-                    continue
-                if st.st_size == 0:
-                    continue
-
-                priority = 1
-                for kw in ("fuzz", "poc", "test", "bug", "demo", "sample", "main", "prog"):
-                    if kw in name_lower:
-                        priority = 0
-                        break
-                depth = full.count(os.sep)
-                score = (priority, depth, -st.st_size)
-                if best_score is None or score < best_score:
-                    best_score = score
-                    best_path = full
-
-        return best_path
-
-    def _collect_existing_pocs(self, root_dir: str) -> List[Tuple[bytes, str]]:
-        results: List[Tuple[bytes, str]] = []
-        for dirpath, dirnames, filenames in os.walk(root_dir):
-            for f in filenames:
-                full = os.path.join(dirpath, f)
-                name_lower = f.lower()
-                if not any(k in name_lower for k in ("poc", "crash", "id_", "input")):
-                    continue
-                try:
-                    st = os.stat(full)
-                except OSError:
-                    continue
-                if st.st_size == 0 or st.st_size > 4096:
-                    continue
-                try:
-                    with open(full, "rb") as fh:
-                        data = fh.read()
-                    if data:
-                        results.append((data, full))
-                except OSError:
-                    continue
-        return results
-
-    def _generate_candidate_inputs(self, root_dir: str) -> List[bytes]:
-        inputs: List[bytes] = []
-        seen = set()
-
-        def add(b: bytes):
-            if not b:
-                return
-            if b in seen:
-                return
-            seen.add(b)
-            inputs.append(b)
-
-        # Pre-existing PoCs in the tarball, if any
-        for data, _path in self._collect_existing_pocs(root_dir):
-            add(data)
-
-        # Our own candidates, aimed at regex / PCRE-style inputs
-        patterns_phase1 = [
-            b"a",
-            b"ab",
-            b"abc",
-            b".*",
-            b"^$",
-            b"()",
-            b"(a)",
-            b"(.)",
-        ]
-        subjects_phase1 = [b"", b"a"]
-
-        for p in patterns_phase1:
-            for s in subjects_phase1:
-                add(p)
-                add(p + b"\n")
-                add(p + b"\n" + s + b"\n")
-                add(p + b"\x00" + s)
-
-        patterns_phase2 = patterns_phase1 + [
-            b"(",
-            b")",
-            b"(a)*",
-            b"(a)+",
-            b"(a)?",
-            b"((a))",
-            b"(a)(b)",
-            b"(a)(b)(c)",
-            b"(?:)",
-            b"(?:a)",
-            b"(a|b)",
-            b"(a|)",
-            b"(a(b)c)",
-        ]
-        subjects_phase2 = [b"", b"a", b"abc", b"123456", b"aaaaaaaa"]
-
-        for p in patterns_phase2:
-            for s in subjects_phase2:
-                add(p)
-                add(p + b"\n")
-                add(p + b"\n" + s + b"\n")
-                add(p + b"\x00" + s)
-
-        # Ensure at least one fixed 8-byte candidate (matches the ground-truth length)
-        add(b"()()()()")
-
-        return inputs
-
-    def _is_crash(self, returncode: int, stderr: bytes) -> bool:
-        # Signal-based termination (e.g., SIGSEGV) is a definite crash
-        if returncode < 0:
-            return True
-        if returncode == 0:
-            return False
+    @staticmethod
+    def _run_and_is_crash(exe_path: str, data: bytes) -> bool:
         try:
-            text = stderr.decode("utf-8", errors="ignore")
+            res = subprocess.run(
+                [exe_path],
+                input=data,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+                timeout=1.0,
+            )
+        except subprocess.TimeoutExpired:
+            return False
         except Exception:
-            text = repr(stderr)
-        if "Sanitizer" in text:
+            return False
+
+        rc = res.returncode
+        if rc == 0:
+            return False
+
+        # Treat signal-terminated processes as crashes
+        if rc < 0 or rc >= 128:
             return True
-        if "stack-buffer-overflow" in text:
-            return True
-        if "heap-buffer-overflow" in text:
-            return True
-        if "buffer-overflow" in text:
-            return True
-        if "runtime error:" in text:
-            return True
+
+        err = res.stderr or b""
+        crash_keywords = [
+            b"AddressSanitizer",
+            b"stack-buffer-overflow",
+            b"stack overflow",
+            b"buffer-overflow",
+            b"SIGSEGV",
+            b"segmentation fault",
+            b"stack smashing detected",
+            b"runtime error",
+        ]
+        for kw in crash_keywords:
+            if kw in err:
+                return True
         return False
+
+    @staticmethod
+    def _generate_static_patterns():
+        patterns = set()
+
+        # Basic literals and simple quantifiers
+        base_lits = ["a", "b", "ab", "abc"]
+        quants = ["", "?", "+", "*"]
+        for lit in base_lits:
+            patterns.add(lit)
+            for q in quants:
+                patterns.add(lit + q)
+
+        patterns.update(
+            [
+                ".",
+                ".*",
+                "^a$",
+                "^.*$",
+                "a?b",
+                "ab+c",
+                "a*b*c*d*",
+                "(?:a)",
+                "(?:a|b)",
+                "(?:a*)+",
+                "(?:(a)b)+",
+            ]
+        )
+
+        # Single and nested capturing groups
+        for lit in base_lits:
+            for q1 in quants:
+                for q2 in quants:
+                    patterns.add(f"({lit}{q1}){q2}")
+                    patterns.add(f"(({lit}{q1})){q2}")
+
+        # Two-group combinations
+        for lit1 in ["a", "ab"]:
+            for lit2 in ["b", "bc"]:
+                patterns.add(f"({lit1})({lit2})")
+                patterns.add(f"({lit1})({lit2})+")
+                patterns.add(f"({lit1}{lit2})|({lit2}{lit1})")
+                patterns.add(f"({lit1})+({lit2})*")
+
+        # Some patterns with alternations and nesting
+        patterns.update(
+            [
+                "(a|b)",
+                "(a|b)*",
+                "(a|b)+",
+                "((a))",
+                "((a)*)",
+                "(ab)",
+                "^(a*)$",
+                "^(a+)$",
+                "((ab)+)+",
+                "(a(b)c)",
+                "a(b(c)d)e",
+                "((a|))+",  # odd but legal
+                "(a*)*b",
+                "((a|b)*)+",
+                "(a|aa)+$",
+                "(ab|a)*",
+                "(a?)+",
+                "((ab)?)+",
+                "((a)+)+b",
+                "(a(b(c(d(e)f)g)h)i)j",
+                "((((a))))",
+                "(a{1,3})",
+                "((a{0,2})b)+",
+            ]
+        )
+
+        # Backreference-heavy patterns
+        patterns.update(
+            [
+                r"(a)\1",
+                r"(a)(b)\2",
+                r"(a|b)\1",
+                r"(.+)\1",
+                r"(\w+)\1",
+                r"([0-9]+)\1",
+                r"((a*)b)+",
+                r"((ab)*c)+",
+            ]
+        )
+
+        # Limit the total number to keep runtime bounded
+        # Deterministic order
+        patterns_list = sorted(patterns)
+        if len(patterns_list) > 200:
+            patterns_list = patterns_list[:200]
+        return patterns_list
+
+    @staticmethod
+    def _generate_input_variants_from_pattern(pattern: str):
+        bs = pattern.encode("ascii", "ignore") or b"a"
+        variants = []
+
+        # Pattern only
+        variants.append(bs)
+
+        # Pattern + newline + small subject
+        variants.append(bs + b"\n" + b"abc")
+
+        # Pattern + null + small subject
+        variants.append(bs + b"\x00" + b"abc")
+
+        # First byte as pattern length
+        if len(bs) <= 250:
+            L = len(bs)
+            variants.append(bytes([L]) + bs)
+            variants.append(bytes([L]) + bs + b"abc")
+
+        # 2-byte length (LE and BE)
+        if len(bs) <= 65535:
+            L2_le = len(bs).to_bytes(2, "little")
+            L2_be = len(bs).to_bytes(2, "big")
+            variants.append(L2_le + bs)
+            variants.append(L2_le + bs + b"abc")
+            variants.append(L2_be + bs)
+            variants.append(L2_be + bs + b"abc")
+
+        # 4-byte LE length
+        L4_le = len(bs).to_bytes(4, "little")
+        variants.append(L4_le + bs)
+        variants.append(L4_le + bs + b"abc")
+
+        # Prefix with a zero options byte
+        variants.append(b"\x00" + bs)
+        variants.append(b"\x00" + bs + b"abc")
+
+        # Deduplicate while preserving order
+        out = []
+        seen = set()
+        for v in variants:
+            if v not in seen:
+                seen.add(v)
+                out.append(v)
+        return out
+
+    @staticmethod
+    def _generate_random_regex_pattern() -> str:
+        base_chars = "ab"
+        quantifiers = ["", "?", "+", "*"]
+        s = ""
+        n_groups = random.randint(0, 3)
+        for _ in range(n_groups):
+            if random.random() < 0.6 or not s:
+                s += random.choice(base_chars) * random.randint(1, 3)
+            # Choose capturing vs non-capturing
+            if random.random() < 0.7:
+                s += "("
+            else:
+                s += "(?:"
+            inner_len = random.randint(1, 4)
+            inner = "".join(random.choice(base_chars) for _ in range(inner_len))
+            s += inner + ")"
+            s += random.choice(quantifiers)
+            if random.random() < 0.3:
+                s += "|"
+        s += random.choice(base_chars) * random.randint(1, 3)
+        if not s:
+            s = "a"
+        if len(s) > 32:
+            s = s[:32]
+        return s
+
+    @staticmethod
+    def _generate_random_input_from_pattern(pattern: str) -> bytes:
+        bs = pattern.encode("ascii", "ignore") or b"a"
+        subj_len = random.randint(1, 8)
+        subj = "".join(random.choice("abc") for _ in range(subj_len)).encode("ascii")
+        form = random.randint(0, 4)
+
+        if form == 0:
+            return bs
+        elif form == 1:
+            return bs + b"\n" + subj
+        elif form == 2:
+            if len(bs) <= 250:
+                return bytes([len(bs)]) + bs + subj
+            return bs + subj
+        elif form == 3:
+            if len(bs) <= 65535:
+                return len(bs).to_bytes(2, "little") + bs + subj
+            return bs + subj
+        else:
+            return bs + b"\x00" + subj

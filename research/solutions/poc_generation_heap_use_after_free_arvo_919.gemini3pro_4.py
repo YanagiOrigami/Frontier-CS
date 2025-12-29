@@ -1,217 +1,214 @@
-import os
 import sys
-import tarfile
+import os
 import subprocess
 import tempfile
 import shutil
 import random
+import struct
+import tarfile
+import glob
 import time
 
 class Solution:
     def solve(self, src_path: str) -> bytes:
-        """
-        Generate a PoC that triggers the heap-use-after-free vulnerability in ots::OTSStream::Write.
-        This solution extracts the source, compiles it with AddressSanitizer, and fuzzes it
-        using available font files as seeds.
-        """
-        # Create a temporary workspace
-        work_dir = tempfile.mkdtemp()
+        base_dir = tempfile.mkdtemp()
         try:
-            # Extract the source code
+            # Extract source
             with tarfile.open(src_path) as tar:
-                tar.extractall(path=work_dir)
+                tar.extractall(path=base_dir)
             
-            # Locate the source root (handle potential single top-level directory)
-            src_root = work_dir
-            entries = os.listdir(work_dir)
-            if len(entries) == 1 and os.path.isdir(os.path.join(work_dir, entries[0])):
-                src_root = os.path.join(work_dir, entries[0])
+            src_root = base_dir
+            entries = os.listdir(base_dir)
+            if len(entries) == 1 and os.path.isdir(os.path.join(base_dir, entries[0])):
+                src_root = os.path.join(base_dir, entries[0])
             
-            # Setup compiler flags for ASAN
-            env = os.environ.copy()
-            # -O1 for speed with meaningful stack traces, disable leak detection to focus on UAF
-            san_flags = "-fsanitize=address -g -O1"
-            env["CC"] = "clang"
-            env["CXX"] = "clang++"
-            env["CFLAGS"] = san_flags
-            env["CXXFLAGS"] = san_flags
-            env["LDFLAGS"] = "-fsanitize=address"
-            env["ASAN_OPTIONS"] = "detect_leaks=0:halt_on_error=1"
+            exe_path = os.path.join(src_root, "fuzz_target")
+            built = False
             
-            executable = None
-            build_success = False
-            
-            # 1. Attempt Build via Meson
-            has_meson_build = os.path.exists(os.path.join(src_root, "meson.build"))
-            meson_bin = shutil.which("meson")
-            
-            if has_meson_build and meson_bin:
-                build_dir = os.path.join(src_root, "build_asan")
-                try:
-                    subprocess.run([meson_bin, "setup", build_dir], cwd=src_root, env=env, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                    subprocess.run(["ninja", "-C", build_dir], cwd=src_root, env=env, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                    cand = os.path.join(build_dir, "ots-sanitize")
-                    if os.path.exists(cand):
-                        executable = cand
-                        build_success = True
-                except subprocess.CalledProcessError:
-                    pass
-            
-            # 2. Attempt Build via Autotools
-            if not build_success:
-                has_autogen = os.path.exists(os.path.join(src_root, "autogen.sh"))
-                has_configure = os.path.exists(os.path.join(src_root, "configure"))
-                
-                if has_autogen or has_configure:
-                    try:
-                        if has_autogen:
-                            subprocess.run(["sh", "./autogen.sh"], cwd=src_root, env=env, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                        
-                        if not os.path.exists(os.path.join(src_root, "configure")):
-                            # Fallback if autogen failed to create configure
-                            pass
-                        else:
-                            subprocess.run(["./configure"], cwd=src_root, env=env, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                            subprocess.run(["make", "-j8"], cwd=src_root, env=env, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                            cand = os.path.join(src_root, "ots-sanitize")
-                            if os.path.exists(cand):
-                                executable = cand
-                                build_success = True
-                    except subprocess.CalledProcessError:
-                        pass
-
-            # 3. Fallback search for binary
-            if not executable:
-                for root, dirs, files in os.walk(src_root):
-                    if "ots-sanitize" in files:
-                        cand = os.path.join(root, "ots-sanitize")
-                        if os.access(cand, os.X_OK):
-                            executable = cand
-                            break
-            
-            if not executable:
-                return b''
-
-            # Gather Seeds from the source tree (tests/fonts)
-            seeds = []
+            # Attempt 1: Manual Compilation (Fastest and most controlled for single binary)
+            sources = []
             for root, dirs, files in os.walk(src_root):
                 for f in files:
-                    if f.lower().endswith(('.ttf', '.otf', '.woff', '.woff2')):
-                        try:
-                            path = os.path.join(root, f)
-                            # Filter out very large files to optimize fuzzing speed
-                            if os.path.getsize(path) < 50 * 1024: 
-                                with open(path, "rb") as fd:
-                                    seeds.append(fd.read())
-                        except:
+                    if f.endswith(".cc"):
+                        # Exclude tests, demos, and woff2 (to avoid brotli dep issues)
+                        path = os.path.join(root, f)
+                        if "test" in path or "demo" in path or "fuzz" in path:
                             continue
+                        if "woff2" in path:
+                            continue
+                        sources.append(path)
             
-            if not seeds:
-                # Minimal seed if none found
-                seeds.append(b'\x00\x01\x00\x00\x00\x00\x00\x00')
-
-            # Fuzz Loop
-            # Time limit ensures we return within a reasonable window
-            start_time = time.time()
-            time_limit = 180 # 3 minutes
+            main_src = None
+            for s in sources:
+                if "ots-sanitize.cc" in s:
+                    main_src = s
+                    break
             
-            best_poc = None
-            found_specific = False
-            
-            while time.time() - start_time < time_limit:
-                seed = random.choice(seeds)
+            if main_src:
+                inc_src = os.path.join(src_root, "src")
+                inc_inc = os.path.join(src_root, "include")
                 
-                # Mutation Strategy
-                mutated = bytearray(seed)
-                if not mutated: continue
-                
-                mutation_ops = random.randint(1, max(2, len(mutated) // 50))
-                for _ in range(mutation_ops):
-                    op = random.randint(0, 3)
-                    idx = random.randint(0, len(mutated) - 1)
-                    
-                    if op == 0: # Bit flip
-                        mutated[idx] ^= (1 << random.randint(0, 7))
-                    elif op == 1: # Byte flip
-                        mutated[idx] = random.randint(0, 255)
-                    elif op == 2: # Delete
-                        chunk = random.randint(1, 100)
-                        if idx + chunk <= len(mutated):
-                            del mutated[idx:idx+chunk]
-                    elif op == 3: # Insert junk
-                        chunk = random.randint(1, 10)
-                        junk = os.urandom(chunk)
-                        mutated[idx:idx] = junk
-
-                # Write to tmp file
-                with tempfile.NamedTemporaryFile(delete=False) as tf:
-                    tf.write(mutated)
-                    tf_path = tf.name
+                # Compile command
+                cmd = [
+                    "g++", "-fsanitize=address", "-g", "-O1", 
+                    "-I", inc_src, "-I", inc_inc, 
+                    "-DOTS_DEBUG",
+                    main_src
+                ] + [s for s in sources if s != main_src] + ["-lz", "-o", exe_path]
                 
                 try:
-                    # Run target
-                    res = subprocess.run([executable, tf_path], capture_output=True, timeout=1)
-                    stderr = res.stderr.decode(errors='ignore')
-                    
-                    if "AddressSanitizer: heap-use-after-free" in stderr:
-                        # Check if it matches the specific requirement
-                        if "ots::OTSStream::Write" in stderr:
-                            best_poc = bytes(mutated)
-                            found_specific = True
-                            break # Success
-                        elif best_poc is None:
-                            # Save as backup if we haven't found the specific one yet
-                            best_poc = bytes(mutated)
-                except subprocess.TimeoutExpired:
+                    subprocess.run(cmd, check=True, stderr=subprocess.DEVNULL)
+                    if os.path.exists(exe_path):
+                        built = True
+                except subprocess.CalledProcessError:
                     pass
-                except Exception:
+
+            # Attempt 2: Autotools/Configure (Fallback)
+            if not built:
+                if os.path.exists(os.path.join(src_root, "configure")) or os.path.exists(os.path.join(src_root, "autogen.sh")):
+                     try:
+                        if os.path.exists(os.path.join(src_root, "autogen.sh")):
+                             subprocess.run(["sh", "autogen.sh"], cwd=src_root, stderr=subprocess.DEVNULL)
+                        
+                        env = os.environ.copy()
+                        env["CXXFLAGS"] = "-fsanitize=address -g -O0"
+                        env["LDFLAGS"] = "-fsanitize=address"
+                        subprocess.run(["./configure"], cwd=src_root, env=env, stderr=subprocess.DEVNULL)
+                        subprocess.run(["make", "-j4"], cwd=src_root, env=env, stderr=subprocess.DEVNULL)
+                        
+                        for r, d, f in os.walk(src_root):
+                            if "ots-sanitize" in f:
+                                cand = os.path.join(r, "ots-sanitize")
+                                if os.access(cand, os.X_OK):
+                                    exe_path = cand
+                                    built = True
+                                    break
+                     except: pass
+
+            if not built:
+                return self.generate_fallback()
+
+            # Construct a robust seed: SFNT with head, hhea, maxp, hmtx
+            # This ensures we pass basic checks and reach deep sanitation logic where Write UAFs often live.
+            seed = bytearray()
+            # SFNT Header
+            seed += struct.pack(">I", 0x00010000) # version
+            seed += struct.pack(">H", 4) # numTables
+            seed += struct.pack(">H", 32) # searchRange
+            seed += struct.pack(">H", 2) # entrySelector
+            seed += struct.pack(">H", 0) # rangeShift
+            
+            # Directory
+            # offsets: header=12, dir=16*4=64. Data starts at 76 (0x4C)
+            offset = 76
+            
+            # 1. head
+            seed += b'head'
+            seed += b'\x00\x00\x00\x00' # checksum
+            seed += struct.pack(">I", offset)
+            seed += struct.pack(">I", 54)
+            offset += 54 + 2 # + padding
+            
+            # 2. hhea
+            seed += b'hhea'
+            seed += b'\x00\x00\x00\x00'
+            seed += struct.pack(">I", offset)
+            seed += struct.pack(">I", 36)
+            offset += 36 + 2
+            
+            # 3. maxp
+            seed += b'maxp'
+            seed += b'\x00\x00\x00\x00'
+            seed += struct.pack(">I", offset)
+            seed += struct.pack(">I", 6)
+            offset += 6 + 2
+            
+            # 4. hmtx
+            seed += b'hmtx'
+            seed += b'\x00\x00\x00\x00'
+            seed += struct.pack(">I", offset)
+            seed += struct.pack(">I", 100) # Arbitrary size for hmtx
+            offset += 100
+            
+            # Data construction
+            
+            # head data (54 bytes)
+            head_data = bytearray(54)
+            struct.pack_into(">I", head_data, 12, 0x5F0F3CF5) # magic
+            struct.pack_into(">H", head_data, 18, 2048) # unitsPerEm
+            struct.pack_into(">H", head_data, 44, 0) # indexToLocFormat
+            seed += head_data + b'\x00\x00'
+            
+            # hhea data (36 bytes)
+            hhea_data = bytearray(36)
+            struct.pack_into(">I", hhea_data, 0, 0x00010000) # version
+            struct.pack_into(">H", hhea_data, 34, 1) # numOfLongHorMetrics
+            seed += hhea_data + b'\x00\x00'
+            
+            # maxp data (6 bytes)
+            maxp_data = struct.pack(">IH", 0x00010000, 1) # version, numGlyphs
+            seed += maxp_data + b'\x00\x00'
+            
+            # hmtx data
+            seed += b'\x00' * 100
+
+            best_input = seed
+            start_time = time.time()
+            
+            # Fuzz for 50 seconds max
+            while time.time() - start_time < 50:
+                curr = bytearray(best_input)
+                
+                # Mutation
+                mutations = random.randint(1, 4)
+                for _ in range(mutations):
+                    m = random.randint(0, 4)
+                    if m == 0: # Byte flip
+                        idx = random.randint(0, len(curr)-1)
+                        curr[idx] ^= random.randint(1, 255)
+                    elif m == 1: # Bit flip
+                        idx = random.randint(0, len(curr)-1)
+                        bit = random.randint(0, 7)
+                        curr[idx] ^= (1 << bit)
+                    elif m == 2: # Integer overwrite (targeting lengths/offsets)
+                        if len(curr) > 4:
+                            idx = random.randint(0, len(curr)-4)
+                            val = random.choice([0, 0xFFFFFFFF, 0x7FFFFFFF, 0x80000000, random.randint(0, 65535)])
+                            struct.pack_into(">I", curr, idx, val)
+                    elif m == 3: # Small chunks havoc
+                        idx = random.randint(0, len(curr)-1)
+                        chunk_len = random.randint(1, 4)
+                        for k in range(chunk_len):
+                            if idx+k < len(curr):
+                                curr[idx+k] = random.randint(0, 255)
+                    elif m == 4: # Insert junk
+                        idx = random.randint(0, len(curr))
+                        curr[idx:idx] = os.urandom(random.randint(1, 10))
+
+                with tempfile.NamedTemporaryFile(delete=False) as tf:
+                    tf.write(curr)
+                    tf_name = tf.name
+                
+                try:
+                    res = subprocess.run([exe_path, tf_name], capture_output=True, timeout=1)
+                    if res.returncode != 0:
+                        err = res.stderr.decode('utf-8', 'ignore')
+                        # Check for UAF
+                        if "AddressSanitizer" in err and "heap-use-after-free" in err:
+                            os.unlink(tf_name)
+                            return bytes(curr)
+                except:
                     pass
                 finally:
-                    if os.path.exists(tf_path):
-                        os.remove(tf_path)
+                    if os.path.exists(tf_name):
+                        os.unlink(tf_name)
             
-            # Minimization Phase
-            if best_poc:
-                current_poc = best_poc
-                # Attempt to strip from end to reduce size (improves score)
-                # Try aggressive cutting first
-                step_div = 10
-                for _ in range(15):
-                    if len(current_poc) < 800: break # Already close to ground truth
-                    
-                    cut_len = len(current_poc) // step_div
-                    if cut_len == 0: cut_len = 1
-                    
-                    candidate = current_poc[:-cut_len]
-                    
-                    with tempfile.NamedTemporaryFile(delete=False) as tf:
-                        tf.write(candidate)
-                        tf_path = tf.name
-                    
-                    valid_min = False
-                    try:
-                        res = subprocess.run([executable, tf_path], capture_output=True, timeout=1)
-                        stderr = res.stderr.decode(errors='ignore')
-                        
-                        target_str = "ots::OTSStream::Write" if found_specific else "AddressSanitizer: heap-use-after-free"
-                        if "AddressSanitizer: heap-use-after-free" in stderr and target_str in stderr:
-                            current_poc = candidate
-                            valid_min = True
-                    except:
-                        pass
-                    finally:
-                        if os.path.exists(tf_path):
-                            os.remove(tf_path)
-                    
-                    if not valid_min:
-                        # If cutting failed, decrease step size (make cuts smaller)
-                        step_div += 5
-                    
-                return current_poc
-
-            return b''
+            return bytes(seed)
 
         except Exception:
-            return b''
+            return self.generate_fallback()
         finally:
-            shutil.rmtree(work_dir, ignore_errors=True)
+            shutil.rmtree(base_dir)
+
+    def generate_fallback(self) -> bytes:
+        return b'\x00\x01\x00\x00' + b'\x00'*200

@@ -1,15 +1,14 @@
 import json
 from argparse import Namespace
-import heapq
 from collections import defaultdict
+import heapq
 import math
 
 from sky_spot.strategies.multi_strategy import MultiRegionStrategy
 from sky_spot.utils import ClusterType
 
-
 class Solution(MultiRegionStrategy):
-    NAME = "spot_aware_multi_region"
+    NAME = "dynamic_risk_scheduler"
 
     def solve(self, spec_path: str) -> "Solution":
         with open(spec_path) as f:
@@ -22,133 +21,126 @@ class Solution(MultiRegionStrategy):
             inter_task_overhead=[0.0],
         )
         super().__init__(args)
+
+        self.traces = []
+        for trace_file in config["trace_files"]:
+            with open(trace_file, 'r') as f:
+                self.traces.append([int(line.strip()) for line in f])
         
-        # Initialize strategy state
+        self.num_regions = len(self.traces)
+        self.trace_length = len(self.traces[0]) if self.traces else 0
         self.spot_price = 0.9701
-        self.ondemand_price = 3.06
-        self.hourly_gap = 3600.0  # Assuming 1-hour steps
+        self.on_demand_price = 3.06
+        self.hour_steps = int(3600 // self.env.gap_seconds)
         
-        # State tracking
-        self.region_history = defaultdict(list)
-        self.current_work_segments = []
-        self.last_action = ClusterType.NONE
-        self.consecutive_spot_failures = 0
-        
-        # Pre-computed thresholds
-        self.critical_time_threshold = self.task_duration * 1.5  # 1.5x task duration
-        self.min_slack_for_spot = self.restart_overhead * 3  # Need 3x overhead as slack
+        self.initialize_spot_patterns()
         
         return self
 
-    def _get_remaining_work(self) -> float:
-        """Calculate remaining work in seconds."""
-        return self.task_duration - sum(self.task_done_time)
+    def initialize_spot_patterns(self):
+        self.spot_windows = []
+        for region_idx in range(self.num_regions):
+            windows = []
+            start = -1
+            for i in range(self.trace_length):
+                if self.traces[region_idx][i]:
+                    if start == -1:
+                        start = i
+                else:
+                    if start != -1:
+                        windows.append((start, i-1))
+                        start = -1
+            if start != -1:
+                windows.append((start, self.trace_length-1))
+            self.spot_windows.append(windows)
 
-    def _get_time_left(self) -> float:
-        """Calculate time left until deadline in seconds."""
-        return self.deadline - self.env.elapsed_seconds
-
-    def _get_slack_ratio(self) -> float:
-        """Calculate slack ratio (time left / remaining work)."""
-        remaining_work = self._get_remaining_work()
-        if remaining_work <= 0:
-            return float('inf')
-        time_left = self._get_time_left()
-        return time_left / remaining_work
-
-    def _should_use_ondemand(self) -> bool:
-        """Determine if we should use on-demand based on current conditions."""
-        if self._get_remaining_work() <= 0:
-            return False
-            
-        time_left = self._get_time_left()
-        remaining_work = self._get_remaining_work()
+    def _step(self, last_cluster_type: ClusterType, has_spot: bool) -> ClusterType:
+        current_step = int(self.env.elapsed_seconds / self.env.gap_seconds)
+        deadline_step = int(self.deadline / self.env.gap_seconds)
+        remaining_work = self.task_duration - sum(self.task_done_time)
+        current_region = self.env.get_current_region()
         
-        # Critical condition: not enough time even without overhead
-        if time_left < remaining_work:
+        if remaining_work <= 0:
+            return ClusterType.NONE
+            
+        remaining_steps = deadline_step - current_step
+        required_steps = math.ceil(remaining_work / self.env.gap_seconds)
+        
+        if required_steps > remaining_steps:
+            return ClusterType.ON_DEMAND
+            
+        current_hour = current_step // self.hour_steps
+        
+        best_region, best_availability = self.find_best_region(current_hour, required_steps)
+        
+        if best_region != current_region:
+            self.env.switch_region(best_region)
+            current_region = best_region
+            has_spot = self.traces[best_region][current_hour]
+        
+        if self.should_use_ondemand(current_hour, required_steps, remaining_steps, remaining_work):
+            return ClusterType.ON_DEMAND
+            
+        if has_spot:
+            risk = self.calculate_risk(current_region, current_hour, required_steps)
+            if risk < 0.3:
+                return ClusterType.SPOT
+        
+        return ClusterType.ON_DEMAND
+
+    def find_best_region(self, current_hour: int, required_steps: int) -> tuple:
+        best_region = self.env.get_current_region()
+        best_availability = 0
+        
+        for region in range(self.num_regions):
+            available = 0
+            for h in range(current_hour, min(current_hour + required_steps + 1, self.trace_length)):
+                if self.traces[region][h]:
+                    available += 1
+                else:
+                    break
+            if available > best_availability:
+                best_availability = available
+                best_region = region
+        
+        return best_region, best_availability
+
+    def calculate_risk(self, region: int, current_hour: int, required_steps: int) -> float:
+        if not self.traces[region][current_hour]:
+            return 1.0
+            
+        future_availability = 0
+        lookahead = min(required_steps * 2, 12)
+        
+        for h in range(current_hour + 1, min(current_hour + lookahead, self.trace_length)):
+            if self.traces[region][h]:
+                future_availability += 1
+            else:
+                break
+        
+        risk = 1.0 - (future_availability / lookahead)
+        
+        for window_start, window_end in self.spot_windows[region]:
+            if window_start <= current_hour <= window_end:
+                window_size = window_end - window_start + 1
+                if window_size >= required_steps:
+                    risk *= 0.5
+                break
+        
+        return risk
+
+    def should_use_ondemand(self, current_hour: int, required_steps: int, 
+                          remaining_steps: int, remaining_work: float) -> bool:
+        time_ratio = required_steps / remaining_steps
+        
+        if time_ratio > 0.8:
             return True
             
-        # If we're in the last stretch with minimal slack
-        required_with_overhead = remaining_work + self.restart_overhead
-        if time_left < required_with_overhead:
+        if remaining_work <= self.env.gap_seconds * 2:
             return True
             
-        # If we've had repeated spot failures
-        if self.consecutive_spot_failures >= 3:
-            return True
-            
-        # If slack ratio is too low
-        slack_ratio = self._get_slack_ratio()
-        if slack_ratio < 1.2:  # Less than 20% slack
+        overhead_steps = math.ceil(self.restart_overhead / self.env.gap_seconds)
+        if required_steps + overhead_steps > remaining_steps * 0.9:
             return True
             
         return False
-
-    def _find_best_region(self, require_spot: bool = False) -> int:
-        """Find the best region to switch to."""
-        current_region = self.env.get_current_region()
-        num_regions = self.env.get_num_regions()
-        
-        # Simple heuristic: try next region if current has no spot
-        if require_spot:
-            # Round-robin through regions
-            next_region = (current_region + 1) % num_regions
-            return next_region
-        
-        # If not requiring spot, stay in current region
-        return current_region
-
-    def _step(self, last_cluster_type: ClusterType, has_spot: bool) -> ClusterType:
-        # Track consecutive spot failures
-        if last_cluster_type == ClusterType.SPOT and not has_spot:
-            self.consecutive_spot_failures += 1
-        else:
-            self.consecutive_spot_failures = 0
-        
-        # Handle pending restart overhead
-        if self.remaining_restart_overhead > 0:
-            return ClusterType.NONE
-        
-        # Check if task is already complete
-        if self._get_remaining_work() <= 0:
-            return ClusterType.NONE
-        
-        # Critical condition: must use on-demand
-        if self._should_use_ondemand():
-            # If no spot but we want on-demand, just use it in current region
-            return ClusterType.ON_DEMAND
-        
-        # Non-critical: try to use spot if available
-        if has_spot:
-            # Calculate if we have enough slack for potential preemption
-            slack_ratio = self._get_slack_ratio()
-            if slack_ratio > 1.5:  # Good amount of slack
-                return ClusterType.SPOT
-            elif slack_ratio > 1.2:  # Moderate slack
-                # Use spot but be cautious
-                if self.consecutive_spot_failures == 0:
-                    return ClusterType.SPOT
-                else:
-                    # After failures, be more conservative
-                    return ClusterType.ON_DEMAND
-            else:
-                # Low slack, use on-demand
-                return ClusterType.ON_DEMAND
-        else:
-            # No spot available in current region
-            # Only switch if we have good slack
-            slack_ratio = self._get_slack_ratio()
-            if slack_ratio > 2.0:  # Plenty of slack to explore
-                # Switch to another region hoping for spot
-                next_region = self._find_best_region(require_spot=True)
-                if next_region != self.env.get_current_region():
-                    self.env.switch_region(next_region)
-                    # After switching, we'll get overhead, so return NONE
-                    # Actually, we return NONE to let the switch happen without starting instance
-                    return ClusterType.NONE
-                else:
-                    # All regions checked, use on-demand
-                    return ClusterType.ON_DEMAND
-            else:
-                # Not enough slack to switch, use on-demand in current region
-                return ClusterType.ON_DEMAND

@@ -1,158 +1,73 @@
 import pandas as pd
-from collections import defaultdict
 
 
 class Solution:
-    def _apply_column_merges(self, df: pd.DataFrame, col_merge):
+    def _apply_col_merges(self, df: pd.DataFrame, col_merge):
         if not col_merge:
             return df
-
-        orig_cols = list(df.columns)
-        col_to_group = {}
-        groups = []
-
-        # Resolve groups to original column names
+        # Work on a copy to avoid mutating the original DataFrame
+        df_out = df.copy()
         for group in col_merge:
             if not group:
                 continue
-            names = []
-            for item in group:
-                if isinstance(item, int):
-                    if 0 <= item < len(orig_cols):
-                        names.append(orig_cols[item])
-                else:
-                    if item in orig_cols:
-                        names.append(item)
-            # Deduplicate while preserving order
-            seen = set()
-            unique_names = []
-            for name in names:
-                if name not in seen:
-                    seen.add(name)
-                    unique_names.append(name)
-            if len(unique_names) >= 2:
-                g = tuple(unique_names)
-                groups.append(g)
-                for c in unique_names:
-                    col_to_group[c] = g
-
-        if not groups:
-            return df
-
-        # Precompute merged series for each group
-        group_to_series = {}
-        for g in groups:
-            if g in group_to_series:
+            # Only consider columns that actually exist in df_out
+            existing = [col for col in group if col in df_out.columns]
+            if len(existing) <= 1:
+                # Nothing to merge or only one column present
                 continue
-            merged_series = df.loc[:, list(g)].astype(str).agg(''.join, axis=1)
-            group_to_series[g] = merged_series
+            # Create a deterministic merged column name
+            new_col_name = "|".join(existing)
+            # Concatenate as strings row-wise
+            df_out[new_col_name] = df_out[existing].astype(str).agg("".join, axis=1)
+            # Drop the original columns
+            df_out.drop(columns=existing, inplace=True)
+        return df_out
 
-        # Build new DataFrame columns order and data
-        new_cols = []
-        new_data = {}
-        seen_groups = set()
+    def _compute_hit_rate(self, order, col_arrays, total_chars):
+        if total_chars <= 0 or not order:
+            return 0.0
 
-        for c in orig_cols:
-            g = col_to_group.get(c)
-            if not g:
-                new_cols.append(c)
-                new_data[c] = df[c]
-            else:
-                if g in seen_groups:
-                    continue
-                seen_groups.add(g)
-                # Use first column name as base name, avoid collisions
-                new_name = g[0]
-                if new_name in new_data:
-                    base = new_name
-                    suffix = 1
-                    while f"{base}_m{suffix}" in new_data:
-                        suffix += 1
-                    new_name = f"{base}_m{suffix}"
-                new_cols.append(new_name)
-                new_data[new_name] = group_to_series[g]
+        # Prepare arrays in the order of columns to avoid repeated dict lookups
+        arr_list = [col_arrays[c] for c in order]
+        if not arr_list:
+            return 0.0
 
-        new_df = pd.DataFrame(new_data, columns=new_cols, index=df.index)
-        return new_df
+        n_rows = len(arr_list[0])
+        if n_rows == 0:
+            return 0.0
 
-    def _prepare_column_stats(self, df: pd.DataFrame):
-        col_names = list(df.columns)
-        n_rows = len(df)
-        n_cols = len(col_names)
-
-        col_ids = [None] * n_cols
-        col_lengths = [None] * n_cols
-        distinct_ratios = [0.0] * n_cols
-        avg_lengths = [0.0] * n_cols
-        top_freq_ratios = [0.0] * n_cols
-
-        for col_idx, col_name in enumerate(col_names):
-            arr = df[col_name].to_numpy()
-            # Ensure string representation for all values
-            str_arr = arr.astype(str)
-
-            n_local = len(str_arr)
-            ids = [0] * n_local
-            lengths = [0] * n_local
-            value_to_id = {}
-            freq = defaultdict(int)
-            next_id = 0
-
-            for i in range(n_local):
-                s = str_arr[i]
-                lengths[i] = len(s)
-                v_id = value_to_id.get(s)
-                if v_id is None:
-                    v_id = next_id
-                    value_to_id[s] = v_id
-                    next_id += 1
-                freq[v_id] += 1
-                ids[i] = v_id
-
-            col_ids[col_idx] = ids
-            col_lengths[col_idx] = lengths
-
-            if n_local > 0:
-                distinct_count = next_id
-                distinct_ratios[col_idx] = distinct_count / float(n_local)
-                avg_lengths[col_idx] = sum(lengths) / float(n_local)
-                max_freq = max(freq.values()) if freq else 0
-                top_freq_ratios[col_idx] = max_freq / float(n_local)
-            else:
-                distinct_ratios[col_idx] = 0.0
-                avg_lengths[col_idx] = 0.0
-                top_freq_ratios[col_idx] = 0.0
-
-        return col_ids, col_lengths, distinct_ratros, avg_lengths, top_freq_ratios, col_names
-
-    def _approximate_score(self, order, col_ids, col_lengths, n_rows, row_limit):
-        limit = n_rows if row_limit is None else min(n_rows, row_limit)
         root = {}
-        total_lcp = 0
+        lcp_sum = 0
 
-        for i in range(limit):
+        for i in range(n_rows):
             node = root
-            char_sum = 0
-            for col_idx in order:
-                vid = col_ids[col_idx][i]
-                child = node.get(vid)
-                if child is None:
-                    break
-                node = child
-                char_sum += col_lengths[col_idx][i]
-            total_lcp += char_sum
+            matched = True
+            lcp_len = 0
 
-            # Insert current row's prefix path
-            node = root
-            for col_idx in order:
-                vid = col_ids[col_idx][i]
-                child = node.get(vid)
-                if child is None:
-                    child = {}
-                    node[vid] = child
-                node = child
+            for arr in arr_list:
+                val = arr[i]
+                # val is ensured to be a string
+                for ch in val:
+                    if matched:
+                        child = node.get(ch)
+                        if child is not None:
+                            node = child
+                            lcp_len += 1
+                        else:
+                            matched = False
+                            new_node = {}
+                            node[ch] = new_node
+                            node = new_node
+                    else:
+                        child = node.get(ch)
+                        if child is None:
+                            child = {}
+                            node[ch] = child
+                        node = child
 
-        return total_lcp
+            lcp_sum += lcp_len
+
+        return lcp_sum / total_chars
 
     def solve(
         self,
@@ -165,95 +80,135 @@ class Solution:
         distinct_value_threshold: float = 0.7,
         parallel: bool = True,
     ) -> pd.DataFrame:
-        """
-        Reorder columns in the DataFrame to maximize prefix hit rate.
-        """
-        if df is None or df.empty:
-            return df.copy()
+        # Apply column merges if specified and possible
+        df_proc = self._apply_col_merges(df, col_merge)
 
-        # Apply column merges if specified
-        df_work = self._apply_column_merges(df, col_merge) if col_merge else df
+        cols = list(df_proc.columns)
+        n_cols = len(cols)
+        n_rows = len(df_proc)
 
-        n_rows = len(df_work)
-        if n_rows <= 1:
-            return df_work.copy()
+        if n_cols <= 1 or n_rows == 0:
+            # Nothing to reorder
+            return df_proc
 
-        (
-            col_ids,
-            col_lengths,
-            distinct_ratios,
-            avg_lengths,
-            top_freq_ratios,
-            col_names,
-        ) = self._prepare_column_stats(df_work)
+        # Convert to string DataFrame for analysis and string concatenation
+        df_str = df_proc.astype(str)
 
-        n_cols = len(col_names)
-        if n_cols <= 1:
-            return df_work.copy()
+        # Precompute per-column string arrays and metrics
+        col_arrays = {}
+        metrics = {}  # col -> (distinct_ratio, avg_len, mode_freq)
+        total_chars = 0
 
-        indices = list(range(n_cols))
+        for col in cols:
+            arr = df_str[col].to_numpy(copy=False)
+            col_arrays[col] = arr
 
-        # Partition columns by distinct value ratio
-        low_card = []
-        high_card = []
-        for i in indices:
-            if distinct_ratios[i] < distinct_value_threshold:
-                low_card.append(i)
+            value_counts = {}
+            total_len_col = 0
+
+            for v in arr:
+                # v is already a string
+                total_len_col += len(v)
+                value_counts[v] = value_counts.get(v, 0) + 1
+
+            n_unique = len(value_counts)
+            maxfreq = max(value_counts.values()) if value_counts else 0
+
+            if n_rows > 0:
+                distinct_ratio = n_unique / n_rows
+                avg_len = total_len_col / n_rows
+                mode_freq = maxfreq / n_rows
             else:
-                high_card.append(i)
+                distinct_ratio = 0.0
+                avg_len = 0.0
+                mode_freq = 0.0
 
-        # Heuristic scoring for initial ordering
-        def low_key(i):
-            # Higher potential earlier: low distinct ratio, high avg length, high top frequency
-            return -(1.0 - distinct_ratios[i]) * (avg_lengths[i] + 1e-6) * (top_freq_ratios[i] + 1e-6)
+            metrics[col] = (distinct_ratio, avg_len, mode_freq)
+            total_chars += total_len_col
 
-        def high_key(i):
-            # Among high-card columns, prefer smaller distinct ratio and shorter avg length
-            return (distinct_ratios[i], avg_lengths[i])
+        if total_chars <= 0:
+            # All empty strings; ordering does not matter
+            return df_proc
 
-        low_card.sort(key=low_key)
-        high_card.sort(key=high_key)
-        order = low_card + high_card
+        # Build candidate column orders
+        candidate_orders = []
+        seen_orders = set()
 
-        # Normalize early_stop
-        if early_stop is None or early_stop <= 0:
-            early_stop = n_rows
+        def add_order(order):
+            key = tuple(order)
+            if key not in seen_orders:
+                seen_orders.add(key)
+                candidate_orders.append(order)
 
-        # Determine sample size for approximate scoring
-        base_sample = min(n_rows, early_stop, 10000)
-        if row_stop is not None and row_stop > 0:
-            computed = row_stop * 2500
-            if computed < 1000:
-                computed = 1000
-            sample_rows = min(n_rows, early_stop, max(base_sample, computed))
-        else:
-            sample_rows = base_sample
+        # Baseline: original order
+        add_order(cols)
 
-        best_score = self._approximate_score(order, col_ids, col_lengths, n_rows, sample_rows)
+        # Heuristic orders based on simple column statistics
+        def distinct_asc_order():
+            return sorted(
+                cols,
+                key=lambda c: (
+                    metrics[c][0],      # distinct_ratio ascending
+                    -metrics[c][1],     # avg_len descending
+                    -metrics[c][2],     # mode_freq descending
+                ),
+            )
 
-        # Local search with pairwise swaps
-        max_iters = 5
-        iter_count = 0
-        improved = True
+        def length_desc_order():
+            return sorted(
+                cols,
+                key=lambda c: (
+                    -metrics[c][1],     # avg_len descending
+                    metrics[c][0],      # distinct_ratio ascending
+                    -metrics[c][2],     # mode_freq descending
+                ),
+            )
 
-        while improved and iter_count < max_iters:
-            improved = False
-            iter_count += 1
-            for a in range(n_cols):
-                for b in range(a + 1, n_cols):
-                    if order[a] == order[b]:
-                        continue
-                    candidate = list(order)
-                    candidate[a], candidate[b] = candidate[b], candidate[a]
-                    score = self._approximate_score(candidate, col_ids, col_lengths, n_rows, sample_rows)
-                    if score > best_score:
-                        best_score = score
-                        order = candidate
-                        improved = True
-                        break
-                if improved:
-                    break
+        def modefreq_desc_order():
+            return sorted(
+                cols,
+                key=lambda c: (
+                    -metrics[c][2],     # mode_freq descending
+                    metrics[c][0],      # distinct_ratio ascending
+                    -metrics[c][1],     # avg_len descending
+                ),
+            )
 
-        final_cols = [col_names[i] for i in order]
-        result_df = df_work.loc[:, final_cols]
-        return result_df
+        def combined_score_order():
+            # Sort by an approximate "noise" score: smaller is better
+            # score ~ distinct_ratio / (avg_len * mode_freq)
+            def score(c):
+                dr, al, mf = metrics[c]
+                denom = al * mf
+                if denom <= 0:
+                    return float("inf")
+                return dr / denom
+
+            return sorted(cols, key=score)
+
+        heuristic_generators = [
+            distinct_asc_order,
+            length_desc_order,
+            modefreq_desc_order,
+            combined_score_order,
+        ]
+
+        max_extra = max(0, int(col_stop))
+        for gen in heuristic_generators:
+            if len(candidate_orders) >= 1 + max_extra:
+                break
+            order = gen()
+            add_order(order)
+
+        # Evaluate all candidate orders and choose the best by true hit rate
+        best_order = candidate_orders[0]
+        best_hit_rate = self._compute_hit_rate(best_order, col_arrays, total_chars)
+
+        for order in candidate_orders[1:]:
+            hr = self._compute_hit_rate(order, col_arrays, total_chars)
+            if hr > best_hit_rate:
+                best_hit_rate = hr
+                best_order = order
+
+        # Return DataFrame with columns reordered according to the best order found
+        return df_proc[best_order]

@@ -23,52 +23,46 @@ class Solution(MultiRegionStrategy):
         with open(spec_path) as f:
             config = json.load(f)
 
-        duration_hours = float(config["duration"])
-        deadline_hours = float(config["deadline"])
-        overhead_hours = float(config["overhead"])
-
-        # Internal copies in seconds for our logic
-        self._task_duration_seconds = duration_hours * 3600.0
-        self._deadline_seconds = deadline_hours * 3600.0
-        self._restart_overhead_seconds = overhead_hours * 3600.0
-
         args = Namespace(
-            deadline_hours=deadline_hours,
-            task_duration_hours=[duration_hours],
-            restart_overhead_hours=[overhead_hours],
+            deadline_hours=float(config["deadline"]),
+            task_duration_hours=[float(config["duration"])],
+            restart_overhead_hours=[float(config["overhead"])],
             inter_task_overhead=[0.0],
         )
         super().__init__(args)
 
-        # Strategy state
-        self._runtime_initialized = False
-        self._gap_seconds = None
+        # Internal state for efficient progress tracking and control
+        self._committed_ondemand = False
+        self._work_done_cache = 0.0
+        self._task_done_len_cache = 0
 
-        # Track cumulative work without O(n) summation every step
-        self._cached_work_done = 0.0
-        self._prev_done_len = 0
+        # Cache scalar task duration / deadline / overhead in seconds
+        td = getattr(self, "task_duration", None)
+        if isinstance(td, (list, tuple)):
+            self._task_total = float(td[0])
+        else:
+            self._task_total = float(td) if td is not None else float(config["duration"]) * 3600.0
 
-        # Once we commit to on-demand, we stay on-demand
-        self.commit_on_demand = False
+        dl = getattr(self, "deadline", None)
+        self._deadline_seconds = float(dl) if dl is not None else float(config["deadline"]) * 3600.0
+
+        ro = getattr(self, "restart_overhead", None)
+        self._restart_overhead_seconds = float(ro) if ro is not None else float(config["overhead"]) * 3600.0
 
         return self
 
-    def _initialize_runtime(self):
-        if not self._runtime_initialized:
-            # gap_seconds is provided by the environment in seconds
-            self._gap_seconds = float(getattr(self.env, "gap_seconds", 3600.0))
-            self._runtime_initialized = True
-
-    def _update_work_done_cache(self):
-        # Incrementally update cached sum of task_done_time
-        tdt = self.task_done_time
-        cur_len = len(tdt)
-        if cur_len > self._prev_done_len:
-            # Sum only newly appended segments
-            new_segments = tdt[self._prev_done_len : cur_len]
-            if new_segments:
-                self._cached_work_done += float(sum(new_segments))
-            self._prev_done_len = cur_len
+    def _update_work_done_cache(self) -> None:
+        """Incrementally maintain total completed work time."""
+        lst = getattr(self, "task_done_time", None)
+        if not lst:
+            return
+        n = len(lst)
+        if n > self._task_done_len_cache:
+            delta = 0.0
+            for i in range(self._task_done_len_cache, n):
+                delta += lst[i]
+            self._work_done_cache += delta
+            self._task_done_len_cache = n
 
     def _step(self, last_cluster_type: ClusterType, has_spot: bool) -> ClusterType:
         """
@@ -76,43 +70,65 @@ class Solution(MultiRegionStrategy):
 
         Returns: ClusterType.SPOT, ClusterType.ON_DEMAND, or ClusterType.NONE
         """
-        self._initialize_runtime()
+        # Ensure internal state is initialized even if solve() was bypassed
+        if not hasattr(self, "_committed_ondemand"):
+            self._committed_ondemand = False
+            self._work_done_cache = 0.0
+            self._task_done_len_cache = 0
+            td = getattr(self, "task_duration", None)
+            if isinstance(td, (list, tuple)):
+                self._task_total = float(td[0])
+            else:
+                self._task_total = float(td) if td is not None else 0.0
+            dl = getattr(self, "deadline", None)
+            self._deadline_seconds = float(dl) if dl is not None else 0.0
+            ro = getattr(self, "restart_overhead", None)
+            self._restart_overhead_seconds = float(ro) if ro is not None else 0.0
+
+        # Update accumulated work done efficiently
         self._update_work_done_cache()
-
-        elapsed = float(self.env.elapsed_seconds)
-        time_remaining = self._deadline_seconds - elapsed
-
-        # If no time left, we cannot do anything meaningful.
-        if time_remaining <= 0.0:
-            return ClusterType.NONE
-
-        # Remaining work (seconds)
-        remaining_work = self._task_duration_seconds - self._cached_work_done
+        work_done = self._work_done_cache
+        remaining_work = self._task_total - work_done
         if remaining_work <= 0.0:
-            # Task already completed
+            # Task completed; no need to run more
             return ClusterType.NONE
 
-        gap = self._gap_seconds
-        restart_overhead = self._restart_overhead_seconds
-
-        # Decide whether to commit to on-demand
-        if not self.commit_on_demand:
-            # Time required to finish if we commit to on-demand *now*
-            required_time_if_commit_now = restart_overhead + remaining_work
-
-            # If we take one more step without guaranteed progress (e.g., NONE or unlucky SPOT),
-            # the remaining time would be (time_remaining - gap).
-            # To stay safe, we only allow that if even then we can still finish on on-demand.
-            if time_remaining - gap < required_time_if_commit_now:
-                self.commit_on_demand = True
-
-        # Once committed, always use on-demand to avoid any further risk.
-        if self.commit_on_demand:
+        # Once committed to on-demand, always stay on on-demand
+        if self._committed_ondemand:
             return ClusterType.ON_DEMAND
 
-        # Pre-commit phase: be aggressive with Spot, but never use On-Demand.
+        # Time bookkeeping
+        elapsed = self.env.elapsed_seconds
+        deadline = self._deadline_seconds
+        time_left = deadline - elapsed
+        if time_left <= 0.0:
+            # Already at/after deadline; best we can do is run on-demand
+            self._committed_ondemand = True
+            return ClusterType.ON_DEMAND
+
+        gap = self.env.gap_seconds
+        overhead = self._restart_overhead_seconds
+
+        # If even switching to on-demand now cannot finish, still choose ON_DEMAND
+        # (environment will apply penalty for missing deadline).
+        if time_left <= remaining_work + overhead:
+            self._committed_ondemand = True
+            return ClusterType.ON_DEMAND
+
+        # Safety condition: can we afford to spend the next step without guaranteed progress
+        # (i.e., a completely wasted step) and still finish by deadline using on-demand?
+        # Worst case for the next step: 0 useful work, then we switch to ON_DEMAND and pay
+        # up to 'overhead' restart delay.
+        # Require: time_left - gap >= remaining_work + overhead
+        # => time_left >= remaining_work + overhead + gap
+        if time_left < remaining_work + overhead + gap:
+            # Must commit to on-demand now to safely finish
+            self._committed_ondemand = True
+            return ClusterType.ON_DEMAND
+
+        # Safe to continue gambling on spot or waiting.
         if has_spot:
             return ClusterType.SPOT
 
-        # Spot unavailable and we still have plenty of slack: wait (no cost).
+        # No spot right now; wait to preserve slack and potential future spot usage.
         return ClusterType.NONE

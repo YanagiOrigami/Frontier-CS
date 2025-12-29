@@ -2,6 +2,11 @@ import numpy as np
 import pandas as pd
 from pysr import PySRRegressor
 import sympy
+import warnings
+import os
+
+# Suppress warnings to keep output clean
+warnings.filterwarnings("ignore")
 
 class Solution:
     def __init__(self, **kwargs):
@@ -9,58 +14,68 @@ class Solution:
 
     def solve(self, X: np.ndarray, y: np.ndarray) -> dict:
         """
-        Solves the symbolic regression problem for the Ripple dataset.
+        Solves the symbolic regression problem using PySR.
+        Targeting ripple-like functions using trigonometric operators.
         """
+        
+        # Data handling: Subsample if the dataset is too large for rapid fitting
+        # but large enough to capture high-frequency oscillations.
+        n_samples = X.shape[0]
+        MAX_SAMPLES = 3000
+        
+        if n_samples > MAX_SAMPLES:
+            rng = np.random.RandomState(42)
+            indices = rng.choice(n_samples, MAX_SAMPLES, replace=False)
+            X_fit = X[indices]
+            y_fit = y[indices]
+        else:
+            X_fit = X
+            y_fit = y
+
+        # Configure PySRRegressor
+        # Settings tuned for 8 vCPUs and Ripple dataset characteristics
+        model = PySRRegressor(
+            niterations=100,                  # Sufficient iterations for convergence
+            binary_operators=["+", "-", "*", "/"], 
+            unary_operators=["sin", "cos", "exp", "log"], # Trigonometric ops are key for ripples
+            populations=16,                   # 2 populations per vCPU (8 vCPUs available)
+            population_size=40,               # Size of each population
+            ncyclesperiteration=500,          # Evolution steps per iteration
+            maxsize=40,                       # Allow complex expressions for nested terms
+            parsimony=0.001,                  # Low penalty to encourage finding the correct structure
+            verbosity=0,                      # Suppress output
+            progress=False,                   # Suppress progress bar
+            random_state=42,                  # Reproducibility
+            procs=8,                          # Use all 8 cores
+            model_selection="best",           # Select best model based on accuracy/complexity trade-off
+            timeout_in_seconds=300,           # 5 minute timeout safety
+            tempdir=os.getcwd(),              # Use current working directory for temp files
+            delete_tempfiles=True             # Cleanup
+        )
+
         try:
-            # Configure PySRRegressor with parameters optimized for the evaluation environment (8 vCPUs)
-            # and the problem characteristics (Ripple -> trig + poly).
-            model = PySRRegressor(
-                niterations=100,            # Reasonable balance for time/accuracy
-                binary_operators=["+", "-", "*", "/", "^"], # Include power for polynomials/roots
-                unary_operators=["sin", "cos", "exp", "log"],
-                populations=24,             # Approx 3 populations per core
-                population_size=40,
-                maxsize=50,                 # Allow sufficient complexity for concentric waves
-                ncycles_per_iteration=500,
-                procs=8,
-                multiprocessing=True,
-                verbosity=0,
-                progress=False,
-                random_state=42,
-                model_selection="best",     # Select best model based on score/complexity
-                batching=True,
-                batch_size=2000,            # Efficient for larger datasets
-                constraints={'^': (-1, 1)}, # Limit power exponent complexity
-                timeout_in_seconds=300,     # Safety timeout (5 mins)
-                temp_equation_file=None,
-                delete_tempfiles=True
-            )
-            
-            # Disable batching for small datasets to ensure convergence
-            if X.shape[0] < 2000:
-                model.set_params(batching=False)
-                
             # Fit the model
-            model.fit(X, y, variable_names=["x1", "x2"])
-            
-            # Extract the best symbolic expression
+            # variable_names ensure the output string uses x1, x2
+            model.fit(X_fit, y_fit, variable_names=["x1", "x2"])
+
+            # Retrieve the best expression found
+            # model.sympy() returns a SymPy object, str() converts it to Python expression string
             best_expr = model.sympy()
             expression = str(best_expr)
-            
-            # Generate predictions using the fitted model
+
+            # Generate predictions for the full dataset
             predictions = model.predict(X)
             
-            if isinstance(predictions, np.ndarray):
-                predictions = predictions.tolist()
-                
-        except Exception:
-            # Fallback to simple Linear Regression if Symbolic Regression fails
-            x1, x2 = X[:, 0], X[:, 1]
-            A = np.column_stack([x1, x2, np.ones_like(x1)])
-            coeffs, _, _, _ = np.linalg.lstsq(A, y, rcond=None)
-            a, b, c = coeffs
-            expression = f"{a}*x1 + {b}*x2 + {c}"
-            predictions = (a * x1 + b * x2 + c).tolist()
+        except Exception as e:
+            # Fallback mechanism if symbolic regression fails (e.g. timeout)
+            # Returns mean of target variable
+            mean_val = float(np.mean(y))
+            expression = str(mean_val)
+            predictions = np.full(n_samples, mean_val)
+
+        # Ensure predictions are a list/array as required
+        if hasattr(predictions, "tolist"):
+            predictions = predictions.tolist()
 
         return {
             "expression": expression,

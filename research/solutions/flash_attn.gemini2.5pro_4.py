@@ -1,170 +1,148 @@
 import torch
+import triton
+import triton.language as tl
 
 class Solution:
     def solve(self, spec_path: str = None) -> dict:
-        kernel_code = """
+        flash_attn_code = """
 import torch
 import triton
 import triton.language as tl
 
+
 @triton.autotune(
     configs=[
-        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 64, 'num_warps': 4, 'num_stages': 2}),
-        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 128, 'num_warps': 4, 'num_stages': 2}),
-        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'num_warps': 8, 'num_stages': 2}),
-        triton.Config({'BLOCK_M': 256, 'BLOCK_N': 64, 'num_warps': 8, 'num_stages': 3}),
-        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 256, 'num_warps': 8, 'num_stages': 3}),
-        triton.Config({'BLOCK_M': 256, 'BLOCK_N': 128, 'num_warps': 8, 'num_stages': 3}),
-        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 256, 'num_warps': 8, 'num_stages': 3}),
-        triton.Config({'BLOCK_M': 256, 'BLOCK_N': 256, 'num_warps': 8, 'num_stages': 4}),
-        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 64, 'num_warps': 4, 'num_stages': 2}),
-        triton.Config({'BLOCK_M': 32, 'BLOCK_N': 128, 'num_warps': 4, 'num_stages': 2}),
-        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 32, 'num_warps': 4, 'num_stages': 2}),
+        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 64}, num_warps=4, num_stages=2),
+        triton.Config({'BLOCK_M': 256, 'BLOCK_N': 64}, num_warps=8, num_stages=3),
+        triton.Config({'BLOCK_M': 256, 'BLOCK_N': 32}, num_warps=8, num_stages=3),
+        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128}, num_warps=8, num_stages=4),
+        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 32}, num_warps=4, num_stages=4),
+        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 128}, num_warps=4, num_stages=4),
+        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 64}, num_warps=4, num_stages=4),
+        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 64}, num_warps=8, num_stages=3),
+        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 128}, num_warps=8, num_stages=3),
+        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128}, num_warps=4, num_stages=2),
     ],
-    key=['M', 'N', 'causal', 'Dq', 'Dv'],
+    key=['M', 'N', 'D_HEAD_Q', 'D_HEAD_V', 'causal'],
 )
 @triton.jit
-def _flash_attn_kernel(
+def _flash_attn_forward_kernel(
     Q, K, V, O,
     stride_qz, stride_qh, stride_qm, stride_qd,
     stride_kz, stride_kh, stride_kn, stride_kd,
     stride_vz, stride_vh, stride_vn, stride_vd,
     stride_oz, stride_oh, stride_om, stride_od,
-    Z, H, M, N,
-    sm_scale,
-    Dq: tl.constexpr,
-    Dv: tl.constexpr,
-    causal: tl.constexpr,
+    Z, H, N, M,
+    D_HEAD_Q: tl.constexpr,
+    D_HEAD_V: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
+    causal: tl.constexpr,
 ):
-    # Program IDs
-    pid_m = tl.program_id(1)
-    pid_zh = tl.program_id(0)
-    pid_z = pid_zh // H
-    pid_h = pid_zh % H
-    
-    start_m = pid_m * BLOCK_M
+    start_m = tl.program_id(0)
+    b_h = tl.program_id(1)
 
-    # Pointers to bases of Q, K, V, O
-    q_base_ptr = Q + pid_z * stride_qz + pid_h * stride_qh
-    k_base_ptr = K + pid_z * stride_kz + pid_h * stride_kh
-    v_base_ptr = V + pid_z * stride_vz + pid_h * stride_vh
-    o_base_ptr = O + pid_z * stride_oz + pid_h * stride_oh
+    b = b_h // H
+    h = b_h % H
 
-    # Offsets for the current block
-    offs_m = start_m + tl.arange(0, BLOCK_M)
-    offs_d_qk = tl.arange(0, Dq)
-    offs_d_v = tl.arange(0, Dv)
+    q_offset = b * stride_qz + h * stride_qh
+    k_offset = b * stride_kz + h * stride_kh
+    v_offset = b * stride_vz + h * stride_vh
+    o_offset = b * stride_oz + h * stride_oh
 
-    # Load Q block
-    q_ptrs = q_base_ptr + offs_m[:, None] * stride_qm + offs_d_qk[None, :] * stride_qd
-    mask_m = offs_m < M
-    q = tl.load(q_ptrs, mask=mask_m[:, None], other=0.0)
+    Q_ptr = Q + q_offset
+    K_ptr = K + k_offset
+    V_ptr = V + v_offset
+    O_ptr = O + o_offset
 
-    # Initialize accumulator and softmax statistics
-    acc = tl.zeros([BLOCK_M, Dv], dtype=tl.float32)
+    acc = tl.zeros([BLOCK_M, D_HEAD_V], dtype=tl.float32)
     m_i = tl.full([BLOCK_M], -float("inf"), dtype=tl.float32)
     l_i = tl.zeros([BLOCK_M], dtype=tl.float32)
 
-    # Loop over K and V blocks
-    start_n = 0
-    loop_end = (start_m + BLOCK_M) if causal else N
-    offs_n_base = tl.arange(0, BLOCK_N)
+    offs_m = start_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_dq = tl.arange(0, D_HEAD_Q)
 
-    while start_n < loop_end:
-        # Offsets for K and V blocks
-        offs_n = start_n + offs_n_base
+    q_ptrs = Q_ptr + offs_m[:, None] * stride_qm + offs_dq[None, :]
+    mask_m = offs_m < M
+    q = tl.load(q_ptrs, mask=mask_m[:, None], other=0.0)
+
+    sm_scale = 1.0 / (D_HEAD_Q ** 0.5)
+
+    # Loop over K, V blocks
+    for start_n in range(0, tl.cdiv(N, BLOCK_N)):
+        start_n_offset = start_n * BLOCK_N
+        offs_n = start_n_offset + tl.arange(0, BLOCK_N)
+
+        # Load K
+        k_ptrs = K_ptr + offs_n[:, None] * stride_kn + offs_dq[None, :]
         mask_n = offs_n < N
+        k = tl.load(k_ptrs, mask=mask_n[:, None], other=0.0)
 
-        # Pointers to K and V blocks
-        k_ptrs = k_base_ptr + offs_n[None, :] * stride_kn + offs_d_qk[:, None] * stride_kd
-        v_ptrs = v_base_ptr + offs_n[:, None] * stride_vn + offs_d_v[None, :] * stride_vd
-        
-        # Load K and V blocks
-        k = tl.load(k_ptrs, mask=mask_n[None, :], other=0.0)
-        v = tl.load(v_ptrs, mask=mask_n[:, None], other=0.0)
-        
-        # Compute scaled dot-product attention scores
-        s_ij = tl.dot(q, tl.trans(k))
-        s_ij *= sm_scale
-        
-        # Apply causal mask
+        # Compute S = Q @ K.T
+        s = tl.dot(q, tl.trans(k))
+        s *= sm_scale
+
         if causal:
-            s_ij += tl.where(offs_m[:, None] >= offs_n[None, :], 0, -float("inf"))
+            causal_mask = offs_m[:, None] >= offs_n[None, :]
+            s = tl.where(causal_mask, s, -float("inf"))
 
-        # Mask out padding tokens
-        s_ij = tl.where(mask_m[:, None], s_ij, -float("inf"))
-
-        # Streaming softmax update
-        m_ij = tl.max(s_ij, 1)
+        # Online softmax update
+        m_ij = tl.max(s, axis=1)
         m_new = tl.maximum(m_i, m_ij)
+        p = tl.exp(s - m_new[:, None])
         
         alpha = tl.exp(m_i - m_new)
-        p_ij = tl.exp(s_ij - m_new[:, None])
         
-        l_i_new = l_i * alpha + tl.sum(p_ij, 1)
-        
+        l_i_scaled = l_i * alpha
+        l_ij = tl.sum(p, axis=1)
+        l_new = l_i_scaled + l_ij
+
+        acc_scaled = acc * alpha[:, None]
+
+        # Load V
+        offs_dv = tl.arange(0, D_HEAD_V)
+        v_ptrs = V_ptr + offs_n[:, None] * stride_vn + offs_dv[None, :]
+        v = tl.load(v_ptrs, mask=mask_n[:, None], other=0.0)
+
         # Update accumulator
-        acc *= alpha[:, None]
-        p_ij_casted = p_ij.to(V.dtype.element_ty)
-        acc += tl.dot(p_ij_casted, v)
+        p = p.to(v.dtype)
+        acc_update = tl.dot(p, v)
+        acc = acc_scaled + acc_update
         
-        # Update softmax statistics for next iteration
-        l_i = l_i_new
+        # Update statistics for next iteration
+        l_i = l_new
         m_i = m_new
 
-        start_n += BLOCK_N
-    
-    # Final normalization
-    l_i = tl.where(mask_m, l_i, 1.0) # Avoid division by zero for padding tokens
-    l_i_reciprocal = 1.0 / l_i
-    acc = acc * l_i_reciprocal[:, None]
-    
-    # Store output block
-    o_ptrs = o_base_ptr + offs_m[:, None] * stride_om + offs_d_v[None, :] * stride_od
-    tl.store(o_ptrs, acc.to(O.dtype.element_ty), mask=mask_m[:, None])
+    # Finalize and store to output
+    l_i_safe = tl.where(l_i == 0, 1.0, l_i)
+    acc = acc / l_i_safe[:, None]
+
+    o_ptrs = O_ptr + offs_m[:, None] * stride_om + offs_dv[None, :]
+    tl.store(o_ptrs, acc.to(tl.float16), mask=mask_m[:, None])
 
 
 def flash_attn(Q: torch.Tensor, K: torch.Tensor, V: torch.Tensor, causal: bool = True) -> torch.Tensor:
-    """
-    Flash attention computation with optional causal masking.
+    Z, H, M, D_HEAD_Q = Q.shape
+    _, _, N, D_HEAD_K = K.shape
+    _, _, _, D_HEAD_V = V.shape
     
-    Args:
-        Q: Input tensor of shape (Z, H, M, Dq) - query tensor (float16)
-        K: Input tensor of shape (Z, H, N, Dq) - key tensor (float16)
-        V: Input tensor of shape (Z, H, N, Dv) - value tensor (float16)
-        causal: Whether to apply causal masking (default True)
+    assert D_HEAD_Q == D_HEAD_K, "Query and Key head dimensions must be equal"
     
-    Returns:
-        Output tensor of shape (Z, H, M, Dv) - attention output (float16)
-    """
-    Z, H, M, Dq = Q.shape
-    _, _, N, _ = K.shape
-    _, _, _, Dv = V.shape
-    
-    assert Q.is_cuda and K.is_cuda and V.is_cuda, "Input tensors must be on a CUDA device"
-    assert Q.dtype == torch.float16 and K.dtype == torch.float16 and V.dtype == torch.float16, "Input tensors must be of type float16"
-    
-    O = torch.empty_like(Q, device=Q.device, dtype=Q.dtype)
-    
-    sm_scale = 1.0 / (Dq ** 0.5)
+    O = torch.empty((Z, H, M, D_HEAD_V), device=Q.device, dtype=Q.dtype)
 
-    def grid(meta):
-        return (Z * H, triton.cdiv(M, meta['BLOCK_M']))
+    grid = lambda META: (triton.cdiv(M, META['BLOCK_M']), Z * H)
 
-    _flash_attn_kernel[grid](
+    _flash_attn_forward_kernel[grid](
         Q, K, V, O,
         Q.stride(0), Q.stride(1), Q.stride(2), Q.stride(3),
         K.stride(0), K.stride(1), K.stride(2), K.stride(3),
         V.stride(0), V.stride(1), V.stride(2), V.stride(3),
         O.stride(0), O.stride(1), O.stride(2), O.stride(3),
-        Z, H, M, N,
-        sm_scale,
-        Dq=Dq,
-        Dv=Dv,
+        Z, H, N, M,
+        D_HEAD_Q=D_HEAD_Q,
+        D_HEAD_V=D_HEAD_V,
         causal=causal,
     )
     return O
 """
-        return {"code": kernel_code}
+        return {"code": flash_attn_code}

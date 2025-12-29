@@ -1,16 +1,10 @@
 import os
-
-os.environ.setdefault("OMP_NUM_THREADS", str(min(8, (os.cpu_count() or 1))))
-os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
-os.environ.setdefault("MKL_NUM_THREADS", "1")
-os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
-
 import numpy as np
 from typing import Tuple
 
 try:
     import faiss  # type: ignore
-except Exception:
+except Exception:  # pragma: no cover
     faiss = None
 
 
@@ -18,241 +12,208 @@ class YourIndexClass:
     def __init__(self, dim: int, **kwargs):
         self.dim = int(dim)
 
-        self.nlist = int(kwargs.get("nlist", 4096))
+        self.nlist = int(kwargs.get("nlist", 8192))
         self.nprobe = int(kwargs.get("nprobe", 8))
 
-        self.use_opq = bool(kwargs.get("use_opq", True))
-        self.m = int(kwargs.get("m", 16))
-        self.nbits = int(kwargs.get("nbits", 8))
+        self.n_threads = int(kwargs.get("n_threads", 8))
+        self.hnsw_m = int(kwargs.get("hnsw_m", 32))
+        self.quantizer_ef_search = int(kwargs.get("quantizer_ef_search", 64))
 
-        self.k_factor = int(kwargs.get("k_factor", 128))
+        self.train_size = int(kwargs.get("train_size", 262144))
+        self.min_train_size = int(kwargs.get("min_train_size", max(50000, self.nlist * 20)))
 
-        self.train_size = int(kwargs.get("train_size", 200000))
-        self.min_train = int(kwargs.get("min_train", max(50000, self.nlist * 20)))
-
-        self.threads = int(kwargs.get("threads", min(8, (os.cpu_count() or 1))))
-
-        self._index = None
         self._trained = False
+        self._ntotal_added = 0
+
         self._pending = []
-        self._pending_count = 0
+        self._index = None
 
         if faiss is not None:
             try:
-                faiss.omp_set_num_threads(self.threads)
+                faiss.omp_set_num_threads(self.n_threads)
             except Exception:
                 pass
-            try:
-                faiss.cvar.rand_seed = 1234
-            except Exception:
-                pass
+            self._index = self._create_faiss_index()
 
-    def _ensure_faiss(self):
-        if faiss is None:
-            raise RuntimeError("faiss is required but could not be imported")
+    def _create_faiss_index(self):
+        try:
+            quantizer = faiss.IndexHNSWFlat(self.dim, self.hnsw_m)
+        except Exception:
+            quantizer = faiss.IndexFlatL2(self.dim)
 
-    def _as_f32_c(self, x: np.ndarray) -> np.ndarray:
-        if x is None:
-            return x
-        if x.dtype != np.float32:
-            x = x.astype(np.float32, copy=False)
-        if not x.flags["C_CONTIGUOUS"]:
-            x = np.ascontiguousarray(x)
+        try:
+            if hasattr(quantizer, "hnsw"):
+                quantizer.hnsw.efSearch = self.quantizer_ef_search
+        except Exception:
+            pass
+
+        index = faiss.IndexIVFFlat(quantizer, self.dim, self.nlist, faiss.METRIC_L2)
+
+        # Ensure exact assignments during clustering even if quantizer is approximate
+        try:
+            index.clustering_index = faiss.IndexFlatL2(self.dim)
+        except Exception:
+            pass
+
+        try:
+            index.cp.niter = int(os.environ.get("FAISS_KMEANS_NITER", "20"))
+        except Exception:
+            pass
+        try:
+            index.cp.max_points_per_centroid = 256
+        except Exception:
+            pass
+        try:
+            index.cp.min_points_per_centroid = 5
+        except Exception:
+            pass
+
+        try:
+            index.nprobe = self.nprobe
+        except Exception:
+            pass
+
+        return index
+
+    def _ensure_float32_contig(self, x: np.ndarray) -> np.ndarray:
+        if x.dtype != np.float32 or not x.flags["C_CONTIGUOUS"]:
+            return np.ascontiguousarray(x, dtype=np.float32)
         return x
 
-    def _train_sample(self, xb: np.ndarray) -> np.ndarray:
+    def _sample_training(self, xb: np.ndarray, train_size: int) -> np.ndarray:
         n = xb.shape[0]
-        if n <= self.train_size:
-            return xb
-        rng = np.random.default_rng(12345)
-        idx = rng.integers(0, n, size=self.train_size, dtype=np.int64)
-        return xb[idx]
+        if n <= train_size:
+            return np.ascontiguousarray(xb, dtype=np.float32)
+        step = max(1, n // train_size)
+        xt = xb[::step][:train_size]
+        return np.ascontiguousarray(xt, dtype=np.float32)
 
-    def _build_index(self):
-        self._ensure_faiss()
-
-        d = self.dim
-        quantizer = faiss.IndexFlatL2(d)
-        ivfpq = faiss.IndexIVFPQ(quantizer, d, self.nlist, self.m, self.nbits)
-
-        try:
-            ivfpq.nprobe = self.nprobe
-        except Exception:
-            pass
-
-        try:
-            ivfpq.use_precomputed_table = 1
-        except Exception:
-            pass
-
-        try:
-            ivfpq.cp.niter = 10
-            ivfpq.cp.seed = 1234
-        except Exception:
-            pass
-
-        base_index = ivfpq
-        if self.use_opq:
-            try:
-                opq = faiss.OPQMatrix(d, self.m)
-                base_index = faiss.IndexPreTransform(opq, ivfpq)
-            except Exception:
-                base_index = ivfpq
-
-        try:
-            index = faiss.IndexRefineFlat(base_index)
-        except Exception:
-            index = base_index
-
-        try:
-            index.verbose = False
-        except Exception:
-            pass
-
-        try:
-            index.k_factor = self.k_factor
-        except Exception:
-            pass
-
-        self._index = index
-
-    def _set_search_params(self):
-        if faiss is None or self._index is None:
-            return
-        try:
-            ivf = faiss.extract_index_ivf(self._index)
-            if ivf is not None:
-                ivf.nprobe = self.nprobe
-        except Exception:
-            pass
-
-        try:
-            base = self._index
-            if hasattr(base, "base_index"):
-                base = base.base_index
-            if hasattr(base, "index"):
-                base = base.index
-            if hasattr(base, "nprobe"):
-                base.nprobe = self.nprobe
-        except Exception:
-            pass
-
-        try:
-            faiss.omp_set_num_threads(self.threads)
-        except Exception:
-            pass
-
-    def _maybe_train_and_flush_pending(self):
-        if self._trained:
-            return
-        if self._pending_count <= 0:
+    def _maybe_train_and_flush(self):
+        if self._trained or faiss is None or self._index is None:
             return
 
-        xb_all = np.vstack(self._pending) if len(self._pending) > 1 else self._pending[0]
-        xb_all = self._as_f32_c(xb_all)
-
-        if xb_all.shape[0] < self.nlist:
+        if not self._pending:
             return
 
-        if self._index is None:
-            self._build_index()
-
-        xt = self._train_sample(xb_all)
-        try:
-            self._index.train(xt)
-        except Exception:
-            # fallback: build a flat index if training fails
-            d = self.dim
-            self._index = faiss.IndexFlatL2(d)
-            self._trained = True
-            self._index.add(xb_all)
-            self._pending = []
-            self._pending_count = 0
+        total = sum(b.shape[0] for b in self._pending)
+        if total < self.min_train_size:
             return
 
+        # Build training set from pending batches (uniform stride over concatenation)
+        # To avoid concatenating huge arrays, take proportional samples per batch.
+        ts = min(self.train_size, total)
+        xt_parts = []
+        remaining = ts
+        for b in self._pending:
+            if remaining <= 0:
+                break
+            bn = b.shape[0]
+            take = max(1, int(round(ts * (bn / total))))
+            take = min(take, remaining, bn)
+            xt_parts.append(self._sample_training(b, take))
+            remaining -= take
+
+        if not xt_parts:
+            xt = self._sample_training(self._pending[0], min(self.train_size, self._pending[0].shape[0]))
+        else:
+            xt = np.ascontiguousarray(np.vstack(xt_parts), dtype=np.float32)
+            if xt.shape[0] > ts:
+                xt = xt[:ts].copy()
+
+        self._index.train(xt)
         self._trained = True
-        self._index.add(xb_all)
 
-        self._pending = []
-        self._pending_count = 0
+        for b in self._pending:
+            self._index.add(b)
+            self._ntotal_added += b.shape[0]
+        self._pending.clear()
 
     def add(self, xb: np.ndarray) -> None:
-        xb = self._as_f32_c(xb)
-        if xb.size == 0:
-            return
+        xb = self._ensure_float32_contig(xb)
+        if xb.ndim != 2 or xb.shape[1] != self.dim:
+            raise ValueError(f"xb must have shape (N, {self.dim})")
 
-        if faiss is None:
-            # Minimal fallback (slow); included for robustness.
-            if self._index is None:
-                self._index = xb.copy()
+        if faiss is None or self._index is None:
+            # Fallback (slow) storage
+            if not hasattr(self, "_xb_store") or self._xb_store is None:
+                self._xb_store = xb.copy()
             else:
-                self._index = np.vstack([self._index, xb])
-            self._trained = True
+                self._xb_store = np.vstack([self._xb_store, xb])
+            self._ntotal_added = int(self._xb_store.shape[0])
             return
 
         if not self._trained:
-            self._pending.append(xb)
-            self._pending_count += xb.shape[0]
-            if self._pending_count >= self.min_train:
-                self._maybe_train_and_flush_pending()
-            return
-
-        if self._index is None:
-            self._build_index()
-            self._trained = False
-            self._pending = [xb]
-            self._pending_count = xb.shape[0]
-            self._maybe_train_and_flush_pending()
-            return
-
-        self._index.add(xb)
+            if xb.shape[0] >= self.min_train_size:
+                ts = min(self.train_size, xb.shape[0])
+                xt = self._sample_training(xb, ts)
+                self._index.train(xt)
+                self._trained = True
+                self._index.add(xb)
+                self._ntotal_added += xb.shape[0]
+            else:
+                self._pending.append(xb.copy())
+                self._maybe_train_and_flush()
+        else:
+            self._index.add(xb)
+            self._ntotal_added += xb.shape[0]
 
     def search(self, xq: np.ndarray, k: int) -> Tuple[np.ndarray, np.ndarray]:
-        k = int(k)
         if k <= 0:
+            nq = int(xq.shape[0])
             return (
-                np.empty((xq.shape[0], 0), dtype=np.float32),
-                np.empty((xq.shape[0], 0), dtype=np.int64),
+                np.empty((nq, 0), dtype=np.float32),
+                np.empty((nq, 0), dtype=np.int64),
             )
 
-        xq = self._as_f32_c(xq)
-        nq = xq.shape[0]
+        xq = self._ensure_float32_contig(xq)
+        if xq.ndim != 2 or xq.shape[1] != self.dim:
+            raise ValueError(f"xq must have shape (nq, {self.dim})")
 
-        if faiss is None:
-            # Slow fallback brute-force.
-            if self._index is None or (isinstance(self._index, np.ndarray) and self._index.shape[0] == 0):
+        if faiss is None or self._index is None:
+            xb = getattr(self, "_xb_store", None)
+            if xb is None or xb.shape[0] == 0:
+                nq = int(xq.shape[0])
                 D = np.full((nq, k), np.inf, dtype=np.float32)
                 I = np.full((nq, k), -1, dtype=np.int64)
                 return D, I
-            xb = self._index
-            xq2 = (xq * xq).sum(axis=1, keepdims=True)
-            xb2 = (xb * xb).sum(axis=1, keepdims=True).T
-            dots = xq @ xb.T
-            dists = xq2 + xb2 - 2.0 * dots
-            idx = np.argpartition(dists, kth=min(k - 1, dists.shape[1] - 1), axis=1)[:, :k]
-            row = np.arange(nq)[:, None]
-            dsel = dists[row, idx]
-            order = np.argsort(dsel, axis=1)
-            I = idx[row, order].astype(np.int64, copy=False)
-            D = dsel[row, order].astype(np.float32, copy=False)
+            xb = self._ensure_float32_contig(xb)
+            xq_norm = (xq * xq).sum(axis=1, keepdims=True)
+            xb_norm = (xb * xb).sum(axis=1, keepdims=True).T
+            dist = xq_norm + xb_norm - 2.0 * (xq @ xb.T)
+            I = np.argpartition(dist, kth=min(k - 1, dist.shape[1] - 1), axis=1)[:, :k]
+            row = np.arange(dist.shape[0])[:, None]
+            Dsel = dist[row, I]
+            order = np.argsort(Dsel, axis=1)
+            I = I[row, order].astype(np.int64, copy=False)
+            D = Dsel[row, order].astype(np.float32, copy=False)
             return D, I
 
+        self._maybe_train_and_flush()
         if not self._trained:
-            self._maybe_train_and_flush_pending()
-
-        if self._index is None or (hasattr(self._index, "ntotal") and self._index.ntotal == 0):
+            nq = int(xq.shape[0])
             D = np.full((nq, k), np.inf, dtype=np.float32)
             I = np.full((nq, k), -1, dtype=np.int64)
             return D, I
 
-        self._set_search_params()
+        try:
+            faiss.omp_set_num_threads(self.n_threads)
+        except Exception:
+            pass
 
-        D, I = self._index.search(xq, k)
+        try:
+            self._index.nprobe = self.nprobe
+        except Exception:
+            pass
+        try:
+            q = getattr(self._index, "quantizer", None)
+            if q is not None and hasattr(q, "hnsw"):
+                q.hnsw.efSearch = self.quantizer_ef_search
+        except Exception:
+            pass
+
+        D, I = self._index.search(xq, int(k))
         if D.dtype != np.float32:
             D = D.astype(np.float32, copy=False)
         if I.dtype != np.int64:
             I = I.astype(np.int64, copy=False)
-        if D.shape != (nq, k) or I.shape != (nq, k):
-            D = np.ascontiguousarray(D.reshape(nq, k).astype(np.float32, copy=False))
-            I = np.ascontiguousarray(I.reshape(nq, k).astype(np.int64, copy=False))
         return D, I

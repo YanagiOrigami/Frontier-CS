@@ -5,99 +5,112 @@ import triton.language as tl
 
 
 @triton.jit
-def _cross_entropy_kernel(
-    logits_ptr,  # pointer to [M, N] float16
-    bias_ptr,    # pointer to [N] float32
-    targets_ptr, # pointer to [M] int64
-    out_ptr,     # pointer to [M] float32
-    M, N,
-    stride_lm, stride_ln,
-    BLOCK_N: tl.constexpr,
+def fused_linear_ce_kernel(
+    X_ptr, W_ptr, B_ptr, targets_ptr, loss_ptr,
+    M, N, K,
+    stride_xm, stride_xk,
+    stride_wk, stride_wn,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
 ):
     pid_m = tl.program_id(0)
-    if pid_m >= M:
-        return
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    mask_m = offs_m < M
 
-    # Offsets along the class dimension
-    offs_n = tl.arange(0, BLOCK_N)
+    # Load targets for each row (int64 -> int32)
+    t = tl.load(targets_ptr + offs_m, mask=mask_m, other=0).to(tl.int32)
 
-    # Pointer to the start of the current row in logits
-    row_logits_ptr = logits_ptr + pid_m * stride_lm
+    # 1) Compute target logits: dot(X[m, :], W[:, t[m]]) + B[t[m]]
+    target_acc = tl.zeros((BLOCK_M,), dtype=tl.float32)
 
-    # Load target index for this row
-    t = tl.load(targets_ptr + pid_m)
-    t = t.to(tl.int32)
+    for k_start in range(0, K, BLOCK_K):
+        offs_k = k_start + tl.arange(0, BLOCK_K)
+        mask_k = offs_k < K
 
-    # First pass: compute row-wise max over logits + bias
-    row_max = -float("inf")
-    col_start = 0
-    while col_start < N:
-        cols = col_start + offs_n
-        mask = cols < N
-
-        # Load logits (float16) and cast to float32
-        l = tl.load(
-            row_logits_ptr + cols * stride_ln,
-            mask=mask,
+        # X block: shape (BLOCK_M, BLOCK_K)
+        x_ptrs = X_ptr + offs_m[:, None] * stride_xm + offs_k[None, :] * stride_xk
+        x = tl.load(
+            x_ptrs,
+            mask=mask_m[:, None] & mask_k[None, :],
             other=0.0,
         ).to(tl.float32)
 
-        # Load bias (float32)
-        b = tl.load(
-            bias_ptr + cols,
-            mask=mask,
-            other=0.0,
-        )
-
-        z = l + b
-        z = tl.where(mask, z, -float("inf"))
-        tile_max = tl.max(z, axis=0)
-        row_max = tl.maximum(row_max, tile_max)
-
-        col_start += BLOCK_N
-
-    # Second pass: compute sumexp and gather target logit
-    sum_exp = 0.0
-    logit_t = 0.0
-    col_start = 0
-    while col_start < N:
-        cols = col_start + offs_n
-        mask = cols < N
-
-        l = tl.load(
-            row_logits_ptr + cols * stride_ln,
-            mask=mask,
+        # W block for target column per row: shape (BLOCK_M, BLOCK_K)
+        # pointer arithmetic: W[k, n] -> k * stride_wk + n * stride_wn
+        w_ptrs = W_ptr + offs_k[None, :] * stride_wk + t[:, None] * stride_wn
+        w = tl.load(
+            w_ptrs,
+            mask=mask_m[:, None] & mask_k[None, :],
             other=0.0,
         ).to(tl.float32)
 
-        b = tl.load(
-            bias_ptr + cols,
-            mask=mask,
-            other=0.0,
-        )
+        target_acc += tl.sum(x * w, axis=1)
 
-        z = l + b
-        z = tl.where(mask, z, -float("inf"))
+    # Add bias for target classes
+    b_t = tl.load(B_ptr + t, mask=mask_m, other=0.0)
+    target_logit = target_acc + b_t
 
-        exp_vals = tl.exp(z - row_max)
-        exp_vals = tl.where(mask, exp_vals, 0.0)
-        sum_exp += tl.sum(exp_vals, axis=0)
+    # 2) Streaming log-sum-exp over all classes via fused matmul
+    neg_inf = -1e9
+    row_max = tl.full((BLOCK_M,), neg_inf, dtype=tl.float32)
+    row_lse = tl.zeros((BLOCK_M,), dtype=tl.float32)
 
-        is_target = cols == t
-        target_vals = tl.where(is_target, z, 0.0)
-        logit_t += tl.sum(target_vals, axis=0)
+    for n_start in range(0, N, BLOCK_N):
+        offs_n = n_start + tl.arange(0, BLOCK_N)
+        mask_n = offs_n < N
 
-        col_start += BLOCK_N
+        # Tile of logits: (BLOCK_M, BLOCK_N)
+        logits = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
 
-    # Avoid log(0)
-    sum_exp = tl.maximum(sum_exp, 1e-20)
-    loss = row_max + tl.log(sum_exp) - logit_t
-    tl.store(out_ptr + pid_m, loss)
+        # Matmul over K dimension
+        for k_start in range(0, K, BLOCK_K):
+            offs_k = k_start + tl.arange(0, BLOCK_K)
+            mask_k = offs_k < K
+
+            # Load X tile (BLOCK_M, BLOCK_K)
+            x_ptrs = X_ptr + offs_m[:, None] * stride_xm + offs_k[None, :] * stride_xk
+            x = tl.load(
+                x_ptrs,
+                mask=mask_m[:, None] & mask_k[None, :],
+                other=0.0,
+            ).to(tl.float16)
+
+            # Load W tile (BLOCK_K, BLOCK_N)
+            w_ptrs = W_ptr + offs_k[:, None] * stride_wk + offs_n[None, :] * stride_wn
+            w = tl.load(
+                w_ptrs,
+                mask=mask_k[:, None] & mask_n[None, :],
+                other=0.0,
+            ).to(tl.float16)
+
+            logits += tl.dot(x, w)
+
+        # Add bias
+        b = tl.load(B_ptr + offs_n, mask=mask_n, other=0.0)
+        logits += b[None, :]
+
+        # Mask out invalid columns
+        logits = tl.where(mask_n[None, :], logits, neg_inf)
+
+        # Streaming log-sum-exp
+        tile_max = tl.max(logits, axis=1)
+        new_row_max = tl.maximum(row_max, tile_max)
+
+        exp_old = tl.exp(row_max - new_row_max) * row_lse
+        exp_new = tl.sum(tl.exp(logits - new_row_max[:, None]), axis=1)
+
+        row_lse = exp_old + exp_new
+        row_max = new_row_max
+
+    # Final log-sum-exp
+    logsumexp = row_max + tl.log(row_lse)
+
+    # Negative log-likelihood loss per sample
+    losses = logsumexp - target_logit
+
+    tl.store(loss_ptr + offs_m, losses, mask=mask_m)
 
 
-def fused_linear_ce(
-    X: torch.Tensor, W: torch.Tensor, B: torch.Tensor, targets: torch.Tensor
-) -> torch.Tensor:
+def fused_linear_ce(X: torch.Tensor, W: torch.Tensor, B: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
     """
     Fused linear layer with cross entropy loss computation.
 
@@ -117,37 +130,32 @@ def fused_linear_ce(
     assert targets.dtype == torch.long
 
     M, K = X.shape
-    K2, N = W.shape
-    assert K == K2
-    assert B.numel() == N
-    assert targets.numel() == M
+    K_w, N = W.shape
+    assert K_w == K
+    assert B.shape[0] == N
+    assert targets.shape[0] == M
 
-    # Use cuBLAS via torch.matmul for the linear layer
-    logits = torch.matmul(X, W)  # (M, N), float16
+    losses = torch.empty((M,), dtype=torch.float32, device=X.device)
 
-    # Prepare output tensor
-    out = torch.empty(M, device=X.device, dtype=torch.float32)
-
-    stride_lm, stride_ln = logits.stride()
-
+    BLOCK_M = 16
     BLOCK_N = 128
-    grid = (M,)
+    BLOCK_K = 64
 
-    _cross_entropy_kernel[grid](
-        logits,
-        B,
-        targets,
-        out,
-        M,
-        N,
-        stride_lm,
-        stride_ln,
+    grid = (triton.cdiv(M, BLOCK_M),)
+
+    fused_linear_ce_kernel[grid](
+        X, W, B, targets, losses,
+        M, N, K,
+        X.stride(0), X.stride(1),
+        W.stride(0), W.stride(1),
+        BLOCK_M=BLOCK_M,
         BLOCK_N=BLOCK_N,
+        BLOCK_K=BLOCK_K,
         num_warps=4,
-        num_stages=2,
+        num_stages=3,
     )
 
-    return out
+    return losses
 
 
 class Solution:

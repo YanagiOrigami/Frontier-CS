@@ -1,85 +1,120 @@
-import textwrap
-
-
-class Solution:
-    def solve(self, spec_path: str = None) -> dict:
-        code = textwrap.dedent(
-            '''\
 import torch
 import triton
 import triton.language as tl
+import inspect
 
 
 @triton.jit
-def _fused_linear_ce_kernel(
-    X_ptr, W_ptr, B_ptr, targets_ptr, out_ptr,
-    M,
+def _fused_linear_ce_stage1(
+    X_ptr, W_ptr, B_ptr, targets_ptr,
+    partial_max_ptr, partial_sumexp_ptr, partial_target_ptr,
+    M, N, K,
     stride_xm, stride_xk,
     stride_wk, stride_wn,
-    K: tl.constexpr, N: tl.constexpr,
-    BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+    stride_b,
+    stride_pm_m, stride_pm_n,
+    stride_ps_m, stride_ps_n,
+    stride_pt_m, stride_pt_n,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
 ):
-    row = tl.program_id(0)
-    if row >= M:
-        return
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
 
-    # Load target index for this row
-    t = tl.load(targets_ptr + row).to(tl.int32)
+    row_offsets = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    col_offsets = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
 
-    # Streaming log-sum-exp state: log(sum(exp(logits))) = log(s) + m
-    m = tl.full((), -1e9, dtype=tl.float32)
-    s = tl.zeros((), dtype=tl.float32)
-    target_logit = tl.zeros((), dtype=tl.float32)
+    mask_m = row_offsets < M
+    mask_n = col_offsets < N
 
-    for n0 in range(0, N, BLOCK_N):
-        offs_n = n0 + tl.arange(0, BLOCK_N)
-        mask_n = offs_n < N
+    # Load target indices for these rows
+    targets = tl.load(targets_ptr + row_offsets, mask=mask_m, other=0).to(tl.int32)
 
-        # Accumulator for logits of this tile
-        acc = tl.zeros([BLOCK_N], dtype=tl.float32)
+    # Accumulator for logits tile
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
 
-        for k0 in range(0, K, BLOCK_K):
-            offs_k = k0 + tl.arange(0, BLOCK_K)
-            mask_k = offs_k < K
+    for k_start in range(0, K, BLOCK_K):
+        k_offsets = k_start + tl.arange(0, BLOCK_K)
+        mask_k = k_offsets < K
 
-            # Load X[row, k] chunk
-            x = tl.load(
-                X_ptr + row * stride_xm + offs_k * stride_xk,
-                mask=mask_k,
-                other=0.0,
-            ).to(tl.float32)
+        x_ptrs = X_ptr + row_offsets[:, None] * stride_xm + k_offsets[None, :] * stride_xk
+        w_ptrs = W_ptr + k_offsets[:, None] * stride_wk + col_offsets[None, :] * stride_wn
 
-            # Load W[k, n] tile
-            w = tl.load(
-                W_ptr + offs_k[:, None] * stride_wk + offs_n[None, :] * stride_wn,
-                mask=mask_k[:, None] & mask_n[None, :],
-                other=0.0,
-            ).to(tl.float32)
+        x = tl.load(x_ptrs, mask=mask_m[:, None] & mask_k[None, :], other=0.0).to(tl.float16)
+        w = tl.load(w_ptrs, mask=mask_k[:, None] & mask_n[None, :], other=0.0).to(tl.float16)
 
-            # Dot product over K-block, unrolled for performance
-            for kk in tl.static_range(0, BLOCK_K):
-                acc += x[kk] * w[kk, :]
+        acc += tl.dot(x, w)
 
-        # Add bias
-        b = tl.load(B_ptr + offs_n, mask=mask_n, other=0.0).to(tl.float32)
-        acc += b
+    # Add bias
+    b = tl.load(B_ptr + col_offsets * stride_b, mask=mask_n, other=0.0).to(tl.float32)
+    acc += b[None, :]
 
-        # Mask out columns beyond N so they don't affect reductions
-        acc = tl.where(mask_n, acc, -1e30)
+    minus_inf = -float("inf")
+    # Mask invalid rows/cols for max/sumexp computation
+    acc_masked = tl.where(mask_m[:, None] & mask_n[None, :], acc, minus_inf)
 
-        # Update running log-sum-exp state
-        tile_max = tl.max(acc, axis=0)
-        new_m = tl.maximum(m, tile_max)
-        s = s * tl.exp(m - new_m) + tl.sum(tl.exp(acc - new_m), axis=0)
-        m = new_m
+    # Local max over columns for each row
+    tile_max = tl.max(acc_masked, axis=1)
 
-        # Accumulate target logit from this tile (only one position matches)
-        mask_t = (offs_n == t) & mask_n
-        target_logit += tl.sum(acc * mask_t.to(tl.float32), axis=0)
+    # Local sumexp with numerical stability
+    exp_term = tl.exp(acc_masked - tile_max[:, None])
+    tile_sumexp = tl.sum(exp_term, axis=1)
+    tile_sumexp = tl.where(tile_max == minus_inf, 0.0, tile_sumexp)
 
-    logsumexp = tl.log(s) + m
-    loss = -target_logit + logsumexp
-    tl.store(out_ptr + row, loss)
+    # Target logits contribution from this tile
+    target_eq = (targets[:, None] == col_offsets[None, :]) & mask_n[None, :] & mask_m[:, None]
+    target_contrib = tl.sum(tl.where(target_eq, acc, 0.0), axis=1)
+
+    # Store partial results
+    pm_ptrs = partial_max_ptr + row_offsets * stride_pm_m + pid_n * stride_pm_n
+    ps_ptrs = partial_sumexp_ptr + row_offsets * stride_ps_m + pid_n * stride_ps_n
+    pt_ptrs = partial_target_ptr + row_offsets * stride_pt_m + pid_n * stride_pt_n
+
+    tl.store(pm_ptrs, tile_max, mask=mask_m)
+    tl.store(ps_ptrs, tile_sumexp, mask=mask_m)
+    tl.store(pt_ptrs, target_contrib, mask=mask_m)
+
+
+@triton.jit
+def _fused_linear_ce_stage2(
+    partial_max_ptr, partial_sumexp_ptr, partial_target_ptr,
+    loss_ptr,
+    M,
+    stride_pm_m, stride_pm_n,
+    stride_ps_m, stride_ps_n,
+    stride_pt_m, stride_pt_n,
+    BLOCK_M: tl.constexpr,
+    NUM_TILES_N: tl.constexpr,
+):
+    pid_m = tl.program_id(0)
+    row_offsets = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    mask_m = row_offsets < M
+
+    minus_inf = -float("inf")
+    row_max = tl.full((BLOCK_M,), minus_inf, dtype=tl.float32)
+    row_sumexp = tl.zeros((BLOCK_M,), dtype=tl.float32)
+    target_logit = tl.zeros((BLOCK_M,), dtype=tl.float32)
+
+    for tile_id in range(0, NUM_TILES_N):
+        pm_ptrs = partial_max_ptr + row_offsets * stride_pm_m + tile_id * stride_pm_n
+        ps_ptrs = partial_sumexp_ptr + row_offsets * stride_ps_m + tile_id * stride_ps_n
+        pt_ptrs = partial_target_ptr + row_offsets * stride_pt_m + tile_id * stride_pt_n
+
+        tile_max = tl.load(pm_ptrs, mask=mask_m, other=minus_inf)
+        tile_sumexp = tl.load(ps_ptrs, mask=mask_m, other=0.0)
+        tile_target = tl.load(pt_ptrs, mask=mask_m, other=0.0)
+
+        new_max = tl.maximum(row_max, tile_max)
+        factor_prev = tl.exp(row_max - new_max)
+        factor_tile = tl.exp(tile_max - new_max)
+        row_sumexp = row_sumexp * factor_prev + tile_sumexp * factor_tile
+        row_max = new_max
+
+        target_logit += tile_target
+
+    logsumexp = tl.log(row_sumexp) + row_max
+    loss = logsumexp - target_logit
+
+    tl.store(loss_ptr + row_offsets, loss, mask=mask_m)
 
 
 def fused_linear_ce(X: torch.Tensor, W: torch.Tensor, B: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
@@ -87,60 +122,89 @@ def fused_linear_ce(X: torch.Tensor, W: torch.Tensor, B: torch.Tensor, targets: 
     Fused linear layer with cross entropy loss computation.
 
     Args:
-        X: Input tensor of shape (M, K) - input features (float16)
-        W: Weight tensor of shape (K, N) - weight matrix (float16)
-        B: Bias tensor of shape (N,) - bias vector (float32)
-        targets: Target tensor of shape (M,) - target class indices (int64)
+        X: (M, K) float16
+        W: (K, N) float16
+        B: (N,) float32
+        targets: (M,) int64
 
     Returns:
-        Output tensor of shape (M,) - negative log-likelihood loss per sample (float32)
+        (M,) float32 loss per sample
     """
-    assert X.is_cuda and W.is_cuda and B.is_cuda and targets.is_cuda, "All tensors must be on CUDA device"
+    assert X.is_cuda and W.is_cuda and B.is_cuda and targets.is_cuda
+    assert X.dtype == torch.float16
+    assert W.dtype == torch.float16
+    assert B.dtype == torch.float32
+    assert targets.dtype == torch.long
 
-    assert X.dtype == torch.float16, "X must be float16"
-    assert W.dtype == torch.float16, "W must be float16"
-    assert B.dtype == torch.float32, "B must be float32"
-    assert targets.dtype in (torch.int64, torch.long), "targets must be int64"
-
-    M, K = X.shape
-    K_w, N = W.shape
-    assert K_w == K, "Incompatible shapes for X and W"
-    assert B.shape[0] == N, "Bias shape mismatch"
-    assert targets.shape[0] == M, "targets shape mismatch"
-
-    # Ensure contiguous memory layouts for predictable strides
     X_ = X.contiguous()
     W_ = W.contiguous()
     B_ = B.contiguous()
     targets_ = targets.contiguous()
 
-    out = torch.empty(M, dtype=torch.float32, device=X.device)
+    M, K = X_.shape
+    K2, N = W_.shape
+    if K != K2:
+        raise ValueError("Incompatible dimensions: X.shape[1] must equal W.shape[0]")
 
+    BLOCK_M = 32
     BLOCK_N = 128
-    BLOCK_K = 32
+    BLOCK_K = 64
 
-    grid = (M,)
+    grid_m = triton.cdiv(M, BLOCK_M)
+    num_tiles_n = triton.cdiv(N, BLOCK_N)
 
-    _fused_linear_ce_kernel[grid](
-        X_ptr=X_,
-        W_ptr=W_,
-        B_ptr=B_,
-        targets_ptr=targets_,
-        out_ptr=out,
-        M=M,
-        stride_xm=X_.stride(0),
-        stride_xk=X_.stride(1),
-        stride_wk=W_.stride(0),
-        stride_wn=W_.stride(1),
-        K=K,
-        N=N,
+    partial_max = torch.empty((M, num_tiles_n), dtype=torch.float32, device=X_.device)
+    partial_sumexp = torch.empty_like(partial_max)
+    partial_target = torch.zeros_like(partial_max)
+
+    grid1 = (grid_m, num_tiles_n)
+
+    _fused_linear_ce_stage1[grid1](
+        X_, W_, B_, targets_,
+        partial_max, partial_sumexp, partial_target,
+        M, N, K,
+        X_.stride(0), X_.stride(1),
+        W_.stride(0), W_.stride(1),
+        B_.stride(0),
+        partial_max.stride(0), partial_max.stride(1),
+        partial_sumexp.stride(0), partial_sumexp.stride(1),
+        partial_target.stride(0), partial_target.stride(1),
+        BLOCK_M=BLOCK_M,
         BLOCK_N=BLOCK_N,
         BLOCK_K=BLOCK_K,
         num_warps=4,
         num_stages=2,
     )
 
-    return out
-'''
-        )
+    loss = torch.empty((M,), dtype=torch.float32, device=X_.device)
+
+    grid2 = (grid_m,)
+
+    _fused_linear_ce_stage2[grid2](
+        partial_max, partial_sumexp, partial_target,
+        loss,
+        M,
+        partial_max.stride(0), partial_max.stride(1),
+        partial_sumexp.stride(0), partial_sumexp.stride(1),
+        partial_target.stride(0), partial_target.stride(1),
+        BLOCK_M=BLOCK_M,
+        NUM_TILES_N=num_tiles_n,
+        num_warps=4,
+        num_stages=2,
+    )
+
+    return loss
+
+
+class Solution:
+    def solve(self, spec_path: str = None) -> dict:
+        parts = [
+            "import torch",
+            "import triton",
+            "import triton.language as tl",
+            inspect.getsource(_fused_linear_ce_stage1),
+            inspect.getsource(_fused_linear_ce_stage2),
+            inspect.getsource(fused_linear_ce),
+        ]
+        code = "\n\n".join(parts)
         return {"code": code}

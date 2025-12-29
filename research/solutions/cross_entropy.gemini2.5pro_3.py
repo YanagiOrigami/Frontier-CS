@@ -12,12 +12,16 @@ import triton.language as tl
 
 @triton.autotune(
     configs=[
-        triton.Config({'BLOCK_SIZE_N': 256}, num_warps=2),
-        triton.Config({'BLOCK_SIZE_N': 512}, num_warps=4),
-        triton.Config({'BLOCK_SIZE_N': 1024}, num_warps=4),
-        triton.Config({'BLOCK_SIZE_N': 2048}, num_warps=8),
-        triton.Config({'BLOCK_SIZE_N': 4096}, num_warps=16),
-        triton.Config({'BLOCK_SIZE_N': 8192}, num_warps=16),
+        triton.Config({'BLOCK_SIZE_N': 256, 'ROWS_PER_PROGRAM': 1}, num_warps=4, num_stages=3),
+        triton.Config({'BLOCK_SIZE_N': 512, 'ROWS_PER_PROGRAM': 1}, num_warps=4, num_stages=3),
+        triton.Config({'BLOCK_SIZE_N': 1024, 'ROWS_PER_PROGRAM': 1}, num_warps=8, num_stages=3),
+        triton.Config({'BLOCK_SIZE_N': 2048, 'ROWS_PER_PROGRAM': 1}, num_warps=8, num_stages=2),
+        triton.Config({'BLOCK_SIZE_N': 512, 'ROWS_PER_PROGRAM': 2}, num_warps=4, num_stages=3),
+        triton.Config({'BLOCK_SIZE_N': 1024, 'ROWS_PER_PROGRAM': 2}, num_warps=8, num_stages=3),
+        triton.Config({'BLOCK_SIZE_N': 512, 'ROWS_PER_PROGRAM': 4}, num_warps=4, num_stages=2),
+        triton.Config({'BLOCK_SIZE_N': 1024, 'ROWS_PER_PROGRAM': 4}, num_warps=8, num_stages=2),
+        triton.Config({'BLOCK_SIZE_N': 4096, 'ROWS_PER_PROGRAM': 1}, num_warps=16, num_stages=2),
+        triton.Config({'BLOCK_SIZE_N': 8192, 'ROWS_PER_PROGRAM': 1}, num_warps=16, num_stages=2),
     ],
     key=['N'],
 )
@@ -25,83 +29,67 @@ import triton.language as tl
 def _cross_entropy_kernel(
     logits_ptr,
     targets_ptr,
-    output_ptr,
-    M: tl.int32,
-    N: tl.int32,
-    logits_row_stride: tl.int32,
+    loss_ptr,
+    M, N,
+    stride_logits_m, stride_logits_n,
+    # Tunable parameters determined by autotuner
+    ROWS_PER_PROGRAM: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr,
 ):
     \"\"\"
     Triton kernel for cross entropy loss.
-    Each program instance computes the loss for a single row of the logits tensor.
-    The computation is done in two passes over each row to ensure numerical stability.
-    Pass 1: Find the maximum logit value for the row.
-    Pass 2: Compute the log-sum-exp using the max value for stability.
+    Each program instance can handle multiple rows (ROWS_PER_PROGRAM) to improve occupancy.
+    The computation uses a numerically stable two-pass approach for the log-sum-exp.
     \"\"\"
-    # Get the row index (batch index) for this program instance.
     pid = tl.program_id(axis=0)
 
-    # Pointer to the start of the current row in the logits tensor.
-    row_logits_ptr = logits_ptr + pid * logits_row_stride
-    
-    # --- Pass 1: Find max logit and load the target logit ---
+    # Loop over rows assigned to this program instance
+    for i in range(ROWS_PER_PROGRAM):
+        pid_m = pid * ROWS_PER_PROGRAM + i
+        # Boundary check to avoid processing out-of-bounds rows
+        if pid_m >= M:
+            return
 
-    # Load the target class index for the current row.
-    target_idx = tl.load(targets_ptr + pid)
-    
-    # Load the logit value corresponding to the target class. This is a scalar load.
-    # The value is converted to float32 for high-precision computation.
-    logit_target = tl.load(row_logits_ptr + target_idx).to(tl.float32)
+        # Pointer to the start of the current row in the logits tensor
+        row_logits_ptr = logits_ptr + pid_m * stride_logits_m
 
-    # Initialize the maximum value for the row to negative infinity.
-    row_max = -float('inf')
-    # Create a range of offsets for a block of the row.
-    offsets_n = tl.arange(0, BLOCK_SIZE_N)
-    
-    # Iterate over the row in blocks to find the maximum logit value.
-    for i in range(0, tl.cdiv(N, BLOCK_SIZE_N)):
-        # Calculate offsets for the current block.
-        current_offsets = offsets_n + i * BLOCK_SIZE_N
-        # Create a mask to handle rows where N is not a multiple of BLOCK_SIZE_N.
-        mask = current_offsets < N
+        # === Pass 1: Find the maximum logit value for the row for numerical stability ===
+        offs_n_init = tl.arange(0, BLOCK_SIZE_N)
+        row_max = -float('inf')
         
-        # Load a block of logits, using -inf for out-of-bounds elements
-        # so they don't affect the maximum operation.
-        block_logits = tl.load(row_logits_ptr + current_offsets, mask=mask, other=-float('inf'))
+        for j in range(0, tl.cdiv(N, BLOCK_SIZE_N)):
+            offs_n = j * BLOCK_SIZE_N + offs_n_init
+            mask = offs_n < N
+            # Load a block of logits, masking out-of-bounds elements
+            logits_block = tl.load(row_logits_ptr + offs_n * stride_logits_n, mask=mask, other=-float('inf'))
+            # Reduce the block to find its maximum value and update the row's maximum
+            current_max = tl.max(logits_block, 0)
+            row_max = tl.maximum(row_max, current_max)
         
-        # Update the running maximum for the row.
-        current_max = tl.max(block_logits, axis=0)
-        row_max = tl.maximum(row_max, current_max)
-    
-    # --- Pass 2: Compute sum of exponentials ---
+        # === Pass 2: Compute the sum of exponentiated logits (for log-sum-exp) ===
+        # The numerically stable formula is: log(sum(exp(logits - max))) + max
+        sum_exp = 0.0
+        
+        for j in range(0, tl.cdiv(N, BLOCK_SIZE_N)):
+            offs_n = j * BLOCK_SIZE_N + offs_n_init
+            mask = offs_n < N
+            logits_block = tl.load(row_logits_ptr + offs_n * stride_logits_n, mask=mask, other=-float('inf'))
+            # Subtract the max, exponentiate, and add to the sum accumulator
+            sum_exp += tl.sum(tl.exp(logits_block - row_max), 0)
+        
+        log_sum_exp = row_max + tl.log(sum_exp)
 
-    # Initialize the sum of exponentials to zero.
-    sum_exp = 0.0
-    # Iterate over the row again.
-    for i in range(0, tl.cdiv(N, BLOCK_SIZE_N)):
-        current_offsets = offsets_n + i * BLOCK_SIZE_N
-        mask = current_offsets < N
+        # === Pass 3: Get the target logit and compute the final loss ===
+        # Load the target class index for the current row
+        target_idx = tl.load(targets_ptr + pid_m)
+        # Load the logit corresponding to the target class
+        logit_target = tl.load(row_logits_ptr + target_idx * stride_logits_n)
         
-        # Load the block of logits again.
-        block_logits = tl.load(row_logits_ptr + current_offsets, mask=mask, other=-float('inf'))
+        # The cross-entropy loss is log_sum_exp - logit_target
+        loss = log_sum_exp - logit_target
         
-        # Subtract the max value for numerical stability (log-sum-exp trick).
-        # Convert to float32 before exponentiation.
-        stable_logits = block_logits.to(tl.float32) - row_max
-        exp_logits = tl.exp(stable_logits)
-        
-        # Accumulate the sum of exponentials.
-        sum_exp += tl.sum(exp_logits, axis=0)
-
-    # --- Final loss calculation ---
-    # loss = log(sum(exp(x))) - x_target
-    # where log(sum(exp(x))) = max(x) + log(sum(exp(x - max(x))))
-    log_sum_exp = row_max + tl.log(sum_exp)
-    loss = log_sum_exp - logit_target
-    
-    # Store the final loss value for the current row.
-    tl.store(output_ptr + pid, loss)
-
+        # Store the computed loss for the current row
+        tl.store(loss_ptr + pid_m, loss)
 
 def cross_entropy(logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
     \"\"\"
@@ -116,21 +104,28 @@ def cross_entropy(logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
     \"\"\"
     M, N = logits.shape
     
-    # Allocate the output tensor for the loss. Loss is always float32.
-    loss = torch.empty((M,), dtype=torch.float32, device=logits.device)
+    # Input validation for robustness
+    assert logits.is_cuda and targets.is_cuda, "Input tensors must be on a CUDA device."
+    assert logits.dim() == 2, "Logits must be a 2D tensor."
+    assert targets.dim() == 1, "Targets must be a 1D tensor."
+    assert M == targets.shape[0], "Batch dimensions of logits and targets must match."
+    assert targets.dtype == torch.int64, "Targets tensor must be of type int64."
     
-    # The grid is 1D with M programs, one for each row in the batch.
-    grid = (M,)
+    # Create the output tensor for the losses
+    loss = torch.empty((M,), device=logits.device, dtype=torch.float32)
     
-    # Launch the Triton kernel.
+    # The grid size is dependent on the number of rows processed by each program.
+    # This is determined by the autotuner. We use a lambda to make the grid
+    # size dependent on the 'ROWS_PER_PROGRAM' meta-parameter.
+    grid = lambda meta: (triton.cdiv(M, meta['ROWS_PER_PROGRAM']),)
+    
+    # Launch the Triton kernel
     _cross_entropy_kernel[grid](
         logits,
         targets,
         loss,
-        M,
-        N,
-        logits.stride(0),
-        # BLOCK_SIZE_N is determined by the autotuner.
+        M, N,
+        logits.stride(0), logits.stride(1),
     )
     
     return loss

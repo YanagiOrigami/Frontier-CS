@@ -1,137 +1,99 @@
 import struct
-from typing import List, Tuple, Dict
-
-
-def _be(n: int, width: int) -> bytes:
-    return n.to_bytes(width, byteorder="big", signed=False)
-
-
-def _obj(num: int, content: bytes) -> bytes:
-    return f"{num} 0 obj\n".encode("ascii") + content + b"\nendobj\n"
-
-
-def _dict(d: str) -> bytes:
-    return (b"<< " + d.encode("ascii") + b" >>")
-
-
-def _stream(dict_items: str, data: bytes) -> bytes:
-    return (
-        b"<< "
-        + dict_items.encode("ascii")
-        + b" /Length "
-        + str(len(data)).encode("ascii")
-        + b" >>\nstream\n"
-        + data
-        + b"\nendstream"
-    )
-
-
-def _objstm_stream(embedded: List[Tuple[int, bytes]]) -> Tuple[bytes, int, int]:
-    # Returns (stream_data, first, n)
-    parts = []
-    offsets = []
-    cur = 0
-    for i, (objnum, objbytes) in enumerate(embedded):
-        offsets.append((objnum, cur))
-        parts.append(objbytes)
-        if i != len(embedded) - 1:
-            parts.append(b" ")
-            cur += len(objbytes) + 1
-        else:
-            cur += len(objbytes)
-
-    header = (" ".join(f"{objnum} {off}" for objnum, off in offsets) + " ").encode("ascii")
-    first = len(header)
-    data = header + b"".join(parts)
-    return data, first, len(embedded)
-
-
-def _xref_entry(t: int, f2: int, f3: int) -> bytes:
-    # W = [1,4,2]
-    return _be(t, 1) + _be(f2, 4) + _be(f3, 2)
+from typing import Dict, List, Tuple
 
 
 class Solution:
     def solve(self, src_path: str) -> bytes:
-        header = b"%PDF-1.5\n%\xE2\xE3\xCF\xD3\n"
+        header = b"%PDF-1.5\n%\xe2\xe3\xcf\xd3\n"
 
-        # Objects:
-        # 1 Catalog, 2 Pages, 3 Page, 4 Contents, 5 ObjStm, 7 ObjStm, 8 XRef stream
-        # Object 6 is compressed and appears multiple times via duplicate xref entries and within objstm 5.
+        def ind_obj(num: int, body: bytes) -> bytes:
+            return (f"{num} 0 obj\n".encode("ascii") + body + b"\nendobj\n")
 
-        obj1 = _dict("/Type /Catalog /Pages 2 0 R")
-        obj2 = _dict("/Type /Pages /Kids [3 0 R] /Count 1")
-        obj3 = _dict("/Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] /Contents 4 0 R /Resources 6 0 R")
+        def stream_obj(num: int, dict_bytes: bytes, data: bytes) -> bytes:
+            return (
+                f"{num} 0 obj\n".encode("ascii")
+                + dict_bytes
+                + b"\nstream\n"
+                + data
+                + b"\nendstream\nendobj\n"
+            )
 
-        contents_data = b"q\nQ\n"
-        obj4 = _stream("", contents_data)
-
-        # ObjStm 5 contains object 6 twice (duplicate object id entries)
-        o6_a = _dict("/ProcSet [/PDF]")
-        o6_b = _dict("/ProcSet [/PDF /Text]")
-        objstm5_data, first5, n5 = _objstm_stream([(6, o6_a), (6, o6_b)])
-        obj5 = _stream(f"/Type /ObjStm /N {n5} /First {first5}", objstm5_data)
-
-        # ObjStm 7 contains object 6 once (another location for same object id)
-        o6_c = _dict("/ProcSet [/PDF /ImageB]")
-        objstm7_data, first7, n7 = _objstm_stream([(6, o6_c)])
-        obj7 = _stream(f"/Type /ObjStm /N {n7} /First {first7}", objstm7_data)
-
-        # Assemble with placeholder for xref object 8 after we know offsets
-        parts: List[Tuple[int, bytes]] = [
-            (1, _obj(1, obj1)),
-            (2, _obj(2, obj2)),
-            (3, _obj(3, obj3)),
-            (4, _obj(4, obj4)),
-            (5, _obj(5, obj5)),
-            (7, _obj(7, obj7)),
-        ]
-
-        pdf = bytearray()
-        pdf += header
-
+        parts: List[bytes] = [header]
         offsets: Dict[int, int] = {}
-        for num, ob in parts:
-            offsets[num] = len(pdf)
-            pdf += ob
+
+        # 1: Catalog
+        obj1 = b"<< /Type /Catalog /Pages 2 0 R >>"
+        # 2: Pages
+        obj2 = b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>"
+        # 3: Page references compressed object 6 for /Resources
+        obj3 = b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] /Contents 4 0 R /Resources 6 0 R >>"
+        # 4: Empty contents
+        obj4_dict = b"<< /Length 0 >>"
+        obj4_data = b""
+
+        # 5: Object stream with duplicate entries for object 6
+        obj6_bytes = b"<< /ProcSet [/PDF] >>\n"
+        obj6_bytes2 = b"<< /ProcSet [/PDF] >>\n"
+        off2 = len(obj6_bytes)
+        objstm_header = f"6 0 6 {off2} ".encode("ascii")
+        objstm_first = len(objstm_header)
+        objstm_data = objstm_header + obj6_bytes + obj6_bytes2
+        objstm_len = len(objstm_data)
+        obj5_dict = f"<< /Type /ObjStm /N 2 /First {objstm_first} /Length {objstm_len} >>".encode("ascii")
+
+        # Build objects 1-5
+        for num, body in [
+            (1, obj1),
+            (2, obj2),
+            (3, obj3),
+        ]:
+            offsets[num] = sum(len(p) for p in parts)
+            parts.append(ind_obj(num, body))
+
+        offsets[4] = sum(len(p) for p in parts)
+        parts.append(stream_obj(4, obj4_dict, obj4_data))
+
+        offsets[5] = sum(len(p) for p in parts)
+        parts.append(stream_obj(5, obj5_dict, objstm_data))
 
         # XRef stream object number
-        xref_num = 8
-        offsets[xref_num] = len(pdf)
+        xref_objnum = 7
+        offsets[xref_objnum] = sum(len(p) for p in parts)
 
-        # Build xref stream with overlapping /Index entries for object 6 multiple times
-        # /Index [0 9 6 1 6 1] => entries: 0..8, plus obj 6 again, plus obj 6 again.
-        # Object 6 entries:
-        # - In 0..8 range: type 2 -> objstm 5 index 0
-        # - dup #1: type 2 -> objstm 5 index 1
-        # - dup #2: type 2 -> objstm 7 index 0
-        size = 9  # objects 0..8
-        entries = []
+        # Build xref stream data with overlapping /Index to duplicate object 6 entry
+        # /Index [0 8 6 1] => objects 0..7 plus an extra entry for object 6
+        # W = [1 4 2] => 7 bytes per entry
+        def xref_entry(t: int, f2: int, f3: int) -> bytes:
+            return struct.pack(">B", t) + struct.pack(">I", f2 & 0xFFFFFFFF) + struct.pack(">H", f3 & 0xFFFF)
 
-        # Objects 0..8
-        entries.append(_xref_entry(0, 0, 65535))  # obj 0 free
-        entries.append(_xref_entry(1, offsets[1], 0))
-        entries.append(_xref_entry(1, offsets[2], 0))
-        entries.append(_xref_entry(1, offsets[3], 0))
-        entries.append(_xref_entry(1, offsets[4], 0))
-        entries.append(_xref_entry(1, offsets[5], 0))
-        entries.append(_xref_entry(2, 5, 0))  # obj 6: objstm 5, index 0
-        entries.append(_xref_entry(1, offsets[7], 0))
-        entries.append(_xref_entry(1, offsets[8], 0))  # xref stream itself
+        xref_entries: List[bytes] = []
+        # obj 0: free
+        xref_entries.append(xref_entry(0, 0, 0xFFFF))
+        # obj 1-5: in-use
+        for objn in range(1, 6):
+            xref_entries.append(xref_entry(1, offsets[objn], 0))
+        # obj 6: compressed in objstm 5, index 0
+        xref_entries.append(xref_entry(2, 5, 0))
+        # obj 7: xref stream itself
+        xref_entries.append(xref_entry(1, offsets[xref_objnum], 0))
+        # duplicate entry for obj 6: compressed in objstm 5, index 1
+        xref_entries.append(xref_entry(2, 5, 1))
 
-        # Duplicate entries for object 6
-        entries.append(_xref_entry(2, 5, 1))  # objstm 5, index 1
-        entries.append(_xref_entry(2, 7, 0))  # objstm 7, index 0
+        xref_data = b"".join(xref_entries)
+        xref_len = len(xref_data)
 
-        xref_data = b"".join(entries)
-
-        xref_dict_items = (
-            f"/Type /XRef /W [1 4 2] /Index [0 {size} 6 1 6 1] /Size {size} /Root 1 0 R"
+        xref_dict = (
+            b"<< /Type /XRef"
+            b" /Size 8"
+            b" /Root 1 0 R"
+            b" /W [1 4 2]"
+            b" /Index [0 8 6 1]"
+            + f" /Length {xref_len} >>".encode("ascii")
         )
-        obj8 = _stream(xref_dict_items, xref_data)
-        pdf += _obj(8, obj8)
 
-        startxref = offsets[8]
-        pdf += b"startxref\n" + str(startxref).encode("ascii") + b"\n%%EOF\n"
+        parts.append(stream_obj(xref_objnum, xref_dict, xref_data))
 
-        return bytes(pdf)
+        startxref = offsets[xref_objnum]
+        parts.append(f"startxref\n{startxref}\n%%EOF\n".encode("ascii"))
+
+        return b"".join(parts)

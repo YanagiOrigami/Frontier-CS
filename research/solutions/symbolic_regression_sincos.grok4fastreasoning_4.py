@@ -19,11 +19,9 @@ class Solution:
         )
         model.fit(X, y, variable_names=["x1", "x2"])
 
-        # Get best expression as sympy, convert to string
         best_expr = model.sympy()
         expression = str(best_expr)
 
-        # Predictions
         predictions = model.predict(X)
 
         return {

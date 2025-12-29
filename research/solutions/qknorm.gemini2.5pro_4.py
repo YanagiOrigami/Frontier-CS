@@ -1,89 +1,87 @@
 import torch
-import flashinfer
 import triton
 import triton.language as tl
+import flashinfer
 
 class Solution:
     def solve(self, spec_path: str = None) -> dict:
+        """
+        Returns a dict containing the Python code for the qknorm implementation.
+        """
         qknorm_code = """
 import torch
-import flashinfer
 import triton
 import triton.language as tl
+import flashinfer
 
 @triton.jit
-def _qknorm_fwd_kernel(
-    # Pointers to input/output tensors
+def _qknorm_kernel(
+    # Pointers to matrices
     Q_ptr, K_ptr, W_ptr, Q_out_ptr, K_out_ptr,
-    # Stride variables for memory access
-    q_stride_m, q_stride_n,
-    k_stride_m, k_stride_n,
-    q_out_stride_m, q_out_stride_n,
-    k_out_stride_m, k_out_stride_n,
     # Matrix dimensions
-    N_q, N_k, D,
-    # Epsilon for numerical stability
-    eps: tl.constexpr,
-    # Triton-specific metaparameters
-    BLOCK_SIZE: tl.constexpr,
+    q_num_rows, D,
+    # Strides for row-major access
+    q_stride_rm, k_stride_rm,
+    q_out_stride_rm, k_out_stride_rm,
+    # Meta-parameters
+    eps,
+    # Compiler constants
+    BLOCK_SIZE_D: tl.constexpr,
 ):
-    # Each program instance processes one row from either Q or K
-    pid = tl.program_id(0)
+    \"\"\"
+    Fused Triton kernel for applying RMSNorm to Q and K tensors.
+    \"\"\"
+    # Each program in the grid processes one row of the combined Q and K tensors.
+    row_idx = tl.program_id(0)
 
-    # Determine if the current program is for a Q row or a K row
-    is_q_row = pid < N_q
-    
-    # Select the correct pointers and strides based on the tensor type (Q or K)
-    if is_q_row:
-        row_idx = pid
-        X_ptr = Q_ptr + row_idx * q_stride_m
-        X_out_ptr = Q_out_ptr + row_idx * q_out_stride_m
-        x_stride_n = q_stride_n
+    # Determine if we are processing a row from Q or K and set up the
+    # corresponding pointers and strides. This branch is resolved at compile time.
+    if row_idx < q_num_rows:
+        # This row belongs to the Q tensor
+        in_ptr = Q_ptr + row_idx * q_stride_rm
+        out_ptr = Q_out_ptr + row_idx * q_out_stride_rm
     else:
-        row_idx = pid - N_q
-        X_ptr = K_ptr + row_idx * k_stride_m
-        X_out_ptr = K_out_ptr + row_idx * k_out_stride_m
-        x_stride_n = k_stride_n
+        # This row belongs to the K tensor
+        k_row_idx = row_idx - q_num_rows
+        in_ptr = K_ptr + k_row_idx * k_stride_rm
+        out_ptr = K_out_ptr + k_row_idx * k_out_stride_rm
 
-    # Compute sum of squares for the row
-    row_var = 0.0
-    offsets = tl.arange(0, BLOCK_SIZE)
-    # Iterate over the row in blocks
-    for off in range(0, D, BLOCK_SIZE):
-        mask = (offsets + off) < D
-        x_ptrs = X_ptr + (offsets + off) * x_stride_n
-        # Load data, converting to float32 for accurate accumulation
-        x = tl.load(x_ptrs, mask=mask, other=0.0).to(tl.float32)
-        row_var += tl.sum(x * x, axis=0)
+    # --- RMSNorm Computation ---
     
-    # Calculate variance and reciprocal standard deviation
-    var = row_var / D
-    rstd = tl.math.rsqrt(var + eps)
-
-    # Normalize the row and apply the learned weight
-    # Iterate again to apply the normalization factor
-    for off in range(0, D, BLOCK_SIZE):
-        mask = (offsets + off) < D
-        x_ptrs = X_ptr + (offsets + off) * x_stride_n
-        w_ptrs = W_ptr + (offsets + off)
-        
-        # Load input data and weights
-        x = tl.load(x_ptrs, mask=mask, other=0.0)
-        w = tl.load(w_ptrs, mask=mask, other=0.0)
-        
-        # Apply normalization and scaling
-        x_hat = x * rstd
-        y = x_hat * w
-        
-        # Store the final result
-        y_ptrs = X_out_ptr + (offsets + off) * x_stride_n
-        tl.store(y_ptrs, y, mask=mask)
-
+    # Define column offsets for the feature dimension.
+    col_offsets = tl.arange(0, BLOCK_SIZE_D)
+    mask = col_offsets < D
+    
+    # Load the row. Masking handles cases where D is not a multiple of BLOCK_SIZE_D.
+    # The row is cast to float32 for numerically stable accumulation.
+    row = tl.load(in_ptr + col_offsets, mask=mask, other=0.0).to(tl.float32)
+    
+    # Compute the variance (mean of squares).
+    variance = tl.sum(row * row, axis=0) / D
+    # Compute the reciprocal of the standard deviation.
+    rstd = tl.math.rsqrt(variance + eps)
+    
+    # Load the corresponding weights.
+    weights = tl.load(W_ptr + col_offsets, mask=mask)
+    
+    # Apply the normalization: y = x * rstd * w.
+    normed_row = row * rstd * weights
+    
+    # Store the result back to the output tensor.
+    # The cast to the output tensor's dtype is handled automatically by tl.store.
+    tl.store(out_ptr + col_offsets, normed_row, mask=mask)
 
 def qknorm(q: torch.Tensor, k: torch.Tensor, norm_weight: torch.Tensor):
-    """
+    \"\"\"
     Apply RMSNorm to query and key tensors using a single fused Triton kernel.
     
+    This implementation fuses the normalization of Q and K into a single kernel
+    launch, significantly reducing overhead for this small, launch-bound operator.
+    It efficiently handles non-contiguous inputs by operating on strides, thus
+    avoiding explicit and costly .contiguous() calls. A fallback to the baseline
+    flashinfer implementation is included for edge cases with non-contiguous feature
+    dimensions to ensure correctness, adhering to the problem's primary goal.
+
     Args:
         q: Query tensor of arbitrary shape.
         k: Key tensor of arbitrary shape.
@@ -91,77 +89,69 @@ def qknorm(q: torch.Tensor, k: torch.Tensor, norm_weight: torch.Tensor):
     
     Returns:
         Tuple of (q_normalized, k_normalized) tensors.
-    """
-    # Handle cases with empty tensors
-    if q.numel() == 0 and k.numel() == 0:
-        return torch.empty_like(q), torch.empty_like(k)
+    \"\"\"
+    # Get original shapes and the hidden dimension.
+    q_shape = q.shape
+    hidden_dim = q_shape[-1]
     
-    # Determine the hidden dimension from the last dimension of the tensors.
-    if q.numel() > 0:
-        hidden_dim = q.shape[-1]
-    elif k.numel() > 0:
-        hidden_dim = k.shape[-1]
-    else:
-        return torch.empty_like(q), torch.empty_like(k)
+    # Validate that the feature dimension is consistent across all tensors.
+    if k.shape[-1] != hidden_dim or norm_weight.shape[0] != hidden_dim:
+        raise ValueError("The last dimension of q, k, and norm_weight must be the same.")
 
-    if hidden_dim == 0:
-        return torch.empty_like(q), torch.empty_like(k)
-
-    # Reshape Q and K to 2D tensors (num_tokens, hidden_dim).
-    # This avoids data copy if the last dimension is contiguous.
+    # Logically reshape inputs to 2D. This is a metadata-only operation
+    # (no data copy) if the tensor layout allows for it.
     q_2d = q.reshape(-1, hidden_dim)
     k_2d = k.reshape(-1, hidden_dim)
 
-    N_q = q_2d.shape[0]
-    N_k = k_2d.shape[0]
+    # Our Triton kernel is optimized for the common case where the feature dimension
+    # is contiguous in memory (stride=1), which enables fast vectorized memory access.
+    # If this is not the case, we fall back to the baseline implementation, which uses
+    # two separate flashinfer calls, to guarantee correctness under all circumstances.
+    if q_2d.stride(1) != 1 or k_2d.stride(1) != 1 or norm_weight.stride(0) != 1:
+        q_o = torch.empty_like(q)
+        k_o = torch.empty_like(k)
+        flashinfer.norm.rmsnorm(q, norm_weight, out=q_o)
+        flashinfer.norm.rmsnorm(k, norm_weight, out=k_o)
+        return q_o, k_o
 
-    # Create output tensors with the same layout as inputs to preserve strides.
+    # Allocate output tensors, preserving the memory layout of the inputs.
     q_o = torch.empty_like(q)
     k_o = torch.empty_like(k)
-
-    # Reshape output tensors to 2D for the kernel.
+    
+    # Reshape output tensors for the kernel interface.
     q_o_2d = q_o.reshape(-1, hidden_dim)
     k_o_2d = k_o.reshape(-1, hidden_dim)
+
+    # Set up kernel launch parameters.
+    q_num_rows = q_2d.shape[0]
+    total_rows = q_num_rows + k_2d.shape[0]
     
-    if N_q + N_k == 0:
+    # Handle empty input tensors.
+    if total_rows == 0:
         return q_o, k_o
+        
+    # The grid is 1D, with one program launched per row of the combined Q and K tensors.
+    grid = (total_rows,)
     
-    # Our kernel assumes contiguous last dimension for efficient vector loads.
-    assert q_2d.stride(1) == 1, "Input tensor q must be contiguous in the last dimension"
-    assert k_2d.stride(1) == 1, "Input tensor k must be contiguous in the last dimension"
-
-    # The grid is 1D, with one program instance per row of Q and K combined.
-    grid = (N_q + N_k,)
+    # Use a common Triton heuristic: set block size to the next power of 2.
+    BLOCK_SIZE_D = triton.next_power_of_2(hidden_dim)
     
-    # Heuristics for block size and number of warps based on hidden dimension.
-    if hidden_dim > 8192:
-        BLOCK_SIZE = 4096
-        num_warps = 16
-    elif hidden_dim > 4096:
-        BLOCK_SIZE = 2048
-        num_warps = 8
-    elif hidden_dim > 2048:
-        BLOCK_SIZE = 1024
-        num_warps = 8
-    else:
-        BLOCK_SIZE = triton.next_power_of_2(min(hidden_dim, 2048))
-        num_warps = 4
-        if BLOCK_SIZE >= 1024:
-            num_warps = 8
-
-    _qknorm_fwd_kernel[grid](
+    _qknorm_kernel[grid](
+        # Tensors
         q_2d, k_2d, norm_weight, q_o_2d, k_o_2d,
-        q_2d.stride(0), q_2d.stride(1),
-        k_2d.stride(0), k_2d.stride(1),
-        q_o_2d.stride(0), q_o_2d.stride(1),
-        k_o_2d.stride(0), k_o_2d.stride(1),
-        N_q, N_k, hidden_dim,
-        eps=1e-6, # Standard epsilon for RMSNorm
-        BLOCK_SIZE=BLOCK_SIZE,
-        num_warps=num_warps,
+        # Dimensions
+        q_num_rows, hidden_dim,
+        # Strides for row-major access
+        q_2d.stride(0), k_2d.stride(0),
+        q_o_2d.stride(0), k_o_2d.stride(0),
+        # Meta-parameters
+        eps=1e-6,
+        # Triton constants
+        BLOCK_SIZE_D=BLOCK_SIZE_D,
     )
     
-    # Output tensors were modified in-place via their 2D views.
+    # Return the output tensors. They are already in their correct original shapes
+    # due to being allocated with `empty_like(q)` and `empty_like(k)`.
     return q_o, k_o
 """
         return {"code": qknorm_code}

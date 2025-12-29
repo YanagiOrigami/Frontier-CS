@@ -1,8 +1,43 @@
 import pandas as pd
-from typing import List, Any
+from collections import Counter
+from itertools import permutations
 
 
 class Solution:
+    def _compute_hit_rate(self, str_cols, total_chars, perm):
+        if not str_cols or total_chars <= 0:
+            return 0.0
+
+        num_rows = len(str_cols[0])
+        if num_rows == 0:
+            return 0.0
+
+        root = {}
+        total_lcp = 0
+        perm_list = list(perm)
+        sc = str_cols
+
+        for i in range(num_rows):
+            node = root
+            mismatch = False
+            lcp = 0
+            for col_idx in perm_list:
+                cell_s = sc[col_idx][i]
+                for ch in cell_s:
+                    child = node.get(ch)
+                    if not mismatch and child is not None:
+                        lcp += 1
+                        node = child
+                    else:
+                        mismatch = True
+                        if child is None:
+                            child = {}
+                            node[ch] = child
+                        node = child
+            total_lcp += lcp
+
+        return total_lcp / float(total_chars) if total_chars > 0 else 0.0
+
     def solve(
         self,
         df: pd.DataFrame,
@@ -14,189 +49,118 @@ class Solution:
         distinct_value_threshold: float = 0.7,
         parallel: bool = True,
     ) -> pd.DataFrame:
-        # Step 1: Apply column merges (on a copy of df)
-        df_work = df.copy()
+        df = df.copy()
 
+        # Apply column merges if specified
         if col_merge:
-            orig_cols = list(df_work.columns)
-
-            # Resolve merge groups to column names
-            merge_groups: List[List[str]] = []
-            for group in col_merge:
-                names: List[str] = []
-                for spec in group:
-                    if isinstance(spec, int):
-                        idx = spec if spec >= 0 else len(orig_cols) + spec
-                        if 0 <= idx < len(orig_cols):
-                            col_name = orig_cols[idx]
-                        else:
-                            continue
-                    else:
-                        col_name = str(spec)
-                    if col_name in df_work.columns:
-                        names.append(col_name)
-                # Deduplicate while preserving order
-                seen = set()
-                unique_names: List[str] = []
-                for n in names:
-                    if n not in seen:
-                        seen.add(n)
-                        unique_names.append(n)
-                if len(unique_names) > 1:
-                    merge_groups.append(unique_names)
-
-            # Apply merges sequentially
-            for names in merge_groups:
-                existing = [n for n in names if n in df_work.columns]
-                if len(existing) <= 1:
+            original_columns = list(df.columns)
+            for merge_idx, group in enumerate(col_merge):
+                if not group:
                     continue
-                target_name = existing[0]
-                # Build merged string column from the existing columns
-                merged_series = df_work[existing].astype(str).agg("".join, axis=1)
-                # Drop original columns in the group
-                df_work = df_work.drop(columns=existing)
-                # Add merged column (reusing the first column's name)
-                df_work[target_name] = merged_series
 
-        # After merges, determine column order to optimize
-        cols = list(df_work.columns)
-        M = len(cols)
-        N_total = len(df_work)
+                # Map group entries (names or indices) to actual column names
+                col_names_group = []
+                for g in group:
+                    name = None
+                    if isinstance(g, int):
+                        if 0 <= g < len(original_columns):
+                            name = original_columns[g]
+                    else:
+                        if g in original_columns:
+                            name = g
+                    if name is not None and name in df.columns and name not in col_names_group:
+                        col_names_group.append(name)
 
-        # If there's nothing to optimize, just return the possibly-merged df
-        if M <= 1 or N_total <= 1:
-            return df_work
+                if len(col_names_group) <= 1:
+                    continue
 
-        # Step 2: Prepare data for scoring
-        # Limit number of rows used for optimization to early_stop
-        if early_stop is not None and early_stop > 0:
-            N_sample = min(N_total, early_stop)
-        else:
-            N_sample = N_total
+                base_name = f"__MERGED_{merge_idx}__"
+                new_name = base_name
+                suffix = 0
+                while new_name in df.columns:
+                    suffix += 1
+                    new_name = f"{base_name}_{suffix}"
 
-        if N_sample < 2:
-            # Not enough rows for any prefix reuse analysis
-            return df_work
+                df[new_name] = df[col_names_group].astype(str).agg(''.join, axis=1)
+                df.drop(columns=col_names_group, inplace=True)
 
-        # Extract string representations per column for sampled rows
-        col_values_str: List[List[str]] = []
-        col_lens: List[List[int]] = []
+        num_rows, num_cols = df.shape
+        if num_rows == 0 or num_cols <= 1:
+            return df
 
-        for col in cols:
-            values = df_work[col].iloc[:N_sample].tolist()
-            str_vals = [str(v) for v in values]
-            lens = [len(s) for s in str_vals]
-            col_values_str.append(str_vals)
-            col_lens.append(lens)
-
-        N_pairs = N_sample - 1
-
-        # Precompute LCP length and full-equality flags for consecutive rows, per column
-        lcp_cols: List[List[int]] = []
-        eq_cols: List[List[bool]] = []
-
-        for c in range(M):
-            vals = col_values_str[c]
-            lens = col_lens[c]
-            lcp_list = [0] * N_pairs
-            eq_list = [False] * N_pairs
-
-            for i in range(1, N_sample):
-                s1 = vals[i - 1]
-                s2 = vals[i]
-                len1 = lens[i - 1]
-                len2 = lens[i]
-                limit = len1 if len1 < len2 else len2
-                k = 0
-                # Compute LCP length
-                while k < limit and s1[k] == s2[k]:
-                    k += 1
-                lcp_list[i - 1] = k
-                eq_list[i - 1] = (k == len1 and k == len2)
-
-            lcp_cols.append(lcp_list)
-            eq_cols.append(eq_list)
-
-        # Step 3: Heuristic scores per column (distinctness and average length)
-        distinct_ratios: List[float] = []
-        avg_lens: List[float] = []
-        scores: List[float] = []
+        # Prepare string representations and statistics per column
+        cols = list(df.columns)
+        str_cols = []
+        eq_probs = [0.0] * num_cols
+        avg_lens = [0.0] * num_cols
+        total_chars = 0
 
         for idx, col in enumerate(cols):
-            series = df_work[col]
-            n_unique = float(series.nunique(dropna=False))
-            ratio = n_unique / float(N_total) if N_total > 0 else 0.0
-            distinct_ratios.append(ratio)
+            col_list = df[col].astype(str).tolist()
+            str_cols.append(col_list)
 
-            lens_sample = col_lens[idx]
-            if lens_sample:
-                avg_len = float(sum(lens_sample)) / float(len(lens_sample))
+            cnt = Counter(col_list)
+            n = float(num_rows)
+            if n == 0:
+                eq_prob = 0.0
             else:
-                avg_len = 0.0
-            avg_lens.append(avg_len)
+                sum_sq = 0.0
+                for f in cnt.values():
+                    sum_sq += float(f) * float(f)
+                eq_prob = sum_sq / (n * n)
 
-            score = ratio * avg_len
-            if ratio > distinct_value_threshold:
-                score *= 2.0
-            scores.append(score)
+            char_total = 0
+            for v in col_list:
+                char_total += len(v)
 
-        # Sort column indices by heuristic score (low first => more stable, shorter first)
-        sorted_indices = sorted(range(M), key=lambda i: scores[i])
+            eq_probs[idx] = eq_prob
+            avg_lens[idx] = (char_total / n) if n > 0 else 0.0
+            total_chars += char_total
 
-        # Step 4: Define scoring function for a permutation (approximate objective)
-        def score_perm(perm: List[int]) -> int:
-            perm_len = len(perm)
-            if perm_len == 0:
-                return 0
-            # Pre-resolve column-wise arrays for this permutation
-            lcp_seq = [lcp_cols[c] for c in perm]
-            eq_seq = [eq_cols[c] for c in perm]
-            total_score = 0
-            for pair_idx in range(N_pairs):
-                acc = 0
-                for k in range(perm_len):
-                    l = lcp_seq[k][pair_idx]
-                    acc += l
-                    if not eq_seq[k][pair_idx]:
-                        break
-                total_score += acc
-            return total_score
+        if total_chars == 0:
+            return df
 
-        # Step 5: Greedy insertion search with multiple seeds
-        best_global_score = -1
-        best_global_perm: List[int] = list(range(M))  # fallback
+        # Approximate objective: enumerate permutations (num_cols is small)
+        indices = list(range(num_cols))
+        best_approx_perm = tuple(indices)
+        best_approx_score = float('-inf')
 
-        for seed in sorted_indices:
-            order: List[int] = [seed]
-            current_score: Any = None
+        for perm in permutations(indices):
+            prod = 1.0
+            score = 0.0
+            for idx in perm:
+                prod *= eq_probs[idx]
+                score += prod * avg_lens[idx]
+            if score > best_approx_score:
+                best_approx_score = score
+                best_approx_perm = perm
 
-            remaining = [idx for idx in sorted_indices if idx != seed]
+        baseline_perm = tuple(range(num_cols))
+        # Additional heuristic permutations
+        eq_prob_desc_perm = tuple(
+            sorted(range(num_cols), key=lambda i: eq_probs[i], reverse=True)
+        )
+        importance_perm = tuple(
+            sorted(range(num_cols), key=lambda i: eq_probs[i] * avg_lens[i], reverse=True)
+        )
 
-            for col_idx in remaining:
-                best_local_score = -1
-                best_local_order: List[int] = []
+        # Collect unique candidate permutations
+        candidate_perms = []
+        seen = set()
+        for p in (baseline_perm, best_approx_perm, eq_prob_desc_perm, importance_perm):
+            if p not in seen:
+                seen.add(p)
+                candidate_perms.append(p)
 
-                # Try inserting col_idx at every position in current order
-                for pos in range(len(order) + 1):
-                    candidate = order[:pos] + [col_idx] + order[pos:]
-                    sc = score_perm(candidate)
-                    if sc > best_local_score:
-                        best_local_score = sc
-                        best_local_order = candidate
+        # Evaluate candidates with exact trie-based hit rate
+        best_perm_final = candidate_perms[0]
+        best_hit = self._compute_hit_rate(str_cols, total_chars, best_perm_final)
 
-                order = best_local_order
-                current_score = best_local_score
+        for perm in candidate_perms[1:]:
+            hit = self._compute_hit_rate(str_cols, total_chars, perm)
+            if hit > best_hit + 1e-12:
+                best_hit = hit
+                best_perm_final = perm
 
-            if current_score is None:
-                # Only one column in this seed case
-                current_score = score_perm(order)
-
-            if current_score > best_global_score:
-                best_global_score = current_score
-                best_global_perm = order
-
-        # Step 6: Reorder df_work columns according to best permutation
-        final_cols_order = [cols[idx] for idx in best_global_perm]
-        result_df = df_work[final_cols_order]
-
-        return result_df
+        ordered_cols = [cols[i] for i in best_perm_final]
+        return df[ordered_cols]

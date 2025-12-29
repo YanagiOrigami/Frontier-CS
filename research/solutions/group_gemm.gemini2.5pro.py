@@ -1,32 +1,30 @@
 import torch
 import triton
 import triton.language as tl
+from typing import Dict, Optional
 from pathlib import Path
 
 @triton.autotune(
     configs=[
-        # Basic configurations, balanced tile sizes
-        triton.Config({'BLOCK_M': 32, 'BLOCK_N': 32, 'BLOCK_K': 32, 'num_stages': 2, 'num_warps': 4}),
-        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 32, 'BLOCK_K': 32, 'num_stages': 3, 'num_warps': 8}),
-        triton.Config({'BLOCK_M': 32, 'BLOCK_N': 64, 'BLOCK_K': 32, 'num_stages': 3, 'num_warps': 8}),
+        # Basic configurations for common sizes
         triton.Config({'BLOCK_M': 64, 'BLOCK_N': 64, 'BLOCK_K': 32, 'num_stages': 4, 'num_warps': 4}),
+        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 128, 'BLOCK_K': 32, 'num_stages': 4, 'num_warps': 4}),
+        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 64, 'BLOCK_K': 32, 'num_stages': 4, 'num_warps': 4}),
+        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 32, 'num_stages': 3, 'num_warps': 8}),
+        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 64, 'BLOCK_K': 64, 'num_stages': 3, 'num_warps': 4}),
         
-        # Configurations with larger K blocking
-        triton.Config({'BLOCK_M': 32, 'BLOCK_N': 32, 'BLOCK_K': 64, 'num_stages': 2, 'num_warps': 4}),
-        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 32, 'BLOCK_K': 64, 'num_stages': 3, 'num_warps': 8}),
-        triton.Config({'BLOCK_M': 32, 'BLOCK_N': 64, 'BLOCK_K': 64, 'num_stages': 3, 'num_warps': 8}),
-        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 64, 'BLOCK_K': 64, 'num_stages': 4, 'num_warps': 4}),
+        # Configurations with larger block K
+        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 64, 'BLOCK_K': 128, 'num_stages': 3, 'num_warps': 4}),
+        triton.Config({'BLOCK_M': 32, 'BLOCK_N': 32, 'BLOCK_K': 128, 'num_stages': 3, 'num_warps': 2}),
         
-        # Configurations with smaller, rectangular tile sizes
-        triton.Config({'BLOCK_M': 16, 'BLOCK_N': 64, 'BLOCK_K': 64, 'num_stages': 2, 'num_warps': 4}),
-        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 16, 'BLOCK_K': 64, 'num_stages': 2, 'num_warps': 4}),
+        # Configurations with smaller block M/N
+        triton.Config({'BLOCK_M': 32, 'BLOCK_N': 64, 'BLOCK_K': 64, 'num_stages': 4, 'num_warps': 2}),
+        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 32, 'BLOCK_K': 64, 'num_stages': 4, 'num_warps': 2}),
+        triton.Config({'BLOCK_M': 32, 'BLOCK_N': 32, 'BLOCK_K': 64, 'num_stages': 5, 'num_warps': 2}),
 
-        # Configurations with very large K blocking (may be good if K is large)
-        triton.Config({'BLOCK_M': 32, 'BLOCK_N': 32, 'BLOCK_K': 128, 'num_stages': 2, 'num_warps': 4}),
-        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 64, 'BLOCK_K': 128, 'num_stages': 3, 'num_warps': 8}),
-
-        # Configurations with minimal blocking in K
-        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 64, 'BLOCK_K': 16, 'num_stages': 5, 'num_warps': 8}),
+        # Configurations for larger matrices
+        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 256, 'BLOCK_K': 64, 'num_stages': 3, 'num_warps': 8}),
+        triton.Config({'BLOCK_M': 256, 'BLOCK_N': 128, 'BLOCK_K': 64, 'num_stages': 3, 'num_warps': 8}),
     ],
     key=['M', 'N', 'K'],
 )
@@ -37,40 +35,63 @@ def _bmm_kernel(
     stride_ab, stride_am, stride_ak,
     stride_bb, stride_bk, stride_bn,
     stride_cb, stride_cm, stride_cn,
-    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr
 ):
-    pid_m = tl.program_id(axis=0)
-    pid_n = tl.program_id(axis=1)
-    pid_b = tl.program_id(axis=2)
+    """
+    Triton kernel for batched matrix multiplication.
+    Each program instance computes a BLOCK_M x BLOCK_N tile of the output matrix C
+    for a given batch index.
+    """
+    # Get program ids
+    pid_batch = tl.program_id(0)
+    pid_m = tl.program_id(1)
+    pid_n = tl.program_id(2)
 
+    # Compute offsets for the current block
     offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
     offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
     offs_k = tl.arange(0, BLOCK_K)
 
-    A_batch_ptr = A_ptr + pid_b * stride_ab
-    B_batch_ptr = B_ptr + pid_b * stride_bb
-    C_batch_ptr = C_ptr + pid_b * stride_cb
+    # Compute initial pointers for the batch
+    A_batch_ptr = A_ptr + pid_batch * stride_ab
+    B_batch_ptr = B_ptr + pid_batch * stride_bb
 
+    # Initialize accumulator with float32 for precision
     acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
 
-    for k0 in range(0, K, BLOCK_K):
-        k_idxs = k0 + offs_k
+    # Loop over the K dimension
+    k_start_idx = 0
+    while k_start_idx < K:
+        k_idxs = k_start_idx + offs_k
+        
+        # Pointers to the current tiles of A and B
+        a_ptrs = A_batch_ptr + (offs_m[:, None] * stride_am + k_idxs[None, :] * stride_ak)
+        b_ptrs = B_batch_ptr + (k_idxs[:, None] * stride_bk + offs_n[None, :] * stride_bn)
 
-        A_ptrs = A_batch_ptr + (offs_m[:, None] * stride_am + k_idxs[None, :] * stride_ak)
-        B_ptrs = B_batch_ptr + (k_idxs[:, None] * stride_bk + offs_n[None, :] * stride_bn)
-
+        # Boundary checks for A and B tiles
         a_mask = (offs_m[:, None] < M) & (k_idxs[None, :] < K)
         b_mask = (k_idxs[:, None] < K) & (offs_n[None, :] < N)
 
-        a = tl.load(A_ptrs, mask=a_mask, other=0.0)
-        b = tl.load(B_ptrs, mask=b_mask, other=0.0)
+        # Load A and B tiles, convert to float32 for computation
+        a = tl.load(a_ptrs, mask=a_mask, other=0.0).to(tl.float32)
+        b = tl.load(b_ptrs, mask=b_mask, other=0.0).to(tl.float32)
 
-        acc += tl.dot(a.to(tl.float32), b.to(tl.float32))
+        # Perform matrix multiplication on tiles
+        acc += tl.dot(a, b)
+        
+        # Advance to the next K block
+        k_start_idx += BLOCK_K
 
+    # Cast accumulator to float16 before storing
+    acc = acc.to(tl.float16)
+
+    # Compute pointers and mask for the output C tile
+    C_batch_ptr = C_ptr + pid_batch * stride_cb
     c_ptrs = C_batch_ptr + (offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn)
     c_mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
-
-    tl.store(c_ptrs, acc.to(tl.float16), mask=c_mask)
+    
+    # Store the result tile to C
+    tl.store(c_ptrs, acc, mask=c_mask)
 
 def bmm(A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
     """
@@ -83,17 +104,25 @@ def bmm(A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
     Returns:
         Output tensor of shape (B, M, N) - batch of M×N result matrices
     """
+    # Shape validation
+    assert A.shape[0] == B.shape[0], "Batch dimensions must be equal"
+    assert A.shape[2] == B.shape[1], "Inner dimensions must be equal (K)"
+    
     Batches, M, K = A.shape
     _, _, N = B.shape
     
+    # Create the output tensor, must be float16
     C = torch.empty((Batches, M, N), device=A.device, dtype=torch.float16)
-
+    
+    # Define the grid for the kernel launch
+    # One program instance per output tile per batch element
     grid = lambda META: (
-        triton.cdiv(M, META['BLOCK_M']),
-        triton.cdiv(N, META['BLOCK_N']),
-        Batches
+        Batches, 
+        triton.cdiv(M, META['BLOCK_M']), 
+        triton.cdiv(N, META['BLOCK_N'])
     )
     
+    # Launch the Triton kernel
     _bmm_kernel[grid](
         A, B, C,
         M, N, K,
@@ -105,11 +134,9 @@ def bmm(A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
     return C
 
 class Solution:
-    def solve(self, spec_path: str = None) -> dict:
+    def solve(self, spec_path: Optional[str] = None) -> Dict[str, str]:
         """
-        Returns a dict with either:
-        - {"code": "python_code_string"}
-        - {"program_path": "path/to/kernel.py"}
+        Returns a dict with the code of the current file.
         """
         current_file = Path(__file__).resolve()
         return {"code": current_file.read_text(encoding="utf-8")}

@@ -1,455 +1,257 @@
 import os
-import math
 import torch
 import triton
 import triton.language as tl
 
 
-@triton.autotune(
-    configs=[
-        triton.Config({'BLOCK_M': 8, 'BLOCK_N': 128, 'BLOCK_K': 32}, num_warps=4, num_stages=2),
-        triton.Config({'BLOCK_M': 8, 'BLOCK_N': 256, 'BLOCK_K': 32}, num_warps=8, num_stages=2),
-        triton.Config({'BLOCK_M': 16, 'BLOCK_N': 128, 'BLOCK_K': 64}, num_warps=4, num_stages=2),
-        triton.Config({'BLOCK_M': 16, 'BLOCK_N': 256, 'BLOCK_K': 64}, num_warps=8, num_stages=2),
-        triton.Config({'BLOCK_M': 4, 'BLOCK_N': 128, 'BLOCK_K': 32}, num_warps=2, num_stages=2),
-    ],
-    key=['M', 'N', 'K'],
-)
 @triton.jit
-def _pass1_lse_kernel(
+def _pass1_update_kernel(
     X_ptr, W1_ptr, B1_ptr, W2_ptr, B2_ptr,
+    m1_ptr, s1_ptr, m2_ptr, s2_ptr,
     M, N, K,
     stride_xm, stride_xk,
     stride_w1k, stride_w1n,
     stride_w2k, stride_w2n,
-    LOGZ1_ptr, LOGZ2_ptr,
+    n_start,
     BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
 ):
     pid_m = tl.program_id(0)
     offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
-    mmask = offs_m < M
+    offs_n = n_start + tl.arange(0, BLOCK_N)
+    offs_k = tl.arange(0, BLOCK_K)
 
-    # Initialize running max and sum for log-sum-exp for both branches
-    neg_big = tl.full([BLOCK_M], -1.0e9, tl.float32)
-    m1 = neg_big
-    m2 = neg_big
-    s1 = tl.zeros([BLOCK_M], dtype=tl.float32)
-    s2 = tl.zeros([BLOCK_M], dtype=tl.float32)
+    mask_m = offs_m < M
+    mask_n = offs_n < N
 
-    # Loop over N in tiles
-    for n_start in range(0, N, BLOCK_N):
-        offs_n = n_start + tl.arange(0, BLOCK_N)
-        nmask = offs_n < N
+    # Accumulate matmul for the tile
+    acc1 = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    acc2 = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
 
-        # Accumulators for logits tiles
-        acc1 = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
-        acc2 = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
+    k0 = 0
+    while k0 < K:
+        kk = k0 + offs_k
+        mask_x = (offs_m[:, None] < M) & (kk[None, :] < K)
+        mask_w = (kk[:, None] < K) & (offs_n[None, :] < N)
 
-        # Loop over K dimension
-        for k_start in range(0, K, BLOCK_K):
-            offs_k = k_start + tl.arange(0, BLOCK_K)
-            kmask = offs_k < K
+        x_ptrs = X_ptr + (offs_m[:, None] * stride_xm + kk[None, :] * stride_xk)
+        w1_ptrs = W1_ptr + (kk[:, None] * stride_w1k + offs_n[None, :] * stride_w1n)
+        w2_ptrs = W2_ptr + (kk[:, None] * stride_w2k + offs_n[None, :] * stride_w2n)
 
-            # Pointers and loads
-            a_ptrs = X_ptr + (offs_m[:, None] * stride_xm + offs_k[None, :] * stride_xk)
-            w1_ptrs = W1_ptr + (offs_k[:, None] * stride_w1k + offs_n[None, :] * stride_w1n)
-            w2_ptrs = W2_ptr + (offs_k[:, None] * stride_w2k + offs_n[None, :] * stride_w2n)
+        a = tl.load(x_ptrs, mask=mask_x, other=0.0)
+        b1 = tl.load(w1_ptrs, mask=mask_w, other=0.0)
+        b2 = tl.load(w2_ptrs, mask=mask_w, other=0.0)
 
-            a = tl.load(a_ptrs, mask=mmask[:, None] & kmask[None, :], other=0.0).to(tl.float16)
-            w1 = tl.load(w1_ptrs, mask=kmask[:, None] & nmask[None, :], other=0.0).to(tl.float16)
-            w2 = tl.load(w2_ptrs, mask=kmask[:, None] & nmask[None, :], other=0.0).to(tl.float16)
+        acc1 += tl.dot(a, b1)
+        acc2 += tl.dot(a, b2)
+        k0 += BLOCK_K
 
-            acc1 += tl.dot(a, w1)
-            acc2 += tl.dot(a, w2)
+    # Add biases
+    b1v = tl.load(B1_ptr + offs_n, mask=mask_n, other=0.0)
+    b2v = tl.load(B2_ptr + offs_n, mask=mask_n, other=0.0)
+    acc1 += b1v[None, :]
+    acc2 += b2v[None, :]
 
-        # Add bias
-        b1 = tl.load(B1_ptr + offs_n, mask=nmask, other=0.0).to(tl.float32)
-        b2 = tl.load(B2_ptr + offs_n, mask=nmask, other=0.0).to(tl.float32)
-        acc1 += b1[None, :]
-        acc2 += b2[None, :]
+    valid_mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
 
-        # Mask invalid columns with large negative value to avoid affecting max/sum
-        neg_val = -1.0e9
-        acc1 = tl.where(nmask[None, :], acc1, neg_val)
-        acc2 = tl.where(nmask[None, :], acc2, neg_val)
+    neg_inf = -float("inf")
 
-        # Update running max and sum using stable log-sum-exp accumulation
-        tile_max1 = tl.max(acc1, 1)
-        tile_max2 = tl.max(acc2, 1)
+    acc1_masked = tl.where(valid_mask, acc1, neg_inf)
+    acc2_masked = tl.where(valid_mask, acc2, neg_inf)
 
-        new_m1 = tl.maximum(m1, tile_max1)
-        new_m2 = tl.maximum(m2, tile_max2)
+    # Row-wise max for this tile
+    tile_max1 = tl.max(acc1_masked, axis=1)
+    tile_max2 = tl.max(acc2_masked, axis=1)
 
-        # Scale old sums
-        s1 = s1 * tl.exp(m1 - new_m1)
-        s2 = s2 * tl.exp(m2 - new_m2)
+    # Load previous m and s
+    m1_old = tl.load(m1_ptr + offs_m, mask=mask_m, other=neg_inf)
+    s1_old = tl.load(s1_ptr + offs_m, mask=mask_m, other=0.0)
+    m2_old = tl.load(m2_ptr + offs_m, mask=mask_m, other=neg_inf)
+    s2_old = tl.load(s2_ptr + offs_m, mask=mask_m, other=0.0)
 
-        # Add current tile contributions
-        s1 += tl.sum(tl.exp(acc1 - new_m1[:, None]), 1)
-        s2 += tl.sum(tl.exp(acc2 - new_m2[:, None]), 1)
+    # Update m and s with streaming log-sum-exp
+    new_m1 = tl.maximum(m1_old, tile_max1)
+    new_m2 = tl.maximum(m2_old, tile_max2)
 
-        m1 = new_m1
-        m2 = new_m2
+    exp_scale1 = tl.exp(m1_old - new_m1)
+    exp_scale2 = tl.exp(m2_old - new_m2)
 
-    # Compute final logZ
-    eps = 1e-20
-    logz1 = m1 + tl.log(tl.maximum(s1, eps))
-    logz2 = m2 + tl.log(tl.maximum(s2, eps))
+    sum_exp_tile1 = tl.sum(tl.exp(acc1_masked - new_m1[:, None]), axis=1)
+    sum_exp_tile2 = tl.sum(tl.exp(acc2_masked - new_m2[:, None]), axis=1)
 
-    tl.store(LOGZ1_ptr + offs_m, logz1, mask=mmask)
-    tl.store(LOGZ2_ptr + offs_m, logz2, mask=mmask)
+    new_s1 = s1_old * exp_scale1 + sum_exp_tile1
+    new_s2 = s2_old * exp_scale2 + sum_exp_tile2
+
+    tl.store(m1_ptr + offs_m, new_m1, mask=mask_m)
+    tl.store(s1_ptr + offs_m, new_s1, mask=mask_m)
+    tl.store(m2_ptr + offs_m, new_m2, mask=mask_m)
+    tl.store(s2_ptr + offs_m, new_s2, mask=mask_m)
 
 
-@triton.autotune(
-    configs=[
-        triton.Config({'BLOCK_M': 8, 'BLOCK_N': 128, 'BLOCK_K': 32}, num_warps=4, num_stages=2),
-        triton.Config({'BLOCK_M': 8, 'BLOCK_N': 256, 'BLOCK_K': 32}, num_warps=8, num_stages=2),
-        triton.Config({'BLOCK_M': 16, 'BLOCK_N': 128, 'BLOCK_K': 64}, num_warps=4, num_stages=2),
-        triton.Config({'BLOCK_M': 16, 'BLOCK_N': 256, 'BLOCK_K': 64}, num_warps=8, num_stages=2),
-        triton.Config({'BLOCK_M': 4, 'BLOCK_N': 128, 'BLOCK_K': 32}, num_warps=2, num_stages=2),
-    ],
-    key=['M', 'N', 'K'],
-)
 @triton.jit
-def _pass2_jsd_kernel(
+def _pass2_update_kernel(
     X_ptr, W1_ptr, B1_ptr, W2_ptr, B2_ptr,
-    LOGZ1_ptr, LOGZ2_ptr,
-    OUT_ptr,
+    lse1_ptr, lse2_ptr,
+    out_ptr,
     M, N, K,
     stride_xm, stride_xk,
     stride_w1k, stride_w1n,
     stride_w2k, stride_w2n,
+    n_start,
     BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
 ):
     pid_m = tl.program_id(0)
     offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
-    mmask = offs_m < M
+    offs_n = n_start + tl.arange(0, BLOCK_N)
+    offs_k = tl.arange(0, BLOCK_K)
 
-    # Load logZ for normalization
-    logz1 = tl.load(LOGZ1_ptr + offs_m, mask=mmask, other=-1.0e9)
-    logz2 = tl.load(LOGZ2_ptr + offs_m, mask=mmask, other=-1.0e9)
+    mask_m = offs_m < M
+    mask_n = offs_n < N
 
-    loss = tl.zeros([BLOCK_M], dtype=tl.float32)
+    # Matmul accumulators
+    acc1 = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    acc2 = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+    k0 = 0
+    while k0 < K:
+        kk = k0 + offs_k
+        mask_x = (offs_m[:, None] < M) & (kk[None, :] < K)
+        mask_w = (kk[:, None] < K) & (offs_n[None, :] < N)
+
+        x_ptrs = X_ptr + (offs_m[:, None] * stride_xm + kk[None, :] * stride_xk)
+        w1_ptrs = W1_ptr + (kk[:, None] * stride_w1k + offs_n[None, :] * stride_w1n)
+        w2_ptrs = W2_ptr + (kk[:, None] * stride_w2k + offs_n[None, :] * stride_w2n)
+
+        a = tl.load(x_ptrs, mask=mask_x, other=0.0)
+        b1 = tl.load(w1_ptrs, mask=mask_w, other=0.0)
+        b2 = tl.load(w2_ptrs, mask=mask_w, other=0.0)
+
+        acc1 += tl.dot(a, b1)
+        acc2 += tl.dot(a, b2)
+        k0 += BLOCK_K
+
+    # Add biases
+    b1v = tl.load(B1_ptr + offs_n, mask=mask_n, other=0.0)
+    b2v = tl.load(B2_ptr + offs_n, mask=mask_n, other=0.0)
+    acc1 += b1v[None, :]
+    acc2 += b2v[None, :]
+
+    valid_mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
+
+    # Load LSE values per row
+    lse1 = tl.load(lse1_ptr + offs_m, mask=mask_m, other=0.0)
+    lse2 = tl.load(lse2_ptr + offs_m, mask=mask_m, other=0.0)
+
+    # Compute logP, logQ
+    logP = acc1 - lse1[:, None]
+    logQ = acc2 - lse2[:, None]
+
+    # Stable computation of logM = log(0.5 * (exp(logP) + exp(logQ)))
+    # m_pair per element
+    # For invalid positions, set m_pair = 0 to avoid -inf - -inf
+    mpair = tl.where(valid_mask, tl.maximum(logP, logQ), 0.0)
+    z1 = tl.where(valid_mask, tl.exp(logP - mpair), 0.0)
+    z2 = tl.where(valid_mask, tl.exp(logQ - mpair), 0.0)
     ln2 = 0.6931471805599453
+    logM = tl.where(valid_mask, mpair + tl.log(z1 + z2) - ln2, 0.0)
 
-    # Loop over N in tiles
-    for n_start in range(0, N, BLOCK_N):
-        offs_n = n_start + tl.arange(0, BLOCK_N)
-        nmask = offs_n < N
+    P = tl.where(valid_mask, tl.exp(logP), 0.0)
+    Q = tl.where(valid_mask, tl.exp(logQ), 0.0)
 
-        # Compute logits tiles
-        acc1 = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
-        acc2 = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
+    contrib = P * (logP - logM) + Q * (logQ - logM)
 
-        for k_start in range(0, K, BLOCK_K):
-            offs_k = k_start + tl.arange(0, BLOCK_K)
-            kmask = offs_k < K
+    row_sum = tl.sum(contrib, axis=1)
 
-            a_ptrs = X_ptr + (offs_m[:, None] * stride_xm + offs_k[None, :] * stride_xk)
-            w1_ptrs = W1_ptr + (offs_k[:, None] * stride_w1k + offs_n[None, :] * stride_w1n)
-            w2_ptrs = W2_ptr + (offs_k[:, None] * stride_w2k + offs_n[None, :] * stride_w2n)
-
-            a = tl.load(a_ptrs, mask=mmask[:, None] & kmask[None, :], other=0.0).to(tl.float16)
-            w1 = tl.load(w1_ptrs, mask=kmask[:, None] & nmask[None, :], other=0.0).to(tl.float16)
-            w2 = tl.load(w2_ptrs, mask=kmask[:, None] & nmask[None, :], other=0.0).to(tl.float16)
-
-            acc1 += tl.dot(a, w1)
-            acc2 += tl.dot(a, w2)
-
-        # Add bias
-        b1 = tl.load(B1_ptr + offs_n, mask=nmask, other=0.0).to(tl.float32)
-        b2 = tl.load(B2_ptr + offs_n, mask=nmask, other=0.0).to(tl.float32)
-        acc1 += b1[None, :]
-        acc2 += b2[None, :]
-
-        # Compute logP/logQ and the contributions
-        # For masked columns, use a large negative value to avoid NaNs; then mask contribution to zero
-        neg_big = -1.0e9
-        acc1 = tl.where(nmask[None, :], acc1, neg_big)
-        acc2 = tl.where(nmask[None, :], acc2, neg_big)
-
-        logp = acc1 - logz1[:, None]
-        logq = acc2 - logz2[:, None]
-
-        m = tl.maximum(logp, logq)
-        # logsumexp(logp, logq)
-        lse2 = m + tl.log(tl.exp(logp - m) + tl.exp(logq - m))
-        logm = lse2 - ln2
-
-        p = tl.exp(logp)
-        q = tl.exp(logq)
-
-        contrib = 0.5 * (p * (logp - logm) + q * (logq - logm))
-        # Zero out invalid columns
-        contrib = tl.where(nmask[None, :], contrib, 0.0)
-        loss += tl.sum(contrib, 1)
-
-    tl.store(OUT_ptr + offs_m, loss, mask=mmask)
+    # Accumulate into output: out += 0.5 * row_sum
+    out_old = tl.load(out_ptr + offs_m, mask=mask_m, other=0.0)
+    out_new = out_old + 0.5 * row_sum
+    tl.store(out_ptr + offs_m, out_new, mask=mask_m)
 
 
 def fused_linear_jsd(X: torch.Tensor, W1: torch.Tensor, B1: torch.Tensor, W2: torch.Tensor, B2: torch.Tensor) -> torch.Tensor:
-    assert X.is_cuda and W1.is_cuda and W2.is_cuda and B1.is_cuda and B2.is_cuda, "All inputs must be CUDA tensors"
-    assert X.dtype == torch.float16 and W1.dtype == torch.float16 and W2.dtype == torch.float16, "X, W1, W2 must be float16"
-    assert B1.dtype == torch.float32 and B2.dtype == torch.float32, "Biases must be float32"
-    assert X.shape[1] == W1.shape[0] == W2.shape[0], "Incompatible K dims"
-    assert W1.shape[1] == W2.shape[1] == B1.shape[0] == B2.shape[0], "Incompatible N dims"
-
+    """
+    Fused linear layers with Jensen-Shannon Divergence computation.
+    Args:
+        X: (M, K) float16 CUDA
+        W1: (K, N) float16 CUDA
+        B1: (N,) float32 CUDA
+        W2: (K, N) float16 CUDA
+        B2: (N,) float32 CUDA
+    Returns:
+        (M,) float32 CUDA tensor with JSD per sample
+    """
+    assert X.is_cuda and W1.is_cuda and W2.is_cuda and B1.is_cuda and B2.is_cuda
+    assert X.dtype == torch.float16
+    assert W1.dtype == torch.float16 and W2.dtype == torch.float16
+    assert B1.dtype == torch.float32 and B2.dtype == torch.float32
     M, K = X.shape
-    N = W1.shape[1]
+    K1, N = W1.shape
+    K2, N2 = W2.shape
+    assert K1 == K and K2 == K and N2 == N
+    assert B1.numel() == N and B2.numel() == N
 
-    # Allocate temporary and output
-    logz1 = torch.empty((M,), dtype=torch.float32, device=X.device)
-    logz2 = torch.empty((M,), dtype=torch.float32, device=X.device)
-    out = torch.empty((M,), dtype=torch.float32, device=X.device)
+    # Allocate temporary buffers
+    device = X.device
+    m1 = torch.full((M,), float("-inf"), dtype=torch.float32, device=device)
+    s1 = torch.zeros((M,), dtype=torch.float32, device=device)
+    m2 = torch.full((M,), float("-inf"), dtype=torch.float32, device=device)
+    s2 = torch.zeros((M,), dtype=torch.float32, device=device)
 
-    # Compute strides
-    stride_xm = X.stride(0)
-    stride_xk = X.stride(1)
+    # Tuning parameters
+    BLOCK_M = 32
+    BLOCK_N = 128
+    BLOCK_K = 32
+    num_warps = 8
+    num_stages = 4
 
-    stride_w1k = W1.stride(0)
-    stride_w1n = W1.stride(1)
-    stride_w2k = W2.stride(0)
-    stride_w2n = W2.stride(1)
+    grid = lambda META: (triton.cdiv(M, META["BLOCK_M"]),)
 
-    # Launch pass1
-    grid = lambda META: (triton.cdiv(M, META['BLOCK_M']),)
-    _pass1_lse_kernel[grid](
-        X, W1, B1, W2, B2,
-        M, N, K,
-        stride_xm, stride_xk,
-        stride_w1k, stride_w1n,
-        stride_w2k, stride_w2n,
-        logz1, logz2,
-    )
+    # Pass 1: stream over N blocks to compute LSE for both logits
+    for n_start in range(0, N, BLOCK_N):
+        _pass1_update_kernel[grid](
+            X, W1, B1, W2, B2,
+            m1, s1, m2, s2,
+            M, N, K,
+            X.stride(0), X.stride(1),
+            W1.stride(0), W1.stride(1),
+            W2.stride(0), W2.stride(1),
+            n_start,
+            BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K,
+            num_warps=num_warps, num_stages=num_stages
+        )
 
-    # Launch pass2
-    _pass2_jsd_kernel[grid](
-        X, W1, B1, W2, B2,
-        logz1, logz2,
-        out,
-        M, N, K,
-        stride_xm, stride_xk,
-        stride_w1k, stride_w1n,
-        stride_w2k, stride_w2n,
-    )
+    # Compute LSE values
+    lse1 = torch.log(s1) + m1
+    lse2 = torch.log(s2) + m2
+
+    # Pass 2: compute JSD accumulation using the LSE values
+    out = torch.zeros((M,), dtype=torch.float32, device=device)
+    for n_start in range(0, N, BLOCK_N):
+        _pass2_update_kernel[grid](
+            X, W1, B1, W2, B2,
+            lse1, lse2, out,
+            M, N, K,
+            X.stride(0), X.stride(1),
+            W1.stride(0), W1.stride(1),
+            W2.stride(0), W2.stride(1),
+            n_start,
+            BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K,
+            num_warps=num_warps, num_stages=num_stages
+        )
 
     return out
 
 
 class Solution:
     def solve(self, spec_path: str = None) -> dict:
-        code = r'''
-import math
-import torch
-import triton
-import triton.language as tl
-
-
-@triton.autotune(
-    configs=[
-        triton.Config({'BLOCK_M': 8, 'BLOCK_N': 128, 'BLOCK_K': 32}, num_warps=4, num_stages=2),
-        triton.Config({'BLOCK_M': 8, 'BLOCK_N': 256, 'BLOCK_K': 32}, num_warps=8, num_stages=2),
-        triton.Config({'BLOCK_M': 16, 'BLOCK_N': 128, 'BLOCK_K': 64}, num_warps=4, num_stages=2),
-        triton.Config({'BLOCK_M': 16, 'BLOCK_N': 256, 'BLOCK_K': 64}, num_warps=8, num_stages=2),
-        triton.Config({'BLOCK_M': 4, 'BLOCK_N': 128, 'BLOCK_K': 32}, num_warps=2, num_stages=2),
-    ],
-    key=['M', 'N', 'K'],
-)
-@triton.jit
-def _pass1_lse_kernel(
-    X_ptr, W1_ptr, B1_ptr, W2_ptr, B2_ptr,
-    M, N, K,
-    stride_xm, stride_xk,
-    stride_w1k, stride_w1n,
-    stride_w2k, stride_w2n,
-    LOGZ1_ptr, LOGZ2_ptr,
-    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
-):
-    pid_m = tl.program_id(0)
-    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
-    mmask = offs_m < M
-
-    neg_big = tl.full([BLOCK_M], -1.0e9, tl.float32)
-    m1 = neg_big
-    m2 = neg_big
-    s1 = tl.zeros([BLOCK_M], dtype=tl.float32)
-    s2 = tl.zeros([BLOCK_M], dtype=tl.float32)
-
-    for n_start in range(0, N, BLOCK_N):
-        offs_n = n_start + tl.arange(0, BLOCK_N)
-        nmask = offs_n < N
-
-        acc1 = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
-        acc2 = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
-
-        for k_start in range(0, K, BLOCK_K):
-            offs_k = k_start + tl.arange(0, BLOCK_K)
-            kmask = offs_k < K
-
-            a_ptrs = X_ptr + (offs_m[:, None] * stride_xm + offs_k[None, :] * stride_xk)
-            w1_ptrs = W1_ptr + (offs_k[:, None] * stride_w1k + offs_n[None, :] * stride_w1n)
-            w2_ptrs = W2_ptr + (offs_k[:, None] * stride_w2k + offs_n[None, :] * stride_w2n)
-
-            a = tl.load(a_ptrs, mask=mmask[:, None] & kmask[None, :], other=0.0).to(tl.float16)
-            w1 = tl.load(w1_ptrs, mask=kmask[:, None] & nmask[None, :], other=0.0).to(tl.float16)
-            w2 = tl.load(w2_ptrs, mask=kmask[:, None] & nmask[None, :], other=0.0).to(tl.float16)
-
-            acc1 += tl.dot(a, w1)
-            acc2 += tl.dot(a, w2)
-
-        b1 = tl.load(B1_ptr + offs_n, mask=nmask, other=0.0).to(tl.float32)
-        b2 = tl.load(B2_ptr + offs_n, mask=nmask, other=0.0).to(tl.float32)
-        acc1 += b1[None, :]
-        acc2 += b2[None, :]
-
-        neg_val = -1.0e9
-        acc1 = tl.where(nmask[None, :], acc1, neg_val)
-        acc2 = tl.where(nmask[None, :], acc2, neg_val)
-
-        tile_max1 = tl.max(acc1, 1)
-        tile_max2 = tl.max(acc2, 1)
-
-        new_m1 = tl.maximum(m1, tile_max1)
-        new_m2 = tl.maximum(m2, tile_max2)
-
-        s1 = s1 * tl.exp(m1 - new_m1)
-        s2 = s2 * tl.exp(m2 - new_m2)
-
-        s1 += tl.sum(tl.exp(acc1 - new_m1[:, None]), 1)
-        s2 += tl.sum(tl.exp(acc2 - new_m2[:, None]), 1)
-
-        m1 = new_m1
-        m2 = new_m2
-
-    eps = 1e-20
-    logz1 = m1 + tl.log(tl.maximum(s1, eps))
-    logz2 = m2 + tl.log(tl.maximum(s2, eps))
-
-    tl.store(LOGZ1_ptr + offs_m, logz1, mask=mmask)
-    tl.store(LOGZ2_ptr + offs_m, logz2, mask=mmask)
-
-
-@triton.autotune(
-    configs=[
-        triton.Config({'BLOCK_M': 8, 'BLOCK_N': 128, 'BLOCK_K': 32}, num_warps=4, num_stages=2),
-        triton.Config({'BLOCK_M': 8, 'BLOCK_N': 256, 'BLOCK_K': 32}, num_warps=8, num_stages=2),
-        triton.Config({'BLOCK_M': 16, 'BLOCK_N': 128, 'BLOCK_K': 64}, num_warps=4, num_stages=2),
-        triton.Config({'BLOCK_M': 16, 'BLOCK_N': 256, 'BLOCK_K': 64}, num_warps=8, num_stages=2),
-        triton.Config({'BLOCK_M': 4, 'BLOCK_N': 128, 'BLOCK_K': 32}, num_warps=2, num_stages=2),
-    ],
-    key=['M', 'N', 'K'],
-)
-@triton.jit
-def _pass2_jsd_kernel(
-    X_ptr, W1_ptr, B1_ptr, W2_ptr, B2_ptr,
-    LOGZ1_ptr, LOGZ2_ptr,
-    OUT_ptr,
-    M, N, K,
-    stride_xm, stride_xk,
-    stride_w1k, stride_w1n,
-    stride_w2k, stride_w2n,
-    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
-):
-    pid_m = tl.program_id(0)
-    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
-    mmask = offs_m < M
-
-    logz1 = tl.load(LOGZ1_ptr + offs_m, mask=mmask, other=-1.0e9)
-    logz2 = tl.load(LOGZ2_ptr + offs_m, mask=mmask, other=-1.0e9)
-
-    loss = tl.zeros([BLOCK_M], dtype=tl.float32)
-    ln2 = 0.6931471805599453
-
-    for n_start in range(0, N, BLOCK_N):
-        offs_n = n_start + tl.arange(0, BLOCK_N)
-        nmask = offs_n < N
-
-        acc1 = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
-        acc2 = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
-
-        for k_start in range(0, K, BLOCK_K):
-            offs_k = k_start + tl.arange(0, BLOCK_K)
-            kmask = offs_k < K
-
-            a_ptrs = X_ptr + (offs_m[:, None] * stride_xm + offs_k[None, :] * stride_xk)
-            w1_ptrs = W1_ptr + (offs_k[:, None] * stride_w1k + offs_n[None, :] * stride_w1n)
-            w2_ptrs = W2_ptr + (offs_k[:, None] * stride_w2k + offs_n[None, :] * stride_w2n)
-
-            a = tl.load(a_ptrs, mask=mmask[:, None] & kmask[None, :], other=0.0).to(tl.float16)
-            w1 = tl.load(w1_ptrs, mask=kmask[:, None] & nmask[None, :], other=0.0).to(tl.float16)
-            w2 = tl.load(w2_ptrs, mask=kmask[:, None] & nmask[None, :], other=0.0).to(tl.float16)
-
-            acc1 += tl.dot(a, w1)
-            acc2 += tl.dot(a, w2)
-
-        b1 = tl.load(B1_ptr + offs_n, mask=nmask, other=0.0).to(tl.float32)
-        b2 = tl.load(B2_ptr + offs_n, mask=nmask, other=0.0).to(tl.float32)
-        acc1 += b1[None, :]
-        acc2 += b2[None, :]
-
-        neg_big = -1.0e9
-        acc1 = tl.where(nmask[None, :], acc1, neg_big)
-        acc2 = tl.where(nmask[None, :], acc2, neg_big)
-
-        logp = acc1 - logz1[:, None]
-        logq = acc2 - logz2[:, None]
-
-        m = tl.maximum(logp, logq)
-        lse2 = m + tl.log(tl.exp(logp - m) + tl.exp(logq - m))
-        logm = lse2 - ln2
-
-        p = tl.exp(logp)
-        q = tl.exp(logq)
-
-        contrib = 0.5 * (p * (logp - logm) + q * (logq - logm))
-        contrib = tl.where(nmask[None, :], contrib, 0.0)
-        loss += tl.sum(contrib, 1)
-
-    tl.store(OUT_ptr + offs_m, loss, mask=mmask)
-
-
-def fused_linear_jsd(X: torch.Tensor, W1: torch.Tensor, B1: torch.Tensor, W2: torch.Tensor, B2: torch.Tensor) -> torch.Tensor:
-    assert X.is_cuda and W1.is_cuda and W2.is_cuda and B1.is_cuda and B2.is_cuda, "All inputs must be CUDA tensors"
-    assert X.dtype == torch.float16 and W1.dtype == torch.float16 and W2.dtype == torch.float16, "X, W1, W2 must be float16"
-    assert B1.dtype == torch.float32 and B2.dtype == torch.float32, "Biases must be float32"
-    assert X.shape[1] == W1.shape[0] == W2.shape[0], "Incompatible K dims"
-    assert W1.shape[1] == W2.shape[1] == B1.shape[0] == B2.shape[0], "Incompatible N dims"
-
-    M, K = X.shape
-    N = W1.shape[1]
-
-    logz1 = torch.empty((M,), dtype=torch.float32, device=X.device)
-    logz2 = torch.empty((M,), dtype=torch.float32, device=X.device)
-    out = torch.empty((M,), dtype=torch.float32, device=X.device)
-
-    stride_xm = X.stride(0)
-    stride_xk = X.stride(1)
-    stride_w1k = W1.stride(0)
-    stride_w1n = W1.stride(1)
-    stride_w2k = W2.stride(0)
-    stride_w2n = W2.stride(1)
-
-    grid = lambda META: (triton.cdiv(M, META['BLOCK_M']),)
-
-    _pass1_lse_kernel[grid](
-        X, W1, B1, W2, B2,
-        M, N, K,
-        stride_xm, stride_xk,
-        stride_w1k, stride_w1n,
-        stride_w2k, stride_w2n,
-        logz1, logz2,
-    )
-
-    _pass2_jsd_kernel[grid](
-        X, W1, B1, W2, B2,
-        logz1, logz2,
-        out,
-        M, N, K,
-        stride_xm, stride_xk,
-        stride_w1k, stride_w1n,
-        stride_w2k, stride_w2n,
-    )
-
-    return out
-'''
-        return {"code": code}
+        code = inspect.getsource(triton)  # dummy to ensure import in the output code string
+        program_code = (
+            "import torch\n"
+            "import triton\n"
+            "import triton.language as tl\n\n"
+            + inspect.getsource(_pass1_update_kernel)
+            + "\n\n"
+            + inspect.getsource(_pass2_update_kernel)
+            + "\n\n"
+            + inspect.getsource(fused_linear_jsd)
+        )
+        return {"code": program_code}

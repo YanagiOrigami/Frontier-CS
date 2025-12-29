@@ -8,7 +8,7 @@ from sky_spot.utils import ClusterType
 class Solution(MultiRegionStrategy):
     """Your multi-region scheduling strategy."""
 
-    NAME = "cant_be_late_multi_v1"  # REQUIRED: unique identifier
+    NAME = "my_strategy"  # REQUIRED: unique identifier
 
     def solve(self, spec_path: str) -> "Solution":
         """
@@ -31,15 +31,69 @@ class Solution(MultiRegionStrategy):
         )
         super().__init__(args)
 
-        # Internal state: whether we've committed to always using on-demand
-        self._commit_on_demand = False
+        # Extract core parameters (seconds), handling both scalar and list forms.
+        try:
+            if isinstance(self.deadline, (list, tuple)):
+                deadline_seconds = float(self.deadline[0])
+            else:
+                deadline_seconds = float(self.deadline)
+        except AttributeError:
+            deadline_seconds = float(getattr(self, "deadline", 0.0))
 
-        # Precompute a conservative safety margin:
-        # one full step (gap) plus twice the restart overhead
-        # (covers existing + future restart overheads).
-        self._safety_margin = self.env.gap_seconds + 2.0 * self.restart_overhead
+        try:
+            if isinstance(self.task_duration, (list, tuple)):
+                task_duration_seconds = float(self.task_duration[0])
+            else:
+                task_duration_seconds = float(self.task_duration)
+        except AttributeError:
+            task_duration_seconds = float(getattr(self, "task_duration", 0.0))
+
+        try:
+            if isinstance(self.restart_overhead, (list, tuple)):
+                restart_overhead_seconds = float(self.restart_overhead[0])
+            else:
+                restart_overhead_seconds = float(self.restart_overhead)
+        except AttributeError:
+            restart_overhead_seconds = float(getattr(self, "restart_overhead", 0.0))
+
+        self._deadline_sec = deadline_seconds
+        self._task_duration_sec = task_duration_seconds
+        self._restart_overhead_sec = restart_overhead_seconds
+
+        # Scheduling parameters based on slack.
+        slack_total = max(0.0, deadline_seconds - task_duration_seconds)
+
+        # Safety buffer before fully committing to on-demand.
+        # At least twice the restart overhead, and at least 10% of initial slack.
+        self._safety_buffer_seconds = max(
+            2.0 * restart_overhead_seconds,
+            0.1 * slack_total,
+        )
+
+        # If slack exceeds this threshold, we're comfortable idling when spot is down.
+        self._wait_slack_threshold = 0.5 * slack_total
+
+        # Incremental tracking of completed work to avoid O(n) summations.
+        self._total_done_time = 0.0
+        self._last_done_index = 0
+
+        # Control flags and counters.
+        self._forced_on_demand = False
+        self._step_counter = 0
 
         return self
+
+    def _update_done_time_cache(self) -> None:
+        """Incrementally accumulate completed work time."""
+        td = self.task_done_time
+        last = self._last_done_index
+        n = len(td)
+        if n > last:
+            total = self._total_done_time
+            for i in range(last, n):
+                total += td[i]
+            self._total_done_time = total
+            self._last_done_index = n
 
     def _step(self, last_cluster_type: ClusterType, has_spot: bool) -> ClusterType:
         """
@@ -47,35 +101,40 @@ class Solution(MultiRegionStrategy):
 
         Returns: ClusterType.SPOT, ClusterType.ON_DEMAND, or ClusterType.NONE
         """
-        # Sum of completed work so far
-        done = sum(self.task_done_time) if self.task_done_time else 0.0
-        remaining_work = max(0.0, self.task_duration - done)
+        self._step_counter += 1
 
-        # If task is already finished, don't run any more compute
+        # Update cached total amount of work done.
+        self._update_done_time_cache()
+        remaining_work = self._task_duration_sec - self._total_done_time
         if remaining_work <= 0.0:
+            # Task already completed.
             return ClusterType.NONE
 
-        time_left = self.deadline - self.env.elapsed_seconds
+        # Time information.
+        elapsed = float(self.env.elapsed_seconds)
+        remaining_time = self._deadline_sec - elapsed
 
-        # If we have already committed, keep using on-demand
-        if self._commit_on_demand:
+        if remaining_time <= 0.0:
+            # Out of time; best effort is to use on-demand.
             return ClusterType.ON_DEMAND
 
-        # Determine whether we can afford to "gamble" one more step
-        # on spot (or waiting) without risking the deadline.
-        # We only gamble if, after potentially wasting one full gap
-        # with zero progress, we can still finish the remaining work
-        # plus at most ~2*restart_overhead time.
-        if time_left <= remaining_work + self._safety_margin:
-            # Not enough slack to keep waiting or relying on spot:
-            # commit to on-demand from now on.
-            self._commit_on_demand = True
+        # Check if we must commit to on-demand to safely meet deadline.
+        if (not self._forced_on_demand) and remaining_time <= remaining_work + self._safety_buffer_seconds:
+            self._forced_on_demand = True
+
+        if self._forced_on_demand:
             return ClusterType.ON_DEMAND
 
-        # We are safely far from the deadline: use Spot if available,
-        # otherwise wait (no cluster) to avoid expensive on-demand.
+        # Opportunistic phase: prefer Spot when available.
         if has_spot:
             return ClusterType.SPOT
 
-        # No spot available and plenty of slack: pause to wait for spot.
-        return ClusterType.NONE
+        # Spot not available: decide between waiting (NONE) and using On-Demand.
+        slack = remaining_time - remaining_work
+
+        # If we still have plenty of slack, we can afford to wait for Spot.
+        if slack > self._wait_slack_threshold:
+            return ClusterType.NONE
+
+        # Slack is shrinking but not yet critical: use On-Demand to keep progress steady.
+        return ClusterType.ON_DEMAND

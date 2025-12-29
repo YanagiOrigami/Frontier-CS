@@ -1,4 +1,5 @@
 import pandas as pd
+import numpy as np
 
 class Solution:
     def solve(
@@ -13,76 +14,77 @@ class Solution:
         parallel: bool = True,
     ) -> pd.DataFrame:
         df = df.copy()
+        col_set = set(df.columns)
         if col_merge is not None:
-            for group in col_merge:
-                if isinstance(group, list) and len(group) > 1:
-                    merged_name = '_'.join(group)
-                    df[merged_name] = df[group].apply(lambda x: ''.join(x.astype(str).values), axis=1)
-                    df = df.drop(columns=group)
-        columns = list(df.columns)
-        if len(columns) == 0:
+            for grp in col_merge:
+                grp = [c for c in grp if c in col_set]
+                if len(grp) > 1:
+                    mname = 'merged_' + '_'.join(sorted(grp))
+                    i = 0
+                    while mname in col_set:
+                        i += 1
+                        mname = f'merged_{i}_' + '_'.join(sorted(grp))
+                    df[mname] = df[grp].astype(str).apply(lambda x: ''.join(x), axis=1)
+                    df = df.drop(columns=grp)
+                    col_set.add(mname)
+                    col_set.difference_update(grp)
+        cols = list(df.columns)
+        M = len(cols)
+        if M <= 1:
             return df
-        approx_n = min(row_stop, len(df))
-        approx_df = df.iloc[:approx_n]
-        str_df = approx_df.astype(str)
-        remaining = list(columns)
-        current_order = []
-
-        def get_partial_strings(order):
-            partials = []
-            for i in range(approx_n):
-                s = ''.join(str_df.iloc[i][c] for c in order)
-                partials.append(s)
-            return partials
-
-        def compute_sum_lcp(partials):
-            if len(partials) < 2:
-                return 0.0
-            trie = {}
-            def insert(s):
-                node = trie
-                for c in s:
-                    node = node.setdefault(c, {})
-            def query(s):
-                node = trie
-                d = 0
-                for c in s:
-                    if c in node:
-                        node = node[c]
-                        d += 1
-                    else:
-                        break
-                return d
-            sum_lcp = 0
-            for i in range(len(partials)):
-                if i > 0:
-                    sum_lcp += query(partials[i])
-                insert(partials[i])
-            total_len = sum(len(s) for s in partials)
-            if total_len == 0:
-                return 0.0
-            return sum_lcp / total_len
-
-        for _ in range(len(columns)):
+        N = len(df)
+        sample_size = row_stop * 1000
+        sample_size = min(sample_size, N)
+        if sample_size < N:
+            idx = np.random.choice(N, sample_size, replace=False)
+            idx.sort()
+            df_s = df.iloc[idx].reset_index(drop=True)
+        else:
+            df_s = df
+        ordered = []
+        remaining = set(cols)
+        max_steps = col_stop * 4
+        max_steps = min(max_steps, M)
+        for step in range(max_steps):
             if not remaining:
                 break
-            best_col = None
-            best_rate = -1
-            for col in remaining:
-                temp_order = current_order + [col]
-                partials = get_partial_strings(temp_order)
-                rate = compute_sum_lcp(partials)
-                if rate > best_rate:
-                    best_rate = rate
-                    best_col = col
-            if best_col is None:
+            prev_cols = ordered[:]
+            candidates = list(remaining)
+            best_additional = -np.inf
+            best_cand = None
+            for cand in candidates:
+                group_keys = prev_cols + [cand]
+                g = df_s.groupby(group_keys, dropna=False)
+                sizes = g.size()
+                additional = 0.0
+                if len(prev_cols) == 0:
+                    for val, f in sizes.items():
+                        if f >= 2:
+                            additional += (f - 1) * len(str(val))
+                else:
+                    for idx, f in sizes.items():
+                        if f >= 2:
+                            val_cand = idx[-1]
+                            additional += (f - 1) * len(str(val_cand))
+                if additional > best_additional:
+                    best_additional = additional
+                    best_cand = cand
+            if best_cand is None or best_additional <= 0:
                 break
-            current_order.append(best_col)
-            remaining.remove(best_col)
-        if remaining:
-            full_n = len(df)
-            diversity = {col: df[col].nunique() / full_n for col in remaining}
-            remaining.sort(key=lambda c: (diversity[c], c))
-            current_order += remaining
-        df = df[current_order]
-        return df
+            ordered.append(best_cand)
+            remaining.discard(best_cand)
+        remain_cols = list(remaining)
+        if remain_cols:
+            scores = {}
+            dist_counts = {}
+            for c in remain_cols:
+                str_series = df[c].astype(str)
+                vc = str_series.value_counts()
+                scores[c] = vc.max() / N if len(vc) > 0 else 0
+                dist_counts[c] = len(str_series.unique()) / N
+            low_dist = [c for c in remain_cols if dist_counts[c] <= distinct_value_threshold]
+            high_dist = [c for c in remain_cols if dist_counts[c] > distinct_value_threshold]
+            low_dist.sort(key=lambda c: -scores[c])
+            high_dist.sort(key=lambda c: -scores[c])
+            ordered += low_dist + high_dist
+        return df[ordered]

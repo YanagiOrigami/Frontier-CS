@@ -1,166 +1,6 @@
 import pandas as pd
-import math
-from typing import List, Dict, Tuple
-
-
-def _lcp_len(a: str, b: str) -> int:
-    n = min(len(a), len(b))
-    i = 0
-    while i < n and a[i] == b[i]:
-        i += 1
-    return i
-
-
-class _ColumnInfo:
-    __slots__ = (
-        "name",
-        "lens",
-        "order",
-        "rank",
-        "lcp_arr",
-        "st",
-        "val_id",
-        "unique_count",
-        "sum_len",
-        "values",
-    )
-
-    def __init__(self, name: str):
-        self.name = name
-        self.lens: List[int] = []
-        self.order: List[int] = []
-        self.rank: List[int] = []
-        self.lcp_arr: List[int] = []
-        self.st: List[List[int]] = []
-        self.val_id: List[int] = []
-        self.unique_count: int = 0
-        self.sum_len: int = 0
-        self.values: List[str] = []
-
-
-def _build_sparse_table(arr: List[int]) -> List[List[int]]:
-    n = len(arr)
-    if n == 0:
-        return []
-    K = (n).bit_length()
-    st = [arr[:]]
-    k = 1
-    while (1 << k) <= n:
-        prev = st[k - 1]
-        size = n - (1 << k) + 1
-        curr = [0] * size
-        half = 1 << (k - 1)
-        for i in range(size):
-            a = prev[i]
-            b = prev[i + half]
-            curr[i] = a if a < b else b
-        st.append(curr)
-        k += 1
-    return st
-
-
-def _rmq_query(st: List[List[int]], logs: List[int], l: int, r: int) -> int:
-    # Query min on [l, r], assumes l <= r
-    if l > r:
-        return 0
-    length = r - l + 1
-    k = logs[length]
-    a = st[k][l]
-    b = st[k][r - (1 << k) + 1]
-    return a if a < b else b
-
-
-def _compute_column_info(df: pd.DataFrame, col: str, n_use: int, logs: List[int]) -> _ColumnInfo:
-    ci = _ColumnInfo(col)
-    # Extract string values for first n_use rows
-    vals = df[col].astype(str).values[:n_use]
-    # Convert to Python list of strings for faster access
-    values = [str(v) for v in vals]
-    ci.values = values
-    n = len(values)
-    lens = [len(v) for v in values]
-    ci.lens = lens
-    ci.sum_len = sum(lens)
-    # Sorted order by values
-    order = list(range(n))
-    order.sort(key=values.__getitem__)
-    ci.order = order
-    rank = [0] * n
-    for pos, idx in enumerate(order):
-        rank[idx] = pos
-    ci.rank = rank
-    # Build lcp array between adjacent in sorted order
-    if n >= 2:
-        lcp_arr = [0] * (n - 1)
-        prev_idx = order[0]
-        prev_val = values[prev_idx]
-        for i in range(n - 1):
-            a_idx = order[i]
-            b_idx = order[i + 1]
-            lcp_arr[i] = _lcp_len(values[a_idx], values[b_idx])
-        ci.lcp_arr = lcp_arr
-        ci.st = _build_sparse_table(lcp_arr)
-    else:
-        ci.lcp_arr = []
-        ci.st = []
-    # Build value id per row based on equality groups in sorted order
-    val_id = [0] * n
-    unique_count = 0
-    if n > 0:
-        unique_count = 1
-        val_id[order[0]] = 0
-        last_val = values[order[0]]
-        curr_id = 0
-        for pos in range(1, n):
-            idx = order[pos]
-            v = values[idx]
-            if v != last_val:
-                curr_id += 1
-                last_val = v
-            val_id[idx] = curr_id
-        unique_count = curr_id + 1
-    ci.val_id = val_id
-    ci.unique_count = unique_count
-    return ci
-
-
-def _subset_trie_cost(ci: _ColumnInfo, group_rows: List[int], logs: List[int]) -> int:
-    # For the subset of rows, compute trie size for this column's values
-    sz = len(group_rows)
-    if sz == 0:
-        return 0
-    if sz == 1:
-        return ci.lens[group_rows[0]]
-    # Sum of lengths
-    total_len = 0
-    for r in group_rows:
-        total_len += ci.lens[r]
-    # Sort ranks
-    ranks = [ci.rank[r] for r in group_rows]
-    ranks.sort()
-    # Sum of LCP between adjacent in sorted subset
-    if not ci.st:
-        # no lcp array (n_use<=1), but sz>=2 shouldn't happen; guard
-        return total_len
-    sum_lcp = 0
-    for i in range(1, sz):
-        r1 = ranks[i - 1]
-        r2 = ranks[i]
-        # lcp between ranks r1 and r2 is RMQ over lcp_arr indices [r1, r2-1]
-        sum_lcp += _rmq_query(ci.st, logs, r1, r2 - 1)
-    return total_len - sum_lcp
-
-
-def _partition_by_column(ci: _ColumnInfo, group_rows: List[int]) -> List[List[int]]:
-    buckets: Dict[int, List[int]] = {}
-    get_val_id = ci.val_id.__getitem__
-    for r in group_rows:
-        vid = get_val_id(r)
-        if vid in buckets:
-            buckets[vid].append(r)
-        else:
-            buckets[vid] = [r]
-    return list(buckets.values())
+import numpy as np
+from typing import List, Optional, Tuple, Dict, Any
 
 
 class Solution:
@@ -175,91 +15,194 @@ class Solution:
         distinct_value_threshold: float = 0.7,
         parallel: bool = True,
     ) -> pd.DataFrame:
-        # Apply column merges if specified
-        df_mod = df.copy()
-        if col_merge:
-            used_cols = set()
-            for idx, group in enumerate(col_merge):
-                if not group:
-                    continue
-                cols = [c for c in group if c in df_mod.columns and c not in used_cols]
-                if len(cols) <= 1:
-                    for c in cols:
-                        used_cols.add(c)
-                    continue
-                # Merge order as given in group list (filtered by existence)
-                base_name = cols[0]
-                # Build merged series
-                s = df_mod[cols[0]].astype(str)
-                for c in cols[1:]:
-                    s = s + df_mod[c].astype(str)
-                # Assign to base_name and drop others
-                df_mod[base_name] = s
-                for c in cols[1:]:
-                    if c in df_mod.columns:
-                        del df_mod[c]
-                for c in cols:
-                    used_cols.add(c)
+        df_prepared = self._apply_merges_as_strings(df, col_merge)
+        if df_prepared.shape[1] <= 1:
+            return df_prepared
 
-        # Determine number of rows to use for optimization
-        n_rows = len(df_mod)
-        if n_rows == 0:
-            return df_mod
-        n_use = n_rows if early_stop is None else min(n_rows, int(early_stop))
-        if n_use < 1:
-            n_use = min(n_rows, 1)
+        order = self._greedy_order(df_prepared)
+        ordered_cols = [df_prepared.columns[i] for i in order]
+        return df_prepared[ordered_cols]
 
-        cols_list = list(df_mod.columns)
-        m = len(cols_list)
-        if m <= 1:
-            return df_mod
+    def _apply_merges_as_strings(self, df: pd.DataFrame, col_merge: Optional[List[List[Any]]]) -> pd.DataFrame:
+        # Convert all to string once
+        # Avoid deep copy; create new DataFrame with object dtype strings
+        df_str = df.astype(str).copy()
 
-        # Precompute log values for RMQ queries up to n_use
-        max_len = max(1, n_use)
-        logs = [0] * (max_len + 1)
-        for i in range(2, max_len + 1):
-            logs[i] = logs[i // 2] + 1
+        if not col_merge:
+            return df_str
 
-        # Build ColumnInfo for each column
-        col_infos: List[_ColumnInfo] = []
-        for c in cols_list:
-            ci = _compute_column_info(df_mod, c, n_use, logs)
-            col_infos.append(ci)
+        # Normalize merge specs to column names
+        cols_list = list(df_str.columns)
+        name_set = set(cols_list)
 
-        # Greedy selection of columns minimizing incremental trie cost at each depth
-        remaining = list(range(m))
-        groups: List[List[int]] = [list(range(n_use))]
-        order_idx: List[int] = []
+        merged_cols_to_drop = set()
+        merged_new_cols = []
+
+        for idx, group in enumerate(col_merge):
+            if not group:
+                continue
+            # Normalize group items to column names
+            group_names = []
+            for g in group:
+                if isinstance(g, int):
+                    if 0 <= g < len(cols_list):
+                        cname = cols_list[g]
+                        if cname in name_set:
+                            group_names.append(cname)
+                else:
+                    if g in name_set:
+                        group_names.append(g)
+            # Ensure unique and preserve order in the given list
+            if not group_names:
+                continue
+            # If only one column, treat as no-op, but still avoid duplicate merging
+            if len(group_names) == 1:
+                # nothing to merge; keep as is
+                continue
+
+            # Build merged column values row-wise
+            # Use vectorized join via Python list comprehension over rows
+            subvals = df_str[group_names].values.tolist()
+            merged_vals = [''.join(row) for row in subvals]
+
+            # Create new column name
+            new_col_name = f"MERGED_{idx}"
+            # Ensure uniqueness in case of clashes
+            suffix = 1
+            base_name = new_col_name
+            while new_col_name in df_str.columns or new_col_name in merged_cols_to_drop:
+                new_col_name = f"{base_name}_{suffix}"
+                suffix += 1
+
+            df_str[new_col_name] = merged_vals
+            merged_new_cols.append(new_col_name)
+            # Mark original group columns for removal
+            for c in group_names:
+                merged_cols_to_drop.add(c)
+
+        if merged_cols_to_drop:
+            # Drop merged columns
+            remaining_cols = [c for c in df_str.columns if c not in merged_cols_to_drop]
+            df_str = df_str[remaining_cols]
+
+        return df_str
+
+    def _factorize_column(self, arr: np.ndarray) -> Tuple[np.ndarray, Dict[Any, int]]:
+        # Map each unique string value to an integer code in scan order
+        n = arr.shape[0]
+        codes = np.empty(n, dtype=np.int32)
+        mapping: Dict[Any, int] = {}
+        next_id = 0
+        for i in range(n):
+            v = arr[i]
+            cid = mapping.get(v)
+            if cid is None:
+                cid = next_id
+                mapping[v] = cid
+                next_id += 1
+            codes[i] = cid
+        return codes, mapping
+
+    def _compute_lengths(self, arr: np.ndarray) -> np.ndarray:
+        # arr: numpy object array of strings
+        # Compute lengths efficiently
+        return np.fromiter((len(x) for x in arr), dtype=np.int32, count=arr.shape[0])
+
+    def _evaluate_candidate_increment(self, prefix_ids: Optional[np.ndarray], cand_codes: np.ndarray, cand_lens: np.ndarray) -> int:
+        n = cand_codes.shape[0]
+        # Sum of lengths for rows where prefix+cand key has appeared before (in earlier indices)
+        if prefix_ids is None:
+            seen = set()
+            total = 0
+            for i in range(n):
+                key = int(cand_codes[i])
+                if key in seen:
+                    total += int(cand_lens[i])
+                else:
+                    seen.add(key)
+            return total
+        else:
+            seen = set()
+            total = 0
+            # Use tuple of (prefix_id, cand_code)
+            for i in range(n):
+                key = (int(prefix_ids[i]), int(cand_codes[i]))
+                if key in seen:
+                    total += int(cand_lens[i])
+                else:
+                    seen.add(key)
+            return total
+
+    def _build_new_prefix_ids(self, prefix_ids: Optional[np.ndarray], cand_codes: np.ndarray) -> np.ndarray:
+        n = cand_codes.shape[0]
+        if prefix_ids is None:
+            # No need to remap: use candidate codes as prefix ids
+            return cand_codes.copy()
+        mapping: Dict[Tuple[int, int], int] = {}
+        next_id = 0
+        new_ids = np.empty(n, dtype=np.int32)
+        for i in range(n):
+            key = (int(prefix_ids[i]), int(cand_codes[i]))
+            nid = mapping.get(key)
+            if nid is None:
+                nid = next_id
+                mapping[key] = nid
+                next_id += 1
+            new_ids[i] = nid
+        return new_ids
+
+    def _greedy_order(self, df_str: pd.DataFrame) -> List[int]:
+        cols = list(df_str.columns)
+        m = len(cols)
+        n = len(df_str)
+
+        # Prepare arrays for each column
+        # Convert columns to numpy object arrays
+        col_arrays: List[np.ndarray] = [df_str[c].values.astype(object) for c in cols]
+        col_lens: List[np.ndarray] = [self._compute_lengths(arr) for arr in col_arrays]
+        col_codes: List[np.ndarray] = [self._factorize_column(arr)[0] for arr in col_arrays]
+
+        remaining = set(range(m))
+        order: List[int] = []
+        prefix_ids: Optional[np.ndarray] = None
+
+        # Tie-breaker heuristics precomputed
+        # Distinct ratio and total length per column
+        distinct_ratios: List[float] = []
+        total_lens: List[int] = []
+        for j in range(m):
+            distinct_count = int(col_codes[j].max()) + 1 if col_codes[j].size > 0 else 0
+            distinct_ratios.append(distinct_count / n if n > 0 else 0.0)
+            total_lens.append(int(col_lens[j].sum()))
 
         while remaining:
             best_col = None
-            best_cost = None
-            best_key = None
-            for idx in remaining:
-                ci = col_infos[idx]
-                total_cost = 0
-                for g in groups:
-                    total_cost += _subset_trie_cost(ci, g, logs)
-                # Tie-breaker: fewer unique values preferred; if still tie, larger total length; then name
-                key = (ci.unique_count, -ci.sum_len, ci.name)
-                if best_cost is None or total_cost < best_cost or (total_cost == best_cost and key < best_key):
-                    best_cost = total_cost
-                    best_col = idx
-                    best_key = key
-            order_idx.append(best_col)
-            # Partition groups by the selected column's value IDs
-            new_groups: List[List[int]] = []
-            sel_ci = col_infos[best_col]
-            for g in groups:
-                parts = _partition_by_column(sel_ci, g)
-                if parts:
-                    if len(parts) == 1:
-                        new_groups.append(parts[0])
-                    else:
-                        new_groups.extend(parts)
-            groups = new_groups
-            remaining.remove(best_col)
+            best_score = -1
 
-        ordered_cols = [cols_list[i] for i in order_idx]
-        # Return DataFrame with reordered columns
-        return df_mod[ordered_cols]
+            # Evaluate each candidate
+            for j in list(remaining):
+                score = self._evaluate_candidate_increment(prefix_ids, col_codes[j], col_lens[j])
+                if score > best_score:
+                    best_score = score
+                    best_col = j
+                elif score == best_score and best_col is not None:
+                    # Tie-breaker: prefer lower distinct ratio, then higher total length
+                    dr_j = distinct_ratios[j]
+                    dr_b = distinct_ratios[best_col]
+                    if dr_j < dr_b or (dr_j == dr_b and total_lens[j] > total_lens[best_col]):
+                        best_col = j
+
+            # If all scores are zero (no duplicates), just pick by heuristic
+            if best_score == 0:
+                # Choose by ascending distinct ratio, then descending total length
+                best_col = min(
+                    remaining,
+                    key=lambda j: (distinct_ratios[j], -total_lens[j]),
+                )
+
+            # Append chosen col and update prefix
+            order.append(best_col)
+            remaining.remove(best_col)
+            prefix_ids = self._build_new_prefix_ids(prefix_ids, col_codes[best_col])
+
+        return order

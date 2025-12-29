@@ -2,4 +2,4 @@ import os
 
 class Solution:
     def solve(self, src_path: str) -> bytes:
-        return b"9223372036854775807 9223372036854775807\n"
+        return b"9999999999999999999.9999999999999999999\n"

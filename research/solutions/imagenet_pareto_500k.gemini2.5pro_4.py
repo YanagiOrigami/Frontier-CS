@@ -26,94 +26,76 @@ class Solution:
         device = torch.device(metadata.get("device", "cpu"))
         input_dim = metadata["input_dim"]
         num_classes = metadata["num_classes"]
-        param_limit = metadata["param_limit"]
 
-        class ResidualBlock(nn.Module):
-            def __init__(self, size, dropout_p=0.4):
+        # Hyperparameters are tuned for performance within the constraints
+        EPOCHS = 250
+        LEARNING_RATE = 5e-4
+        WEIGHT_DECAY = 0.01
+        DROPOUT_RATE = 0.25
+        LABEL_SMOOTHING = 0.1
+        HIDDEN_DIM = 380  # Carefully chosen to maximize capacity under the 500K param limit
+
+        # A ResNet-style block for MLPs to allow for deeper, more effective models
+        class ResBlock(nn.Module):
+            def __init__(self, dim, dropout):
                 super().__init__()
-                self.fc1 = nn.Linear(size, size)
-                self.bn1 = nn.BatchNorm1d(size)
-                self.act = nn.GELU()
-                self.dropout = nn.Dropout(dropout_p)
-                self.fc2 = nn.Linear(size, size)
-                self.bn2 = nn.BatchNorm1d(size)
+                self.main_path = nn.Sequential(
+                    nn.Linear(dim, dim),
+                    nn.BatchNorm1d(dim),
+                    nn.GELU(),
+                    nn.Dropout(dropout),
+                    nn.Linear(dim, dim),
+                    nn.BatchNorm1d(dim),
+                )
+                self.activation = nn.GELU()
 
             def forward(self, x):
-                identity = x
-                out = self.fc1(x)
-                out = self.bn1(out)
-                out = self.act(out)
-                out = self.dropout(out)
-                out = self.fc2(out)
-                out = self.bn2(out)
-                out = self.dropout(out)
-                out += identity
-                out = self.act(out)
+                residual = x
+                out = self.main_path(x)
+                out += residual
+                out = self.activation(out)
                 return out
-
-        class ResMLP(nn.Module):
-            def __init__(self, input_dim, hidden_dim, num_classes, num_blocks=1, dropout_p=0.4):
+        
+        # The main network architecture, using a ResNet-like structure
+        class Net(nn.Module):
+            def __init__(self, input_dim, num_classes, hidden_dim, dropout_rate):
                 super().__init__()
-                self.input_layer = nn.Sequential(
+                self.stem = nn.Sequential(
                     nn.Linear(input_dim, hidden_dim),
                     nn.BatchNorm1d(hidden_dim),
                     nn.GELU()
                 )
-                
-                blocks = []
-                for _ in range(num_blocks):
-                    blocks.append(ResidualBlock(hidden_dim, dropout_p))
-                self.res_blocks = nn.Sequential(*blocks)
-                
-                self.output_layer = nn.Linear(hidden_dim, num_classes)
-                
+                self.res_block = ResBlock(hidden_dim, dropout_rate)
+                self.head = nn.Linear(hidden_dim, num_classes)
+
             def forward(self, x):
-                x = self.input_layer(x)
-                x = self.res_blocks(x)
-                x = self.output_layer(x)
+                x = self.stem(x)
+                x = self.res_block(x)
+                x = self.head(x)
                 return x
 
-        # Model configuration to stay under the 500k parameter limit
-        # After manual calculation, hidden_dim=386 with 1 block is optimal
-        hidden_dim = 386
-        dropout_p = 0.4
-        num_blocks = 1
-        
-        model = ResMLP(
+        model = Net(
             input_dim=input_dim,
-            hidden_dim=hidden_dim,
             num_classes=num_classes,
-            num_blocks=num_blocks,
-            dropout_p=dropout_p
+            hidden_dim=HIDDEN_DIM,
+            dropout_rate=DROPOUT_RATE
         ).to(device)
-        
-        # Verify parameter count
-        param_count = sum(p.numel() for p in model.parameters() if p.requires_grad)
-        if param_count > param_limit:
-            # Fallback to a smaller model if the primary one exceeds the limit
-            # This is a safeguard, but the primary model should be within bounds.
-            hidden_dim = 380 
-            model = ResMLP(
-                input_dim=input_dim,
-                hidden_dim=hidden_dim,
-                num_classes=num_classes,
-                num_blocks=1,
-                dropout_p=0.4
-            ).to(device)
 
-        # Training hyperparameters
-        epochs = 300
-        lr = 0.001
-        weight_decay = 0.01
-        label_smoothing = 0.1
+        # Total parameters for this architecture: ~487K
+        # This maximizes model capacity while staying safely under the 500K limit.
 
-        criterion = nn.CrossEntropyLoss(label_smoothing=label_smoothing)
-        optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
-        scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
+        criterion = nn.CrossEntropyLoss(label_smoothing=LABEL_SMOOTHING)
+        optimizer = optim.AdamW(
+            model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY
+        )
+        # Cosine annealing scheduler for better convergence
+        scheduler = optim.lr_scheduler.CosineAnnealingLR(
+            optimizer, T_max=EPOCHS, eta_min=1e-6
+        )
 
         # Training loop
-        model.train()
-        for epoch in range(epochs):
+        for _ in range(EPOCHS):
+            model.train()
             for inputs, targets in train_loader:
                 inputs, targets = inputs.to(device), targets.to(device)
                 
@@ -122,7 +104,8 @@ class Solution:
                 loss = criterion(outputs, targets)
                 loss.backward()
                 optimizer.step()
+            
             scheduler.step()
-        
+
         model.eval()
         return model

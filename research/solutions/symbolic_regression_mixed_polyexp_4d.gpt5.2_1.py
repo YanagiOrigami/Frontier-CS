@@ -2,288 +2,452 @@ import numpy as np
 
 class Solution:
     def __init__(self, **kwargs):
-        self.random_state = int(kwargs.get("random_state", 0))
-        self.max_terms = int(kwargs.get("max_terms", 12))
-        self.train_frac = float(kwargs.get("train_frac", 0.8))
+        self.random_state = int(kwargs.get("random_state", 42))
+        self.max_terms = int(kwargs.get("max_terms", 20))
+        self.max_iter_stridge = int(kwargs.get("max_iter_stridge", 8))
 
     @staticmethod
-    def _safe_exp(z):
-        return np.exp(np.clip(z, -60.0, 60.0))
+    def _format_float(x: float) -> str:
+        if not np.isfinite(x):
+            return "0.0"
+        if abs(x) < 1e-15:
+            x = 0.0
+        s = "{:.12g}".format(float(x))
+        if s == "-0":
+            s = "0"
+        return s
 
     @staticmethod
-    def _ridge_solve(A, b, ridge=1e-10):
-        k = A.shape[1]
+    def _generate_exponents(nvars: int, max_degree: int):
+        exps = []
+
+        def rec(i, remaining, current):
+            if i == nvars - 1:
+                current.append(remaining)
+                exps.append(tuple(current))
+                current.pop()
+                return
+            for e in range(remaining + 1):
+                current.append(e)
+                rec(i + 1, remaining - e, current)
+                current.pop()
+
+        for deg in range(max_degree + 1):
+            rec(0, deg, [])
+        return exps
+
+    @staticmethod
+    def _monomial_str(exp_tuple, var_names):
+        parts = []
+        for v, e in zip(var_names, exp_tuple):
+            if e == 0:
+                continue
+            if e == 1:
+                parts.append(v)
+            else:
+                parts.append(f"{v}**{e}")
+        if not parts:
+            return "1"
+        return "*".join(parts)
+
+    @staticmethod
+    def _build_expr_from_terms(coefs, monom_strs, idxs):
+        terms = []
+        for j in idxs:
+            c = float(coefs[j])
+            if not np.isfinite(c) or abs(c) < 1e-15:
+                continue
+            m = monom_strs[j]
+            terms.append((c, m))
+
+        if not terms:
+            return "0"
+
+        out = []
+        first = True
+        for c, m in terms:
+            sign = "-" if c < 0 else "+"
+            cabs = abs(c)
+            cstr = Solution._format_float(cabs)
+
+            if first:
+                if c < 0:
+                    prefix = "-"
+                else:
+                    prefix = ""
+                first = False
+            else:
+                prefix = f" {sign} "
+
+            if m == "1":
+                out.append(prefix + cstr)
+            else:
+                out.append(prefix + f"({cstr})*({m})")
+        return "".join(out)
+
+    @staticmethod
+    def _ridge_solve_from_gram(gram, b, lam):
+        p = gram.shape[0]
+        lam = float(lam)
+        if lam < 1e-18:
+            lam = 1e-18
+        A = gram + lam * np.eye(p, dtype=gram.dtype)
         try:
-            AtA = A.T @ A
-            Atb = A.T @ b
-            if ridge > 0:
-                reg = np.zeros((k, k), dtype=np.float64)
-                reg[1:, 1:] = ridge * np.eye(k - 1, dtype=np.float64)
-                AtA = AtA + reg
-            return np.linalg.solve(AtA, Atb)
-        except Exception:
+            return np.linalg.solve(A, b)
+        except np.linalg.LinAlgError:
             return np.linalg.lstsq(A, b, rcond=None)[0]
 
-    def solve(self, X: np.ndarray, y: np.ndarray) -> dict:
-        X = np.asarray(X)
-        y = np.asarray(y).reshape(-1)
-        n, d = X.shape
-        if d != 4:
-            raise ValueError("Expected X with shape (n, 4)")
+    def _stridge_fit_from_design(self, A_train, y_train, A_val, y_val, lam, thresh):
+        scales = np.linalg.norm(A_train, axis=0)
+        scales = np.where(scales > 0.0, scales, 1.0)
 
-        x1 = X[:, 0].astype(np.float64, copy=False)
-        x2 = X[:, 1].astype(np.float64, copy=False)
-        x3 = X[:, 2].astype(np.float64, copy=False)
-        x4 = X[:, 3].astype(np.float64, copy=False)
+        A_tr = A_train / scales
+        A_va = A_val / scales
 
-        one = np.ones(n, dtype=np.float64)
+        gram = A_tr.T @ A_tr
+        b = A_tr.T @ y_train
 
-        x1_2 = x1 * x1
-        x2_2 = x2 * x2
-        x3_2 = x3 * x3
-        x4_2 = x4 * x4
-
-        x1_3 = x1_2 * x1
-        x2_3 = x2_2 * x2
-        x3_3 = x3_2 * x3
-        x4_3 = x4_2 * x4
-
-        # Polynomial monomials up to degree 3 (selected)
-        poly_exprs = []
-        poly_vals = []
-
-        poly_exprs.append("1")
-        poly_vals.append(one)
-
-        poly_exprs += ["x1", "x2", "x3", "x4"]
-        poly_vals += [x1, x2, x3, x4]
-
-        poly_exprs += ["x1**2", "x2**2", "x3**2", "x4**2"]
-        poly_vals += [x1_2, x2_2, x3_2, x4_2]
-
-        poly_exprs += ["x1*x2", "x1*x3", "x1*x4", "x2*x3", "x2*x4", "x3*x4"]
-        poly_vals += [x1 * x2, x1 * x3, x1 * x4, x2 * x3, x2 * x4, x3 * x4]
-
-        poly_exprs += ["x1**3", "x2**3", "x3**3", "x4**3"]
-        poly_vals += [x1_3, x2_3, x3_3, x4_3]
-
-        # xi^2 * xj terms
-        vars_expr = ["x1", "x2", "x3", "x4"]
-        vars_vals = [x1, x2, x3, x4]
-        vars_sq_expr = ["x1**2", "x2**2", "x3**2", "x4**2"]
-        vars_sq_vals = [x1_2, x2_2, x3_2, x4_2]
-        for i in range(4):
-            for j in range(4):
-                if i == j:
-                    continue
-                poly_exprs.append(f"{vars_sq_expr[i]}*{vars_expr[j]}")
-                poly_vals.append(vars_sq_vals[i] * vars_vals[j])
-
-        # triple products
-        triples = [(0, 1, 2), (0, 1, 3), (0, 2, 3), (1, 2, 3)]
-        for a, b, c in triples:
-            poly_exprs.append(f"{vars_expr[a]}*{vars_expr[b]}*{vars_expr[c]}")
-            poly_vals.append(vars_vals[a] * vars_vals[b] * vars_vals[c])
-
-        P = np.column_stack(poly_vals).astype(np.float64, copy=False)
-        p = P.shape[1]
-
-        # Damping bases
-        sumsq_12 = x1_2 + x2_2
-        sumsq_34 = x3_2 + x4_2
-        sumsq_123 = x1_2 + x2_2 + x3_2
-        sumsq_234 = x2_2 + x3_2 + x4_2
-        sumsq_1234 = x1_2 + x2_2 + x3_2 + x4_2
-        xsum = x1 + x2 + x3 + x4
-
-        base_terms = [
-            ("", None),  # represents 1
-            ("x1**2", x1_2),
-            ("x2**2", x2_2),
-            ("x3**2", x3_2),
-            ("x4**2", x4_2),
-            ("x1**2 + x2**2", sumsq_12),
-            ("x3**2 + x4**2", sumsq_34),
-            ("x1**2 + x2**2 + x3**2", sumsq_123),
-            ("x2**2 + x3**2 + x4**2", sumsq_234),
-            ("x1**2 + x2**2 + x3**2 + x4**2", sumsq_1234),
-            ("x1", x1),
-            ("x2", x2),
-            ("x3", x3),
-            ("x4", x4),
-            ("x1 + x2 + x3 + x4", xsum),
-        ]
-        scales = [0.5, 1.0, 2.0]
-
-        damp_exprs = []
-        damp_vals = []
-
-        damp_exprs.append("1")
-        damp_vals.append(one)
-
-        for base_expr, base_val in base_terms[1:]:
-            for s in scales:
-                if s == 1.0:
-                    expr = f"exp(-({base_expr}))"
-                    vals = self._safe_exp(-base_val)
-                else:
-                    s_str = f"{s:.12g}"
-                    expr = f"exp(-{s_str}*({base_expr}))"
-                    vals = self._safe_exp(-s * base_val)
-                damp_exprs.append(expr)
-                damp_vals.append(vals)
-
-        Dm = np.column_stack(damp_vals).astype(np.float64, copy=False)
-        dcnt = Dm.shape[1]
-
-        # Build full feature matrix Phi = P * D for all combinations
-        m = p * dcnt
-        Phi = np.empty((n, m), dtype=np.float32)
-        feat_exprs = []
-        col = 0
-        for j in range(dcnt):
-            dj = Dm[:, j].astype(np.float64, copy=False)
-            block = (P * dj[:, None]).astype(np.float32, copy=False)
-            Phi[:, col:col + p] = block
-            damp_e = damp_exprs[j]
-            for i in range(p):
-                poly_e = poly_exprs[i]
-                if poly_e == "1":
-                    term_e = damp_e
-                elif damp_e == "1":
-                    term_e = poly_e
-                else:
-                    term_e = f"({poly_e})*({damp_e})"
-                feat_exprs.append(term_e)
-            col += p
-
-        # train/val split
-        rng = np.random.default_rng(self.random_state)
-        perm = rng.permutation(n)
-        ntrain = int(max(10, min(n - 10, round(self.train_frac * n))))
-        train_idx = perm[:ntrain]
-        val_idx = perm[ntrain:] if ntrain < n else perm[:0]
-
-        y_train = y[train_idx].astype(np.float64, copy=False)
-        y_val = y[val_idx].astype(np.float64, copy=False) if val_idx.size > 0 else None
-
-        # Standardize on train for selection and mask out degenerate features
-        Phi_train = Phi[train_idx].astype(np.float64, copy=True)  # copy for in-place ops
-        mean = Phi_train.mean(axis=0)
-        Phi_train -= mean
-        norms = np.sqrt(np.sum(Phi_train * Phi_train, axis=0))
-        mask = norms > 1e-12
-
-        if not np.any(mask):
-            beta0 = float(np.mean(y))
-            expression = f"{beta0:.12g}"
-            predictions = np.full(n, beta0, dtype=np.float64)
-            return {"expression": expression, "predictions": predictions.tolist(), "details": {"complexity": 0}}
-
-        # Reduce feature set
-        Phi = Phi[:, mask]
-        feat_exprs = [e for e, keep in zip(feat_exprs, mask.tolist()) if keep]
-        mean = mean[mask]
-        norms = norms[mask]
-
-        # Recompute standardized train matrix Z_train
-        Z_train = Phi[train_idx].astype(np.float64, copy=True)
-        Z_train -= mean
-        Z_train /= norms
-
-        # Baseline: intercept-only
-        best_active = []
-        best_beta = np.array([np.mean(y_train)], dtype=np.float64)
-        best_val_mse = np.inf
-
-        if val_idx.size > 0:
-            pred_val0 = np.full(val_idx.size, best_beta[0], dtype=np.float64)
-            best_val_mse = float(np.mean((y_val - pred_val0) ** 2))
-        else:
-            pred_train0 = np.full(train_idx.size, best_beta[0], dtype=np.float64)
-            best_val_mse = float(np.mean((y_train - pred_train0) ** 2))
-
-        active = []
-        selected = np.zeros(Z_train.shape[1], dtype=bool)
-
-        # residual starts from intercept-only model
-        residual = y_train - best_beta[0]
-
-        no_improve_rounds = 0
-        for t in range(self.max_terms):
-            corr = Z_train.T @ residual
-            corr[selected] = 0.0
-            j = int(np.argmax(np.abs(corr)))
-            if selected[j] or not np.isfinite(corr[j]) or np.abs(corr[j]) < 1e-14:
+        w = self._ridge_solve_from_gram(gram, b, lam)
+        for _ in range(self.max_iter_stridge):
+            small = np.abs(w) < thresh
+            if not np.any(small):
                 break
+            big = ~small
+            if np.sum(big) == 0:
+                w[:] = 0.0
+                break
+            w_big = self._ridge_solve_from_gram(gram[np.ix_(big, big)], b[big], lam)
+            w_new = np.zeros_like(w)
+            w_new[big] = w_big
+            w = w_new
 
-            active.append(j)
-            selected[j] = True
+        pred_val = A_va @ w
+        resid = y_val - pred_val
+        mse_val = float(np.mean(resid * resid))
 
-            # Fit on train with intercept + raw features
-            Phi_tr_act = Phi[train_idx][:, active].astype(np.float64, copy=False)
-            A_tr = np.column_stack([np.ones(train_idx.size, dtype=np.float64), Phi_tr_act])
-            beta = self._ridge_solve(A_tr, y_train, ridge=1e-10)
+        nz = np.flatnonzero(np.abs(w) > 0.0)
+        k = int(nz.size)
+        return w, scales, mse_val, k
 
-            # Update residual
-            pred_tr = A_tr @ beta
-            residual = y_train - pred_tr
+    def _fit_with_params(self, M_P, M_R, y, z, lam_list, thresh_list, train_idx, val_idx):
+        z_tr = z[train_idx]
+        z_va = z[val_idx]
 
-            # Validate
-            if val_idx.size > 0:
-                Phi_va_act = Phi[val_idx][:, active].astype(np.float64, copy=False)
-                A_va = np.column_stack([np.ones(val_idx.size, dtype=np.float64), Phi_va_act])
-                pred_va = A_va @ beta
-                val_mse = float(np.mean((y_val - pred_va) ** 2))
-            else:
-                val_mse = float(np.mean(residual ** 2))
+        A_train = np.hstack([M_P[train_idx] * z_tr[:, None], M_R[train_idx]])
+        A_val = np.hstack([M_P[val_idx] * z_va[:, None], M_R[val_idx]])
 
-            if val_mse + 1e-12 < best_val_mse:
-                best_val_mse = val_mse
-                best_active = active.copy()
-                best_beta = beta.copy()
-                no_improve_rounds = 0
-            else:
-                no_improve_rounds += 1
-                if no_improve_rounds >= 3 and t >= 4:
-                    break
+        best = None
+        n_val = max(1, len(val_idx))
+        eps = 1e-30
+        logn = float(np.log(n_val + 1.0))
 
-        # Refit on full data with best_active
-        if len(best_active) > 0:
-            Phi_full_act = Phi[:, best_active].astype(np.float64, copy=False)
-            A_full = np.column_stack([np.ones(n, dtype=np.float64), Phi_full_act])
-            beta_full = self._ridge_solve(A_full, y.astype(np.float64, copy=False), ridge=1e-10)
+        for lam in lam_list:
+            for thresh in thresh_list:
+                w_norm, scales, mse_val, k = self._stridge_fit_from_design(
+                    A_train, y[train_idx], A_val, y[val_idx], lam, thresh
+                )
+                obj = n_val * float(np.log(mse_val + eps)) + k * logn
+                if best is None or obj < best["obj"]:
+                    best = {
+                        "obj": obj,
+                        "mse_val": mse_val,
+                        "k": k,
+                        "lam": float(lam),
+                        "thresh": float(thresh),
+                        "w_norm": w_norm,
+                        "scales": scales,
+                    }
+        return best
+
+    def _refit_full(self, M_P, M_R, y, z, lam, thresh):
+        A_full = np.hstack([M_P * z[:, None], M_R])
+
+        scales = np.linalg.norm(A_full, axis=0)
+        scales = np.where(scales > 0.0, scales, 1.0)
+        A_n = A_full / scales
+
+        gram = A_n.T @ A_n
+        b = A_n.T @ y
+
+        w = self._ridge_solve_from_gram(gram, b, lam)
+        for _ in range(self.max_iter_stridge):
+            small = np.abs(w) < thresh
+            if not np.any(small):
+                break
+            big = ~small
+            if np.sum(big) == 0:
+                w[:] = 0.0
+                break
+            w_big = self._ridge_solve_from_gram(gram[np.ix_(big, big)], b[big], lam)
+            w_new = np.zeros_like(w)
+            w_new[big] = w_big
+            w = w_new
+
+        nz = np.flatnonzero(np.abs(w) > 0.0)
+
+        if nz.size > self.max_terms:
+            top = nz[np.argsort(np.abs(w[nz]))[::-1][: self.max_terms]]
+            keep = np.sort(top)
         else:
-            beta_full = np.array([float(np.mean(y))], dtype=np.float64)
+            keep = nz
 
-        # Build expression
-        intercept = float(beta_full[0])
-        terms = []
-        coefs = []
-        if len(best_active) > 0:
-            for c, idx in zip(beta_full[1:], best_active):
-                if np.isfinite(c) and abs(c) > 1e-12:
-                    terms.append(feat_exprs[idx])
-                    coefs.append(float(c))
+        if keep.size == 0:
+            w_full = np.zeros(A_full.shape[1], dtype=np.float64)
+            return w_full, A_full
 
-        if abs(intercept) < 1e-12 and not terms:
-            expression = "0"
-        else:
-            expr_parts = [f"{intercept:.12g}"]
-            for c, texpr in zip(coefs, terms):
-                mag = abs(c)
-                if c >= 0:
-                    expr_parts.append(f"+ {mag:.12g}*({texpr})")
+        A_sel = A_full[:, keep]
+        w_sel = np.linalg.lstsq(A_sel, y, rcond=None)[0]
+        w_full = np.zeros(A_full.shape[1], dtype=np.float64)
+        w_full[keep] = w_sel
+
+        maxabs = float(np.max(np.abs(w_full))) if w_full.size else 0.0
+        if maxabs > 0:
+            tiny = np.abs(w_full) < (1e-12 * maxabs)
+            w_full[tiny] = 0.0
+
+        return w_full, A_full
+
+    def solve(self, X: np.ndarray, y: np.ndarray) -> dict:
+        try:
+            X = np.asarray(X, dtype=np.float64)
+            y = np.asarray(y, dtype=np.float64).reshape(-1)
+            n, d = X.shape
+            if d != 4:
+                raise ValueError("Expected X shape (n, 4)")
+
+            rng = np.random.default_rng(self.random_state)
+            idx = np.arange(n)
+            rng.shuffle(idx)
+            n_train = max(2, int(0.8 * n))
+            train_idx = idx[:n_train]
+            val_idx = idx[n_train:] if n_train < n else idx[: max(1, n // 5)]
+
+            var_names = ["x1", "x2", "x3", "x4"]
+            x1, x2, x3, x4 = X[:, 0], X[:, 1], X[:, 2], X[:, 3]
+
+            # Polynomial bases
+            exps_P = self._generate_exponents(4, 4)  # up to degree 4
+            exps_R = self._generate_exponents(4, 2)  # up to degree 2
+
+            max_deg_P = 4
+            max_deg_R = 2
+
+            pows = []
+            for i in range(4):
+                xi = X[:, i]
+                pw = [np.ones_like(xi)]
+                for e in range(1, max_deg_P + 1):
+                    pw.append(pw[-1] * xi)
+                pows.append(pw)
+
+            def build_monomials(exps, max_deg):
+                M = np.empty((n, len(exps)), dtype=np.float64)
+                for j, e in enumerate(exps):
+                    col = np.ones(n, dtype=np.float64)
+                    for i in range(4):
+                        ei = e[i]
+                        if ei:
+                            if ei <= max_deg:
+                                col *= pows[i][ei]
+                            else:
+                                col *= X[:, i] ** ei
+                    M[:, j] = col
+                return M
+
+            M_P = build_monomials(exps_P, max_deg_P)
+            M_R = build_monomials(exps_R, max_deg_R)
+
+            monom_P_strs = [self._monomial_str(e, var_names) for e in exps_P]
+            monom_R_strs = [self._monomial_str(e, var_names) for e in exps_R]
+
+            # Candidate damping forms
+            np.seterr(over="ignore", under="ignore", invalid="ignore")
+
+            bases = []
+            base_exprs = []
+
+            q1 = x1 * x1 + x2 * x2 + x3 * x3 + x4 * x4
+            bases.append(q1)
+            base_exprs.append("x1**2 + x2**2 + x3**2 + x4**2")
+
+            q2 = (x1 + x2) ** 2 + (x3 + x4) ** 2
+            bases.append(q2)
+            base_exprs.append("(x1 + x2)**2 + (x3 + x4)**2")
+
+            q3 = (x1 + x3) ** 2 + (x2 + x4) ** 2
+            bases.append(q3)
+            base_exprs.append("(x1 + x3)**2 + (x2 + x4)**2")
+
+            q4 = (x1 + x4) ** 2 + (x2 + x3) ** 2
+            bases.append(q4)
+            base_exprs.append("(x1 + x4)**2 + (x2 + x3)**2")
+
+            q5 = (x1 + x2 + x3 + x4) ** 2
+            bases.append(q5)
+            base_exprs.append("(x1 + x2 + x3 + x4)**2")
+
+            q6 = (x1 - x2) ** 2 + (x3 - x4) ** 2
+            bases.append(q6)
+            base_exprs.append("(x1 - x2)**2 + (x3 - x4)**2")
+
+            s_values = [0.0, 0.25, 0.5, 0.75, 1.0, 1.5, 2.0, 3.0]
+            candidates = []
+
+            for bi in range(len(bases)):
+                for s in s_values:
+                    candidates.append(("base", bi, float(s), None))
+
+            # Diagonal quadratic damping: q = sum si*xi^2
+            diag_seeds = [
+                np.array([0.0, 0.0, 0.0, 0.0]),
+                np.array([1.0, 1.0, 1.0, 1.0]),
+                np.array([0.5, 0.5, 1.0, 1.0]),
+                np.array([1.0, 1.0, 0.5, 0.5]),
+                np.array([2.0, 2.0, 1.0, 1.0]),
+                np.array([1.0, 1.0, 2.0, 2.0]),
+                np.array([0.5, 1.0, 0.5, 1.0]),
+                np.array([1.0, 0.5, 1.0, 0.5]),
+            ]
+            for _ in range(10):
+                diag_seeds.append(rng.uniform(0.0, 3.0, size=4))
+            for sv in diag_seeds:
+                candidates.append(("diag", None, None, sv.astype(np.float64)))
+
+            lam_list = [1e-12, 1e-8, 1e-5]
+            thresh_list = [1e-6, 1e-4, 1e-3, 1e-2]
+
+            best_global = None
+
+            for kind, bi, s, sv in candidates:
+                if kind == "base":
+                    if s == 0.0:
+                        q = np.zeros(n, dtype=np.float64)
+                        q_expr = "0"
+                    else:
+                        q = s * bases[bi]
+                        if abs(s - 1.0) < 1e-15:
+                            q_expr = f"({base_exprs[bi]})"
+                        else:
+                            q_expr = f"({self._format_float(s)})*({base_exprs[bi]})"
                 else:
-                    expr_parts.append(f"- {mag:.12g}*({texpr})")
-            expression = " ".join(expr_parts)
+                    sv = np.asarray(sv, dtype=np.float64)
+                    q = sv[0] * (x1 * x1) + sv[1] * (x2 * x2) + sv[2] * (x3 * x3) + sv[3] * (x4 * x4)
+                    parts = []
+                    if abs(sv[0]) > 1e-15:
+                        parts.append(f"({self._format_float(sv[0])})*x1**2")
+                    if abs(sv[1]) > 1e-15:
+                        parts.append(f"({self._format_float(sv[1])})*x2**2")
+                    if abs(sv[2]) > 1e-15:
+                        parts.append(f"({self._format_float(sv[2])})*x3**2")
+                    if abs(sv[3]) > 1e-15:
+                        parts.append(f"({self._format_float(sv[3])})*x4**2")
+                    q_expr = " + ".join(parts) if parts else "0"
 
-        # Predictions
-        if len(best_active) > 0:
-            Phi_full_act = Phi[:, best_active].astype(np.float64, copy=False)
-            predictions = intercept + Phi_full_act @ np.array(coefs, dtype=np.float64)
-        else:
-            predictions = np.full(n, intercept, dtype=np.float64)
+                z = np.exp(-q)
+                cand_best = self._fit_with_params(M_P, M_R, y, z, lam_list, thresh_list, train_idx, val_idx)
+                if cand_best is None:
+                    continue
 
-        details = {"complexity": int(len(terms))}
-        return {"expression": expression, "predictions": predictions.tolist(), "details": details}
+                # Slight preference for simpler expressions if objectives tie
+                obj = cand_best["obj"]
+                if best_global is None or obj < best_global["obj"] - 1e-12:
+                    best_global = {
+                        "obj": obj,
+                        "mse_val": cand_best["mse_val"],
+                        "k": cand_best["k"],
+                        "lam": cand_best["lam"],
+                        "thresh": cand_best["thresh"],
+                        "kind": kind,
+                        "bi": bi,
+                        "s": s,
+                        "sv": sv,
+                        "q_expr": q_expr,
+                    }
+
+            if best_global is None:
+                raise RuntimeError("Model selection failed")
+
+            # Build final z and refit on full data
+            kind = best_global["kind"]
+            if kind == "base":
+                s = best_global["s"]
+                bi = best_global["bi"]
+                if s == 0.0:
+                    q = np.zeros(n, dtype=np.float64)
+                    q_expr = "0"
+                else:
+                    q = s * bases[bi]
+                    if abs(s - 1.0) < 1e-15:
+                        q_expr = f"({base_exprs[bi]})"
+                    else:
+                        q_expr = f"({self._format_float(s)})*({base_exprs[bi]})"
+            else:
+                sv = np.asarray(best_global["sv"], dtype=np.float64)
+                q = sv[0] * (x1 * x1) + sv[1] * (x2 * x2) + sv[2] * (x3 * x3) + sv[3] * (x4 * x4)
+                parts = []
+                if abs(sv[0]) > 1e-15:
+                    parts.append(f"({self._format_float(sv[0])})*x1**2")
+                if abs(sv[1]) > 1e-15:
+                    parts.append(f"({self._format_float(sv[1])})*x2**2")
+                if abs(sv[2]) > 1e-15:
+                    parts.append(f"({self._format_float(sv[2])})*x3**2")
+                if abs(sv[3]) > 1e-15:
+                    parts.append(f"({self._format_float(sv[3])})*x4**2")
+                q_expr = " + ".join(parts) if parts else "0"
+
+            z = np.exp(-q)
+            w_full, A_full = self._refit_full(M_P, M_R, y, z, best_global["lam"], best_global["thresh"])
+
+            pP = M_P.shape[1]
+            wP = w_full[:pP]
+            wR = w_full[pP:]
+
+            nzP = np.flatnonzero(np.abs(wP) > 0.0)
+            nzR = np.flatnonzero(np.abs(wR) > 0.0)
+
+            P_expr = self._build_expr_from_terms(wP, monom_P_strs, nzP)
+            R_expr = self._build_expr_from_terms(wR, monom_R_strs, nzR)
+
+            use_exp = (q_expr != "0") and (P_expr != "0") and (np.any(np.abs(wP) > 0.0))
+
+            if use_exp:
+                damp_expr = f"exp(-({q_expr}))*({P_expr})"
+            else:
+                damp_expr = P_expr
+
+            if R_expr != "0" and damp_expr != "0":
+                expression = f"({damp_expr}) + ({R_expr})"
+            elif R_expr != "0":
+                expression = R_expr
+            else:
+                expression = damp_expr
+
+            # Predictions
+            pred = A_full @ w_full
+            pred = np.asarray(pred, dtype=np.float64)
+
+            complexity = int((1 if use_exp else 0) + int(nzP.size) + int(nzR.size))
+
+            return {
+                "expression": expression,
+                "predictions": pred.tolist(),
+                "details": {"complexity": complexity},
+            }
+        except Exception:
+            X = np.asarray(X, dtype=np.float64)
+            y = np.asarray(y, dtype=np.float64).reshape(-1)
+            x1, x2, x3, x4 = X[:, 0], X[:, 1], X[:, 2], X[:, 3]
+            A = np.column_stack([x1, x2, x3, x4, np.ones_like(x1)])
+            coeffs, _, _, _ = np.linalg.lstsq(A, y, rcond=None)
+            a, b, c, d, e = coeffs
+            expression = (
+                f"({self._format_float(a)})*x1 + ({self._format_float(b)})*x2 + "
+                f"({self._format_float(c)})*x3 + ({self._format_float(d)})*x4 + "
+                f"({self._format_float(e)})"
+            )
+            pred = (a * x1 + b * x2 + c * x3 + d * x4 + e).astype(np.float64)
+            return {
+                "expression": expression,
+                "predictions": pred.tolist(),
+                "details": {"complexity": 5},
+            }

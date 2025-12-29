@@ -1,11 +1,4 @@
 import pandas as pd
-import random
-import multiprocessing as mp
-import os
-
-class TrieNode:
-    def __init__(self):
-        self.children = {}
 
 class Solution:
     def solve(
@@ -19,85 +12,95 @@ class Solution:
         distinct_value_threshold: float = 0.7,
         parallel: bool = True,
     ) -> pd.DataFrame:
-        if one_way_dep is not None:
-            pass
         df = df.copy()
-        if col_merge:
-            for group in col_merge:
-                if len(group) > 1:
-                    merged_name = '_'.join(group)
-                    temp = df[group].astype(str)
-                    merged = temp.apply(lambda x: ''.join(x), axis=1)
-                    df[merged_name] = merged
-                    df = df.drop(columns=group)
-        current_columns = list(df.columns)
-        M = len(current_columns)
-        if M == 0:
-            return pd.DataFrame()
+        if col_merge is not None:
+            cols_to_drop = set()
+            for i, group in enumerate(col_merge):
+                if isinstance(group, (list, tuple)) and len(group) > 1:
+                    if all(col in df.columns for col in group):
+                        merged_name = f"merged_{i}"
+                        j = i
+                        while merged_name in df.columns:
+                            j += 1
+                            merged_name = f"merged_{j}"
+                        merged_series = df[group].apply(lambda row: ''.join(row.astype(str)), axis=1)
+                        df[merged_name] = merged_series
+                        cols_to_drop.update(group)
+            if cols_to_drop:
+                df = df.drop(columns=list(cols_to_drop))
+
+        all_cols = list(df.columns)
+        if len(all_cols) == 0:
+            return df
+
         N = len(df)
-        str_values = df.astype(str).values
-        col_to_idx = {col: idx for idx, col in enumerate(current_columns)}
-        sample_size = min(N, row_stop * 64)
-        sample_indices = sorted(random.sample(range(N), sample_size)) if sample_size < N else list(range(N))
-        sample_str_rows = [list(str_values[si]) for si in sample_indices]
-        num_sample = len(sample_str_rows)
-        beam_size = max(1, col_stop)
-        beam = [([], 0.0)]
-        total_evals = 0
-        num_workers = min(8, os.cpu_count() or 1) if parallel else 1
+        unique_cols = [col for col in all_cols if df[col].nunique() / N > distinct_value_threshold]
+        non_unique_cols = [col for col in all_cols if df[col].nunique() / N <= distinct_value_threshold]
 
-        def worker(args):
-            perm, sample_str_rows, col_to_idx, num_sample = args
-            p = [col_to_idx[col] for col in perm]
-            total_lcp = 0
-            total_len = 0.0
-            root = TrieNode()
-            for idx in range(num_sample):
-                row_str = ''.join(sample_str_rows[idx][j] for j in p)
-                l = len(row_str)
-                total_len += l
-                if idx == 0:
-                    node = root
-                    for ch in row_str:
-                        if ch not in node.children:
-                            node.children[ch] = TrieNode()
-                        node = node.children[ch]
-                    continue
-                node = root
-                i = 0
-                l_str = len(row_str)
-                while i < l_str and row_str[i] in node.children:
-                    node = node.children[row_str[i]]
-                    i += 1
-                total_lcp += i
-                curr_node = node
-                for k in range(i, l_str):
-                    ch = row_str[k]
-                    if ch not in curr_node.children:
-                        curr_node.children[ch] = TrieNode()
-                    curr_node = curr_node.children[ch]
-            return total_lcp / total_len if total_len > 0 else 0.0
+        def lcp(a: str, b: str) -> int:
+            i = 0
+            min_len = min(len(a), len(b))
+            while i < min_len and a[i] == b[i]:
+                i += 1
+            return i
 
-        for step in range(M):
-            all_cand = []
-            for partial_perm, _ in beam:
-                used = set(partial_perm)
-                avail = [col for col in current_columns if col not in used]
-                for col in avail:
-                    all_cand.append(partial_perm + [col])
-            num_new_evals = len(all_cand)
-            if total_evals + num_new_evals > early_stop:
-                best_perm = max(beam, key=lambda x: x[1])[0]
+        def compute_score(perm: list, df_sample: pd.DataFrame, row_sample_size: int) -> float:
+            partial_strs = []
+            for i in range(row_sample_size):
+                row_series = df_sample[perm].iloc[i].astype(str)
+                s = ''.join(row_series.values)
+                partial_strs.append(s)
+            total_lcp = 0.0
+            total_len = len(partial_strs[0])
+            for i in range(1, row_sample_size):
+                si = partial_strs[i]
+                total_len += len(si)
+                max_lcp_len = 0
+                for j in range(i):
+                    sj = partial_strs[j]
+                    curr_lcp = lcp(si, sj)
+                    if curr_lcp > max_lcp_len:
+                        max_lcp_len = curr_lcp
+                total_lcp += max_lcp_len
+            if total_len == 0:
+                return 0.0
+            return total_lcp / total_len
+
+        if len(non_unique_cols) == 0:
+            return df[all_cols]
+
+        row_sample_size = min(row_stop, len(df))
+        if row_sample_size < 2:
+            full_order = non_unique_cols + unique_cols
+            return df[full_order]
+
+        df_sample = df.iloc[:row_sample_size]
+
+        # Beam search on non_unique_cols
+        search_cols = non_unique_cols
+        M = len(search_cols)
+        beam_width = max(1, col_stop)
+        beam = [(0.0, [])]
+        eval_count = 0
+
+        for depth in range(M):
+            new_beam = []
+            for _, partial_perm in beam:
+                remaining = [c for c in search_cols if c not in partial_perm]
+                for cand in remaining:
+                    new_perm = partial_perm + [cand]
+                    sc = compute_score(new_perm, df_sample, row_sample_size)
+                    new_beam.append((sc, new_perm))
+                    eval_count += 1
+                    if eval_count >= early_stop:
+                        break
+                if eval_count >= early_stop:
+                    break
+            if eval_count >= early_stop:
                 break
-            args_list = [(perm, sample_str_rows, col_to_idx, num_sample) for perm in all_cand]
-            if parallel and num_workers > 1 and num_new_evals > 0:
-                with mp.Pool(num_workers) as pool:
-                    scores = pool.map(worker, args_list)
-            else:
-                scores = [worker(arg) for arg in args_list]
-            total_evals += num_new_evals
-            scored_cand = sorted(zip(all_cand, scores), key=lambda x: x[1], reverse=True)
-            beam = scored_cand[:beam_size]
-        else:
-            best_perm = beam[0][0]
-        return df[best_perm].copy()
+            new_beam.sort(key=lambda x: x[0], reverse=True)
+            beam = new_beam[:beam_width]
+
+        best_perm = beam[0][1]
+        full_order = best_perm + unique_cols
+        return df[full_order]

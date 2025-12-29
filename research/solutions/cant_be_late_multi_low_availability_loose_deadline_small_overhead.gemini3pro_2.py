@@ -6,11 +6,14 @@ from sky_spot.utils import ClusterType
 
 
 class Solution(MultiRegionStrategy):
-    """Cant-Be-Late Multi-Region Scheduling Strategy."""
+    """Your multi-region scheduling strategy."""
 
-    NAME = "cant_be_late_strategy"
+    NAME = "CantBeLateStrategy"
 
     def solve(self, spec_path: str) -> "Solution":
+        """
+        Initialize the solution from spec_path config.
+        """
         with open(spec_path) as f:
             config = json.load(f)
 
@@ -21,42 +24,57 @@ class Solution(MultiRegionStrategy):
             inter_task_overhead=[0.0],
         )
         super().__init__(args)
+        
+        # Initialize progress cache to avoid O(N^2) complexity with sum()
+        self.cached_progress = 0.0
+        self.last_step_count = 0
+        
         return self
 
     def _step(self, last_cluster_type: ClusterType, has_spot: bool) -> ClusterType:
-        current_work_done = sum(self.task_done_time)
-        work_remaining = self.task_duration - current_work_done
+        """
+        Decide next action based on current state.
+        """
+        # Efficiently calculate progress
+        current_len = len(self.task_done_time)
+        if current_len > self.last_step_count:
+            self.cached_progress += sum(self.task_done_time[self.last_step_count:])
+            self.last_step_count = current_len
+
+        remaining_work = self.task_duration - self.cached_progress
         
-        # If work is essentially done, stop
-        if work_remaining <= 1e-6:
+        # If work is effectively done, stop
+        if remaining_work <= 1e-6:
             return ClusterType.NONE
 
-        time_elapsed = self.env.elapsed_seconds
-        time_remaining = self.deadline - time_elapsed
+        elapsed = self.env.elapsed_seconds
+        remaining_time = self.deadline - elapsed
         
-        # Calculate strict time budget needed to finish using On-Demand.
-        # We assume we pay restart_overhead to account for potential switching costs.
-        time_needed_od = work_remaining + self.restart_overhead
-        
-        # Define safety buffer: 
-        # If we are close to the "Point of No Return" (time_needed_od), we must switch to OD.
-        # We add 1.5 * gap_seconds to ensure we don't start a "probe" (waiting 1 step)
-        # if that wait would push us past the deadline feasibility.
+        # Determine if we are in a critical state
+        # We need enough time to finish using On-Demand (efficiency 1.0)
+        # plus overhead (if we need to restart/switch) plus a safety buffer.
+        # Safety buffer of 1.5 gaps allows for one failed probe step + margin.
+        overhead = self.restart_overhead
         safety_buffer = 1.5 * self.env.gap_seconds
         
-        # Panic Condition: Force On-Demand if deadline is at risk
-        if time_remaining < (time_needed_od + safety_buffer):
+        required_time = remaining_work + overhead + safety_buffer
+        
+        if remaining_time < required_time:
+            # Critical: Slack is low. Use On-Demand to guarantee finish.
             return ClusterType.ON_DEMAND
         
-        # Normal Operation: Prefer Spot if available
+        # If not critical, try to save money with Spot
         if has_spot:
             return ClusterType.SPOT
-        
-        # Spot unavailable in current region, but we have time slack.
-        # Switch to the next region and return NONE to probe availability in the next step.
+            
+        # No Spot in current region, but we have slack.
+        # Strategy: Switch to next region and probe (Wait).
+        # We use ClusterType.NONE to avoid On-Demand costs while searching.
+        # We cycle regions to ensure coverage.
         current_region = self.env.get_current_region()
         num_regions = self.env.get_num_regions()
         next_region = (current_region + 1) % num_regions
         
         self.env.switch_region(next_region)
+        
         return ClusterType.NONE

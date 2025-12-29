@@ -1,42 +1,68 @@
 import numpy as np
 import faiss
 
-class Recall80LatencyIndex:
+class LatencyOptimizedIndex:
     def __init__(self, dim: int, **kwargs):
         """
-        Optimized index for SIFT1M with recall >= 0.80 and latency < 0.6ms
-        Uses IVF with very small nprobe for extreme speed
+        Initialize an IVF index optimized for extreme low latency while maintaining ≥80% recall.
+        Uses IVF with 1024 clusters and PQ compression for fast search.
         """
         self.dim = dim
-        self.nlist = kwargs.get('nlist', 2048)  # Coarse quantizer cells
-        self.nprobe = kwargs.get('nprobe', 1)   # Extremely aggressive for latency
-        self.quantizer = None
-        self.index = None
+        self.nlist = 1024  # Number of Voronoi cells
+        self.m = 8  # Number of subquantizers for PQ (compromise between speed and accuracy)
+        self.nprobe = 3  # Number of cells to visit during search
         
+        # Create the IVF index with PQ compression
+        quantizer = faiss.IndexFlatL2(dim)
+        self.index = faiss.IndexIVFPQ(quantizer, dim, self.nlist, self.m, 8)
+        
+        # Pre-allocate for batch processing
+        self.batch_size = 1000
+        
+        # Enable parallelism
+        faiss.omp_set_num_threads(8)
+
     def add(self, xb: np.ndarray) -> None:
         """
-        Build IVF index with training on subset of data
+        Add vectors to the index with training if needed.
         """
-        n_samples = min(100000, len(xb))
-        train_data = xb[:n_samples].copy()
+        if not self.index.is_trained:
+            # Train on a subset for speed
+            n_train = min(100000, len(xb))
+            self.index.train(xb[:n_train])
         
-        # Create and train quantizer
-        self.quantizer = faiss.IndexFlatL2(self.dim)
-        self.index = faiss.IndexIVFFlat(self.quantizer, self.dim, self.nlist)
-        self.index.train(train_data)
-        
-        # Add all vectors
-        self.index.add(xb)
-        self.index.nprobe = self.nprobe
-    
-    def search(self, xq: np.ndarray, k: int):
+        # Add in batches to manage memory
+        for i in range(0, len(xb), self.batch_size):
+            batch = xb[i:i + self.batch_size]
+            self.index.add(batch)
+
+    def search(self, xq: np.ndarray, k: int) -> tuple:
         """
-        Search with minimal nprobe for extreme latency optimization
+        Search for k nearest neighbors with optimized parameters for low latency.
         """
-        # Ensure nprobe is set to minimal value
+        # Set search parameters for maximum speed while maintaining recall
         self.index.nprobe = self.nprobe
         
-        # Batch search - faiss handles vectorization efficiently
-        distances, indices = self.index.search(xq, k)
+        # Ensure k doesn't exceed available vectors
+        k = min(k, self.index.ntotal)
         
-        return distances.astype(np.float32), indices.astype(np.int64)
+        # Pre-allocate output arrays
+        nq = xq.shape[0]
+        distances = np.empty((nq, k), dtype=np.float32)
+        indices = np.empty((nq, k), dtype=np.int64)
+        
+        # Search in batches for better cache utilization
+        for i in range(0, nq, self.batch_size):
+            batch_end = min(i + self.batch_size, nq)
+            batch_xq = xq[i:batch_end]
+            batch_distances = np.empty((batch_end - i, k), dtype=np.float32)
+            batch_indices = np.empty((batch_end - i, k), dtype=np.int64)
+            
+            self.index.search(batch_xq, k, batch_distances, batch_indices)
+            
+            distances[i:batch_end] = batch_distances
+            indices[i:batch_end] = batch_indices
+        
+        # Convert distances to L2 (PQ returns approximate distances)
+        # The index already returns L2 distances
+        return distances, indices

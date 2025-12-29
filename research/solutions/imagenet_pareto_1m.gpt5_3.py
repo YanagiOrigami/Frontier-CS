@@ -1,151 +1,94 @@
 import math
+import os
 import random
-import copy
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 
-class ResidualBottleneckBlock(nn.Module):
-    def __init__(self, d_model: int, hidden_dim: int, dropout: float = 0.2):
-        super().__init__()
-        self.norm = nn.LayerNorm(d_model)
-        self.fc1 = nn.Linear(d_model, hidden_dim, bias=True)
-        self.act = nn.GELU()
-        self.fc2 = nn.Linear(hidden_dim, d_model, bias=True)
-        self.drop = nn.Dropout(dropout)
-
-    def forward(self, x):
-        y = self.norm(x)
-        y = self.fc1(y)
-        y = self.act(y)
-        y = self.drop(y)
-        y = self.fc2(y)
-        y = self.drop(y)
-        return x + y
-
-
-class ResidualMLP(nn.Module):
-    def __init__(
-        self,
-        input_dim: int,
-        num_classes: int,
-        d_model: int = 576,
-        num_blocks: int = 2,
-        bottleneck_ratio: float = 0.5,
-        dropout: float = 0.2,
-        input_dropout: float = 0.05,
-        use_ln_out: bool = True,
-    ):
-        super().__init__()
-        self.in_drop = nn.Dropout(input_dropout) if input_dropout and input_dropout > 0 else nn.Identity()
-        self.input_proj = nn.Linear(input_dim, d_model, bias=True)
-        self.act = nn.GELU()
-        hidden_dim = max(1, int(d_model * bottleneck_ratio))
-        self.blocks = nn.ModuleList(
-            [ResidualBottleneckBlock(d_model, hidden_dim, dropout=dropout) for _ in range(num_blocks)]
-        )
-        self.ln_out = nn.LayerNorm(d_model) if use_ln_out else nn.Identity()
-        self.head = nn.Linear(d_model, num_classes, bias=True)
-
-    def forward(self, x):
-        x = self.in_drop(x)
-        x = self.input_proj(x)
-        x = self.act(x)
-        for blk in self.blocks:
-            x = blk(x)
-        x = self.ln_out(x)
-        x = self.head(x)
-        return x
+def set_seed(seed: int = 42):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
 
 
 def count_trainable_params(model: nn.Module) -> int:
     return sum(p.numel() for p in model.parameters() if p.requires_grad)
 
 
-def choose_model_under_budget(input_dim, num_classes, param_limit, target_blocks=2, bottleneck_ratio=0.5):
-    # Search for the largest d_model under budget
-    # Start from a high width and go down
-    candidate_ds = list(range(640, 255, -16))
-    best_model = None
-    best_d = None
-    for d in candidate_ds:
-        model = ResidualMLP(
-            input_dim=input_dim,
-            num_classes=num_classes,
-            d_model=d,
-            num_blocks=target_blocks,
-            bottleneck_ratio=bottleneck_ratio,
-            dropout=0.2,
-            input_dropout=0.05,
-            use_ln_out=True,
-        )
-        n_params = count_trainable_params(model)
-        if n_params <= param_limit:
-            best_model = model
-            best_d = d
-            break
-    if best_model is None:
-        # Fallback to a compact baseline
-        # 2-layer MLP 384->512->128 with ReLU
-        model = nn.Sequential(
-            nn.Linear(input_dim, 512),
-            nn.ReLU(),
-            nn.Dropout(0.1),
-            nn.Linear(512, num_classes),
-        )
-        return model, count_trainable_params(model), 512
-    return best_model, count_trainable_params(best_model), best_d
+class MLPNet(nn.Module):
+    def __init__(self, input_dim: int, hidden_dim: int, num_classes: int, dropout: float = 0.2):
+        super().__init__()
+        self.in_ln = nn.LayerNorm(input_dim)
+        self.fc1 = nn.Linear(input_dim, hidden_dim)
+        self.bn1 = nn.BatchNorm1d(hidden_dim)
+        self.fc2 = nn.Linear(hidden_dim, hidden_dim)
+        self.bn2 = nn.BatchNorm1d(hidden_dim)
+        self.act = nn.GELU()
+        self.drop = nn.Dropout(dropout)
+        self.fc_out = nn.Linear(hidden_dim, num_classes)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = x.view(x.size(0), -1)
+        x = self.in_ln(x)
+        x = self.fc1(x)
+        x = self.bn1(x)
+        x = self.act(x)
+        x = self.drop(x)
+        x = self.fc2(x)
+        x = self.bn2(x)
+        x = self.act(x)
+        x = self.drop(x)
+        x = self.fc_out(x)
+        return x
 
 
-def mixup_data(x, y, alpha=0.2):
-    if alpha <= 0.0:
-        return x, y, None
-    lam = np_beta(alpha, alpha)
-    batch_size = x.size(0)
-    index = torch.randperm(batch_size, device=x.device)
-    mixed_x = lam * x + (1 - lam) * x[index, :]
-    y_a, y_b = y, y[index]
-    return mixed_x, y_a, (y_b, lam)
+def build_model_within_limit(input_dim: int, num_classes: int, param_limit: int, base_dropout: float = 0.2) -> nn.Module:
+    # Analytical width estimate for architecture with:
+    # LayerNorm(in_dim): 2*in_dim params, two hidden layers with BN, dropout, GELU
+    # Params ~= W^2 + W*(input_dim + num_classes + 6) + num_classes + 2*input_dim
+    a = 1.0
+    b = float(input_dim + num_classes + 6)
+    c = float(num_classes + 2 * input_dim - param_limit)
+
+    disc = b * b - 4 * a * c
+    w_est = int(max(2, math.floor((-b + math.sqrt(max(0.0, disc))) / (2 * a))))
+    # Clamp to reasonable range
+    w = max(64, min(1024, w_est))
+
+    # Adjust to fit within the limit by constructing models
+    while w > 0:
+        model = MLPNet(input_dim, w, num_classes, dropout=base_dropout)
+        params = count_trainable_params(model)
+        if params <= param_limit:
+            return model
+        w -= 1
+
+    # Fallback minimal model if needed
+    return MLPNet(input_dim, 128, num_classes, dropout=base_dropout)
 
 
-def np_beta(a, b):
-    # Lightweight Beta sampler using torch to avoid numpy dependency
-    # Sample two Gamma and normalize
-    ga = torch.distributions.Gamma(a, 1.0).sample()
-    gb = torch.distributions.Gamma(b, 1.0).sample()
-    lam = ga / (ga + gb)
-    return float(lam)
-
-
-def evaluate_accuracy(model: nn.Module, data_loader, device):
+def evaluate_accuracy(model: nn.Module, loader, device: torch.device) -> float:
     model.eval()
     correct = 0
     total = 0
     with torch.no_grad():
-        for xb, yb in data_loader:
-            xb = xb.to(device, non_blocking=False).float()
-            yb = yb.to(device, non_blocking=False).long()
-            logits = model(xb)
-            preds = logits.argmax(dim=1)
-            correct += (preds == yb).sum().item()
-            total += yb.numel()
-    return correct / total if total > 0 else 0.0
-
-
-def update_ema(ema_model: nn.Module, model: nn.Module, decay: float):
-    with torch.no_grad():
-        msd = model.state_dict()
-        for k, v in ema_model.state_dict().items():
-            # Only update floating tensors
-            if v.dtype.is_floating_point:
-                v.mul_(decay).add_(msd[k].to(v.device), alpha=(1.0 - decay))
-            else:
-                v.copy_(msd[k])
+        for inputs, targets in loader:
+            inputs = inputs.to(device, non_blocking=True)
+            targets = targets.to(device, non_blocking=True)
+            outputs = model(inputs)
+            preds = outputs.argmax(dim=1)
+            correct += (preds == targets).sum().item()
+            total += targets.numel()
+    return (correct / total) if total > 0 else 0.0
 
 
 class Solution:
     def solve(self, train_loader, val_loader, metadata: dict = None) -> torch.nn.Module:
+        set_seed(42)
+
+        # Metadata defaults
         if metadata is None:
             metadata = {}
         input_dim = int(metadata.get("input_dim", 384))
@@ -154,128 +97,82 @@ class Solution:
         device_str = metadata.get("device", "cpu")
         device = torch.device(device_str)
 
-        # Reproducibility
-        seed = 42
-        random.seed(seed)
-        torch.manual_seed(seed)
-
-        # Choose model architecture under budget
-        model, n_params, used_d = choose_model_under_budget(
-            input_dim=input_dim, num_classes=num_classes, param_limit=param_limit, target_blocks=2, bottleneck_ratio=0.5
-        )
-
-        # Safety check
-        if count_trainable_params(model) > param_limit:
-            # As a final guard, reduce to a minimal baseline
-            model = nn.Sequential(
-                nn.Linear(input_dim, 512),
-                nn.GELU(),
-                nn.Dropout(0.1),
-                nn.Linear(512, num_classes),
-            )
+        # Build model maximally within the parameter budget
+        model = build_model_within_limit(input_dim, num_classes, param_limit, base_dropout=0.2)
         model.to(device)
 
-        # EMA model
-        ema_model = copy.deepcopy(model).to(device)
-        for p in ema_model.parameters():
-            p.requires_grad_(False)
+        # Safety check: ensure parameter budget is not exceeded
+        if count_trainable_params(model) > param_limit:
+            # Reduce hidden dim aggressively until under budget
+            if isinstance(model, MLPNet):
+                hidden = model.fc1.out_features
+                while hidden > 32:
+                    hidden -= 1
+                    reduced = MLPNet(input_dim, hidden, num_classes, dropout=0.2).to(device)
+                    if count_trainable_params(reduced) <= param_limit:
+                        model = reduced
+                        break
 
-        # Optimizer and scheduler
-        train_samples = int(metadata.get("train_samples", 2048))
-        batches_per_epoch = max(1, len(train_loader))
-        # Epochs: scale modestly with data size
-        epochs = 160 if train_samples >= 2048 else 120
-        max_lr = 0.003
-        base_lr = max_lr / 10.0
-        optimizer = torch.optim.AdamW(model.parameters(), lr=base_lr, weight_decay=0.05, betas=(0.9, 0.999))
-        scheduler = torch.optim.lr_scheduler.OneCycleLR(
-            optimizer,
-            max_lr=max_lr,
-            epochs=epochs,
-            steps_per_epoch=batches_per_epoch,
-            pct_start=0.15,
-            anneal_strategy="cos",
-            div_factor=max_lr / base_lr,
-            final_div_factor=100.0,
-        )
-
-        # Loss functions
-        criterion = nn.CrossEntropyLoss(label_smoothing=0.08)
-        criterion_plain = nn.CrossEntropyLoss()
-
-        # Training utilities
+        # Training setup
+        # AdamW works well for MLPs; weight decay for regularization; label smoothing to reduce overfit
+        base_lr = 3e-3
+        weight_decay = 1e-2
+        max_epochs = 120
         patience = 25
-        best_val = -1.0
+        grad_clip = 1.0
+        label_smoothing = 0.1
+
+        optimizer = torch.optim.AdamW(model.parameters(), lr=base_lr, weight_decay=weight_decay)
+
+        # Warmup + Cosine decay scheduler per-epoch
+        def lr_lambda(epoch):
+            warmup_epochs = max(2, int(0.08 * max_epochs))
+            if epoch < warmup_epochs:
+                return float(epoch + 1) / float(warmup_epochs)
+            # Cosine decay from 1.0 to 0.05
+            progress = (epoch - warmup_epochs) / max(1, (max_epochs - warmup_epochs))
+            cos_decay = 0.5 * (1.0 + math.cos(math.pi * progress))
+            min_factor = 0.05
+            return min_factor + (1.0 - min_factor) * cos_decay
+
+        scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_lambda)
+
+        best_acc = -1.0
         best_state = None
-        best_ema_state = None
-        ema_decay = 0.995
-        mixup_alpha = 0.2
-        mixup_prob = 0.5
+        epochs_no_improve = 0
 
-        # Some DataLoaders may not have pinned memory; keep default
-
-        for epoch in range(epochs):
+        # Training loop
+        for epoch in range(max_epochs):
             model.train()
-            for xb, yb in train_loader:
-                xb = xb.to(device, non_blocking=False).float()
-                yb = yb.to(device, non_blocking=False).long()
-
-                use_mix = (random.random() < mixup_prob) and (mixup_alpha > 0.0)
-                if use_mix:
-                    mixed_x, y_a, mix_info = mixup_data(xb, yb, alpha=mixup_alpha)
-                    y_b, lam = mix_info
-                    logits = model(mixed_x)
-                    loss = lam * criterion_plain(logits, y_a) + (1.0 - lam) * criterion_plain(logits, y_b)
-                else:
-                    logits = model(xb)
-                    loss = criterion(logits, yb)
+            for inputs, targets in train_loader:
+                inputs = inputs.to(device, non_blocking=True)
+                targets = targets.to(device, non_blocking=True)
 
                 optimizer.zero_grad(set_to_none=True)
+                outputs = model(inputs)
+                loss = F.cross_entropy(outputs, targets, label_smoothing=label_smoothing)
                 loss.backward()
-                nn.utils.clip_grad_norm_(model.parameters(), max_norm=2.0)
+                if grad_clip is not None and grad_clip > 0:
+                    nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
                 optimizer.step()
-                scheduler.step()
 
-                update_ema(ema_model, model, decay=ema_decay)
+            scheduler.step()
 
-            # Validation at epoch end for base and EMA
-            val_acc_base = evaluate_accuracy(model, val_loader, device)
-            val_acc_ema = evaluate_accuracy(ema_model, val_loader, device)
+            # Validation
+            val_acc = evaluate_accuracy(model, val_loader, device)
 
-            if val_acc_ema >= val_acc_base:
-                current_best_acc = val_acc_ema
-                current_best_state = copy.deepcopy(ema_model.state_dict())
-                from_ema = True
+            if val_acc > best_acc:
+                best_acc = val_acc
+                best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
+                epochs_no_improve = 0
             else:
-                current_best_acc = val_acc_base
-                current_best_state = copy.deepcopy(model.state_dict())
-                from_ema = False
+                epochs_no_improve += 1
+                if epochs_no_improve >= patience:
+                    break
 
-            if current_best_acc > best_val:
-                best_val = current_best_acc
-                if from_ema:
-                    best_ema_state = current_best_state
-                    best_state = None
-                else:
-                    best_state = current_best_state
-                    best_ema_state = None
-                patience_counter = 0
-            else:
-                patience_counter = locals().get("patience_counter", 0) + 1
-            if patience_counter >= patience:
-                break
-
-        # Load the best state
-        if best_ema_state is not None:
-            ema_model.load_state_dict(best_ema_state)
-            final_model = ema_model
-        elif best_state is not None:
-            model.load_state_dict(best_state)
-            final_model = model
-        else:
-            # Fallback load EMA
-            final_model = ema_model
-
-        final_model.to(device)
-        final_model.eval()
-        return final_model
+        # Load best state dict
+        if best_state is not None:
+            model.load_state_dict(best_state, strict=True)
+        model.to("cpu")
+        model.eval()
+        return model

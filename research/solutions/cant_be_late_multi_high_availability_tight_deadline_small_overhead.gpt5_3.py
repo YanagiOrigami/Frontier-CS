@@ -6,7 +6,7 @@ from sky_spot.utils import ClusterType
 
 
 class Solution(MultiRegionStrategy):
-    NAME = "cbm_safe_multiregion"
+    NAME = "cantbe_late_mr_ewma_v1"
 
     def solve(self, spec_path: str) -> "Solution":
         with open(spec_path) as f:
@@ -20,81 +20,112 @@ class Solution(MultiRegionStrategy):
         )
         super().__init__(args)
 
-        # Internal state for strategy
+        # Strategy state (initialized lazily in _step when env is ready)
         self._initialized = False
-        self._commit_on_demand = False
-        self._no_spot_wait_steps = 0
         return self
 
-    def _init_once(self):
+    def _lazy_init(self):
         if self._initialized:
             return
-        self._initialized = True
+        # Regions
         try:
-            self._num_regions = int(self.env.get_num_regions())
+            num_regions = self.env.get_num_regions()
         except Exception:
-            self._num_regions = 1
-        if self._num_regions is None or self._num_regions <= 0:
-            self._num_regions = 1
+            num_regions = 1
+        self._num_regions = max(1, int(num_regions))
 
-    def _rotate_region_for_next_step(self):
-        if self._num_regions <= 1:
-            return
-        cur = self.env.get_current_region()
-        nxt = (cur + 1) % self._num_regions
-        if nxt != cur:
-            self.env.switch_region(nxt)
+        # EWMA for spot availability per region
+        self._ewma = [0.7] * self._num_regions  # optimistic prior given high availability
+        self._ewma_alpha = 0.08  # smoothing factor
+
+        # Counts (for optional diagnostics/adaptation)
+        self._obs = [0] * self._num_regions
+        self._succ = [0] * self._num_regions
+
+        # Streak of consecutive steps without spot in current region
+        self._no_spot_streak = 0
+
+        # Safety margin in seconds: switch to OD when slack <= margin
+        # Choose conservatively: 2 steps or at least 4x overhead, at most 3 hours
+        gap = float(self.env.gap_seconds)
+        overhead = float(self.restart_overhead)
+        self._safety_margin_seconds = max(4.0 * overhead, min(2.5 * gap, 3.0 * 3600.0))
+
+        # Region switching parameters
+        self._switch_threshold = 0.05  # min EWMA advantage to switch
+        self._probe_offset = 1  # for round-robin probing when uncertain
+
+        # Once set, we commit to OD until finish
+        self._od_lock = False
+
+        self._initialized = True
+
+    def _update_region_stats(self, region_idx: int, has_spot: bool):
+        # Update EWMA and counts based on observation in the given region
+        self._obs[region_idx] += 1
+        if has_spot:
+            self._succ[region_idx] += 1
+        alpha = self._ewma_alpha
+        old = self._ewma[region_idx]
+        self._ewma[region_idx] = (1.0 - alpha) * old + alpha * (1.0 if has_spot else 0.0)
+
+    def _select_region_on_no_spot(self, current_region: int) -> int:
+        # Choose best region by EWMA if clearly better; otherwise probe next region
+        best_idx = current_region
+        best_score = self._ewma[current_region]
+        for i in range(self._num_regions):
+            if self._ewma[i] > best_score:
+                best_score = self._ewma[i]
+                best_idx = i
+
+        if best_idx != current_region and (best_score - self._ewma[current_region]) > self._switch_threshold:
+            return best_idx
+
+        # No clear winner: probe next region in round-robin manner to collect data
+        # Stagger probing based on streak count to avoid rapid toggling between two regions
+        next_idx = (current_region + max(1, min(self._no_spot_streak, self._num_regions - 1))) % self._num_regions
+        return next_idx if next_idx != current_region else (current_region + self._probe_offset) % self._num_regions
 
     def _step(self, last_cluster_type: ClusterType, has_spot: bool) -> ClusterType:
-        self._init_once()
+        self._lazy_init()
 
-        # If already committed to on-demand to ensure finish, keep it
-        if self._commit_on_demand:
+        # Snapshot current region before any switch (observation applies to this region)
+        current_region = self.env.get_current_region()
+
+        # Update region statistics with current observation
+        self._update_region_stats(current_region, has_spot)
+
+        # Compute remaining work and time
+        done_work = float(sum(self.task_done_time))
+        remain_work = max(0.0, float(self.task_duration) - done_work)
+        remain_time = max(0.0, float(self.deadline) - float(self.env.elapsed_seconds))
+
+        # If we've already finished, choose NONE to avoid cost (environment should stop soon)
+        if remain_work <= 0.0:
+            return ClusterType.NONE
+
+        # Calculate slack
+        slack = remain_time - remain_work
+
+        # Lock to OD if we are too close to the deadline
+        if not self._od_lock and slack <= self._safety_margin_seconds:
+            self._od_lock = True
+
+        # If locked, always run on OD
+        if self._od_lock:
+            # No need to switch region when on OD
+            self._no_spot_streak = 0
             return ClusterType.ON_DEMAND
 
-        gap = float(self.env.gap_seconds)
-        elapsed = float(self.env.elapsed_seconds)
-        time_left = float(self.deadline - elapsed)
-
-        done = float(sum(self.task_done_time))
-        remaining_work = max(0.0, float(self.task_duration - done))
-
-        restart_overhead = float(self.restart_overhead)
-        remaining_restart_overhead = float(getattr(self, "remaining_restart_overhead", restart_overhead) or 0.0)
-
-        # Overhead to finish if switching to OD now
-        if last_cluster_type == ClusterType.ON_DEMAND:
-            od_overhead_now = max(0.0, remaining_restart_overhead)
-        else:
-            od_overhead_now = restart_overhead
-
-        od_time_needed = od_overhead_now + remaining_work
-
-        # Safety buffers:
-        # For running on SPOT this step: ensure we still can fallback to OD next step even if we lose this step (gap)
-        # and, if currently on OD, account for paying a fresh restart_overhead when switching back to OD.
-        risk_buffer_spot = gap + max(0.0, restart_overhead - od_overhead_now)
-
-        # For waiting (NONE) this step due to no spot: ensure we can still finish by switching to OD next step.
-        wait_buffer_none = gap * (1 + max(0, self._no_spot_wait_steps))
-
-        # If time is tight relative to OD finish time, choose OD now to guarantee completion.
-        if time_left <= od_time_needed + risk_buffer_spot:
-            self._commit_on_demand = True
-            return ClusterType.ON_DEMAND
-
-        # If SPOT is available and we have enough buffer, run on SPOT
+        # Not locked: prefer SPOT when available; otherwise pause (NONE) and possibly switch region
         if has_spot:
-            # Reset no-spot waiting counter
-            self._no_spot_wait_steps = 0
+            self._no_spot_streak = 0
             return ClusterType.SPOT
 
-        # SPOT not available: decide between waiting (NONE) vs switching to OD
-        if time_left <= od_time_needed + wait_buffer_none:
-            self._commit_on_demand = True
-            return ClusterType.ON_DEMAND
+        # No spot this step: pause to save cost, and pick a better region for the next step
+        self._no_spot_streak += 1
+        target_region = self._select_region_on_no_spot(current_region)
+        if target_region != current_region:
+            self.env.switch_region(target_region)
 
-        # We have enough slack to wait for SPOT; rotate region to try a different one next step
-        self._no_spot_wait_steps += 1
-        self._rotate_region_for_next_step()
         return ClusterType.NONE

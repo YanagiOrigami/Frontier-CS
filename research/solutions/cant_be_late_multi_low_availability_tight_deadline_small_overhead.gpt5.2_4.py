@@ -1,17 +1,15 @@
 import json
 import math
 from argparse import Namespace
-from typing import List, Optional, Sequence, Union
+from collections import deque
+from typing import List, Optional
 
 from sky_spot.strategies.multi_strategy import MultiRegionStrategy
 from sky_spot.utils import ClusterType
 
 
-Number = Union[int, float]
-
-
 class Solution(MultiRegionStrategy):
-    NAME = "cant_be_late_mr_v2"
+    NAME = "cant_be_late_v1"
 
     def solve(self, spec_path: str) -> "Solution":
         with open(spec_path) as f:
@@ -25,181 +23,173 @@ class Solution(MultiRegionStrategy):
         )
         super().__init__(args)
 
-        self._mr_initialized = False
-        self._committed_ondemand = False
+        self._inited = False
+        self._n_regions: int = 1
+        self._succ: List[int] = []
+        self._trial: List[int] = []
+        self._total_obs: int = 0
 
-        self._done_sum = 0.0
-        self._done_len = 0
+        self._done_sum: float = 0.0
+        self._last_done_len: int = 0
 
-        self._num_regions = 1
-        self._spot_obs = []
-        self._total_obs = []
-        self._no_spot_streak = []
+        self._commit_on_demand: bool = False
 
-        self._switch_streak = 2
-        self._ucb_c = 0.25
+        self._unavail_streak_steps: int = 0
+        self._last_switch_elapsed: float = -1e30
+        self._switch_count: int = 0
+        self._recent_regions: deque = deque(maxlen=4)
+
+        self._cooldown_seconds: float = 600.0
+        self._streak_threshold_seconds: float = 300.0
+        self._switch_buffer_seconds: float = 1800.0
+
+        self._bootstrap_until_elapsed: float = 600.0
+        self._bootstrap_switch_interval: float = 30.0
+        self._bootstrap_next_switch_time: float = 0.0
 
         return self
 
-    def _as_scalar(self, x: Union[Number, Sequence[Number]]) -> float:
-        if isinstance(x, (list, tuple)):
-            return float(x[0]) if x else 0.0
-        return float(x)
+    def _lazy_init(self) -> None:
+        if self._inited:
+            return
+        try:
+            self._n_regions = int(self.env.get_num_regions())
+        except Exception:
+            self._n_regions = 1
 
-    def _get_done_list(self) -> List[float]:
-        tdt = self.task_done_time
-        if isinstance(tdt, (list, tuple)) and tdt and isinstance(tdt[0], (list, tuple)):
-            return list(tdt[0])
-        return list(tdt) if isinstance(tdt, (list, tuple)) else []
+        self._succ = [0] * self._n_regions
+        self._trial = [0] * self._n_regions
+        self._total_obs = 0
+
+        o = float(self.restart_overhead)
+        self._cooldown_seconds = max(600.0, 4.0 * o)
+        self._streak_threshold_seconds = max(300.0, 2.0 * o)
+        self._switch_buffer_seconds = max(1800.0, 10.0 * o)
+
+        self._bootstrap_until_elapsed = min(600.0, 0.05 * float(self.deadline))
+        self._bootstrap_switch_interval = max(30.0, 2.0 * float(self.env.gap_seconds))
+        self._bootstrap_next_switch_time = 0.0
+
+        self._inited = True
 
     def _update_done_sum(self) -> None:
-        tdt = self.task_done_time
-        if isinstance(tdt, (list, tuple)) and tdt and isinstance(tdt[0], (list, tuple)):
-            tdt0 = tdt[0]
-        else:
-            tdt0 = tdt
+        l = len(self.task_done_time)
+        if l <= self._last_done_len:
+            return
+        # Usually one append per step; loop is O(total_steps) overall.
+        for i in range(self._last_done_len, l):
+            self._done_sum += float(self.task_done_time[i])
+        self._last_done_len = l
 
-        if not isinstance(tdt0, (list, tuple)):
-            self._done_sum = 0.0
-            self._done_len = 0
+    def _region_score(self, ridx: int) -> float:
+        t = self._trial[ridx]
+        s = self._succ[ridx]
+        mean = (s + 1.0) / (t + 2.0)
+        bonus = math.sqrt(math.log(self._total_obs + 2.0) / (t + 1.0))
+        score = mean + 0.4 * bonus
+        if ridx in self._recent_regions:
+            # Small penalty to reduce ping-pong.
+            score -= 0.05
+        return score
+
+    def _pick_best_region(self, current: int) -> int:
+        if self._n_regions <= 1:
+            return current
+        best = current
+        best_score = -1e30
+        for i in range(self._n_regions):
+            if i == current:
+                continue
+            sc = self._region_score(i)
+            if sc > best_score:
+                best_score = sc
+                best = i
+        return best
+
+    def _maybe_switch_region_while_waiting(self, elapsed: float, time_left: float, remaining_work: float) -> None:
+        if self._n_regions <= 1:
+            return
+        if self._switch_count >= 50:
+            return
+        if elapsed - self._last_switch_elapsed < self._cooldown_seconds:
+            return
+        if time_left <= remaining_work + float(self.restart_overhead) + self._switch_buffer_seconds:
+            return
+        if float(self.remaining_restart_overhead) > 0.0:
             return
 
-        n = len(tdt0)
-        if n == self._done_len:
+        cur = int(self.env.get_current_region())
+
+        # Bootstrap: quickly find any region with spot at the beginning.
+        if self._done_sum <= 0.0 and elapsed <= self._bootstrap_until_elapsed:
+            if elapsed >= self._bootstrap_next_switch_time:
+                target = (cur + 1) % self._n_regions
+                if target != cur:
+                    self.env.switch_region(target)
+                    self._recent_regions.append(cur)
+                    self._last_switch_elapsed = elapsed
+                    self._switch_count += 1
+                    self._unavail_streak_steps = 0
+                self._bootstrap_next_switch_time = elapsed + self._bootstrap_switch_interval
             return
-        if n < self._done_len:
-            self._done_sum = float(sum(float(v) for v in tdt0))
-            self._done_len = n
+
+        streak_seconds = self._unavail_streak_steps * float(self.env.gap_seconds)
+        if streak_seconds < self._streak_threshold_seconds:
             return
 
-        s = self._done_sum
-        for i in range(self._done_len, n):
-            s += float(tdt0[i])
-        self._done_sum = s
-        self._done_len = n
-
-    def _lazy_init(self) -> None:
-        if self._mr_initialized:
-            return
-        try:
-            n = int(self.env.get_num_regions())
-        except Exception:
-            n = 1
-        n = max(1, n)
-        self._num_regions = n
-        self._spot_obs = [0] * n
-        self._total_obs = [0] * n
-        self._no_spot_streak = [0] * n
-        self._mr_initialized = True
-
-    def _get_remaining_overhead(self) -> float:
-        v = getattr(self, "remaining_restart_overhead", 0.0)
-        try:
-            return float(v) if v is not None else 0.0
-        except Exception:
-            return 0.0
-
-    def _work_if_choose(self, choose: ClusterType, last_cluster_type: ClusterType) -> float:
-        if choose == ClusterType.NONE:
-            return 0.0
-        gap = float(self.env.gap_seconds)
-        if choose == last_cluster_type:
-            overhead = self._get_remaining_overhead()
-        else:
-            overhead = self._as_scalar(self.restart_overhead)
-        w = gap - float(overhead)
-        return w if w > 0.0 else 0.0
-
-    def _best_region_ucb(self, current_region: int) -> int:
-        n = self._num_regions
-        if n <= 1:
-            return current_region
-
-        total_all = 0
-        for t in self._total_obs:
-            total_all += t
-        total_all = max(1, total_all)
-
-        best_idx = current_region
-        best_score = -1e18
-
-        log_term = math.log(total_all + 1.0)
-        c = self._ucb_c
-
-        for i in range(n):
-            tot = self._total_obs[i]
-            spot = self._spot_obs[i]
-            p = (spot + 1.0) / (tot + 2.0)
-            bonus = c * math.sqrt(log_term / (tot + 1.0))
-            score = p + bonus
-            if i == current_region:
-                score += 1e-9
-            if score > best_score:
-                best_score = score
-                best_idx = i
-
-        return best_idx
+        target = self._pick_best_region(cur)
+        if target != cur:
+            self.env.switch_region(target)
+            self._recent_regions.append(cur)
+            self._last_switch_elapsed = elapsed
+            self._switch_count += 1
+            self._unavail_streak_steps = 0
 
     def _step(self, last_cluster_type: ClusterType, has_spot: bool) -> ClusterType:
         self._lazy_init()
+
+        cur = int(self.env.get_current_region())
+        if 0 <= cur < self._n_regions:
+            self._trial[cur] += 1
+            if has_spot:
+                self._succ[cur] += 1
+            self._total_obs += 1
+
+        if has_spot:
+            self._unavail_streak_steps = 0
+        else:
+            self._unavail_streak_steps += 1
+
         self._update_done_sum()
-
-        duration = self._as_scalar(self.task_duration)
-        deadline = self._as_scalar(self.deadline)
-        restart_overhead = self._as_scalar(self.restart_overhead)
-
-        remaining_work = duration - self._done_sum
-        if remaining_work <= 1e-9:
-            self._committed_ondemand = False
+        remaining_work = float(self.task_duration) - float(self._done_sum)
+        if remaining_work <= 0.0:
             return ClusterType.NONE
 
         elapsed = float(self.env.elapsed_seconds)
-        time_left = deadline - elapsed
+        time_left = float(self.deadline) - elapsed
         gap = float(self.env.gap_seconds)
+        o = float(self.restart_overhead)
 
-        try:
-            cur_region = int(self.env.get_current_region())
-        except Exception:
-            cur_region = 0
-        cur_region = max(0, min(self._num_regions - 1, cur_region))
-
-        self._total_obs[cur_region] += 1
-        if has_spot:
-            self._spot_obs[cur_region] += 1
-            self._no_spot_streak[cur_region] = 0
-        else:
-            self._no_spot_streak[cur_region] += 1
-
-        if self._committed_ondemand:
+        if time_left <= 0.0:
+            self._commit_on_demand = True
             return ClusterType.ON_DEMAND
 
-        time_left_after_step = time_left - gap
+        safety = 2.0 * gap
 
-        safe_to_wait_one_step = (time_left_after_step >= 0.0) and (remaining_work + restart_overhead <= time_left_after_step)
+        if self._commit_on_demand:
+            return ClusterType.ON_DEMAND
 
-        safe_to_take_spot_step = False
-        if has_spot and time_left_after_step >= 0.0:
-            spot_work_now = self._work_if_choose(ClusterType.SPOT, last_cluster_type)
-            rem_after_spot = remaining_work - spot_work_now
-            if rem_after_spot < 0.0:
-                rem_after_spot = 0.0
-            safe_to_take_spot_step = (rem_after_spot + restart_overhead <= time_left_after_step)
-
-        if not safe_to_wait_one_step:
-            if has_spot and safe_to_take_spot_step:
-                return ClusterType.SPOT
-            self._committed_ondemand = True
+        if time_left <= remaining_work + o + safety:
+            self._commit_on_demand = True
             return ClusterType.ON_DEMAND
 
         if has_spot:
             return ClusterType.SPOT
 
-        if self._no_spot_streak[cur_region] >= self._switch_streak and self._num_regions > 1:
-            best = self._best_region_ucb(cur_region)
-            if best != cur_region:
-                try:
-                    self.env.switch_region(best)
-                except Exception:
-                    pass
+        # Spot unavailable.
+        if time_left - gap > remaining_work + o + safety:
+            self._maybe_switch_region_while_waiting(elapsed, time_left, remaining_work)
+            return ClusterType.NONE
 
-        return ClusterType.NONE
+        self._commit_on_demand = True
+        return ClusterType.ON_DEMAND

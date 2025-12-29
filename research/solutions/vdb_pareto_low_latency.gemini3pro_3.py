@@ -2,49 +2,61 @@ import numpy as np
 import faiss
 from typing import Tuple
 
-class HNSWSolution:
+class YourIndexClass:
     def __init__(self, dim: int, **kwargs):
         """
-        Initialize the index using HNSW with Flat storage.
-        
-        Optimization strategy:
-        - Use HNSW for robust recall/latency tradeoff.
-        - M=32 provides a good graph connectivity for high recall.
-        - efConstruction=200 ensures a high-quality graph structure (offline cost).
-        - efSearch=64 is chosen to strictly meet the 2.31ms latency constraint.
-          Typical latency for this config on 8 vCPUs is ~1.0-1.5ms for SIFT1M.
+        Initialize the index for vectors of dimension `dim`.
+        Optimized for low latency (constraint < 2.31ms) on SIFT1M.
         """
         self.dim = dim
         
-        # Optimize threading for the 8 vCPU environment
+        # HNSW Parameters
+        # M=16 is reduced from standard 32 to improve search speed per hop
+        self.M = 16 
+        
+        # efConstruction determines graph quality. Higher values (e.g. 100-200) 
+        # improve recall potential without affecting search latency.
+        self.ef_construction = 128
+        
+        # efSearch is the critical runtime knob.
+        # Based on baseline (3.85ms) vs limit (2.31ms), we need aggressive speedup.
+        # efSearch=50 combined with M=16 provides a safe margin (target ~1.8ms)
+        # while maintaining recall typically > 0.95.
+        self.ef_search = 50
+        
+        # Ensure FAISS uses all available vCPUs (Environment has 8)
         faiss.omp_set_num_threads(8)
         
-        # Initialize HNSW index with M=32
-        self.index = faiss.IndexHNSWFlat(dim, 32, faiss.METRIC_L2)
-        
-        # Set construction depth (affects build time, improves search speed/recall)
-        self.index.hnsw.efConstruction = 200
-        
-        # Set search depth (critical for latency constraint)
-        # Target latency < 2.31ms. efSearch=64 provides a safe margin.
-        self.ef_search = 64
+        # Initialize HNSW Flat index
+        self.index = faiss.IndexHNSWFlat(dim, self.M, faiss.METRIC_L2)
+        self.index.hnsw.efConstruction = self.ef_construction
 
     def add(self, xb: np.ndarray) -> None:
         """
-        Add vectors to the HNSW index.
+        Add vectors to the index.
         """
-        # Faiss handles float32 arrays natively
+        # Ensure correct data type and memory layout for FAISS
+        if xb.dtype != np.float32:
+            xb = xb.astype(np.float32)
+        if not xb.flags.c_contiguous:
+            xb = np.ascontiguousarray(xb)
+            
         self.index.add(xb)
 
     def search(self, xq: np.ndarray, k: int) -> Tuple[np.ndarray, np.ndarray]:
         """
         Search for k nearest neighbors.
         """
-        # Set the search parameter
+        # Ensure correct data type and memory layout
+        if xq.dtype != np.float32:
+            xq = xq.astype(np.float32)
+        if not xq.flags.c_contiguous:
+            xq = np.ascontiguousarray(xq)
+            
+        # Set runtime search parameter
         self.index.hnsw.efSearch = self.ef_search
         
-        # Perform batch search
-        # D: distances, I: indices
-        D, I = self.index.search(xq, k)
+        # Perform search
+        distances, indices = self.index.search(xq, k)
         
-        return D, I
+        return distances, indices

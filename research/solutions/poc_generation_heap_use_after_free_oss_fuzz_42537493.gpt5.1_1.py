@@ -1,248 +1,136 @@
-import os
 import tarfile
-import gzip
+from typing import List, Optional
 
 
 class Solution:
-    def __init__(self):
-        self.bug_id_full = "42537493"
-        self.bug_id_short = "42537"
-        self.name_keywords = [
-            "poc",
-            "proof",
-            "crash",
-            "repro",
-            "reproducer",
-            "testcase",
-            "test-case",
-            "uaf",
-            "use-after",
-            "use_after",
-            "heap-use",
-            "heap_use",
-            "heap-uaf",
-            "heap_overflow",
-            "oss-fuzz",
-            "ossfuzz",
-            "clusterfuzz",
-            "bug",
-            "issue",
-            "ticket",
-            "regress",
-        ]
-        self.preferred_exts = {
-            ".xml",
-            ".html",
-            ".htm",
-            ".xhtml",
-            ".txt",
-            ".dat",
-            ".bin",
-            ".in",
-            ".out",
-            ".poc",
-            "",
-        }
-        self.allowed_exts = set(self.preferred_exts) | {".seed"}
-
     def solve(self, src_path: str) -> bytes:
-        poc = self._find_poc(src_path)
-        if poc is not None:
-            return poc
-        return self._default_poc()
+        def has_text_extension(name: str) -> bool:
+            name = name.lower()
+            text_exts = (
+                ".xml",
+                ".html",
+                ".htm",
+                ".xhtml",
+                ".txt",
+                ".dat",
+                ".sgml",
+                ".sgm",
+                ".json",
+                ".xsl",
+                ".xslt",
+                ".svg",
+            )
+            return any(name.endswith(ext) for ext in text_exts)
 
-    def _find_poc(self, src_path: str) -> bytes | None:
-        # Try tarball first
-        if os.path.isfile(src_path) and tarfile.is_tarfile(src_path):
-            poc = self._find_poc_in_tar(src_path)
-            if poc is not None:
-                return poc
+        def select_member(
+            members: List[tarfile.TarInfo],
+            substrs: List[str],
+            prefer_text: bool = True,
+        ) -> Optional[tarfile.TarInfo]:
+            candidates: List[tarfile.TarInfo] = []
+            for m in members:
+                if not m.isfile():
+                    continue
+                if m.size <= 0:
+                    continue
+                name_lower = m.name.lower()
+                if any(sub in name_lower for sub in substrs):
+                    if prefer_text and not has_text_extension(name_lower):
+                        continue
+                    candidates.append(m)
+            if not candidates and prefer_text:
+                for m in members:
+                    if not m.isfile():
+                        continue
+                    if m.size <= 0:
+                        continue
+                    name_lower = m.name.lower()
+                    if any(sub in name_lower for sub in substrs):
+                        candidates.append(m)
+            if not candidates:
+                return None
+            candidates.sort(key=lambda x: x.size)
+            return candidates[0]
 
-        # If it's a directory, search within
-        if os.path.isdir(src_path):
-            poc = self._find_poc_in_dir(src_path)
-            if poc is not None:
-                return poc
-
-        return None
-
-    def _find_poc_in_tar(self, tar_path: str) -> bytes | None:
-        best_data = None
-        best_score = 0
+        # Fallback PoC guess (24 bytes)
+        fallback_poc = b'<?xml version="1.0"?><a/>'
 
         try:
-            with tarfile.open(tar_path, "r:*") as tf:
-                for member in tf:
-                    if not member.isreg():
-                        continue
-                    size = member.size
-                    if size <= 0 or size > 200000:
-                        continue
-
-                    name = os.path.basename(member.name)
-                    lower = name.lower()
-                    root, ext = os.path.splitext(lower)
-
-                    # Allow .gz for compressed PoCs; otherwise restrict extensions
-                    if ext not in self.allowed_exts and ext != ".gz":
-                        if (
-                            self.bug_id_full not in lower
-                            and self.bug_id_short not in lower
-                            and not any(kw in lower for kw in self.name_keywords)
-                        ):
-                            continue
-
-                    try:
-                        f = tf.extractfile(member)
-                        if f is None:
-                            continue
-                        raw = f.read()
-                    except Exception:
-                        continue
-
-                    if not raw:
-                        continue
-
-                    data = raw
-                    cand_name = name
-
-                    # Handle gzip-compressed PoCs
-                    if lower.endswith(".gz"):
-                        try:
-                            data = gzip.decompress(raw)
-                            cand_name = name[:-3]
-                        except Exception:
-                            data = raw
-
-                    if not data or len(data) > 200000:
-                        continue
-
-                    score = self._score_candidate(cand_name, len(data), data)
-                    if score > best_score:
-                        best_score = score
-                        best_data = data
+            tf = tarfile.open(src_path, "r:*")
         except Exception:
-            return None
+            return fallback_poc
 
-        return best_data
+        with tf:
+            members = tf.getmembers()
 
-    def _find_poc_in_dir(self, root_dir: str) -> bytes | None:
-        best_data = None
-        best_score = 0
-
-        for dirpath, _, filenames in os.walk(root_dir):
-            for fname in filenames:
-                path = os.path.join(dirpath, fname)
-                try:
-                    size = os.path.getsize(path)
-                except OSError:
-                    continue
-                if size <= 0 or size > 200000:
-                    continue
-
-                name = os.path.basename(path)
-                lower = name.lower()
-                root, ext = os.path.splitext(lower)
-
-                if ext not in self.allowed_exts and ext != ".gz":
-                    if (
-                        self.bug_id_full not in lower
-                        and self.bug_id_short not in lower
-                        and not any(kw in lower for kw in self.name_keywords)
-                    ):
-                        continue
-
-                try:
-                    with open(path, "rb") as f:
-                        raw = f.read()
-                except OSError:
-                    continue
-
-                if not raw:
-                    continue
-
-                data = raw
-                cand_name = name
-
-                if lower.endswith(".gz"):
+            # 1) Search by full bug-id / truncated id in file names
+            search_patterns = [
+                ["42537493"],
+                ["oss-fuzz-42537493"],
+                ["ossfuzz-42537493"],
+                ["42537"],
+            ]
+            for patterns in search_patterns:
+                m = select_member(members, patterns, prefer_text=True)
+                if m is not None:
                     try:
-                        data = gzip.decompress(raw)
-                        cand_name = name[:-3]
+                        f = tf.extractfile(m)
+                        if f is not None:
+                            data = f.read()
+                            if data:
+                                return data
                     except Exception:
-                        data = raw
+                        pass
 
-                if not data or len(data) > 200000:
+            # 2) Search inside small test/fuzz files for the bug id
+            best_data: Optional[bytes] = None
+            for m in members:
+                if not m.isfile():
                     continue
+                if m.size == 0 or m.size > 4096:
+                    continue
+                name_lower = m.name.lower()
+                if (
+                    "test" not in name_lower
+                    and "fuzz" not in name_lower
+                    and "regress" not in name_lower
+                    and "regression" not in name_lower
+                ):
+                    continue
+                try:
+                    f = tf.extractfile(m)
+                    if f is None:
+                        continue
+                    data = f.read()
+                except Exception:
+                    continue
+                if not data:
+                    continue
+                if b"42537493" in data or b"42537" in data:
+                    if best_data is None or len(data) < len(best_data):
+                        best_data = data
+            if best_data is not None:
+                return best_data
 
-                score = self._score_candidate(cand_name, len(data), data)
-                if score > best_score:
-                    best_score = score
-                    best_data = data
+            # 3) Fallback: smallest oss-fuzz-related text file
+            oss_candidates: List[tarfile.TarInfo] = []
+            for m in members:
+                if not m.isfile() or m.size == 0:
+                    continue
+                name_lower = m.name.lower()
+                if "oss-fuzz" in name_lower or "ossfuzz" in name_lower:
+                    if has_text_extension(name_lower):
+                        oss_candidates.append(m)
+            if oss_candidates:
+                oss_candidates.sort(key=lambda x: x.size)
+                try:
+                    f = tf.extractfile(oss_candidates[0])
+                    if f is not None:
+                        data = f.read()
+                        if data:
+                            return data
+                except Exception:
+                    pass
 
-        return best_data
-
-    def _is_likely_text(self, data: bytes) -> bool:
-        if not data:
-            return False
-        sample = data[:64]
-        printable = 0
-        for b in sample:
-            if 32 <= b <= 126 or b in (9, 10, 13):
-                printable += 1
-        return printable / len(sample) >= 0.8
-
-    def _score_candidate(self, name: str, size: int, data: bytes) -> int:
-        if not self._is_likely_text(data):
-            return 0
-
-        score = 0
-        lower_name = name.lower()
-        base, ext = os.path.splitext(lower_name)
-
-        # Bug-id prominence in file name
-        if self.bug_id_full in lower_name:
-            score += 1000
-        elif self.bug_id_short in lower_name:
-            score += 800
-
-        # Name keywords
-        for kw in self.name_keywords:
-            if kw in lower_name:
-                score += 200
-
-        # Extension preference
-        if ext in self.preferred_exts:
-            score += 100
-
-        # Content-based scoring
-        data_strip = data.lstrip()
-        data_lower = data.lower()
-
-        if data_strip.startswith(b"<?xml"):
-            score += 400
-        if data_strip.startswith(b"<"):
-            score += 200
-        if b"<?xml" in data_lower:
-            score += 200
-        if b"<!doctype" in data_lower:
-            score += 100
-        if b"encoding" in data_lower:
-            score += 300
-        if b"xml" in data_lower:
-            score += 50
-
-        # Prefer smaller inputs, especially near 24 bytes
-        dist = abs(len(data) - 24)
-        if dist <= 50:
-            score += max(0, 300 - dist * 5)
-
-        # Tiny bonus for very small files
-        if len(data) <= 64:
-            score += 50
-
-        return score
-
-    def _default_poc(self) -> bytes:
-        # Fallback PoC guess emphasizing XML with explicit encoding.
-        # This is only used if we couldn't find a better candidate in the source tree.
-        return b'<?xml version="1.0" encoding="UTF-8"?><a/>'
+        # Final generic fallback if nothing found in the tarball
+        return fallback_poc

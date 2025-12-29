@@ -1,33 +1,33 @@
 import pandas as pd
 import numpy as np
 from joblib import Parallel, delayed
+from typing import List, Tuple
 
-# Helper functions for parallel processing.
-# Defined at the top level for easier pickling by joblib.
-def _calculate_cheap_score_job(col: str, prefixes: pd.Series, df_sample_col: pd.Series):
-    """Calculates a simple score based on group sizes."""
-    temp_prefixes = prefixes + df_sample_col
-    groups = temp_prefixes.value_counts(sort=False)
-    # The score is sum(k^2), rewarding larger groups.
-    return col, (groups.values**2).sum()
+def _calculate_score_static(col: str, df_sample_str: pd.DataFrame, group_ids: pd.Series) -> Tuple[str, float]:
+    """
+    Calculates the grouping score for a candidate column. This function is defined at the
+    top level to ensure compatibility with multiprocessing-based parallel backends.
 
-def _calculate_full_score_job(col: str, prefixes: pd.Series, df_sample_col: pd.Series):
-    """Calculates the LCP-proxy score and new prefixes."""
-    new_prefixes = prefixes + df_sample_col
-    groups = new_prefixes.value_counts(sort=False)
-    
-    if groups.empty:
-        return col, 0.0, new_prefixes
-        
-    counts = groups.values
-    # Efficiently get lengths of string index
-    lengths = groups.index.str.len().to_numpy(dtype=np.int64)
-    
-    # Score is sum(k*(k-1) * len(prefix)), a proxy for total LCP.
-    # We omit the /2 as it's a constant factor.
-    score = np.dot(counts * (counts - 1), lengths)
-    return col, score, new_prefixes
+    The score is the sum of squares of subgroup sizes formed by adding the new column.
+    Maximizing this score is equivalent to minimizing the entropy of the new partitioning,
+    effectively favoring columns that preserve existing large groups.
 
+    Args:
+        col: The name of the candidate column to score.
+        df_sample_str: DataFrame of string-converted sample data.
+        group_ids: A Series mapping each sample row to its current group ID.
+
+    Returns:
+        A tuple containing the column name and its calculated score.
+    """
+    try:
+        subgroup_sizes = df_sample_str.groupby(
+            [group_ids, df_sample_str[col]], observed=True, sort=False
+        ).size()
+        score = np.sum(subgroup_sizes.values ** 2)
+        return col, float(score)
+    except Exception:
+        return col, 0.0
 
 class Solution:
     def solve(
@@ -42,138 +42,113 @@ class Solution:
         parallel: bool = True,
     ) -> pd.DataFrame:
         """
-        Reorder columns in the DataFrame to maximize prefix hit rate.
+        Reorders columns in the DataFrame to maximize prefix hit rate.
+
+        The strategy is a hybrid greedy approach:
+        1.  A limited-step greedy search identifies the optimal initial set of columns,
+            considering inter-column dependencies. This is the most critical part for
+            establishing long common prefixes.
+        2.  The remaining columns are sorted by a simpler, faster heuristic (cardinality),
+            as their impact on the overall hit rate is progressively smaller.
+        3.  High-cardinality columns, which are detrimental to prefix matching, are
+            identified and moved to the end.
+        4.  The entire process is performed on a data sample to meet the strict runtime
+            constraints, and parallel processing is used to accelerate the greedy search.
         """
-        
-        original_df = df
-        
-        # 1. Handle column merges. Merged columns are processed as single units.
-        working_df, merge_map = self._handle_merges(df, col_merge)
-        
-        # 2. Preprocess: convert to string and sample for performance.
-        df_str = working_df.astype(str)
-        n_rows = min(len(df_str), early_stop)
-        if n_rows == 0:
-            return original_df
-            
-        df_sample = df_str.head(n_rows)
-
-        # 3. Heuristic: Separate high-cardinality columns to be placed at the end.
-        high_card_cols = []
-        search_cols = []
-        for col in df_sample.columns:
-            # A high ratio of unique values suggests an ID-like column.
-            if df_sample[col].nunique() / n_rows >= distinct_value_threshold:
-                high_card_cols.append(col)
-            else:
-                search_cols.append(col)
-
-        # Sort high-cardinality columns by cardinality (most unique goes last).
-        if high_card_cols:
-            high_card_nunique = df_sample[high_card_cols].nunique()
-            high_card_cols.sort(key=lambda c: high_card_nunique[c], reverse=True)
-
-        # 4. Core logic: Beam search to find the best ordering for the remaining columns.
-        beam_width = row_stop
-        all_cols_to_search = set(search_cols)
-        num_search_cols = len(all_cols_to_search)
-        
-        best_order_search = []
-        if num_search_cols > 0:
-            initial_prefixes = pd.Series([''] * n_rows, index=df_sample.index, dtype=str)
-            # A beam state is (score, ordered_columns_list, prefixes_series)
-            beam = [(0.0, [], initial_prefixes)]
-            n_jobs = 8 if parallel else 1 # Use 8 cores as per environment spec
-
-            for _ in range(num_search_cols):
-                all_candidates = []
+        # 1. Handle Column Merges
+        df_processed = df.copy()
+        if col_merge:
+            all_merged_cols = set()
+            new_cols_data = {}
+            for i, group in enumerate(col_merge):
+                if not isinstance(group, list) or not group:
+                    continue
                 
-                for score, ordered, prefixes in beam:
-                    remaining = sorted(list(all_cols_to_search - set(ordered)))
-                    if not remaining:
-                        # This permutation is complete, carry it forward.
-                        all_candidates.append((score, ordered, prefixes))
-                        continue
-
-                    # Prune candidate columns using a cheaper score to speed up search.
-                    top_cols = remaining
-                    if len(remaining) > col_stop > 0:
-                        if parallel:
-                            cheap_scores = Parallel(n_jobs=n_jobs, prefer="threads")(
-                                delayed(_calculate_cheap_score_job)(col, prefixes, df_sample[col]) for col in remaining
-                            )
-                        else:
-                            cheap_scores = [_calculate_cheap_score_job(col, prefixes, df_sample[col]) for col in remaining]
-                        
-                        cheap_scores.sort(key=lambda x: x[1], reverse=True)
-                        top_cols = [col for col, _ in cheap_scores[:col_stop]]
-                    
-                    if not top_cols: continue
-
-                    # Evaluate the top candidates using the full LCP-proxy score.
-                    if parallel:
-                        results = Parallel(n_jobs=n_jobs, prefer="threads")(
-                            delayed(_calculate_full_score_job)(col, prefixes, df_sample[col]) for col in top_cols
-                        )
-                    else:
-                        results = [_calculate_full_score_job(col, prefixes, df_sample[col]) for col in top_cols]
-                    
-                    for col, new_score, new_prefixes in results:
-                        new_ordered = ordered + [col]
-                        all_candidates.append((new_score, new_ordered, new_prefixes))
-
-                if not all_candidates:
-                    break
+                valid_group = [c for c in group if c in df_processed.columns]
+                if not valid_group:
+                    continue
                 
-                # Select the top `beam_width` candidates for the next step.
-                all_candidates.sort(key=lambda x: x[0], reverse=True)
-                beam = all_candidates[:beam_width]
+                new_col_name = f"__merged_{i}"
+                new_cols_data[new_col_name] = df_processed[valid_group].astype(str).agg("".join, axis=1)
+                all_merged_cols.update(valid_group)
+            
+            if all_merged_cols:
+                df_processed.drop(columns=list(all_merged_cols), inplace=True)
+                for name, data in new_cols_data.items():
+                    df_processed[name] = data
+        
+        if df_processed.shape[1] <= 1:
+            return df_processed
 
-            if beam:
-                best_order_search = beam[0][1]
+        # 2. Prepare for Search using a Sample
+        sample_size = min(len(df_processed), 4000)
+        df_sample = df_processed.sample(n=sample_size, random_state=42)
         
-        # 5. Finalize: Combine the ordered search columns and high-cardinality columns.
-        best_order = best_order_search + high_card_cols
+        nunique = df_sample.nunique()
         
-        # Un-merge columns to get the final order of original columns.
-        final_order = []
-        for col in best_order:
-            if col in merge_map:
-                final_order.extend(merge_map[col])
+        # 3. Partition columns into low and high cardinality groups
+        high_card_cols = {
+            c for c, n in nunique.items() 
+            if (n / sample_size) > distinct_value_threshold and n > 10
+        }
+        candidates = [c for c in df_processed.columns if c not in high_card_cols]
+        
+        df_sample_str = df_sample[candidates].astype(str)
+
+        # 4. Greedy search for the best prefix
+        ordered_prefix = []
+        group_ids = pd.Series(0, index=df_sample.index, dtype=np.int32)
+        
+        num_greedy_steps = min(len(candidates), col_stop)
+
+        for _ in range(num_greedy_steps):
+            if not candidates:
+                break
+            
+            scores = {}
+            if parallel and len(candidates) > 1:
+                with Parallel(n_jobs=-1, prefer="threads") as parallel_runner:
+                    results = parallel_runner(
+                        delayed(_calculate_score_static)(c, df_sample_str, group_ids)
+                        for c in candidates
+                    )
+                scores = dict(results)
             else:
-                final_order.append(col)
+                for col in candidates:
+                    _, score = _calculate_score_static(col, df_sample_str, group_ids)
+                    scores[col] = score
+
+            if not scores:
+                break
+
+            best_col = max(scores, key=scores.get)
+            
+            ordered_prefix.append(best_col)
+            candidates.remove(best_col)
+            
+            if not candidates:
+                break
+                
+            # Update group_ids efficiently by factorizing tuples of (old_id, new_value)
+            group_ids = pd.Series(
+                pd.factorize(list(zip(group_ids, df_sample_str[best_col])))[0],
+                index=df_sample.index,
+                dtype=np.int32
+            )
+            
+        # 5. Order remaining columns based on cardinality
+        remaining_candidates_sorted = sorted(candidates, key=lambda c: nunique[c])
+        high_card_cols_sorted = sorted(list(high_card_cols), key=lambda c: nunique[c])
         
-        # Ensure all original columns are present in the final output.
-        original_cols_set = set(original_df.columns)
-        final_order_set = set(final_order)
-        if len(original_cols_set) > len(final_order_set):
-            missing_cols = sorted(list(original_cols_set - final_order_set))
-            final_order.extend(missing_cols)
-
-        return original_df[final_order]
-
-    def _handle_merges(self, df: pd.DataFrame, col_merge: list):
-        """
-        Merges specified column groups into single columns.
-        Returns a new DataFrame and a map from merged names to original names.
-        """
-        if not col_merge:
-            return df, {}
-
-        working_df = df.copy()
-        merge_map = {}
-        merged_cols_set = set()
-        for i, group in enumerate(col_merge):
-            if not isinstance(group, list) or not group: continue
-            
-            # Create a unique name for the new merged column.
-            new_col_name = f"__merged_{i}__"
-            merge_map[new_col_name] = group
-            
-            for col in group:
-                merged_cols_set.add(col)
-            
-            working_df[new_col_name] = working_df[group].astype(str).agg(''.join, axis=1)
+        # 6. Combine ordered column sets to get the final order
+        final_order = ordered_prefix + remaining_candidates_sorted + high_card_cols_sorted
         
-        cols_to_keep = [c for c in df.columns if c not in merged_cols_set] + list(merge_map.keys())
-        return working_df[cols_to_keep], merge_map
+        # Fallback mechanism in case of column mismatch
+        if len(final_order) != df_processed.shape[1] or len(set(final_order)) != df_processed.shape[1]:
+            all_cols_sorted = sorted(
+                df_processed.columns.tolist(),
+                key=lambda c: nunique.get(c, df_processed.shape[0])
+            )
+            return df_processed[all_cols_sorted]
+
+        return df_processed[final_order]

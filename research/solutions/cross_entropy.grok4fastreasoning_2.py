@@ -2,10 +2,9 @@ import torch
 import triton
 import triton.language as tl
 import math
-from typing import Dict
 
 class Solution:
-    def solve(self, spec_path: str = None) -> Dict[str, str]:
+    def solve(self, spec_path: str = None) -> dict:
         code = """
 import torch
 import triton
@@ -13,84 +12,99 @@ import triton.language as tl
 
 @triton.autotune(
     configs=[
-        triton.Config({'BLOCK_N': 1024}, num_stages=4),
-        triton.Config({'BLOCK_N': 512}, num_stages=2),
-        triton.Config({'BLOCK_N': 256}, num_stages=1),
+        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 128}),
+        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 256}),
+        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 512}),
+        triton.Config({'BLOCK_M': 256, 'BLOCK_N': 256}),
     ],
-    key=['N'],
+    key=['M', 'N'],
 )
 @triton.jit
 def cross_entropy_kernel(
-    losses_ptr, logits_ptr, targets_ptr,
-    M, N,
-    stride_logits_m, stride_logits_n,
-    stride_targets,
+    logits_ptr, targets_ptr, output_ptr,
+    stride_lm, stride_ln, stride_t, stride_o,
+    M: tl.int32, N: tl.int32,
+    BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr
 ):
-    row = tl.program_id(0)
-    if row >= M:
-        return
+    block_start = tl.program_id(0) * BLOCK_M
+    pids_m = block_start + tl.arange(0, BLOCK_M)
+    mask_m = pids_m < M
 
-    target_ptr = targets_ptr + row * stride_targets
-    target = tl.load(target_ptr)
+    # Load targets
+    target_offsets = pids_m.to(tl.int64) * stride_t
+    target_ids = tl.load(targets_ptr + target_offsets, dtype=tl.int64, mask=mask_m, other=0)
 
     # First pass: compute max_logit
-    max_logit = -1e20
-    for start in range(0, N, BLOCK_N):
-        offsets = tl.arange(0, BLOCK_N)
-        mask = (start + offsets) < N
-        row_start_ptr = logits_ptr + row * stride_logits_m + start * stride_logits_n
-        col_ptrs = row_start_ptr + offsets * stride_logits_n
-        block = tl.load(col_ptrs, mask=mask, other=-1e20)
-        block_max = tl.max(block, axis=0)
+    max_logit = tl.full((BLOCK_M,), -1e30, dtype=tl.float32)
+    for start_n in range(0, N, BLOCK_N):
+        offsets_n = tl.arange(0, BLOCK_N)
+        len_n = tl.minimum(BLOCK_N, N - start_n)
+        mask_n = offsets_n < len_n
+        off_m_bytes = pids_m.to(tl.int64)[:, None] * stride_lm
+        off_n_bytes = (start_n + offsets_n[None, :]).to(tl.int64) * stride_ln
+        ptrs = logits_ptr + off_m_bytes + off_n_bytes
+        load_mask = mask_m[:, None] & mask_n[None, :]
+        logits_block = tl.load(ptrs, mask=load_mask, other=-1e30)
+        block_max = tl.max(logits_block, axis=1)
         max_logit = tl.maximum(max_logit, block_max)
 
-    # Load target_logit
-    target_offset = target * stride_logits_n
-    target_logit_ptr = logits_ptr + row * stride_logits_m + target_offset
-    target_logit = tl.load(target_logit_ptr)
-
     # Second pass: compute sum_exp
-    sum_exp = 0.0
-    for start in range(0, N, BLOCK_N):
-        offsets = tl.arange(0, BLOCK_N)
-        mask = (start + offsets) < N
-        row_start_ptr = logits_ptr + row * stride_logits_m + start * stride_logits_n
-        col_ptrs = row_start_ptr + offsets * stride_logits_n
-        block = tl.load(col_ptrs, mask=mask, other=-1e20)
-        block = block - max_logit
-        exp_block = tl.exp(block)
-        sum_exp += tl.sum(exp_block, axis=0)
+    sum_exp = tl.zeros((BLOCK_M,), dtype=tl.float32)
+    for start_n in range(0, N, BLOCK_N):
+        offsets_n = tl.arange(0, BLOCK_N)
+        len_n = tl.minimum(BLOCK_N, N - start_n)
+        mask_n = offsets_n < len_n
+        off_m_bytes = pids_m.to(tl.int64)[:, None] * stride_lm
+        off_n_bytes = (start_n + offsets_n[None, :]).to(tl.int64) * stride_ln
+        ptrs = logits_ptr + off_m_bytes + off_n_bytes
+        load_mask = mask_m[:, None] & mask_n[None, :]
+        logits_block = tl.load(ptrs, mask=load_mask, other=0.0)
+        shifted = tl.where(mask_m[:, None], logits_block - max_logit[:, None], 0.0)
+        exped = tl.exp(shifted)
+        block_sum = tl.sum(exped, axis=1)
+        sum_exp += block_sum
 
-    lse = max_logit + tl.log(sum_exp)
-    log_prob = target_logit - lse
-    loss = -log_prob
-    tl.store(losses_ptr + row, loss)
+    logsumexp = tl.log(sum_exp) + max_logit
 
+    # Load target_logits and compute/store losses with per-element handling
+    for j in range(BLOCK_M):
+        m = block_start + j
+        cond = m < M
+        tid = target_ids[j]
+        m_bytes = m.to(tl.int64) * stride_lm
+        t_bytes = tid.to(tl.int64) * stride_ln
+        bad_ptr = logits_ptr + m_bytes + t_bytes
+        ptr = tl.where(cond, bad_ptr, logits_ptr)
+        target_l = tl.load(ptr, dtype=tl.float32)
+        loss = tl.where(cond, -(target_l - logsumexp[j]), 0.0)
+        store_ptr = output_ptr + m.to(tl.int64) * stride_o
+        tl.store(store_ptr, loss, mask=cond)
 
 def cross_entropy(logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
-    assert logits.dim() == 2, "logits must be 2D"
-    assert targets.dim() == 1, "targets must be 1D"
     M, N = logits.shape
-    assert targets.shape[0] == M, "batch size mismatch"
-    assert targets.max() < N and targets.min() >= 0, "invalid targets"
-
-    losses = torch.empty(M, dtype=torch.float32, device=logits.device, requires_grad=False)
-
     if M == 0:
-        return losses
-
-    stride_logits_m = logits.stride(0)
-    stride_logits_n = logits.stride(1)
-    stride_targets = targets.stride(0)
-
-    grid = (M,)
+        return torch.empty((0,), dtype=torch.float32, device=logits.device)
+    output = torch.empty((M,), dtype=torch.float32, device=logits.device)
+    logits_ptr = logits.data_ptr()
+    targets_ptr = targets.data_ptr()
+    output_ptr = output.data_ptr()
+    stride_lm = logits.stride(0) * logits.element_size()
+    stride_ln = logits.stride(1) * logits.element_size()
+    stride_t = targets.stride(0) * targets.element_size()
+    stride_o = output.stride(0) * output.element_size()
+    grid = lambda meta: (triton.cdiv(M, meta['BLOCK_M']), )
     cross_entropy_kernel[grid](
-        losses, logits, targets,
-        M, N,
-        stride_logits_m, stride_logits_n,
-        stride_targets,
+        logits_ptr=logits_ptr,
+        targets_ptr=targets_ptr,
+        output_ptr=output_ptr,
+        stride_lm=stride_lm,
+        stride_ln=stride_ln,
+        stride_t=stride_t,
+        stride_o=stride_o,
+        M=M,
+        N=N,
     )
-    return losses
+    return output
 """
         return {"code": code}

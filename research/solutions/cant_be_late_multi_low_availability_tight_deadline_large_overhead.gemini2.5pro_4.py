@@ -7,42 +7,9 @@ from sky_spot.utils import ClusterType
 
 
 class Solution(MultiRegionStrategy):
-    """
-    A multi-region scheduling strategy that balances cost and deadline adherence.
-
-    The strategy operates on a simple but effective principle: be greedy with cost
-    savings when time permits, but switch to a reliable, expensive option when
-    the deadline is at risk.
-
-    Core Logic:
-    1.  **Default Action (Greedy)**: Prioritize using cheap SPOT instances to minimize
-        cost. If a SPOT instance is available in the current region, it will be used.
-
-    2.  **Spot Search**: If a SPOT instance is not available in the current region,
-        the strategy will not immediately fall back to an expensive ON_DEMAND instance.
-        Instead, it will cycle to the next available AWS region and wait for one
-        timestep (by returning `ClusterType.NONE`). This action uses up slack time
-        to search for cheaper resources across regions, avoiding unnecessary costs.
-
-    3.  **Deadline-Aware Safety Net**: The cornerstone of the strategy is its
-        "point of no return" calculation. At every step, it computes the
-        worst-case time required to finish the remaining work using a reliable
-        ON_DEMAND instance, including any potential restart overheads. If the time
-        remaining until the deadline is less than or equal to this calculated
-        worst-case time, the strategy enters a "danger zone". In this mode, it
-        overrides all cost-saving measures and immediately selects `ClusterType.ON_DEMAND`
-        to guarantee the job finishes on time.
-
-    This two-tiered approach ensures that the strategy is as cost-effective as
-    possible while robustly avoiding deadline failures.
-    """
-
-    NAME = "deadline_aware_greedy_cycler"
+    NAME = "my_strategy"
 
     def solve(self, spec_path: str) -> "Solution":
-        """
-        Initialize the solution from spec_path config.
-        """
         with open(spec_path) as f:
             config = json.load(f)
 
@@ -53,52 +20,135 @@ class Solution(MultiRegionStrategy):
             inter_task_overhead=[0.0],
         )
         super().__init__(args)
+
+        self.SWITCH_ISLAND_HEADROOM = 1.5
+        self.WAIT_SLACK_HEADROOM = 2.0
+        self.WAIT_MAX_DURATION = 1.0
+        self.CRITICAL_SLACK_BUFFER_FACTOR = 1.1
+
+        self.spot_availability = []
+        if "trace_files" in config and config["trace_files"]:
+            for trace_file in config["trace_files"]:
+                with open(trace_file) as f:
+                    trace_data = json.load(f)["spot"]
+                    self.spot_availability.append(trace_data)
+
+        self.num_regions_from_traces = len(self.spot_availability)
+        self.precomputed = self.num_regions_from_traces == 0
+
+        self.critical_slack_buffer = self.restart_overhead * self.CRITICAL_SLACK_BUFFER_FACTOR
+        
         return self
 
-    def _step(self, last_cluster_type: ClusterType, has_spot: bool) -> ClusterType:
-        """
-        Decide next action based on current state.
-        """
-        remaining_work = self.task_duration - sum(self.task_done_time)
+    def _precompute_if_needed(self):
+        if self.precomputed:
+            return
 
-        if remaining_work <= 0:
+        self.num_timesteps = len(self.spot_availability[0])
+        self._precompute_trace_insights()
+        self.precomputed = True
+
+    def _precompute_trace_insights(self):
+        gap_seconds = self.env.gap_seconds
+        self.spot_island_length = [[0] * self.num_timesteps for _ in range(self.num_regions_from_traces)]
+        self.time_to_next_spot = [[0] * self.num_timesteps for _ in range(self.num_regions_from_traces)]
+
+        for r in range(self.num_regions_from_traces):
+            # Backwards pass for spot_island_length
+            if self.spot_availability[r][-1] == 1:
+                self.spot_island_length[r][-1] = gap_seconds
+            for t in range(self.num_timesteps - 2, -1, -1):
+                if self.spot_availability[r][t] == 1:
+                    self.spot_island_length[r][t] = gap_seconds + self.spot_island_length[r][t + 1]
+                else:
+                    self.spot_island_length[r][t] = 0.0
+
+            # Backwards pass for time_to_next_spot
+            if self.spot_availability[r][-1] == 0:
+                self.time_to_next_spot[r][-1] = float('inf')
+            else:
+                self.time_to_next_spot[r][-1] = 0.0
+                
+            for t in range(self.num_timesteps - 2, -1, -1):
+                if self.spot_availability[r][t] == 0:
+                    self.time_to_next_spot[r][t] = gap_seconds + self.time_to_next_spot[r][t + 1]
+                else:
+                    self.time_to_next_spot[r][t] = 0.0
+
+
+    def _step(self, last_cluster_type: ClusterType, has_spot: bool) -> ClusterType:
+        self._precompute_if_needed()
+
+        if self.num_regions_from_traces == 0:
+            return self._simple_step(last_cluster_type, has_spot)
+
+        work_done = sum(self.task_done_time)
+        work_remaining = self.task_duration - work_done
+
+        if work_remaining <= 0:
             return ClusterType.NONE
 
-        # --- Safety Net Calculation ---
-        # Calculate the worst-case time required to finish the job using On-Demand
-        # from this point forward, assuming a full restart overhead is incurred.
+        elapsed_seconds = self.env.elapsed_seconds
+        time_remaining = self.deadline - elapsed_seconds
         
-        # Timesteps needed for a potential restart overhead.
-        num_overhead_steps = math.ceil(self.restart_overhead / self.env.gap_seconds)
+        if time_remaining < work_remaining:
+            return ClusterType.ON_DEMAND
         
-        # Timesteps needed to complete the remaining work.
-        num_work_steps = math.ceil(remaining_work / self.env.gap_seconds)
-        
-        # Total time needed from now if we switch to On-Demand.
-        time_needed_for_od = (num_overhead_steps + num_work_steps) * self.env.gap_seconds
-        
-        time_left_to_deadline = self.deadline - self.env.elapsed_seconds
+        current_timestep = int(elapsed_seconds / self.env.gap_seconds)
+        if current_timestep >= self.num_timesteps:
+            return self._simple_step(last_cluster_type, has_spot)
+            
+        current_region = self.env.get_current_region()
+        num_regions = self.env.get_num_regions()
 
-        # If time left is insufficient for the On-Demand fallback, we must
-        # use On-Demand now to guarantee completion before the deadline.
-        if time_left_to_deadline <= time_needed_for_od:
+        slack = time_remaining - work_remaining
+        overhead_if_switch_to_od = self.restart_overhead if last_cluster_type != ClusterType.ON_DEMAND else 0.0
+
+        if slack < overhead_if_switch_to_od + self.critical_slack_buffer:
             return ClusterType.ON_DEMAND
 
-        # --- Greedy Cost-Saving Logic ---
-        # If not in the danger zone, we have slack time. Prioritize Spot.
+        if has_spot:
+            return ClusterType.SPOT
+
+        best_region_to_switch = -1
+        max_island_duration = 0
+
+        for r in range(num_regions):
+            if r == current_region:
+                continue
+            
+            if r < self.num_regions_from_traces and self.spot_availability[r][current_timestep] == 1:
+                duration = self.spot_island_length[r][current_timestep]
+                if duration > max_island_duration:
+                    max_island_duration = duration
+                    best_region_to_switch = r
+        
+        if best_region_to_switch != -1 and max_island_duration > self.SWITCH_ISLAND_HEADROOM * self.restart_overhead:
+            self.env.switch_region(best_region_to_switch)
+            return ClusterType.SPOT
+
+        if current_region < self.num_regions_from_traces:
+            next_spot_wait_time = self.time_to_next_spot[current_region][current_timestep]
+            
+            if slack > self.WAIT_SLACK_HEADROOM * self.restart_overhead and \
+               next_spot_wait_time <= self.WAIT_MAX_DURATION * self.restart_overhead:
+               return ClusterType.NONE
+
+        return ClusterType.ON_DEMAND
+        
+    def _simple_step(self, last_cluster_type: ClusterType, has_spot: bool) -> ClusterType:
+        work_done = sum(self.task_done_time)
+        work_remaining = self.task_duration - work_done
+
+        if work_remaining <= 0:
+            return ClusterType.NONE
+
+        time_remaining = self.deadline - self.env.elapsed_seconds
+        
+        if time_remaining < work_remaining + self.restart_overhead:
+            return ClusterType.ON_DEMAND
 
         if has_spot:
-            # A cheap Spot instance is available, so we use it.
             return ClusterType.SPOT
         else:
-            # No Spot in the current region. Search for it in other regions.
-            num_regions = self.env.get_num_regions()
-            if num_regions > 1:
-                # Cycle to the next region to check for spot availability
-                # in the subsequent timestep.
-                current_region = self.env.get_current_region()
-                next_region = (current_region + 1) % num_regions
-                self.env.switch_region(next_region)
-            
-            # Use no cluster for this step to avoid On-Demand costs while searching.
-            return ClusterType.NONE
+            return ClusterType.ON_DEMAND

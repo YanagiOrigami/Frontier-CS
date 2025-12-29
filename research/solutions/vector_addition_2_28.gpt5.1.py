@@ -1,72 +1,119 @@
-import textwrap
+import torch
+import triton
+import triton.language as tl
+from typing import Dict, Optional
+
+
+@triton.jit
+def add_kernel(x_ptr, y_ptr, out_ptr, n_elements, BLOCK_SIZE: tl.constexpr):
+    pid = tl.program_id(axis=0)
+    block_start = pid * BLOCK_SIZE
+    offsets = block_start + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < n_elements
+    x = tl.load(x_ptr + offsets, mask=mask)
+    y = tl.load(y_ptr + offsets, mask=mask)
+    out = x + y
+    tl.store(out_ptr + offsets, out, mask=mask)
+
+
+def add(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    """
+    Element-wise addition of two vectors using a Triton kernel.
+    """
+    if x.shape != y.shape:
+        raise ValueError("Input tensors must have the same shape")
+    if x.device != y.device:
+        raise ValueError("Input tensors must be on the same device")
+
+    # Fallback to PyTorch if not on CUDA
+    if not x.is_cuda:
+        return x + y
+
+    # For dtypes other than float32, fallback to PyTorch to avoid dtype handling complexity
+    if x.dtype != torch.float32 or y.dtype != torch.float32:
+        return x + y
+
+    x_flat = x.view(-1)
+    y_flat = y.view(-1)
+    n_elements = x_flat.numel()
+
+    out = torch.empty_like(x_flat)
+    if n_elements == 0:
+        return out.view_as(x)
+
+    BLOCK_SIZE = 4096
+    grid = (triton.cdiv(n_elements, BLOCK_SIZE),)
+
+    add_kernel[grid](
+        x_flat,
+        y_flat,
+        out,
+        n_elements,
+        BLOCK_SIZE=BLOCK_SIZE,
+        num_warps=4,
+        num_stages=2,
+    )
+
+    return out.view_as(x)
 
 
 class Solution:
-    def solve(self, spec_path: str = None) -> dict:
-        code = textwrap.dedent(
-            """
-            import torch
-            import triton
-            import triton.language as tl
+    def solve(self, spec_path: Optional[str] = None) -> Dict[str, str]:
+        kernel_code = '''import torch
+import triton
+import triton.language as tl
 
 
-            @triton.jit
-            def _add_kernel(x_ptr, y_ptr, out_ptr, n_elements, BLOCK_SIZE: tl.constexpr):
-                pid = tl.program_id(axis=0)
-                block_start = pid * BLOCK_SIZE
-                offsets = block_start + tl.arange(0, BLOCK_SIZE)
-                mask = offsets < n_elements
-
-                # Alignment and contiguity hints for better codegen
-                tl.multiple_of(offsets, BLOCK_SIZE)
-                tl.max_contiguous(offsets, BLOCK_SIZE)
-
-                x = tl.load(x_ptr + offsets, mask=mask)
-                y = tl.load(y_ptr + offsets, mask=mask)
-                tl.store(out_ptr + offsets, x + y, mask=mask)
+@triton.jit
+def add_kernel(x_ptr, y_ptr, out_ptr, n_elements, BLOCK_SIZE: tl.constexpr):
+    pid = tl.program_id(axis=0)
+    block_start = pid * BLOCK_SIZE
+    offsets = block_start + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < n_elements
+    x = tl.load(x_ptr + offsets, mask=mask)
+    y = tl.load(y_ptr + offsets, mask=mask)
+    out = x + y
+    tl.store(out_ptr + offsets, out, mask=mask)
 
 
-            def add(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
-                \"\"\"
-                Element-wise addition of two vectors.
+def add(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    """
+    Element-wise addition of two vectors using a Triton kernel.
+    """
+    if x.shape != y.shape:
+        raise ValueError("Input tensors must have the same shape")
+    if x.device != y.device:
+        raise ValueError("Input tensors must be on the same device")
 
-                Args:
-                    x: Input tensor of shape (268435456,)
-                    y: Input tensor of shape (268435456,)
+    # Fallback to PyTorch if not on CUDA
+    if not x.is_cuda:
+        return x + y
 
-                Returns:
-                    Output tensor of shape (268435456,) with x + y
-                \"\"\"
-                if x.shape != y.shape:
-                    raise ValueError("Input tensors must have the same shape")
-                if x.device != y.device:
-                    raise ValueError("Input tensors must be on the same device")
+    # For dtypes other than float32, fallback to PyTorch to avoid dtype handling complexity
+    if x.dtype != torch.float32 or y.dtype != torch.float32:
+        return x + y
 
-                # CPU fallback (used only if CUDA is unavailable)
-                if x.device.type == "cpu":
-                    return x + y
+    x_flat = x.view(-1)
+    y_flat = y.view(-1)
+    n_elements = x_flat.numel()
 
-                if x.device.type != "cuda":
-                    raise ValueError("Only CUDA tensors are supported")
+    out = torch.empty_like(x_flat)
+    if n_elements == 0:
+        return out.view_as(x)
 
-                # Inputs are documented to be contiguous; handle non-contiguous defensively
-                if not x.is_contiguous() or not y.is_contiguous():
-                    x = x.contiguous()
-                    y = y.contiguous()
+    BLOCK_SIZE = 4096
+    grid = (triton.cdiv(n_elements, BLOCK_SIZE),)
 
-                n_elements = x.numel()
-                out = torch.empty_like(x)
+    add_kernel[grid](
+        x_flat,
+        y_flat,
+        out,
+        n_elements,
+        BLOCK_SIZE=BLOCK_SIZE,
+        num_warps=4,
+        num_stages=2,
+    )
 
-                BLOCK_SIZE = 4096
-                grid = (triton.cdiv(n_elements, BLOCK_SIZE),)
-
-                _add_kernel[grid](
-                    x, y, out, n_elements,
-                    BLOCK_SIZE=BLOCK_SIZE,
-                    num_warps=8,
-                    num_stages=4,
-                )
-                return out
-            """
-        )
-        return {"code": code}
+    return out.view_as(x)
+'''
+        return {"code": kernel_code}

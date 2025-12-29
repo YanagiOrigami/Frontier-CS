@@ -1,37 +1,22 @@
 import json
 from argparse import Namespace
+from collections import defaultdict
 import math
-from typing import List, Tuple
+from typing import List
 
 from sky_spot.strategies.multi_strategy import MultiRegionStrategy
 from sky_spot.utils import ClusterType
 
 
 class Solution(MultiRegionStrategy):
-    """Multi-region scheduling strategy that minimizes cost while meeting deadline."""
-
-    NAME = "multi_region_scheduler"
-
-    def __init__(self, args):
-        """Initialize the solution."""
-        super().__init__(args)
-        self.spot_availability = None
-        self.region_count = 0
-        self.time_step = 3600  # 1 hour in seconds
-        self.spot_price = 0.9701  # $/hr
-        self.ondemand_price = 3.06  # $/hr
-        self.deadline_seconds = 0
-        self.task_duration_seconds = 0
-        self.overhead_seconds = 0
-        self.current_time_idx = 0
+    """Multi-region scheduling strategy with dynamic region selection."""
+    
+    NAME = "multi_region_adaptive"
 
     def solve(self, spec_path: str) -> "Solution":
-        """
-        Initialize the solution from spec_path config.
-        """
         with open(spec_path) as f:
             config = json.load(f)
-
+        
         args = Namespace(
             deadline_hours=float(config["deadline"]),
             task_duration_hours=[float(config["duration"])],
@@ -40,210 +25,177 @@ class Solution(MultiRegionStrategy):
         )
         super().__init__(args)
         
-        # Load spot availability traces
-        self.spot_availability = []
-        for trace_file in config["trace_files"]:
-            with open(trace_file, 'r') as f:
-                # Read availability data (assuming one value per line)
-                availability = [bool(int(line.strip())) for line in f]
-                self.spot_availability.append(availability)
+        # Load traces for lookahead capability
+        self.traces = []
+        self.trace_duration = 0
+        if "trace_files" in config:
+            for trace_file in config["trace_files"]:
+                try:
+                    with open(trace_file, 'r') as f:
+                        # Parse trace: each line contains availability (0/1)
+                        trace = []
+                        for line in f:
+                            line = line.strip()
+                            if line:
+                                trace.append(int(line))
+                        if trace:
+                            self.traces.append(trace)
+                            self.trace_duration = max(self.trace_duration, len(trace))
+                except Exception:
+                    # If trace file cannot be read, continue without it
+                    pass
         
-        self.region_count = len(self.spot_availability)
-        self.deadline_seconds = float(config["deadline"]) * 3600
-        self.task_duration_seconds = float(config["duration"]) * 3600
-        self.overhead_seconds = float(config["overhead"]) * 3600
+        # Initialize strategy state
+        self.spot_price = 0.9701
+        self.ondemand_price = 3.06
+        self.hourly_gap = 3600  # 1 hour in seconds
+        self.task_duration_hours = float(config["duration"])
+        self.deadline_hours = float(config["deadline"])
+        self.overhead_hours = float(config["overhead"])
+        
+        # Region statistics
+        self.region_stats = defaultdict(lambda: {
+            'spot_available': 0,
+            'total_steps': 0,
+            'reliability': 1.0
+        })
+        
+        # Current execution state
+        self.current_region = 0
+        self.last_action = ClusterType.NONE
+        self.consecutive_failures = 0
+        self.switch_cooldown = 0
+        
+        # Lookahead window for planning
+        self.lookahead_window = min(12, self.trace_duration)
         
         return self
-
-    def _get_time_index(self, elapsed_seconds: float) -> int:
-        """Convert elapsed seconds to time step index."""
-        return int(elapsed_seconds // self.time_step)
-
-    def _get_remaining_time_steps(self, elapsed_seconds: float) -> int:
-        """Get remaining time steps until deadline."""
-        total_steps = int(self.deadline_seconds // self.time_step)
-        current_step = self._get_time_index(elapsed_seconds)
-        return max(0, total_steps - current_step)
-
-    def _get_work_done(self) -> float:
-        """Get total work done in seconds."""
-        return sum(self.task_done_time)
-
-    def _get_remaining_work(self) -> float:
-        """Get remaining work in seconds."""
-        return max(0, self.task_duration - self._get_work_done())
-
-    def _estimate_best_case_completion(self, current_region: int, has_spot: bool,
-                                      time_idx: int) -> Tuple[float, float]:
-        """
-        Estimate best-case completion time and cost.
-        Returns (time_seconds, cost_dollars).
-        """
-        remaining_work = self._get_remaining_work()
-        elapsed = self.env.elapsed_seconds
-        
-        if remaining_work <= 0:
-            return (0, 0)
-        
-        # Calculate if we need to consider restart overhead
-        needs_restart = False
-        if (self.env.cluster_type == ClusterType.SPOT and not has_spot) or \
-           self.remaining_restart_overhead > 0:
-            needs_restart = True
-        
-        # Calculate effective work per time step
-        if needs_restart:
-            effective_work = self.time_step - self.overhead_seconds
-        else:
-            effective_work = self.time_step
-        
-        # Estimate time to complete with current setup
-        steps_needed = math.ceil(remaining_work / effective_work)
-        time_needed = steps_needed * self.time_step
-        
-        # Estimate cost
-        if has_spot:
-            cost_per_step = self.spot_price * (self.time_step / 3600)
-        else:
-            cost_per_step = self.ondemand_price * (self.time_step / 3600)
-        
-        estimated_cost = steps_needed * cost_per_step
-        
-        return (time_needed, estimated_cost)
-
-    def _find_best_region(self, current_time_idx: int) -> Tuple[int, bool, float]:
-        """
-        Find the best region to switch to.
-        Returns (region_index, has_spot_now, future_availability_score).
-        """
-        best_region = self.env.get_current_region()
-        best_score = -1
-        best_has_spot = False
-        
-        for region_idx in range(self.region_count):
-            if region_idx == self.env.get_current_region():
-                continue
-                
-            # Check current availability
-            has_spot_now = False
-            if current_time_idx < len(self.spot_availability[region_idx]):
-                has_spot_now = self.spot_availability[region_idx][current_time_idx]
-            
-            # Calculate future availability score (next 5 time steps)
-            future_score = 0
-            lookahead = min(5, len(self.spot_availability[region_idx]) - current_time_idx)
-            
-            for i in range(lookahead):
-                time_idx = current_time_idx + i
-                if time_idx < len(self.spot_availability[region_idx]):
-                    if self.spot_availability[region_idx][time_idx]:
-                        future_score += 1.0 / (i + 1)  # Weight by proximity
-            
-            total_score = future_score
-            if has_spot_now:
-                total_score += 2.0  # Bonus for immediate availability
-            
-            if total_score > best_score:
-                best_score = total_score
-                best_region = region_idx
-                best_has_spot = has_spot_now
-        
-        return (best_region, best_has_spot, best_score)
-
-    def _should_switch_region(self, current_region: int, current_has_spot: bool,
-                             time_idx: int) -> bool:
-        """Determine if we should switch to another region."""
-        if self.region_count <= 1:
-            return False
-        
-        remaining_work = self._get_remaining_work()
-        remaining_time = self.deadline_seconds - self.env.elapsed_seconds
-        
-        # If we're very close to deadline, don't switch
-        if remaining_time < 2 * self.time_step:
-            return False
-        
-        # If current region has spot, only switch if other region is much better
-        if current_has_spot:
-            best_region, best_has_spot, best_score = self._find_best_region(time_idx)
-            if best_region != current_region and best_score > 3.0:  # Threshold
-                return True
-            return False
-        
-        # Current region doesn't have spot - check if any other region does
-        for region_idx in range(self.region_count):
-            if region_idx == current_region:
-                continue
-            if time_idx < len(self.spot_availability[region_idx]):
-                if self.spot_availability[region_idx][time_idx]:
-                    return True
-        
-        return False
-
+    
     def _step(self, last_cluster_type: ClusterType, has_spot: bool) -> ClusterType:
-        """
-        Decide next action based on current state.
-        """
+        # Update statistics for current region
+        if self.env.get_current_region() < len(self.region_stats):
+            stats = self.region_stats[self.env.get_current_region()]
+            stats['total_steps'] += 1
+            if has_spot:
+                stats['spot_available'] += 1
+            if stats['total_steps'] > 0:
+                stats['reliability'] = stats['spot_available'] / stats['total_steps']
+        
+        # Get current state
         current_region = self.env.get_current_region()
-        time_idx = self._get_time_index(self.env.elapsed_seconds)
+        elapsed = self.env.elapsed_seconds
+        deadline = self.deadline
+        task_done = sum(self.task_done_time)
+        remaining_work = max(0, self.task_duration - task_done)
+        remaining_time = max(0, deadline - elapsed)
         
-        # Get remaining work and time
-        remaining_work = self._get_remaining_work()
-        remaining_time = self.deadline_seconds - self.env.elapsed_seconds
+        # Check if we can finish in time with on-demand
+        time_needed = remaining_work
+        if self.last_action != ClusterType.ON_DEMAND and remaining_work > 0:
+            time_needed += self.restart_overhead
         
-        # If task is already completed
-        if remaining_work <= 0:
-            return ClusterType.NONE
-        
-        # Check if we can still meet the deadline
-        min_time_needed = remaining_work
-        if self.remaining_restart_overhead > 0:
-            min_time_needed += self.overhead_seconds
-        
-        if remaining_time < min_time_needed:
-            # Emergency mode: use on-demand if we're behind schedule
+        # If we're running out of time, switch to on-demand
+        if remaining_time < time_needed * 1.2:  # 20% safety margin
+            if has_spot and self.last_action == ClusterType.SPOT:
+                return ClusterType.SPOT
             return ClusterType.ON_DEMAND
         
-        # Check if we should switch regions
-        if self._should_switch_region(current_region, has_spot, time_idx):
-            best_region, best_has_spot, _ = self._find_best_region(time_idx)
-            if best_region != current_region:
+        # Calculate progress rate needed
+        progress_needed = remaining_work / max(1, remaining_time - self.restart_overhead)
+        
+        # If we have traces for lookahead, use them for planning
+        best_region = current_region
+        best_score = -float('inf')
+        
+        if self.traces and len(self.traces) > 1:
+            current_step = int(elapsed // self.hourly_gap)
+            
+            for region_idx in range(len(self.traces)):
+                if region_idx >= self.env.get_num_regions():
+                    continue
+                    
+                # Calculate score for this region
+                score = 0
+                
+                # Reliability score
+                rel = self.region_stats[region_idx]['reliability']
+                score += rel * 2.0
+                
+                # Lookahead availability
+                if current_step < len(self.traces[region_idx]):
+                    future_avail = 0
+                    look_steps = min(self.lookahead_window, len(self.traces[region_idx]) - current_step)
+                    for i in range(look_steps):
+                        if current_step + i < len(self.traces[region_idx]):
+                            future_avail += self.traces[region_idx][current_step + i]
+                    if look_steps > 0:
+                        score += (future_avail / look_steps) * 1.5
+                
+                # Prefer staying in current region to avoid switch overhead
+                if region_idx == current_region:
+                    score += 1.0
+                
+                if score > best_score:
+                    best_score = score
+                    best_region = region_idx
+        
+        # Switch region if beneficial and not in cooldown
+        if (best_region != current_region and 
+            self.switch_cooldown <= 0 and
+            len(self.traces) > 1):
+            
+            # Only switch if the target region has better reliability
+            current_rel = self.region_stats[current_region]['reliability']
+            target_rel = self.region_stats[best_region]['reliability']
+            
+            if target_rel > current_rel * 1.2:  # 20% better
                 self.env.switch_region(best_region)
-                # After switching, use spot if available in new region
-                if best_has_spot:
+                self.current_region = best_region
+                self.switch_cooldown = 3  # Don't switch again for 3 steps
+                self.last_action = ClusterType.NONE
+                return ClusterType.NONE  # Let overhead clear
+        
+        # Update cooldown
+        if self.switch_cooldown > 0:
+            self.switch_cooldown -= 1
+        
+        # Decision logic based on current state
+        if has_spot:
+            # Use spot if we have buffer time
+            buffer_ratio = remaining_time / (remaining_work + self.restart_overhead)
+            
+            if buffer_ratio > 1.5:  # Good buffer
+                if (self.last_action != ClusterType.SPOT and 
+                    remaining_work > 0 and
+                    self.remaining_restart_overhead <= 0):
+                    # Only switch to spot if no overhead pending
+                    self.last_action = ClusterType.SPOT
+                    return ClusterType.SPOT
+                elif self.last_action == ClusterType.SPOT:
+                    return ClusterType.SPOT
+            
+            # Moderate buffer: use spot cautiously
+            elif buffer_ratio > 1.2:
+                if self.consecutive_failures < 2:
+                    self.last_action = ClusterType.SPOT
                     return ClusterType.SPOT
                 else:
+                    # Too many recent failures, try on-demand
+                    self.consecutive_failures = 0
+                    self.last_action = ClusterType.ON_DEMAND
                     return ClusterType.ON_DEMAND
         
-        # Calculate slack time
-        slack_time = remaining_time - min_time_needed
-        
-        # Determine strategy based on slack and current conditions
-        if slack_time > 3 * self.time_step:  # Plenty of slack
-            if has_spot:
-                return ClusterType.SPOT
-            elif slack_time > 5 * self.time_step:
-                # Enough slack to wait for spot
-                return ClusterType.NONE
-            else:
-                return ClusterType.ON_DEMAND
-        
-        elif slack_time > self.time_step:  # Moderate slack
-            if has_spot:
-                return ClusterType.SPOT
-            else:
-                # Check if spot will be available soon in current region
-                future_spot = False
-                lookahead = min(3, len(self.spot_availability[current_region]) - time_idx)
-                for i in range(1, lookahead + 1):
-                    if self.spot_availability[current_region][time_idx + i]:
-                        future_spot = True
-                        break
-                
-                if future_spot and slack_time > 2 * self.time_step:
-                    return ClusterType.NONE
-                else:
-                    return ClusterType.ON_DEMAND
-        
-        else:  # Little to no slack
+        # Default to on-demand when spot is not available or we need reliability
+        if progress_needed > 0.8:  # Need high progress rate
+            self.last_action = ClusterType.ON_DEMAND
+            self.consecutive_failures = 0
             return ClusterType.ON_DEMAND
+        
+        # If spot not available and we have time, pause briefly
+        if remaining_time > remaining_work * 1.3:
+            self.last_action = ClusterType.NONE
+            return ClusterType.NONE
+        
+        # Final fallback
+        self.last_action = ClusterType.ON_DEMAND
+        return ClusterType.ON_DEMAND

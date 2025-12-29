@@ -1,153 +1,121 @@
-import torch
-import triton
-import triton.language as tl
-import math
-
 class Solution:
     def solve(self, spec_path: str = None) -> dict:
         code = """
 import torch
 import triton
 import triton.language as tl
+import math
 
 @triton.jit
-def gdpa_attn_kernel(
-    Q_PTR, K_PTR, V_PTR, GQ_PTR, GK_PTR, O_PTR,
-    STRIDE_ZQ, STRIDE_HQ, STRIDE_MQ, STRIDE_DQ,
-    STRIDE_ZK, STRIDE_HK, STRIDE_NK, STRIDE_DK,
-    STRIDE_ZV, STRIDE_HV, STRIDE_NV, STRIDE_DV,
-    STRIDE_ZGQ, STRIDE_HGQ, STRIDE_MGQ, STRIDE_DGQ,
-    STRIDE_ZGK, STRIDE_HGK, STRIDE_NGK, STRIDE_DGK,
-    STRIDE_ZO, STRIDE_HO, STRIDE_MO, STRIDE_DO,
-    Z, H, M, N, Dq, Dv,
+def attention_kernel(
+    Q_ptr, GQ_ptr, K_ptr, GK_ptr, V_ptr, O_ptr,
+    stride_qz, stride_qh, stride_qm, stride_qd,
+    stride_kz, stride_kh, stride_kn, stride_kd,
+    stride_vz, stride_vh, stride_vn, stride_vd,
+    stride_oz, stride_oh, stride_om, stride_od,
+    M, N, Dq, Dv,
+    scale,
     BLOCK_M: tl.constexpr,
-    BLOCK_N: tl.constexpr
+    BLOCK_N: tl.constexpr,
+    D_MODEL: tl.constexpr
 ):
     pid_z = tl.program_id(0)
     pid_h = tl.program_id(1)
-    pid_q = tl.program_id(2)
-    q_start = pid_q * BLOCK_M
-    offs_q = q_start + tl.arange(0, BLOCK_M)
-    scale = 1.0 / tl.sqrt(tl.cast(Dq, tl.float32))
-
-    # Load Q and GQ blocks
-    q_base = Q_PTR + pid_z * STRIDE_ZQ + pid_h * STRIDE_HQ + q_start * STRIDE_MQ
-    q_ptr = tl.make_block_ptr(
-        q_base,
-        (BLOCK_M, Dq),
-        (STRIDE_MQ, STRIDE_DQ),
-        (0, 0),
-    )
-    q_block = tl.load(q_ptr)
-
-    gq_base = GQ_PTR + pid_z * STRIDE_ZGQ + pid_h * STRIDE_HGQ + q_start * STRIDE_MGQ
-    gq_ptr = tl.make_block_ptr(
-        gq_base,
-        (BLOCK_M, Dq),
-        (STRIDE_MGQ, STRIDE_DGQ),
-        (0, 0),
-    )
-    gq_block = tl.load(gq_ptr)
-
-    qg_block = q_block * tl.sigmoid(gq_block)
-    qg_f = tl.cast(qg_block, tl.float32)
-
-    # Initialize accumulators
-    acc = tl.zeros((BLOCK_M, Dv), dtype=tl.float32)
-    m = tl.full((BLOCK_M,), float("-1e30"), dtype=tl.float32)
+    pid_m = tl.program_id(2)
+    block_m = tl.arange(0, BLOCK_M)
+    offs_m = pid_m * BLOCK_M + block_m
+    offs_d = tl.arange(0, D_MODEL)
+    q_offsets = (offs_m[:, None] * stride_qm + offs_d[None, :] * stride_qd).to(tl.int32)
+    q_base = (Q_ptr + pid_z * stride_qz + pid_h * stride_qh).to(tl.int32)
+    q_ptrs = q_base + q_offsets
+    m_mask = offs_m < M
+    q_mask = m_mask[:, None] & (offs_d[None, :] < Dq)
+    q = tl.load(q_ptrs, mask=q_mask, other=0.0, dtype=tl.float16)
+    gq_base = (GQ_ptr + pid_z * stride_qz + pid_h * stride_qh).to(tl.int32)
+    gq_ptrs = gq_base + q_offsets
+    gq = tl.load(gq_ptrs, mask=q_mask, other=0.0, dtype=tl.float16)
+    qg = q * tl.sigmoid(gq)
+    o = tl.zeros((BLOCK_M, D_MODEL), dtype=tl.float32)
     l = tl.zeros((BLOCK_M,), dtype=tl.float32)
-
-    # Loop over key blocks
-    for kn in range(0, tl.cdiv(N, BLOCK_N)):
-        k_start = kn * BLOCK_N
-        offs_n = k_start + tl.arange(0, BLOCK_N)
-        n_mask = offs_n < N
-
-        # Load K and GK blocks
-        k_base = K_PTR + pid_z * STRIDE_ZK + pid_h * STRIDE_HK + k_start * STRIDE_NK
-        k_ptr = tl.make_block_ptr(
-            k_base,
-            (BLOCK_N, Dq),
-            (STRIDE_NK, STRIDE_DK),
-            (0, 0),
-        )
-        k_load_mask = n_mask[:, None]
-        k_block = tl.load(k_ptr, mask=k_load_mask)
-
-        gk_base = GK_PTR + pid_z * STRIDE_ZGK + pid_h * STRIDE_HGK + k_start * STRIDE_NGK
-        gk_ptr = tl.make_block_ptr(
-            gk_base,
-            (BLOCK_N, Dq),
-            (STRIDE_NGK, STRIDE_DGK),
-            (0, 0),
-        )
-        gk_block = tl.load(gk_ptr, mask=k_load_mask)
-
-        kg_block = k_block * tl.sigmoid(gk_block)
-        kg_f = tl.cast(kg_block, tl.float32)
-
-        # Compute attention scores
-        s = tl.dot(qg_f, tl.trans(kg_f)) * scale
-
-        # Mask invalid key positions
-        s = tl.where(n_mask[None, :], s, float("-1e9"))
-
-        # Streaming softmax
-        m_new = tl.maximum(m, tl.max(s, 1))
+    m = tl.full((BLOCK_M,), -1e9, dtype=tl.float32)
+    start_n = 0
+    while start_n < N:
+        block_n = tl.arange(0, BLOCK_N)
+        offs_n_current = start_n + block_n
+        n_mask = offs_n_current < N
+        k_offsets = (offs_n_current[:, None] * stride_kn + offs_d[None, :] * stride_kd).to(tl.int32)
+        k_base = (K_ptr + pid_z * stride_kz + pid_h * stride_kh).to(tl.int32)
+        k_ptrs = k_base + k_offsets
+        k_mask = n_mask[:, None] & (offs_d[None, :] < Dq)
+        k = tl.load(k_ptrs, mask=k_mask, other=0.0, dtype=tl.float16)
+        gk_base = (GK_ptr + pid_z * stride_kz + pid_h * stride_kh).to(tl.int32)
+        gk_ptrs = gk_base + k_offsets
+        gk = tl.load(gk_ptrs, mask=k_mask, other=0.0, dtype=tl.float16)
+        kg = k * tl.sigmoid(gk)
+        v_offsets = (offs_n_current[:, None] * stride_vn + offs_d[None, :] * stride_vd).to(tl.int32)
+        v_base = (V_ptr + pid_z * stride_vz + pid_h * stride_vh).to(tl.int32)
+        v_ptrs = v_base + v_offsets
+        v_mask = n_mask[:, None] & (offs_d[None, :] < Dv)
+        v = tl.load(v_ptrs, mask=v_mask, other=0.0, dtype=tl.float16)
+        s = tl.dot(qg.to(tl.float32), tl.trans(kg.to(tl.float32))) * scale
+        s = tl.where(n_mask[None, :], s, -1e9)
+        m_curr = tl.max(s, 1)
+        m_new = tl.maximum(m, m_curr)
         p = tl.exp(s - m_new[:, None])
-        l_new = tl.exp(m - m_new) * l + tl.sum(p, 1)
-        acc_new = tl.exp(m - m_new)[:, None] * acc + tl.dot(p.to(tl.float32), tl.cast(tl.load(
-            tl.make_block_ptr(
-                V_PTR + pid_z * STRIDE_ZV + pid_h * STRIDE_HV + k_start * STRIDE_NV,
-                (BLOCK_N, Dv),
-                (STRIDE_NV, STRIDE_DV),
-                (0, 0),
-            ), mask=k_load_mask
-        ), tl.float32))
-
+        o_delta = tl.dot(p, v.to(tl.float32))
+        exp_scale = tl.exp(m - m_new)
+        o = o * exp_scale[:, None] + o_delta
+        l_curr = tl.sum(p, 1)
+        l = l * exp_scale + l_curr
         m = m_new
-        l = l_new
-        acc = acc_new
-
-    # Finalize output
-    o_final = acc / l[:, None]
-    o_base = O_PTR + pid_z * STRIDE_ZO + pid_h * STRIDE_HO + q_start * STRIDE_MO
-    o_ptr = tl.make_block_ptr(
-        o_base,
-        (BLOCK_M, Dv),
-        (STRIDE_MO, STRIDE_DO),
-        (0, 0),
-    )
-    tl.store(o_ptr, tl.cast(o_final, tl.float16))
+        start_n += BLOCK_N
+    o_final = tl.where(m_mask[:, None], o / l[:, None], 0.0)
+    offs_dv = tl.arange(0, D_MODEL)
+    o_offsets = (offs_m[:, None] * stride_om + offs_dv[None, :] * stride_od).to(tl.int32)
+    o_base = (O_ptr + pid_z * stride_oz + pid_h * stride_oh).to(tl.int32)
+    o_ptrs = o_base + o_offsets
+    o_mask = m_mask[:, None] & (offs_dv[None, :] < Dv)
+    tl.store(o_ptrs, o_final.to(tl.float16), mask=o_mask)
 
 def gdpa_attn(Q: torch.Tensor, K: torch.Tensor, V: torch.Tensor, GQ: torch.Tensor, GK: torch.Tensor) -> torch.Tensor:
     Z, H, M, Dq = Q.shape
     _, _, N, _ = K.shape
     _, _, _, Dv = V.shape
-    output = torch.empty(Z, H, M, Dv, dtype=Q.dtype, device=Q.device)
-
-    stride_zq, stride_hq, stride_mq, stride_dq = Q.stride()
-    stride_zk, stride_hk, stride_nk, stride_dk = K.stride()
-    stride_zv, stride_hv, stride_nv, stride_dv = V.stride()
-    stride_zgq, stride_hgq, stride_mgq, stride_dgq = GQ.stride()
-    stride_zgk, stride_hgk, stride_ngk, stride_dgk = GK.stride()
-    stride_zo, stride_ho, stride_mo, stride_do = output.stride()
-
-    BLOCK_M = 64
+    scale = 1 / math.sqrt(Dq)
+    O = torch.empty((Z, H, M, Dv), dtype=Q.dtype, device=Q.device)
+    BLOCK_M = 128
     BLOCK_N = 64
-    grid = (Z, H, M // BLOCK_M)
-    gdpa_attn_kernel[grid](
-        Q.data_ptr(), K.data_ptr(), V.data_ptr(), GQ.data_ptr(), GK.data_ptr(), output.data_ptr(),
-        stride_zq, stride_hq, stride_mq, stride_dq,
-        stride_zk, stride_hk, stride_nk, stride_dk,
-        stride_zv, stride_hv, stride_nv, stride_dv,
-        stride_zgq, stride_hgq, stride_mgq, stride_dgq,
-        stride_zgk, stride_hgk, stride_ngk, stride_dgk,
-        stride_zo, stride_ho, stride_mo, stride_do,
-        Z, H, M, N, Dq, Dv,
+    D_MODEL = 64
+    num_blocks_m = (M + BLOCK_M - 1) // BLOCK_M
+    grid = (Z, H, num_blocks_m)
+    stride_qz = Q.stride(0)
+    stride_qh = Q.stride(1)
+    stride_qm = Q.stride(2)
+    stride_qd = Q.stride(3)
+    stride_kz = K.stride(0)
+    stride_kh = K.stride(1)
+    stride_kn = K.stride(2)
+    stride_kd = K.stride(3)
+    stride_vz = V.stride(0)
+    stride_vh = V.stride(1)
+    stride_vn = V.stride(2)
+    stride_vd = V.stride(3)
+    stride_oz = O.stride(0)
+    stride_oh = O.stride(1)
+    stride_om = O.stride(2)
+    stride_od = O.stride(3)
+    attention_kernel[grid](
+        Q, GQ, K, GK, V, O,
+        stride_qz, stride_qh, stride_qm, stride_qd,
+        stride_kz, stride_kh, stride_kn, stride_kd,
+        stride_vz, stride_vh, stride_vn, stride_vd,
+        stride_oz, stride_oh, stride_om, stride_od,
+        M, N, Dq, Dv,
+        scale,
         BLOCK_M=BLOCK_M,
         BLOCK_N=BLOCK_N,
+        D_MODEL=D_MODEL,
     )
-    return output
-        """
+    return O
+"""
         return {"code": code}

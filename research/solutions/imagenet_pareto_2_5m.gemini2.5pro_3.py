@@ -1,39 +1,60 @@
 import torch
 import torch.nn as nn
-import copy
+import torch.optim as optim
+from copy import deepcopy
 
-class ParetoNet(nn.Module):
-    """
-    A deep and wide MLP with BatchNorm and Dropout for regularization.
-    The hidden dimension (995) is chosen to maximize parameter usage under the 2.5M limit,
-    resulting in a parameter count of approximately 2,498,957.
-    """
-    def __init__(self, input_dim: int, num_classes: int):
+class ResidualBlock(nn.Module):
+    """A residual block for an MLP."""
+    def __init__(self, size: int, dropout_p: float):
         super().__init__()
-        hidden_dim = 995
-        dropout_p = 0.3
+        self.block = nn.Sequential(
+            nn.Linear(size, size),
+            nn.BatchNorm1d(size),
+            nn.ReLU(inplace=True),
+            nn.Dropout(p=dropout_p),
+            nn.Linear(size, size),
+            nn.BatchNorm1d(size),
+        )
+        self.relu = nn.ReLU(inplace=True)
+        self.dropout = nn.Dropout(p=dropout_p)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        residual = x
+        out = self.block(x)
+        out += residual
+        out = self.relu(out)
+        out = self.dropout(out)
+        return out
+
+class ParetoResMLP(nn.Module):
+    """A ResNet-style MLP designed for the Pareto optimization problem."""
+    def __init__(self, input_dim: int, num_classes: int, hidden_dim: int, num_blocks: int, dropout_p: float):
+        super().__init__()
         
-        self.net = nn.Sequential(
+        # Parameter count for (input_dim=384, hidden_dim=600, num_blocks=3, num_classes=128):
+        # Input layer: (384*600+600) + (2*600) = 232,200
+        # 3x ResBlocks: 3 * (2*(600*600+600) + 2*(2*600)) = 3 * 723,600 = 2,170,800
+        # Output layer: 600*128+128 = 76,928
+        # Total = 232,200 + 2,170,800 + 76,928 = 2,479,928 < 2,500,000
+
+        self.input_layer = nn.Sequential(
             nn.Linear(input_dim, hidden_dim),
             nn.BatchNorm1d(hidden_dim),
             nn.ReLU(inplace=True),
-            nn.Dropout(p=dropout_p),
-            
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.BatchNorm1d(hidden_dim),
-            nn.ReLU(inplace=True),
-            nn.Dropout(p=dropout_p),
-            
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.BatchNorm1d(hidden_dim),
-            nn.ReLU(inplace=True),
-            nn.Dropout(p=dropout_p),
-            
-            nn.Linear(hidden_dim, num_classes)
+            nn.Dropout(p=dropout_p)
         )
+        
+        self.residual_layers = nn.Sequential(
+            *[ResidualBlock(hidden_dim, dropout_p) for _ in range(num_blocks)]
+        )
+        
+        self.output_layer = nn.Linear(hidden_dim, num_classes)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.net(x)
+        x = self.input_layer(x)
+        x = self.residual_layers(x)
+        x = self.output_layer(x)
+        return x
 
 class Solution:
     def solve(self, train_loader, val_loader, metadata: dict = None) -> torch.nn.Module:
@@ -60,36 +81,51 @@ class Solution:
         input_dim = metadata["input_dim"]
         num_classes = metadata["num_classes"]
 
-        model = ParetoNet(input_dim, num_classes).to(device)
-
-        # Hyperparameters
-        epochs = 500
-        learning_rate = 1e-3
-        weight_decay = 1e-2
-        label_smoothing = 0.1
-
-        criterion = nn.CrossEntropyLoss(label_smoothing=label_smoothing)
-        optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
+        # --- Hyperparameters ---
+        HIDDEN_DIM = 600
+        NUM_BLOCKS = 3
+        DROPOUT_P = 0.3
         
-        total_steps = epochs * len(train_loader)
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=total_steps)
+        NUM_EPOCHS = 250
+        MAX_LR = 2e-3
+        WEIGHT_DECAY = 5e-5
 
-        best_val_accuracy = 0.0
+        # --- Model Initialization ---
+        model = ParetoResMLP(
+            input_dim=input_dim,
+            num_classes=num_classes,
+            hidden_dim=HIDDEN_DIM,
+            num_blocks=NUM_BLOCKS,
+            dropout_p=DROPOUT_P
+        )
+        model.to(device)
+
+        # --- Training Setup ---
+        criterion = nn.CrossEntropyLoss()
+        optimizer = optim.AdamW(model.parameters(), lr=MAX_LR, weight_decay=WEIGHT_DECAY)
+        
+        scheduler = optim.lr_scheduler.OneCycleLR(
+            optimizer, 
+            max_lr=MAX_LR, 
+            epochs=NUM_EPOCHS, 
+            steps_per_epoch=len(train_loader)
+        )
+
+        # --- Training Loop ---
+        best_val_acc = -1.0
         best_model_state = None
 
-        for _ in range(epochs):
+        for epoch in range(NUM_EPOCHS):
             # Training phase
             model.train()
             for inputs, targets in train_loader:
                 inputs, targets = inputs.to(device), targets.to(device)
                 
+                optimizer.zero_grad()
                 outputs = model(inputs)
                 loss = criterion(outputs, targets)
-                
-                optimizer.zero_grad()
                 loss.backward()
                 optimizer.step()
-                
                 scheduler.step()
 
             # Validation phase
@@ -104,14 +140,14 @@ class Solution:
                     total += targets.size(0)
                     correct += (predicted == targets).sum().item()
             
-            current_val_accuracy = correct / total
+            val_acc = correct / total
             
-            if current_val_accuracy > best_val_accuracy:
-                best_val_accuracy = current_val_accuracy
-                best_model_state = copy.deepcopy(model.state_dict())
+            if val_acc > best_val_acc:
+                best_val_acc = val_acc
+                best_model_state = deepcopy(model.state_dict())
         
-        # Load the best model state found during training
+        # --- Finalization ---
         if best_model_state:
             model.load_state_dict(best_model_state)
-        
+            
         return model

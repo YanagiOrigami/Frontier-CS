@@ -1,118 +1,69 @@
-import math
+import os
 import torch
 import triton
 import triton.language as tl
 
 
+@triton.autotune(
+    configs=[
+        triton.Config({'BLOCK_SIZE': 1024}, num_warps=4, num_stages=1),
+        triton.Config({'BLOCK_SIZE': 2048}, num_warps=4, num_stages=1),
+        triton.Config({'BLOCK_SIZE': 4096}, num_warps=8, num_stages=1),
+        triton.Config({'BLOCK_SIZE': 8192}, num_warps=8, num_stages=1),
+    ],
+    key=['N'],
+)
 @triton.jit
-def _add_kernel(x_ptr, y_ptr, o_ptr, n_elements, BLOCK: tl.constexpr, VEC: tl.constexpr):
+def _add_kernel(X_ptr, Y_ptr, Z_ptr, N, BLOCK_SIZE: tl.constexpr):
     pid = tl.program_id(0)
-    block_start = pid * BLOCK * VEC
-    ar0 = tl.arange(0, BLOCK)[:, None]
-    ar1 = tl.arange(0, VEC)[None, :]
-    offsets = block_start + ar0 * VEC + ar1
-    mask = offsets < n_elements
+    offs = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = offs < N
 
-    x = tl.load(x_ptr + offsets, mask=mask, other=0)
-    y = tl.load(y_ptr + offsets, mask=mask, other=0)
+    x = tl.load(X_ptr + offs, mask=mask)
+    y = tl.load(Y_ptr + offs, mask=mask)
     z = x + y
-    tl.store(o_ptr + offsets, z, mask=mask)
+    tl.store(Z_ptr + offs, z, mask=mask)
 
 
 def add(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
-    assert x.shape == y.shape, "Input tensors must have the same shape"
-    assert x.is_contiguous() and y.is_contiguous(), "Inputs must be contiguous"
-    assert x.device.type == "cuda" and y.device.type == "cuda", "Inputs must be on CUDA device"
-    assert x.dtype == y.dtype, "Inputs must have the same dtype"
+    """
+    Element-wise addition of two vectors.
 
+    Args:
+        x: Input tensor of shape (16777216,)
+        y: Input tensor of shape (16777216,)
+
+    Returns:
+        Output tensor of shape (16777216,) with x + y
+    """
+    if x.shape != y.shape:
+        raise ValueError("Input tensors must have the same shape")
+    if x.dim() != 1:
+        raise ValueError("Input tensors must be 1D")
+    if x.numel() == 0:
+        return x.clone()
+
+    if x.dtype != y.dtype:
+        raise ValueError("Input tensors must have the same dtype")
+    if x.device != y.device:
+        raise ValueError("Input tensors must be on the same device")
+
+    # CPU fallback for completeness
+    if not x.is_cuda:
+        return x + y
+
+    x = x.contiguous()
+    y = y.contiguous()
     n_elements = x.numel()
-    out = torch.empty_like(x)
 
-    # Choose vectorization factor based on alignment and dtype size (target 16B vector width)
-    elem_bytes = x.element_size()
-    max_vec = max(1, 16 // elem_bytes)
-    aligned16 = (x.data_ptr() % 16 == 0) and (y.data_ptr() % 16 == 0) and (out.data_ptr() % 16 == 0)
-    vec = max_vec if aligned16 else 1
+    z = torch.empty_like(x)
 
-    # Choose tile size: bytes per program ~ 32KB-64KB; adapt BLOCK with vectorization
-    target_tile_elems = 8192  # elements per program
-    block = max(256, target_tile_elems // vec)
+    grid = lambda meta: (triton.cdiv(n_elements, meta['BLOCK_SIZE']),)
+    _add_kernel[grid](x, y, z, n_elements)
 
-    # Heuristic for kernel launch parameters
-    if block * vec >= 8192:
-        num_warps = 8
-    else:
-        num_warps = 4
-    num_stages = 2
-
-    grid = lambda META: (triton.cdiv(n_elements, META["BLOCK"] * META["VEC"]),)
-
-    _add_kernel[grid](
-        x, y, out, n_elements,
-        BLOCK=block,
-        VEC=vec,
-        num_warps=num_warps,
-        num_stages=num_stages,
-    )
-    return out
+    return z
 
 
 class Solution:
     def solve(self, spec_path: str = None) -> dict:
-        code = '''
-import math
-import torch
-import triton
-import triton.language as tl
-
-
-@triton.jit
-def _add_kernel(x_ptr, y_ptr, o_ptr, n_elements, BLOCK: tl.constexpr, VEC: tl.constexpr):
-    pid = tl.program_id(0)
-    block_start = pid * BLOCK * VEC
-    ar0 = tl.arange(0, BLOCK)[:, None]
-    ar1 = tl.arange(0, VEC)[None, :]
-    offsets = block_start + ar0 * VEC + ar1
-    mask = offsets < n_elements
-
-    x = tl.load(x_ptr + offsets, mask=mask, other=0)
-    y = tl.load(y_ptr + offsets, mask=mask, other=0)
-    z = x + y
-    tl.store(o_ptr + offsets, z, mask=mask)
-
-
-def add(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
-    assert x.shape == y.shape, "Input tensors must have the same shape"
-    assert x.is_contiguous() and y.is_contiguous(), "Inputs must be contiguous"
-    assert x.device.type == "cuda" and y.device.type == "cuda", "Inputs must be on CUDA device"
-    assert x.dtype == y.dtype, "Inputs must have the same dtype"
-
-    n_elements = x.numel()
-    out = torch.empty_like(x)
-
-    elem_bytes = x.element_size()
-    max_vec = max(1, 16 // elem_bytes)
-    aligned16 = (x.data_ptr() % 16 == 0) and (y.data_ptr() % 16 == 0) and (out.data_ptr() % 16 == 0)
-    vec = max_vec if aligned16 else 1
-
-    target_tile_elems = 8192
-    block = max(256, target_tile_elems // vec)
-
-    if block * vec >= 8192:
-        num_warps = 8
-    else:
-        num_warps = 4
-    num_stages = 2
-
-    grid = lambda META: (triton.cdiv(n_elements, META["BLOCK"] * META["VEC"]),)
-
-    _add_kernel[grid](
-        x, y, out, n_elements,
-        BLOCK=block,
-        VEC=vec,
-        num_warps=num_warps,
-        num_stages=num_stages,
-    )
-    return out
-'''
-        return {"code": code}
+        return {"program_path": os.path.abspath(__file__)}

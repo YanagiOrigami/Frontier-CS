@@ -1,8 +1,7 @@
 import numpy as np
-import pandas as pd
-import sympy
 from pysr import PySRRegressor
-import os
+import sympy
+import warnings
 
 class Solution:
     def __init__(self, **kwargs):
@@ -10,66 +9,68 @@ class Solution:
 
     def solve(self, X: np.ndarray, y: np.ndarray) -> dict:
         """
-        Solves the symbolic regression problem using PySR.
+        Solves the symbolic regression problem using PySRRegressor.
         """
-        feature_names = ["x1", "x2", "x3", "x4"]
+        # Suppress warnings
+        warnings.filterwarnings("ignore")
+        
+        # Define variable names corresponding to the 4 input features
+        variable_names = ["x1", "x2", "x3", "x4"]
         
         # Configure PySRRegressor
-        # Using settings optimized for the provided environment (8 vCPUs) and problem type
+        # Optimized for the available 8 vCPUs (procs=8)
+        # Using niterations and timeout to ensure completion within reasonable time
         model = PySRRegressor(
-            niterations=100,             # Sufficient iterations for 4D complexity
+            niterations=200,
             binary_operators=["+", "-", "*", "/"],
             unary_operators=["exp", "sin", "cos", "log"],
-            populations=20,             # Parallel populations matching CPU scale
-            population_size=40,
-            maxsize=40,                 # Allow for larger expressions (poly interactions + exp)
-            model_selection="best",     # Optimize for mix of accuracy and complexity
+            populations=32,          # 4 populations per core
+            population_size=50,
+            maxsize=40,              # Allow enough complexity for 4D PolyExp interactions
+            ncycles_per_iteration=500,
+            model_selection="best",  # Selects best expression based on accuracy/complexity trade-off
+            loss="loss(prediction, target) = (prediction - target)^2",
             verbosity=0,
             progress=False,
             random_state=42,
-            procs=8,                    # Use all available vCPUs
-            multithreading=False,       # Multiprocessing is generally more stable for PySR
-            timeout_in_seconds=300,     # Time limit to ensure return
+            procs=8,                 # Use all 8 vCPUs
+            multithreading=False,    # Use multiprocessing (safer/faster for Julia backend)
+            timeout_in_seconds=240,  # Safety timeout (4 minutes)
             deterministic=True
         )
-
+        
         try:
-            # Clean up potential artifacts from previous runs
-            if os.path.exists("hall_of_fame.csv"):
-                try:
-                    os.remove("hall_of_fame.csv")
-                except OSError:
-                    pass
-
-            # Fit the model
-            model.fit(X, y, variable_names=feature_names)
+            # Fit the model to the data
+            model.fit(X, y, variable_names=variable_names)
             
-            # Retrieve the best expression
-            # PySR returns a sympy object which can be converted to a Python string
+            # Extract the best symbolic expression as a SymPy object
             best_expr = model.sympy()
+            # Convert to string for output
             expression = str(best_expr)
             
             # Generate predictions
             predictions = model.predict(X)
-            if isinstance(predictions, np.ndarray):
-                predictions = predictions.tolist()
-                
-        except Exception:
-            # Fallback: Linear Regression
-            # In case of environment issues or search failure, return a valid linear baseline
-            X_bias = np.c_[X, np.ones(X.shape[0])]
-            coeffs, _, _, _ = np.linalg.lstsq(X_bias, y, rcond=None)
             
-            terms = []
-            for i in range(4):
-                terms.append(f"({coeffs[i]} * x{i+1})")
-            terms.append(f"{coeffs[4]}")
+        except Exception:
+            # Fallback mechanism: Linear Regression
+            # Used if PySR fails to converge or runs into runtime issues
+            
+            # Prepare data for linear regression (add intercept)
+            X_aug = np.column_stack([X, np.ones(X.shape[0])])
+            
+            # Solve using least squares
+            coeffs, _, _, _ = np.linalg.lstsq(X_aug, y, rcond=None)
+            
+            # Construct the linear expression string
+            terms = [f"({coeffs[i]}*{var})" for i, var in enumerate(variable_names)]
+            terms.append(str(coeffs[-1])) # Add intercept
             expression = " + ".join(terms)
             
-            predictions = (X_bias @ coeffs).tolist()
+            # Compute predictions
+            predictions = X_aug @ coeffs
 
         return {
             "expression": expression,
-            "predictions": predictions,
+            "predictions": predictions.tolist(),
             "details": {}
         }

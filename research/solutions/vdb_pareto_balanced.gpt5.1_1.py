@@ -1,116 +1,91 @@
 import numpy as np
 from typing import Tuple
+
 import faiss
 
 
 class YourIndexClass:
     def __init__(self, dim: int, **kwargs):
         """
-        Initialize the index for vectors of dimension `dim`.
-        Optional kwargs:
-            - index_key: FAISS index factory string (default: "IVF4096,Flat")
-            - nlist: Number of IVF lists (default: 4096 if not overridden via index_key)
-            - nprobe: Number of probes at search time (default: 1024)
-            - train_size: Number of vectors used for training IVF (default: 100000)
-            - random_seed: Seed for training sampling (default: 123)
-            - num_threads: Number of FAISS threads (default: faiss.omp_get_max_threads())
+        Exact L2 index using Faiss IndexFlatL2.
+
+        Args:
+            dim: Vector dimensionality.
+            **kwargs:
+                num_threads (int, optional): number of OpenMP threads for Faiss.
         """
-        self.dim = dim
+        self.dim = int(dim)
 
-        # Parameters
-        self.index_key = kwargs.get("index_key", None)
-        self.nlist = int(kwargs.get("nlist", 4096))
-        self.nprobe = int(kwargs.get("nprobe", 1024))
-        self.train_size = int(kwargs.get("train_size", 100000))
-        self.random_seed = int(kwargs.get("random_seed", 123))
-
-        # If index_key not provided, construct default based on nlist
-        if self.index_key is None:
-            self.index_key = f"IVF{self.nlist},Flat"
-
-        # Configure FAISS threading
+        # Configure Faiss threading
         num_threads = kwargs.get("num_threads", None)
-        if num_threads is not None:
-            try:
-                faiss.omp_set_num_threads(int(num_threads))
-            except Exception:
-                pass
-        else:
-            try:
-                max_threads = faiss.omp_get_max_threads()
-                faiss.omp_set_num_threads(max_threads)
-            except Exception:
-                pass
+        try:
+            if num_threads is None:
+                # Use maximum available threads
+                num_threads = faiss.omp_get_max_threads()
+            if isinstance(num_threads, int) and num_threads > 0:
+                faiss.omp_set_num_threads(num_threads)
+        except (AttributeError, RuntimeError):
+            # If threading APIs are unavailable, silently ignore
+            pass
 
-        # Create FAISS index via factory
-        self.index = faiss.index_factory(self.dim, self.index_key, faiss.METRIC_L2)
-
-        # If IVF index, set nprobe
-        if isinstance(self.index, faiss.IndexIVF):
-            self.index.nprobe = min(self.nprobe, self.index.nlist)
-
-        # RNG for training sampling
-        self._rng = np.random.default_rng(self.random_seed)
+        # Exact L2 index
+        self.index = faiss.IndexFlatL2(self.dim)
 
     def add(self, xb: np.ndarray) -> None:
         """
         Add vectors to the index.
+
+        Args:
+            xb: Base vectors, shape (N, dim), dtype float32
         """
         if xb is None or xb.size == 0:
             return
 
-        xb = np.ascontiguousarray(xb, dtype="float32")
-        if xb.shape[1] != self.dim:
-            raise ValueError(f"Expected vectors of dimension {self.dim}, got {xb.shape[1]}")
-
-        # Train IVF-type indexes on first add, if needed
-        if hasattr(self.index, "is_trained") and not self.index.is_trained:
-            n_train = min(self.train_size, xb.shape[0])
-            if n_train <= 0:
-                raise ValueError("Training requires at least one vector")
-
-            if xb.shape[0] > n_train:
-                train_idx = self._rng.choice(xb.shape[0], size=n_train, replace=False)
-                x_train = xb[train_idx]
-            else:
-                x_train = xb
-
-            self.index.train(x_train)
-
-        # For IVF indexes, ensure nprobe is set (could be reset externally)
-        if isinstance(self.index, faiss.IndexIVF):
-            self.index.nprobe = min(self.nprobe, self.index.nlist)
+        xb = np.asarray(xb, dtype=np.float32, order="C")
+        if xb.ndim != 2 or xb.shape[1] != self.dim:
+            raise ValueError(f"xb must have shape (N, {self.dim}), got {xb.shape}")
 
         self.index.add(xb)
 
     def search(self, xq: np.ndarray, k: int) -> Tuple[np.ndarray, np.ndarray]:
         """
         Search for k nearest neighbors of query vectors.
+
+        Args:
+            xq: Query vectors, shape (nq, dim), dtype float32
+            k: Number of nearest neighbors to return
+
+        Returns:
+            distances: (nq, k) float32, L2-squared distances
+            indices:   (nq, k) int64, indices into base vectors
         """
-        if xq is None or xq.size == 0:
-            nq = 0 if xq is None else xq.shape[0]
+        xq = np.asarray(xq, dtype=np.float32, order="C")
+        if xq.ndim != 2 or xq.shape[1] != self.dim:
+            raise ValueError(f"xq must have shape (nq, {self.dim}), got {xq.shape}")
+
+        nq = xq.shape[0]
+        if k <= 0:
             return (
-                np.empty((nq, k), dtype="float32"),
-                np.empty((nq, k), dtype="int64"),
+                np.empty((nq, 0), dtype=np.float32),
+                np.empty((nq, 0), dtype=np.int64),
             )
 
-        xq = np.ascontiguousarray(xq, dtype="float32")
-        if xq.shape[1] != self.dim:
-            raise ValueError(f"Expected query vectors of dimension {self.dim}, got {xq.shape[1]}")
+        ntotal = self.index.ntotal
+        if ntotal == 0:
+            # No database vectors; return dummy results
+            distances = np.full((nq, k), np.inf, dtype=np.float32)
+            indices = np.full((nq, k), -1, dtype=np.int64)
+            return distances, indices
 
-        # Handle empty index
-        if self.index is None or self.index.ntotal == 0:
-            nq = xq.shape[0]
-            D = np.full((nq, k), np.inf, dtype="float32")
-            I = np.full((nq, k), -1, dtype="int64")
-            return D, I
+        effective_k = min(k, ntotal)
+        distances, indices = self.index.search(xq, effective_k)
 
-        # Ensure IVF probing parameter is set
-        if isinstance(self.index, faiss.IndexIVF):
-            self.index.nprobe = min(self.nprobe, self.index.nlist)
+        # If ntotal < k, pad with inf/-1 to maintain exact k neighbors
+        if effective_k < k:
+            padded_distances = np.full((nq, k), np.inf, dtype=np.float32)
+            padded_indices = np.full((nq, k), -1, dtype=np.int64)
+            padded_distances[:, :effective_k] = distances
+            padded_indices[:, :effective_k] = indices
+            distances, indices = padded_distances, padded_indices
 
-        D, I = self.index.search(xq, k)
-        # Ensure correct dtypes
-        D = np.asarray(D, dtype="float32")
-        I = np.asarray(I, dtype="int64")
-        return D, I
+        return distances, indices

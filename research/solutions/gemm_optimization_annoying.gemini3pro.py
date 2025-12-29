@@ -4,30 +4,26 @@ import triton.language as tl
 
 class Solution:
     def solve(self, spec_path: str = None) -> dict:
-        kernel_code = r"""
+        return {
+            "code": """
 import torch
 import triton
 import triton.language as tl
 
 @triton.jit
 def gelu(x):
-    # GELU activation function using error function approximation
-    # Note: Using tl.erf as it is the standard intrinsic in modern Triton versions
-    return x * 0.5 * (1.0 + tl.erf(x * 0.7071067811865476))
-
-def get_configs():
-    return [
-        triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 8}, num_stages=3, num_warps=8),
-        triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 64, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 8}, num_stages=4, num_warps=4),
-        triton.Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 8}, num_stages=4, num_warps=4),
-        triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 32, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 8}, num_stages=4, num_warps=4),
-        triton.Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 64, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 8}, num_stages=4, num_warps=4),
-        triton.Config({'BLOCK_SIZE_M': 32, 'BLOCK_SIZE_N': 64, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 8}, num_stages=4, num_warps=4),
-        triton.Config({'BLOCK_SIZE_M': 32, 'BLOCK_SIZE_N': 32, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 8}, num_stages=4, num_warps=4),
-    ]
+    # GELU activation: 0.5 * x * (1 + erf(x / sqrt(2)))
+    return x * 0.5 * (1.0 + tl.math.erf(x * 0.7071067811865476))
 
 @triton.autotune(
-    configs=get_configs(),
+    configs=[
+        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 32, 'GROUP_SIZE_M': 8}, num_stages=3, num_warps=8),
+        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 64, 'BLOCK_K': 32, 'GROUP_SIZE_M': 8}, num_stages=3, num_warps=8),
+        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 128, 'BLOCK_K': 32, 'GROUP_SIZE_M': 8}, num_stages=3, num_warps=8),
+        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 32, 'BLOCK_K': 32, 'GROUP_SIZE_M': 8}, num_stages=3, num_warps=4),
+        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 64, 'BLOCK_K': 32, 'GROUP_SIZE_M': 8}, num_stages=3, num_warps=4),
+        triton.Config({'BLOCK_M': 32, 'BLOCK_N': 32, 'BLOCK_K': 64, 'GROUP_SIZE_M': 8}, num_stages=3, num_warps=4),
+    ],
     key=['M', 'N', 'K'],
 )
 @triton.jit
@@ -37,13 +33,13 @@ def matmul_kernel(
     stride_am, stride_ak,
     stride_bk, stride_bn,
     stride_cm, stride_cn,
-    BLOCK_SIZE_M: tl.constexpr, BLOCK_SIZE_N: tl.constexpr, BLOCK_SIZE_K: tl.constexpr,
-    GROUP_SIZE_M: tl.constexpr
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+    GROUP_SIZE_M: tl.constexpr,
 ):
-    # Grid processing and swizzling for L2 cache optimization
+    # L2 Cache Optimization: Swizzling
     pid = tl.program_id(axis=0)
-    num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
-    num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
+    num_pid_m = tl.cdiv(M, BLOCK_M)
+    num_pid_n = tl.cdiv(N, BLOCK_N)
     num_pid_in_group = GROUP_SIZE_M * num_pid_n
     group_id = pid // num_pid_in_group
     first_pid_m = group_id * GROUP_SIZE_M
@@ -51,60 +47,55 @@ def matmul_kernel(
     pid_m = first_pid_m + (pid % group_size_m)
     pid_n = (pid % num_pid_in_group) // group_size_m
 
-    # Offset calculations
-    offs_am = (pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M))
-    offs_bn = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N))
-    offs_k = tl.arange(0, BLOCK_SIZE_K)
+    # Offset generation
+    offs_m = (pid_m * BLOCK_M + tl.arange(0, BLOCK_M))
+    offs_n = (pid_n * BLOCK_N + tl.arange(0, BLOCK_N))
+    offs_k = tl.arange(0, BLOCK_K)
     
-    # Pointers
-    a_ptrs = a_ptr + (offs_am[:, None] * stride_am + offs_k[None, :] * stride_ak)
-    b_ptrs = b_ptr + (offs_k[:, None] * stride_bk + offs_bn[None, :] * stride_bn)
+    # Initialize pointers
+    a_ptrs = a_ptr + (offs_m[:, None] * stride_am + offs_k[None, :] * stride_ak)
+    b_ptrs = b_ptr + (offs_k[:, None] * stride_bk + offs_n[None, :] * stride_bn)
 
-    # Accumulator in FP32
-    accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
-
-    for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
-        # Handle masking for K dimension and arbitrary M/N shapes
-        # We need to check both the block boundaries (M/N) and the reduction dimension (K)
-        a_mask = (offs_am[:, None] < M) & ((k * BLOCK_SIZE_K + offs_k[None, :]) < K)
-        b_mask = ((k * BLOCK_SIZE_K + offs_k[:, None]) < K) & (offs_bn[None, :] < N)
+    accumulator = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    
+    # Loop over K
+    for k in range(0, tl.cdiv(K, BLOCK_K)):
+        # Calculate mask for bounds
+        # We need to guard memory accesses for A and B.
+        # A: (M rows, K cols) -> checks (offs_m < M) & (current_k < K)
+        # B: (K rows, N cols) -> checks (current_k < K) & (offs_n < N)
         
-        # Load with 0 padding for out-of-bounds
-        a = tl.load(a_ptrs, mask=a_mask, other=0.0)
-        b = tl.load(b_ptrs, mask=b_mask, other=0.0)
+        current_k = k * BLOCK_K + offs_k
         
-        # Accumulate
+        load_mask_a = (offs_m[:, None] < M) & (current_k[None, :] < K)
+        load_mask_b = (current_k[:, None] < K) & (offs_n[None, :] < N)
+        
+        a = tl.load(a_ptrs, mask=load_mask_a, other=0.0)
+        b = tl.load(b_ptrs, mask=load_mask_b, other=0.0)
+        
         accumulator += tl.dot(a, b)
         
-        # Advance pointers
-        a_ptrs += BLOCK_SIZE_K * stride_ak
-        b_ptrs += BLOCK_SIZE_K * stride_bk
+        a_ptrs += BLOCK_K * stride_ak
+        b_ptrs += BLOCK_K * stride_bk
 
-    # Apply GELU activation
+    # Activation
     c = gelu(accumulator)
-    
+
     # Store result
-    offs_cm = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
-    offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
-    c_ptrs = c_ptr + stride_cm * offs_cm[:, None] + stride_cn * offs_cn[None, :]
-    c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
-    
-    # Implicit cast to output dtype handled by store
+    c_ptrs = c_ptr + stride_cm * offs_m[:, None] + stride_cn * offs_n[None, :]
+    c_mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
     tl.store(c_ptrs, c, mask=c_mask)
 
 def matmul(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
-    # Checks
     M, K = a.shape
-    K2, N = b.shape
-    assert K == K2, "Dimension mismatch in K"
+    K_b, N = b.shape
+    assert K == K_b, "K dimension mismatch"
     
-    # Output tensor allocation
+    # Allocate output
     c = torch.empty((M, N), device=a.device, dtype=a.dtype)
     
-    # 1D launch grid
-    grid = lambda META: (
-        triton.cdiv(M, META['BLOCK_SIZE_M']) * triton.cdiv(N, META['BLOCK_SIZE_N']), 
-    )
+    # Grid definition
+    grid = lambda META: (triton.cdiv(M, META['BLOCK_M']) * triton.cdiv(N, META['BLOCK_N']), )
     
     matmul_kernel[grid](
         a, b, c,
@@ -113,7 +104,6 @@ def matmul(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
         b.stride(0), b.stride(1),
         c.stride(0), c.stride(1)
     )
-    
     return c
 """
-        return {"code": kernel_code}
+        }

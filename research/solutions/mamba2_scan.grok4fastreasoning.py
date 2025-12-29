@@ -1,3 +1,7 @@
+import torch
+import triton
+import triton.language as tl
+
 class Solution:
     def solve(self, spec_path: str = None) -> dict:
         code = """
@@ -5,54 +9,50 @@ import torch
 import triton
 import triton.language as tl
 
+@triton.jit
+def chunk_kernel(
+    X, A, B, Y, state,
+    start: tl.int32,
+    stride_l: tl.int32,
+    D: tl.int32,
+    chunk_size: tl.int32,
+    BLOCK_D: tl.constexpr
+):
+    pid = tl.program_id(0)
+    block_start = pid * BLOCK_D
+    offsets = block_start + tl.arange(0, BLOCK_D)
+    mask = offsets < D
+    y_prev = tl.load(state + offsets, mask=mask, other=0.0)
+    for t in range(chunk_size):
+        offs_t = start + t
+        offset = offs_t * stride_l + offsets
+        x_slice = tl.load(X + offset, mask=mask, other=0.0)
+        a_slice = tl.load(A + offset, mask=mask, other=0.0)
+        b_slice = tl.load(B + offset, mask=mask, other=0.0)
+        c = b_slice * x_slice
+        y_curr = a_slice * y_prev + c
+        tl.store(Y + offset, y_curr, mask=mask)
+        y_prev = y_curr
+    tl.store(state + offsets, y_prev, mask=mask)
+
 def chunk_scan(X: torch.Tensor, A: torch.Tensor, B: torch.Tensor, chunk: int = 128, BD: int = 128) -> torch.Tensor:
-    L, D = X.shape
-    y = torch.empty((L, D), dtype=X.dtype, device=X.device)
-    state = torch.zeros(D, dtype=X.dtype, device=X.device)
-    MAX_BD = 128
-
-    @triton.jit
-    def kernel(
-        X_ptr, A_ptr, B_ptr, Y_ptr, state_ptr,
-        start: tl.int32,
-        C: tl.int32,
-        L: tl.int32,
-        D: tl.int32,
-        BD: tl.int32,
-        MAX_BD: tl.constexpr
-    ):
-        pid = tl.program_id(0)
-        block_start = pid * BD
-        offs = tl.arange(0, MAX_BD)
-        mask = offs < BD
-        offs_d = block_start + offs
-        mask_d = mask & (offs_d < D)
-
-        state = tl.load(state_ptr + offs_d, mask=mask_d, other=0.0)
-
-        for k in range(C):
-            t = start + k
-            row_start = t * D + block_start
-            x = tl.load(X_ptr + row_start + offs, mask=mask_d, other=0.0)
-            a = tl.load(A_ptr + row_start + offs, mask=mask_d, other=0.0)
-            b = tl.load(B_ptr + row_start + offs, mask=mask_d, other=0.0)
-            state = a * state + b * x
-            tl.store(Y_ptr + row_start + offs, state, mask=mask_d)
-
-        tl.store(state_ptr + offs_d, state, mask=mask_d)
-
-    grid = lambda meta: (triton.cdiv(D, BD), )
-
-    num_chunks = L // chunk
-    for i in range(num_chunks):
-        start_pos = i * chunk
-        kernel[grid](
-            X, A, B, y, state,
-            start_pos, chunk, L, D, BD,
-            MAX_BD=MAX_BD,
-            num_stages=1
+    L, D_ = X.shape
+    if L % chunk != 0:
+        raise ValueError("L must be divisible by chunk")
+    Y = torch.empty_like(X)
+    state = torch.zeros(D_, dtype=X.dtype, device=X.device)
+    N = L // chunk
+    stride_l = D_
+    for k in range(N):
+        start = k * chunk
+        n_blocks = (D_ + BD - 1) // BD
+        grid = (n_blocks,)
+        chunk_kernel[grid](
+            X, A, B, Y, state,
+            start, stride_l, D_, chunk,
+            BLOCK_D=BD,
+            num_stages=4
         )
-
-    return y
-        """
+    return Y
+"""
         return {"code": code}

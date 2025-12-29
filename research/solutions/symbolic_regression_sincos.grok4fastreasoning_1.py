@@ -7,15 +7,16 @@ class Solution:
 
     def solve(self, X: np.ndarray, y: np.ndarray) -> dict:
         model = PySRRegressor(
-            niterations=40,
-            binary_operators=["+", "-", "*", "/"],
+            niterations=100,
+            binary_operators=["+", "-", "*", "/", "**"],
             unary_operators=["sin", "cos", "exp", "log"],
-            populations=15,
-            population_size=33,
-            maxsize=25,
+            populations=30,
+            population_size=50,
+            maxsize=20,
             verbosity=0,
             progress=False,
             random_state=42,
+            timeout_in_seconds=30,
         )
         model.fit(X, y, variable_names=["x1", "x2"])
 
@@ -24,8 +25,10 @@ class Solution:
 
         predictions = model.predict(X)
 
+        complexity = int(model.equations_["complexity"].iloc[0])
+
         return {
             "expression": expression,
             "predictions": predictions.tolist(),
-            "details": {}
+            "details": {"complexity": complexity}
         }

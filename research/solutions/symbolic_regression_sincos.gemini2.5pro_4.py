@@ -4,59 +4,63 @@ from pysr import PySRRegressor
 class Solution:
     def __init__(self, **kwargs):
         """
-        Initializes the PySRRegressor with a configuration optimized for the
-        8-core CPU environment and the specifics of the SinCos dataset.
+        No specific initialization needed for this solution.
         """
-        self.model = PySRRegressor(
-            niterations=60,
-            populations=16,
-            population_size=40,
-            procs=8,
-            binary_operators=["+", "-", "*", "/", "**"],
-            # Strong prior based on dataset name "SinCos"
-            unary_operators=["sin", "cos"],
-            maxsize=25,
-            model_selection="best",
-            random_state=42,
-            verbosity=0,
-            progress=False,
-            temp_equation_file=False,
-        )
+        pass
 
     def solve(self, X: np.ndarray, y: np.ndarray) -> dict:
         """
-        Fits the PySR model to the data and returns the best symbolic expression.
+        Finds a symbolic expression for the SinCos dataset using PySR.
+        
+        This solution uses PySR, a genetic programming-based symbolic regression
+        library, to find the underlying mathematical expression in the data.
+        The hyperparameters are tuned based on the problem description ("SinCos"
+        dataset with periodic behavior) and the evaluation environment (8 vCPUs).
 
-        Args:
-            X: Feature matrix of shape (n, 2)
-            y: Target values of shape (n,)
-
-        Returns:
-            A dictionary containing the symbolic expression, predictions, and
-            details about the model's complexity.
+        Key tuning decisions:
+        - Operator set is focused on `sin`, `cos`, `+`, `*`, `-` to leverage
+          problem-specific knowledge and reduce the search space.
+        - `niterations`, `populations`, and `population_size` are increased
+          from the baseline example to allow for a more thorough search.
+        - `procs` is set to 8 to fully utilize the available CPU cores.
+        - `complexity_of_operators` is configured to match the problem's
+          scoring formula, guiding PySR's internal selection towards
+          expressions that will score higher.
+        - A fallback mechanism is implemented to handle the case where PySR
+          does not find any valid expressions.
         """
-        self.model.fit(X, y, variable_names=["x1", "x2"])
+        model = PySRRegressor(
+            niterations=100,
+            populations=24,
+            population_size=50,
+            procs=8,
+            binary_operators=["+", "*", "-"],
+            unary_operators=["sin", "cos"],
+            maxsize=20,
+            random_state=42,
+            verbosity=0,
+            progress=False,
+            temp_equation_file=True,
+            complexity_of_operators={
+                "+": 2, "*": 2, "-": 2,
+                "sin": 1, "cos": 1
+            },
+        )
 
-        # Check if PySR found any valid equations
-        if not hasattr(self.model, 'equations_') or self.model.equations_.empty:
-            # Provide a fallback solution if PySR fails
-            expression = "0.0"
-            predictions = np.zeros_like(y)
-            details = {"complexity": 0}
+        model.fit(X, y, variable_names=["x1", "x2"])
+
+        if len(model.equations) == 0:
+            # Fallback if no expression is found by PySR
+            mean_y = np.mean(y)
+            expression = f"{mean_y:.8f}"
+            predictions = np.full_like(y, mean_y)
         else:
-            # Get the best symbolic expression found by PySR
-            best_expr_sympy = self.model.sympy()
-            expression = str(best_expr_sympy)
-            
-            # Generate predictions using the best model
-            predictions = self.model.predict(X)
-            
-            # Extract complexity from the best model's details
-            best_equation_details = self.model.get_best()
-            details = {"complexity": int(best_equation_details.complexity)}
+            # Get the best expression and its predictions
+            expression = str(model.sympy())
+            predictions = model.predict(X)
 
         return {
             "expression": expression,
             "predictions": predictions.tolist(),
-            "details": details
+            "details": {}
         }

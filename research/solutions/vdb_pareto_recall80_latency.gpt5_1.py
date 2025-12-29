@@ -1,300 +1,110 @@
 import numpy as np
-from typing import Tuple, Optional
-
-try:
-    import faiss
-except Exception:
-    faiss = None
-
+import faiss
+from typing import Tuple
 
 class YourIndexClass:
     def __init__(
         self,
         dim: int,
-        nlist: int = 16384,
-        nprobe: int = 3,
-        pq_m: int = 16,
-        pq_nbits: int = 8,
-        use_opq: bool = True,
-        train_size: int = 150000,
-        hnsw_m: int = 32,
-        hnsw_ef_search: int = 64,
-        hnsw_ef_construction: int = 200,
-        refine_factor: int = 8,
-        num_threads: Optional[int] = None,
-        seed: int = 12345,
-        **kwargs,
+        **kwargs
     ):
-        self.d = dim
-        self.nlist = int(nlist)
-        self.nprobe = int(nprobe)
-        self.pq_m = int(pq_m)
-        self.pq_nbits = int(pq_nbits)
-        self.use_opq = bool(use_opq)
-        self.train_size = int(train_size)
-        self.hnsw_m = int(hnsw_m)
-        self.hnsw_ef_search = int(hnsw_ef_search)
-        self.hnsw_ef_construction = int(hnsw_ef_construction)
-        self.refine_factor = int(refine_factor)
-        self.seed = int(seed)
+        self.dim = dim
 
-        self.num_threads = num_threads
-        self._trained = False
-        self._added = 0
+        # Parameters with sensible defaults aimed at high recall under tight latency
+        self.nlist = int(kwargs.get("nlist", 8192))
+        self.nprobe = int(kwargs.get("nprobe", 4))
+        self.pq_m = int(kwargs.get("M", 16))
+        self.pq_nbits = int(kwargs.get("nbits", 8))
 
-        self.quantizer = None
-        self.ivf = None
-        self.base_index = None
-        self.search_index = None
+        # HNSW quantizer params
+        self.quantizer_m = int(kwargs.get("quantizer_m", 32))
+        self.ef_search = int(kwargs.get("ef_search", 64))
+        self.ef_construction = int(kwargs.get("ef_construction", 100))
 
-        # Thread setup for FAISS if available
-        if faiss is not None:
+        # OPQ transform
+        self.use_opq = bool(kwargs.get("use_opq", True))
+        self.opq_m = int(kwargs.get("opq_m", self.pq_m))
+
+        # Training control
+        self.training_samples = int(kwargs.get("training_samples", 150000))
+        self.training_seed = int(kwargs.get("training_seed", 123))
+
+        # Training iterations tuning for speed/quality tradeoff
+        self.coarse_niter = int(kwargs.get("coarse_niter", 15))
+
+        # Threading
+        self.num_threads = int(kwargs.get("num_threads", 0))  # 0 => faiss default
+
+        self.index = None
+        self.ivf = None  # Keep a reference to set/search parameters when wrapped
+        self._is_trained = False
+
+        if self.num_threads > 0:
             try:
-                if self.num_threads is None:
-                    self.num_threads = faiss.omp_get_max_threads()
-                if self.num_threads is not None and self.num_threads > 0:
-                    faiss.omp_set_num_threads(self.num_threads)
+                faiss.omp_set_num_threads(self.num_threads)
             except Exception:
                 pass
 
-        # Fallback flags if FAISS is missing
-        self._fallback = faiss is None
-        if self._fallback:
-            # Fallback parameters for a very simple IVFFlat-like index
-            self._centroids = None
-            self._assign = None
-            self._xb = None
-            self._rng = np.random.RandomState(self.seed)
+    def _build_index(self):
+        # Build HNSW quantizer for IVF coarse assignment
+        quantizer = faiss.IndexHNSWFlat(self.dim, self.quantizer_m)
+        quantizer.hnsw.efSearch = self.ef_search
+        quantizer.hnsw.efConstruction = self.ef_construction
 
-    def _build_faiss_index(self, xtrain: np.ndarray):
-        d = self.d
+        # IVF with PQ codes
+        ivf = faiss.IndexIVFPQ(quantizer, self.dim, self.nlist, self.pq_m, self.pq_nbits)
+        ivf.nprobe = self.nprobe
+        ivf.cp.min_points_per_centroid = 5
+        ivf.cp.niter = self.coarse_niter
+        # Enable use of precomputed tables for faster scanning
+        ivf.use_precomputed_table = 1
 
-        # Coarse quantizer: HNSW for fast nprobe selection
-        self.quantizer = faiss.IndexHNSWFlat(d, self.hnsw_m)
-        try:
-            self.quantizer.hnsw.efSearch = self.hnsw_ef_search
-            self.quantizer.hnsw.efConstruction = self.hnsw_ef_construction
-        except Exception:
-            pass
-
-        # IVF+PQ
-        self.ivf = faiss.IndexIVFPQ(self.quantizer, d, self.nlist, self.pq_m, self.pq_nbits)
-        try:
-            self.ivf.use_precomputed_table = 1
-        except Exception:
-            pass
-
-        # Optional OPQ rotation
         if self.use_opq:
-            opq = faiss.OPQMatrix(d, self.pq_m)
-            self.base_index = faiss.IndexPreTransform(opq, self.ivf)
+            opq = faiss.OPQMatrix(self.dim, self.opq_m)
+            opq.niter = 10
+            index = faiss.IndexPreTransform(opq, ivf)
         else:
-            self.base_index = self.ivf
+            index = ivf
 
-        # Optional refine step for accuracy: re-rank a small factor of candidates using exact L2
-        if self.refine_factor and self.refine_factor > 1:
-            self.search_index = faiss.IndexRefineFlat(self.base_index)
-            # Try to set k_factor on refine index
-            set_ok = False
-            try:
-                self.search_index.k_factor = int(self.refine_factor)
-                set_ok = True
-            except Exception:
-                pass
-            if not set_ok:
-                try:
-                    ps = faiss.ParameterSpace()
-                    ps.set_index_parameter(self.search_index, "k_factor", str(int(self.refine_factor)))
-                except Exception:
-                    pass
-        else:
-            self.search_index = self.base_index
-
-        # Train
-        self.base_index.train(xtrain)
-
-        # IVF parameters
-        try:
-            self.ivf.nprobe = self.nprobe
-        except Exception:
-            pass
-
-        # Precompute distance tables if supported
-        try:
-            if hasattr(self.ivf, "use_precomputed_table") and self.ivf.use_precomputed_table:
-                try:
-                    self.ivf.precompute_table()
-                except Exception:
-                    pass
-        except Exception:
-            pass
-
-        # Ensure HNSW quantizer parameters are up to date
-        try:
-            self.quantizer.hnsw.efSearch = self.hnsw_ef_search
-        except Exception:
-            pass
-
-        self._trained = True
-
-    def _train_if_needed_faiss(self, xb: np.ndarray):
-        if self._trained:
-            return
-        n = xb.shape[0]
-        train_n = min(self.train_size, n)
-        rng = np.random.RandomState(self.seed)
-        if n > train_n:
-            idx = rng.choice(n, size=train_n, replace=False)
-            xtrain = xb[idx].copy()
-        else:
-            xtrain = xb.copy()
-        self._build_faiss_index(xtrain)
+        self.index = index
+        self.ivf = ivf
 
     def add(self, xb: np.ndarray) -> None:
-        xb = np.ascontiguousarray(xb.astype(np.float32))
-        if self._fallback:
-            # Simple fallback: KMeans coarse clustering + list assignment (IVFFlat-like), exact within lists
-            if self._xb is None:
-                self._xb = xb.copy()
+        if xb.dtype != np.float32:
+            xb = xb.astype(np.float32, copy=False)
+        xb = np.ascontiguousarray(xb)
+
+        if self.index is None:
+            self._build_index()
+
+        if not self._is_trained:
+            # Sample training data
+            rng = np.random.default_rng(self.training_seed)
+            n_train = min(self.training_samples, xb.shape[0])
+            if xb.shape[0] == n_train:
+                xt = xb
             else:
-                self._xb = np.vstack((self._xb, xb))
+                idx = rng.choice(xb.shape[0], size=n_train, replace=False)
+                xt = xb[idx]
 
-            # Train centroids if not trained
-            if self._centroids is None:
-                n = self._xb.shape[0]
-                train_n = min(self.train_size, n)
-                # init centroids with random samples
-                idx0 = self._rng.choice(n, size=min(self.nlist, train_n), replace=False)
-                self._centroids = self._xb[idx0].copy()
+            self.index.train(xt)
+            self._is_trained = True
 
-                # A few kmeans iters to get coarse centroids
-                iters = 8
-                for _ in range(iters):
-                    # Assign
-                    dots = np.matmul(self._xb, self._centroids.T)
-                    xb2 = (self._xb * self._xb).sum(axis=1, keepdims=True)
-                    c2 = (self._centroids * self._centroids).sum(axis=1, keepdims=True).T
-                    dists = xb2 + c2 - 2 * dots
-                    assign = dists.argmin(axis=1)
-
-                    # Update
-                    for i in range(self._centroids.shape[0]):
-                        mask = (assign == i)
-                        if np.any(mask):
-                            self._centroids[i] = self._xb[mask].mean(axis=0)
-                self._assign = None  # will reassign on search
-            self._added += xb.shape[0]
-            return
-
-        # FAISS path
-        self._train_if_needed_faiss(xb)
-        # Set parameters that may change
-        try:
-            self.ivf.nprobe = self.nprobe
-        except Exception:
-            pass
-        try:
-            self.quantizer.hnsw.efSearch = self.hnsw_ef_search
-        except Exception:
-            pass
-
-        self.search_index.add(xb)
-        self._added += xb.shape[0]
-
-    def _fallback_assign(self):
-        # Assign all database vectors to nearest centroid
-        dots = np.matmul(self._xb, self._centroids.T)
-        xb2 = (self._xb * self._xb).sum(axis=1, keepdims=True)
-        c2 = (self._centroids * self._centroids).sum(axis=1, keepdims=True).T
-        dists = xb2 + c2 - 2 * dots
-        self._assign = dists.argmin(axis=1)
+        self.index.add(xb)
 
     def search(self, xq: np.ndarray, k: int) -> Tuple[np.ndarray, np.ndarray]:
-        xq = np.ascontiguousarray(xq.astype(np.float32))
+        if xq.dtype != np.float32:
+            xq = xq.astype(np.float32, copy=False)
+        xq = np.ascontiguousarray(xq)
 
-        if self._fallback:
-            # Naive IVF-Flat fallback: nprobe nearest centroids, exact scan within lists
-            if self._centroids is None:
-                # No data added; return empty results
-                nq = xq.shape[0]
-                return np.full((nq, k), np.inf, dtype=np.float32), np.full((nq, k), -1, dtype=np.int64)
-            if self._assign is None:
-                self._fallback_assign()
-
-            # Centroid search
-            dots = np.matmul(xq, self._centroids.T)
-            xq2 = (xq * xq).sum(axis=1, keepdims=True)
-            c2 = (self._centroids * self._centroids).sum(axis=1, keepdims=True).T
-            cdists = xq2 + c2 - 2 * dots
-            # pick nprobe
-            nprobe = min(self.nprobe, self._centroids.shape[0])
-            cand_lists = np.argpartition(cdists, nprobe - 1, axis=1)[:, :nprobe]
-
-            # exact scan (L2) within candidate lists
-            nq = xq.shape[0]
-            D = np.full((nq, k), np.float32(np.inf), dtype=np.float32)
-            I = np.full((nq, k), -1, dtype=np.int64)
-
-            # Build inverted lists
-            lists = [[] for _ in range(self._centroids.shape[0])]
-            for idx, cid in enumerate(self._assign):
-                lists[cid].append(idx)
-            lists = [np.array(l, dtype=np.int64) if len(l) > 0 else None for l in lists]
-
-            for qi in range(nq):
-                candidates = []
-                for cid in cand_lists[qi]:
-                    lid = int(cid)
-                    if lists[lid is not None]:
-                        pass
-                for cid in cand_lists[qi]:
-                    lid = int(cid)
-                    if lists[lid] is None or lists[lid].size == 0:
-                        continue
-                    ids = lists[lid]
-                    xb_sub = self._xb[ids]
-                    # exact L2 distances
-                    diff = xb_sub - xq[qi]
-                    dist_sub = np.einsum('ij,ij->i', diff, diff)
-                    candidates.append((dist_sub, ids))
-                if not candidates:
-                    continue
-                dist_all = np.concatenate([c[0] for c in candidates], axis=0)
-                ids_all = np.concatenate([c[1] for c in candidates], axis=0)
-                if dist_all.shape[0] <= k:
-                    order = np.argsort(dist_all, kind='mergesort')
-                    D[qi, :dist_all.shape[0]] = dist_all[order]
-                    I[qi, :dist_all.shape[0]] = ids_all[order]
-                else:
-                    idx_part = np.argpartition(dist_all, k - 1)[:k]
-                    vals = dist_all[idx_part]
-                    ids_sel = ids_all[idx_part]
-                    order = np.argsort(vals, kind='mergesort')
-                    D[qi] = vals[order]
-                    I[qi] = ids_sel[order]
-            return D, I
-
-        # FAISS path
-        if not self._trained:
-            # No data; return empty results
-            nq = xq.shape[0]
-            return np.full((nq, k), np.inf, dtype=np.float32), np.full((nq, k), -1, dtype=np.int64)
-
-        # Ensure params set at query time
-        try:
+        # Ensure runtime parameters are set (in case user changed attributes)
+        if self.ivf is not None:
             self.ivf.nprobe = self.nprobe
-        except Exception:
-            pass
-        try:
-            if hasattr(self.quantizer, "hnsw"):
-                self.quantizer.hnsw.efSearch = self.hnsw_ef_search
-        except Exception:
-            pass
+            if isinstance(self.ivf.quantizer, faiss.IndexHNSWFlat):
+                try:
+                    self.ivf.quantizer.hnsw.efSearch = self.ef_search
+                except Exception:
+                    pass
 
-        D, I = self.search_index.search(xq, k)
-
-        if D.dtype != np.float32:
-            D = D.astype(np.float32, copy=False)
-        if I.dtype != np.int64:
-            I = I.astype(np.int64, copy=False)
+        D, I = self.index.search(xq, k)
         return D, I

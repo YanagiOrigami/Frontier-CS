@@ -7,23 +7,24 @@ class Solution:
 
     def solve(self, X: np.ndarray, y: np.ndarray) -> dict:
         model = PySRRegressor(
-            niterations=40,
-            binary_operators=["+", "-", "*", "/"],
+            niterations=100,
+            binary_operators=["+", "-", "*", "/", "**"],
             unary_operators=["sin", "cos", "exp", "log"],
-            populations=15,
-            population_size=33,
-            maxsize=25,
+            populations=8,
+            population_size=50,
+            maxsize=20,
             verbosity=0,
             progress=False,
             random_state=42,
+            parsimony=1e-3,
+            loss="loss(sum_of_squares())",
+            model_selection="best"
         )
         model.fit(X, y, variable_names=["x1", "x2"])
 
-        # Get best expression as sympy, convert to string
         best_expr = model.sympy()
         expression = str(best_expr)
 
-        # Predictions
         predictions = model.predict(X)
 
         return {

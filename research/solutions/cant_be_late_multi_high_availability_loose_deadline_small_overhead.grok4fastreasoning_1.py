@@ -30,6 +30,10 @@ class Solution(MultiRegionStrategy):
             inter_task_overhead=[0.0],
         )
         super().__init__(args)
+        self.total_progress = 0.0
+        self.last_list_len = 0
+        self.consecutive_no_spot = 0
+        self.threshold = None
         return self
 
     def _step(self, last_cluster_type: ClusterType, has_spot: bool) -> ClusterType:
@@ -49,7 +53,39 @@ class Solution(MultiRegionStrategy):
 
         Returns: ClusterType.SPOT, ClusterType.ON_DEMAND, or ClusterType.NONE
         """
-        # Your decision logic here
+        current_len = len(self.task_done_time)
+        if current_len > self.last_list_len:
+            num_new = current_len - self.last_list_len
+            added = sum(self.task_done_time[-num_new:])
+            self.total_progress += added
+            self.last_list_len = current_len
+
+        remaining_work = self.task_duration - self.total_progress
+        time_left = self.deadline - self.env.elapsed_seconds
+        gap = self.env.gap_seconds
+
+        if self.threshold is None:
+            wait_time_max = 3600.0
+            self.threshold = int(wait_time_max / gap) + 1
+
         if has_spot:
+            self.consecutive_no_spot = 0
             return ClusterType.SPOT
-        return ClusterType.ON_DEMAND
+        else:
+            self.consecutive_no_spot += 1
+            do_switch = self.consecutive_no_spot >= self.threshold
+            if do_switch:
+                current_region = self.env.get_current_region()
+                num_regions = self.env.get_num_regions()
+                next_region = (current_region + 1) % num_regions
+                self.env.switch_region(next_region)
+                self.consecutive_no_spot = 0
+
+            if remaining_work <= 0:
+                return ClusterType.NONE
+
+            need_progress = remaining_work > time_left - gap
+            if need_progress:
+                return ClusterType.ON_DEMAND
+            else:
+                return ClusterType.NONE

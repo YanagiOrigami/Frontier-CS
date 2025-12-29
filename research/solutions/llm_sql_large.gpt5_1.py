@@ -1,105 +1,9 @@
 import pandas as pd
 import numpy as np
 import math
-from typing import List, Any, Dict, Tuple, Optional
 
 
 class Solution:
-    def _resolve_merge_group(self, group: list, original_cols: List[Any]) -> List[Any]:
-        resolved = []
-        for x in group:
-            if isinstance(x, (int, np.integer)):
-                idx = int(x)
-                if 0 <= idx < len(original_cols):
-                    resolved.append(original_cols[idx])
-            else:
-                resolved.append(x)
-        seen = set()
-        out = []
-        for c in resolved:
-            if c not in seen:
-                seen.add(c)
-                out.append(c)
-        return out
-
-    def _unique_col_name(self, cols: List[Any], base: str) -> str:
-        if base not in cols:
-            return base
-        k = 1
-        while True:
-            name = f"{base}__m{k}"
-            if name not in cols:
-                return name
-            k += 1
-
-    def _apply_col_merges(self, df: pd.DataFrame, col_merge: Optional[list]) -> pd.DataFrame:
-        if not col_merge:
-            return df
-
-        df2 = df.copy()
-        original_cols = list(df.columns)
-
-        for group in col_merge:
-            if not group or not isinstance(group, (list, tuple)):
-                continue
-            names = self._resolve_merge_group(group, original_cols)
-            names = [c for c in names if c in df2.columns]
-            if len(names) <= 1:
-                continue
-
-            insert_pos = min(int(df2.columns.get_loc(c)) for c in names)
-            merged = df2[names[0]].astype(str)
-            for c in names[1:]:
-                merged = merged + df2[c].astype(str)
-
-            base_name = "+".join(str(c) for c in names)
-            new_name = self._unique_col_name(list(df2.columns), base_name)
-
-            df2 = df2.drop(columns=names)
-            df2.insert(insert_pos, new_name, merged)
-
-        return df2
-
-    def _col_stats(self, ser: pd.Series, K: int = 8) -> Tuple[float, float, float, float]:
-        arr = ser.astype(str).to_numpy(dtype=object, copy=False)
-        n = int(len(arr))
-        if n <= 1:
-            avg_len = float(len(arr[0])) if n == 1 else 0.0
-            return avg_len, 1.0, avg_len, 0.0
-
-        lens = np.fromiter((len(x) for x in arr), dtype=np.int32, count=n)
-        avg_len = float(lens.mean())
-
-        vc = pd.Series(arr, copy=False).value_counts(dropna=False)
-        counts = vc.to_numpy(dtype=np.int64, copy=False)
-        n2 = float(n) * float(n)
-        sumsq = float(np.dot(counts, counts))
-        g_full = sumsq / n2
-
-        uniq_vals = vc.index.to_numpy(dtype=object, copy=False)
-        tail_lens = np.fromiter((max(0, len(v) - K) for v in uniq_vals), dtype=np.int32, count=len(uniq_vals))
-        tail = float(np.dot(counts * counts, tail_lens.astype(np.int64, copy=False))) / n2
-
-        e_prefix = 0.0
-        max_k = min(K, int(lens.max()) if n > 0 else 0)
-        if max_k > 0:
-            for k in range(1, max_k + 1):
-                mask = lens >= k
-                if not mask.any():
-                    continue
-                d: Dict[str, int] = {}
-                for s in arr[mask]:
-                    p = s[:k]
-                    d[p] = d.get(p, 0) + 1
-                s2 = 0
-                for c in d.values():
-                    s2 += c * c
-                e_prefix += float(s2) / n2
-
-        e_total = e_prefix + tail
-        distinct_ratio = float(len(vc)) / float(n)
-        return avg_len, g_full, e_total, distinct_ratio
-
     def solve(
         self,
         df: pd.DataFrame,
@@ -111,35 +15,127 @@ class Solution:
         distinct_value_threshold: float = 0.7,
         parallel: bool = True,
     ) -> pd.DataFrame:
-        df2 = self._apply_col_merges(df, col_merge)
+        # Step 1: Optional column merges
+        def apply_col_merges(df_in: pd.DataFrame, merges):
+            if not merges:
+                return df_in
+            dfm = df_in.copy()
+            for idx, group in enumerate(merges):
+                if not group:
+                    continue
+                valid = [c for c in group if c in dfm.columns]
+                if len(valid) <= 1:
+                    continue
+                # Merge by string concatenation without spaces
+                try:
+                    merged_series = dfm[valid].astype(str).agg(''.join, axis=1)
+                except Exception:
+                    # Fallback: slower but robust
+                    merged_series = dfm[valid].apply(lambda r: ''.join([str(x) for x in r.values]), axis=1)
+                new_col = f"_MERGED_{idx}"
+                dfm = dfm.drop(columns=valid)
+                dfm[new_col] = merged_series
+            return dfm
 
-        cols = list(df2.columns)
-        m = len(cols)
-        if m <= 1:
-            return df2
+        df_work = apply_col_merges(df, col_merge)
 
-        n = len(df2)
-        sample_n = min(n, 4000)
-        if n <= sample_n:
-            sdf = df2
-        else:
-            sdf = df2.sample(n=sample_n, random_state=0)
+        # Parameters and sampling
+        N = len(df_work)
+        if N == 0 or df_work.shape[1] <= 1:
+            return df_work
 
-        K = 8
-        keys: List[Tuple[float, float, float, int, Any]] = []
-        for idx, c in enumerate(cols):
-            avg_len, g_full, e_total, distinct_ratio = self._col_stats(sdf[c], K=K)
+        sample_n = min(N, early_stop if early_stop is not None else N)
+        # Use first sample_n rows deterministically
+        sample_idx = np.arange(sample_n)
 
-            if g_full >= 1.0 - 1e-15:
-                key = float("inf")
-            else:
-                key = e_total / max(1e-12, (1.0 - g_full))
+        cols = list(df_work.columns)
+        M = len(cols)
 
-            if distinct_ratio > distinct_value_threshold and not math.isinf(key):
-                key *= 0.5
+        # Precompute factorized codes and base per column on sample
+        codes_dict = {}
+        base_dict = {}
+        uniq_counts = {}
+        avg_len = {}
 
-            keys.append((key, e_total, g_full, -idx, c))
+        for c in cols:
+            s = df_work[c].iloc[sample_idx]
+            # Factorize with NaN support -> -1, shift to 0..K
+            codes, uniques = pd.factorize(s, sort=False, na_sentinel=-1)
+            # shift by +1 to make NaN=0, others 1..K
+            codes = (codes + 1).astype(np.int64, copy=False)
+            max_code = int(codes.max()) if codes.size > 0 else 0
+            base = max_code + 1  # ensure base > max_code
+            if base <= 0:
+                base = 1
+            codes_dict[c] = codes
+            base_dict[c] = base
+            uniq_counts[c] = len(uniques) + (1 if (codes == 0).any() else 0)
 
-        keys.sort(reverse=True)
-        new_order = [c for (_, _, _, _, c) in keys]
-        return df2.loc[:, new_order]
+            # Estimate average string length on sample
+            try:
+                avg_len[c] = float(s.astype(str).str.len().mean())
+            except Exception:
+                # Robust fallback
+                avg_len[c] = float(np.mean([len(str(x)) for x in s]))
+
+            if not np.isfinite(avg_len[c]):
+                avg_len[c] = 0.0
+
+        # Greedy construction of column order maximizing dup_frac(prefix)*len(column)
+        gid = np.zeros(sample_n, dtype=np.int64)  # current prefix group id over sample
+        selected = []
+        remaining = set(cols)
+
+        # Precompute initial duplicates fraction per column alone for tie-breaks
+        dup_frac_alone = {}
+        for c in cols:
+            # Since gid are zeros, newkey == codes
+            u = uniq_counts[c] if c in uniq_counts else len(pd.unique(codes_dict[c]))
+            dup_frac_alone[c] = max(0.0, 1.0 - (u / sample_n))
+
+        # Greedy loop
+        for _ in range(M):
+            best_col = None
+            best_score = -1.0
+            best_base = 1
+            # Evaluate candidates
+            for c in list(remaining):
+                codes_c = codes_dict[c]
+                base_c = base_dict[c]
+                # Combine keys (gid, codes_c)
+                # key = gid * base_c + codes_c
+                # We only need the unique count to compute duplicate fraction
+                key = gid * base_c + codes_c
+                # Use factorize to count unique number of pairs
+                # Note: factorize returns (codes, uniques)
+                try:
+                    uniq = pd.factorize(key, sort=False)[1].size
+                except Exception:
+                    uniq = np.unique(key).size
+                dup_frac = 1.0 - (uniq / sample_n)
+                if dup_frac < 0:
+                    dup_frac = 0.0
+                # Score = duplicates fraction for new prefix times average length of this column
+                score = dup_frac * avg_len[c]
+                # In ties, prefer column with higher dup_frac alone and longer length
+                if score > best_score:
+                    best_score = score
+                    best_col = c
+                    best_base = base_c
+            if best_col is None:
+                # Should not happen, but append remaining arbitrarily by descending avg length
+                rest = sorted(list(remaining), key=lambda x: avg_len.get(x, 0.0), reverse=True)
+                selected.extend(rest)
+                remaining.clear()
+                break
+
+            # Update gid with chosen column
+            codes_best = codes_dict[best_col]
+            key_best = gid * best_base + codes_best
+            gid = pd.factorize(key_best, sort=False)[0].astype(np.int64, copy=False)
+
+            selected.append(best_col)
+            remaining.remove(best_col)
+
+        # Return reordered DataFrame
+        return df_work.loc[:, selected]

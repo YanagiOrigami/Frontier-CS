@@ -8,17 +8,11 @@ from sky_spot.utils import ClusterType
 class Solution(MultiRegionStrategy):
     """Your multi-region scheduling strategy."""
 
-    NAME = "my_strategy"  # REQUIRED: unique identifier
+    NAME = "cost_optimized_strategy"
 
     def solve(self, spec_path: str) -> "Solution":
         """
         Initialize the solution from spec_path config.
-
-        The spec file contains:
-        - deadline: deadline in hours
-        - duration: task duration in hours
-        - overhead: restart overhead in hours
-        - trace_files: list of trace file paths (one per region)
         """
         with open(spec_path) as f:
             config = json.load(f)
@@ -35,52 +29,64 @@ class Solution(MultiRegionStrategy):
     def _step(self, last_cluster_type: ClusterType, has_spot: bool) -> ClusterType:
         """
         Decide next action based on current state.
-
-        Returns: ClusterType.SPOT, ClusterType.ON_DEMAND, or ClusterType.NONE
         """
-        # Gather current state information
-        elapsed = self.env.elapsed_seconds
-        done = sum(self.task_done_time)
-        remaining_work = self.task_duration - done
-        time_remaining = self.deadline - elapsed
-        overhead = self.restart_overhead
-        gap = self.env.gap_seconds
+        # Current state
+        current_time = self.env.elapsed_seconds
+        work_done = sum(self.task_done_time)
+        work_remaining = self.task_duration - work_done
+        time_remaining = self.deadline - current_time
         
-        # Panic Threshold Calculation
-        # We need enough time to finish remaining work plus some buffer for overheads.
-        # If time is below this threshold, we stop exploring and stick to safe resources.
-        # Buffer = 3 * overhead allows for a few unexpected restarts/transitions.
-        safe_buffer = 3.0 * overhead
-        is_panic = time_remaining < (remaining_work + safe_buffer)
-
-        if is_panic:
-            # Panic Mode: Prioritize finishing over cost.
-            # If Spot is available, use it (cheapest way to finish).
-            if has_spot:
-                return ClusterType.SPOT
-            else:
-                # Force On-Demand. Do NOT switch regions to avoid further overhead penalties.
-                return ClusterType.ON_DEMAND
-
-        # Normal Mode: We have slack time.
-        # Prioritize Spot instances.
+        # Restart overhead in seconds
+        overhead = self.restart_overhead
+        
+        # Slack calculation:
+        # Time remaining minus work remaining minus one overhead (to be safe for a restart)
+        # Slack represents the buffer of time we can waste before we fail
+        slack = time_remaining - work_remaining - overhead
+        
+        # Define safety thresholds (in seconds)
+        # 1.5x overhead provides a buffer against floating point issues or mid-step changes.
+        # If slack drops below this, we are in danger of missing the deadline.
+        safety_buffer = 1.5 * overhead
+        
+        # Panic Mode: If slack is insufficient, force On-Demand to avoid failure penalty.
+        # The penalty for failure (-100,000) outweighs any cost savings.
+        if slack < safety_buffer:
+            return ClusterType.ON_DEMAND
+        
+        # Prefer Spot if available (it is significantly cheaper)
         if has_spot:
             return ClusterType.SPOT
-
-        # If Spot is unavailable in current region, search elsewhere.
-        # Switch to the next region (Round Robin).
+            
+        # If Spot is unavailable in current region:
+        # Strategy: Switch to the next region to search for Spot availability.
+        # We cycle through regions round-robin.
         current_region = self.env.get_current_region()
         num_regions = self.env.get_num_regions()
         next_region = (current_region + 1) % num_regions
+        
+        # Switch region (incurs overhead on next execution)
         self.env.switch_region(next_region)
-
-        # After switching, we need to decide the action for the *next* step.
-        # We don't know if the new region has Spot yet.
-        # If the time step (gap) is small (e.g., < 5 mins), return NONE.
-        # This acts as a cheap "probe" to check availability without paying OD costs.
-        # If the time step is large (e.g., 1 hour), return ON_DEMAND.
-        # This ensures we make progress (paying OD cost + overhead) rather than wasting a huge chunk of time.
-        if gap < 300.0:
+        
+        # After switching, we cannot use Spot in this step because 'has_spot' was False 
+        # for the previous region, and we haven't checked the new region yet.
+        # We must decide whether to run On-Demand or Wait (NONE).
+        
+        # If we return NONE:
+        # - Cost: $0
+        # - Progress: 0
+        # - Slack Impact: Decreases by 'gap_seconds' (time wasted waiting)
+        
+        # If we return ON_DEMAND:
+        # - Cost: High ($3.06/hr)
+        # - Progress: gap_seconds - overhead
+        # - Slack Impact: Decreases by 'overhead' (time wasted on restart)
+        
+        # Decision: 
+        # If we have plenty of slack, return NONE to save money and check the new region for Spot in the next step.
+        # If slack is tight, return ON_DEMAND to ensure we make progress.
+        
+        if slack > (self.env.gap_seconds + safety_buffer):
             return ClusterType.NONE
         else:
             return ClusterType.ON_DEMAND

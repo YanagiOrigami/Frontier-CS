@@ -1,212 +1,32 @@
-import pandas as pd
 import numpy as np
+import pandas as pd
 from typing import List, Any, Dict, Tuple, Optional
 
 
+def _lcp_len(a: str, b: str) -> int:
+    la = len(a)
+    lb = len(b)
+    n = la if la < lb else lb
+    i = 0
+    while i < n and a[i] == b[i]:
+        i += 1
+    return i
+
+
+def _make_unique_name(existing: set, base: str) -> str:
+    if base not in existing:
+        existing.add(base)
+        return base
+    k = 2
+    while True:
+        name = f"{base}__{k}"
+        if name not in existing:
+            existing.add(name)
+            return name
+        k += 1
+
+
 class Solution:
-    def _resolve_merge_group(self, df_cols: List[Any], group: Any) -> List[Any]:
-        if group is None:
-            return []
-        if not isinstance(group, (list, tuple)):
-            group = [group]
-        resolved = []
-        seen = set()
-        n = len(df_cols)
-        for g in group:
-            col = None
-            if g in df_cols:
-                col = g
-            elif isinstance(g, (int, np.integer)):
-                gi = int(g)
-                if 0 <= gi < n:
-                    col = df_cols[gi]
-                elif 1 <= gi <= n:
-                    col = df_cols[gi - 1]
-            if col is not None and col not in seen:
-                seen.add(col)
-                resolved.append(col)
-        return resolved
-
-    def _apply_col_merge(self, df: pd.DataFrame, col_merge: Optional[list]) -> pd.DataFrame:
-        if not col_merge:
-            return df
-
-        df = df.copy()
-        cols = list(df.columns)
-
-        for group in col_merge:
-            cols = list(df.columns)
-            group_cols = self._resolve_merge_group(cols, group)
-            if len(group_cols) <= 1:
-                continue
-            if not all(c in df.columns for c in group_cols):
-                group_cols = [c for c in group_cols if c in df.columns]
-                if len(group_cols) <= 1:
-                    continue
-
-            positions = [cols.index(c) for c in group_cols if c in cols]
-            if not positions:
-                continue
-            insert_pos = min(positions)
-
-            base_name = "+".join(str(c) for c in group_cols)
-            new_name = base_name
-            if new_name in df.columns:
-                k = 1
-                while f"{base_name}__m{k}" in df.columns:
-                    k += 1
-                new_name = f"{base_name}__m{k}"
-
-            sub = df[group_cols].astype(str)
-            arr = sub.to_numpy(dtype=object, copy=False)
-            merged = pd.Series(("".join(row) for row in arr), index=df.index)
-
-            df.drop(columns=group_cols, inplace=True)
-            df.insert(insert_pos, new_name, merged)
-
-        return df
-
-    def _compute_stats(
-        self,
-        df: pd.DataFrame,
-        sample_n: int,
-        distinct_value_threshold: float,
-    ) -> Tuple[Dict[Any, float], Dict[Any, float], Dict[Any, float], Dict[Any, float], Dict[Any, float]]:
-        n = len(df)
-        if n == 0:
-            return {}, {}, {}, {}, {}
-        if sample_n >= n:
-            sample = df
-        else:
-            sample = df.sample(n=sample_n, random_state=0)
-
-        s_sample = sample.astype(str)
-        n_s = len(s_sample)
-
-        cp_full: Dict[Any, float] = {}
-        prefix_head: Dict[Any, float] = {}
-        avg_len: Dict[Any, float] = {}
-        distinct_ratio: Dict[Any, float] = {}
-        score: Dict[Any, float] = {}
-
-        n_sq = float(n_s * n_s)
-
-        for c in s_sample.columns:
-            s = s_sample[c]
-
-            counts = s.value_counts(dropna=False).to_numpy()
-            if counts.size:
-                cp = float(np.dot(counts, counts)) / n_sq
-                dr = float(counts.size) / float(n_s)
-            else:
-                cp = 0.0
-                dr = 1.0
-            cp_full[c] = cp
-            distinct_ratio[c] = dr
-
-            arr = s.to_numpy(dtype=object, copy=False)
-            al = float(sum(len(x) for x in arr)) / float(n_s) if n_s else 0.0
-            avg_len[c] = al
-
-            ph = 0.0
-            t_cnt = 0
-            if n_s:
-                p1 = s.str.slice(0, 1)
-                c1 = p1.value_counts(dropna=False).to_numpy()
-                if c1.size:
-                    ph += float(np.dot(c1, c1)) / n_sq
-                    t_cnt += 1
-                if al >= 2.0:
-                    p2 = s.str.slice(0, 2)
-                    c2 = p2.value_counts(dropna=False).to_numpy()
-                    if c2.size:
-                        ph += float(np.dot(c2, c2)) / n_sq
-                        t_cnt += 1
-            ph = (ph / t_cnt) if t_cnt else cp
-            prefix_head[c] = ph
-
-            penalty = 0.0
-            if distinct_value_threshold is not None:
-                excess = dr - float(distinct_value_threshold)
-                if excess > 0:
-                    penalty = 0.55 * excess
-
-            sc = (5.0 * cp) + (1.3 * ph) + (0.02 * np.log1p(min(al, 200.0))) - penalty
-            score[c] = float(sc)
-
-        return score, cp_full, prefix_head, avg_len, distinct_ratio
-
-    def _trie_prefix_sum_from_rows(self, arr2d: np.ndarray) -> int:
-        nodes = [{}]
-        nodes_append = nodes.append
-        total = 0
-
-        for row in arr2d:
-            s = "".join(row)
-            node = 0
-            matched = 0
-            for pos in range(len(s)):
-                ch = s[pos]
-                d = nodes[node]
-                nxt = d.get(ch)
-                if nxt is None:
-                    total += matched
-                    new = len(nodes)
-                    d[ch] = new
-                    nodes_append({})
-                    node = new
-                    for k in range(pos + 1, len(s)):
-                        ch2 = s[k]
-                        d2 = nodes[node]
-                        new2 = len(nodes)
-                        d2[ch2] = new2
-                        nodes_append({})
-                        node = new2
-                    break
-                node = nxt
-                matched += 1
-            else:
-                total += matched
-
-        return total
-
-    def _pick_best_order(self, df: pd.DataFrame, candidates: List[List[Any]], eval_n: int) -> List[Any]:
-        if not candidates:
-            return list(df.columns)
-        candidates_unique = []
-        seen = set()
-        cols_set = set(df.columns)
-        for cand in candidates:
-            if not cand:
-                continue
-            if len(cand) != len(cols_set):
-                continue
-            if set(cand) != cols_set:
-                continue
-            tup = tuple(cand)
-            if tup in seen:
-                continue
-            seen.add(tup)
-            candidates_unique.append(cand)
-
-        if not candidates_unique:
-            return list(df.columns)
-
-        eval_n = max(1, min(len(df), int(eval_n)))
-        eval_df = df.iloc[:eval_n].astype(str)
-
-        best_order = candidates_unique[0]
-        best_val = -1
-
-        for order in candidates_unique:
-            arr = eval_df[order].to_numpy(dtype=object, copy=False)
-            val = self._trie_prefix_sum_from_rows(arr)
-            if val > best_val:
-                best_val = val
-                best_order = order
-
-        return best_order
-
     def solve(
         self,
         df: pd.DataFrame,
@@ -221,38 +41,173 @@ class Solution:
         if df is None or df.shape[1] <= 1:
             return df
 
-        df2 = self._apply_col_merge(df, col_merge)
-        cols = list(df2.columns)
-        m = len(cols)
-        n = len(df2)
-        if m <= 1 or n == 0:
-            return df2
+        if col_merge:
+            df = df.copy()
+            existing_names = set(df.columns)
+            for grp in col_merge:
+                if not grp or len(grp) < 2:
+                    continue
+                cols = []
+                for x in grp:
+                    if isinstance(x, (int, np.integer)):
+                        ix = int(x)
+                        if 0 <= ix < len(df.columns):
+                            cols.append(df.columns[ix])
+                    else:
+                        cols.append(x)
+                cols = [c for c in cols if c in df.columns]
+                if len(cols) < 2:
+                    continue
+                insert_pos = min(int(df.columns.get_loc(c)) for c in cols)
+                s = df[cols[0]].astype(str)
+                for c in cols[1:]:
+                    s = s + df[c].astype(str)
+                base_name = "+".join(cols)
+                new_name = _make_unique_name(existing_names, base_name)
+                df = df.drop(columns=cols)
+                df.insert(insert_pos, new_name, s)
 
-        sample_n = min(n, 8000)
-        if n <= 2000:
-            sample_n = n
-        elif m >= 60:
-            sample_n = min(sample_n, 6000)
+        cols_all = list(df.columns)
+        m = len(cols_all)
+        if m <= 1:
+            return df
 
-        score, cp_full, prefix_head, avg_len, distinct_ratio = self._compute_stats(
-            df2, sample_n=sample_n, distinct_value_threshold=distinct_value_threshold
-        )
+        n = len(df)
+        if n <= 1:
+            return df
 
-        def key_score(c):
-            return (score.get(c, 0.0), cp_full.get(c, 0.0), prefix_head.get(c, 0.0), avg_len.get(c, 0.0))
+        n_sample = min(n, 8000)
+        if n_sample < n:
+            rng = np.random.default_rng(0)
+            sample_idx = rng.choice(n, size=n_sample, replace=False)
+        else:
+            sample_idx = np.arange(n, dtype=np.int64)
 
-        def key_cp(c):
-            return (cp_full.get(c, 0.0), prefix_head.get(c, 0.0), avg_len.get(c, 0.0))
+        # Precompute per-column sample strings and hashes
+        col_hash: Dict[Any, np.ndarray] = {}
+        stats: Dict[Any, Dict[str, float]] = {}
+        avg_lens = []
 
-        def key_distinct(c):
-            return (-distinct_ratio.get(c, 1.0), cp_full.get(c, 0.0), prefix_head.get(c, 0.0), avg_len.get(c, 0.0))
+        for c in cols_all:
+            sarr = df[c].iloc[sample_idx].astype(str).to_numpy(dtype=object, copy=False)
+            uniq, counts = np.unique(sarr, return_counts=True)
+            u = int(len(uniq))
+            distinct_ratio = u / float(n_sample)
+            freq_max = float(counts.max()) / float(n_sample) if u > 0 else 0.0
 
-        cand1 = sorted(cols, key=key_score, reverse=True)
-        cand2 = sorted(cols, key=key_cp, reverse=True)
-        cand3 = sorted(cols, key=key_distinct, reverse=True)
-        cand4 = cols[:]
+            lens = np.fromiter((len(x) for x in sarr), dtype=np.int32, count=n_sample)
+            avg_len = float(lens.mean()) if n_sample > 0 else 0.0
+            avg_lens.append(avg_len)
 
-        eval_n = min(n, 1800 if m >= 25 else 2500)
-        best_order = self._pick_best_order(df2, [cand1, cand2, cand3, cand4], eval_n=eval_n)
+            prefix_mode_avg = 0.0
+            common_all = 0.0
+            mode_len = 0.0
+            if u > 0:
+                mode_i = int(np.argmax(counts))
+                mode = str(uniq[mode_i])
+                mode_len = float(len(mode))
+                # Common prefix across all values (since uniq is sorted lexicographically)
+                common_all = float(_lcp_len(str(uniq[0]), str(uniq[-1]))) if u >= 2 else float(len(mode))
+                # Average LCP to mode among top frequent values
+                topk = min(u, 80)
+                if topk > 1:
+                    top_idx = np.argpartition(-counts, topk - 1)[:topk]
+                    total = 0.0
+                    for idx in top_idx:
+                        val = str(uniq[int(idx)])
+                        lcp = _lcp_len(mode, val)
+                        total += float(counts[int(idx)]) * float(lcp)
+                    prefix_mode_avg = total / float(n_sample)
 
-        return df2.loc[:, best_order]
+            prefix_score = max(prefix_mode_avg, common_all)
+            stats[c] = {
+                "distinct_ratio": float(distinct_ratio),
+                "freq_max": float(freq_max),
+                "avg_len": float(avg_len),
+                "prefix_score": float(prefix_score),
+                "mode_len": float(mode_len),
+            }
+
+            try:
+                col_hash[c] = pd.util.hash_array(sarr, categorize=True).astype(np.uint64, copy=False)
+            except Exception:
+                # Fallback: use pandas hashing on a Series
+                col_hash[c] = pd.util.hash_pandas_object(pd.Series(sarr), index=False).to_numpy(dtype=np.uint64, copy=False)
+
+        global_avg_len = float(np.mean(avg_lens)) if avg_lens else 1.0
+        if global_avg_len <= 0:
+            global_avg_len = 1.0
+
+        def base_key(cname: Any) -> Tuple[int, float, float, float, float, str]:
+            st = stats[cname]
+            dr = st["distinct_ratio"]
+            bucket = 0 if dr <= float(distinct_value_threshold) else 1
+            return (
+                bucket,
+                dr,
+                -st["freq_max"],
+                -st["prefix_score"],
+                -st["avg_len"],
+                str(cname),
+            )
+
+        base_order = sorted(cols_all, key=base_key)
+
+        # Greedy selection for early columns using conditional duplicate strength
+        k_greedy = min(12, m)
+        pool_size = min(30, m)
+
+        selected: List[Any] = []
+        remaining = set(cols_all)
+
+        key_hash = np.zeros(n_sample, dtype=np.uint64)
+        MULT = np.uint64(1315423911)
+        MIX = np.uint64(11400714819323198485)
+
+        for step in range(k_greedy):
+            cand = [c for c in base_order if c in remaining][:pool_size]
+            if not cand:
+                break
+
+            if step == 0:
+                pick = cand[0]
+            else:
+                group_id = pd.factorize(key_hash, sort=False)[0].astype(np.int32, copy=False)
+                group_sizes = np.bincount(group_id)
+                total_pairs = int(np.sum(group_sizes.astype(np.int64) * (group_sizes.astype(np.int64) - 1)))
+                if total_pairs <= 0:
+                    break
+
+                best_score = -1e300
+                pick = cand[0]
+                for c in cand:
+                    vh = col_hash[c]
+                    key2 = vh ^ (group_id.astype(np.uint64, copy=False) * MIX)
+                    _, counts = np.unique(key2, return_counts=True)
+                    cnt = counts.astype(np.int64, copy=False)
+                    sum_pairs = int(np.sum(cnt * (cnt - 1)))
+                    pair_prob = float(sum_pairs) / float(total_pairs) if total_pairs > 0 else 0.0
+
+                    st = stats[c]
+                    dr = st["distinct_ratio"]
+                    avg_len = st["avg_len"]
+                    pref = st["prefix_score"]
+
+                    score = (pair_prob * 3.0 + (1.0 - dr) * 0.8) * (avg_len + 0.5)
+                    score += (pref / (avg_len + 1e-9)) * (avg_len + 0.5) * 0.15
+                    score += (avg_len / global_avg_len) * 0.05
+
+                    if score > best_score:
+                        best_score = score
+                        pick = c
+
+            selected.append(pick)
+            remaining.remove(pick)
+            key_hash = (key_hash * MULT) ^ col_hash[pick]
+
+        remaining_cols = [c for c in base_order if c in remaining]
+        final_order = selected + remaining_cols
+
+        if final_order == cols_all:
+            return df
+        return df.loc[:, final_order]

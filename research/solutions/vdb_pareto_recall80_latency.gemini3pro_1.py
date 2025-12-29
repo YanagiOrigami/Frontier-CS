@@ -5,90 +5,99 @@ from typing import Tuple
 class Recall80Index:
     def __init__(self, dim: int, **kwargs):
         """
-        Initialize the index for vectors of dimension `dim`.
-        
+        Initialize the index.
         We use HNSW (Hierarchical Navigable Small World) graph which offers 
-        excellent latency-recall trade-offs. 
-        - HNSW32: M=32 links per node. This is robust for 128D vectors.
-        - Flat: We store full float32 vectors. 1M vectors * 128 * 4 bytes = 512MB,
-          which fits easily in the 16GB RAM constraint and avoids quantization errors.
+        excellent latency-recall tradeoffs.
         """
         self.dim = dim
-        # Initialize HNSW index with M=32
-        self.index = faiss.IndexHNSWFlat(dim, 32, faiss.METRIC_L2)
+        # M=32 is a robust choice for SIFT1M scale
+        self.M = 32
+        # High construction budget to ensure good graph quality
+        self.ef_construction = 100
         
-        # Set efConstruction higher than default to build a higher quality graph.
-        # This takes more time during add(), but allows for faster search() 
-        # (lower efSearch) to achieve the same recall.
-        # Time complexity of add() is not part of the score.
-        self.index.hnsw.efConstruction = 120
+        # Initialize the HNSW index
+        # IndexHNSWFlat stores the full vectors, ensuring no compression loss
+        self.index = faiss.IndexHNSWFlat(dim, self.M)
+        self.index.hnsw.efConstruction = self.ef_construction
+        
+        # Default efSearch, will be tuned during add
+        self.ef_search = 32
+        self.is_tuned = False
+        
+        # Set number of threads to utilize the 8 vCPUs
+        faiss.omp_set_num_threads(8)
 
     def add(self, xb: np.ndarray) -> None:
         """
-        Add vectors to the index and auto-tune search parameters.
+        Add vectors to the index.
+        Implements an auto-tuning strategy on the first large batch of data
+        to minimize latency while ensuring the recall constraint.
         """
-        # Keep track of the ID offset for the new vectors
-        start_id = self.index.ntotal
-        
-        # Add vectors to the HNSW structure
-        self.index.add(xb)
-        
-        # --- Auto-Tuning Strategy ---
-        # The goal is to find the minimum `efSearch` that satisfies the recall constraint.
-        # Lower `efSearch` results in lower latency (higher score).
-        # We use "Self-Recall" (finding the vector itself) as a proxy for Query Recall.
-        # We tune for ~96% Self-Recall to safely ensure >=80% Query Recall.
-        
-        # Skip tuning if the index is too small to be representative
-        if self.index.ntotal < 1000:
-            self.index.hnsw.efSearch = 32
-            return
+        if xb.dtype != np.float32:
+            xb = xb.astype(np.float32)
 
-        n_avail = xb.shape[0]
-        n_samples = 256  # Sufficient sample size for parameter estimation
-        
-        # Select sample vectors for tuning
-        if n_avail > n_samples:
-            # Use a fixed seed for deterministic behavior
-            rng = np.random.RandomState(42)
-            indices = rng.choice(n_avail, n_samples, replace=False)
-            queries = xb[indices]
-            gt_ids = start_id + indices
+        # Check if we should perform auto-tuning
+        # We tune only once, on the first large batch (assumed to be the main dataset)
+        if not self.is_tuned and xb.shape[0] >= 10000:
+            n_tune = 1000
+            
+            # Split the provided data into a training set and a tuning set
+            # The tuning set acts as proxy queries
+            xb_train = xb[:-n_tune]
+            xq_tune = xb[-n_tune:]
+            
+            # Add the training set to the HNSW index
+            self.index.add(xb_train)
+            
+            # Calculate Ground Truth for the tuning set
+            # We use a Flat (exact) index on the training set
+            gt_index = faiss.IndexFlatL2(self.dim)
+            gt_index.add(xb_train)
+            _, gt_indices = gt_index.search(xq_tune, 1)
+            
+            # Tune efSearch
+            # Goal: Find smallest efSearch such that Recall@1 >= 0.80
+            # We use a target of 0.82 to provide a safety margin
+            target_recall = 0.82
+            best_ef = 64 # Fallback value
+            
+            # Candidate values for efSearch, ordered from fastest to slowest
+            candidates = [10, 12, 16, 20, 24, 28, 32, 40, 48, 64, 80, 100, 128]
+            
+            for ef in candidates:
+                self.index.hnsw.efSearch = ef
+                _, I = self.index.search(xq_tune, 1)
+                
+                # Calculate Recall@1
+                recall = (I[:, 0] == gt_indices[:, 0]).sum() / n_tune
+                
+                if recall >= target_recall:
+                    best_ef = ef
+                    break
+            
+            self.ef_search = best_ef
+            
+            # Clean up temporary resources
+            del gt_index
+            
+            # Add the tuning set to the main index
+            # Faiss assigns IDs sequentially, so indices remain consistent
+            self.index.add(xq_tune)
+            self.is_tuned = True
+            
         else:
-            # Use all available vectors if batch is small
-            queries = xb
-            gt_ids = start_id + np.arange(n_avail)
-            
-        # Candidate values for efSearch.
-        # We start with very low values (fastest) and increase until recall is met.
-        candidates = [8, 10, 12, 16, 20, 24, 32, 40, 50, 64, 80, 100, 128]
-        
-        # Target Self-Recall: 0.96 (heuristic buffer for 0.80 real recall)
-        target_recall = 0.96
-        best_ef = 128  # Fallback safe value
-        
-        # Test candidates
-        for ef in candidates:
-            self.index.hnsw.efSearch = ef
-            
-            # Search for the sample vectors themselves (k=1)
-            D, I = self.index.search(queries, k=1)
-            
-            # Calculate recall (fraction of vectors finding themselves as NN)
-            matches = (I.flatten() == gt_ids).sum()
-            recall = matches / len(queries)
-            
-            if recall >= target_recall:
-                best_ef = ef
-                break
-        
-        # Apply the optimal parameter
-        self.index.hnsw.efSearch = best_ef
+            # If dataset is too small or already tuned, just add
+            self.index.add(xb)
 
     def search(self, xq: np.ndarray, k: int) -> Tuple[np.ndarray, np.ndarray]:
         """
         Search for k nearest neighbors.
         """
-        # Faiss handles multithreading automatically using available CPUs (8 vCPUs)
-        # for batch queries, ensuring high throughput.
+        if xq.dtype != np.float32:
+            xq = xq.astype(np.float32)
+            
+        # Apply the tuned efSearch parameter
+        # Ensure efSearch is at least k to return valid k neighbors
+        self.index.hnsw.efSearch = max(self.ef_search, k)
+        
         return self.index.search(xq, k)

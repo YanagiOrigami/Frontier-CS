@@ -1,386 +1,326 @@
+import os
 import math
 import copy
-from typing import Tuple, Optional, Dict
+from typing import Dict, Tuple, Optional, List
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 
-def _count_trainable_params(model: nn.Module) -> int:
-    return sum(p.numel() for p in model.parameters() if p.requires_grad)
-
-
-def _loader_to_tensors(loader) -> Tuple[torch.Tensor, torch.Tensor]:
-    xs = []
-    ys = []
-    for batch in loader:
-        if isinstance(batch, (list, tuple)) and len(batch) >= 2:
-            x, y = batch[0], batch[1]
-        else:
-            raise ValueError("DataLoader batch must be a tuple/list (inputs, targets).")
-        xs.append(x.detach().cpu())
-        ys.append(y.detach().cpu())
-    x = torch.cat(xs, dim=0)
-    y = torch.cat(ys, dim=0).long()
-    if x.dtype != torch.float32:
-        x = x.float()
-    return x, y
-
-
-def _make_soft_targets(y: torch.Tensor, num_classes: int, smoothing: float) -> torch.Tensor:
-    bs = y.shape[0]
-    off = smoothing / float(num_classes)
-    on = 1.0 - smoothing + off
-    t = torch.full((bs, num_classes), off, dtype=torch.float32, device=y.device)
-    t.scatter_(1, y.view(-1, 1), on)
-    return t
-
-
-def _soft_cross_entropy(logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
-    logp = F.log_softmax(logits, dim=1)
-    return -(targets * logp).sum(dim=1).mean()
-
-
-class _ResidualFFN(nn.Module):
-    def __init__(self, d: int, h: int, dropout: float):
+class _ResBlock(nn.Module):
+    def __init__(self, width: int, bottleneck: int, dropout: float):
         super().__init__()
-        self.ln = nn.LayerNorm(d)
-        self.fc1 = nn.Linear(d, h)
-        self.fc2 = nn.Linear(h, d)
+        self.fc1 = nn.Linear(width, bottleneck, bias=True)
+        self.ln1 = nn.LayerNorm(bottleneck, elementwise_affine=True)
+        self.fc2 = nn.Linear(bottleneck, width, bias=True)
+        self.ln2 = nn.LayerNorm(width, elementwise_affine=True)
         self.drop = nn.Dropout(dropout)
-        self.alpha = nn.Parameter(torch.zeros(1))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        y = self.ln(x)
-        y = self.fc1(y)
-        y = F.gelu(y)
-        y = self.drop(y)
-        y = self.fc2(y)
-        y = self.drop(y)
-        return x + self.alpha * y
+        r = x
+        x = self.fc1(x)
+        x = self.ln1(x)
+        x = F.gelu(x)
+        x = self.drop(x)
+        x = self.fc2(x)
+        x = self.ln2(x)
+        x = x + r
+        x = F.gelu(x)
+        return x
 
 
-class _ResMLPClassifier(nn.Module):
+class _TabResMLP(nn.Module):
     def __init__(
         self,
         input_dim: int,
         num_classes: int,
-        d: int,
-        h: int,
-        n_blocks: int,
+        width: int,
+        bottleneck: int,
+        blocks: int,
         dropout: float,
-        mean: torch.Tensor,
-        std: torch.Tensor,
-        input_noise: float = 0.0,
+        mu: torch.Tensor,
+        sigma: torch.Tensor,
     ):
         super().__init__()
-        self.input_dim = input_dim
-        self.num_classes = num_classes
-        self.d = d
-        self.h = h
-        self.n_blocks = n_blocks
-        self.dropout_p = dropout
-        self.input_noise = float(input_noise)
+        self.register_buffer("mu", mu)
+        self.register_buffer("sigma", sigma)
 
-        self.register_buffer("x_mean", mean.view(1, -1).clone())
-        self.register_buffer("x_std", std.view(1, -1).clone())
+        self.fc_in = nn.Linear(input_dim, width, bias=True)
+        self.ln0 = nn.LayerNorm(width, elementwise_affine=True)
+        self.blocks = nn.ModuleList([_ResBlock(width, bottleneck, dropout) for _ in range(blocks)])
+        self.drop = nn.Dropout(dropout)
+        self.fc_out = nn.Linear(width, num_classes, bias=True)
 
-        self.in_ln = nn.LayerNorm(input_dim)
-        self.in_proj = nn.Linear(input_dim, d)
-        self.in_drop = nn.Dropout(dropout)
+        self._init_weights()
 
-        self.blocks = nn.ModuleList([_ResidualFFN(d, h, dropout) for _ in range(n_blocks)])
-        self.out_ln = nn.LayerNorm(d)
-        self.head = nn.Linear(d, num_classes)
-
-    def _normalize(self, x: torch.Tensor) -> torch.Tensor:
-        return (x - self.x_mean) / self.x_std
-
-    def forward_features(self, x: torch.Tensor) -> torch.Tensor:
-        x = self._normalize(x)
-        if self.training and self.input_noise > 0:
-            x = x + self.input_noise * torch.randn_like(x)
-        x = self.in_ln(x)
-        x = self.in_proj(x)
-        x = F.gelu(x)
-        x = self.in_drop(x)
-        for blk in self.blocks:
-            x = blk(x)
-        x = self.out_ln(x)
-        return x
+    def _init_weights(self):
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.kaiming_normal_(m.weight, a=math.sqrt(5))
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        feats = self.forward_features(x)
-        return self.head(feats)
+        if x.dtype != torch.float32:
+            x = x.float()
+        x = (x - self.mu) / self.sigma
+        x = self.fc_in(x)
+        x = self.ln0(x)
+        x = F.gelu(x)
+        for blk in self.blocks:
+            x = blk(x)
+        x = self.drop(x)
+        x = self.fc_out(x)
+        return x
 
 
-def _param_estimate(
-    input_dim: int,
-    num_classes: int,
-    d: int,
-    h: int,
-    n_blocks: int,
-    include_input_ln: bool = True,
-    include_in_drop: bool = False,
-    include_out_ln: bool = True,
-    include_block_alpha: bool = True,
-) -> int:
-    total = 0
-    if include_input_ln:
-        total += 2 * input_dim
-    total += (input_dim * d + d)  # in_proj
-    if include_in_drop:
-        total += 0
-    for _ in range(n_blocks):
-        total += 2 * d  # block ln
-        total += d * h + h  # fc1
-        total += h * d + d  # fc2
-        if include_block_alpha:
-            total += 1
-    if include_out_ln:
-        total += 2 * d
-    total += d * num_classes + num_classes  # head
-    return total
+def _collect_loader(loader) -> Tuple[torch.Tensor, torch.Tensor]:
+    xs = []
+    ys = []
+    for xb, yb in loader:
+        xs.append(xb.detach().cpu())
+        ys.append(yb.detach().cpu())
+    x = torch.cat(xs, dim=0)
+    y = torch.cat(ys, dim=0)
+    return x, y
 
 
-def _choose_arch(input_dim: int, num_classes: int, param_limit: int) -> Tuple[int, int, int, float]:
-    best = None  # (score, params, d, h, n, dropout)
-    dropouts = [0.10, 0.08, 0.12]
-    ratios = [4, 5, 3]
-    for dropout in dropouts:
-        for n_blocks in (4, 3, 2, 1):
-            for d in range(1024, 255, -32):
-                for r in ratios:
-                    h = max(64, d // r)
-                    if h >= d:
-                        continue
-                    p = _param_estimate(input_dim, num_classes, d, h, n_blocks)
-                    if p > param_limit:
-                        continue
-                    # Prefer using most params, then more blocks, then larger d
-                    score = (p, n_blocks, d, h)
-                    if best is None or score > best[0]:
-                        best = (score, p, d, h, n_blocks, dropout)
-    if best is None:
-        d = 256
-        h = 64
-        n_blocks = 1
-        dropout = 0.10
-        return d, h, n_blocks, dropout
-    _, _, d, h, n_blocks, dropout = best
-    return d, h, n_blocks, dropout
-
-
+@torch.inference_mode()
 def _accuracy(model: nn.Module, x: torch.Tensor, y: torch.Tensor, batch_size: int = 512) -> float:
     model.eval()
+    n = x.shape[0]
     correct = 0
-    total = y.numel()
-    with torch.inference_mode():
-        for i in range(0, x.shape[0], batch_size):
-            xb = x[i : i + batch_size]
-            yb = y[i : i + batch_size]
-            logits = model(xb)
-            pred = logits.argmax(dim=1)
-            correct += (pred == yb).sum().item()
-    return float(correct) / float(total) if total > 0 else 0.0
+    for i in range(0, n, batch_size):
+        xb = x[i : i + batch_size]
+        yb = y[i : i + batch_size]
+        logits = model(xb)
+        pred = logits.argmax(dim=1)
+        correct += (pred == yb).sum().item()
+    return correct / max(1, n)
 
 
-def _ridge_refit_head(
-    model: _ResMLPClassifier,
-    train_x: torch.Tensor,
-    train_y: torch.Tensor,
-    val_x: Optional[torch.Tensor],
-    val_y: Optional[torch.Tensor],
-    lam: float = 1e-2,
-) -> None:
-    model.eval()
-    d = model.d
-    c = model.num_classes
+def _estimate_params(input_dim: int, num_classes: int, width: int, bottleneck: int, blocks: int) -> int:
+    # input linear: input_dim*width + width
+    # ln0: 2*width
+    # each block:
+    #   fc1: width*bottleneck + bottleneck
+    #   ln1: 2*bottleneck
+    #   fc2: bottleneck*width + width
+    #   ln2: 2*width
+    # output: width*num_classes + num_classes
+    total = 0
+    total += input_dim * width + width
+    total += 2 * width
+    per_block = (width * bottleneck + bottleneck) + (2 * bottleneck) + (bottleneck * width + width) + (2 * width)
+    total += blocks * per_block
+    total += width * num_classes + num_classes
+    return int(total)
 
-    with torch.inference_mode():
-        feats = model.forward_features(train_x).float()
-    feats = feats.contiguous()
 
-    ones = torch.ones((feats.shape[0], 1), dtype=feats.dtype, device=feats.device)
-    Faug = torch.cat([feats, ones], dim=1).double()  # (N, d+1)
-
-    Y = torch.zeros((train_y.shape[0], c), dtype=torch.float64, device=Faug.device)
-    Y.scatter_(1, train_y.view(-1, 1).to(torch.int64), 1.0)
-
-    FtF = Faug.T @ Faug
-    FtY = Faug.T @ Y
-    FtF = FtF + lam * torch.eye(d + 1, dtype=torch.float64, device=Faug.device)
-
-    try:
-        Waug = torch.linalg.solve(FtF, FtY)  # (d+1, c)
-    except RuntimeError:
-        return
-
-    old_w = model.head.weight.detach().clone()
-    old_b = model.head.bias.detach().clone()
-
-    new_w = Waug[:d, :].T.contiguous().float()
-    new_b = Waug[d, :].contiguous().float()
-
-    with torch.no_grad():
-        model.head.weight.copy_(new_w)
-        model.head.bias.copy_(new_b)
-
-    if val_x is not None and val_y is not None:
-        before = None
-        after = _accuracy(model, val_x, val_y, batch_size=512)
-        # If val got worse, revert
-        with torch.no_grad():
-            model.head.weight.copy_(old_w)
-            model.head.bias.copy_(old_b)
-        before = _accuracy(model, val_x, val_y, batch_size=512)
-        if after >= before:
-            with torch.no_grad():
-                model.head.weight.copy_(new_w)
-                model.head.bias.copy_(new_b)
+def _pick_arch(input_dim: int, num_classes: int, param_limit: int) -> Tuple[int, int, int]:
+    # Search for a good width/bottleneck/blocks under param_limit.
+    # Prefer high parameter usage; tie-breaker prefers more blocks then larger width.
+    block_choices = [3, 2, 1]
+    ratio_choices = [0.50, 0.40, 0.333, 0.25]
+    best = None  # (params, blocks, width, bottleneck)
+    for blocks in block_choices:
+        for ratio in ratio_choices:
+            for width in range(1024, 127, -16):
+                bneck = int(width * ratio)
+                bneck = max(32, min(width, (bneck // 8) * 8))
+                params = _estimate_params(input_dim, num_classes, width, bneck, blocks)
+                if params <= param_limit:
+                    cand = (params, blocks, width, bneck)
+                    if best is None or cand > best:
+                        best = cand
+                    break
+    if best is None:
+        # Minimal fallback
+        width = 128
+        blocks = 1
+        bneck = 64
+        params = _estimate_params(input_dim, num_classes, width, bneck, blocks)
+        if params > param_limit:
+            width = 64
+            bneck = 32
+            blocks = 1
+        return width, bneck, blocks
+    return best[2], best[3], best[1]
 
 
 class Solution:
     def solve(self, train_loader, val_loader, metadata: dict = None) -> torch.nn.Module:
         if metadata is None:
             metadata = {}
-        input_dim = int(metadata.get("input_dim", 384))
-        num_classes = int(metadata.get("num_classes", 128))
-        param_limit = int(metadata.get("param_limit", 1_000_000))
-        device = metadata.get("device", "cpu")
-        if device is None:
-            device = "cpu"
-        device = str(device)
 
-        train_x, train_y = _loader_to_tensors(train_loader)
+        device_str = metadata.get("device", "cpu")
+        device = torch.device(device_str)
+
+        try:
+            cpu_count = os.cpu_count() or 8
+            torch.set_num_threads(max(1, min(8, cpu_count)))
+        except Exception:
+            pass
+
+        torch.manual_seed(0)
+
+        train_x_cpu, train_y_cpu = _collect_loader(train_loader)
         if val_loader is not None:
-            val_x, val_y = _loader_to_tensors(val_loader)
+            val_x_cpu, val_y_cpu = _collect_loader(val_loader)
         else:
-            val_x, val_y = None, None
+            val_x_cpu, val_y_cpu = train_x_cpu.clone(), train_y_cpu.clone()
 
-        mean = train_x.mean(dim=0)
-        std = train_x.std(dim=0, unbiased=False).clamp_min(1e-6)
+        if "input_dim" in metadata:
+            input_dim = int(metadata["input_dim"])
+        else:
+            input_dim = int(train_x_cpu.shape[1])
 
-        d, h, n_blocks, dropout = _choose_arch(input_dim, num_classes, param_limit)
+        if "num_classes" in metadata:
+            num_classes = int(metadata["num_classes"])
+        else:
+            num_classes = int(train_y_cpu.max().item() + 1)
 
-        model = _ResMLPClassifier(
+        param_limit = int(metadata.get("param_limit", 1_000_000))
+
+        train_x = train_x_cpu.to(device=device, dtype=torch.float32, non_blocking=False)
+        train_y = train_y_cpu.to(device=device, dtype=torch.long, non_blocking=False)
+        val_x = val_x_cpu.to(device=device, dtype=torch.float32, non_blocking=False)
+        val_y = val_y_cpu.to(device=device, dtype=torch.long, non_blocking=False)
+
+        mu = train_x.mean(dim=0, keepdim=True)
+        sigma = train_x.std(dim=0, keepdim=True).clamp_min(1e-6)
+
+        width, bottleneck, blocks = _pick_arch(input_dim, num_classes, param_limit)
+
+        dropout = 0.10
+        model = _TabResMLP(
             input_dim=input_dim,
             num_classes=num_classes,
-            d=d,
-            h=h,
-            n_blocks=n_blocks,
+            width=width,
+            bottleneck=bottleneck,
+            blocks=blocks,
             dropout=dropout,
-            mean=mean,
-            std=std,
-            input_noise=0.02,
-        ).to("cpu")
+            mu=mu,
+            sigma=sigma,
+        ).to(device)
 
-        # Hard safety: ensure under param limit, otherwise shrink d until it is.
-        while _count_trainable_params(model) > param_limit and d > 128:
-            d -= 32
-            h = max(64, d // 4)
-            model = _ResMLPClassifier(
+        trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        if trainable_params > param_limit:
+            # Emergency shrink (should not happen with estimator, but keep safe)
+            width = max(64, width // 2)
+            bottleneck = max(32, min(width, bottleneck // 2))
+            blocks = max(1, min(blocks, 2))
+            model = _TabResMLP(
                 input_dim=input_dim,
                 num_classes=num_classes,
-                d=d,
-                h=h,
-                n_blocks=n_blocks,
+                width=width,
+                bottleneck=bottleneck,
+                blocks=blocks,
                 dropout=dropout,
-                mean=mean,
-                std=std,
-                input_noise=0.02,
-            ).to("cpu")
+                mu=mu,
+                sigma=sigma,
+            ).to(device)
 
-        # Training hyperparams
-        n = train_x.shape[0]
-        batch_size = 256 if n >= 512 else 128
-        max_epochs = 220
-        min_epochs = 30
-        patience = 35
+        n_train = train_x.shape[0]
+        batch_size = 256 if n_train >= 256 else n_train
+        steps_per_epoch = max(1, math.ceil(n_train / batch_size))
 
-        base_lr = 3e-3
-        min_lr = 3e-5
-        warmup_epochs = 6
-        weight_decay = 1.5e-4
-        smoothing = 0.06
-        mixup_alpha = 0.20
+        max_epochs = 80
+        lr = 3e-3
+        weight_decay = 1e-2
+        label_smoothing = 0.05
+        mixup_alpha = 0.2
+        mixup_prob = 0.6
+        grad_clip = 1.0
 
-        optimizer = torch.optim.AdamW(model.parameters(), lr=base_lr, weight_decay=weight_decay)
+        optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay, betas=(0.9, 0.99))
+        scheduler = torch.optim.lr_scheduler.OneCycleLR(
+            optimizer,
+            max_lr=lr,
+            total_steps=max_epochs * steps_per_epoch,
+            pct_start=0.15,
+            anneal_strategy="cos",
+            div_factor=12.0,
+            final_div_factor=50.0,
+        )
 
-        best_state = copy.deepcopy(model.state_dict())
-        best_val = -1.0
-        best_epoch = -1
-        no_improve = 0
+        def ce_loss(logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+            return F.cross_entropy(logits, targets, label_smoothing=label_smoothing)
 
-        beta_dist = torch.distributions.Beta(mixup_alpha, mixup_alpha)
+        params_list: List[torch.Tensor] = [p for p in model.parameters() if p.requires_grad]
+        ema_list: List[torch.Tensor] = [p.detach().clone() for p in params_list]
+        ema_decay = 0.995
 
-        train_x = train_x.to("cpu")
-        train_y = train_y.to("cpu")
-        if val_x is not None:
-            val_x = val_x.to("cpu")
-            val_y = val_y.to("cpu")
+        def ema_update():
+            for e, p in zip(ema_list, params_list):
+                e.mul_(ema_decay).add_(p.detach(), alpha=(1.0 - ema_decay))
 
+        def apply_ema() -> List[torch.Tensor]:
+            backup = [p.detach().clone() for p in params_list]
+            for p, e in zip(params_list, ema_list):
+                p.data.copy_(e)
+            return backup
+
+        def restore_params(backup: List[torch.Tensor]):
+            for p, b in zip(params_list, backup):
+                p.data.copy_(b)
+
+        best_acc = -1.0
+        best_state = None
+        patience = 20
+        bad_epochs = 0
+
+        model.train()
         for epoch in range(max_epochs):
             model.train()
+            perm = torch.randperm(n_train, device=device)
+            for si in range(0, n_train, batch_size):
+                idx = perm[si : si + batch_size]
+                xb = train_x.index_select(0, idx)
+                yb = train_y.index_select(0, idx)
 
-            if epoch < warmup_epochs:
-                lr = base_lr * float(epoch + 1) / float(warmup_epochs)
-            else:
-                prog = float(epoch - warmup_epochs) / float(max(1, max_epochs - warmup_epochs))
-                lr = min_lr + 0.5 * (base_lr - min_lr) * (1.0 + math.cos(math.pi * prog))
-            for pg in optimizer.param_groups:
-                pg["lr"] = lr
-
-            idx = torch.randperm(n)
-            mixup_p = 0.55 if epoch < int(0.65 * max_epochs) else 0.15
-            for start in range(0, n, batch_size):
-                bidx = idx[start : start + batch_size]
-                xb = train_x[bidx]
-                yb = train_y[bidx]
-
-                do_mixup = (mixup_alpha > 0) and (torch.rand(()) < mixup_p) and (yb.numel() > 1)
-                if do_mixup:
-                    perm = torch.randperm(xb.shape[0])
-                    lam = float(beta_dist.sample().item())
-                    xb2 = xb[perm]
-                    yb2 = yb[perm]
-                    xb = xb.mul(lam).add_(xb2, alpha=(1.0 - lam))
-                    t1 = _make_soft_targets(yb, num_classes, smoothing)
-                    t2 = _make_soft_targets(yb2, num_classes, smoothing)
-                    targets = t1.mul(lam).add_(t2, alpha=(1.0 - lam))
+                if mixup_alpha > 0 and torch.rand((), device=device).item() < mixup_prob:
+                    lam = torch.distributions.Beta(mixup_alpha, mixup_alpha).sample().to(device)
+                    lam = torch.maximum(lam, 1.0 - lam)
+                    perm2 = torch.randperm(xb.shape[0], device=device)
+                    xb2 = xb[perm2]
+                    yb2 = yb[perm2]
+                    xb = lam * xb + (1.0 - lam) * xb2
+                    logits = model(xb)
+                    loss = lam * ce_loss(logits, yb) + (1.0 - lam) * ce_loss(logits, yb2)
                 else:
-                    targets = _make_soft_targets(yb, num_classes, smoothing)
-
-                logits = model(xb)
-                loss = _soft_cross_entropy(logits, targets)
+                    logits = model(xb)
+                    loss = ce_loss(logits, yb)
 
                 optimizer.zero_grad(set_to_none=True)
                 loss.backward()
-                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                if grad_clip is not None and grad_clip > 0:
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
                 optimizer.step()
+                scheduler.step()
+                ema_update()
 
-            # Validation / tracking
-            if val_x is not None:
-                val_acc = _accuracy(model, val_x, val_y, batch_size=512)
+            backup = apply_ema()
+            acc = _accuracy(model, val_x, val_y, batch_size=512)
+            if acc > best_acc + 1e-6:
+                best_acc = acc
+                best_state = {k: v.detach().clone() for k, v in model.state_dict().items()}
+                bad_epochs = 0
             else:
-                val_acc = _accuracy(model, train_x, train_y, batch_size=512)
+                bad_epochs += 1
+            restore_params(backup)
 
-            if val_acc > best_val + 1e-4:
-                best_val = val_acc
-                best_epoch = epoch
-                best_state = copy.deepcopy(model.state_dict())
-                no_improve = 0
-            else:
-                no_improve += 1
-
-            if epoch + 1 >= min_epochs and no_improve >= patience:
+            if bad_epochs >= patience:
                 break
 
-        model.load_state_dict(best_state)
+        if best_state is not None:
+            model.load_state_dict(best_state, strict=True)
+        else:
+            backup = apply_ema()
+            best_state = {k: v.detach().clone() for k, v in model.state_dict().items()}
+            restore_params(backup)
+            model.load_state_dict(best_state, strict=True)
 
-        # Ridge refit head for potentially better generalization
-        _ridge_refit_head(model, train_x, train_y, val_x, val_y, lam=1e-2)
-
-        model.to(device)
+        model.eval()
         return model

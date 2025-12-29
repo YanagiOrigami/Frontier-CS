@@ -1,147 +1,464 @@
 import torch
 import triton
 import triton.language as tl
+from typing import Tuple
 
 @triton.jit
-def chunk_scan_kernel(
-    X_ptr, A_ptr, B_ptr, Y_ptr,
+def _chunk_scan_forward_kernel(
+    X_ptr, A_ptr, B_ptr, Y_ptr, State_ptr,
+    chunk_stride, feature_stride,
     L, D,
-    stride_X_l, stride_X_d,
-    stride_A_l, stride_A_d,
-    stride_B_l, stride_B_d,
-    stride_Y_l, stride_Y_d,
-    chunk: tl.constexpr,
-    BD: tl.constexpr,
-    BLOCK_L: tl.constexpr
+    chunk_size: tl.constexpr, BD: tl.constexpr,
+    BLOCK_L: tl.constexpr, BLOCK_D: tl.constexpr,
+    STORE_STATE: tl.constexpr,
 ):
     pid = tl.program_id(0)
+    num_chunks = tl.cdiv(L, chunk_size)
+    chunk_idx = pid // (D // BD)
+    feature_block = pid % (D // BD)
     
-    d_start = pid * BD
-    d_offsets = d_start + tl.arange(0, BD)
-    d_mask = d_offsets < D
+    start_feature = feature_block * BD
+    start_time = chunk_idx * chunk_size
     
-    chunk_id = tl.program_id(1)
-    l_start_chunk = chunk_id * chunk
-    l_end_chunk = l_start_chunk + chunk
+    feature_offsets = start_feature + tl.arange(0, BLOCK_D)
+    time_offsets = start_time + tl.arange(0, BLOCK_L)
     
-    Y_l_ptr = Y_ptr + l_start_chunk * stride_Y_l
-    X_l_ptr = X_ptr + l_start_chunk * stride_X_l
-    A_l_ptr = A_ptr + l_start_chunk * stride_A_l
-    B_l_ptr = B_ptr + l_start_chunk * stride_B_l
+    mask_feature = feature_offsets < D
+    mask_time = time_offsets < L
     
-    if chunk_id == 0:
-        state = tl.zeros([BD], dtype=tl.float16)
-    else:
-        prev_chunk_id = chunk_id - 1
-        prev_l_start = prev_chunk_id * chunk
-        prev_l_ptr = Y_ptr + (prev_l_start + chunk - 1) * stride_Y_l
-        state = tl.load(prev_l_ptr + d_offsets * stride_Y_d, mask=d_mask, other=0.0)
+    chunk_mask = time_offsets < min(L, start_time + chunk_size)
+    final_mask = mask_time & mask_feature[:, None] & chunk_mask
     
-    for l_offset in range(0, chunk, BLOCK_L):
-        l_offsets = l_offset + tl.arange(0, BLOCK_L)
-        l_mask = (l_offsets < chunk) & (l_offsets + l_start_chunk < L)
+    X_ptrs = X_ptr + time_offsets[None, :] * chunk_stride + feature_offsets[:, None] * feature_stride
+    A_ptrs = A_ptr + time_offsets[None, :] * chunk_stride + feature_offsets[:, None] * feature_stride
+    B_ptrs = B_ptr + time_offsets[None, :] * chunk_stride + feature_offsets[:, None] * feature_stride
+    Y_ptrs = Y_ptr + time_offsets[None, :] * chunk_stride + feature_offsets[:, None] * feature_stride
+    
+    x = tl.load(X_ptrs, mask=final_mask, other=0.0)
+    a = tl.load(A_ptrs, mask=final_mask, other=0.0)
+    b = tl.load(B_ptrs, mask=final_mask, other=0.0)
+    
+    state = tl.zeros((BLOCK_D,), dtype=tl.float32)
+    y = tl.zeros((BLOCK_D, BLOCK_L), dtype=tl.float32)
+    
+    for i in range(BLOCK_L):
+        if start_time + i < L and (start_time + i) % chunk_size == 0 and start_time + i > 0:
+            state_ptr = State_ptr + ((start_time + i) // chunk_size - 1) * D + feature_offsets
+            prev_state = tl.load(state_ptr, mask=mask_feature, other=0.0)
+            state = prev_state
         
-        X_ptrs = X_l_ptr + l_offsets[:, None] * stride_X_l + d_offsets[None, :] * stride_X_d
-        A_ptrs = A_l_ptr + l_offsets[:, None] * stride_A_l + d_offsets[None, :] * stride_A_d
-        B_ptrs = B_l_ptr + l_offsets[:, None] * stride_B_l + d_offsets[None, :] * stride_B_d
-        Y_ptrs = Y_l_ptr + l_offsets[:, None] * stride_Y_l + d_offsets[None, :] * stride_Y_d
+        state = state * a[:, i] + b[:, i] * x[:, i]
+        y[:, i] = state
         
-        X = tl.load(X_ptrs, mask=l_mask[:, None] & d_mask[None, :], other=0.0)
-        A = tl.load(A_ptrs, mask=l_mask[:, None] & d_mask[None, :], other=0.0)
-        B = tl.load(B_ptrs, mask=l_mask[:, None] & d_mask[None, :], other=0.0)
-        
-        for i in range(BLOCK_L):
-            if i < tl.num_programs(0):
-                state = A[i] * state + B[i] * X[i]
-                tl.store(Y_ptrs[i], state, mask=l_mask[i] & d_mask)
+        if STORE_STATE and (i == BLOCK_L - 1 or start_time + i == L - 1):
+            next_chunk_idx = (start_time + i + 1) // chunk_size
+            if next_chunk_idx < num_chunks:
+                state_ptr = State_ptr + next_chunk_idx * D + feature_offsets
+                tl.store(state_ptr, state, mask=mask_feature)
     
-    if chunk_id == tl.num_programs(1) - 1:
-        last_l = tl.min(L, l_end_chunk) - 1
-        last_ptr = Y_ptr + last_l * stride_Y_l + d_offsets * stride_Y_d
-        final = tl.load(last_ptr, mask=d_mask, other=0.0)
-        _ = final
+    tl.store(Y_ptrs, y.to(tl.float16), mask=final_mask)
 
 @triton.jit
-def chunk_scan_kernel_optimized(
-    X_ptr, A_ptr, B_ptr, Y_ptr,
+def _chunk_scan_backward_kernel(
+    X_ptr, A_ptr, B_ptr, Y_ptr, State_ptr,
+    chunk_stride, feature_stride,
     L, D,
-    stride_X_l, stride_X_d,
-    stride_A_l, stride_A_d,
-    stride_B_l, stride_B_d,
-    stride_Y_l, stride_Y_d,
-    chunk: tl.constexpr,
-    BD: tl.constexpr,
-    BLOCK_L: tl.constexpr
+    chunk_size: tl.constexpr, BD: tl.constexpr,
+    BLOCK_L: tl.constexpr, BLOCK_D: tl.constexpr,
 ):
     pid = tl.program_id(0)
-    chunk_id = tl.program_id(1)
+    num_chunks = tl.cdiv(L, chunk_size)
+    chunk_idx = (num_chunks - 1) - (pid // (D // BD))
+    feature_block = pid % (D // BD)
     
-    d_start = pid * BD
-    d_offsets = d_start + tl.arange(0, BD)
-    d_mask = d_offsets < D
+    start_feature = feature_block * BD
+    start_time = chunk_idx * chunk_size
     
-    l_start = chunk_id * chunk
-    l_end = tl.min(l_start + chunk, L)
+    feature_offsets = start_feature + tl.arange(0, BLOCK_D)
+    time_offsets = start_time + tl.arange(0, BLOCK_L)
     
-    if chunk_id > 0:
-        prev_state_ptr = Y_ptr + (l_start - 1) * stride_Y_l + d_offsets * stride_Y_d
-        state = tl.load(prev_state_ptr, mask=d_mask, other=0.0)
+    mask_feature = feature_offsets < D
+    mask_time = time_offsets < L
+    
+    chunk_mask = time_offsets < min(L, start_time + chunk_size)
+    final_mask = mask_time & mask_feature[:, None] & chunk_mask
+    
+    A_ptrs = A_ptr + time_offsets[None, :] * chunk_stride + feature_offsets[:, None] * feature_stride
+    B_ptrs = B_ptr + time_offsets[None, :] * chunk_stride + feature_offsets[:, None] * feature_stride
+    X_ptrs = X_ptr + time_offsets[None, :] * chunk_stride + feature_offsets[:, None] * feature_stride
+    Y_ptrs = Y_ptr + time_offsets[None, :] * chunk_stride + feature_offsets[:, None] * feature_stride
+    
+    a = tl.load(A_ptrs, mask=final_mask, other=0.0)
+    b = tl.load(B_ptrs, mask=final_mask, other=0.0)
+    x = tl.load(X_ptrs, mask=final_mask, other=0.0)
+    
+    next_state_ptr = State_ptr + (chunk_idx + 1) * D + feature_offsets
+    if chunk_idx < num_chunks - 1:
+        next_state = tl.load(next_state_ptr, mask=mask_feature, other=0.0)
     else:
-        state = tl.zeros([BD], dtype=tl.float16)
+        next_state = tl.zeros((BLOCK_D,), dtype=tl.float32)
     
-    for l in range(l_start, l_end, BLOCK_L):
-        l_offsets = l + tl.arange(0, BLOCK_L)
-        l_mask = l_offsets < l_end
-        
-        X_ptrs = X_ptr + l_offsets[:, None] * stride_X_l + d_offsets[None, :] * stride_X_d
-        A_ptrs = A_ptr + l_offsets[:, None] * stride_A_l + d_offsets[None, :] * stride_A_d
-        B_ptrs = B_ptr + l_offsets[:, None] * stride_B_l + d_offsets[None, :] * stride_B_d
-        Y_ptrs = Y_ptr + l_offsets[:, None] * stride_Y_l + d_offsets[None, :] * stride_Y_d
-        
-        X = tl.load(X_ptrs, mask=l_mask[:, None] & d_mask[None, :], other=0.0)
-        A = tl.load(A_ptrs, mask=l_mask[:, None] & d_mask[None, :], other=0.0)
-        B = tl.load(B_ptrs, mask=l_mask[:, None] & d_mask[None, :], other=0.0)
-        
-        for i in range(BLOCK_L):
-            state = A[i] * state + B[i] * X[i]
-            tl.store(Y_ptrs[i], state, mask=l_mask[i] & d_mask)
+    y = tl.zeros((BLOCK_D, BLOCK_L), dtype=tl.float32)
+    
+    for i in range(BLOCK_L - 1, -1, -1):
+        if start_time + i < L:
+            if i == BLOCK_L - 1 and chunk_idx < num_chunks - 1:
+                state = next_state
+            elif i < BLOCK_L - 1:
+                state = y[:, i + 1]
+            else:
+                state = tl.zeros((BLOCK_D,), dtype=tl.float32)
+            
+            local_idx = (start_time + i) % chunk_size
+            if local_idx == chunk_size - 1 and chunk_idx < num_chunks - 1:
+                state = next_state
+            
+            state = state * a[:, i] + b[:, i] * x[:, i]
+            y[:, i] = state
+    
+    tl.store(Y_ptrs, y.to(tl.float16), mask=final_mask)
+
+@triton.jit
+def _chunk_scan_fused_kernel(
+    X_ptr, A_ptr, B_ptr, Y_ptr,
+    chunk_stride, feature_stride,
+    L, D,
+    chunk_size: tl.constexpr, BD: tl.constexpr,
+    BLOCK_L: tl.constexpr, BLOCK_D: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    num_chunks = tl.cdiv(L, chunk_size)
+    
+    chunk_idx = pid // (D // BD)
+    feature_block = pid % (D // BD)
+    
+    if chunk_idx >= num_chunks:
+        return
+    
+    start_feature = feature_block * BD
+    start_time = chunk_idx * chunk_size
+    
+    feature_offsets = start_feature + tl.arange(0, BLOCK_D)
+    time_offsets = start_time + tl.arange(0, BLOCK_L)
+    
+    mask_feature = feature_offsets < D
+    mask_time = time_offsets < L
+    chunk_mask = time_offsets < min(L, start_time + chunk_size)
+    final_mask = mask_time & mask_feature[:, None] & chunk_mask
+    
+    X_ptrs = X_ptr + time_offsets[None, :] * chunk_stride + feature_offsets[:, None] * feature_stride
+    A_ptrs = A_ptr + time_offsets[None, :] * chunk_stride + feature_offsets[:, None] * feature_stride
+    B_ptrs = B_ptr + time_offsets[None, :] * chunk_stride + feature_offsets[:, None] * feature_stride
+    Y_ptrs = Y_ptr + time_offsets[None, :] * chunk_stride + feature_offsets[:, None] * feature_stride
+    
+    x = tl.load(X_ptrs, mask=final_mask, other=0.0)
+    a = tl.load(A_ptrs, mask=final_mask, other=0.0)
+    b = tl.load(B_ptrs, mask=final_mask, other=0.0)
+    
+    state = tl.zeros((BLOCK_D,), dtype=tl.float32)
+    y = tl.zeros((BLOCK_D, BLOCK_L), dtype=tl.float32)
+    
+    for i in range(BLOCK_L):
+        if start_time + i < L:
+            if (start_time + i) % chunk_size == 0 and start_time + i > 0:
+                prev_chunk_end = start_time + i - 1
+                prev_chunk_idx = prev_chunk_end // chunk_size
+                prev_time_in_chunk = chunk_size - 1
+                
+                prev_feature_offsets = start_feature + tl.arange(0, BLOCK_D)
+                prev_mask = prev_feature_offsets < D
+                
+                prev_Y_ptr = Y_ptr + (prev_chunk_idx * chunk_size + prev_time_in_chunk) * chunk_stride + prev_feature_offsets * feature_stride
+                prev_state = tl.load(prev_Y_ptr, mask=prev_mask, other=0.0)
+                state = prev_state.to(tl.float32)
+            
+            state = state * a[:, i] + b[:, i] * x[:, i]
+            y[:, i] = state
+    
+    tl.store(Y_ptrs, y.to(tl.float16), mask=final_mask)
 
 def chunk_scan(
-    X: torch.Tensor, 
+    X: torch.Tensor,
     A: torch.Tensor, 
-    B: torch.Tensor, 
-    chunk: int = 128, 
+    B: torch.Tensor,
+    chunk: int = 128,
     BD: int = 128
 ) -> torch.Tensor:
     L, D = X.shape
-    assert L % chunk == 0, "Sequence length must be divisible by chunk size"
-    assert X.dtype == torch.float16
-    assert A.dtype == torch.float16
-    assert B.dtype == torch.float16
+    assert L % chunk == 0, f"Sequence length {L} must be divisible by chunk size {chunk}"
+    assert X.dtype == torch.float16 and A.dtype == torch.float16 and B.dtype == torch.float16
     
+    device = X.device
     Y = torch.empty_like(X)
     
-    grid = lambda META: (triton.cdiv(D, BD), L // chunk)
+    num_chunks = L // chunk
+    BLOCK_D = min(BD, triton.next_power_of_2(D))
+    BLOCK_L = min(chunk, 128)
     
-    BLOCK_L = 16
-    
-    chunk_scan_kernel_optimized[grid](
-        X, A, B, Y,
-        L, D,
-        X.stride(0), X.stride(1),
-        A.stride(0), A.stride(1),
-        B.stride(0), B.stride(1),
-        Y.stride(0), Y.stride(1),
-        chunk, BD, BLOCK_L
-    )
+    if chunk <= 128 and D <= 512:
+        grid = (num_chunks * (D // BD + (D % BD > 0)),)
+        _chunk_scan_fused_kernel[grid](
+            X, A, B, Y,
+            X.stride(0), X.stride(1),
+            L, D,
+            chunk_size=chunk, BD=BD,
+            BLOCK_L=BLOCK_L, BLOCK_D=BLOCK_D,
+        )
+    else:
+        State = torch.zeros((num_chunks + 1, D), dtype=torch.float32, device=device)
+        
+        grid_forward = (num_chunks * (D // BD + (D % BD > 0)),)
+        _chunk_scan_forward_kernel[grid_forward](
+            X, A, B, Y, State,
+            X.stride(0), X.stride(1),
+            L, D,
+            chunk_size=chunk, BD=BD,
+            BLOCK_L=BLOCK_L, BLOCK_D=BLOCK_D,
+            STORE_STATE=True,
+        )
+        
+        grid_backward = (num_chunks * (D // BD + (D % BD > 0)),)
+        _chunk_scan_backward_kernel[grid_backward](
+            X, A, B, Y, State,
+            X.stride(0), X.stride(1),
+            L, D,
+            chunk_size=chunk, BD=BD,
+            BLOCK_L=BLOCK_L, BLOCK_D=BLOCK_D,
+        )
     
     return Y
 
 class Solution:
     def solve(self, spec_path: str = None) -> dict:
-        return {"code": self.get_code()}
+        code = '''
+import torch
+import triton
+import triton.language as tl
+from typing import Tuple
+
+@triton.jit
+def _chunk_scan_forward_kernel(
+    X_ptr, A_ptr, B_ptr, Y_ptr, State_ptr,
+    chunk_stride, feature_stride,
+    L, D,
+    chunk_size: tl.constexpr, BD: tl.constexpr,
+    BLOCK_L: tl.constexpr, BLOCK_D: tl.constexpr,
+    STORE_STATE: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    num_chunks = tl.cdiv(L, chunk_size)
+    chunk_idx = pid // (D // BD)
+    feature_block = pid % (D // BD)
     
-    @staticmethod
-    def get_code():
-        import inspect
-        return inspect.getsource(chunk_scan)
+    start_feature = feature_block * BD
+    start_time = chunk_idx * chunk_size
+    
+    feature_offsets = start_feature + tl.arange(0, BLOCK_D)
+    time_offsets = start_time + tl.arange(0, BLOCK_L)
+    
+    mask_feature = feature_offsets < D
+    mask_time = time_offsets < L
+    
+    chunk_mask = time_offsets < min(L, start_time + chunk_size)
+    final_mask = mask_time & mask_feature[:, None] & chunk_mask
+    
+    X_ptrs = X_ptr + time_offsets[None, :] * chunk_stride + feature_offsets[:, None] * feature_stride
+    A_ptrs = A_ptr + time_offsets[None, :] * chunk_stride + feature_offsets[:, None] * feature_stride
+    B_ptrs = B_ptr + time_offsets[None, :] * chunk_stride + feature_offsets[:, None] * feature_stride
+    Y_ptrs = Y_ptr + time_offsets[None, :] * chunk_stride + feature_offsets[:, None] * feature_stride
+    
+    x = tl.load(X_ptrs, mask=final_mask, other=0.0)
+    a = tl.load(A_ptrs, mask=final_mask, other=0.0)
+    b = tl.load(B_ptrs, mask=final_mask, other=0.0)
+    
+    state = tl.zeros((BLOCK_D,), dtype=tl.float32)
+    y = tl.zeros((BLOCK_D, BLOCK_L), dtype=tl.float32)
+    
+    for i in range(BLOCK_L):
+        if start_time + i < L and (start_time + i) % chunk_size == 0 and start_time + i > 0:
+            state_ptr = State_ptr + ((start_time + i) // chunk_size - 1) * D + feature_offsets
+            prev_state = tl.load(state_ptr, mask=mask_feature, other=0.0)
+            state = prev_state
+        
+        state = state * a[:, i] + b[:, i] * x[:, i]
+        y[:, i] = state
+        
+        if STORE_STATE and (i == BLOCK_L - 1 or start_time + i == L - 1):
+            next_chunk_idx = (start_time + i + 1) // chunk_size
+            if next_chunk_idx < num_chunks:
+                state_ptr = State_ptr + next_chunk_idx * D + feature_offsets
+                tl.store(state_ptr, state, mask=mask_feature)
+    
+    tl.store(Y_ptrs, y.to(tl.float16), mask=final_mask)
+
+@triton.jit
+def _chunk_scan_backward_kernel(
+    X_ptr, A_ptr, B_ptr, Y_ptr, State_ptr,
+    chunk_stride, feature_stride,
+    L, D,
+    chunk_size: tl.constexpr, BD: tl.constexpr,
+    BLOCK_L: tl.constexpr, BLOCK_D: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    num_chunks = tl.cdiv(L, chunk_size)
+    chunk_idx = (num_chunks - 1) - (pid // (D // BD))
+    feature_block = pid % (D // BD)
+    
+    start_feature = feature_block * BD
+    start_time = chunk_idx * chunk_size
+    
+    feature_offsets = start_feature + tl.arange(0, BLOCK_D)
+    time_offsets = start_time + tl.arange(0, BLOCK_L)
+    
+    mask_feature = feature_offsets < D
+    mask_time = time_offsets < L
+    
+    chunk_mask = time_offsets < min(L, start_time + chunk_size)
+    final_mask = mask_time & mask_feature[:, None] & chunk_mask
+    
+    A_ptrs = A_ptr + time_offsets[None, :] * chunk_stride + feature_offsets[:, None] * feature_stride
+    B_ptrs = B_ptr + time_offsets[None, :] * chunk_stride + feature_offsets[:, None] * feature_stride
+    X_ptrs = X_ptr + time_offsets[None, :] * chunk_stride + feature_offsets[:, None] * feature_stride
+    Y_ptrs = Y_ptr + time_offsets[None, :] * chunk_stride + feature_offsets[:, None] * feature_stride
+    
+    a = tl.load(A_ptrs, mask=final_mask, other=0.0)
+    b = tl.load(B_ptrs, mask=final_mask, other=0.0)
+    x = tl.load(X_ptrs, mask=final_mask, other=0.0)
+    
+    next_state_ptr = State_ptr + (chunk_idx + 1) * D + feature_offsets
+    if chunk_idx < num_chunks - 1:
+        next_state = tl.load(next_state_ptr, mask=mask_feature, other=0.0)
+    else:
+        next_state = tl.zeros((BLOCK_D,), dtype=tl.float32)
+    
+    y = tl.zeros((BLOCK_D, BLOCK_L), dtype=tl.float32)
+    
+    for i in range(BLOCK_L - 1, -1, -1):
+        if start_time + i < L:
+            if i == BLOCK_L - 1 and chunk_idx < num_chunks - 1:
+                state = next_state
+            elif i < BLOCK_L - 1:
+                state = y[:, i + 1]
+            else:
+                state = tl.zeros((BLOCK_D,), dtype=tl.float32)
+            
+            local_idx = (start_time + i) % chunk_size
+            if local_idx == chunk_size - 1 and chunk_idx < num_chunks - 1:
+                state = next_state
+            
+            state = state * a[:, i] + b[:, i] * x[:, i]
+            y[:, i] = state
+    
+    tl.store(Y_ptrs, y.to(tl.float16), mask=final_mask)
+
+@triton.jit
+def _chunk_scan_fused_kernel(
+    X_ptr, A_ptr, B_ptr, Y_ptr,
+    chunk_stride, feature_stride,
+    L, D,
+    chunk_size: tl.constexpr, BD: tl.constexpr,
+    BLOCK_L: tl.constexpr, BLOCK_D: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    num_chunks = tl.cdiv(L, chunk_size)
+    
+    chunk_idx = pid // (D // BD)
+    feature_block = pid % (D // BD)
+    
+    if chunk_idx >= num_chunks:
+        return
+    
+    start_feature = feature_block * BD
+    start_time = chunk_idx * chunk_size
+    
+    feature_offsets = start_feature + tl.arange(0, BLOCK_D)
+    time_offsets = start_time + tl.arange(0, BLOCK_L)
+    
+    mask_feature = feature_offsets < D
+    mask_time = time_offsets < L
+    chunk_mask = time_offsets < min(L, start_time + chunk_size)
+    final_mask = mask_time & mask_feature[:, None] & chunk_mask
+    
+    X_ptrs = X_ptr + time_offsets[None, :] * chunk_stride + feature_offsets[:, None] * feature_stride
+    A_ptrs = A_ptr + time_offsets[None, :] * chunk_stride + feature_offsets[:, None] * feature_stride
+    B_ptrs = B_ptr + time_offsets[None, :] * chunk_stride + feature_offsets[:, None] * feature_stride
+    Y_ptrs = Y_ptr + time_offsets[None, :] * chunk_stride + feature_offsets[:, None] * feature_stride
+    
+    x = tl.load(X_ptrs, mask=final_mask, other=0.0)
+    a = tl.load(A_ptrs, mask=final_mask, other=0.0)
+    b = tl.load(B_ptrs, mask=final_mask, other=0.0)
+    
+    state = tl.zeros((BLOCK_D,), dtype=tl.float32)
+    y = tl.zeros((BLOCK_D, BLOCK_L), dtype=tl.float32)
+    
+    for i in range(BLOCK_L):
+        if start_time + i < L:
+            if (start_time + i) % chunk_size == 0 and start_time + i > 0:
+                prev_chunk_end = start_time + i - 1
+                prev_chunk_idx = prev_chunk_end // chunk_size
+                prev_time_in_chunk = chunk_size - 1
+                
+                prev_feature_offsets = start_feature + tl.arange(0, BLOCK_D)
+                prev_mask = prev_feature_offsets < D
+                
+                prev_Y_ptr = Y_ptr + (prev_chunk_idx * chunk_size + prev_time_in_chunk) * chunk_stride + prev_feature_offsets * feature_stride
+                prev_state = tl.load(prev_Y_ptr, mask=prev_mask, other=0.0)
+                state = prev_state.to(tl.float32)
+            
+            state = state * a[:, i] + b[:, i] * x[:, i]
+            y[:, i] = state
+    
+    tl.store(Y_ptrs, y.to(tl.float16), mask=final_mask)
+
+def chunk_scan(
+    X: torch.Tensor,
+    A: torch.Tensor, 
+    B: torch.Tensor,
+    chunk: int = 128,
+    BD: int = 128
+) -> torch.Tensor:
+    L, D = X.shape
+    assert L % chunk == 0, f"Sequence length {L} must be divisible by chunk size {chunk}"
+    assert X.dtype == torch.float16 and A.dtype == torch.float16 and B.dtype == torch.float16
+    
+    device = X.device
+    Y = torch.empty_like(X)
+    
+    num_chunks = L // chunk
+    BLOCK_D = min(BD, triton.next_power_of_2(D))
+    BLOCK_L = min(chunk, 128)
+    
+    if chunk <= 128 and D <= 512:
+        grid = (num_chunks * (D // BD + (D % BD > 0)),)
+        _chunk_scan_fused_kernel[grid](
+            X, A, B, Y,
+            X.stride(0), X.stride(1),
+            L, D,
+            chunk_size=chunk, BD=BD,
+            BLOCK_L=BLOCK_L, BLOCK_D=BLOCK_D,
+        )
+    else:
+        State = torch.zeros((num_chunks + 1, D), dtype=torch.float32, device=device)
+        
+        grid_forward = (num_chunks * (D // BD + (D % BD > 0)),)
+        _chunk_scan_forward_kernel[grid_forward](
+            X, A, B, Y, State,
+            X.stride(0), X.stride(1),
+            L, D,
+            chunk_size=chunk, BD=BD,
+            BLOCK_L=BLOCK_L, BLOCK_D=BLOCK_D,
+            STORE_STATE=True,
+        )
+        
+        grid_backward = (num_chunks * (D // BD + (D % BD > 0)),)
+        _chunk_scan_backward_kernel[grid_backward](
+            X, A, B, Y, State,
+            X.stride(0), X.stride(1),
+            L, D,
+            chunk_size=chunk, BD=BD,
+            BLOCK_L=BLOCK_L, BLOCK_D=BLOCK_D,
+        )
+    
+    return Y
+'''
+        return {"code": code}

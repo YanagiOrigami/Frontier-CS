@@ -1,235 +1,237 @@
 import math
 import random
 import copy
-import numpy as np
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
+import torch.optim as optim
 
 
-def set_seed(seed: int = 42):
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-
-
-def count_params(model: nn.Module) -> int:
+def count_trainable_params(model: nn.Module) -> int:
     return sum(p.numel() for p in model.parameters() if p.requires_grad)
 
 
-class ResidualMLP(nn.Module):
-    def __init__(self, input_dim: int, hidden_dim: int, num_classes: int, dropout: float = 0.1):
+class MLPNet(nn.Module):
+    def __init__(self, input_dim, hidden_dims, num_classes, dropout=0.15, use_bn=True, use_input_bn=False):
         super().__init__()
-        self.bn0 = nn.BatchNorm1d(input_dim)
-        self.fc1 = nn.Linear(input_dim, hidden_dim, bias=True)
-        self.bn1 = nn.BatchNorm1d(hidden_dim)
-        self.fc_res = nn.Linear(hidden_dim, hidden_dim, bias=True)
-        self.bn2 = nn.BatchNorm1d(hidden_dim)
-        self.fc_out = nn.Linear(hidden_dim, num_classes, bias=True)
+        self.use_bn = use_bn
+        self.use_input_bn = use_input_bn
+        layers = []
+        self.input_bn = nn.BatchNorm1d(input_dim) if use_input_bn else nn.Identity()
+
+        dims = [input_dim] + hidden_dims
+        self.fcs = nn.ModuleList()
+        self.bns = nn.ModuleList()
+        for i in range(len(dims) - 1):
+            fc = nn.Linear(dims[i], dims[i + 1], bias=True)
+            self.fcs.append(fc)
+            if use_bn:
+                self.bns.append(nn.BatchNorm1d(dims[i + 1]))
+            else:
+                self.bns.append(nn.Identity())
+
+        self.fc_out = nn.Linear(dims[-1], num_classes, bias=True)
+        self.act = nn.GELU()
         self.drop = nn.Dropout(dropout)
-        self.res_scale = nn.Parameter(torch.tensor(0.1, dtype=torch.float32))
 
-        self.reset_parameters()
-
-    def reset_parameters(self):
-        for m in self.modules():
-            if isinstance(m, nn.Linear):
-                nn.init.kaiming_normal_(m.weight, nonlinearity='relu')
-                if m.bias is not None:
-                    nn.init.zeros_(m.bias)
-            elif isinstance(m, nn.BatchNorm1d):
-                nn.init.ones_(m.weight)
-                nn.init.zeros_(m.bias)
+        for layer in self.fcs:
+            nn.init.kaiming_normal_(layer.weight, nonlinearity='relu')
+            nn.init.zeros_(layer.bias)
+        nn.init.zeros_(self.fc_out.bias)
 
     def forward(self, x):
-        x = x.float()
-        x = self.bn0(x)
-        x = self.fc1(x)
-        x = self.bn1(x)
-        x = F.gelu(x)
-        x = self.drop(x)
-
-        res = self.fc_res(x)
-        res = self.bn2(res)
-        res = F.gelu(res)
-        res = self.drop(res)
-
-        x = x + self.res_scale * res
-        out = self.fc_out(x)
-        return out
+        x = self.input_bn(x)
+        for fc, bn in zip(self.fcs, self.bns):
+            x = fc(x)
+            x = bn(x)
+            x = self.act(x)
+            x = self.drop(x)
+        x = self.fc_out(x)
+        return x
 
 
-def max_hidden_dim(input_dim: int, num_classes: int, param_limit: int) -> int:
-    # Parameter formula:
-    # p(h) = h^2 + h*(input_dim + num_classes + 6) + (num_classes + 2*input_dim + 1)
-    a = 1
-    b = input_dim + num_classes + 6
-    c = (num_classes + 2 * input_dim + 1) - param_limit
-    disc = b * b - 4 * a * c
-    if disc < 0:
-        # In practice this should not happen; fall back to minimal hidden
-        return 32
-    h_float = (-b + math.sqrt(disc)) / (2 * a)
-    # Round down to nearest multiple of 8 for efficiency
-    h = max(16, int(h_float) // 8 * 8)
-    return h
+def estimate_params(input_dim, hidden_dims, num_classes, use_bn=True, use_input_bn=False):
+    dims = [input_dim] + hidden_dims + [num_classes]
+    total = 0
+    for i in range(len(dims) - 1):
+        total += dims[i] * dims[i + 1] + dims[i + 1]  # weights + bias
+    if use_bn:
+        # BN for all hidden dims
+        for d in hidden_dims:
+            total += 2 * d  # gamma + beta
+    if use_input_bn:
+        total += 2 * input_dim
+    return total
 
 
-class WarmupCosineScheduler:
-    def __init__(self, optimizer, total_steps: int, warmup_steps: int, max_lr: float, final_lr: float):
-        self.optimizer = optimizer
-        self.total_steps = max(1, total_steps)
-        self.warmup_steps = max(1, warmup_steps)
-        self.max_lr = max_lr
-        self.final_lr = final_lr
-        self.step_count = 0
+def choose_architecture(input_dim, num_classes, param_limit):
+    # Start with 3 hidden layers scaled from input dimension
+    # Initial widths target
+    w1 = max(128, min(256, int(round(input_dim * 0.75))))  # for 384 -> 288, then capped at 256
+    w2 = max(96, int(round(w1 * 0.75)))
+    w3 = max(64, int(round(w2 * 0.75)))
 
-    def get_lr_at_step(self, step: int) -> float:
-        if step < self.warmup_steps:
-            return self.max_lr * (step + 1) / self.warmup_steps
-        progress = (step - self.warmup_steps) / max(1, self.total_steps - self.warmup_steps)
-        cosine_decay = 0.5 * (1 + math.cos(math.pi * progress))
-        lr = self.final_lr + (self.max_lr - self.final_lr) * cosine_decay
-        return lr
+    use_bn = True
+    use_input_bn = True
 
-    def step(self):
-        lr = self.get_lr_at_step(self.step_count)
-        for pg in self.optimizer.param_groups:
-            pg['lr'] = lr
-        self.step_count += 1
+    # Try to fit with BN and input BN
+    for _ in range(128):
+        hidden_dims = [w1, w2, w3]
+        params = estimate_params(input_dim, hidden_dims, num_classes, use_bn=True, use_input_bn=True)
+        if params <= param_limit:
+            return hidden_dims, True, True
+        # Try without input BN
+        params = estimate_params(input_dim, hidden_dims, num_classes, use_bn=True, use_input_bn=False)
+        if params <= param_limit:
+            return hidden_dims, True, False
+        # Try without BN
+        params = estimate_params(input_dim, hidden_dims, num_classes, use_bn=False, use_input_bn=False)
+        if params <= param_limit:
+            return hidden_dims, False, False
+        # Reduce widths
+        w1 = max(96, w1 - 8)
+        w2 = max(72, int(round(w1 * 0.75)))
+        w3 = max(48, int(round(w2 * 0.75)))
+
+    # Fallback to 2 hidden layers if still not fitting
+    w1 = max(128, min(256, int(round(input_dim * 0.67))))
+    w2 = max(96, int(round(w1 * 0.75)))
+    for _ in range(128):
+        hidden_dims = [w1, w2]
+        params = estimate_params(input_dim, hidden_dims, num_classes, use_bn=True, use_input_bn=True)
+        if params <= param_limit:
+            return hidden_dims, True, True
+        params = estimate_params(input_dim, hidden_dims, num_classes, use_bn=True, use_input_bn=False)
+        if params <= param_limit:
+            return hidden_dims, True, False
+        params = estimate_params(input_dim, hidden_dims, num_classes, use_bn=False, use_input_bn=False)
+        if params <= param_limit:
+            return hidden_dims, False, False
+        w1 = max(96, w1 - 8)
+        w2 = max(72, int(round(w1 * 0.75)))
+
+    # Last resort: single hidden layer
+    w1 = max(128, min(320, int(round(input_dim * 0.67))))
+    for _ in range(128):
+        hidden_dims = [w1]
+        params = estimate_params(input_dim, hidden_dims, num_classes, use_bn=True, use_input_bn=False)
+        if params <= param_limit:
+            return hidden_dims, True, False
+        params = estimate_params(input_dim, hidden_dims, num_classes, use_bn=False, use_input_bn=False)
+        if params <= param_limit:
+            return hidden_dims, False, False
+        w1 = max(64, w1 - 8)
+
+    # Default fallback
+    return [256], False, False
 
 
-def evaluate(model: nn.Module, data_loader, device) -> float:
+def mixup_batch(x, y, alpha=0.2):
+    if alpha <= 0:
+        lam = 1.0
+        index = torch.arange(x.size(0))
+    else:
+        lam = torch._standard_gamma(torch.tensor([alpha]))[0].item()
+        lam2 = torch._standard_gamma(torch.tensor([alpha]))[0].item()
+        lam = lam / (lam + lam2)
+        index = torch.randperm(x.size(0))
+    mixed_x = lam * x + (1 - lam) * x[index, :]
+    y_a, y_b = y, y[index]
+    return mixed_x, y_a, y_b, lam
+
+
+def evaluate(model, data_loader, device):
     model.eval()
     correct = 0
     total = 0
     with torch.no_grad():
         for inputs, targets in data_loader:
             inputs = inputs.to(device)
-            targets = targets.to(device, dtype=torch.long)
+            targets = targets.to(device)
             outputs = model(inputs)
             preds = outputs.argmax(dim=1)
             correct += (preds == targets).sum().item()
             total += targets.numel()
-    return (correct / total) if total > 0 else 0.0
-
-
-def mixup(inputs, targets, alpha: float = 0.2):
-    if alpha <= 0.0:
-        return inputs, targets, targets, 1.0
-    lam = np.random.beta(alpha, alpha)
-    batch_size = inputs.size(0)
-    index = torch.randperm(batch_size, device=inputs.device)
-    mixed_inputs = lam * inputs + (1 - lam) * inputs[index]
-    targets_a = targets
-    targets_b = targets[index]
-    return mixed_inputs, targets_a, targets_b, lam
+    return correct / max(1, total)
 
 
 class Solution:
     def solve(self, train_loader, val_loader, metadata: dict = None) -> torch.nn.Module:
-        set_seed(42)
         if metadata is None:
             metadata = {}
+        device = torch.device(metadata.get("device", "cpu"))
         input_dim = int(metadata.get("input_dim", 384))
         num_classes = int(metadata.get("num_classes", 128))
         param_limit = int(metadata.get("param_limit", 200000))
-        device = metadata.get("device", "cpu")
+        baseline_accuracy = float(metadata.get("baseline_accuracy", 0.65))
 
-        # Determine hidden dimension within parameter budget
-        h_max = max_hidden_dim(input_dim, num_classes, param_limit)
-        # Prefer 256 if budget allows, otherwise use computed max
-        preferred = 256
-        def param_count_for_h(h):
-            # exact parameter count for our architecture
-            return h * h + h * (input_dim + num_classes + 6) + (num_classes + 2 * input_dim + 1)
-        if param_count_for_h(preferred) <= param_limit:
-            hidden_dim = preferred
-        else:
-            # ensure not exceeding limit
-            # step down by 8 until within limit
-            hidden_dim = h_max
-            while hidden_dim > 16 and param_count_for_h(hidden_dim) > param_limit:
-                hidden_dim -= 8
+        # Construct architecture within parameter budget
+        hidden_dims, use_bn, use_input_bn = choose_architecture(input_dim, num_classes, param_limit)
+        model = MLPNet(input_dim, hidden_dims, num_classes, dropout=0.15, use_bn=use_bn, use_input_bn=use_input_bn).to(device)
 
-        model = ResidualMLP(input_dim=input_dim, hidden_dim=hidden_dim, num_classes=num_classes, dropout=0.1)
-        # Safety check: ensure parameter count under limit
-        if count_params(model) > param_limit:
-            # As a fallback, reduce hidden_dim more aggressively
-            hd = hidden_dim
-            while hd > 16 and count_params(ResidualMLP(input_dim, hd, num_classes, dropout=0.1)) > param_limit:
-                hd -= 8
-            hidden_dim = max(16, hd)
-            model = ResidualMLP(input_dim=input_dim, hidden_dim=hidden_dim, num_classes=num_classes, dropout=0.1)
+        # Verify parameter constraint
+        total_params = count_trainable_params(model)
+        if total_params > param_limit:
+            # As a strict fallback, revert to a small 2-layer network always under budget
+            model = MLPNet(input_dim, [256, 160], num_classes, dropout=0.15, use_bn=False, use_input_bn=False).to(device)
 
-        model.to(device)
+        # Optimizer and scheduler
+        base_lr = 0.003
+        weight_decay = 1e-4
+        optimizer = optim.AdamW(model.parameters(), lr=base_lr, weight_decay=weight_decay)
+        criterion = nn.CrossEntropyLoss(label_smoothing=0.05)
 
-        # Optimizer and loss
-        base_lr = 3e-3
-        final_lr = 2e-4
-        weight_decay = 4e-4
-        optimizer = torch.optim.AdamW(model.parameters(), lr=base_lr, weight_decay=weight_decay, betas=(0.9, 0.999))
-        # Label smoothing helps with synthetic noise
-        criterion = nn.CrossEntropyLoss(label_smoothing=0.03)
+        epochs = 150
+        steps_per_epoch = max(1, len(train_loader))
+        total_steps = epochs * steps_per_epoch
+        scheduler = optim.lr_scheduler.OneCycleLR(
+            optimizer,
+            max_lr=base_lr,
+            total_steps=total_steps,
+            pct_start=0.15,
+            anneal_strategy='cos',
+            cycle_momentum=False
+        )
 
-        # Scheduler
-        max_epochs = 140
-        try:
-            num_train_steps = max_epochs * len(train_loader)
-        except TypeError:
-            num_train_steps = max_epochs * 1
-        warmup_steps = max(10, int(0.1 * num_train_steps))
-        scheduler = WarmupCosineScheduler(optimizer, total_steps=num_train_steps, warmup_steps=warmup_steps, max_lr=base_lr, final_lr=final_lr)
+        best_val_acc = 0.0
+        best_state = copy.deepcopy(model.state_dict())
+        patience = 30
+        no_improve_epochs = 0
 
-        # Early stopping setup
-        patience = 20
-        best_val_acc = -1.0
-        best_state = None
-        epochs_no_improve = 0
-
-        mixup_alpha = 0.2
-        mixup_prob = 0.6
-
-        for epoch in range(max_epochs):
+        # Train loop
+        for epoch in range(epochs):
             model.train()
             for inputs, targets in train_loader:
                 inputs = inputs.to(device)
-                targets = targets.to(device, dtype=torch.long)
+                targets = targets.to(device)
 
-                if mixup_alpha > 0 and random.random() < mixup_prob:
-                    mixed_inputs, targets_a, targets_b, lam = mixup(inputs, targets, alpha=mixup_alpha)
-                    outputs = model(mixed_inputs)
-                    loss = lam * criterion(outputs, targets_a) + (1.0 - lam) * criterion(outputs, targets_b)
+                use_mix = random.random() < 0.7
+                if use_mix:
+                    mixed_x, y_a, y_b, lam = mixup_batch(inputs, targets, alpha=0.3)
+                    optimizer.zero_grad(set_to_none=True)
+                    outputs = model(mixed_x)
+                    loss = lam * criterion(outputs, y_a) + (1 - lam) * criterion(outputs, y_b)
                 else:
+                    optimizer.zero_grad(set_to_none=True)
                     outputs = model(inputs)
                     loss = criterion(outputs, targets)
 
-                optimizer.zero_grad()
                 loss.backward()
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                nn.utils.clip_grad_norm_(model.parameters(), max_norm=2.0)
                 optimizer.step()
                 scheduler.step()
 
             # Validation
-            if val_loader is not None:
-                val_acc = evaluate(model, val_loader, device)
-            else:
-                # If no validation loader is provided, evaluate on training data
-                val_acc = evaluate(model, train_loader, device)
-
-            if val_acc > best_val_acc:
+            val_acc = evaluate(model, val_loader, device)
+            if val_acc > best_val_acc + 1e-6:
                 best_val_acc = val_acc
-                best_state = copy.deepcopy({k: v.detach().cpu() for k, v in model.state_dict().items()})
-                epochs_no_improve = 0
+                best_state = copy.deepcopy(model.state_dict())
+                no_improve_epochs = 0
             else:
-                epochs_no_improve += 1
+                no_improve_epochs += 1
 
-            if epochs_no_improve >= patience:
+            if no_improve_epochs >= patience:
                 break
 
-        if best_state is not None:
-            model.load_state_dict(best_state, strict=True)
-
+        model.load_state_dict(best_state)
         model.eval()
-        model.to("cpu")
         return model

@@ -4,8 +4,7 @@ import triton.language as tl
 
 class Solution:
     def solve(self, spec_path: str = None) -> dict:
-        return {
-            "code": r"""
+        code = r'''
 import torch
 import triton
 import triton.language as tl
@@ -14,172 +13,193 @@ import math
 @triton.jit
 def gdpa_kernel(
     Q, K, V, GQ, GK, Out,
-    sqz, sqh, sqm, sqk,
-    skz, skh, skn, skk,
-    svz, svh, svn, svk,
-    sgqz, sgqh, sgqm, sgqk,
-    sgkz, sgkh, sgkn, sgkk,
-    soz, soh, som, son,
-    Z, H, N_CTX,
-    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
-    HEAD_DIM: tl.constexpr
+    stride_qz, stride_qh, stride_qm, stride_qk,
+    stride_kz, stride_kh, stride_kn, stride_kk,
+    stride_vz, stride_vh, stride_vn, stride_vk,
+    stride_oz, stride_oh, stride_om, stride_on,
+    Z, H, M, N,
+    sm_scale,
+    BLOCK_M: tl.constexpr, 
+    BLOCK_N: tl.constexpr, 
+    DQ: tl.constexpr, 
+    DV: tl.constexpr
 ):
-    tl.static_assert(BLOCK_N <= HEAD_DIM)
-    start_m = tl.program_id(0)
-    off_z = tl.program_id(1) // H
-    off_h = tl.program_id(1) % H
+    # Grid handling
+    off_m = tl.program_id(0) * BLOCK_M
+    off_zh = tl.program_id(1)
+    off_z = off_zh // H
+    off_h = off_zh % H
     
-    # Compute offsets for the current batch and head
-    q_off = off_z * sqz + off_h * sqh
-    k_off = off_z * skz + off_h * skh
-    v_off = off_z * svz + off_h * svh
-    gq_off = off_z * sgqz + off_h * sgqh
-    gk_off = off_z * sgkz + off_h * sgkh
-    o_off = off_z * soz + off_h * soh
-    
-    # Initialize Block Pointers for Q and GQ
-    # Grid computes BLOCK_M rows of Output
-    Q_ptr = tl.make_block_ptr(
-        base=Q + q_off,
-        shape=(N_CTX, HEAD_DIM),
-        strides=(sqm, sqk),
-        offsets=(start_m * BLOCK_M, 0),
-        block_shape=(BLOCK_M, HEAD_DIM),
+    # Base pointers for the current batch and head
+    q_base = Q + off_z * stride_qz + off_h * stride_qh
+    k_base = K + off_z * stride_kz + off_h * stride_kh
+    v_base = V + off_z * stride_vz + off_h * stride_vh
+    gq_base = GQ + off_z * stride_qz + off_h * stride_qh
+    gk_base = GK + off_z * stride_kz + off_h * stride_kh
+    out_base = Out + off_z * stride_oz + off_h * stride_oh
+
+    # Initialize pointers using make_block_ptr
+    # Q and GQ: Shape (M, DQ), contiguous in DQ (row-major)
+    q_ptr = tl.make_block_ptr(
+        base=q_base,
+        shape=(M, DQ),
+        strides=(stride_qm, stride_qk),
+        offsets=(off_m, 0),
+        block_shape=(BLOCK_M, DQ),
         order=(1, 0)
     )
-    GQ_ptr = tl.make_block_ptr(
-        base=GQ + gq_off,
-        shape=(N_CTX, HEAD_DIM),
-        strides=(sgqm, sgqk),
-        offsets=(start_m * BLOCK_M, 0),
-        block_shape=(BLOCK_M, HEAD_DIM),
+    gq_ptr = tl.make_block_ptr(
+        base=gq_base,
+        shape=(M, DQ),
+        strides=(stride_qm, stride_qk),
+        offsets=(off_m, 0),
+        block_shape=(BLOCK_M, DQ),
         order=(1, 0)
     )
     
-    # Initialize Block Pointers for K, GK, V
-    # These will iterate over the sequence length N
-    K_ptr = tl.make_block_ptr(
-        base=K + k_off,
-        shape=(N_CTX, HEAD_DIM),
-        strides=(skn, skk),
+    # K and GK: Shape (N, DQ) in memory.
+    # We load them as (DQ, N) blocks to perform Q @ K.T directly as dot(Q, K_transposed_block).
+    # Strides for (DQ, N) view are (stride_kk, stride_kn).
+    k_ptr = tl.make_block_ptr(
+        base=k_base,
+        shape=(DQ, N),
+        strides=(stride_kk, stride_kn),
         offsets=(0, 0),
-        block_shape=(BLOCK_N, HEAD_DIM),
-        order=(1, 0)
+        block_shape=(DQ, BLOCK_N),
+        order=(0, 1)
     )
-    GK_ptr = tl.make_block_ptr(
-        base=GK + gk_off,
-        shape=(N_CTX, HEAD_DIM),
-        strides=(sgkn, sgkk),
+    gk_ptr = tl.make_block_ptr(
+        base=gk_base,
+        shape=(DQ, N),
+        strides=(stride_kk, stride_kn),
         offsets=(0, 0),
-        block_shape=(BLOCK_N, HEAD_DIM),
-        order=(1, 0)
-    )
-    V_ptr = tl.make_block_ptr(
-        base=V + v_off,
-        shape=(N_CTX, HEAD_DIM),
-        strides=(svn, svk),
-        offsets=(0, 0),
-        block_shape=(BLOCK_N, HEAD_DIM),
-        order=(1, 0)
+        block_shape=(DQ, BLOCK_N),
+        order=(0, 1)
     )
     
-    # Initialize Online Softmax Accumulators
+    # V: Shape (N, DV), contiguous in DV
+    v_ptr = tl.make_block_ptr(
+        base=v_base,
+        shape=(N, DV),
+        strides=(stride_vn, stride_vk),
+        offsets=(0, 0),
+        block_shape=(BLOCK_N, DV),
+        order=(1, 0)
+    )
+
+    # Load Q and GQ
+    # Assuming M is a multiple of BLOCK_M based on problem spec (512, 1024), 
+    # so boundary checks are skipped for performance.
+    q = tl.load(q_ptr)
+    gq = tl.load(gq_ptr)
+    
+    # Apply Query Gating: Qg = Q * sigmoid(GQ)
+    q = q * tl.sigmoid(gq)
+    
+    # Initialize statistics for online softmax
     m_i = tl.zeros([BLOCK_M], dtype=tl.float32) - float("inf")
     l_i = tl.zeros([BLOCK_M], dtype=tl.float32)
-    acc = tl.zeros([BLOCK_M, HEAD_DIM], dtype=tl.float32)
-    
-    qk_scale = 1.0 / math.sqrt(HEAD_DIM)
-    
-    # Load Q and GQ tiles
-    q = tl.load(Q_ptr)
-    gq = tl.load(GQ_ptr)
-    
-    # Apply Gating to Q
-    # Computation in fp32 for stability, then back to fp16
-    q = q.to(tl.float32)
-    gq = gq.to(tl.float32)
-    q = q * tl.sigmoid(gq) * qk_scale
-    q = q.to(tl.float16)
+    acc = tl.zeros([BLOCK_M, DV], dtype=tl.float32)
     
     # Loop over K/V blocks
-    for start_n in range(0, N_CTX, BLOCK_N):
-        # Load K, GK, V
-        k = tl.load(K_ptr)
-        gk = tl.load(GK_ptr)
-        v = tl.load(V_ptr)
+    # N is also multiple of BLOCK_N (N=M)
+    for start_n in range(0, N, BLOCK_N):
+        # Load K, GK
+        k = tl.load(k_ptr)
+        gk = tl.load(gk_ptr)
         
-        # Apply Gating to K
-        k = k.to(tl.float32)
-        gk = gk.to(tl.float32)
+        # Apply Key Gating: Kg = K * sigmoid(GK)
+        # k, gk are loaded as (DQ, BLOCK_N). Operation is elementwise.
         k = k * tl.sigmoid(gk)
-        k = k.to(tl.float16)
         
-        # Compute Attention Scores: Q * K^T
-        # q: (BLOCK_M, HEAD_DIM), k: (BLOCK_N, HEAD_DIM) -> qk: (BLOCK_M, BLOCK_N)
-        qk = tl.dot(q, tl.trans(k))
+        # Load V
+        v = tl.load(v_ptr)
+        
+        # Compute Attention Scores: S = Qg @ Kg.T
+        # q: (BLOCK_M, DQ), k: (DQ, BLOCK_N) -> qk: (BLOCK_M, BLOCK_N)
+        qk = tl.dot(q, k)
+        
+        # Apply scaling
+        qk *= sm_scale
         
         # Online Softmax updates
-        m_ij = tl.max(qk, 1) # Row max for current block
-        p = tl.exp(qk - m_ij[:, None])
-        l_ij = tl.sum(p, 1)
-        
-        # Combine with previous stats
-        m_new = tl.max(m_i, m_ij)
+        m_ij = tl.max(qk, 1)
+        m_new = tl.maximum(m_i, m_ij)
         alpha = tl.exp(m_i - m_new)
-        beta = tl.exp(m_ij - m_new)
+        p = tl.exp(qk - m_new[:, None])
         
-        # Update accumulator
-        acc = acc * alpha[:, None]
-        p = p.to(tl.float16)
-        # p: (BLOCK_M, BLOCK_N), v: (BLOCK_N, HEAD_DIM) -> (BLOCK_M, HEAD_DIM)
-        acc = acc + tl.dot(p, v) * beta[:, None]
+        # Update denominator
+        l_i = l_i * alpha + tl.sum(p, 1)
         
-        # Update running max and sum
-        l_i = l_i * alpha + l_ij * beta
+        # Update output accumulator
+        # acc: (BLOCK_M, DV), p: (BLOCK_M, BLOCK_N), v: (BLOCK_N, DV)
+        # Accumulate in fp32
+        acc = acc * alpha[:, None] + tl.dot(p.to(tl.float16), v)
+        
+        # Update max
         m_i = m_new
         
-        # Advance pointers to next block
-        K_ptr = tl.advance(K_ptr, (BLOCK_N, 0))
-        GK_ptr = tl.advance(GK_ptr, (BLOCK_N, 0))
-        V_ptr = tl.advance(V_ptr, (BLOCK_N, 0))
+        # Advance pointers
+        k_ptr = tl.advance(k_ptr, (0, BLOCK_N))
+        gk_ptr = tl.advance(gk_ptr, (0, BLOCK_N))
+        v_ptr = tl.advance(v_ptr, (BLOCK_N, 0))
         
-    # Finalize output
+    # Finalize Output
     acc = acc / l_i[:, None]
     
-    # Store result
-    Out_ptr = tl.make_block_ptr(
-        base=Out + o_off,
-        shape=(N_CTX, HEAD_DIM),
-        strides=(som, son),
-        offsets=(start_m * BLOCK_M, 0),
-        block_shape=(BLOCK_M, HEAD_DIM),
+    # Store Output
+    out_ptr = tl.make_block_ptr(
+        base=out_base,
+        shape=(M, DV),
+        strides=(stride_om, stride_on),
+        offsets=(off_m, 0),
+        block_shape=(BLOCK_M, DV),
         order=(1, 0)
     )
-    tl.store(Out_ptr, acc.to(tl.float16))
+    tl.store(out_ptr, acc.to(tl.float16))
 
-def gdpa_attn(Q, K, V, GQ, GK):
+def gdpa_attn(Q: torch.Tensor, K: torch.Tensor, V: torch.Tensor, GQ: torch.Tensor, GK: torch.Tensor) -> torch.Tensor:
+    """
+    GDPA attention computation with gated Q and K tensors.
+    """
+    # Input verification
     Z, H, M, Dq = Q.shape
-    _, _, N, Dv = V.shape
+    _, _, N, _ = K.shape
+    _, _, _, Dv = V.shape
     
-    # Allocate output
-    Out = torch.empty((Z, H, M, Dv), device=Q.device, dtype=torch.float16)
+    # Output tensor allocation
+    Out = torch.empty((Z, H, M, Dv), device=Q.device, dtype=Q.dtype)
     
-    # Grid definition: tiles along M dimension, and batch*heads
-    grid = (triton.cdiv(M, 128), Z * H)
+    # Kernel configuration
+    # L4 GPU (Ada) usually handles 128x64 blocks well for fp16
+    BLOCK_M = 128
+    BLOCK_N = 64
+    num_warps = 4
+    num_stages = 3
     
+    # Scaling factor
+    sm_scale = 1.0 / math.sqrt(Dq)
+    
+    # Grid definition: (M tiles, Batch * Heads)
+    grid = (triton.cdiv(M, BLOCK_M), Z * H)
+    
+    # Kernel Launch
     gdpa_kernel[grid](
         Q, K, V, GQ, GK, Out,
         Q.stride(0), Q.stride(1), Q.stride(2), Q.stride(3),
         K.stride(0), K.stride(1), K.stride(2), K.stride(3),
         V.stride(0), V.stride(1), V.stride(2), V.stride(3),
-        GQ.stride(0), GQ.stride(1), GQ.stride(2), GQ.stride(3),
-        GK.stride(0), GK.stride(1), GK.stride(2), GK.stride(3),
         Out.stride(0), Out.stride(1), Out.stride(2), Out.stride(3),
-        Z, H, M,
-        BLOCK_M=128, BLOCK_N=64, HEAD_DIM=64,
-        num_warps=4, num_stages=2
+        Z, H, M, N,
+        sm_scale,
+        BLOCK_M=BLOCK_M,
+        BLOCK_N=BLOCK_N,
+        DQ=Dq,
+        DV=Dv,
+        num_warps=num_warps,
+        num_stages=num_stages
     )
     
     return Out
-"""
-        }
+'''
+        return {"code": code}

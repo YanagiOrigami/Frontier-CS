@@ -1,18 +1,17 @@
 import json
 from argparse import Namespace
-import numpy as np
+from collections import deque
 
 from sky_spot.strategies.multi_strategy import MultiRegionStrategy
 from sky_spot.utils import ClusterType
 
 
 class Solution(MultiRegionStrategy):
-    NAME = "my_strategy"
+    """Your multi-region scheduling strategy."""
+
+    NAME = "adaptive_explorer"
 
     def solve(self, spec_path: str) -> "Solution":
-        """
-        Initialize the solution from spec_path config.
-        """
         with open(spec_path) as f:
             config = json.load(f)
 
@@ -24,90 +23,103 @@ class Solution(MultiRegionStrategy):
         )
         super().__init__(args)
 
-        # --- Hyperparameters for the strategy ---
-        self.EMA_ALPHA = 0.1
-        self.ON_DEMAND_SAFETY_FACTOR = 25.0
-        self.WAIT_SLACK_THRESHOLD_FACTOR = 5.0
-        self.SWITCH_CONFIDENCE_THRESHOLD = 0.5
-        self.EXPLORATION_WEIGHT = 0.15
-        self.RECENCY_HALF_LIFE_SECONDS = 3.0 * 3600.0
-
-        # --- State tracking ---
-        self.num_regions = self.env.get_num_regions()
-        
-        self.spot_availability_ema = np.full(self.num_regions, 0.75)
-        
-        self.last_update_time = np.zeros(self.num_regions)
-        
-        self.visit_counts = np.zeros(self.num_regions)
-        
-        self.steps_counter = 0
-
-        self.recency_decay_rate = np.log(2) / self.RECENCY_HALF_LIFE_SECONDS
-
+        self.is_initialized = False
         return self
 
-    def _step(self, last_cluster_type: ClusterType, has_spot: bool) -> ClusterType:
-        """
-        Decide next action based on current state.
-        """
-        self.steps_counter += 1
-        current_region = self.env.get_current_region()
-        time_elapsed = self.env.elapsed_seconds
+    def _initialize_state(self):
+        self.num_regions = self.env.get_num_regions()
+        
+        self.history_window_size = 20
+        self.initial_spot_proba = 0.9
+        self.explore_slack_factor = 2.0
+        self.explore_proba_threshold = 0.75
+        self.panic_mode_safety_factor = 1.05
 
-        # 1. Update knowledge base with current observation
-        current_ema = self.spot_availability_ema[current_region]
-        self.spot_availability_ema[current_region] = (1 - self.EMA_ALPHA) * current_ema + self.EMA_ALPHA * float(has_spot)
-        self.last_update_time[current_region] = time_elapsed
-        self.visit_counts[current_region] += 1
+        self.spot_history = [
+            deque(maxlen=self.history_window_size) for _ in range(self.num_regions)
+        ]
+        self.probas = [self.initial_spot_proba] * self.num_regions
+        self.state = 'STABLE'
         
-        # 2. Calculate current state and urgency
-        work_done = sum(self.task_done_time)
-        work_remaining = self.task_duration - work_done
+        self.is_initialized = True
+
+    def _step(self, last_cluster_type: ClusterType, has_spot: bool) -> ClusterType:
+        if not self.is_initialized:
+            self._initialize_state()
         
+        self._update_knowledge(has_spot)
+
+        work_remaining = self.task_duration - sum(self.task_done_time)
         if work_remaining <= 0:
             return ClusterType.NONE
 
-        time_to_deadline = self.deadline - time_elapsed
-        
-        on_demand_panic_threshold = work_remaining + self.restart_overhead * self.ON_DEMAND_SAFETY_FACTOR
-
-        if time_to_deadline <= on_demand_panic_threshold:
+        time_remaining = self.deadline - self.env.elapsed_seconds
+        panic_threshold = work_remaining + self.restart_overhead * self.panic_mode_safety_factor
+        if time_remaining <= panic_threshold:
+            self.state = 'STABLE'
             return ClusterType.ON_DEMAND
+        
+        if self.state == 'STABLE':
+            return self._decide_from_stable_state(has_spot, work_remaining, time_remaining)
+        
+        elif self.state == 'EXPLORING':
+            return self._decide_from_exploring_state(has_spot)
+        
+        return ClusterType.ON_DEMAND
 
-        # 3. Main decision logic
+    def _update_knowledge(self, has_spot: bool):
+        current_region = self.env.get_current_region()
+        self.spot_history[current_region].append(1 if has_spot else 0)
+        history = self.spot_history[current_region]
+        if len(history) > 0:
+            self.probas[current_region] = sum(history) / len(history)
+
+    def _decide_from_stable_state(self, has_spot, work_remaining, time_remaining):
         if has_spot:
             return ClusterType.SPOT
+        else:
+            if self._should_explore(work_remaining, time_remaining):
+                self._switch_to_best_alt_region()
+                self.state = 'EXPLORING'
+                return ClusterType.NONE
+            else:
+                return ClusterType.ON_DEMAND
 
-        # Spot is NOT available locally. Evaluate other options.
-        
-        # 3a. Evaluate other regions
-        region_scores = np.copy(self.spot_availability_ema)
-        
-        time_since_update = time_elapsed - self.last_update_time
-        decay_factor = np.exp(-self.recency_decay_rate * time_since_update)
-        region_scores *= decay_factor
-        
-        # Add UCB1-like exploration bonus
-        # Use self.steps_counter + 1 to avoid log(0).
-        log_total_steps = np.log(self.steps_counter + 1)
-        exploration_bonus = self.EXPLORATION_WEIGHT * np.sqrt(log_total_steps / (self.visit_counts + 1e-6))
-        region_scores += exploration_bonus
-        
-        region_scores[current_region] = -np.inf
-        
-        best_other_region = np.argmax(region_scores)
-        best_score = region_scores[best_other_region]
-
-        # 3b. Make the final decision: switch, wait, or on-demand
-        if best_score > self.SWITCH_CONFIDENCE_THRESHOLD:
-            self.env.switch_region(best_other_region)
-            return ClusterType.NONE
-            
-        slack_time = time_to_deadline - work_remaining
-        wait_threshold = self.restart_overhead * self.WAIT_SLACK_THRESHOLD_FACTOR + self.env.gap_seconds
-
-        if slack_time > wait_threshold:
-            return ClusterType.NONE
+    def _decide_from_exploring_state(self, has_spot: bool):
+        self.state = 'STABLE'
+        if has_spot:
+            return ClusterType.SPOT
         else:
             return ClusterType.ON_DEMAND
+
+    def _should_explore(self, work_remaining, time_remaining) -> bool:
+        slack = time_remaining - work_remaining
+        if slack < self.restart_overhead * self.explore_slack_factor:
+            return False
+
+        best_alt_proba, _ = self._get_best_alt_region()
+        
+        if best_alt_proba is None:
+            return False
+
+        if best_alt_proba > self.explore_proba_threshold:
+            return True
+        
+        return False
+
+    def _get_best_alt_region(self):
+        current_region = self.env.get_current_region()
+        candidate_regions = []
+        for i in range(self.num_regions):
+            if i != current_region:
+                candidate_regions.append((self.probas[i], i))
+        
+        if not candidate_regions:
+            return None, None
+        
+        return max(candidate_regions)
+
+    def _switch_to_best_alt_region(self):
+        _, best_alt_region = self._get_best_alt_region()
+        if best_alt_region is not None:
+            self.env.switch_region(best_alt_region)

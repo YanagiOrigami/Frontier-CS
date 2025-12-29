@@ -2,196 +2,213 @@ import torch
 import triton
 import triton.language as tl
 
-# We define the kernel code as a string to return in Solution.solve
-# and also execute it to provide the required function in the current scope.
-KERNEL_CODE = r"""
+class Solution:
+    def solve(self, spec_path: str = None) -> dict:
+        return {"code": r"""
 import torch
 import triton
 import triton.language as tl
 
-@triton.autotune(
-    configs=[
-        triton.Config({'BLOCK_N': 128, 'BLOCK_K': 32, 'num_warps': 4}, num_stages=3),
-        triton.Config({'BLOCK_N': 128, 'BLOCK_K': 64, 'num_warps': 8}, num_stages=3),
-        triton.Config({'BLOCK_N': 256, 'BLOCK_K': 32, 'num_warps': 8}, num_stages=3),
-        triton.Config({'BLOCK_N': 64, 'BLOCK_K': 64, 'num_warps': 4}, num_stages=4),
-    ],
-    key=['M', 'N', 'K'],
-)
 @triton.jit
-def fused_linear_jsd_kernel(
-    X_ptr, W1_ptr, B1_ptr, W2_ptr, B2_ptr, Out_ptr,
+def _linear_lse_kernel(
+    X_ptr, W1_ptr, B1_ptr, W2_ptr, B2_ptr,
+    L1_ptr, L2_ptr,
+    LSE1_ptr, LSE2_ptr,
     M, K, N,
     stride_xm, stride_xk,
     stride_w1k, stride_w1n,
     stride_w2k, stride_w2n,
-    BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr
+    stride_l1m, stride_l1n,
+    stride_l2m, stride_l2n,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr
 ):
-    # Each program handles one row of M
     pid_m = tl.program_id(0)
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
     
-    # Base pointer for X row
-    x_base = X_ptr + pid_m * stride_xm
-    
-    # -----------------------------------------------------------
-    # Pass 1: Compute LogSumExp (LSE) for row m
-    # We use FlashAttention-style recomputation (online softmax) 
-    # but since we need LSE before JSD, we do two passes over N/K blocks.
-    # -----------------------------------------------------------
-    
-    # Stats for LogSumExp: max (m), sum_exp (d)
-    m1 = -float('inf')
-    d1 = 0.0
-    m2 = -float('inf')
-    d2 = 0.0
-    
-    # Iterate over N in blocks
-    for n_start in range(0, N, BLOCK_N):
-        offs_n = n_start + tl.arange(0, BLOCK_N)
+    # Initialize online softmax stats: max and sum_exp
+    m1 = tl.zeros([BLOCK_M], dtype=tl.float32) - float('inf')
+    s1 = tl.zeros([BLOCK_M], dtype=tl.float32)
+    m2 = tl.zeros([BLOCK_M], dtype=tl.float32) - float('inf')
+    s2 = tl.zeros([BLOCK_M], dtype=tl.float32)
+
+    # Iterate over N in blocks to compute logits and update stats
+    for start_n in range(0, N, BLOCK_N):
+        offs_n = start_n + tl.arange(0, BLOCK_N)
         mask_n = offs_n < N
         
-        # Load Bias: (BLOCK_N,)
-        b1 = tl.load(B1_ptr + offs_n, mask=mask_n, other=0.0).to(tl.float32)
-        b2 = tl.load(B2_ptr + offs_n, mask=mask_n, other=0.0).to(tl.float32)
+        # Accumulators for logits
+        acc1 = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
+        acc2 = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
         
-        # Accumulators (1, BLOCK_N) - initialize with bias
-        acc1 = b1[None, :]
-        acc2 = b2[None, :]
-        
-        # Iterate over K to compute logits tile
-        for k_start in range(0, K, BLOCK_K):
-            offs_k = k_start + tl.arange(0, BLOCK_K)
+        # Compute fused matrix multiplication for this N block
+        for start_k in range(0, K, BLOCK_K):
+            offs_k = start_k + tl.arange(0, BLOCK_K)
             mask_k = offs_k < K
+            mask_mk = (offs_m[:, None] < M) & mask_k[None, :]
             
-            # Load X tile: (1, BLOCK_K)
-            x = tl.load(x_base + offs_k * stride_xk, mask=mask_k, other=0.0).to(tl.float16)
-            x = x[None, :] # Ensure 2D for dot
+            # Load X tile
+            x = tl.load(X_ptr + offs_m[:, None] * stride_xm + offs_k[None, :] * stride_xk, 
+                        mask=mask_mk, other=0.0)
             
-            # Load W tiles: (BLOCK_K, BLOCK_N)
-            w1_ptr_base = W1_ptr + (offs_k[:, None] * stride_w1k + offs_n[None, :] * stride_w1n)
-            w2_ptr_base = W2_ptr + (offs_k[:, None] * stride_w2k + offs_n[None, :] * stride_w2n)
-            
-            w1 = tl.load(w1_ptr_base, mask=mask_k[:, None] & mask_n[None, :], other=0.0).to(tl.float16)
-            w2 = tl.load(w2_ptr_base, mask=mask_k[:, None] & mask_n[None, :], other=0.0).to(tl.float16)
-            
-            # Accumulate dot product
+            # Load W1 tile
+            mask_kn = mask_k[:, None] & mask_n[None, :]
+            w1 = tl.load(W1_ptr + offs_k[:, None] * stride_w1k + offs_n[None, :] * stride_w1n,
+                         mask=mask_kn, other=0.0)
             acc1 += tl.dot(x, w1)
+            
+            # Load W2 tile
+            w2 = tl.load(W2_ptr + offs_k[:, None] * stride_w2k + offs_n[None, :] * stride_w2n,
+                         mask=mask_kn, other=0.0)
             acc2 += tl.dot(x, w2)
+
+        # Add Bias
+        b1 = tl.load(B1_ptr + offs_n, mask=mask_n, other=0.0)
+        acc1 += b1[None, :]
         
-        # Mask padded elements with -inf for Softmax stats
-        acc1 = tl.where(mask_n[None, :], acc1, -float('inf'))
-        acc2 = tl.where(mask_n[None, :], acc2, -float('inf'))
+        b2 = tl.load(B2_ptr + offs_n, mask=mask_n, other=0.0)
+        acc2 += b2[None, :]
+
+        # Store Logits (fp16) to global memory for the second pass
+        mask_mn = (offs_m[:, None] < M) & mask_n[None, :]
+        tl.store(L1_ptr + offs_m[:, None] * stride_l1m + offs_n[None, :] * stride_l1n, 
+                 acc1.to(tl.float16), mask=mask_mn)
+        tl.store(L2_ptr + offs_m[:, None] * stride_l2m + offs_n[None, :] * stride_l2n, 
+                 acc2.to(tl.float16), mask=mask_mn)
+
+        # Online Softmax Update for Set 1
+        # Mask invalid elements with -inf for max calc
+        acc1_masked = tl.where(mask_n[None, :], acc1, -float('inf'))
+        max1_curr = tl.max(acc1_masked, 1)
+        new_m1 = tl.maximum(m1, max1_curr)
         
-        # Update LSE stats 1
-        max1_block = tl.max(acc1, axis=1)
-        new_m1 = tl.maximum(m1, max1_block)
-        # Handle exp stability: exp(m - new_m)
-        d1 = d1 * tl.exp(m1 - new_m1) + tl.sum(tl.exp(acc1 - new_m1), axis=1)
+        # Calculate sum of exp, handling the shift
+        # exp(x - new_max)
+        term1 = tl.exp(acc1_masked - new_m1[:, None])
+        sum1_curr = tl.sum(tl.where(mask_n[None, :], term1, 0.0), 1)
+        
+        s1 = s1 * tl.exp(m1 - new_m1) + sum1_curr
         m1 = new_m1
+
+        # Online Softmax Update for Set 2
+        acc2_masked = tl.where(mask_n[None, :], acc2, -float('inf'))
+        max2_curr = tl.max(acc2_masked, 1)
+        new_m2 = tl.maximum(m2, max2_curr)
         
-        # Update LSE stats 2
-        max2_block = tl.max(acc2, axis=1)
-        new_m2 = tl.maximum(m2, max2_block)
-        d2 = d2 * tl.exp(m2 - new_m2) + tl.sum(tl.exp(acc2 - new_m2), axis=1)
+        term2 = tl.exp(acc2_masked - new_m2[:, None])
+        sum2_curr = tl.sum(tl.where(mask_n[None, :], term2, 0.0), 1)
+        
+        s2 = s2 * tl.exp(m2 - new_m2) + sum2_curr
         m2 = new_m2
 
-    # Final LSE
-    lse1 = m1 + tl.log(d1)
-    lse2 = m2 + tl.log(d2)
+    # Store Log-Sum-Exp results
+    lse1 = m1 + tl.log(s1)
+    lse2 = m2 + tl.log(s2)
     
-    # -----------------------------------------------------------
-    # Pass 2: Compute JSD
-    # Recompute logits and accumulate JSD terms
-    # -----------------------------------------------------------
-    jsd_sum = 0.0
+    tl.store(LSE1_ptr + offs_m, lse1, mask=offs_m < M)
+    tl.store(LSE2_ptr + offs_m, lse2, mask=offs_m < M)
+
+@triton.jit
+def _jsd_kernel(
+    L1_ptr, L2_ptr, LSE1_ptr, LSE2_ptr, Out_ptr,
+    M, N,
+    stride_l1m, stride_l1n,
+    stride_l2m, stride_l2n,
+    BLOCK_N: tl.constexpr
+):
+    pid_m = tl.program_id(0)
+    if pid_m >= M: return
     
-    for n_start in range(0, N, BLOCK_N):
-        offs_n = n_start + tl.arange(0, BLOCK_N)
+    lse1 = tl.load(LSE1_ptr + pid_m)
+    lse2 = tl.load(LSE2_ptr + pid_m)
+    
+    jsd_acc = 0.0
+    
+    for start_n in range(0, N, BLOCK_N):
+        offs_n = start_n + tl.arange(0, BLOCK_N)
         mask_n = offs_n < N
         
-        # Reload/Recompute
-        b1 = tl.load(B1_ptr + offs_n, mask=mask_n, other=0.0).to(tl.float32)
-        b2 = tl.load(B2_ptr + offs_n, mask=mask_n, other=0.0).to(tl.float32)
+        l1 = tl.load(L1_ptr + pid_m * stride_l1m + offs_n * stride_l1n, mask=mask_n, other=-float('inf')).to(tl.float32)
+        l2 = tl.load(L2_ptr + pid_m * stride_l2m + offs_n * stride_l2n, mask=mask_n, other=-float('inf')).to(tl.float32)
         
-        acc1 = b1[None, :]
-        acc2 = b2[None, :]
+        # logP, logQ
+        log_p = l1 - lse1
+        log_q = l2 - lse2
         
-        for k_start in range(0, K, BLOCK_K):
-            offs_k = k_start + tl.arange(0, BLOCK_K)
-            mask_k = offs_k < K
-            
-            x = tl.load(x_base + offs_k * stride_xk, mask=mask_k, other=0.0).to(tl.float16)
-            x = x[None, :]
-            
-            w1_ptr_base = W1_ptr + (offs_k[:, None] * stride_w1k + offs_n[None, :] * stride_w1n)
-            w2_ptr_base = W2_ptr + (offs_k[:, None] * stride_w2k + offs_n[None, :] * stride_w2n)
-            
-            w1 = tl.load(w1_ptr_base, mask=mask_k[:, None] & mask_n[None, :], other=0.0).to(tl.float16)
-            w2 = tl.load(w2_ptr_base, mask=mask_k[:, None] & mask_n[None, :], other=0.0).to(tl.float16)
-            
-            acc1 += tl.dot(x, w1)
-            acc2 += tl.dot(x, w2)
+        # P, Q
+        p = tl.exp(log_p)
+        q = tl.exp(log_q)
         
-        # Mask padded elements to -inf for correct probabilities
-        acc1 = tl.where(mask_n[None, :], acc1, -float('inf'))
-        acc2 = tl.where(mask_n[None, :], acc2, -float('inf'))
+        # M = 0.5 * (P + Q)
+        # logM = log(0.5) + log(P + Q)
+        # log(P + Q) = log(exp(logP) + exp(logQ)) = max(logP, logQ) + log(1 + exp(-abs(logP - logQ)))
+        # Robust LSE for M
+        max_log = tl.maximum(log_p, log_q)
+        diff = -tl.abs(log_p - log_q)
+        # Handle -inf in diff (if one prob is 0)
+        # exp(-inf) is 0.
+        log_sum = max_log + tl.log(1.0 + tl.exp(diff))
+        log_m = -0.69314718056 + log_sum  # ln(0.5) approx
         
-        # Compute probabilities
-        p = tl.exp(acc1 - lse1)
-        q = tl.exp(acc2 - lse2)
+        # KL terms: p * (log_p - log_m)
+        t1 = p * (log_p - log_m)
+        t2 = q * (log_q - log_m)
         
-        # Ensure 0 in padded region
-        p = tl.where(mask_n[None, :], p, 0.0)
-        q = tl.where(mask_n[None, :], q, 0.0)
+        # Mask valid
+        t1 = tl.where(mask_n, t1, 0.0)
+        t2 = tl.where(mask_n, t2, 0.0)
         
-        # Mean distribution
-        m_prob = 0.5 * (p + q)
+        jsd_acc += tl.sum(0.5 * (t1 + t2))
         
-        # log(M) with epsilon for stability (though M=0 implies P=Q=0 so term=0)
-        log_m = tl.log(m_prob + 1e-20)
-        
-        # KL terms: P * (logP - logM) = P * (logits - lse - logM)
-        # If P=0, P*logP -> 0. P*anything finite -> 0.
-        # But logits are -inf. P * logits = 0 * -inf = NaN.
-        # So we must guard the calculation.
-        
-        term1 = p * (acc1 - lse1 - log_m)
-        term2 = q * (acc2 - lse2 - log_m)
-        
-        # Mask out NaN/invalid terms from padding
-        term1 = tl.where(mask_n[None, :], term1, 0.0)
-        term2 = tl.where(mask_n[None, :], term2, 0.0)
-        
-        jsd_sum += tl.sum(term1 + term2)
-        
-    tl.store(Out_ptr + pid_m, 0.5 * jsd_sum)
+    tl.store(Out_ptr + pid_m, jsd_acc)
 
 def fused_linear_jsd(X: torch.Tensor, W1: torch.Tensor, B1: torch.Tensor, W2: torch.Tensor, B2: torch.Tensor) -> torch.Tensor:
     M, K = X.shape
     _, N = W1.shape
     
-    # Output tensor
-    Out = torch.empty((M,), dtype=torch.float32, device=X.device)
+    # Allocations
+    # Intermediate Logits: (M, N) float16
+    logits1 = torch.empty((M, N), device=X.device, dtype=torch.float16)
+    logits2 = torch.empty((M, N), device=X.device, dtype=torch.float16)
     
-    # 1 block per row
-    grid = (M,)
+    # LSE: (M,) float32
+    lse1 = torch.empty((M,), device=X.device, dtype=torch.float32)
+    lse2 = torch.empty((M,), device=X.device, dtype=torch.float32)
     
-    fused_linear_jsd_kernel[grid](
-        X, W1, B1, W2, B2, Out,
+    # Output: (M,) float32
+    output = torch.empty((M,), device=X.device, dtype=torch.float32)
+    
+    # Pass 1: Fused Linear + LSE
+    BLOCK_M = 32 
+    BLOCK_N = 128
+    BLOCK_K = 32
+    
+    grid1 = (triton.cdiv(M, BLOCK_M),)
+    
+    _linear_lse_kernel[grid1](
+        X, W1, B1, W2, B2,
+        logits1, logits2,
+        lse1, lse2,
         M, K, N,
         X.stride(0), X.stride(1),
         W1.stride(0), W1.stride(1),
         W2.stride(0), W2.stride(1),
+        logits1.stride(0), logits1.stride(1),
+        logits2.stride(0), logits2.stride(1),
+        BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K
     )
-    return Out
-"""
-
-# Execute the kernel code to define functions in the current scope
-exec(KERNEL_CODE)
-
-class Solution:
-    def solve(self, spec_path: str = None) -> dict:
-        """
-        Returns the optimized Triton code.
-        """
-        return {"code": KERNEL_CODE}
+    
+    # Pass 2: JSD
+    # Process one row per program instance
+    BLOCK_SIZE_JSD = 1024
+    grid2 = (M,)
+    
+    _jsd_kernel[grid2](
+        logits1, logits2, lse1, lse2, output,
+        M, N,
+        logits1.stride(0), logits1.stride(1),
+        logits2.stride(0), logits2.stride(1),
+        BLOCK_N=BLOCK_SIZE_JSD
+    )
+    
+    return output
+"""}

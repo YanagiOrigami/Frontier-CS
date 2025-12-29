@@ -9,34 +9,27 @@ class Solution:
 
     def solve(self, X: np.ndarray, y: np.ndarray) -> dict:
         """
-        Solves the symbolic regression problem using PySRRegressor.
-        
-        Args:
-            X: Feature matrix of shape (n, 2)
-            y: Target values of shape (n,)
-            
-        Returns:
-            dict containing "expression", "predictions", and "details"
+        Fits a symbolic regression model to the data using PySR.
         """
         # Configure PySRRegressor
-        # Optimized for 8 vCPUs (populations multiple of cores)
-        # Includes trigonometric functions matching the "SinCos" dataset hint
+        # Using settings optimized for 8 vCPUs (CPU-only) and the SinCos dataset characteristics
         model = PySRRegressor(
-            niterations=100,
+            niterations=50,
             binary_operators=["+", "-", "*", "/"],
             unary_operators=["sin", "cos", "exp", "log"],
-            populations=24,
+            populations=16,            # Parallelize across available vCPUs
             population_size=40,
-            maxsize=30,
+            ncycles_per_iteration=500,
+            maxsize=30,                # Allow sufficient complexity for trig combinations
+            model_selection="best",    # Select best model based on accuracy/complexity trade-off
             verbosity=0,
             progress=False,
             random_state=42,
-            model_selection="best",
             deterministic=True
         )
 
         try:
-            # Fit the model to the data
+            # Fit the model
             model.fit(X, y, variable_names=["x1", "x2"])
 
             # Extract the best expression as a sympy object and convert to string
@@ -45,14 +38,10 @@ class Solution:
 
             # Generate predictions
             predictions = model.predict(X)
-            
-            # Ensure predictions format is list
-            if hasattr(predictions, "tolist"):
-                predictions = predictions.tolist()
 
         except Exception:
-            # Fallback strategy: Linear Regression
-            # Used if PySR encounters runtime issues
+            # Fallback to linear regression if symbolic regression fails
+            # This ensures a valid return format is always produced
             x1 = X[:, 0]
             x2 = X[:, 1]
             A = np.column_stack([x1, x2, np.ones_like(x1)])
@@ -60,10 +49,10 @@ class Solution:
             a, b, c = coeffs
             
             expression = f"{a}*x1 + {b}*x2 + {c}"
-            predictions = (a * x1 + b * x2 + c).tolist()
+            predictions = a * x1 + b * x2 + c
 
         return {
             "expression": expression,
-            "predictions": predictions,
+            "predictions": predictions.tolist(),
             "details": {}
         }

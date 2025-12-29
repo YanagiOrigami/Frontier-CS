@@ -3,63 +3,59 @@ from pysr import PySRRegressor
 
 class Solution:
     def __init__(self, **kwargs):
-        pass
-
-    def solve(self, X: np.ndarray, y: np.ndarray) -> dict:
-        """
-        Finds a symbolic expression that fits the given data using PySR.
-
-        The Ripple Dataset is described as having polynomial amplitude modulation
-        with high-frequency trigonometric oscillations, suggesting a function
-        with radial symmetry involving sin/cos and powers of x1 and x2.
-        PySR is configured with operators that can construct such functions.
-        """
-        model = PySRRegressor(
-            niterations=45,
+        self.model = PySRRegressor(
+            procs=8,
+            niterations=60,
             populations=16,
             population_size=40,
-            maxsize=28,
+            maxsize=35,
             binary_operators=["+", "-", "*", "/", "pow"],
             unary_operators=["sin", "cos", "exp", "log"],
-            procs=8,  # Utilize 8 vCPUs as specified in the environment
+            optimizer_nrestarts=3,
+            timeout_in_seconds=300,
             random_state=42,
             verbosity=0,
             progress=False,
-            model_selection="best",
         )
 
-        model.fit(X, y, variable_names=["x1", "x2"])
-
+    def solve(self, X: np.ndarray, y: np.ndarray) -> dict:
         try:
-            # Check if PySR found any equations
-            if model.equations_.empty:
-                raise IndexError("PySR did not find any equations.")
-
-            # Get the best expression as a sympy object and convert to string
-            best_sympy_expr = model.sympy()
-            expression_str = str(best_sympy_expr)
+            self.model.fit(X, y, variable_names=["x1", "x2"])
             
-            # Generate predictions from the best model
-            predictions = model.predict(X)
-            
-            # Extract complexity from the results dataframe
-            # The last row corresponds to the selected best equation
-            best_equation_details = model.equations_.iloc[-1]
-            complexity = int(best_equation_details['complexity'])
+            if self.model.equations_ is not None and not self.model.equations_.empty:
+                best_equation = self.model.get_best()
+                expression = str(best_equation.sympy_format)
+                
+                predictions = self.model.predict(X)
 
-        except (IndexError, AttributeError, ValueError):
-            # Fallback if PySR fails to find a suitable equation
-            expression_str = "0.0"
-            predictions = np.zeros_like(y)
-            complexity = 0
+                return {
+                    "expression": expression,
+                    "predictions": predictions.tolist(),
+                    "details": {
+                        "complexity": int(best_equation.complexity)
+                    }
+                }
+            else:
+                return self._fallback_linear(X, y)
+        except Exception:
+            return self._fallback_linear(X, y)
 
-        # Prepare the 'details' dictionary
-        details = {}
-        if complexity > 0:
-            details["complexity"] = complexity
-            
+    def _fallback_linear(self, X: np.ndarray, y: np.ndarray) -> dict:
+        x1, x2 = X[:, 0], X[:, 1]
+        
+        A = np.c_[x1, x2, np.ones_like(x1)]
+        
+        try:
+            coeffs, _, _, _ = np.linalg.lstsq(A, y, rcond=None)
+            a, b, c = coeffs
+        except np.linalg.LinAlgError:
+            a, b, c = 0.0, 0.0, np.mean(y)
+
+        expression = f"{a:.6f}*x1 + {b:.6f}*x2 + {c:.6f}"
+        predictions = a * x1 + b * x2 + c
+
         return {
-            "expression": expression_str,
+            "expression": expression,
             "predictions": predictions.tolist(),
-            "details": details,
+            "details": {}
         }

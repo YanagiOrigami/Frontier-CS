@@ -4,10 +4,10 @@ import textwrap
 class Solution:
     def solve(self, spec_path: str = None) -> dict:
         code = textwrap.dedent("""
+            import math
             import torch
             import triton
             import triton.language as tl
-
 
             @triton.jit
             def _flash_attn_fwd_kernel(
@@ -16,187 +16,138 @@ class Solution:
                 stride_kz, stride_kh, stride_kn, stride_kd,
                 stride_vz, stride_vh, stride_vn, stride_vd,
                 stride_oz, stride_oh, stride_om, stride_od,
-                Z, H, M,
+                Z, H, M, N, D, DV,
                 sm_scale,
-                N_CTX: tl.constexpr,
+                causal: tl.constexpr,
                 BLOCK_M: tl.constexpr,
                 BLOCK_N: tl.constexpr,
                 BLOCK_DMODEL: tl.constexpr,
-                BLOCK_DVALUE: tl.constexpr,
-                causal: tl.constexpr,
+                BLOCK_DV: tl.constexpr,
             ):
-                pid_m = tl.program_id(0)
-                pid_bh = tl.program_id(1)
+                pid_m = tl.program_id(axis=0)
+                pid_zh = tl.program_id(axis=1)
 
-                # indices
+                z = pid_zh // H
+                h = pid_zh % H
+
                 offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
-                offs_dq = tl.arange(0, BLOCK_DMODEL)
-                offs_dv = tl.arange(0, BLOCK_DVALUE)
+                offs_n = tl.arange(0, BLOCK_N)
+                offs_d = tl.arange(0, BLOCK_DMODEL)
+                offs_dv = tl.arange(0, BLOCK_DV)
 
-                # map pid_bh to z, h
-                bh = pid_bh
-                z = bh // H
-                h = bh - z * H
+                m_mask = offs_m < M
+                d_mask = offs_d < D
+                dv_mask = offs_dv < DV
 
-                # base pointers per (z, h)
-                q_ptrs = Q_ptr + (
-                    z * stride_qz +
-                    h * stride_qh +
-                    offs_m[:, None] * stride_qm +
-                    offs_dq[None, :] * stride_qd
-                )
-
-                # load Q: [BM, Dq]
-                q = tl.load(
-                    q_ptrs,
-                    mask=(offs_m[:, None] < M) & (offs_dq[None, :] < stride_qd * 0 + tl.sum(0 * offs_dq) + BLOCK_DMODEL),  # dummy to keep tl happy
-                    other=0.0
-                )
-                # Mask proper Dq tail using runtime D from strides is not available; instead, rely on caller to ensure BLOCK_DMODEL >= Dq and pad via mask below.
-                # In practice, the mask above doesn't mask D, so correct masking below with tl.where using a constructed mask.
-                # However, for correctness we regenerate a Dq mask by comparing offs_dq to a passed Dq value via stride trick is unreliable.
-                # To avoid complexity, we receive Dq and Dv via BLOCK_DMODEL/BLOCK_DVALUE ensuring they are >= real dims
-                # and use safe loads with other=0.0; no extra action needed since tl.load beyond tensor dims is masked by pointer arithmetic.
-                q = q.to(tl.float32) * sm_scale
+                # Load Q block [BLOCK_M, D]
+                q_ptrs = Q_ptr + z * stride_qz + h * stride_qh + offs_m[:, None] * stride_qm + offs_d[None, :] * stride_qd
+                q = tl.load(q_ptrs, mask=m_mask[:, None] & d_mask[None, :], other=0.0)
+                q = q.to(tl.float32)
 
                 # Initialize streaming softmax state
-                NEG_INFINITY = -1.0e30
-                m_i = tl.full([BLOCK_M], NEG_INFINITY, dtype=tl.float32)
-                l_i = tl.zeros([BLOCK_M], dtype=tl.float32)
-                acc = tl.zeros([BLOCK_M, BLOCK_DVALUE], dtype=tl.float32)
+                m_i = tl.full([BLOCK_M], -1e9, tl.float32)  # running max
+                l_i = tl.zeros([BLOCK_M], tl.float32)       # running sum of exp
+                acc = tl.zeros([BLOCK_M, BLOCK_DV], tl.float32)
 
-                # Loop over K/V blocks
-                for start_n in range(0, N_CTX, BLOCK_N):
+                # Iterate over K/V blocks
+                for start_n in range(0, N, BLOCK_N):
                     offs_n = start_n + tl.arange(0, BLOCK_N)
+                    n_mask = offs_n < N
 
-                    k_ptrs = K_ptr + (
-                        z * stride_kz +
-                        h * stride_kh +
-                        offs_n[:, None] * stride_kn +
-                        offs_dq[None, :] * stride_kd
-                    )
-                    v_ptrs = V_ptr + (
-                        z * stride_vz +
-                        h * stride_vh +
-                        offs_n[:, None] * stride_vn +
-                        offs_dv[None, :] * stride_vd
-                    )
+                    # Load K block [BLOCK_N, D]
+                    k_ptrs = K_ptr + z * stride_kz + h * stride_kh + offs_n[:, None] * stride_kn + offs_d[None, :] * stride_kd
+                    k = tl.load(k_ptrs, mask=n_mask[:, None] & d_mask[None, :], other=0.0).to(tl.float32)
 
-                    k = tl.load(
-                        k_ptrs,
-                        mask=(offs_n[:, None] < N_CTX),
-                        other=0.0
-                    )
-                    v = tl.load(
-                        v_ptrs,
-                        mask=(offs_n[:, None] < N_CTX),
-                        other=0.0
-                    )
+                    # Compute scores = Q @ K^T
+                    scores = tl.dot(q, tl.trans(k)) * sm_scale
 
-                    k = k.to(tl.float32)
-                    v = v.to(tl.float32)
-
-                    # [BM, BN] = [BM, D] x [BN, D]^T
-                    qk = tl.dot(q, tl.trans(k))
-
-                    # Apply masks
-                    # Out-of-bounds N
-                    qk = tl.where(offs_n[None, :] < N_CTX, qk, float("-inf"))
-                    # Out-of-bounds M
-                    qk = tl.where(offs_m[:, None] < M, qk, float("-inf"))
-                    # Causal mask: col > row -> -inf
+                    # Apply causal mask
                     if causal:
-                        row_idx = offs_m[:, None]
-                        col_idx = offs_n[None, :]
-                        causal_mask = col_idx > row_idx
-                        qk = tl.where(causal_mask, float("-inf"), qk)
+                        causal_mask = offs_n[None, :] <= offs_m[:, None]
+                        scores = tl.where(causal_mask, scores, -1e9)
 
-                    # Numerical stability: compute new max
-                    m_ij = tl.max(qk, 1)  # [BM]
+                    # Apply padding masks for m/n
+                    scores = tl.where(m_mask[:, None] & n_mask[None, :], scores, -1e9)
+
+                    # Numerically stable streaming softmax update
+                    m_ij = tl.max(scores, axis=1)
                     m_new = tl.maximum(m_i, m_ij)
-                    # exp scale for previous and current
                     alpha = tl.exp(m_i - m_new)
-                    p = tl.exp(qk - m_new[:, None])
+                    p = tl.exp(scores - m_new[:, None])
+                    l_new = l_i * alpha + tl.sum(p, axis=1)
 
-                    # Update l_i and acc
-                    l_i = l_i * alpha + tl.sum(p, 1)
+                    # Load V block [BLOCK_N, DV]
+                    v_ptrs = V_ptr + z * stride_vz + h * stride_vh + offs_n[:, None] * stride_vn + offs_dv[None, :] * stride_vd
+                    v = tl.load(v_ptrs, mask=n_mask[:, None] & dv_mask[None, :], other=0.0).to(tl.float32)
+
+                    # Update accumulator
                     acc = acc * alpha[:, None] + tl.dot(p, v)
 
+                    # Update running stats
                     m_i = m_new
+                    l_i = l_new
 
-                # Normalize
-                denom = l_i[:, None]
-                denom = tl.where(denom == 0, 1.0, denom)
-                out = acc / denom
+                # Normalize and store output
+                o = acc / l_i[:, None]
+                o_ptrs = O_ptr + z * stride_oz + h * stride_oh + offs_m[:, None] * stride_om + offs_dv[None, :] * stride_od
+                tl.store(o_ptrs, o.to(tl.float16), mask=m_mask[:, None] & dv_mask[None, :])
 
-                # Store output
-                o_ptrs = O_ptr + (
-                    z * stride_oz +
-                    h * stride_oh +
-                    offs_m[:, None] * stride_om +
-                    offs_dv[None, :] * stride_od
-                )
-                tl.store(
-                    o_ptrs,
-                    out.to(tl.float16),
-                    mask=(offs_m[:, None] < M)
-                )
-
-
-            def _next_power_of_two(x: int) -> int:
-                if x <= 1:
-                    return 1
-                return 1 << ((x - 1).bit_length())
-
+            def _torch_flash_attn_reference(Q, K, V, causal=True):
+                # Q: [Z, H, M, D], K: [Z, H, N, D], V: [Z, H, N, DV]
+                Z, H, M, D = Q.shape
+                N = K.shape[2]
+                DV = V.shape[-1]
+                sm_scale = 1.0 / math.sqrt(D)
+                # Use float32 compute for stability
+                q = Q.float()
+                k = K.float()
+                v = V.float()
+                scores = torch.matmul(q, k.transpose(-1, -2)) * sm_scale  # [Z,H,M,N]
+                if causal:
+                    # Create causal mask [M, N]
+                    mask = torch.arange(N, device=Q.device)[None, :] <= torch.arange(M, device=Q.device)[:, None]
+                    scores = scores.masked_fill(~mask, float('-inf'))
+                probs = torch.softmax(scores, dim=-1)
+                out = torch.matmul(probs, v)
+                return out.to(Q.dtype)
 
             def flash_attn(Q: torch.Tensor, K: torch.Tensor, V: torch.Tensor, causal: bool = True) -> torch.Tensor:
                 """
                 Flash attention computation with optional causal masking.
 
                 Args:
-                    Q: Input tensor of shape (Z, H, M, Dq) - query tensor (float16)
-                    K: Input tensor of shape (Z, H, N, Dq) - key tensor (float16)
-                    V: Input tensor of shape (Z, H, N, Dv) - value tensor (float16)
-                    causal: Whether to apply causal masking (default True)
-
+                    Q: (Z, H, M, Dq) float16 CUDA
+                    K: (Z, H, N, Dq) float16 CUDA
+                    V: (Z, H, N, Dv) float16 CUDA
+                    causal: bool
                 Returns:
-                    Output tensor of shape (Z, H, M, Dv) - attention output (float16)
+                    (Z, H, M, Dv) float16 CUDA
                 """
-                assert Q.is_cuda and K.is_cuda and V.is_cuda, "Inputs must be on CUDA"
+                assert Q.dim() == 4 and K.dim() == 4 and V.dim() == 4, "Q,K,V must be 4D"
+                assert Q.shape[0] == K.shape[0] == V.shape[0], "Batch (Z) mismatch"
+                assert Q.shape[1] == K.shape[1] == V.shape[1], "Heads (H) mismatch"
+                assert K.shape[2] == V.shape[2], "Seq length N mismatch between K and V"
+                assert Q.shape[2] > 0 and K.shape[2] > 0, "Empty sequences not supported"
                 assert Q.dtype == torch.float16 and K.dtype == torch.float16 and V.dtype == torch.float16, "Inputs must be float16"
-                Z, H, M, Dq = Q.shape
-                Zk, Hk, N, Dk = K.shape
-                Zv, Hv, Nv, Dv = V.shape
-                assert Z == Zk == Zv and H == Hk == Hv and N == Nv and Dq == Dk, "Shape mismatch"
+                assert Q.is_cuda and K.is_cuda and V.is_cuda, "Inputs must be CUDA tensors"
                 device = Q.device
 
-                O = torch.empty((Z, H, M, Dv), dtype=torch.float16, device=device)
+                Z, H, M, D = Q.shape
+                N = K.shape[2]
+                DV = V.shape[3]
 
-                # Choose tiling parameters
-                BLOCK_DMODEL = _next_power_of_two(Dq)
-                BLOCK_DVALUE = _next_power_of_two(Dv)
-                # Limit to reasonable sizes for register pressure
-                if BLOCK_DMODEL > 128:
-                    BLOCK_DMODEL = 256 if Dq <= 256 else _next_power_of_two(Dq)
-                if BLOCK_DVALUE > 128:
-                    BLOCK_DVALUE = 256 if Dv <= 256 else _next_power_of_two(Dv)
+                # Fallback conditions: very large D or DV not supported by kernel tile size
+                BLOCK_M = 64
+                BLOCK_N = 64
+                BLOCK_DMODEL = 64  # supports D <= 64
+                BLOCK_DV = 128     # supports DV <= 128
 
-                if M >= 2048:
-                    BLOCK_M = 128
-                else:
-                    BLOCK_M = 64
+                if D > BLOCK_DMODEL or DV > BLOCK_DV:
+                    return _torch_flash_attn_reference(Q, K, V, causal=causal)
 
-                if N >= 1024:
-                    BLOCK_N = 128
-                else:
-                    BLOCK_N = 64
+                sm_scale = 1.0 / math.sqrt(D)
 
-                num_warps = 8 if (BLOCK_M >= 128 or BLOCK_N >= 128) else 4
-                num_stages = 2
-
-                # scaling factor for dot-product attention
-                sm_scale = (1.0 / (Dq ** 0.5))
-                sm_scale = torch.tensor(sm_scale, dtype=torch.float32, device=device)
+                O = torch.empty((Z, H, M, DV), dtype=torch.float16, device=device)
 
                 grid = (triton.cdiv(M, BLOCK_M), Z * H)
 
@@ -206,17 +157,16 @@ class Solution:
                     K.stride(0), K.stride(1), K.stride(2), K.stride(3),
                     V.stride(0), V.stride(1), V.stride(2), V.stride(3),
                     O.stride(0), O.stride(1), O.stride(2), O.stride(3),
-                    Z, H, M,
+                    Z, H, M, N, D, DV,
                     sm_scale,
-                    N_CTX=N,
-                    BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N,
-                    BLOCK_DMODEL=BLOCK_DMODEL,
-                    BLOCK_DVALUE=BLOCK_DVALUE,
                     causal=causal,
-                    num_warps=num_warps,
-                    num_stages=num_stages,
+                    BLOCK_M=BLOCK_M,
+                    BLOCK_N=BLOCK_N,
+                    BLOCK_DMODEL=BLOCK_DMODEL,
+                    BLOCK_DV=BLOCK_DV,
+                    num_warps=4,
+                    num_stages=2,
                 )
-
                 return O
         """)
         return {"code": code}

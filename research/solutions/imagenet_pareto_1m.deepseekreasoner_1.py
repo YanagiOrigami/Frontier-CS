@@ -1,74 +1,118 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.optim as optim
 from torch.optim.lr_scheduler import CosineAnnealingLR
+import time
 import math
 
+
 class ResidualBlock(nn.Module):
-    def __init__(self, in_features, out_features, dropout_rate=0.2):
+    def __init__(self, in_features, out_features, dropout=0.1):
         super().__init__()
-        self.linear1 = nn.Linear(in_features, out_features)
+        self.fc1 = nn.Linear(in_features, out_features)
         self.bn1 = nn.BatchNorm1d(out_features)
-        self.linear2 = nn.Linear(out_features, out_features)
+        self.fc2 = nn.Linear(out_features, out_features)
         self.bn2 = nn.BatchNorm1d(out_features)
-        self.dropout = nn.Dropout(dropout_rate)
-        self.relu = nn.ReLU()
+        self.dropout = nn.Dropout(dropout)
         
-        self.shortcut = None
+        self.shortcut = nn.Sequential()
         if in_features != out_features:
-            self.shortcut = nn.Linear(in_features, out_features)
-        
+            self.shortcut = nn.Sequential(
+                nn.Linear(in_features, out_features),
+                nn.BatchNorm1d(out_features)
+            )
+    
     def forward(self, x):
-        identity = x
-        
-        out = self.linear1(x)
-        out = self.bn1(out)
-        out = self.relu(out)
+        residual = self.shortcut(x)
+        out = F.relu(self.bn1(self.fc1(x)))
         out = self.dropout(out)
-        
-        out = self.linear2(out)
-        out = self.bn2(out)
-        
-        if self.shortcut is not None:
-            identity = self.shortcut(identity)
-        
-        out += identity
-        out = self.relu(out)
+        out = self.bn2(self.fc2(out))
+        out += residual
+        out = F.relu(out)
         return out
 
-class EfficientModel(nn.Module):
+
+class BottleneckResidualBlock(nn.Module):
+    def __init__(self, in_features, hidden_features, out_features, dropout=0.1):
+        super().__init__()
+        self.fc1 = nn.Linear(in_features, hidden_features)
+        self.bn1 = nn.BatchNorm1d(hidden_features)
+        self.fc2 = nn.Linear(hidden_features, hidden_features)
+        self.bn2 = nn.BatchNorm1d(hidden_features)
+        self.fc3 = nn.Linear(hidden_features, out_features)
+        self.bn3 = nn.BatchNorm1d(out_features)
+        self.dropout = nn.Dropout(dropout)
+        
+        self.shortcut = nn.Sequential()
+        if in_features != out_features:
+            self.shortcut = nn.Sequential(
+                nn.Linear(in_features, out_features),
+                nn.BatchNorm1d(out_features)
+            )
+    
+    def forward(self, x):
+        residual = self.shortcut(x)
+        out = F.relu(self.bn1(self.fc1(x)))
+        out = self.dropout(out)
+        out = F.relu(self.bn2(self.fc2(out)))
+        out = self.dropout(out)
+        out = self.bn3(self.fc3(out))
+        out += residual
+        out = F.relu(out)
+        return out
+
+
+class EfficientNet(nn.Module):
     def __init__(self, input_dim, num_classes):
         super().__init__()
-        # Carefully designed architecture to maximize capacity within 1M params
-        hidden1 = 512
-        hidden2 = 384
-        hidden3 = 320
-        hidden4 = 256
         
-        self.input_layer = nn.Sequential(
-            nn.Linear(input_dim, hidden1),
-            nn.BatchNorm1d(hidden1),
+        # Stage 1: Initial projection (384 -> 512)
+        self.stem = nn.Sequential(
+            nn.Linear(input_dim, 512),
+            nn.BatchNorm1d(512),
             nn.ReLU(),
-            nn.Dropout(0.3)
+            nn.Dropout(0.1)
         )
         
-        self.res_block1 = ResidualBlock(hidden1, hidden2, dropout_rate=0.25)
-        self.res_block2 = ResidualBlock(hidden2, hidden3, dropout_rate=0.2)
-        self.res_block3 = ResidualBlock(hidden3, hidden4, dropout_rate=0.15)
-        
-        # Attention-like gating mechanism
-        self.attention = nn.Sequential(
-            nn.Linear(hidden4, hidden4 // 4),
-            nn.ReLU(),
-            nn.Linear(hidden4 // 4, hidden4),
-            nn.Sigmoid()
+        # Stage 2: Bottleneck blocks (512 -> 512)
+        self.stage2 = nn.Sequential(
+            BottleneckResidualBlock(512, 256, 512, dropout=0.1),
+            BottleneckResidualBlock(512, 256, 512, dropout=0.1),
         )
         
-        self.output_layer = nn.Linear(hidden4, num_classes)
+        # Stage 3: Reduce dimension (512 -> 384)
+        self.stage3 = nn.Sequential(
+            ResidualBlock(512, 384, dropout=0.1),
+            ResidualBlock(384, 384, dropout=0.1),
+        )
+        
+        # Stage 4: Further reduction (384 -> 256)
+        self.stage4 = nn.Sequential(
+            ResidualBlock(384, 256, dropout=0.1),
+            ResidualBlock(256, 256, dropout=0.1),
+        )
+        
+        # Stage 5: Final reduction (256 -> 128)
+        self.stage5 = nn.Sequential(
+            nn.Linear(256, 128),
+            nn.BatchNorm1d(128),
+            nn.ReLU(),
+            nn.Dropout(0.1)
+        )
+        
+        # Classification head
+        self.classifier = nn.Sequential(
+            nn.Linear(128, 128),
+            nn.BatchNorm1d(128),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+            nn.Linear(128, num_classes)
+        )
         
         # Initialize weights
         self._initialize_weights()
-        
+    
     def _initialize_weights(self):
         for m in self.modules():
             if isinstance(m, nn.Linear):
@@ -80,90 +124,171 @@ class EfficientModel(nn.Module):
                 nn.init.constant_(m.bias, 0)
     
     def forward(self, x):
-        x = self.input_layer(x)
-        x = self.res_block1(x)
-        x = self.res_block2(x)
-        x = self.res_block3(x)
+        x = self.stem(x)
+        x = self.stage2(x)
+        x = self.stage3(x)
+        x = self.stage4(x)
+        x = self.stage5(x)
+        x = self.classifier(x)
+        return x
+    
+    def count_parameters(self):
+        return sum(p.numel() for p in self.parameters() if p.requires_grad)
+
+
+def adjust_model_size(model, input_dim, num_classes, param_limit):
+    """Adjust model architecture to stay within parameter limit"""
+    param_count = model.count_parameters()
+    
+    # If already under limit, return
+    if param_count <= param_limit:
+        return model
+    
+    # Calculate reduction factor
+    current_params = param_count
+    target_params = param_limit
+    reduction_factor = math.sqrt(target_params / current_params)
+    
+    # Create a more compact model
+    hidden1 = max(128, int(512 * reduction_factor))
+    hidden2 = max(128, int(384 * reduction_factor))
+    hidden3 = max(64, int(256 * reduction_factor))
+    
+    class CompactNet(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.net = nn.Sequential(
+                nn.Linear(input_dim, hidden1),
+                nn.BatchNorm1d(hidden1),
+                nn.ReLU(),
+                nn.Dropout(0.1),
+                
+                nn.Linear(hidden1, hidden2),
+                nn.BatchNorm1d(hidden2),
+                nn.ReLU(),
+                nn.Dropout(0.1),
+                
+                nn.Linear(hidden2, hidden3),
+                nn.BatchNorm1d(hidden3),
+                nn.ReLU(),
+                nn.Dropout(0.1),
+                
+                nn.Linear(hidden3, 128),
+                nn.BatchNorm1d(128),
+                nn.ReLU(),
+                nn.Dropout(0.1),
+                
+                nn.Linear(128, num_classes)
+            )
         
-        # Apply attention gating
-        attn_weights = self.attention(x)
-        x = x * attn_weights + x  # Residual attention
-        
-        return self.output_layer(x)
+        def forward(self, x):
+            return self.net(x)
+    
+    return CompactNet()
+
+
+class EarlyStopping:
+    def __init__(self, patience=15, min_delta=0.0001):
+        self.patience = patience
+        self.min_delta = min_delta
+        self.counter = 0
+        self.best_loss = None
+        self.early_stop = False
+    
+    def __call__(self, val_loss):
+        if self.best_loss is None:
+            self.best_loss = val_loss
+        elif val_loss > self.best_loss - self.min_delta:
+            self.counter += 1
+            if self.counter >= self.patience:
+                self.early_stop = True
+        else:
+            self.best_loss = val_loss
+            self.counter = 0
+        return self.early_stop
+
 
 class Solution:
     def solve(self, train_loader, val_loader, metadata: dict = None):
-        device = torch.device(metadata.get("device", "cpu"))
         input_dim = metadata["input_dim"]
         num_classes = metadata["num_classes"]
         param_limit = metadata["param_limit"]
+        device = metadata.get("device", "cpu")
         
-        # Create model with parameter constraint
-        model = EfficientModel(input_dim, num_classes).to(device)
+        # Initialize model
+        model = EfficientNet(input_dim, num_classes)
+        model = model.to(device)
         
-        # Verify parameter count
-        total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-        print(f"Model parameters: {total_params:,}")
+        # Adjust model size if needed
+        param_count = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        if param_count > param_limit:
+            model = adjust_model_size(model, input_dim, num_classes, param_limit)
+            model = model.to(device)
         
-        # Adjust model if over limit
-        if total_params > param_limit:
-            # Create simpler model if over limit
-            model = self._create_simpler_model(input_dim, num_classes).to(device)
-            total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-            print(f"Adjusted model parameters: {total_params:,}")
+        # Double-check parameter count
+        final_param_count = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        if final_param_count > param_limit:
+            # Create minimal viable model
+            class MinimalNet(nn.Module):
+                def __init__(self):
+                    super().__init__()
+                    self.fc1 = nn.Linear(input_dim, 256)
+                    self.bn1 = nn.BatchNorm1d(256)
+                    self.fc2 = nn.Linear(256, 128)
+                    self.bn2 = nn.BatchNorm1d(128)
+                    self.fc3 = nn.Linear(128, num_classes)
+                
+                def forward(self, x):
+                    x = F.relu(self.bn1(self.fc1(x)))
+                    x = F.relu(self.bn2(self.fc2(x)))
+                    x = self.fc3(x)
+                    return x
+            
+            model = MinimalNet().to(device)
         
         # Training setup
         criterion = nn.CrossEntropyLoss()
-        optimizer = optim.AdamW(model.parameters(), lr=0.001, weight_decay=1e-4)
-        scheduler = CosineAnnealingLR(optimizer, T_max=100, eta_min=1e-6)
+        optimizer = optim.AdamW(model.parameters(), lr=0.001, weight_decay=0.01)
+        scheduler = CosineAnnealingLR(optimizer, T_max=50, eta_min=1e-5)
+        early_stopping = EarlyStopping(patience=15)
         
-        # Mixed precision training for efficiency
-        scaler = torch.cuda.amp.GradScaler() if device.type == 'cuda' else None
-        
-        best_val_acc = 0
+        # Training loop
+        num_epochs = 100
+        best_val_loss = float('inf')
         best_model_state = None
-        patience = 15
-        patience_counter = 0
-        
-        num_epochs = 200
         
         for epoch in range(num_epochs):
             # Training phase
             model.train()
-            train_loss = 0
-            correct = 0
-            total = 0
+            train_loss = 0.0
+            train_correct = 0
+            train_total = 0
             
             for batch_idx, (inputs, targets) in enumerate(train_loader):
                 inputs, targets = inputs.to(device), targets.to(device)
                 
                 optimizer.zero_grad()
+                outputs = model(inputs)
+                loss = criterion(outputs, targets)
+                loss.backward()
                 
-                if scaler is not None:
-                    with torch.cuda.amp.autocast():
-                        outputs = model(inputs)
-                        loss = criterion(outputs, targets)
-                    scaler.scale(loss).backward()
-                    scaler.step(optimizer)
-                    scaler.update()
-                else:
-                    outputs = model(inputs)
-                    loss = criterion(outputs, targets)
-                    loss.backward()
-                    optimizer.step()
+                # Gradient clipping
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                
+                optimizer.step()
                 
                 train_loss += loss.item()
                 _, predicted = outputs.max(1)
-                total += targets.size(0)
-                correct += predicted.eq(targets).sum().item()
+                train_total += targets.size(0)
+                train_correct += predicted.eq(targets).sum().item()
             
-            train_acc = 100. * correct / total
+            train_acc = 100. * train_correct / train_total
             
             # Validation phase
             model.eval()
-            val_loss = 0
-            correct = 0
-            total = 0
+            val_loss = 0.0
+            val_correct = 0
+            val_total = 0
             
             with torch.no_grad():
                 for inputs, targets in val_loader:
@@ -173,74 +298,27 @@ class Solution:
                     
                     val_loss += loss.item()
                     _, predicted = outputs.max(1)
-                    total += targets.size(0)
-                    correct += predicted.eq(targets).sum().item()
+                    val_total += targets.size(0)
+                    val_correct += predicted.eq(targets).sum().item()
             
-            val_acc = 100. * correct / total
+            val_acc = 100. * val_correct / val_total
+            avg_val_loss = val_loss / len(val_loader)
             
             # Update scheduler
             scheduler.step()
             
-            # Early stopping with patience
-            if val_acc > best_val_acc:
-                best_val_acc = val_acc
+            # Save best model
+            if avg_val_loss < best_val_loss:
+                best_val_loss = avg_val_loss
                 best_model_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
-                patience_counter = 0
-            else:
-                patience_counter += 1
             
-            if epoch % 20 == 0:
-                print(f'Epoch {epoch:3d}: Train Acc: {train_acc:.2f}%, Val Acc: {val_acc:.2f}%')
-            
-            if patience_counter >= patience:
-                print(f'Early stopping at epoch {epoch}')
+            # Check early stopping
+            if early_stopping(avg_val_loss):
                 break
         
         # Load best model
         if best_model_state is not None:
             model.load_state_dict(best_model_state)
         
+        model.eval()
         return model
-    
-    def _create_simpler_model(self, input_dim, num_classes):
-        """Fallback model if main model exceeds parameter limit"""
-        class SimpleModel(nn.Module):
-            def __init__(self, input_dim, num_classes):
-                super().__init__()
-                hidden1 = 384
-                hidden2 = 256
-                hidden3 = 192
-                
-                self.network = nn.Sequential(
-                    nn.Linear(input_dim, hidden1),
-                    nn.BatchNorm1d(hidden1),
-                    nn.ReLU(),
-                    nn.Dropout(0.3),
-                    
-                    nn.Linear(hidden1, hidden2),
-                    nn.BatchNorm1d(hidden2),
-                    nn.ReLU(),
-                    nn.Dropout(0.25),
-                    
-                    nn.Linear(hidden2, hidden3),
-                    nn.BatchNorm1d(hidden3),
-                    nn.ReLU(),
-                    nn.Dropout(0.2),
-                    
-                    nn.Linear(hidden3, num_classes)
-                )
-                
-                # Initialize weights
-                for m in self.modules():
-                    if isinstance(m, nn.Linear):
-                        nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
-                        if m.bias is not None:
-                            nn.init.constant_(m.bias, 0)
-                    elif isinstance(m, nn.BatchNorm1d):
-                        nn.init.constant_(m.weight, 1)
-                        nn.init.constant_(m.bias, 0)
-            
-            def forward(self, x):
-                return self.network(x)
-        
-        return SimpleModel(input_dim, num_classes)

@@ -1,352 +1,378 @@
 import os
 import math
 import copy
+import time
+from typing import Optional, Tuple, List, Dict
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 
-def _param_count_trainable(model: nn.Module) -> int:
+def _set_torch_threads():
+    try:
+        n = os.cpu_count() or 8
+        torch.set_num_threads(min(8, n))
+        torch.set_num_interop_threads(min(2, n))
+    except Exception:
+        pass
+
+
+def _count_trainable_params(model: nn.Module) -> int:
     return sum(p.numel() for p in model.parameters() if p.requires_grad)
 
 
-def _collect_from_loader(loader):
-    xs, ys = [], []
-    for batch in loader:
-        if isinstance(batch, (list, tuple)) and len(batch) >= 2:
-            x, y = batch[0], batch[1]
-        else:
-            raise ValueError("Unexpected batch format from loader.")
-        xs.append(x.detach().to(dtype=torch.float32, device="cpu"))
-        ys.append(y.detach().to(dtype=torch.long, device="cpu"))
-    x = torch.cat(xs, dim=0).contiguous()
-    y = torch.cat(ys, dim=0).contiguous()
+@torch.no_grad()
+def _collect_xy(loader) -> Tuple[torch.Tensor, torch.Tensor]:
+    xs = []
+    ys = []
+    for xb, yb in loader:
+        if isinstance(xb, (list, tuple)):
+            xb = xb[0]
+        xs.append(xb.detach().cpu())
+        ys.append(yb.detach().cpu())
+    x = torch.cat(xs, dim=0)
+    y = torch.cat(ys, dim=0).long()
     return x, y
 
 
 @torch.no_grad()
-def _accuracy_core(core: nn.Module, x: torch.Tensor, y: torch.Tensor, bs: int = 1024) -> float:
-    core.eval()
-    n = y.numel()
+def _accuracy(model: nn.Module, loader, device: str = "cpu") -> float:
+    model.eval()
     correct = 0
-    for i in range(0, n, bs):
-        xb = x[i:i + bs]
-        yb = y[i:i + bs]
-        logits = core(xb)
+    total = 0
+    for xb, yb in loader:
+        xb = xb.to(device)
+        yb = yb.to(device)
+        logits = model(xb)
         pred = logits.argmax(dim=1)
         correct += (pred == yb).sum().item()
-    return correct / max(1, n)
+        total += yb.numel()
+    return (correct / total) if total > 0 else 0.0
 
 
-def _iterate_minibatches(n: int, batch_size: int, generator: torch.Generator):
-    perm = torch.randperm(n, generator=generator)
-    for i in range(0, n, batch_size):
-        yield perm[i:i + batch_size]
-
-
-class _StandardizedWrapper(nn.Module):
-    def __init__(self, core: nn.Module, mean: torch.Tensor, std: torch.Tensor):
+class _Normalize(nn.Module):
+    def __init__(self, mean: torch.Tensor, inv_std: torch.Tensor):
         super().__init__()
-        self.core = core
-        self.register_buffer("mean", mean.clone().detach().to(dtype=torch.float32, device="cpu"))
-        self.register_buffer("std", std.clone().detach().to(dtype=torch.float32, device="cpu"))
+        self.register_buffer("mean", mean.clone().detach())
+        self.register_buffer("inv_std", inv_std.clone().detach())
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if x.dim() == 1:
-            x = x.unsqueeze(0)
-        x = x.to(dtype=torch.float32)
-        x = (x - self.mean) / self.std
-        return self.core(x)
+        return (x - self.mean) * self.inv_std
 
 
-class _WideResMLPCore(nn.Module):
-    def __init__(self, input_dim: int, num_classes: int, hidden_dim: int, dropout: float = 0.12):
+class _LDAClassifier(nn.Module):
+    def __init__(self, mean: torch.Tensor, inv_std: torch.Tensor, W: torch.Tensor, b: torch.Tensor):
         super().__init__()
-        self.fc1 = nn.Linear(input_dim, hidden_dim)
-        self.bn1 = nn.BatchNorm1d(hidden_dim)
-        self.fc2 = nn.Linear(hidden_dim, hidden_dim)
-        self.bn2 = nn.BatchNorm1d(hidden_dim)
-        self.fc3 = nn.Linear(hidden_dim, num_classes)
+        self.norm = _Normalize(mean, inv_std)
+        self.register_buffer("W", W.clone().detach())
+        self.register_buffer("b", b.clone().detach())
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.norm(x)
+        return x.matmul(self.W) + self.b
+
+
+class _BottleneckResidualBlock(nn.Module):
+    def __init__(self, width: int, bottleneck: int, dropout: float):
+        super().__init__()
+        self.ln = nn.LayerNorm(width)
+        self.fc1 = nn.Linear(width, bottleneck)
+        self.fc2 = nn.Linear(bottleneck, width)
+        self.dropout = nn.Dropout(dropout)
         self.act = nn.GELU()
-        self.drop = nn.Dropout(dropout)
-
-        self._init_weights()
-
-    def _init_weights(self):
-        for m in self.modules():
-            if isinstance(m, nn.Linear):
-                nn.init.kaiming_normal_(m.weight, nonlinearity="relu")
-                if m.bias is not None:
-                    nn.init.zeros_(m.bias)
-            elif isinstance(m, nn.BatchNorm1d):
-                nn.init.ones_(m.weight)
-                nn.init.zeros_(m.bias)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x1 = self.drop(self.act(self.bn1(self.fc1(x))))
-        x2 = self.drop(self.act(self.bn2(self.fc2(x1))))
-        x2 = x1 + x2
-        logits = self.fc3(x2)
-        return logits
+        h = self.ln(x)
+        h = self.fc1(h)
+        h = self.act(h)
+        h = self.dropout(h)
+        h = self.fc2(h)
+        h = self.dropout(h)
+        return x + h
 
 
-class _EnsembleCore(nn.Module):
-    def __init__(self, core_a: nn.Module, core_b: nn.Module, alpha: float = 0.5):
+class _ResidualBottleneckMLP(nn.Module):
+    def __init__(
+        self,
+        input_dim: int,
+        num_classes: int,
+        mean: torch.Tensor,
+        inv_std: torch.Tensor,
+        width: int = 1728,
+        bottleneck: int = 384,
+        blocks: int = 3,
+        dropout: float = 0.10,
+    ):
         super().__init__()
-        self.core_a = core_a
-        self.core_b = core_b
-        self.alpha = float(alpha)
+        self.norm = _Normalize(mean, inv_std)
+        self.in_ln = nn.LayerNorm(input_dim)
+        self.stem = nn.Linear(input_dim, width)
+        self.stem_act = nn.GELU()
+        self.stem_ln = nn.LayerNorm(width)
+        self.blocks = nn.ModuleList([_BottleneckResidualBlock(width, bottleneck, dropout) for _ in range(blocks)])
+        self.final_ln = nn.LayerNorm(width)
+        self.head = nn.Linear(width, num_classes)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.alpha * self.core_a(x) + (1.0 - self.alpha) * self.core_b(x)
+        x = self.norm(x)
+        x = self.in_ln(x)
+        x = self.stem(x)
+        x = self.stem_act(x)
+        x = self.stem_ln(x)
+        for blk in self.blocks:
+            x = blk(x)
+        x = self.final_ln(x)
+        return self.head(x)
 
 
-def _compute_standardizer(x_train: torch.Tensor):
-    mean = x_train.mean(dim=0)
-    var = (x_train - mean).pow(2).mean(dim=0)
-    std = var.sqrt().clamp_min(1e-6)
-    return mean, std
+def _compute_standardization(x: torch.Tensor, eps: float = 1e-6) -> Tuple[torch.Tensor, torch.Tensor]:
+    mean = x.mean(dim=0)
+    var = x.var(dim=0, unbiased=False)
+    inv_std = torch.rsqrt(var + eps)
+    return mean, inv_std
 
 
-def _lda_init_weights(x_train_s: torch.Tensor, y_train: torch.Tensor, num_classes: int, reg: float = 1e-3, shrink: float = 0.10):
-    n, d = x_train_s.shape
-    c = num_classes
+def _build_lda_from_data(
+    x_train: torch.Tensor,
+    y_train: torch.Tensor,
+    input_dim: int,
+    num_classes: int,
+    alphas: List[float],
+    x_val: Optional[torch.Tensor] = None,
+    y_val: Optional[torch.Tensor] = None,
+) -> Tuple[nn.Module, float]:
+    mean, inv_std = _compute_standardization(x_train)
+    xtr = (x_train - mean) * inv_std
+    xtr64 = xtr.double()
 
-    counts = torch.bincount(y_train, minlength=c).to(dtype=torch.float32)
-    counts = counts.clamp_min(1.0)
-    sums = torch.zeros((c, d), dtype=torch.float32)
-    sums.index_add_(0, y_train, x_train_s)
-    means = sums / counts.unsqueeze(1)
-
-    xc = x_train_s - means[y_train]
-    denom = max(1, n - c)
-    cov = (xc.t() @ xc) / float(denom)
-
-    cov64 = cov.to(dtype=torch.float64)
-    mu = (torch.trace(cov64) / float(d)).item()
-    cov64 = (1.0 - shrink) * cov64 + shrink * (mu * torch.eye(d, dtype=torch.float64))
-    cov64 = cov64 + (reg * torch.eye(d, dtype=torch.float64))
-
-    chol = torch.linalg.cholesky(cov64)
-    tmp = torch.cholesky_solve(means.to(dtype=torch.float64).t().contiguous(), chol)  # [d, c]
-    w = tmp.t().to(dtype=torch.float32).contiguous()  # [c, d]
-    diag = (means.to(dtype=torch.float64) * tmp.t()).sum(dim=1)  # [c]
-    b = (-0.5 * diag).to(dtype=torch.float32).contiguous()
-    return w, b
-
-
-def _train_linear(core: nn.Linear, x_train_s: torch.Tensor, y_train: torch.Tensor, x_val_s: torch.Tensor, y_val: torch.Tensor,
-                  epochs: int = 60, batch_size: int = 512, lr_max: float = 2e-2, wd: float = 2e-4, label_smoothing: float = 0.05):
-    n = y_train.numel()
-    gen = torch.Generator(device="cpu")
-    gen.manual_seed(12345)
-
-    opt = torch.optim.AdamW(core.parameters(), lr=lr_max, weight_decay=wd)
-
-    warmup = min(5, epochs)
-    lr_min = lr_max * 0.08
-
-    best_acc = -1.0
-    best_state = copy.deepcopy(core.state_dict())
-    no_imp = 0
-    patience = 10
-
-    for epoch in range(epochs):
-        if epoch < warmup:
-            lr = lr_max * float(epoch + 1) / float(max(1, warmup))
+    means = torch.zeros((num_classes, input_dim), dtype=torch.float64)
+    counts = torch.zeros((num_classes,), dtype=torch.float64)
+    for c in range(num_classes):
+        mask = (y_train == c)
+        if mask.any():
+            xc = xtr64[mask]
+            means[c] = xc.mean(dim=0)
+            counts[c] = mask.sum().item()
         else:
-            t = float(epoch - warmup) / float(max(1, epochs - warmup))
-            lr = lr_min + 0.5 * (lr_max - lr_min) * (1.0 + math.cos(math.pi * t))
-        for pg in opt.param_groups:
-            pg["lr"] = lr
+            means[c] = 0.0
+            counts[c] = 1.0
 
-        core.train()
-        for idx in _iterate_minibatches(n, batch_size, gen):
-            xb = x_train_s.index_select(0, idx)
-            yb = y_train.index_select(0, idx)
-            opt.zero_grad(set_to_none=True)
-            logits = core(xb)
-            loss = F.cross_entropy(logits, yb, label_smoothing=label_smoothing)
-            loss.backward()
-            nn.utils.clip_grad_norm_(core.parameters(), 5.0)
-            opt.step()
+    n = xtr64.shape[0]
+    xm = xtr64.mean(dim=0, keepdim=True)
+    xc = xtr64 - xm
+    cov = (xc.t().matmul(xc)) / max(1, (n - 1))
+    cov = (cov + cov.t()) * 0.5
 
-        acc = _accuracy_core(core, x_val_s, y_val)
-        if acc > best_acc + 1e-6:
-            best_acc = acc
-            best_state = copy.deepcopy(core.state_dict())
-            no_imp = 0
-        else:
-            no_imp += 1
-            if no_imp >= patience:
-                break
+    evals, evecs = torch.linalg.eigh(cov)
+    evals = torch.clamp(evals, min=1e-12)
+    m = evals.mean()
 
-    core.load_state_dict(best_state)
-    return best_acc
-
-
-def _build_mlp_core_under_limit(input_dim: int, num_classes: int, param_limit: int, reserve_params: int = 0):
-    limit = max(1, param_limit - reserve_params)
-
-    # Params for WideResMLPCore:
-    # total = h^2 + h*(D + C + 6) + C
-    D, C = input_dim, num_classes
-    a = 1
-    b = (D + C + 6)
-    c0 = C - limit
-    disc = b * b - 4 * a * c0
-    if disc <= 0:
-        h0 = 256
+    if x_val is not None and y_val is not None:
+        xva = ((x_val - mean) * inv_std).double()
+        yva = y_val.long()
     else:
-        h0 = int(((-b + math.isqrt(int(disc))) // (2 * a)) if disc > 0 else 256)
-        h0 = max(128, h0)
-
-    # Round down to a "nice" multiple and search downward
-    h = (h0 // 4) * 4
-    h = max(128, h)
-    while h >= 128:
-        core = _WideResMLPCore(D, C, h, dropout=0.12)
-        if _param_count_trainable(core) <= limit:
-            return core, h
-        h -= 4
-
-    core = _WideResMLPCore(D, C, 128, dropout=0.12)
-    return core, 128
-
-
-def _train_mlp(core: nn.Module, x_train_s: torch.Tensor, y_train: torch.Tensor, x_val_s: torch.Tensor, y_val: torch.Tensor,
-               epochs: int = 120, batch_size: int = 512, lr_max: float = 3e-3, wd: float = 1.5e-4,
-               label_smoothing: float = 0.10, noise_std: float = 0.03):
-    n = y_train.numel()
-    gen = torch.Generator(device="cpu")
-    gen.manual_seed(54321)
-
-    opt = torch.optim.AdamW(core.parameters(), lr=lr_max, weight_decay=wd)
-    warmup = min(8, epochs)
-    lr_min = lr_max * 0.05
+        xva = None
+        yva = None
 
     best_acc = -1.0
-    best_state = copy.deepcopy(core.state_dict())
-    no_imp = 0
-    patience = 18
+    best_W = None
+    best_b = None
+    best_alpha = None
 
-    for epoch in range(epochs):
-        if epoch < warmup:
-            lr = lr_max * float(epoch + 1) / float(max(1, warmup))
+    Qt_meansT = evecs.t().matmul(means.t())  # (d, C)
+    for alpha in alphas:
+        lam = (1.0 - alpha) * evals + alpha * m
+        inv_lam = 1.0 / torch.clamp(lam, min=1e-12)
+        tmp = inv_lam.unsqueeze(1) * Qt_meansT
+        W64 = evecs.matmul(tmp)  # (d, C)
+        quad = torch.sum(means.t() * W64, dim=0)  # (C,)
+        b64 = (-0.5 * quad)
+
+        if xva is None:
+            acc = 0.0
         else:
-            t = float(epoch - warmup) / float(max(1, epochs - warmup))
-            lr = lr_min + 0.5 * (lr_max - lr_min) * (1.0 + math.cos(math.pi * t))
-        for pg in opt.param_groups:
-            pg["lr"] = lr
+            logits = xva.matmul(W64) + b64
+            pred = logits.argmax(dim=1)
+            acc = (pred == yva).double().mean().item()
 
-        core.train()
-        for idx in _iterate_minibatches(n, batch_size, gen):
-            xb = x_train_s.index_select(0, idx)
-            yb = y_train.index_select(0, idx)
-            if noise_std > 0:
-                xb = xb + noise_std * torch.randn_like(xb)
-            opt.zero_grad(set_to_none=True)
-            logits = core(xb)
-            loss = F.cross_entropy(logits, yb, label_smoothing=label_smoothing)
-            loss.backward()
-            nn.utils.clip_grad_norm_(core.parameters(), 2.0)
-            opt.step()
-
-        acc = _accuracy_core(core, x_val_s, y_val)
-        if acc > best_acc + 1e-6:
+        if acc > best_acc:
             best_acc = acc
-            best_state = copy.deepcopy(core.state_dict())
-            no_imp = 0
+            best_W = W64
+            best_b = b64
+            best_alpha = alpha
+
+    if best_W is None:
+        alpha = 0.1
+        lam = (1.0 - alpha) * evals + alpha * m
+        inv_lam = 1.0 / torch.clamp(lam, min=1e-12)
+        tmp = inv_lam.unsqueeze(1) * Qt_meansT
+        best_W = evecs.matmul(tmp)
+        quad = torch.sum(means.t() * best_W, dim=0)
+        best_b = (-0.5 * quad)
+        best_acc = -1.0
+        best_alpha = alpha
+
+    model = _LDAClassifier(mean.float(), inv_std.float(), best_W.float(), best_b.float())
+    return model, float(best_acc)
+
+
+def _train_mlp(
+    model: nn.Module,
+    train_loader,
+    val_loader,
+    device: str,
+    max_epochs: int = 40,
+    patience: int = 8,
+    lr: float = 2e-3,
+    weight_decay: float = 2e-2,
+    label_smoothing: float = 0.08,
+    mixup_alpha: float = 0.2,
+    grad_clip: float = 1.0,
+) -> Tuple[nn.Module, float]:
+    model.to(device)
+    opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
+    total_steps = max(1, max_epochs * max(1, len(train_loader)))
+    sched = torch.optim.lr_scheduler.OneCycleLR(
+        opt,
+        max_lr=lr,
+        total_steps=total_steps,
+        pct_start=0.2,
+        div_factor=10.0,
+        final_div_factor=50.0,
+        anneal_strategy="cos",
+    )
+
+    beta_dist = torch.distributions.Beta(mixup_alpha, mixup_alpha) if mixup_alpha and mixup_alpha > 0 else None
+
+    best_state = None
+    best_val = -1.0
+    bad = 0
+
+    step = 0
+    for epoch in range(max_epochs):
+        model.train()
+        for xb, yb in train_loader:
+            xb = xb.to(device)
+            yb = yb.to(device)
+
+            if beta_dist is not None and xb.size(0) >= 2:
+                lam = float(beta_dist.sample().clamp(0.0, 1.0).item())
+                perm = torch.randperm(xb.size(0), device=device)
+                xb2 = xb[perm]
+                yb2 = yb[perm]
+                xmix = lam * xb + (1.0 - lam) * xb2
+                logits = model(xmix)
+                loss1 = F.cross_entropy(logits, yb, label_smoothing=label_smoothing)
+                loss2 = F.cross_entropy(logits, yb2, label_smoothing=label_smoothing)
+                loss = lam * loss1 + (1.0 - lam) * loss2
+            else:
+                logits = model(xb)
+                loss = F.cross_entropy(logits, yb, label_smoothing=label_smoothing)
+
+            opt.zero_grad(set_to_none=True)
+            loss.backward()
+            if grad_clip is not None and grad_clip > 0:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+            opt.step()
+            sched.step()
+            step += 1
+
+        val_acc = _accuracy(model, val_loader, device=device)
+        if val_acc > best_val + 1e-6:
+            best_val = val_acc
+            best_state = copy.deepcopy(model.state_dict())
+            bad = 0
         else:
-            no_imp += 1
-            if no_imp >= patience:
+            bad += 1
+            if bad >= patience:
                 break
 
-    core.load_state_dict(best_state)
-    return best_acc
+    if best_state is not None:
+        model.load_state_dict(best_state)
+    model.eval()
+    return model, float(best_val)
 
 
 class Solution:
     def solve(self, train_loader, val_loader, metadata: dict = None) -> torch.nn.Module:
+        _set_torch_threads()
         if metadata is None:
             metadata = {}
+        device = str(metadata.get("device", "cpu"))
         input_dim = int(metadata.get("input_dim", 384))
         num_classes = int(metadata.get("num_classes", 128))
         param_limit = int(metadata.get("param_limit", 5_000_000))
-        baseline_acc = float(metadata.get("baseline_accuracy", 0.88))
 
-        try:
-            torch.set_num_threads(min(8, os.cpu_count() or 8))
-        except Exception:
-            pass
         torch.manual_seed(0)
 
-        x_train, y_train = _collect_from_loader(train_loader)
-        x_val, y_val = _collect_from_loader(val_loader)
+        x_train, y_train = _collect_xy(train_loader)
+        x_val, y_val = _collect_xy(val_loader)
 
-        if x_train.dim() != 2 or x_train.shape[1] != input_dim:
-            x_train = x_train.view(x_train.shape[0], -1).contiguous()
-        if x_val.dim() != 2 or x_val.shape[1] != input_dim:
-            x_val = x_val.view(x_val.shape[0], -1).contiguous()
+        alphas = [0.0, 0.02, 0.05, 0.1, 0.2, 0.4]
+        lda_model, lda_val_acc = _build_lda_from_data(
+            x_train=x_train,
+            y_train=y_train,
+            input_dim=input_dim,
+            num_classes=num_classes,
+            alphas=alphas,
+            x_val=x_val,
+            y_val=y_val,
+        )
+        lda_model.to(device)
 
-        mean, std = _compute_standardizer(x_train)
-        x_train_s = ((x_train - mean) / std).contiguous()
-        x_val_s = ((x_val - mean) / std).contiguous()
+        mean, inv_std = _compute_standardization(x_train)
 
-        # Linear model (LDA init + short CE fine-tune)
-        w_init, b_init = _lda_init_weights(x_train_s, y_train, num_classes=num_classes, reg=2e-3, shrink=0.12)
-        lin_core = nn.Linear(input_dim, num_classes)
-        with torch.no_grad():
-            lin_core.weight.copy_(w_init)
-            lin_core.bias.copy_(b_init)
+        width, bottleneck, blocks, dropout = 1728, 384, 3, 0.10
+        mlp_model = _ResidualBottleneckMLP(
+            input_dim=input_dim,
+            num_classes=num_classes,
+            mean=mean.float(),
+            inv_std=inv_std.float(),
+            width=width,
+            bottleneck=bottleneck,
+            blocks=blocks,
+            dropout=dropout,
+        )
+        while _count_trainable_params(mlp_model) > param_limit and width > 256:
+            width = max(256, width - 64)
+            bottleneck = min(bottleneck, max(64, width // 4))
+            blocks = min(blocks, 4)
+            mlp_model = _ResidualBottleneckMLP(
+                input_dim=input_dim,
+                num_classes=num_classes,
+                mean=mean.float(),
+                inv_std=inv_std.float(),
+                width=width,
+                bottleneck=bottleneck,
+                blocks=blocks,
+                dropout=dropout,
+            )
 
-        lin_acc = _train_linear(
-            lin_core, x_train_s, y_train, x_val_s, y_val,
-            epochs=70, batch_size=512, lr_max=2.5e-2, wd=2e-4, label_smoothing=0.04
+        mlp_params = _count_trainable_params(mlp_model)
+        if mlp_params > param_limit:
+            return lda_model
+
+        max_epochs = 20 if lda_val_acc >= 0.97 else 45
+        patience = 6 if lda_val_acc >= 0.97 else 10
+
+        mlp_model, mlp_val_acc = _train_mlp(
+            model=mlp_model,
+            train_loader=train_loader,
+            val_loader=val_loader,
+            device=device,
+            max_epochs=max_epochs,
+            patience=patience,
+            lr=2.2e-3,
+            weight_decay=2e-2,
+            label_smoothing=0.08,
+            mixup_alpha=0.2 if lda_val_acc < 0.985 else 0.1,
+            grad_clip=1.0,
         )
 
-        # If already very strong, return linear
-        if lin_acc >= max(baseline_acc + 0.06, 0.94):
-            model = _StandardizedWrapper(lin_core, mean, std)
-            if _param_count_trainable(model) > param_limit:
-                for p in model.parameters():
-                    p.requires_grad_(False)
-            model.eval()
-            return model
-
-        # Train a wide residual MLP under budget (reserve space for possible ensemble)
-        reserve_for_lin = _param_count_trainable(lin_core)
-        mlp_core, h_used = _build_mlp_core_under_limit(input_dim, num_classes, param_limit, reserve_params=reserve_for_lin)
-
-        mlp_acc = _train_mlp(
-            mlp_core, x_train_s, y_train, x_val_s, y_val,
-            epochs=140, batch_size=512, lr_max=3.2e-3, wd=1.6e-4,
-            label_smoothing=0.10, noise_std=0.03
-        )
-
-        # Consider simple ensemble if within budget
-        best_choice = "mlp"
-        best_acc = mlp_acc
-        best_model = _StandardizedWrapper(mlp_core, mean, std)
-
-        if lin_acc > best_acc + 1e-6:
-            best_choice = "lin"
-            best_acc = lin_acc
-            best_model = _StandardizedWrapper(lin_core, mean, std)
-
-        ens_core = _EnsembleCore(mlp_core, lin_core, alpha=0.5)
-        ens_model = _StandardizedWrapper(ens_core, mean, std)
-        if _param_count_trainable(ens_model) <= param_limit:
-            ens_acc = _accuracy_core(ens_core, x_val_s, y_val)
-            if ens_acc > best_acc + 5e-4:
-                best_choice = "ens"
-                best_acc = ens_acc
-                best_model = ens_model
-
-        if _param_count_trainable(best_model) > param_limit:
-            # Last-resort safety: freeze parameters so trainable param count is 0
-            for p in best_model.parameters():
-                p.requires_grad_(False)
-
-        best_model.eval()
-        return best_model
+        if mlp_val_acc >= lda_val_acc:
+            mlp_model.to(device)
+            return mlp_model
+        else:
+            lda_model.to(device)
+            return lda_model

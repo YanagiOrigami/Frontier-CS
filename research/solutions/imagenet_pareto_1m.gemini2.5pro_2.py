@@ -1,40 +1,65 @@
 import torch
 import torch.nn as nn
 import torch.optim as optim
+from copy import deepcopy
+from typing import Dict, Optional
 
-class CustomModel(nn.Module):
-    """
-    A custom MLP architecture designed to maximize parameter usage under the 1M limit.
-    With hidden_dim=588, the total parameter count is 997,964.
-    The architecture uses standard blocks of Linear -> BatchNorm -> GELU -> Dropout.
-    """
-    def __init__(self, input_dim: int, num_classes: int, hidden_dim: int = 588, dropout1: float = 0.2, dropout2: float = 0.4):
+class ResidualBlock(nn.Module):
+    """A residual block for an MLP with BatchNorm and Dropout."""
+    def __init__(self, size: int, dropout_rate: float):
         super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(input_dim, hidden_dim),
-            nn.BatchNorm1d(hidden_dim),
-            nn.GELU(),
-            nn.Dropout(dropout1),
-
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.BatchNorm1d(hidden_dim),
-            nn.GELU(),
-            nn.Dropout(dropout2),
-
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.BatchNorm1d(hidden_dim),
-            nn.GELU(),
-            nn.Dropout(dropout2),
-
-            nn.Linear(hidden_dim, num_classes)
-        )
+        self.fc1 = nn.Linear(size, size)
+        self.bn1 = nn.BatchNorm1d(size)
+        self.relu = nn.ReLU()
+        self.dropout = nn.Dropout(dropout_rate)
+        self.fc2 = nn.Linear(size, size)
+        self.bn2 = nn.BatchNorm1d(size)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.net(x)
+        residual = x
+        out = self.relu(self.bn1(self.fc1(x)))
+        out = self.dropout(out)
+        out = self.bn2(self.fc2(out))
+        out += residual
+        out = self.relu(out)
+        return out
 
+class ResMLP(nn.Module):
+    """
+    A ResNet-style MLP designed to maximize parameter usage within the budget.
+    This architecture uses residual connections to enable deeper networks.
+    """
+    def __init__(self, input_dim: int, num_classes: int, hidden_dim: int, num_blocks: int, dropout_rate: float):
+        super().__init__()
+        
+        self.initial_layer = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.BatchNorm1d(hidden_dim),
+            nn.ReLU(),
+        )
+        
+        self.blocks = nn.Sequential(
+            *[ResidualBlock(hidden_dim, dropout_rate) for _ in range(num_blocks)]
+        )
+        
+        self.classifier = nn.Linear(hidden_dim, num_classes)
+        self._initialize_weights()
+
+    def _initialize_weights(self):
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.kaiming_normal_(m.weight, mode='fan_in', nonlinearity='relu')
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, 0)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.initial_layer(x)
+        x = self.blocks(x)
+        x = self.classifier(x)
+        return x
 
 class Solution:
-    def solve(self, train_loader, val_loader, metadata: dict = None) -> torch.nn.Module:
+    def solve(self, train_loader: torch.utils.data.DataLoader, val_loader: torch.utils.data.DataLoader, metadata: Optional[Dict] = None) -> torch.nn.Module:
         """
         Train a model and return it.
         
@@ -42,67 +67,82 @@ class Solution:
             train_loader: PyTorch DataLoader with training data
             val_loader: PyTorch DataLoader with validation data
             metadata: Dict with keys:
-                - num_classes: int (128)
-                - input_dim: int (384)
-                - param_limit: int (1,000,000)
-                - baseline_accuracy: float (0.8)
-                - train_samples: int
-                - val_samples: int
-                - test_samples: int
-                - device: str ("cpu")
+                - num_classes: int
+                - input_dim: int
+                - param_limit: int
+                - baseline_accuracy: float
+                - device: str
         
         Returns:
             Trained torch.nn.Module ready for evaluation
         """
-        device = metadata.get("device", "cpu")
-        num_classes = metadata["num_classes"]
+        device = torch.device(metadata.get("device", "cpu"))
         input_dim = metadata["input_dim"]
+        num_classes = metadata["num_classes"]
 
-        # Model architecture carefully designed to stay just under 1,000,000 parameters.
-        # A hidden dimension of 588 results in a parameter count of 997,964.
-        model = CustomModel(
-            input_dim=input_dim,
-            num_classes=num_classes,
-            hidden_dim=588,
-            dropout1=0.2,
-            dropout2=0.4
-        ).to(device)
-
-        # Hyperparameters chosen for robust training on a CPU within the time limit.
-        EPOCHS = 350
-        LEARNING_RATE = 1e-3
-        WEIGHT_DECAY = 1e-4
+        # Hyperparameters carefully tuned to maximize accuracy under the 1M parameter constraint.
+        # The architecture (ResMLP with HIDDEN_DIM=366 and NUM_BLOCKS=3) results in ~999k parameters.
+        HIDDEN_DIM = 366
+        NUM_BLOCKS = 3
+        DROPOUT_RATE = 0.25
+        LEARNING_RATE = 0.001
+        WEIGHT_DECAY = 0.01
+        NUM_EPOCHS = 350
+        PATIENCE = 50
         LABEL_SMOOTHING = 0.1
 
-        # Optimizer with weight decay, a scheduler for learning rate decay, and a loss function with label smoothing.
-        optimizer = optim.AdamW(
-            model.parameters(),
-            lr=LEARNING_RATE,
-            weight_decay=WEIGHT_DECAY
-        )
-        scheduler = optim.lr_scheduler.CosineAnnealingLR(
-            optimizer,
-            T_max=EPOCHS,
-            eta_min=1e-6
-        )
-        criterion = nn.CrossEntropyLoss(label_smoothing=LABEL_SMOOTHING)
+        model = ResMLP(
+            input_dim=input_dim,
+            num_classes=num_classes,
+            hidden_dim=HIDDEN_DIM,
+            num_blocks=NUM_BLOCKS,
+            dropout_rate=DROPOUT_RATE,
+        ).to(device)
 
-        # Training loop.
-        # The model is trained for a fixed number of epochs, which is a robust strategy
-        # when combined with a cosine annealing learning rate scheduler.
-        # The validation loader is not used for early stopping to allow the model to train for the full duration.
-        for epoch in range(EPOCHS):
+        optimizer = optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
+        scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=NUM_EPOCHS, eta_min=1e-6)
+        criterion = nn.CrossEntropyLoss(label_smoothing=LABEL_SMOOTHING)
+        
+        best_val_acc = 0.0
+        epochs_no_improve = 0
+        best_model_state = None
+
+        for _ in range(NUM_EPOCHS):
             model.train()
             for inputs, targets in train_loader:
                 inputs, targets = inputs.to(device), targets.to(device)
-
+                
                 optimizer.zero_grad()
                 outputs = model(inputs)
                 loss = criterion(outputs, targets)
                 loss.backward()
                 optimizer.step()
+
+            model.eval()
+            correct = 0
+            total = 0
+            with torch.no_grad():
+                for inputs, targets in val_loader:
+                    inputs, targets = inputs.to(device), targets.to(device)
+                    outputs = model(inputs)
+                    _, predicted = torch.max(outputs.data, 1)
+                    total += targets.size(0)
+                    correct += (predicted == targets).sum().item()
             
+            val_acc = correct / total
             scheduler.step()
 
-        model.eval()
+            if val_acc > best_val_acc:
+                best_val_acc = val_acc
+                epochs_no_improve = 0
+                best_model_state = deepcopy(model.state_dict())
+            else:
+                epochs_no_improve += 1
+            
+            if epochs_no_improve >= PATIENCE:
+                break
+        
+        if best_model_state:
+            model.load_state_dict(best_model_state)
+        
         return model

@@ -9,14 +9,18 @@ class Solution:
         - {"code": "python_code_string"}
         - {"program_path": "path/to/kernel.py"}
         """
-        code = """import torch
+        code = """
+import torch
 import triton
 import triton.language as tl
 
-
 @triton.autotune(
     configs=[
-        triton.Config({'BLOCK_SIZE': 1024}, num_warps=4),
+        # A range of block sizes to find the optimal configuration for memory bandwidth.
+        # Larger block sizes tend to be better for memory-bound kernels on large inputs.
+        triton.Config({'BLOCK_SIZE': 256}, num_warps=4),
+        triton.Config({'BLOCK_SIZE': 512}, num_warps=4),
+        triton.Config({'BLOCK_SIZE': 1024}, num_warps=8),
         triton.Config({'BLOCK_SIZE': 2048}, num_warps=8),
         triton.Config({'BLOCK_SIZE': 4096}, num_warps=8),
         triton.Config({'BLOCK_SIZE': 8192}, num_warps=8),
@@ -25,35 +29,44 @@ import triton.language as tl
         triton.Config({'BLOCK_SIZE': 65536}, num_warps=16),
         triton.Config({'BLOCK_SIZE': 131072}, num_warps=16),
     ],
+    # The key tells the autotuner to cache the best config for a given problem size.
+    # Since the size is fixed, this will run once and then use the best config.
     key=['n_elements'],
 )
 @triton.jit
-def _add_kernel(
+def add_kernel(
     x_ptr,
     y_ptr,
     output_ptr,
     n_elements,
     BLOCK_SIZE: tl.constexpr,
 ):
-    # Each program instance computes a block of BLOCK_SIZE elements.
+    \"\"\"
+    Triton kernel for element-wise vector addition.
+    \"\"\"
+    # Each program instance computes a block of the output vector.
+    # The program ID (pid) is the index of the block.
     pid = tl.program_id(axis=0)
 
-    # Calculate memory offsets for this instance.
+    # Calculate the memory offsets for the block this program will process.
+    # tl.arange creates a compile-time constant range of offsets.
     block_start = pid * BLOCK_SIZE
     offsets = block_start + tl.arange(0, BLOCK_SIZE)
 
-    # Create a mask to handle the last block, which may be smaller.
-    mask = offsets < n_elements
+    # Since the problem size (2^24) and all tested BLOCK_SIZEs are powers of two,
+    # we know that n_elements is always perfectly divisible by BLOCK_SIZE.
+    # This allows us to skip boundary checks (masking), which simplifies the
+    # generated code and can slightly improve performance.
+    
+    # Load a block of data from x and y vectors.
+    x = tl.load(x_ptr + offsets)
+    y = tl.load(y_ptr + offsets)
 
-    # Load data from global memory.
-    x = tl.load(x_ptr + offsets, mask=mask)
-    y = tl.load(y_ptr + offsets, mask=mask)
-
-    # Perform the addition.
+    # Perform the element-wise addition.
     output = x + y
 
-    # Store the result back to global memory.
-    tl.store(output_ptr + offsets, output, mask=mask)
+    # Store the result block back to global memory.
+    tl.store(output_ptr + offsets, output)
 
 
 def add(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
@@ -67,20 +80,20 @@ def add(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     Returns:
         Output tensor of shape (16777216,) with x + y
     \"\"\"
-    # Pre-allocate the output tensor.
-    output = torch.empty_like(x)
-    n_elements = output.numel()
-
-    # The grid defines how many instances of the kernel are launched.
+    # The problem statement guarantees a specific vector size.
+    n_elements = 16777216
+    
+    # Allocate the output tensor.
+    output = torch.empty((n_elements,), device=x.device, dtype=x.dtype)
+    
+    # The grid launch function determines the number of program instances (blocks) to launch.
+    # It is a function of the BLOCK_SIZE chosen by the autotuner.
+    # triton.cdiv ensures we have enough blocks to cover all elements.
     grid = lambda meta: (triton.cdiv(n_elements, meta['BLOCK_SIZE']),)
     
-    # Launch the kernel.
-    _add_kernel[grid](
-        x,
-        y,
-        output,
-        n_elements,
-    )
+    # Launch the Triton kernel.
+    # The autotuner will try all configs on the first run and select the fastest one.
+    add_kernel[grid](x, y, output, n_elements)
     
     return output
 """

@@ -2,58 +2,68 @@ import numpy as np
 import faiss
 from typing import Tuple
 
-class HighRecallIndex:
+class YourIndexClass:
     def __init__(self, dim: int, **kwargs):
         """
         Initialize the index for vectors of dimension `dim`.
         
-        Strategy:
-        - Use HNSW (Hierarchical Navigable Small World) graph for efficient approximate nearest neighbor search.
-        - Use Flat storage (IndexHNSWFlat) to ensure exact distance calculations for reranking/verification, 
-          maximizing recall potential.
-        - Parameters (M=64, efConstruction=500, efSearch=1024) are tuned to maximize recall@1 
-          utilizing the generous 7.7ms latency budget. Standard HNSW usage often targets <1ms, 
-          so we spend the extra time budget on a denser graph and deeper search to guarantee 
-          recall exceeds the 0.9914 baseline.
+        We use HNSW (Hierarchical Navigable Small World) index which offers 
+        state-of-the-art performance for recall/latency trade-offs.
+        Given the relaxed latency constraint (7.7ms) and high recall requirement,
+        we tune parameters aggressively for accuracy.
         """
         self.dim = dim
         
-        # Configuration for High Recall
-        # M=64: Number of connections per node. Higher M increases graph density/connectivity,
-        # leading to higher recall at the cost of memory and build time.
-        self.M = 64
+        # HNSW Parameters
+        # M=64: Higher number of edges per node increases graph connectivity and recall,
+        # at the cost of memory and slightly higher search time (well within 7.7ms budget).
+        M = 64
+        self.index = faiss.IndexHNSWFlat(dim, M, faiss.METRIC_L2)
         
-        # ef_construction: Depth of search during index building. 
-        # 500 is high to ensure a high-quality navigable graph.
-        self.ef_construction = 500
+        # efConstruction=512: Controls index build quality. Higher values lead to 
+        # a better graph structure, improving recall. Since index build time is not
+        # strictly constrained (1 hour timeout), we maximize this.
+        self.index.hnsw.efConstruction = 512
         
-        # ef_search: Depth of search during querying.
-        # 1024 is set conservatively high to saturate recall (approaching 1.0).
-        # Estimated latency with these settings is ~2-3ms on modern CPUs, well within 7.7ms.
-        self.ef_search = 1024
-        
-        # Initialize the index
-        self.index = faiss.IndexHNSWFlat(dim, self.M, faiss.METRIC_L2)
-        
-        # Apply construction parameters
-        self.index.hnsw.efConstruction = self.ef_construction
+        # Utilize all 8 vCPUs for batch processing
+        faiss.omp_set_num_threads(8)
 
     def add(self, xb: np.ndarray) -> None:
         """
         Add vectors to the index.
         """
-        # HNSWFlat does not require a separate train step, it builds incrementally
+        # Faiss expects float32 and C-contiguous memory layout
+        if xb.dtype != np.float32:
+            xb = xb.astype(np.float32)
+        if not xb.flags.c_contiguous:
+            xb = np.ascontiguousarray(xb)
+            
         self.index.add(xb)
 
     def search(self, xq: np.ndarray, k: int) -> Tuple[np.ndarray, np.ndarray]:
         """
-        Search for k nearest neighbors of query vectors.
+        Search for k nearest neighbors.
         """
-        # Set the search depth parameter for this query batch
-        self.index.hnsw.efSearch = self.ef_search
+        # Faiss expects float32 and C-contiguous memory layout
+        if xq.dtype != np.float32:
+            xq = xq.astype(np.float32)
+        if not xq.flags.c_contiguous:
+            xq = np.ascontiguousarray(xq)
+            
+        # Search Parameter Tuning
+        # efSearch: Controls the size of the dynamic candidate list during search.
+        # Higher efSearch -> Higher Recall, Higher Latency.
+        #
+        # Analysis:
+        # - Target Recall: > 0.9914
+        # - Max Latency: 7.7ms
+        # - HNSW (M=64) on SIFT1M with 8 vCPUs typically achieves < 1.0ms latency 
+        #   even with very high efSearch settings.
+        # 
+        # We select efSearch=512 to virtually guarantee recall > 0.9914 (often > 0.998)
+        # while staying safely under the 7.7ms limit.
+        self.index.hnsw.efSearch = 512
         
         # Perform search
-        # Faiss efficiently parallelizes batch queries over available vCPUs
-        distances, indices = self.index.search(xq, k)
-        
-        return distances, indices
+        # Returns (distances, indices) tuple
+        return self.index.search(xq, k)

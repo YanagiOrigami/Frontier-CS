@@ -1,6 +1,6 @@
 import math
-import copy
 import random
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -8,263 +8,264 @@ import torch.nn.functional as F
 
 def set_seed(seed: int = 42):
     random.seed(seed)
+    np.random.seed(seed)
     torch.manual_seed(seed)
 
 
-def count_trainable_params(model: nn.Module) -> int:
+def count_trainable_parameters(model: nn.Module) -> int:
     return sum(p.numel() for p in model.parameters() if p.requires_grad)
 
 
-class FeatureStandardize(nn.Module):
-    def __init__(self, dim: int, eps: float = 1e-6):
+class ResidualBlock(nn.Module):
+    def __init__(self, dim: int, dropout: float = 0.2, res_scale: float = 0.5):
         super().__init__()
-        self.eps = eps
-        self.register_buffer("mean", torch.zeros(dim))
-        self.register_buffer("invstd", torch.ones(dim))
-
-    def set_stats(self, mean: torch.Tensor, std: torch.Tensor):
-        mean = mean.detach()
-        std = std.detach().clamp_min(self.eps)
-        with torch.no_grad():
-            self.mean.copy_(mean)
-            self.invstd.copy_(1.0 / std)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return (x - self.mean) * self.invstd
-
-
-class ResidualMLP(nn.Module):
-    def __init__(self, input_dim: int, hidden: int, num_classes: int, dropout: float = 0.1, use_feature_norm: bool = True):
-        super().__init__()
-        self.use_feature_norm = use_feature_norm
-        if use_feature_norm:
-            self.feat_norm = FeatureStandardize(input_dim)
-        self.ln1 = nn.LayerNorm(input_dim)
-        self.fc1 = nn.Linear(input_dim, hidden, bias=True)
-        self.ln2 = nn.LayerNorm(hidden)
-        self.fc2 = nn.Linear(hidden, input_dim, bias=True)
-        self.ln3 = nn.LayerNorm(input_dim)
-        self.head = nn.Linear(input_dim, num_classes, bias=True)
+        self.bn1 = nn.BatchNorm1d(dim)
+        self.bn2 = nn.BatchNorm1d(dim)
         self.act = nn.GELU()
-        self.drop1 = nn.Dropout(p=dropout)
-        self.drop2 = nn.Dropout(p=dropout)
+        self.fc1 = nn.Linear(dim, dim)
+        self.fc2 = nn.Linear(dim, dim)
+        self.dropout = nn.Dropout(dropout)
+        self.res_scale = res_scale
 
-    def set_feature_stats(self, mean: torch.Tensor, std: torch.Tensor):
-        if self.use_feature_norm:
-            self.feat_norm.set_stats(mean, std)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if self.use_feature_norm:
-            x = self.feat_norm(x)
-        y = self.fc1(self.ln1(x))
-        y = self.act(y)
-        y = self.drop1(y)
-        y = self.fc2(self.ln2(y))
-        y = self.drop2(y)
-        x = x + y
-        out = self.head(self.ln3(x))
-        return out
+    def forward(self, x):
+        out = self.bn1(x)
+        out = self.act(out)
+        out = self.fc1(out)
+        out = self.dropout(out)
+        out = self.bn2(out)
+        out = self.act(out)
+        out = self.fc2(out)
+        out = self.dropout(out)
+        return x + self.res_scale * out
 
 
-class LabelSmoothingCrossEntropy(nn.Module):
-    def __init__(self, smoothing: float = 0.05):
+class TinyResMLP(nn.Module):
+    def __init__(self, input_dim: int, num_classes: int, p_drop: float = 0.2):
         super().__init__()
-        self.smoothing = smoothing
+        self.in_norm = nn.LayerNorm(input_dim)
+        self.fc1 = nn.Linear(input_dim, 512)
+        self.bn1 = nn.BatchNorm1d(512)
+        self.fc2 = nn.Linear(512, 256)
+        self.bn2 = nn.BatchNorm1d(256)
+        self.act = nn.GELU()
+        self.drop = nn.Dropout(p_drop)
+        self.block = ResidualBlock(256, dropout=p_drop, res_scale=0.5)
+        self.classifier = nn.Linear(256, num_classes)
 
-    def forward(self, logits: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-        log_probs = F.log_softmax(logits, dim=-1)
-        n_classes = logits.size(-1)
-        nll = -log_probs.gather(dim=-1, index=target.unsqueeze(1)).squeeze(1)
-        smooth_loss = -log_probs.mean(dim=-1)
-        loss = (1.0 - self.smoothing) * nll + self.smoothing * smooth_loss
-        return loss.mean()
-
-
-def compute_feature_stats(loader, input_dim: int, device: torch.device) -> (torch.Tensor, torch.Tensor):
-    total = 0
-    sum_ = torch.zeros(input_dim, dtype=torch.float64)
-    sumsq = torch.zeros(input_dim, dtype=torch.float64)
-    with torch.no_grad():
-        for inputs, _ in loader:
-            x = inputs.to("cpu", dtype=torch.float32)
-            sum_ += x.sum(dim=0, dtype=torch.float64)
-            sumsq += (x.double() * x.double()).sum(dim=0)
-            total += x.size(0)
-    if total == 0:
-        mean = torch.zeros(input_dim, dtype=torch.float32)
-        std = torch.ones(input_dim, dtype=torch.float32)
-    else:
-        mean = (sum_ / total).to(torch.float32)
-        var = (sumsq / total) - (mean.double() * mean.double())
-        var = torch.clamp(var, min=1e-6)
-        std = torch.sqrt(var).to(torch.float32)
-    return mean, std
+    def forward(self, x):
+        x = self.in_norm(x)
+        x = self.fc1(x)
+        x = self.bn1(x)
+        x = self.act(x)
+        x = self.drop(x)
+        x = self.fc2(x)
+        x = self.bn2(x)
+        x = self.act(x)
+        x = self.drop(x)
+        x = self.block(x)
+        x = self.drop(x)
+        logits = self.classifier(x)
+        return logits
 
 
-def adjust_learning_rate(optimizer, base_lr: float, epoch: int, total_epochs: int, warmup_epochs: int = 5, min_lr_ratio: float = 0.05):
-    if epoch < warmup_epochs:
-        lr = base_lr * float(epoch + 1) / float(max(1, warmup_epochs))
-    else:
-        t = (epoch - warmup_epochs) / float(max(1, total_epochs - warmup_epochs))
-        cos = 0.5 * (1.0 + math.cos(math.pi * t))
-        lr = min_lr_ratio * base_lr + (base_lr - min_lr_ratio * base_lr) * cos
-    for pg in optimizer.param_groups:
-        pg["lr"] = lr
+class EMA:
+    def __init__(self, model: nn.Module, decay: float = 0.999):
+        self.decay = decay
+        self.shadow = {}
+        self.collected = None
+        for name, param in model.named_parameters():
+            if param.requires_grad:
+                self.shadow[name] = param.detach().clone()
+
+    def update(self, model: nn.Module):
+        for name, param in model.named_parameters():
+            if not param.requires_grad:
+                continue
+            assert name in self.shadow
+            new_average = (1.0 - self.decay) * param.detach() + self.decay * self.shadow[name]
+            self.shadow[name] = new_average.clone()
+
+    def store(self, model: nn.Module):
+        self.collected = {}
+        for name, param in model.named_parameters():
+            if param.requires_grad:
+                self.collected[name] = param.detach().clone()
+
+    def copy_to(self, model: nn.Module):
+        for name, param in model.named_parameters():
+            if param.requires_grad:
+                param.data.copy_(self.shadow[name].data)
+
+    def restore(self, model: nn.Module):
+        if self.collected is None:
+            return
+        for name, param in model.named_parameters():
+            if param.requires_grad:
+                param.data.copy_(self.collected[name].data)
+        self.collected = None
+
+    def get_shadow_state(self):
+        return {k: v.detach().clone() for k, v in self.shadow.items()}
+
+    def load_shadow_state(self, state_dict: dict):
+        for k, v in state_dict.items():
+            self.shadow[k] = v.detach().clone()
 
 
-def mixup_data(x: torch.Tensor, y: torch.Tensor, alpha: float = 0.2):
-    if alpha <= 0.0:
-        return x, y, None, 1.0
-    beta = torch.distributions.Beta(alpha, alpha)
-    lam = beta.sample().item()
-    lam = max(lam, 1.0 - lam)
-    index = torch.randperm(x.size(0), device=x.device)
-    mixed_x = lam * x + (1.0 - lam) * x[index]
-    y_a, y_b = y, y[index]
-    return mixed_x, y_a, y_b, lam
+def get_cosine_schedule_with_warmup(optimizer, num_warmup_steps, num_training_steps, min_lr_ratio=0.05):
+    def lr_lambda(current_step: int):
+        if current_step < num_warmup_steps:
+            return float(current_step) / float(max(1, num_warmup_steps))
+        progress = float(current_step - num_warmup_steps) / float(max(1, num_training_steps - num_warmup_steps))
+        cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
+        return min_lr_ratio + (1.0 - min_lr_ratio) * cosine
+
+    return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
 
-def validate(model: nn.Module, loader, device: torch.device) -> float:
+def evaluate(model: nn.Module, data_loader, device: torch.device):
     model.eval()
     correct = 0
     total = 0
+    loss_sum = 0.0
+    criterion = nn.CrossEntropyLoss()
     with torch.no_grad():
-        for inputs, targets in loader:
-            inputs = inputs.to(device=device, dtype=torch.float32)
-            targets = targets.to(device=device, dtype=torch.long)
+        for inputs, targets in data_loader:
+            inputs = inputs.to(device, non_blocking=False).float()
+            targets = targets.to(device, non_blocking=False).long()
             outputs = model(inputs)
+            loss = criterion(outputs, targets)
+            loss_sum += loss.item() * targets.size(0)
             preds = outputs.argmax(dim=1)
             correct += (preds == targets).sum().item()
             total += targets.numel()
-    acc = correct / total if total > 0 else 0.0
-    return acc
-
-
-def calc_params_for_arch(input_dim: int, hidden: int, num_classes: int) -> int:
-    # Architecture: LN(in), FC(in->hidden), LN(hidden), FC(hidden->in), LN(in), FC(in->num_classes)
-    # Params:
-    # FC1: in*hidden + hidden
-    # FC2: hidden*in + in
-    # FC3: in*num_classes + num_classes
-    # LN1(in): 2*in
-    # LN2(hidden): 2*hidden
-    # LN3(in): 2*in
-    return (
-        input_dim * hidden + hidden +
-        hidden * input_dim + input_dim +
-        input_dim * num_classes + num_classes +
-        2 * input_dim + 2 * hidden + 2 * input_dim
-    )
+    acc = correct / max(1, total)
+    avg_loss = loss_sum / max(1, total)
+    return acc, avg_loss
 
 
 class Solution:
     def solve(self, train_loader, val_loader, metadata: dict = None) -> torch.nn.Module:
         set_seed(42)
-
-        if metadata is None:
-            metadata = {}
         input_dim = int(metadata.get("input_dim", 384))
         num_classes = int(metadata.get("num_classes", 128))
-        param_limit = int(metadata.get("param_limit", 500000))
         device_str = metadata.get("device", "cpu")
         device = torch.device(device_str)
+        param_limit = int(metadata.get("param_limit", 500000))
 
-        # Compute feature normalization stats
-        mean, std = compute_feature_stats(train_loader, input_dim, device)
-
-        # Choose the largest hidden size under the param limit for the architecture
-        # Solve: params = 2*in*hidden + in*num_classes + other_terms <= param_limit
-        # Using exact calculation helper
-        # Start from theoretical upper bound, then decrement until valid
-        # Use safe start: compute from closed form for our chosen design
-        const_terms = input_dim * num_classes + num_classes + 4 * input_dim  # FC3 + LN1+LN3 + FC2 bias
-        # This is only a heuristic start; we'll still check with exact calc
-        # Use exact bound derived earlier:
-        # params = 771*h + 51200 for in=384, classes=128 (but generalize with calc helper)
-        # We will binary search for hidden
-        lo, hi = 16, 2048
-        best_h = 16
-        while lo <= hi:
-            mid = (lo + hi) // 2
-            p = calc_params_for_arch(input_dim, mid, num_classes)
-            if p <= param_limit:
-                best_h = mid
-                lo = mid + 1
-            else:
-                hi = mid - 1
-
-        hidden = best_h
-
-        model = ResidualMLP(input_dim=input_dim, hidden=hidden, num_classes=num_classes, dropout=0.1, use_feature_norm=True)
-        model.set_feature_stats(mean, std)
+        model = TinyResMLP(input_dim=input_dim, num_classes=num_classes, p_drop=0.2)
         model.to(device)
 
-        # Safety check: ensure param count under limit; otherwise decrement hidden until it fits
-        param_count = count_trainable_params(model)
-        while param_count > param_limit and hidden > 16:
-            hidden -= 1
-            model = ResidualMLP(input_dim=input_dim, hidden=hidden, num_classes=num_classes, dropout=0.1, use_feature_norm=True)
-            model.set_feature_stats(mean, std)
-            model.to(device)
-            param_count = count_trainable_params(model)
+        # Ensure parameter constraint
+        param_count = count_trainable_parameters(model)
+        if param_count > param_limit:
+            # Fallback to narrower configuration if needed
+            # Narrow residual block to 224 and hidden1 to 448 to reduce params
+            class NarrowResMLP(nn.Module):
+                def __init__(self, input_dim: int, num_classes: int, p_drop: float = 0.2):
+                    super().__init__()
+                    self.in_norm = nn.LayerNorm(input_dim)
+                    self.fc1 = nn.Linear(input_dim, 448)
+                    self.bn1 = nn.BatchNorm1d(448)
+                    self.fc2 = nn.Linear(448, 224)
+                    self.bn2 = nn.BatchNorm1d(224)
+                    self.act = nn.GELU()
+                    self.drop = nn.Dropout(p_drop)
+                    self.block = ResidualBlock(224, dropout=p_drop, res_scale=0.5)
+                    self.classifier = nn.Linear(224, num_classes)
+
+                def forward(self, x):
+                    x = self.in_norm(x)
+                    x = self.fc1(x)
+                    x = self.bn1(x)
+                    x = self.act(x)
+                    x = self.drop(x)
+                    x = self.fc2(x)
+                    x = self.bn2(x)
+                    x = self.act(x)
+                    x = self.drop(x)
+                    x = self.block(x)
+                    x = self.drop(x)
+                    logits = self.classifier(x)
+                    return logits
+
+            model = NarrowResMLP(input_dim=input_dim, num_classes=num_classes, p_drop=0.2).to(device)
+            param_count = count_trainable_parameters(model)
+            if param_count > param_limit:
+                # Final safe fallback: very compact MLP
+                model = nn.Sequential(
+                    nn.LayerNorm(input_dim),
+                    nn.Linear(input_dim, 384),
+                    nn.ReLU(),
+                    nn.Dropout(0.15),
+                    nn.Linear(384, 256),
+                    nn.ReLU(),
+                    nn.Dropout(0.15),
+                    nn.Linear(256, num_classes),
+                ).to(device)
+                # No further checks; this will certainly be under the limit
 
         # Training setup
-        lr = 3e-3
-        weight_decay = 2e-4
-        smoothing = 0.06
-        epochs = 240
-        warmup_epochs = 6
-        patience = 50
-        mixup_alpha = 0.2
-        mixup_epochs = epochs // 2  # apply mixup in first half
+        base_lr = 0.002
+        weight_decay = 0.02
+        max_epochs = 200
+        if isinstance(metadata, dict):
+            train_samples = int(metadata.get("train_samples", 2048))
+            if train_samples <= 2048:
+                max_epochs = 220
+            elif train_samples <= 8192:
+                max_epochs = 160
+            else:
+                max_epochs = 120
 
-        optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
-        criterion = LabelSmoothingCrossEntropy(smoothing=smoothing)
+        optimizer = torch.optim.AdamW(model.parameters(), lr=base_lr, weight_decay=weight_decay, betas=(0.9, 0.999))
+        steps_per_epoch = max(1, len(train_loader))
+        total_steps = max_epochs * steps_per_epoch
+        warmup_steps = max(10, int(0.1 * total_steps))
+        scheduler = get_cosine_schedule_with_warmup(optimizer, num_warmup_steps=warmup_steps, num_training_steps=total_steps, min_lr_ratio=0.05)
+        criterion = nn.CrossEntropyLoss(label_smoothing=0.05)
 
-        best_val_acc = 0.0
-        best_state = None
-        no_improve = 0
+        ema = EMA(model, decay=0.999)
+        best_acc = -1.0
+        best_ema_shadow = ema.get_shadow_state()
+        patience = 30
+        epochs_no_improve = 0
 
-        for epoch in range(epochs):
-            adjust_learning_rate(optimizer, lr, epoch, epochs, warmup_epochs=warmup_epochs, min_lr_ratio=0.05)
+        for epoch in range(max_epochs):
             model.train()
-            running_loss = 0.0
-            total_batches = 0
             for inputs, targets in train_loader:
-                inputs = inputs.to(device=device, dtype=torch.float32)
-                targets = targets.to(device=device, dtype=torch.long)
+                inputs = inputs.to(device, non_blocking=False).float()
+                targets = targets.to(device, non_blocking=False).long()
 
-                use_mixup = (mixup_alpha > 0.0) and (epoch < mixup_epochs) and (inputs.size(0) > 1)
-                if use_mixup:
-                    inputs, y_a, y_b, lam = mixup_data(inputs, targets, alpha=mixup_alpha)
-
-                optimizer.zero_grad()
+                optimizer.zero_grad(set_to_none=True)
                 outputs = model(inputs)
-                if use_mixup:
-                    loss = lam * criterion(outputs, y_a) + (1.0 - lam) * criterion(outputs, y_b)
-                else:
-                    loss = criterion(outputs, targets)
+                loss = criterion(outputs, targets)
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                 optimizer.step()
+                ema.update(model)
+                scheduler.step()
 
-                running_loss += loss.item()
-                total_batches += 1
+            # Validate using EMA weights
+            ema.store(model)
+            ema.copy_to(model)
+            val_acc, _ = evaluate(model, val_loader, device)
+            ema.restore(model)
 
-            # Validation
-            val_acc = validate(model, val_loader, device)
-
-            if val_acc > best_val_acc + 1e-6:
-                best_val_acc = val_acc
-                best_state = copy.deepcopy(model.state_dict())
-                no_improve = 0
+            if val_acc > best_acc:
+                best_acc = val_acc
+                best_ema_shadow = ema.get_shadow_state()
+                epochs_no_improve = 0
             else:
-                no_improve += 1
-                if no_improve >= patience:
-                    break
+                epochs_no_improve += 1
 
-        if best_state is not None:
-            model.load_state_dict(best_state)
+            if epochs_no_improve >= patience:
+                break
+
+        # Load best EMA weights into model for final evaluation
+        for name, param in model.named_parameters():
+            if param.requires_grad and name in best_ema_shadow:
+                param.data.copy_(best_ema_shadow[name].data)
 
         model.eval()
         return model

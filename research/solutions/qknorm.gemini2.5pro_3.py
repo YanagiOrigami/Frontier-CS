@@ -1,149 +1,80 @@
 import torch
-import triton
-import triton.language as tl
 import flashinfer
+import os
 
-@triton.jit
-def _qknorm_fused_kernel(
-    # Pointers to tensors
-    Q_ptr, K_ptr, W_ptr,
-    Q_out_ptr, K_out_ptr,
-    # Strides for non-contiguous memory access
-    q_stride_r, q_stride_c,
-    k_stride_r, k_stride_c,
-    q_out_stride_r, q_out_stride_c,
-    k_out_stride_r, k_out_stride_c,
-    # Dimensions
-    N_q, D,
-    # Kernel constants
-    BLOCK_SIZE_D: tl.constexpr,
-    eps: tl.constexpr,
-):
-    """
-    Fused Triton kernel for applying RMSNorm to Q and K tensors in a single launch.
-    The grid is 1D, with each program instance processing one row from either Q or K.
-    """
-    # Each program instance computes a unique row index.
-    pid = tl.program_id(0)
+# By using global streams, we avoid the overhead of creating new streams on every call.
+# This is crucial for a performance-sensitive, frequently called function.
+_QK_NORM_STREAMS = None
 
-    # Branch to determine whether to process a row from Q or K.
-    # This branch is taken once at the beginning of the program.
-    if pid < N_q:
-        # This instance handles a row from the Q tensor.
-        row_idx = pid
-        X_ptr_base = Q_ptr + row_idx * q_stride_r
-        X_out_ptr_base = Q_out_ptr + row_idx * q_out_stride_r
-        x_stride_c = q_stride_c
-        x_out_stride_c = q_out_stride_c
-    else:
-        # This instance handles a row from the K tensor.
-        row_idx = pid - N_q
-        X_ptr_base = K_ptr + row_idx * k_stride_r
-        X_out_ptr_base = K_out_ptr + row_idx * k_out_stride_r
-        x_stride_c = k_stride_c
-        x_out_stride_c = k_out_stride_c
-
-    # --- RMSNorm Core Logic ---
-
-    # 1. Calculate the sum of squares for the row (variance calculation).
-    # The row is processed in blocks of size BLOCK_SIZE_D.
-    offs_d = tl.arange(0, BLOCK_SIZE_D)
-    var = 0.0
-    for i in range(0, tl.cdiv(D, BLOCK_SIZE_D)):
-        c_offs = i * BLOCK_SIZE_D + offs_d
-        mask = c_offs < D
-        x_ptr = X_ptr_base + c_offs * x_stride_c
-        x = tl.load(x_ptr, mask=mask, other=0.0).to(tl.float32)
-        var += tl.sum(x * x, axis=0)
-    
-    # 2. Compute the reciprocal of the root mean square (rsqrt).
-    rstd = tl.math.rsqrt(var / D + eps)
-
-    # 3. Apply normalization and scaling weights.
-    # This requires a second pass over the row data.
-    for i in range(0, tl.cdiv(D, BLOCK_SIZE_D)):
-        c_offs = i * BLOCK_SIZE_D + offs_d
-        mask = c_offs < D
-        
-        # Load input row data again.
-        x_ptr = X_ptr_base + c_offs * x_stride_c
-        x = tl.load(x_ptr, mask=mask, other=0.0)
-        
-        # Load scaling weights.
-        w_ptr = W_ptr + c_offs
-        w = tl.load(w_ptr, mask=mask, other=0.0)
-        
-        # Compute normalized output.
-        y_out = x * rstd * w
-        
-        # Store the result.
-        y_out_ptr = X_out_ptr_base + c_offs * x_out_stride_c
-        tl.store(y_out_ptr, y_out, mask=mask)
+def _get_qknorm_streams():
+    """Initializes and returns a tuple of two CUDA streams for parallel execution."""
+    global _QK_NORM_STREAMS
+    if _QK_NORM_STREAMS is None:
+        # Create two separate streams for query and key normalization.
+        _QK_NORM_STREAMS = (torch.cuda.Stream(), torch.cuda.Stream())
+    return _QK_NORM_STREAMS
 
 def qknorm(q: torch.Tensor, k: torch.Tensor, norm_weight: torch.Tensor):
     """
-    Apply RMSNorm to query and key tensors using a single fused Triton kernel
-    to minimize launch overhead and handle non-contiguous inputs efficiently.
-    
+    Apply RMSNorm to query and key tensors in parallel using CUDA streams.
+
+    This implementation optimizes the qknorm operation by leveraging task-level
+    parallelism. The normalization of the query (q) and key (k) tensors are
+    independent operations. By executing them on separate CUDA streams, we can
+    overlap their execution on the GPU, significantly reducing the total latency.
+    This is especially effective for the specified "launch-bound tiny operator"
+    problem, where the GPU would otherwise be underutilized by sequential kernel
+    launches.
+
+    This approach is superior to the baselines because it:
+    1.  Avoids explicit memory copies (e.g., .contiguous()) which are expensive for
+        the non-contiguous inputs that arise from fused QKV projections.
+    2.  Avoids the high memory traffic overhead of a torch.cat operation, which
+        would be an alternative but less efficient fusion strategy.
+    3.  Directly addresses the launch-bound nature of the problem by parallelizing
+        the two independent `flashinfer.norm.rmsnorm` calls.
+
     Args:
-        q: Query tensor of arbitrary shape.
-        k: Key tensor of arbitrary shape.
-        norm_weight: Normalization weight tensor of shape (hidden_dim,).
-    
+        q: Query tensor of arbitrary shape. May be non-contiguous.
+        k: Key tensor of arbitrary shape. May be non-contiguous.
+        norm_weight: Normalization weight tensor of shape (hidden_dim,)
+
     Returns:
-        Tuple of (q_normalized, k_normalized) tensors.
+        Tuple of (q_normalized, k_normalized) tensors
     """
-    q_shape_orig = q.shape
-    k_shape_orig = k.shape
-    hidden_dim = q.shape[-1]
-    
-    # Reshape to 2D without data copy. This relies on the last dimension
-    # being contiguous in memory relative to the view.
-    q_2d = q.view(-1, hidden_dim)
-    k_2d = k.view(-1, hidden_dim)
+    # `torch.empty_like` preserves the memory layout (strides) of the input
+    # tensors. This is crucial because `flashinfer.norm.rmsnorm`'s `out`
+    # parameter expects a tensor with a compatible layout to write the results
+    # to, especially for non-contiguous inputs.
+    q_o = torch.empty_like(q)
+    k_o = torch.empty_like(k)
 
-    N_q = q_2d.shape[0]
-    N_k = k_2d.shape[0]
-    D = hidden_dim
+    # Retrieve the persistent CUDA streams to minimize creation overhead.
+    s_q, s_k = _get_qknorm_streams()
 
-    total_rows = N_q + N_k
-    if total_rows == 0:
-        return torch.empty_like(q), torch.empty_like(k)
+    # Enqueue the RMSNorm operation for the query tensor on the first stream.
+    with torch.cuda.stream(s_q):
+        flashinfer.norm.rmsnorm(q, norm_weight, out=q_o)
 
-    # Allocate output tensors.
-    q_out = torch.empty(q_shape_orig, device=q.device, dtype=q.dtype)
-    k_out = torch.empty(k_shape_orig, device=k.device, dtype=k.dtype)
+    # Enqueue the RMSNorm operation for the key tensor on the second stream.
+    with torch.cuda.stream(s_k):
+        flashinfer.norm.rmsnorm(k, norm_weight, out=k_o)
 
-    q_out_2d = q_out.view(-1, hidden_dim)
-    k_out_2d = k_out.view(-1, hidden_dim)
-    
-    assert q.is_cuda and k.is_cuda and norm_weight.is_cuda, "All tensors must be on a CUDA device"
+    # The default stream (where the calling code executes) must wait for the
+    # operations on `s_q` and `s_k` to complete before any subsequent
+    # operation can safely use the results `q_o` and `k_o`.
+    # `wait_stream` enqueues a wait dependency in the default stream's command
+    # queue and is non-blocking for the host CPU, ensuring efficient execution.
+    current_stream = torch.cuda.current_stream()
+    current_stream.wait_stream(s_q)
+    current_stream.wait_stream(s_k)
 
-    grid = (total_rows,)
-
-    # Use next_power_of_2 for block size, a common Triton practice.
-    BLOCK_SIZE_D = triton.next_power_of_2(D)
-
-    # Launch the fused kernel.
-    _qknorm_fused_kernel[grid](
-        q_2d, k_2d, norm_weight,
-        q_out_2d, k_out_2d,
-        q_2d.stride(0), q_2d.stride(1),
-        k_2d.stride(0), k_2d.stride(1),
-        q_out_2d.stride(0), q_out_2d.stride(1),
-        k_out_2d.stride(0), k_out_2d.stride(1),
-        N_q, D,
-        BLOCK_SIZE_D=BLOCK_SIZE_D,
-        eps=1e-5,  # A standard epsilon value for RMSNorm.
-        num_warps=4, # A generally good value for memory-bound kernels.
-    )
-    
-    return q_out, k_out
+    return q_o, k_o
 
 class Solution:
     def solve(self, spec_path: str = None) -> dict:
         """
-        Returns a dictionary indicating the path to the program file containing
-        the optimized `qknorm` implementation.
+        Returns a dict indicating the path to the file containing the kernel.
+        The evaluator will load this file as a module and call the `qknorm` function.
         """
-        return {"program_path": __file__}
+        return {"program_path": os.path.abspath(__file__)}

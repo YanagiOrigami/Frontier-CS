@@ -1,170 +1,171 @@
 import os
 import sys
-import tarfile
 import subprocess
+import tempfile
 import shutil
+import random
+import glob
 import re
 import struct
-import random
+import time
+import concurrent.futures
+
+def fuzz_one(args):
+    objdump_path, data = args
+    # Create temp file
+    fd, path = tempfile.mkstemp()
+    os.close(fd)
+    try:
+        with open(path, 'wb') as f:
+            f.write(data)
+        
+        # Run objdump with arguments to trigger tic30 disassembly
+        # -D: disassemble all
+        # -b binary: treat as raw binary
+        # -m tic30: use tic30 architecture
+        res = subprocess.run(
+            [objdump_path, "-D", "-b", "binary", "-m", "tic30", path],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            timeout=2
+        )
+        
+        # Check for ASAN crash or signal
+        if res.returncode != 0:
+            # Signal (negative return code) or ASAN error message in stderr
+            if res.returncode < 0 or b"AddressSanitizer" in res.stderr:
+                return data
+    except Exception:
+        pass
+    finally:
+        if os.path.exists(path):
+            os.unlink(path)
+    return None
 
 class Solution:
     def solve(self, src_path: str) -> bytes:
-        # Define workspace paths
-        base_dir = os.getcwd()
-        work_dir = os.path.join(base_dir, "workspace_tic30")
-        if os.path.exists(work_dir):
-            try:
-                shutil.rmtree(work_dir)
-            except OSError:
-                pass
-        os.makedirs(work_dir)
-        
+        """
+        Generate a PoC that triggers the vulnerability in tic30-dis.c.
+        Builds binutils for tic30 target with ASAN and fuzzes it.
+        """
+        # Create build directory
+        build_root = tempfile.mkdtemp()
         try:
             # Extract source
-            with tarfile.open(src_path) as tar:
-                tar.extractall(path=work_dir)
+            extract_dir = os.path.join(build_root, "source")
+            os.makedirs(extract_dir, exist_ok=True)
+            subprocess.run(["tar", "-xf", src_path, "-C", extract_dir], check=True, stderr=subprocess.DEVNULL)
             
-            # Find source root
-            src_root = work_dir
-            for root, dirs, files in os.walk(work_dir):
-                if "configure" in files:
-                    src_root = root
-                    break
-            
-            # Build directory
-            build_dir = os.path.join(work_dir, "build")
-            os.makedirs(build_dir)
-            
-            # Environment variables for ASAN
-            env = os.environ.copy()
-            env["CFLAGS"] = "-g -O0 -fsanitize=address"
-            env["LDFLAGS"] = "-fsanitize=address"
-            env["MAKEINFO"] = "true"
-            env["CC"] = "gcc"
-            env["CXX"] = "g++"
-            
+            # Locate source root
+            src_dirs = glob.glob(os.path.join(extract_dir, "*"))
+            if len(src_dirs) == 1 and os.path.isdir(src_dirs[0]):
+                src_root = src_dirs[0]
+            else:
+                src_root = extract_dir
+
             # Configure
-            subprocess.run(
-                [
-                    os.path.join(src_root, "configure"),
-                    "--target=tic30-coff",
-                    "--disable-nls",
-                    "--disable-werror",
-                    "--disable-gdb",
-                    "--disable-sim",
-                    "--disable-libdecnumber",
-                    "--disable-readline"
-                ],
-                cwd=build_dir,
-                env=env,
-                check=True,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL
-            )
+            # Target tic30-unknown-coff for the specific vulnerability
+            # Enable ASAN to reliably detect the overflow
+            env = os.environ.copy()
+            env["CFLAGS"] = "-g -O2 -fsanitize=address"
+            env["LDFLAGS"] = "-fsanitize=address"
             
-            # Build
-            subprocess.run(
-                ["make", "-j8", "all-opcodes", "all-binutils"],
-                cwd=build_dir,
-                env=env,
-                check=True,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL
-            )
+            config_cmd = [
+                "./configure",
+                "--target=tic30-unknown-coff",
+                "--disable-nls",
+                "--disable-werror",
+                "--disable-gdb",
+                "--disable-sim",
+                "--disable-libdecnumber",
+                "--disable-readline"
+            ]
             
-            # Find objdump
-            objdump_bin = None
-            for root, dirs, files in os.walk(build_dir):
-                if "objdump" in files:
-                    path = os.path.join(root, "objdump")
-                    if os.access(path, os.X_OK):
-                        objdump_bin = path
-                        break
+            subprocess.run(config_cmd, cwd=src_root, env=env, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             
-            if not objdump_bin:
-                # Fallback to standard location
-                path = os.path.join(build_dir, "binutils", "objdump")
-                if os.access(path, os.X_OK):
-                    objdump_bin = path
+            # Build binutils (contains objdump)
+            # Parallel build
+            subprocess.run(["make", "-j8", "all-binutils"], cwd=src_root, env=env, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             
-            if not objdump_bin:
-                return b""
+            # Locate objdump binary
+            objdump_path = os.path.join(src_root, "binutils", "objdump")
+            if not os.path.exists(objdump_path):
+                found = glob.glob(os.path.join(src_root, "**/objdump"), recursive=True)
+                if found:
+                    objdump_path = found[0]
+                else:
+                    raise RuntimeError("Could not find compiled objdump")
 
-            # Parse templates from tic30-dis.c
-            templates = []
-            tic30_dis_path = None
-            for root, dirs, files in os.walk(src_root):
-                if "tic30-dis.c" in files:
-                    tic30_dis_path = os.path.join(root, "tic30-dis.c")
+            # Extract seeds from tic30-dis.c to guide fuzzing
+            # We look for hex constants that might be opcodes or masks
+            tic30_dis_path = os.path.join(src_root, "opcodes", "tic30-dis.c")
+            seeds = set()
+            if os.path.exists(tic30_dis_path):
+                with open(tic30_dis_path, "r", errors="ignore") as f:
+                    content = f.read()
+                    hex_consts = re.findall(r'0x[0-9a-fA-F]+', content)
+                    for h in hex_consts:
+                        try:
+                            val = int(h, 16)
+                            if val <= 0xFF:
+                                seeds.add(val)
+                            elif val <= 0xFFFF:
+                                seeds.add(val >> 8)
+                                seeds.add(val & 0xFF)
+                            elif val <= 0xFFFFFFFF:
+                                b = struct.pack(">I", val)
+                                for x in b: seeds.add(x)
+                        except: pass
+            
+            seed_list = list(seeds) if seeds else [0x60, 0x00, 0x10, 0x20] 
+
+            # Fuzzing
+            # We use ProcessPoolExecutor to utilize the 8 vCPUs
+            executor = concurrent.futures.ProcessPoolExecutor(max_workers=8)
+            start_time = time.time()
+            found_poc = None
+            
+            # Fuzzing loop (max 5 minutes)
+            while time.time() - start_time < 300:
+                batch = []
+                for _ in range(500):
+                    # Ground truth is 10 bytes, so target similar lengths
+                    # TIC30 instructions are 32-bit (4 bytes)
+                    length = random.choice([4, 8, 9, 10, 11, 12])
+                    
+                    if random.random() < 0.2:
+                        # Pure random
+                        payload = os.urandom(length)
+                    else:
+                        # Seeded random: mix seeds with random bytes
+                        arr = bytearray()
+                        for _ in range(length):
+                            if seed_list and random.random() < 0.4:
+                                arr.append(random.choice(seed_list))
+                            else:
+                                arr.append(random.randint(0, 255))
+                        payload = bytes(arr)
+                    batch.append((objdump_path, payload))
+                
+                # Check batch results
+                futures = [executor.submit(fuzz_one, b) for b in batch]
+                for f in concurrent.futures.as_completed(futures):
+                    res = f.result()
+                    if res:
+                        found_poc = res
+                        executor.shutdown(wait=False)
+                        break
+                
+                if found_poc:
                     break
             
-            if tic30_dis_path:
-                with open(tic30_dis_path, 'r', errors='ignore') as f:
-                    content = f.read()
-                    # Regex to capture opcode definitions: { "name", operands, opcode, mask
-                    matches = re.findall(r'\{\s*"([^"]+)"\s*,[^,]*,\s*(0x[0-9A-Fa-f]+)\s*,\s*(0x[0-9A-Fa-f]+)', content)
-                    for name, opcode, mask in matches:
-                        templates.append((name, int(opcode, 16), int(mask, 16)))
+            executor.shutdown(wait=False)
             
-            if not templates:
-                # Fallback template if parsing fails
-                templates = [("br", 0x60000000, 0xFF000000)]
+            if found_poc:
+                return found_poc
+            
+            # Fallback if no crash found
+            return b"\x60" * 10
 
-            # Fuzzing strategy
-            # Prioritize branch instructions as vulnerability is in print_branch
-            branches = [t for t in templates if "br" in t[0] or "call" in t[0] or t[0].startswith("b")]
-            others = [t for t in templates if t not in branches]
-            
-            poc_path = os.path.join(work_dir, "poc.bin")
-            
-            # We iterate through templates, generating variations for wildcard bits
-            for name, opcode, mask in branches + others:
-                wildcard = (~mask) & 0xFFFFFFFF
-                
-                # Test candidates:
-                # 1. Base opcode (wildcards 0)
-                # 2. All wildcards set to 1
-                # 3. Random variations
-                candidates = [opcode, opcode | wildcard]
-                for _ in range(15):
-                    candidates.append(opcode | (random.getrandbits(32) & wildcard))
-                
-                for val in candidates:
-                    # Try both Big and Little Endian
-                    for fmt in ['>I', '<I']:
-                        data = struct.pack(fmt, val)
-                        
-                        with open(poc_path, 'wb') as f:
-                            f.write(data)
-                        
-                        try:
-                            # Run objdump with raw binary input mode for tic30
-                            proc = subprocess.run(
-                                [objdump_bin, "-D", "-b", "binary", "-m", "tic30", poc_path],
-                                stdout=subprocess.PIPE,
-                                stderr=subprocess.PIPE,
-                                timeout=0.5
-                            )
-                            
-                            # Check for crash
-                            if proc.returncode != 0:
-                                err_out = proc.stderr.lower()
-                                if b"addresssanitizer" in err_out or b"segmentation fault" in err_out or proc.returncode < 0:
-                                    try:
-                                        shutil.rmtree(work_dir)
-                                    except:
-                                        pass
-                                    return data
-                        except subprocess.TimeoutExpired:
-                            pass
-                            
-        except Exception as e:
-            pass
         finally:
-            if os.path.exists(work_dir):
-                try:
-                    shutil.rmtree(work_dir)
-                except:
-                    pass
-
-        return b""
+            shutil.rmtree(build_root, ignore_errors=True)

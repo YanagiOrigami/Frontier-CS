@@ -5,53 +5,61 @@ from typing import Tuple
 
 class YourIndexClass:
     def __init__(self, dim: int, **kwargs):
-        self.dim = dim
+        """
+        Initialize the index for vectors of dimension `dim`.
+        """
+        self.dim = int(dim)
 
-        # HNSW parameters with sensible defaults for high recall
+        # Hyperparameters with flexible naming
         self.M = int(kwargs.get("M", 32))
-        self.ef_construction = int(kwargs.get("ef_construction", 200))
-        self.ef_search = int(kwargs.get("ef_search", 256))
+        self.ef_construction = int(
+            kwargs.get("ef_construction", kwargs.get("efConstruction", 200))
+        )
+        self.ef_search = int(
+            kwargs.get("ef_search", kwargs.get("efSearch", 256))
+        )
 
-        # Set FAISS to use all available threads (if OpenMP is enabled)
-        try:
-            max_threads = faiss.omp_get_max_threads()
-            if isinstance(max_threads, int) and max_threads > 0:
-                faiss.omp_set_num_threads(max_threads)
-        except Exception:
-            pass
-
-        # Initialize HNSW index (L2 metric by default)
+        # Build HNSW index (L2 metric, flat storage)
         self.index = faiss.IndexHNSWFlat(self.dim, self.M)
         self.index.hnsw.efConstruction = self.ef_construction
         self.index.hnsw.efSearch = self.ef_search
 
     def add(self, xb: np.ndarray) -> None:
-        if xb.size == 0:
+        """
+        Add vectors to the index.
+        """
+        if xb is None:
             return
-        if xb.shape[1] != self.dim:
-            raise ValueError(f"Input dimension {xb.shape[1]} does not match index dimension {self.dim}")
+
+        xb = np.asarray(xb, dtype=np.float32)
+        if xb.ndim != 2 or xb.shape[1] != self.dim:
+            raise ValueError(f"xb must have shape (N, {self.dim}), got {xb.shape}")
+
         xb = np.ascontiguousarray(xb, dtype=np.float32)
         self.index.add(xb)
 
     def search(self, xq: np.ndarray, k: int) -> Tuple[np.ndarray, np.ndarray]:
-        if xq.size == 0:
-            return (
-                np.empty((0, k), dtype=np.float32),
-                np.empty((0, k), dtype=np.int64),
-            )
-        if xq.shape[1] != self.dim:
-            raise ValueError(f"Query dimension {xq.shape[1]} does not match index dimension {self.dim}")
+        """
+        Search for k nearest neighbors of query vectors.
+        """
+        if k <= 0:
+            raise ValueError("k must be positive")
+
+        xq = np.asarray(xq, dtype=np.float32)
+        if xq.ndim == 1:
+            if xq.shape[0] != self.dim:
+                raise ValueError(f"xq must have shape ({self.dim},) or (nq, {self.dim}), got {xq.shape}")
+            xq = xq.reshape(1, -1)
+
+        if xq.ndim != 2 or xq.shape[1] != self.dim:
+            raise ValueError(f"xq must have shape (nq, {self.dim}), got {xq.shape}")
+
         xq = np.ascontiguousarray(xq, dtype=np.float32)
 
-        # Ensure efSearch is set (in case user changed it via kwargs)
+        # Ensure efSearch is set (in case user modified after construction)
         self.index.hnsw.efSearch = self.ef_search
 
-        D, I = self.index.search(xq, k)
+        distances, indices = self.index.search(xq, int(k))
 
-        # Ensure correct dtypes
-        if D.dtype != np.float32:
-            D = D.astype(np.float32, copy=False)
-        if I.dtype != np.int64:
-            I = I.astype(np.int64, copy=False)
-
-        return D, I
+        # Faiss already returns float32 distances and int64 indices
+        return distances, indices

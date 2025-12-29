@@ -6,9 +6,9 @@ from sky_spot.utils import ClusterType
 
 
 class Solution(MultiRegionStrategy):
-    """Slack-aware multi-region scheduling strategy."""
+    """Multi-region scheduling strategy with deadline safety."""
 
-    NAME = "cbl_multi_slack_v1"
+    NAME = "cant_be_late_multi_region_v1"
 
     def solve(self, spec_path: str) -> "Solution":
         """
@@ -31,9 +31,46 @@ class Solution(MultiRegionStrategy):
         )
         super().__init__(args)
 
-        # Once this flag is set, we always run on on-demand to avoid missing the deadline.
-        self.force_on_demand = False
+        # Internal tracking of accumulated work to avoid O(n) sums each step.
+        self._initialized = False
+        self._done_work = 0.0
+        self._last_task_segments = 0
+
         return self
+
+    def _ensure_initialized(self) -> None:
+        """Lazy initialization based on current environment state."""
+        if self._initialized:
+            return
+
+        try:
+            segments = self.task_done_time
+        except AttributeError:
+            # In case env has not attached task_done_time yet.
+            self._done_work = 0.0
+            self._last_task_segments = 0
+            self._initialized = True
+            return
+
+        if segments:
+            self._done_work = float(sum(segments))
+            self._last_task_segments = len(segments)
+        else:
+            self._done_work = 0.0
+            self._last_task_segments = 0
+
+        self._initialized = True
+
+    def _update_done_work(self) -> None:
+        """Incrementally update total completed work based on new segments."""
+        segments = self.task_done_time
+        curr_len = len(segments)
+        if curr_len > self._last_task_segments:
+            new_work = 0.0
+            for v in segments[self._last_task_segments:]:
+                new_work += float(v)
+            self._done_work += new_work
+            self._last_task_segments = curr_len
 
     def _step(self, last_cluster_type: ClusterType, has_spot: bool) -> ClusterType:
         """
@@ -41,50 +78,40 @@ class Solution(MultiRegionStrategy):
 
         Returns: ClusterType.SPOT, ClusterType.ON_DEMAND, or ClusterType.NONE
         """
-        # Ensure flag exists even if solve() wasn't called as expected.
-        if not hasattr(self, "force_on_demand"):
-            self.force_on_demand = False
+        self._ensure_initialized()
+        self._update_done_work()
 
-        # If somehow already past the deadline, just keep using on-demand.
-        if self.env.elapsed_seconds >= self.deadline:
-            return ClusterType.ON_DEMAND
-
-        # Compute remaining work (in seconds).
-        task_done_list = self.task_done_time or []
-        done = float(sum(task_done_list))
-        remaining_work = self.task_duration - done
-
-        # If there is no remaining work, don't run any cluster.
+        # Remaining required work in seconds.
+        remaining_work = self.task_duration - self._done_work
         if remaining_work <= 0.0:
+            # Job finished; no need to run more.
             return ClusterType.NONE
 
-        remaining_time = self.deadline - self.env.elapsed_seconds
+        # Remaining wall-clock time until deadline in seconds.
+        time_elapsed = self.env.elapsed_seconds
+        time_remaining = self.deadline - time_elapsed
+
+        if time_remaining <= 0.0:
+            # Already past deadline; keep using on-demand (penalty is already incurred).
+            return ClusterType.ON_DEMAND
+
         gap = self.env.gap_seconds
-        over = self.restart_overhead
+        restart_overhead = self.restart_overhead
 
-        # If we've already committed to on-demand, always use it.
-        if self.force_on_demand:
+        # Conservative "one more gamble" budget:
+        #   - We might waste the next full step (gap) with no useful work.
+        #   - We may incur up to two restart overheads (existing + new).
+        #   - Then we must be able to finish all remaining work on on-demand.
+        worst_case_time_needed = remaining_work + 2.0 * restart_overhead + gap
+
+        # If we no longer have enough slack to afford that worst case,
+        # immediately switch to on-demand and stick with it.
+        if worst_case_time_needed >= time_remaining:
             return ClusterType.ON_DEMAND
 
-        # Safety condition: it's safe to "risk" this step (by using SPOT or NONE)
-        # only if, even in the worst case that this entire step provides zero
-        # useful work and we then pay a full restart overhead, we can still
-        # finish using only on-demand afterwards.
-        #
-        # Worst-case after risking this step:
-        #   - time left: remaining_time - gap
-        #   - work left: remaining_work
-        #   - need at most: remaining_work + over
-        safe_to_risk = (remaining_time - gap) >= (remaining_work + over)
-
-        # If not safe to risk, permanently switch to on-demand from now on.
-        if not safe_to_risk:
-            self.force_on_demand = True
-            return ClusterType.ON_DEMAND
-
-        # We have enough slack to risk spot or idling.
+        # Still have comfortable slack: prefer cheap spot when available.
         if has_spot:
             return ClusterType.SPOT
 
-        # No spot available and we have slack: wait to save cost.
+        # Spot unavailable and far from deadline: wait to avoid expensive on-demand usage.
         return ClusterType.NONE

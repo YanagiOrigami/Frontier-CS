@@ -6,9 +6,20 @@ from sky_spot.utils import ClusterType
 
 
 class Solution(MultiRegionStrategy):
-    NAME = "my_strategy"
+    """Your multi-region scheduling strategy."""
+
+    NAME = "my_strategy"  # REQUIRED: unique identifier
 
     def solve(self, spec_path: str) -> "Solution":
+        """
+        Initialize the solution from spec_path config.
+
+        The spec file contains:
+        - deadline: deadline in hours
+        - duration: task duration in hours
+        - overhead: restart overhead in hours
+        - trace_files: list of trace file paths (one per region)
+        """
         with open(spec_path) as f:
             config = json.load(f)
 
@@ -19,30 +30,49 @@ class Solution(MultiRegionStrategy):
             inter_task_overhead=[0.0],
         )
         super().__init__(args)
-
-        self.availability = []
-        for tf in config.get("trace_files", []):
-            with open(tf, 'r') as f:
-                trace = json.load(f)
-            self.availability.append([bool(x) for x in trace])
-
-        if self.availability:
-            spot_counts = [sum(trace) for trace in self.availability]
-            self.best_region = spot_counts.index(max(spot_counts))
-        else:
-            self.best_region = 0
-
         return self
 
     def _step(self, last_cluster_type: ClusterType, has_spot: bool) -> ClusterType:
-        current_t = int(self.env.elapsed_seconds // self.env.gap_seconds)
-        current_r = self.env.get_current_region()
-        if current_r != self.best_region:
-            self.env.switch_region(self.best_region)
-            current_r = self.best_region
-            avail = self.availability[current_r][current_t] if current_t < len(self.availability[current_r]) else False
-        else:
-            avail = has_spot
-        if avail:
+        """
+        Decide next action based on current state.
+
+        Available attributes:
+        - self.env.get_current_region(): Get current region index
+        - self.env.get_num_regions(): Get total number of regions
+        - self.env.switch_region(idx): Switch to region by index
+        - self.env.elapsed_seconds: Current time elapsed
+        - self.task_duration: Total task duration needed (seconds)
+        - self.deadline: Deadline time (seconds)
+        - self.restart_overhead: Restart overhead (seconds)
+        - self.task_done_time: List of completed work segments
+        - self.remaining_restart_overhead: Current pending overhead
+
+        Returns: ClusterType.SPOT, ClusterType.ON_DEMAND, or ClusterType.NONE
+        """
+        current_region = self.env.get_current_region()
+        n_regions = self.env.get_num_regions()
+        gap = self.env.gap_seconds
+        elapsed = self.env.elapsed_seconds
+        time_left = self.deadline - elapsed
+        progress = sum(self.task_done_time)
+        remaining_work = self.task_duration - progress
+        remaining_overhead = self.remaining_restart_overhead
+        effective_time_left = time_left - remaining_overhead
+
+        if effective_time_left < remaining_work:
+            return ClusterType.ON_DEMAND
+
+        slack_seconds = effective_time_left - remaining_work
+        search_time = (n_regions - 1) * gap
+
+        if has_spot:
             return ClusterType.SPOT
-        return ClusterType.ON_DEMAND
+        else:
+            if last_cluster_type == ClusterType.ON_DEMAND:
+                return ClusterType.ON_DEMAND
+            if slack_seconds > search_time + gap:
+                next_region = (current_region + 1) % n_regions
+                self.env.switch_region(next_region)
+                return ClusterType.NONE
+            else:
+                return ClusterType.ON_DEMAND

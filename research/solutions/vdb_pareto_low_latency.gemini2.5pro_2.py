@@ -1,60 +1,95 @@
 import numpy as np
 import faiss
-import os
 from typing import Tuple
 
 class YourIndexClass:
+    """
+    An efficient Vector Database index for the Low Latency Tier problem.
+
+    This implementation uses FAISS's IndexIVFPQ, a highly optimized method for
+    Approximate Nearest Neighbor (ANN) search. It's designed for a balance of
+    speed, memory usage, and recall, making it suitable for large datasets under
+    strict latency constraints.
+
+    The strategy is to partition the vector space into a large number of cells
+    (`nlist`) and then, at query time, only search a small subset of these cells
+    (`nprobe`). This drastically reduces the number of vectors that need to be
+    compared. Product Quantization (PQ) is used to compress the vectors,
+    which reduces memory footprint and accelerates distance calculations within
+    the selected cells.
+
+    Key parameter choices for this low-latency scenario:
+    - nlist=4096: A relatively large number of cells to create a fine-grained
+      partition of the 1M vector dataset.
+    - m=32: The number of sub-quantizers for PQ. 128 (dim) / 32 = 4D
+      sub-vectors, providing good compression and fast lookups.
+    - nprobe=5: A very small number of cells to search. This is the most
+      critical parameter for meeting the aggressive latency target of < 2.31ms.
+      It prunes the search space by ~99.9%.
+
+    Multi-threading is enabled to leverage the 8 vCPUs available in the
+    evaluation environment, speeding up both index construction and search.
+    """
+
     def __init__(self, dim: int, **kwargs):
         """
         Initialize the index for vectors of dimension `dim`.
 
         Args:
             dim: Vector dimensionality (e.g., 128 for SIFT1M)
-            **kwargs: Optional parameters (e.g., M, ef_construction for HNSW)
+            **kwargs: Optional parameters for index tuning.
+                - nlist: Number of Voronoi cells for the IVF index.
+                - m: Number of sub-quantizers for PQ.
+                - nprobe: Number of cells to search at query time.
         """
         self.dim = dim
-        
-        # These parameters are tuned for the SIFT1M dataset on an 8-core CPU
-        # to meet the strict <2.31ms latency constraint while maximizing recall.
-        # HNSW is chosen for its excellent speed-recall tradeoff.
-        # M: Number of connections per node. Higher M creates a better quality graph.
-        self.M = int(kwargs.get("M", 48))
-        # efConstruction: Build-time parameter. Higher value means a better graph.
-        self.efConstruction = int(kwargs.get("efConstruction", 200))
-        # efSearch: Search-time parameter, the primary knob for latency vs recall.
-        # This value is set aggressively to ensure latency is met.
-        self.efSearch = int(kwargs.get("efSearch", 80))
-        
-        self.index = None
-        self.is_built = False
+        self.is_trained = False
 
-        # Use all available CPU cores for FAISS to speed up batch search.
+        # Parameters for IndexIVFPQ, tuned for the low latency tier.
+        self.nlist = kwargs.get('nlist', 4096)
+        self.m = kwargs.get('m', 32)
+        self.nbits = 8  # 8 bits per sub-quantizer, standard for PQ.
+        self.metric = faiss.METRIC_L2
+
+        # The crucial search-time parameter for the speed-recall trade-off.
+        self.nprobe = kwargs.get('nprobe', 5)
+
+        # Set FAISS to use all available CPU cores (8 in the eval env)
+        # This significantly speeds up training and batch search.
         try:
-            num_threads = os.cpu_count()
-            if num_threads:
-                faiss.omp_set_num_threads(num_threads)
-        except (AttributeError, TypeError):
-            # Fallback for environments where os.cpu_count() is not available/reliable.
+            faiss.omp_set_num_threads(8)
+        except AttributeError:
+            # This might happen if FAISS is compiled without OpenMP support.
+            # The evaluation environment should have it.
             pass
+
+        # 1. Coarse quantizer: maps a vector to a cell. IndexFlatL2 is a brute-force L2 index.
+        quantizer = faiss.IndexFlatL2(self.dim)
         
-        # Initialize the HNSW index. METRIC_L2 corresponds to Euclidean distance.
-        self.index = faiss.IndexHNSWFlat(self.dim, self.M, faiss.METRIC_L2)
-        self.index.hnsw.efConstruction = self.efConstruction
+        # 2. Main index: uses the quantizer to partition data.
+        self.index = faiss.IndexIVFPQ(quantizer, self.dim, self.nlist, self.m, self.nbits)
+
 
     def add(self, xb: np.ndarray) -> None:
         """
-        Add vectors to the index.
+        Add vectors to the index. If the index is not trained, it will be
+        trained on the first batch of vectors provided.
 
         Args:
             xb: Base vectors, shape (N, dim), dtype float32
         """
-        # FAISS requires C-contiguous float32 arrays for optimal performance.
-        if not xb.flags['C_CONTIGUOUS'] or xb.dtype != np.float32:
-            xb = np.ascontiguousarray(xb, dtype=np.float32)
+        if not self.is_trained:
+            # Training the index involves finding the 'nlist' cluster centroids.
+            # This only needs to be done once. The evaluation script calls add()
+            # with the full 1M vectors, which is sufficient for training.
+            print(f"Training IVF-PQ index on {xb.shape[0]} vectors...")
+            self.index.train(xb)
+            self.is_trained = True
+            print("Training complete.")
         
-        # In HNSW, adding vectors is the build process.
+        # Add the vectors to the inverted lists.
         self.index.add(xb)
-        self.is_built = True
+        print(f"Added {xb.shape[0]} vectors. Total vectors in index: {self.index.ntotal}")
 
     def search(self, xq: np.ndarray, k: int) -> Tuple[np.ndarray, np.ndarray]:
         """
@@ -66,21 +101,14 @@ class YourIndexClass:
 
         Returns:
             (distances, indices):
-                - distances: shape (nq, k), dtype float32, L2 distances
+                - distances: shape (nq, k), dtype float32, L2-squared distances
                 - indices: shape (nq, k), dtype int64, indices into base vectors
         """
-        if not self.is_built:
-            raise RuntimeError("Index has not been built. Call add() first.")
-
-        # Set the search-time parameter.
-        self.index.hnsw.efSearch = self.efSearch
-
-        if not xq.flags['C_CONTIGUOUS'] or xq.dtype != np.float32:
-            xq = np.ascontiguousarray(xq, dtype=np.float32)
-
+        # Set the number of cells to probe. This is the most critical parameter
+        # for controlling the latency-recall trade-off.
+        self.index.nprobe = self.nprobe
+        
+        # FAISS search is batched and parallelized, efficiently handling all queries.
         distances, indices = self.index.search(xq, k)
         
-        # Per the problem spec, L2-squared distances are acceptable.
-        # Faiss's IndexHNSWFlat returns squared L2 distances by default,
-        # which is faster as it avoids the sqrt operation.
         return distances, indices

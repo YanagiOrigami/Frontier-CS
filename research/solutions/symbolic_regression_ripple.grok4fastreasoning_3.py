@@ -10,9 +10,10 @@ class Solution:
             niterations=100,
             binary_operators=["+", "-", "*", "/", "**"],
             unary_operators=["sin", "cos", "exp", "log"],
-            populations=8,
+            populations=20,
             population_size=50,
             maxsize=30,
+            procs=8,
             verbosity=0,
             progress=False,
             random_state=42,
@@ -22,10 +23,10 @@ class Solution:
         best_expr = model.sympy()
         expression = str(best_expr)
 
-        predictions = model.predict(X)
+        predictions = model.predict(X).tolist()
 
         return {
             "expression": expression,
-            "predictions": predictions.tolist(),
+            "predictions": predictions,
             "details": {}
         }

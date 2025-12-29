@@ -2,107 +2,119 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 import numpy as np
-
-class ResBlock(nn.Module):
-    def __init__(self, dim, dropout=0.25):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(dim, dim, bias=False),
-            nn.BatchNorm1d(dim),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(dim, dim, bias=False),
-            nn.BatchNorm1d(dim),
-            nn.GELU(),
-            nn.Dropout(dropout)
-        )
-        
-    def forward(self, x):
-        return x + self.net(x)
-
-class ParetoModel(nn.Module):
-    def __init__(self, input_dim, num_classes, hidden_dim=525):
-        super().__init__()
-        self.bn_input = nn.BatchNorm1d(input_dim)
-        
-        self.proj_in = nn.Sequential(
-            nn.Linear(input_dim, hidden_dim, bias=False),
-            nn.BatchNorm1d(hidden_dim),
-            nn.GELU(),
-            nn.Dropout(0.1)
-        )
-        
-        self.blocks = nn.Sequential(
-            ResBlock(hidden_dim),
-            ResBlock(hidden_dim),
-            ResBlock(hidden_dim),
-            ResBlock(hidden_dim)
-        )
-        
-        self.proj_out = nn.Linear(hidden_dim, num_classes)
-        
-    def forward(self, x):
-        x = self.bn_input(x)
-        x = self.proj_in(x)
-        x = self.blocks(x)
-        return self.proj_out(x)
+import copy
 
 class Solution:
     def solve(self, train_loader, val_loader, metadata: dict = None) -> torch.nn.Module:
+        """
+        Train a model and return it.
+        """
+        # Handle metadata
+        metadata = metadata or {}
         input_dim = metadata.get("input_dim", 384)
         num_classes = metadata.get("num_classes", 128)
+        param_limit = metadata.get("param_limit", 2500000)
         device = metadata.get("device", "cpu")
         
-        # Set seeds for reproducibility
-        torch.manual_seed(42)
-        np.random.seed(42)
-        
-        # Initialize model with calculated hidden dimension to stay under 2.5M
-        # Calculation:
-        # Input BN: 384*2 = 768
-        # Proj In: 384*525 + 525*2 (BN) = 202,650
-        # 4 Blocks (525 dim): 4 * (2*(525*525 + 1050)) = 4 * 553350 = 2,213,400
-        # Proj Out: 525*128 + 128 = 67,328
-        # Total: ~2.484M < 2.5M
-        hidden_dim = 525
-        model = ParetoModel(input_dim, num_classes, hidden_dim=hidden_dim)
+        # Hyperparameters
+        # To maximize accuracy within 2.5M parameters, we use a Residual MLP.
+        # Calculation for H=524 with 4 blocks (2 layers each):
+        # Embed: 384*524 + 524 + BN params ~= 203k
+        # Blocks: 4 * (2 * (524*524 + 524 + BN)) ~= 4 * 552k = 2.2M
+        # Head: 524*128 + 128 ~= 67k
+        # Total ~= 2.47M < 2.5M.
+        hidden_dim = 524
+        num_blocks = 4
+        dropout_rate = 0.2
+        epochs = 120
+        learning_rate = 1e-3
+        weight_decay = 1e-2
+        mixup_alpha = 0.2
+
+        class ResBlock(nn.Module):
+            def __init__(self, dim, drop):
+                super().__init__()
+                self.net = nn.Sequential(
+                    nn.Linear(dim, dim),
+                    nn.BatchNorm1d(dim),
+                    nn.ReLU(),
+                    nn.Dropout(drop),
+                    nn.Linear(dim, dim),
+                    nn.BatchNorm1d(dim),
+                    nn.ReLU(),
+                    nn.Dropout(drop)
+                )
+            
+            def forward(self, x):
+                return x + self.net(x)
+
+        class ResMLP(nn.Module):
+            def __init__(self, in_dim, h_dim, out_dim, blocks, drop):
+                super().__init__()
+                self.embedding = nn.Sequential(
+                    nn.Linear(in_dim, h_dim),
+                    nn.BatchNorm1d(h_dim),
+                    nn.ReLU(),
+                    nn.Dropout(drop)
+                )
+                self.layers = nn.ModuleList([ResBlock(h_dim, drop) for _ in range(blocks)])
+                self.head = nn.Linear(h_dim, out_dim)
+            
+            def forward(self, x):
+                x = self.embedding(x)
+                for layer in self.layers:
+                    x = layer(x)
+                return self.head(x)
+
+        # Initialize model
+        model = ResMLP(input_dim, hidden_dim, num_classes, num_blocks, dropout_rate)
         model = model.to(device)
-        
-        # Safety check for parameter count
-        param_count = sum(p.numel() for p in model.parameters() if p.requires_grad)
-        if param_count > 2500000:
-            # Fallback to 512 if somehow over limit (e.g. diff internal impl)
-            model = ParetoModel(input_dim, num_classes, hidden_dim=512)
+
+        # Check parameter count constraint
+        current_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        if current_params > param_limit:
+            # Fallback to a slightly smaller width if calculation exceeds limit
+            hidden_dim = 512
+            model = ResMLP(input_dim, hidden_dim, num_classes, num_blocks, dropout_rate)
             model = model.to(device)
 
-        # Training Hyperparameters
-        epochs = 70
-        lr = 0.001
-        weight_decay = 1e-3
-        
-        optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
-        scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
+        # Setup Training
+        optimizer = optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
         criterion = nn.CrossEntropyLoss()
         
-        best_acc = -1.0
-        best_state = None
+        # OneCycleLR is efficient for convergence
+        total_steps = epochs * len(train_loader)
+        scheduler = optim.lr_scheduler.OneCycleLR(
+            optimizer, max_lr=learning_rate, total_steps=total_steps, pct_start=0.3
+        )
         
+        best_val_acc = 0.0
+        best_model_state = copy.deepcopy(model.state_dict())
+        
+        # Training Loop
         for epoch in range(epochs):
             model.train()
             for inputs, targets in train_loader:
                 inputs, targets = inputs.to(device), targets.to(device)
                 
-                # Mixup augmentation
-                inputs, targets_a, targets_b, lam = self.mixup_data(inputs, targets, alpha=0.4, device=device)
-                
                 optimizer.zero_grad()
-                outputs = model(inputs)
-                loss = self.mixup_criterion(criterion, outputs, targets_a, targets_b, lam)
+                
+                # Mixup Augmentation
+                if mixup_alpha > 0:
+                    lam = np.random.beta(mixup_alpha, mixup_alpha)
+                    indices = torch.randperm(inputs.size(0)).to(device)
+                    mixed_inputs = lam * inputs + (1 - lam) * inputs[indices]
+                    targets_a, targets_b = targets, targets[indices]
+                    
+                    outputs = model(mixed_inputs)
+                    loss = lam * criterion(outputs, targets_a) + (1 - lam) * criterion(outputs, targets_b)
+                else:
+                    outputs = model(inputs)
+                    loss = criterion(outputs, targets)
                 
                 loss.backward()
                 optimizer.step()
-            
-            scheduler.step()
+                scheduler.step()
             
             # Validation
             model.eval()
@@ -112,31 +124,16 @@ class Solution:
                 for inputs, targets in val_loader:
                     inputs, targets = inputs.to(device), targets.to(device)
                     outputs = model(inputs)
-                    preds = outputs.argmax(dim=1)
-                    correct += (preds == targets).sum().item()
+                    _, predicted = torch.max(outputs, 1)
                     total += targets.size(0)
+                    correct += (predicted == targets).sum().item()
             
-            val_acc = correct / total
-            if val_acc > best_acc:
-                best_acc = val_acc
-                best_state = {k: v.cpu() for k, v in model.state_dict().items()}
+            val_acc = correct / total if total > 0 else 0
+            
+            if val_acc > best_val_acc:
+                best_val_acc = val_acc
+                best_model_state = copy.deepcopy(model.state_dict())
         
-        # Load best performing model
-        if best_state is not None:
-            model.load_state_dict(best_state)
-            
+        # Load best model
+        model.load_state_dict(best_model_state)
         return model
-
-    def mixup_data(self, x, y, alpha=1.0, device='cpu'):
-        if alpha > 0:
-            lam = np.random.beta(alpha, alpha)
-        else:
-            lam = 1
-        batch_size = x.size(0)
-        index = torch.randperm(batch_size).to(device)
-        mixed_x = lam * x + (1 - lam) * x[index, :]
-        y_a, y_b = y, y[index]
-        return mixed_x, y_a, y_b, lam
-
-    def mixup_criterion(self, criterion, pred, y_a, y_b, lam):
-        return lam * criterion(pred, y_a) + (1 - lam) * criterion(pred, y_b)

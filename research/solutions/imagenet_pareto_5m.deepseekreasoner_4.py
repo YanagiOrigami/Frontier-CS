@@ -1,136 +1,116 @@
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.optim.lr_scheduler import CosineAnnealingLR
+from torch.optim.lr_scheduler import CosineAnnealingLR, ReduceLROnPlateau
+import time
 import numpy as np
-import math
-
-def count_parameters(model):
-    return sum(p.numel() for p in model.parameters() if p.requires_grad)
+from collections import OrderedDict
 
 class ResidualBlock(nn.Module):
-    def __init__(self, in_features, out_features, dropout_rate=0.1):
-        super().__init__()
+    def __init__(self, in_features, out_features, dropout_rate=0.2):
+        super(ResidualBlock, self).__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+        
         self.norm1 = nn.BatchNorm1d(in_features)
-        self.fc1 = nn.Linear(in_features, out_features)
-        self.relu = nn.ReLU(inplace=True)
-        self.dropout = nn.Dropout(dropout_rate)
+        self.linear1 = nn.Linear(in_features, out_features)
         self.norm2 = nn.BatchNorm1d(out_features)
-        self.fc2 = nn.Linear(out_features, out_features)
+        self.linear2 = nn.Linear(out_features, out_features)
+        self.activation = nn.GELU()
+        self.dropout = nn.Dropout(dropout_rate)
         
-        # Skip connection
-        self.skip = nn.Linear(in_features, out_features) if in_features != out_features else nn.Identity()
-        
+        if in_features != out_features:
+            self.shortcut = nn.Linear(in_features, out_features)
+        else:
+            self.shortcut = nn.Identity()
+            
     def forward(self, x):
-        identity = self.skip(x)
+        identity = self.shortcut(x)
+        
         out = self.norm1(x)
-        out = self.fc1(out)
-        out = self.relu(out)
+        out = self.activation(out)
+        out = self.linear1(out)
+        
+        out = self.norm2(out)
+        out = self.activation(out)
+        out = self.linear2(out)
         out = self.dropout(out)
-        out = self.norm2(out)
-        out = self.fc2(out)
-        out = self.relu(out + identity)
+        
+        out = out + identity
         return out
 
-class BottleneckResidualBlock(nn.Module):
-    def __init__(self, in_features, bottleneck_features, dropout_rate=0.1):
-        super().__init__()
-        self.norm1 = nn.BatchNorm1d(in_features)
-        self.fc1 = nn.Linear(in_features, bottleneck_features)
-        self.relu = nn.ReLU(inplace=True)
-        self.dropout1 = nn.Dropout(dropout_rate)
-        self.norm2 = nn.BatchNorm1d(bottleneck_features)
-        self.fc2 = nn.Linear(bottleneck_features, in_features)
-        self.dropout2 = nn.Dropout(dropout_rate)
+class EfficientMLP(nn.Module):
+    def __init__(self, input_dim=384, num_classes=128, hidden_dims=None, dropout_rate=0.2):
+        super(EfficientMLP, self).__init__()
+        
+        if hidden_dims is None:
+            hidden_dims = [768, 1024, 768, 512]
+        
+        layers = OrderedDict()
+        
+        # Input layer
+        layers['input_norm'] = nn.BatchNorm1d(input_dim)
+        layers['input_linear'] = nn.Linear(input_dim, hidden_dims[0])
+        layers['input_activation'] = nn.GELU()
+        layers['input_dropout'] = nn.Dropout(dropout_rate)
+        
+        # Hidden layers with residual connections
+        for i in range(len(hidden_dims) - 1):
+            layers[f'res_block_{i}'] = ResidualBlock(
+                hidden_dims[i], 
+                hidden_dims[i + 1], 
+                dropout_rate
+            )
+        
+        # Final layers
+        layers['final_norm'] = nn.BatchNorm1d(hidden_dims[-1])
+        layers['final_activation'] = nn.GELU()
+        layers['final_dropout'] = nn.Dropout(dropout_rate * 0.5)
+        layers['output'] = nn.Linear(hidden_dims[-1], num_classes)
+        
+        self.model = nn.Sequential(layers)
         
     def forward(self, x):
-        identity = x
-        out = self.norm1(x)
-        out = self.fc1(out)
-        out = self.relu(out)
-        out = self.dropout1(out)
-        out = self.norm2(out)
-        out = self.fc2(out)
-        out = self.dropout2(out)
-        out = self.relu(out + identity)
-        return out
-
-class SolutionModel(nn.Module):
-    def __init__(self, input_dim, num_classes):
-        super().__init__()
-        # Stage 1: Initial projection
-        base_dim = 1536
-        self.input_proj = nn.Sequential(
-            nn.Linear(input_dim, base_dim),
-            nn.BatchNorm1d(base_dim),
-            nn.ReLU(inplace=True),
-            nn.Dropout(0.2)
-        )
-        
-        # Stage 2: Residual blocks with bottleneck
-        self.res_blocks = nn.Sequential(
-            BottleneckResidualBlock(base_dim, 384, dropout_rate=0.1),
-            BottleneckResidualBlock(base_dim, 384, dropout_rate=0.1),
-            BottleneckResidualBlock(base_dim, 384, dropout_rate=0.1),
-            BottleneckResidualBlock(base_dim, 384, dropout_rate=0.1),
-            BottleneckResidualBlock(base_dim, 384, dropout_rate=0.1),
-            BottleneckResidualBlock(base_dim, 384, dropout_rate=0.1),
-        )
-        
-        # Stage 3: Head
-        self.head = nn.Sequential(
-            nn.BatchNorm1d(base_dim),
-            nn.Dropout(0.3),
-            nn.Linear(base_dim, 1024),
-            nn.ReLU(inplace=True),
-            nn.BatchNorm1d(1024),
-            nn.Dropout(0.2),
-            nn.Linear(1024, 512),
-            nn.ReLU(inplace=True),
-            nn.BatchNorm1d(512),
-            nn.Dropout(0.1),
-            nn.Linear(512, num_classes)
-        )
-        
-        # Initialize weights
-        self._initialize_weights()
-        
-    def _initialize_weights(self):
-        for m in self.modules():
-            if isinstance(m, nn.Linear):
-                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
-                if m.bias is not None:
-                    nn.init.constant_(m.bias, 0)
-            elif isinstance(m, nn.BatchNorm1d):
-                nn.init.constant_(m.weight, 1)
-                nn.init.constant_(m.bias, 0)
-                
-    def forward(self, x):
-        x = self.input_proj(x)
-        x = self.res_blocks(x)
-        x = self.head(x)
-        return x
+        return self.model(x)
 
 class Solution:
     def solve(self, train_loader, val_loader, metadata: dict = None):
-        device = torch.device(metadata.get("device", "cpu"))
-        input_dim = metadata["input_dim"]
-        num_classes = metadata["num_classes"]
-        param_limit = metadata["param_limit"]
+        if metadata is None:
+            metadata = {}
         
-        # Create model
-        model = SolutionModel(input_dim, num_classes).to(device)
+        device = metadata.get("device", "cpu")
+        input_dim = metadata.get("input_dim", 384)
+        num_classes = metadata.get("num_classes", 128)
+        param_limit = metadata.get("param_limit", 5000000)
+        
+        # Adjust architecture based on parameter budget
+        hidden_dims = self._optimize_architecture(input_dim, num_classes, param_limit)
+        
+        model = EfficientMLP(
+            input_dim=input_dim,
+            num_classes=num_classes,
+            hidden_dims=hidden_dims,
+            dropout_rate=0.25
+        ).to(device)
         
         # Verify parameter count
-        total_params = count_parameters(model)
-        if total_params > param_limit:
-            # If model exceeds limit, scale it down
-            model = self._create_scaled_model(input_dim, num_classes, param_limit).to(device)
-            total_params = count_parameters(model)
-            
-        print(f"Model parameters: {total_params:,} / {param_limit:,}")
+        total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        print(f"Total trainable parameters: {total_params:,}")
         
-        # Training setup
+        if total_params > param_limit:
+            # Reduce hidden dimensions proportionally
+            scale = (param_limit / total_params) ** 0.5
+            hidden_dims = [int(d * scale) for d in hidden_dims]
+            model = EfficientMLP(
+                input_dim=input_dim,
+                num_classes=num_classes,
+                hidden_dims=hidden_dims,
+                dropout_rate=0.25
+            ).to(device)
+            total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+            print(f"Adjusted parameters: {total_params:,}")
+        
+        # Training configuration
         criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
         optimizer = optim.AdamW(
             model.parameters(),
@@ -139,27 +119,31 @@ class Solution:
             betas=(0.9, 0.999)
         )
         
-        scheduler = CosineAnnealingLR(
-            optimizer,
-            T_max=100,
-            eta_min=1e-6
-        )
-        
-        # Mixed precision training
-        scaler = torch.cuda.amp.GradScaler() if device.type == 'cuda' else None
+        # Multi-step scheduler with warmup
+        warmup_epochs = 5
+        total_epochs = 200
+        scheduler = CosineAnnealingLR(optimizer, T_max=total_epochs - warmup_epochs)
         
         # Early stopping
-        best_val_acc = 0.0
-        patience_counter = 0
-        patience = 20
+        best_val_acc = 0
         best_model_state = None
+        patience = 15
+        patience_counter = 0
+        
+        # Mixed precision training (CPU-friendly)
+        scaler = torch.cuda.amp.GradScaler(enabled=False)  # Disabled for CPU
         
         # Training loop
-        num_epochs = 200
-        for epoch in range(num_epochs):
-            # Training phase
+        for epoch in range(total_epochs):
+            # Warmup phase
+            if epoch < warmup_epochs:
+                lr_scale = min(1.0, (epoch + 1) / warmup_epochs)
+                for param_group in optimizer.param_groups:
+                    param_group['lr'] = 0.001 * lr_scale
+            
+            # Training
             model.train()
-            train_loss = 0.0
+            train_loss = 0
             train_correct = 0
             train_total = 0
             
@@ -168,18 +152,16 @@ class Solution:
                 
                 optimizer.zero_grad()
                 
-                if scaler is not None:
-                    with torch.cuda.amp.autocast():
-                        outputs = model(inputs)
-                        loss = criterion(outputs, targets)
-                    scaler.scale(loss).backward()
-                    scaler.step(optimizer)
-                    scaler.update()
-                else:
+                with torch.cuda.amp.autocast(enabled=False):
                     outputs = model(inputs)
                     loss = criterion(outputs, targets)
-                    loss.backward()
-                    optimizer.step()
+                
+                loss.backward()
+                
+                # Gradient clipping
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                
+                optimizer.step()
                 
                 train_loss += loss.item()
                 _, predicted = outputs.max(1)
@@ -188,8 +170,9 @@ class Solution:
             
             train_acc = 100. * train_correct / train_total
             
-            # Validation phase
+            # Validation
             model.eval()
+            val_loss = 0
             val_correct = 0
             val_total = 0
             
@@ -197,94 +180,79 @@ class Solution:
                 for inputs, targets in val_loader:
                     inputs, targets = inputs.to(device), targets.to(device)
                     outputs = model(inputs)
+                    loss = criterion(outputs, targets)
+                    
+                    val_loss += loss.item()
                     _, predicted = outputs.max(1)
                     val_total += targets.size(0)
                     val_correct += predicted.eq(targets).sum().item()
             
             val_acc = 100. * val_correct / val_total
             
-            # Update scheduler
-            scheduler.step()
+            # Update scheduler after warmup
+            if epoch >= warmup_epochs:
+                scheduler.step()
             
-            # Early stopping logic
+            # Early stopping check
             if val_acc > best_val_acc:
                 best_val_acc = val_acc
+                best_model_state = model.state_dict().copy()
                 patience_counter = 0
-                best_model_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
             else:
                 patience_counter += 1
-                
-            if patience_counter >= patience:
-                print(f"Early stopping at epoch {epoch}")
-                break
             
-            if (epoch + 1) % 20 == 0:
-                print(f"Epoch [{epoch+1}/{num_epochs}], "
-                      f"Train Loss: {train_loss/(batch_idx+1):.4f}, "
-                      f"Train Acc: {train_acc:.2f}%, "
-                      f"Val Acc: {val_acc:.2f}%")
+            # Print progress
+            if (epoch + 1) % 10 == 0:
+                print(f'Epoch: {epoch+1:03d} | '
+                      f'Train Loss: {train_loss/len(train_loader):.4f} | '
+                      f'Train Acc: {train_acc:.2f}% | '
+                      f'Val Loss: {val_loss/len(val_loader):.4f} | '
+                      f'Val Acc: {val_acc:.2f}% | '
+                      f'LR: {optimizer.param_groups[0]["lr"]:.6f}')
+            
+            if patience_counter >= patience:
+                print(f'Early stopping triggered at epoch {epoch+1}')
+                break
         
         # Load best model
         if best_model_state is not None:
             model.load_state_dict(best_model_state)
         
-        print(f"Final validation accuracy: {best_val_acc:.2f}%")
-        
-        # Final parameter count check
-        final_params = count_parameters(model)
-        if final_params > param_limit:
-            print(f"WARNING: Model exceeds parameter limit ({final_params} > {param_limit})")
-        
         return model
     
-    def _create_scaled_model(self, input_dim, num_classes, param_limit):
-        """Create a scaled-down model if initial design exceeds parameter limit"""
-        # Conservative design that should stay under limit
-        base_dim = 1024
+    def _optimize_architecture(self, input_dim, num_classes, param_limit):
+        # Calculate optimal hidden dimensions within parameter budget
+        # Using a pyramid structure: wider in middle, narrower at ends
+        base_width = 1024
+        middle_width = 1280
         
-        class ConservativeModel(nn.Module):
-            def __init__(self):
-                super().__init__()
-                self.net = nn.Sequential(
-                    nn.Linear(input_dim, base_dim),
-                    nn.BatchNorm1d(base_dim),
-                    nn.ReLU(inplace=True),
-                    nn.Dropout(0.2),
-                    
-                    nn.Linear(base_dim, base_dim),
-                    nn.BatchNorm1d(base_dim),
-                    nn.ReLU(inplace=True),
-                    nn.Dropout(0.2),
-                    
-                    nn.Linear(base_dim, base_dim),
-                    nn.BatchNorm1d(base_dim),
-                    nn.ReLU(inplace=True),
-                    nn.Dropout(0.1),
-                    
-                    nn.Linear(base_dim, base_dim // 2),
-                    nn.BatchNorm1d(base_dim // 2),
-                    nn.ReLU(inplace=True),
-                    nn.Dropout(0.1),
-                    
-                    nn.Linear(base_dim // 2, num_classes)
-                )
-                
-                # Initialize weights
-                self._initialize_weights()
-                
-            def _initialize_weights(self):
-                for m in self.modules():
-                    if isinstance(m, nn.Linear):
-                        nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
-                        if m.bias is not None:
-                            nn.init.constant_(m.bias, 0)
-                    elif isinstance(m, nn.BatchNorm1d):
-                        nn.init.constant_(m.weight, 1)
-                        nn.init.constant_(m.bias, 0)
-                        
-            def forward(self, x):
-                return self.net(x)
+        # Try to allocate ~4.8M parameters to be safe
+        target_params = param_limit * 0.96
         
-        model = ConservativeModel()
-        print(f"Scaled model parameters: {count_parameters(model):,}")
-        return model
+        # Calculate available parameters for hidden layers
+        # Subtract input and output layer parameters
+        input_output_params = (
+            input_dim * base_width + base_width +  # Input layer
+            base_width * num_classes + num_classes  # Output layer (worst case)
+        )
+        
+        hidden_params_budget = target_params - input_output_params
+        
+        # Estimate parameters per residual block
+        # Each block has 2 linear layers + batchnorm
+        block_params_estimate = 2 * (base_width * base_width + base_width) + 4 * base_width
+        
+        # Calculate number of blocks we can afford
+        n_blocks = max(2, int(hidden_params_budget / block_params_estimate))
+        n_blocks = min(n_blocks, 6)  # Limit depth
+        
+        # Create pyramid structure
+        if n_blocks >= 4:
+            # 4 or more blocks: narrow -> wide -> wide -> narrow
+            return [base_width, middle_width, middle_width, base_width]
+        elif n_blocks == 3:
+            # 3 blocks: narrow -> wide -> narrow
+            return [base_width, middle_width, base_width]
+        else:
+            # 2 blocks: moderate width throughout
+            return [base_width, base_width]

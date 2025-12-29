@@ -1,334 +1,447 @@
 import numpy as np
-from itertools import combinations
+import sympy as sp
+
+
+def _safe_eval(expr: str, x1: np.ndarray, x2: np.ndarray) -> np.ndarray:
+    env = {
+        "__builtins__": {},
+        "sin": np.sin,
+        "cos": np.cos,
+        "exp": np.exp,
+        "log": np.log,
+        "x1": x1,
+        "x2": x2,
+    }
+    return eval(expr, env, {})
+
+
+def _fit_affine(u: np.ndarray, y: np.ndarray) -> tuple[float, float, float]:
+    u = np.asarray(u, dtype=np.float64)
+    y = np.asarray(y, dtype=np.float64)
+    A = np.column_stack([u, np.ones_like(u)])
+    coef, _, _, _ = np.linalg.lstsq(A, y, rcond=None)
+    a = float(coef[0])
+    b = float(coef[1])
+    pred = a * u + b
+    mse = float(np.mean((y - pred) ** 2))
+    return a, b, mse
+
+
+def _sympy_complexity(expr_str: str) -> int:
+    x1, x2 = sp.Symbol("x1"), sp.Symbol("x2")
+    locals_map = {"sin": sp.sin, "cos": sp.cos, "exp": sp.exp, "log": sp.log, "x1": x1, "x2": x2}
+    try:
+        expr = sp.sympify(expr_str, locals=locals_map)
+    except Exception:
+        return 10**9
+
+    unary_funcs = {sp.sin, sp.cos, sp.exp, sp.log}
+
+    def rec(e):
+        if e.is_Atom:
+            return 0, 0
+        if e.func in unary_funcs:
+            u_b, u_u = rec(e.args[0])
+            return u_b, u_u + 1
+        if isinstance(e, sp.Add) or isinstance(e, sp.Mul):
+            b = max(0, len(e.args) - 1)
+            tb, tu = 0, 0
+            for a in e.args:
+                cb, cu = rec(a)
+                tb += cb
+                tu += cu
+            return tb + b, tu
+        if isinstance(e, sp.Pow):
+            b1, u1 = rec(e.args[0])
+            b2, u2 = rec(e.args[1])
+            return b1 + b2 + 1, u1 + u2
+        tb, tu = 0, 0
+        for a in e.args:
+            cb, cu = rec(a)
+            tb += cb
+            tu += cu
+        return tb, tu
+
+    b, u = rec(expr)
+    return int(2 * b + u)
+
+
+def _snap_coef(c: float, scale: float) -> float:
+    if not np.isfinite(c):
+        return 0.0
+    if abs(c) < max(1e-12, 1e-10 * scale):
+        return 0.0
+    targets = [-3.0, -2.0, -1.0, -0.5, -1.0 / 3.0, 1.0 / 3.0, 0.5, 1.0, 2.0, 3.0]
+    for t in targets:
+        if abs(c - t) <= max(1e-7, 1e-5 * max(1.0, abs(t))):
+            return float(t)
+    return float(c)
+
+
+def _format_float(c: float) -> str:
+    if c == 0.0:
+        return "0.0"
+    s = f"{c:.12g}"
+    if "e" in s or "E" in s:
+        s = s.replace("E", "e")
+    return s
+
+
+def _needs_parens(s: str) -> bool:
+    if not s:
+        return False
+    # Conservative: wrap if contains + or - not as leading sign.
+    # Also wrap if contains space (sympy can insert spaces).
+    if " " in s:
+        return True
+    if "+" in s:
+        return True
+    if "-" in s[1:]:
+        return True
+    return False
+
+
+def _build_linear_expression(intercept: float, terms: list[tuple[float, str]], scale: float) -> str:
+    intercept = _snap_coef(intercept, scale)
+    cleaned = []
+    for c, f in terms:
+        c = _snap_coef(c, scale)
+        if c == 0.0:
+            continue
+        cleaned.append((c, f))
+
+    pieces = []
+
+    if intercept != 0.0 or not cleaned:
+        pieces.append(_format_float(intercept))
+
+    for c, f in cleaned:
+        if c == 1.0:
+            term = f
+        elif c == -1.0:
+            term = f"-({f})" if _needs_parens(f) else f"-{f}"
+        else:
+            cf = _format_float(c)
+            ff = f"({f})" if _needs_parens(f) else f
+            term = f"{cf}*{ff}"
+        pieces.append(term)
+
+    expr = " + ".join(pieces)
+    expr = expr.replace("+ -", "- ")
+    return expr
+
+
+def _expr_to_sympy_str(expr: str) -> str:
+    x1, x2 = sp.Symbol("x1"), sp.Symbol("x2")
+    locals_map = {"sin": sp.sin, "cos": sp.cos, "exp": sp.exp, "log": sp.log, "x1": x1, "x2": x2}
+    try:
+        e = sp.sympify(expr, locals=locals_map)
+        e = sp.simplify(e)
+        s = str(e)
+        # Ensure sympy prints in allowed forms (no "Sympy" wrappers)
+        return s
+    except Exception:
+        return expr
+
+
+def _baseline_mse(X: np.ndarray, y: np.ndarray) -> float:
+    x1 = X[:, 0]
+    x2 = X[:, 1]
+    A = np.column_stack([x1, x2, np.ones_like(x1)])
+    coef, _, _, _ = np.linalg.lstsq(A, y, rcond=None)
+    pred = A @ coef
+    return float(np.mean((y - pred) ** 2))
+
+
+def _make_arg_str(a: int, b: int) -> str:
+    parts = []
+    if a != 0:
+        if a == 1:
+            parts.append("x1")
+        elif a == -1:
+            parts.append("-x1")
+        else:
+            parts.append(f"{a}*x1")
+    if b != 0:
+        if b == 1:
+            parts.append("x2")
+        elif b == -1:
+            parts.append("-x2")
+        else:
+            parts.append(f"{b}*x2")
+    if not parts:
+        return "0"
+    s = " + ".join(parts)
+    s = s.replace("+ -", "- ")
+    return s
+
+
+def _generate_feature_library(X: np.ndarray) -> tuple[np.ndarray, list[str]]:
+    x1 = X[:, 0].astype(np.float64, copy=False)
+    x2 = X[:, 1].astype(np.float64, copy=False)
+    feats = []
+    names = []
+
+    def add(name: str, arr: np.ndarray):
+        arr = np.asarray(arr, dtype=np.float64)
+        if not np.all(np.isfinite(arr)):
+            return
+        # Avoid constant/near-constant (except intercept will be separate)
+        if np.std(arr) < 1e-12:
+            return
+        names.append(name)
+        feats.append(arr)
+
+    # Base linear terms
+    add("x1", x1)
+    add("x2", x2)
+
+    # Trig on single vars with small integer multipliers
+    for k in (1, 2):
+        add(f"sin({k}*x1)" if k != 1 else "sin(x1)", np.sin(k * x1))
+        add(f"cos({k}*x1)" if k != 1 else "cos(x1)", np.cos(k * x1))
+        add(f"sin({k}*x2)" if k != 1 else "sin(x2)", np.sin(k * x2))
+        add(f"cos({k}*x2)" if k != 1 else "cos(x2)", np.cos(k * x2))
+
+    # Trig of linear combinations a*x1 + b*x2 with small integers
+    ab_vals = [-2, -1, 0, 1, 2]
+    for a in ab_vals:
+        for b in ab_vals:
+            if a == 0 and b == 0:
+                continue
+            if a == 0 and abs(b) <= 2:
+                continue  # already covered by single-var trig
+            if b == 0 and abs(a) <= 2:
+                continue  # already covered
+            arg = a * x1 + b * x2
+            arg_str = _make_arg_str(a, b)
+            add(f"sin({arg_str})", np.sin(arg))
+            add(f"cos({arg_str})", np.cos(arg))
+
+    # Products of sin/cos of individual vars
+    trig1 = [("sin(x1)", np.sin(x1)), ("cos(x1)", np.cos(x1)), ("sin(2*x1)", np.sin(2 * x1)), ("cos(2*x1)", np.cos(2 * x1))]
+    trig2 = [("sin(x2)", np.sin(x2)), ("cos(x2)", np.cos(x2)), ("sin(2*x2)", np.sin(2 * x2)), ("cos(2*x2)", np.cos(2 * x2))]
+    for n1, a1 in trig1:
+        for n2, a2 in trig2:
+            add(f"{n1}*{n2}", a1 * a2)
+
+    Phi = np.column_stack(feats) if feats else np.empty((X.shape[0], 0), dtype=np.float64)
+    return Phi, names
+
+
+def _forward_select(Phi: np.ndarray, names: list[str], y: np.ndarray, max_terms: int = 5) -> tuple[list[int], np.ndarray, float]:
+    n, k = Phi.shape
+    y = y.astype(np.float64, copy=False)
+
+    # Always include intercept separately; fit on [Phi_selected, 1]
+    remaining = list(range(k))
+    selected: list[int] = []
+    best_coef = None
+    best_mse = np.inf
+
+    models = []
+
+    def fit(idxs: list[int]) -> tuple[np.ndarray, float]:
+        if idxs:
+            A = np.column_stack([Phi[:, idxs], np.ones(n)])
+        else:
+            A = np.ones((n, 1), dtype=np.float64)
+        coef, _, _, _ = np.linalg.lstsq(A, y, rcond=None)
+        pred = A @ coef
+        mse = float(np.mean((y - pred) ** 2))
+        return coef, mse
+
+    # start with intercept only
+    coef0, mse0 = fit([])
+    models.append(([], coef0, mse0))
+    best_coef, best_mse = coef0, mse0
+
+    for _ in range(max_terms):
+        best_local = None
+        best_local_mse = np.inf
+        best_local_coef = None
+        for j in remaining:
+            idxs = selected + [j]
+            coef, mse = fit(idxs)
+            if mse < best_local_mse:
+                best_local_mse = mse
+                best_local = j
+                best_local_coef = coef
+        if best_local is None:
+            break
+        # Require meaningful improvement
+        if best_mse - best_local_mse <= max(1e-14, 1e-10 * (abs(best_mse) + 1.0)):
+            break
+        selected.append(best_local)
+        remaining.remove(best_local)
+        best_mse = best_local_mse
+        best_coef = best_local_coef
+        models.append((selected.copy(), best_coef.copy(), best_mse))
+
+    # Choose simplest within tolerance of best MSE
+    best_mse_overall = min(m[2] for m in models)
+    tol = max(1e-12, 1e-6 * (np.var(y) + 1e-12))
+    candidates = [m for m in models if m[2] <= best_mse_overall + tol]
+
+    def model_complexity(m):
+        idxs, coef, _ = m
+        intercept = coef[-1] if len(coef) >= 1 else 0.0
+        terms = []
+        for t, j in enumerate(idxs):
+            terms.append((float(coef[t]), names[j]))
+        expr = _build_linear_expression(float(intercept), terms, scale=float(np.std(y) + 1e-12))
+        expr = _expr_to_sympy_str(expr)
+        return _sympy_complexity(expr)
+
+    candidates.sort(key=lambda m: (model_complexity(m), m[2], len(m[0])))
+    idxs, coef, mse = candidates[0]
+    return idxs, coef, float(mse)
+
 
 class Solution:
     def __init__(self, **kwargs):
         self.kwargs = kwargs
 
-    class _Feature:
-        __slots__ = ("expr", "values", "unary", "binary")
-        def __init__(self, expr: str, values: np.ndarray, unary: int, binary: int):
-            self.expr = expr
-            self.values = values
-            self.unary = unary
-            self.binary = binary
-
-    @staticmethod
-    def _fmt_float(x: float) -> str:
-        if np.isnan(x):
-            return "nan"
-        if np.isposinf(x):
-            return "inf"
-        if np.isneginf(x):
-            return "-inf"
-        s = format(float(x), ".12g")
-        if s == "-0":
-            s = "0"
-        return s
-
-    @staticmethod
-    def _safe_solve(G: np.ndarray, b: np.ndarray) -> np.ndarray:
-        try:
-            return np.linalg.solve(G, b)
-        except np.linalg.LinAlgError:
-            return np.linalg.lstsq(G, b, rcond=None)[0]
-
-    @staticmethod
-    def _mse_from_beta(beta: np.ndarray, G: np.ndarray, b: np.ndarray, yTy: float, n: int) -> float:
-        Gb = G @ beta
-        sse = yTy - 2.0 * float(beta @ b) + float(beta @ Gb)
-        if sse < 0.0 and sse > -1e-9:
-            sse = 0.0
-        return float(sse) / float(n)
-
-    def _build_features(self, x1: np.ndarray, x2: np.ndarray):
-        feats = []
-
-        def add(expr, vals, unary, binary):
-            feats.append(self._Feature(expr, vals, unary, binary))
-
-        # Linear terms
-        add("x1", x1, unary=0, binary=0)
-        add("x2", x2, unary=0, binary=0)
-
-        # Trig terms: k in {1, 2, 0.5}
-        for k in (1.0, 2.0, 0.5):
-            if k == 1.0:
-                add("sin(x1)", np.sin(x1), unary=1, binary=0)
-                add("cos(x1)", np.cos(x1), unary=1, binary=0)
-                add("sin(x2)", np.sin(x2), unary=1, binary=0)
-                add("cos(x2)", np.cos(x2), unary=1, binary=0)
-            else:
-                ks = self._fmt_float(k)
-                add(f"sin({ks}*x1)", np.sin(k * x1), unary=1, binary=1)
-                add(f"cos({ks}*x1)", np.cos(k * x1), unary=1, binary=1)
-                add(f"sin({ks}*x2)", np.sin(k * x2), unary=1, binary=1)
-                add(f"cos({ks}*x2)", np.cos(k * x2), unary=1, binary=1)
-
-        # Sum/diff trig
-        x1px2 = x1 + x2
-        x1mx2 = x1 - x2
-        add("sin(x1 + x2)", np.sin(x1px2), unary=1, binary=1)
-        add("cos(x1 + x2)", np.cos(x1px2), unary=1, binary=1)
-        add("sin(x1 - x2)", np.sin(x1mx2), unary=1, binary=1)
-        add("cos(x1 - x2)", np.cos(x1mx2), unary=1, binary=1)
-
-        # Products
-        sx1 = np.sin(x1)
-        cx1 = np.cos(x1)
-        sx2 = np.sin(x2)
-        cx2 = np.cos(x2)
-        add("sin(x1)*cos(x2)", sx1 * cx2, unary=2, binary=1)
-        add("cos(x1)*sin(x2)", cx1 * sx2, unary=2, binary=1)
-        add("sin(x1)*sin(x2)", sx1 * sx2, unary=2, binary=1)
-        add("cos(x1)*cos(x2)", cx1 * cx2, unary=2, binary=1)
-
-        return feats
-
-    def _expression_and_complexity(self, subset, beta, features, intercept_idx):
-        # subset: list of feature indices; beta aligned with subset + intercept at end
-        coef_terms = []
-        const = beta[-1]
-        for j, fi in enumerate(subset):
-            a = beta[j]
-            if a == 0.0:
-                continue
-            coef_terms.append((fi, a))
-
-        # Complexity estimation (C = 2*binary + unary)
-        unary = 0
-        binary = 0
-        term_count = 0
-
-        for fi, a in coef_terms:
-            f = features[fi]
-            unary += f.unary
-            binary += f.binary
-            if not (a == 1.0 or a == -1.0):
-                binary += 1  # multiplication by coefficient
-            term_count += 1
-
-        if const != 0.0:
-            term_count += 1
-
-        if term_count >= 2:
-            binary += (term_count - 1)  # additions/subtractions
-
-        C = int(2 * binary + unary)
-
-        # Build expression string
-        parts = []
-
-        def maybe_paren(e: str) -> str:
-            if ("+" in e) or ("-" in e) or (" " in e):
-                return f"({e})"
-            return e
-
-        def add_term(sign: str, term: str):
-            if not parts:
-                if sign == "-":
-                    parts.append("-" + term)
-                else:
-                    parts.append(term)
-            else:
-                parts.append(f" {sign} {term}")
-
-        for fi, a in coef_terms:
-            expr = features[fi].expr
-            if a < 0:
-                sign = "-"
-                aa = -a
-            else:
-                sign = "+"
-                aa = a
-
-            if aa == 1.0:
-                term = maybe_paren(expr)
-            else:
-                term = f"{self._fmt_float(aa)}*{maybe_paren(expr)}"
-            add_term(sign, term)
-
-        if const != 0.0 or not parts:
-            c = const
-            if c < 0:
-                sign = "-"
-                cc = -c
-            else:
-                sign = "+"
-                cc = c
-            term = self._fmt_float(cc)
-            add_term(sign, term)
-
-        expression = "".join(parts).strip()
-        if expression == "":
-            expression = "0"
-
-        return expression, C
-
     def solve(self, X: np.ndarray, y: np.ndarray) -> dict:
-        X = np.asarray(X)
-        y = np.asarray(y).reshape(-1)
-        n = int(X.shape[0])
-        if n == 0:
-            return {"expression": "0", "predictions": [], "details": {"complexity": 0}}
+        X = np.asarray(X, dtype=np.float64)
+        y = np.asarray(y, dtype=np.float64).reshape(-1)
+        n = X.shape[0]
+        x1 = X[:, 0]
+        x2 = X[:, 1]
+        y_scale = float(np.std(y) + 1e-12)
 
-        x1 = X[:, 0].astype(np.float64, copy=False)
-        x2 = X[:, 1].astype(np.float64, copy=False)
-        y = y.astype(np.float64, copy=False)
+        # Baseline
+        try:
+            base_mse = _baseline_mse(X, y)
+        except Exception:
+            base_mse = float(np.mean((y - np.mean(y)) ** 2))
 
-        features = self._build_features(x1, x2)
-        m = len(features)
-        intercept_idx = m
+        # First: try a curated list of very low-complexity expressions
+        base_exprs = [
+            "sin(x1)",
+            "cos(x1)",
+            "sin(x2)",
+            "cos(x2)",
+            "sin(x1)+sin(x2)",
+            "sin(x1)+cos(x2)",
+            "cos(x1)+sin(x2)",
+            "cos(x1)+cos(x2)",
+            "sin(x1)-sin(x2)",
+            "sin(x1)-cos(x2)",
+            "cos(x1)-sin(x2)",
+            "cos(x1)-cos(x2)",
+            "sin(x1)*sin(x2)",
+            "sin(x1)*cos(x2)",
+            "cos(x1)*sin(x2)",
+            "cos(x1)*cos(x2)",
+            "sin(x1+x2)",
+            "cos(x1+x2)",
+            "sin(x1-x2)",
+            "cos(x1-x2)",
+            "sin(2*x1)",
+            "cos(2*x1)",
+            "sin(2*x2)",
+            "cos(2*x2)",
+        ]
 
-        F = np.column_stack([f.values for f in features]).astype(np.float64, copy=False)
-        ones = np.ones((n, 1), dtype=np.float64)
-        Z = np.hstack([F, ones])
+        best_expr = None
+        best_pred = None
+        best_mse = np.inf
+        best_comp = 10**9
 
-        gram = Z.T @ Z
-        Zy = Z.T @ y
-        yTy = float(y @ y)
-
-        # Evaluate all subsets up to size 3
-        results = []
-        sizes = (0, 1, 2, 3)
-        for k in sizes:
-            if k == 0:
-                subset = ()
-                idx = (intercept_idx,)
-                G = gram[np.ix_(idx, idx)]
-                b = Zy[list(idx)]
-                beta = self._safe_solve(G, b)
-                mse = self._mse_from_beta(beta, G, b, yTy, n)
-                results.append((mse, subset, beta))
+        for e in base_exprs:
+            try:
+                u = _safe_eval(e, x1, x2)
+                if u.shape != y.shape or not np.all(np.isfinite(u)):
+                    continue
+            except Exception:
                 continue
 
-            for subset in combinations(range(m), k):
-                idx = list(subset) + [intercept_idx]
-                G = gram[np.ix_(idx, idx)]
-                b = Zy[idx]
-                beta = self._safe_solve(G, b)
-                mse = self._mse_from_beta(beta, G, b, yTy, n)
-                results.append((mse, subset, beta))
+            mse0 = float(np.mean((y - u) ** 2))
+            expr0 = _expr_to_sympy_str(e)
+            comp0 = _sympy_complexity(expr0)
 
-        results.sort(key=lambda t: t[0])
-        top = results[:50] if len(results) > 50 else results
+            # Consider affine scaling if it helps substantially
+            a, b, mse1 = _fit_affine(u, y)
 
-        y_scale = float(np.max(np.abs(y))) if n > 0 else 1.0
-        coef_zero_tol = max(1e-12, 1e-10 * (y_scale + 1.0))
-        snap_candidates = (0.0, 1.0, -1.0, 2.0, -2.0, 0.5, -0.5)
-
-        best = None
-        best_mse = None
-        best_C = None
-        best_subset = None
-        best_beta = None
-
-        for mse0, subset0, beta0 in top:
-            subset = list(subset0)
-            beta = beta0.copy()
-            # Prune tiny coefficients then refit on reduced subset
-            pruned_subset = []
-            for j, fi in enumerate(subset):
-                if abs(beta[j]) >= coef_zero_tol:
-                    pruned_subset.append(fi)
-
-            # Always keep intercept during refit; later may prune if near 0
-            subset = pruned_subset
-            idx = subset + [intercept_idx]
-            G = gram[np.ix_(idx, idx)]
-            b = Zy[idx]
-            beta = self._safe_solve(G, b)
-            mse = self._mse_from_beta(beta, G, b, yTy, n)
-
-            # Snap coefficients conservatively
-            mse_allow = mse * (1.0 + 1e-6) + 1e-12
-            beta_snapped = beta.copy()
-            for j in range(len(beta_snapped)):
-                v = float(beta_snapped[j])
-                best_v = v
-                best_mse_local = mse
-                for c in snap_candidates:
-                    if c == v:
-                        continue
-                    # Only try if already close
-                    if abs(v - c) > max(1e-7, 1e-6 * max(1.0, abs(v))):
-                        continue
-                    trial = beta_snapped.copy()
-                    trial[j] = c
-                    mse_trial = self._mse_from_beta(trial, G, b, yTy, n)
-                    if mse_trial <= mse_allow and mse_trial <= best_mse_local + 1e-15:
-                        best_mse_local = mse_trial
-                        best_v = c
-                beta_snapped[j] = best_v
-
-            # Drop snapped zeros and refit again (without snapping) for best SSE
-            subset2 = []
-            for j, fi in enumerate(subset):
-                if beta_snapped[j] != 0.0 and abs(beta_snapped[j]) >= coef_zero_tol:
-                    subset2.append(fi)
-
-            idx2 = subset2 + [intercept_idx]
-            G2 = gram[np.ix_(idx2, idx2)]
-            b2 = Zy[idx2]
-            beta2 = self._safe_solve(G2, b2)
-            mse2 = self._mse_from_beta(beta2, G2, b2, yTy, n)
-
-            # Now attempt snapping on refit solution (final aesthetic), without refit
-            beta_final = beta2.copy()
-            mse_allow2 = mse2 * (1.0 + 1e-6) + 1e-12
-            for j in range(len(beta_final)):
-                v = float(beta_final[j])
-                best_v = v
-                best_mse_local = mse2
-                for c in snap_candidates:
-                    if c == v:
-                        continue
-                    if abs(v - c) > max(1e-7, 1e-6 * max(1.0, abs(v))):
-                        continue
-                    trial = beta_final.copy()
-                    trial[j] = c
-                    mse_trial = self._mse_from_beta(trial, G2, b2, yTy, n)
-                    if mse_trial <= mse_allow2 and mse_trial <= best_mse_local + 1e-15:
-                        best_mse_local = mse_trial
-                        best_v = c
-                beta_final[j] = best_v
-
-            # Prune near-zero intercept if possible (after snapping)
-            if abs(beta_final[-1]) < coef_zero_tol:
-                beta_final[-1] = 0.0
-
-            expr, C = self._expression_and_complexity(subset2, beta_final, features, intercept_idx)
-
-            if best is None:
-                best = expr
-                best_mse = mse2
-                best_C = C
-                best_subset = subset2
-                best_beta = beta_final
+            # Build potentially simplified scaled expression
+            a_s = _snap_coef(a, y_scale)
+            b_s = _snap_coef(b, y_scale)
+            if a_s == 0.0:
+                expr1 = _format_float(b_s)
             else:
-                # Prefer lower MSE; if similar, prefer lower complexity
-                if mse2 < best_mse - 1e-12:
-                    best = expr
-                    best_mse = mse2
-                    best_C = C
-                    best_subset = subset2
-                    best_beta = beta_final
+                if a_s == 1.0:
+                    if b_s == 0.0:
+                        expr1 = e
+                    else:
+                        expr1 = f"{e} + {_format_float(b_s)}"
+                elif a_s == -1.0:
+                    if b_s == 0.0:
+                        expr1 = f"-({e})"
+                    else:
+                        expr1 = f"-({e}) + {_format_float(b_s)}"
                 else:
-                    if mse2 <= best_mse * (1.0 + 1e-7) + 1e-12:
-                        if C < best_C:
-                            best = expr
-                            best_mse = mse2
-                            best_C = C
-                            best_subset = subset2
-                            best_beta = beta_final
+                    expr1 = f"{_format_float(a_s)}*({e})"
+                    if b_s != 0.0:
+                        expr1 = f"{expr1} + {_format_float(b_s)}"
+            expr1 = expr1.replace("+ -", "- ")
+            expr1 = _expr_to_sympy_str(expr1)
+            comp1 = _sympy_complexity(expr1)
 
-        # Compute predictions for best
-        pred = np.full(n, float(best_beta[-1]), dtype=np.float64)
-        for j, fi in enumerate(best_subset):
-            pred += float(best_beta[j]) * features[fi].values
+            # Choose between unscaled and scaled using primary MSE, then complexity
+            for expr_cand, mse_cand, comp_cand in ((expr0, mse0, comp0), (expr1, mse1, comp1)):
+                if mse_cand < best_mse - 1e-15 or (abs(mse_cand - best_mse) <= max(1e-12, 1e-6 * (np.var(y) + 1e-12)) and comp_cand < best_comp):
+                    try:
+                        pred_cand = _safe_eval(expr_cand, x1, x2)
+                        if pred_cand.shape != y.shape or not np.all(np.isfinite(pred_cand)):
+                            continue
+                    except Exception:
+                        continue
+                    best_expr = expr_cand
+                    best_mse = float(mse_cand)
+                    best_comp = int(comp_cand)
+                    best_pred = pred_cand
+
+        # If not good enough, run feature selection on a broader library
+        # Heuristic: if we didn't beat linear baseline by a lot, search broader.
+        if best_expr is None or best_mse > 0.05 * base_mse:
+            Phi, names = _generate_feature_library(X)
+            if Phi.shape[1] > 0:
+                idxs, coef, mse = _forward_select(Phi, names, y, max_terms=5)
+
+                # Build expression from selected features + intercept
+                intercept = float(coef[-1])
+                terms = []
+                for t, j in enumerate(idxs):
+                    terms.append((float(coef[t]), names[j]))
+
+                expr = _build_linear_expression(intercept, terms, scale=y_scale)
+                expr = _expr_to_sympy_str(expr)
+
+                try:
+                    pred = _safe_eval(expr, x1, x2)
+                    if pred.shape == y.shape and np.all(np.isfinite(pred)):
+                        comp = _sympy_complexity(expr)
+                        mse2 = float(np.mean((y - pred) ** 2))
+                        # Prefer this if significantly better, or similar but simpler
+                        if best_expr is None or mse2 < best_mse - 1e-12 or (abs(mse2 - best_mse) <= max(1e-12, 1e-6 * (np.var(y) + 1e-12)) and comp < best_comp):
+                            best_expr, best_pred, best_mse, best_comp = expr, pred, mse2, comp
+                except Exception:
+                    pass
+
+        # Final fallback: constant mean
+        if best_expr is None:
+            c = float(np.mean(y))
+            best_expr = _format_float(c)
+            best_pred = np.full(n, c, dtype=np.float64)
+            best_mse = float(np.mean((y - best_pred) ** 2))
+            best_comp = _sympy_complexity(best_expr)
 
         return {
-            "expression": best,
-            "predictions": pred.tolist(),
-            "details": {"complexity": int(best_C)}
+            "expression": str(best_expr),
+            "predictions": best_pred.tolist() if best_pred is not None else None,
+            "details": {
+                "complexity": int(best_comp),
+                "mse": float(best_mse),
+            },
         }

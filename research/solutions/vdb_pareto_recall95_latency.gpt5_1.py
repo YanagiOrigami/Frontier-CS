@@ -1,155 +1,139 @@
 import os
-import math
 import numpy as np
-from typing import Tuple
 
 try:
     import faiss
-except Exception:
+except Exception as e:
     faiss = None
 
 
 class YourIndexClass:
     def __init__(self, dim: int, **kwargs):
-        self.dim = dim
-        self._index = None
-        self._is_trained = False
-        self._added = 0
+        self.dim = int(dim)
+        self.index = None
+        self.index_type = kwargs.get("index_type", "hnsw").lower()
+        self._xb_count = 0
 
-        self._cfg_nlist = kwargs.get("nlist", None)
-        self._cfg_nprobe = kwargs.get("nprobe", 128)
-        self._cfg_train_size = kwargs.get("train_size", None)
-        self._seed = kwargs.get("seed", 123)
-
+        # Threading setup
+        num_threads = kwargs.get("num_threads", None)
         if faiss is not None:
-            nt = kwargs.get("num_threads", None)
-            if nt is None:
-                cpu_cnt = os.cpu_count() or 8
-                nt = max(1, cpu_cnt)
             try:
-                faiss.omp_set_num_threads(nt)
+                if num_threads is None:
+                    num_threads = min(8, os.cpu_count() or 1)
+                faiss.omp_set_num_threads(int(num_threads))
             except Exception:
                 pass
 
-    def _choose_nlist(self, N: int) -> int:
-        if self._cfg_nlist is not None:
-            nlist = int(self._cfg_nlist)
-        else:
-            if N >= 1_000_000:
-                nlist = 8192
-            elif N >= 200_000:
-                nlist = 4096
-            elif N >= 50_000:
-                nlist = 2048
-            elif N >= 10_000:
-                nlist = 1024
-            else:
-                est = max(32, int(4 * math.sqrt(max(N, 1))))
-                # round to power of two for small N
-                p = 1 << (est - 1).bit_length()
-                nlist = max(32, min(p, 1024))
-        nlist = max(1, min(nlist, N))
-        return nlist
+        if faiss is None:
+            self._fallback_store = []
 
-    def _choose_train_size(self, N: int, nlist: int) -> int:
-        if self._cfg_train_size is not None:
-            return int(min(max(self._cfg_train_size, nlist), N))
-        if N >= 1_000_000:
-            ts = 256_000
-        elif N >= 200_000:
-            ts = 128_000
+        if self.index_type == "hnsw":
+            self.M = int(kwargs.get("M", 64))
+            self.ef_construction = int(kwargs.get("ef_construction", 200))
+            self.ef_search = int(kwargs.get("ef_search", 256))
+
+            if faiss is not None:
+                self.index = faiss.IndexHNSWFlat(self.dim, self.M)
+                self.index.hnsw.efConstruction = self.ef_construction
+                self.index.hnsw.efSearch = self.ef_search
+
+        elif self.index_type == "ivf_flat":
+            # IVF-Flat configuration
+            self.nlist = int(kwargs.get("nlist", 32768))
+            self.nprobe = int(kwargs.get("nprobe", 64))
+            if faiss is not None:
+                quantizer = faiss.IndexFlatL2(self.dim)
+                self.index = faiss.IndexIVFFlat(quantizer, self.dim, self.nlist, faiss.METRIC_L2)
+                # Training is deferred until add() is called with data
+                self.index.nprobe = self.nprobe
         else:
-            ts = min(64_000, N)
-        ts = max(nlist, min(ts, N))
-        return ts
+            # Default to HNSW if unsupported type provided
+            self.index_type = "hnsw"
+            self.M = int(kwargs.get("M", 64))
+            self.ef_construction = int(kwargs.get("ef_construction", 200))
+            self.ef_search = int(kwargs.get("ef_search", 256))
+            if faiss is not None:
+                self.index = faiss.IndexHNSWFlat(self.dim, self.M)
+                self.index.hnsw.efConstruction = self.ef_construction
+                self.index.hnsw.efSearch = self.ef_search
 
     def add(self, xb: np.ndarray) -> None:
-        if not isinstance(xb, np.ndarray):
-            xb = np.asarray(xb, dtype=np.float32)
-        if xb.dtype != np.float32:
-            xb = xb.astype(np.float32, copy=False)
-        if xb.ndim != 2 or xb.shape[1] != self.dim:
-            raise ValueError("xb must have shape (N, dim) with dtype float32")
-
-        N = xb.shape[0]
-
+        if xb is None or xb.size == 0:
+            return
+        xb = np.ascontiguousarray(xb, dtype=np.float32)
         if faiss is None:
-            # Fallback: store for brute-force search
-            if not hasattr(self, "_xb"):
-                self._xb = xb.copy()
-            else:
-                self._xb = np.vstack([self._xb, xb])
-            self._added += N
+            self._fallback_store.append(xb.copy())
+            self._xb_count += xb.shape[0]
             return
 
-        if self._index is None:
-            nlist = self._choose_nlist(N)
-            quantizer = faiss.IndexFlatL2(self.dim)
-            index = faiss.IndexIVFFlat(quantizer, self.dim, nlist, faiss.METRIC_L2)
+        if self.index_type == "ivf_flat":
+            if not self.index.is_trained:
+                # Train on a random subset to speed up training
+                n_train = min(xb.shape[0], max(200000, self.nlist * 10))
+                if n_train < xb.shape[0]:
+                    rs = np.random.RandomState(1234)
+                    idx = rs.choice(xb.shape[0], n_train, replace=False)
+                    train_data = xb[idx]
+                else:
+                    train_data = xb
+                self.index.train(train_data)
+            self.index.add(xb)
+        else:
+            # HNSW and others
+            self.index.add(xb)
+        self._xb_count += xb.shape[0]
 
-            # Train with a representative sample
-            train_sz = self._choose_train_size(N, nlist)
-            if train_sz < N:
-                rng = np.random.default_rng(self._seed)
-                idx = rng.choice(N, size=train_sz, replace=False)
-                xtrain = xb[idx]
-            else:
-                xtrain = xb
-
-            if not index.is_trained:
-                index.train(xtrain)
-
-            nprobe = int(self._cfg_nprobe)
-            index.nprobe = max(1, min(nprobe, nlist))
-            self._index = index
-            self._is_trained = True
-
-        self._index.add(xb)
-        self._added += N
-
-    def search(self, xq: np.ndarray, k: int) -> Tuple[np.ndarray, np.ndarray]:
-        if not isinstance(xq, np.ndarray):
-            xq = np.asarray(xq, dtype=np.float32)
-        if xq.dtype != np.float32:
-            xq = xq.astype(np.float32, copy=False)
-        if xq.ndim != 2 or xq.shape[1] != self.dim:
-            raise ValueError("xq must have shape (nq, dim) with dtype float32")
+    def search(self, xq: np.ndarray, k: int):
+        k = int(k)
         if k <= 0:
-            raise ValueError("k must be positive")
+            return np.empty((xq.shape[0], 0), dtype=np.float32), np.empty((xq.shape[0], 0), dtype=np.int64)
 
-        if faiss is not None and self._index is not None and self._added > 0:
-            D, I = self._index.search(xq, k)
-            return D, I
+        xq = np.ascontiguousarray(xq, dtype=np.float32)
 
-        # Fallback brute-force search if faiss not available or index not built
-        if not hasattr(self, "_xb") or self._added == 0:
+        if faiss is None:
+            # Extremely slow fallback (not expected to be used in evaluation)
+            xb = np.concatenate(self._fallback_store, axis=0) if self._fallback_store else np.empty((0, self.dim), dtype=np.float32)
+            if xb.shape[0] == 0:
+                nq = xq.shape[0]
+                return np.full((nq, k), np.inf, dtype=np.float32), -np.ones((nq, k), dtype=np.int64)
+            # Compute squared L2 distances
+            xq_norms = (xq * xq).sum(axis=1, keepdims=True)
+            xb_norms = (xb * xb).sum(axis=1, keepdims=True).T
+            distances = xq_norms + xb_norms - 2.0 * xq @ xb.T
+            distances = distances.astype(np.float32, copy=False)
+            if k >= distances.shape[1]:
+                idx = np.argsort(distances, axis=1)
+                I = idx[:, :k]
+                D = np.take_along_axis(distances, I, axis=1)
+                return D.astype(np.float32), I.astype(np.int64)
+            part = np.argpartition(distances, kth=k - 1, axis=1)[:, :k]
+            row_idx = np.arange(distances.shape[0])[:, None]
+            part_vals = distances[row_idx, part]
+            order = np.argsort(part_vals, axis=1)
+            I = part[row_idx, order]
+            D = distances[row_idx, I]
+            return D.astype(np.float32), I.astype(np.int64)
+
+        if self.index_type == "hnsw":
+            # Ensure efSearch is set appropriately
+            try:
+                if getattr(self.index.hnsw, "efSearch", None) is not None:
+                    self.index.hnsw.efSearch = max(self.index.hnsw.efSearch, k)
+            except Exception:
+                pass
+
+        elif self.index_type == "ivf_flat":
+            try:
+                self.index.nprobe = max(self.index.nprobe, 1)
+            except Exception:
+                pass
+
+        D, I = self.index.search(xq, k)
+        if D is None or I is None:
             nq = xq.shape[0]
-            D = np.full((nq, k), np.inf, dtype=np.float32)
-            I = np.full((nq, k), -1, dtype=np.int64)
-            return D, I
-
-        xb = self._xb
-        nq = xq.shape[0]
-        N = xb.shape[0]
-        k = min(k, N)
-
-        bs = 2048
-        all_D = np.empty((nq, k), dtype=np.float32)
-        all_I = np.empty((nq, k), dtype=np.int64)
-        for i0 in range(0, nq, bs):
-            i1 = min(i0 + bs, nq)
-            q = xq[i0:i1]
-            # Compute squared L2 distances using (a - b)^2 = a^2 + b^2 - 2ab
-            q_norms = np.sum(q * q, axis=1, keepdims=True)
-            xb_norms = np.sum(xb * xb, axis=1, keepdims=True).T
-            dots = q @ xb.T
-            dists = q_norms + xb_norms - 2.0 * dots
-            idx = np.argpartition(dists, kth=k - 1, axis=1)[:, :k]
-            part = dists[np.arange(i1 - i0)[:, None], idx]
-            ord = np.argsort(part, axis=1)
-            final_idx = idx[np.arange(i1 - i0)[:, None], ord]
-            final_d = part[np.arange(i1 - i0)[:, None], ord]
-            all_D[i0:i1] = final_d.astype(np.float32, copy=False)
-            all_I[i0:i1] = final_idx.astype(np.int64, copy=False)
-
-        return all_D, all_I
+            return np.full((nq, k), np.inf, dtype=np.float32), -np.ones((nq, k), dtype=np.int64)
+        if D.dtype != np.float32:
+            D = D.astype(np.float32)
+        if I.dtype != np.int64:
+            I = I.astype(np.int64)
+        return D, I

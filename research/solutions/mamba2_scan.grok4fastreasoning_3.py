@@ -9,82 +9,60 @@ import torch
 import triton
 import triton.language as tl
 
+@triton.jit
+def chunk_kernel(
+    X_PTR, A_PTR, B_PTR, Y_PTR, STATE_PTR,
+    STRIDE_L, STRIDE_D,
+    START_T, CHUNK_SIZE, DIM_D,
+    BLOCK_D: tl.constexpr
+):
+    pid = tl.program_id(0)
+    block_start = pid * BLOCK_D
+    offsets_d = block_start + tl.arange(0, BLOCK_D)
+    mask = offsets_d < DIM_D
+    
+    state_offsets = STATE_PTR + offsets_d
+    acc = tl.load(state_offsets, mask=mask, other=0.0)
+    
+    for k in range(CHUNK_SIZE):
+        t = START_T + k
+        x_offsets = X_PTR + t * STRIDE_L + offsets_d * STRIDE_D
+        x = tl.load(x_offsets, mask=mask, other=0.0).to(tl.float32)
+        a_offsets = A_PTR + t * STRIDE_L + offsets_d * STRIDE_D
+        a = tl.load(a_offsets, mask=mask, other=0.0).to(tl.float32)
+        b_offsets = B_PTR + t * STRIDE_L + offsets_d * STRIDE_D
+        b = tl.load(b_offsets, mask=mask, other=0.0).to(tl.float32)
+        acc = a * acc + b * x
+        y_offsets = Y_PTR + t * STRIDE_L + offsets_d * STRIDE_D
+        tl.store(y_offsets, acc.to(tl.float16), mask=mask)
+    
+    tl.store(state_offsets, acc, mask=mask)
+
 def chunk_scan(X: torch.Tensor, A: torch.Tensor, B: torch.Tensor, chunk: int = 128, BD: int = 128) -> torch.Tensor:
     L, D = X.shape
-    if L % chunk != 0:
-        raise ValueError("L must be divisible by chunk")
-    Y = torch.empty((L, D), dtype=X.dtype, device=X.device)
-    num_chunks = L // chunk
-    num_tiles = (D + BD - 1) // BD
-    grid = (num_tiles,)
+    assert L % chunk == 0
+    y = torch.empty_like(X)
     state = torch.zeros(D, dtype=torch.float32, device=X.device)
-    stride_l = X.stride(0) * X.element_size()
-    stride_d = X.stride(1) * X.element_size()
-    stride_sd = state.element_size()
-
+    stride_l = X.stride(0)
+    stride_d = X.stride(1)
+    # Assume all tensors are contiguous with matching strides
+    grid = lambda meta: (triton.cdiv(D, meta['BD']),)
+    
     @triton.jit
-    def chunk_scan_kernel(
-        X_PTR,
-        A_PTR,
-        B_PTR,
-        Y_PTR,
-        STATE_PTR,
-        chunk_start: int,
-        D: int,
-        stride_xl: int,
-        stride_xd: int,
-        stride_al: int,
-        stride_ad: int,
-        stride_bl: int,
-        stride_bd: int,
-        stride_yl: int,
-        stride_yd: int,
-        stride_sd: int,
-        BD: tl.constexpr,
-        chunk_size: tl.constexpr,
+    def kernel_wrapper(
+        X_PTR, A_PTR, B_PTR, Y_PTR, STATE_PTR,
+        STRIDE_L, STRIDE_D,
+        START_T, CHUNK_SIZE, DIM_D,
+        BLOCK_D: tl.constexpr = 128
     ):
-        pid = tl.program_id(0)
-        d_start = pid * BD
-        offsets_d = d_start + tl.arange(0, BD)
-        mask = offsets_d < D
-        off_state = offsets_d * stride_sd
-        y_prev = tl.load(STATE_PTR + off_state, mask=mask, other=0.0)
-        for step in range(0, chunk_size):
-            t = chunk_start + step
-            off_x = t * stride_xl + offsets_d * stride_xd
-            off_a = t * stride_al + offsets_d * stride_ad
-            off_b = t * stride_bl + offsets_d * stride_bd
-            off_y = t * stride_yl + offsets_d * stride_yd
-            x = tl.load(X_PTR + off_x, mask=mask, other=0.0).to(tl.float32)
-            a = tl.load(A_PTR + off_a, mask=mask, other=0.0).to(tl.float32)
-            b = tl.load(B_PTR + off_b, mask=mask, other=0.0).to(tl.float32)
-            y_curr = a * y_prev + b * x
-            tl.store(Y_PTR + off_y, y_curr.to(tl.float16), mask=mask)
-            y_prev = y_curr
-        tl.store(STATE_PTR + off_state, y_prev, mask=mask)
-
-    for c in range(num_chunks):
-        chunk_start = c * chunk
-        chunk_scan_kernel[grid](
-            X,
-            A,
-            B,
-            Y,
-            state,
-            chunk_start=chunk_start,
-            D=D,
-            stride_xl=stride_l,
-            stride_xd=stride_d,
-            stride_al=stride_l,
-            stride_ad=stride_d,
-            stride_bl=stride_l,
-            stride_bd=stride_d,
-            stride_yl=stride_l,
-            stride_yd=stride_d,
-            stride_sd=stride_sd,
-            BD=BD,
-            chunk_size=chunk,
-        )
-    return Y
+        chunk_kernel(X_PTR, A_PTR, B_PTR, Y_PTR, STATE_PTR,
+                     STRIDE_L, STRIDE_D,
+                     START_T, CHUNK_SIZE, DIM_D,
+                     BLOCK_D=BLOCK_D)
+    
+    for i in range(0, L, chunk):
+        kernel_wrapper[grid](X.data_ptr(), A.data_ptr(), B.data_ptr(), y.data_ptr(), state.data_ptr(),
+                             stride_l, stride_d, i, chunk, D, BLOCK_D=128)
+    return y
 """
         return {"code": code}

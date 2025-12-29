@@ -1,13 +1,13 @@
 import json
+import math
 from argparse import Namespace
-from typing import List, Optional
 
 from sky_spot.strategies.multi_strategy import MultiRegionStrategy
 from sky_spot.utils import ClusterType
 
 
 class Solution(MultiRegionStrategy):
-    NAME = "my_strategy"
+    NAME = "cant_be_late_mr_sched"
 
     def solve(self, spec_path: str) -> "Solution":
         with open(spec_path) as f:
@@ -21,92 +21,92 @@ class Solution(MultiRegionStrategy):
         )
         super().__init__(args)
 
-        # Internal strategy state
-        self._initialized = False
-        self._commit_on_demand = False
-        self._on_demand_region: Optional[int] = None
-        self._region_scores: List[float] = []
-        self._region_counts: List[float] = []
-        self._region_success: List[float] = []
-        self._no_spot_streak: List[int] = []
-        self._last_switch_elapsed: float = 0.0
-        self._cooldown_seconds: float = 0.0
-        self._safe_margin_seconds: float = 0.0
+        # Internal state
+        self._committed_od = False
+        self._last_done_len = 0
+        self._work_done_sum = 0.0
         return self
 
-    def _init_if_needed(self):
-        if self._initialized:
-            return
-        num_regions = max(1, self.env.get_num_regions())
-        # Initialize region statistics with a mild prior (Beta(1,1) -> 0.5)
-        self._region_scores = [0.5 for _ in range(num_regions)]
-        self._region_counts = [2.0 for _ in range(num_regions)]  # prior count
-        self._region_success = [1.0 for _ in range(num_regions)]  # prior success
-        self._no_spot_streak = [0 for _ in range(num_regions)]
-        self._last_switch_elapsed = self.env.elapsed_seconds
-        # Cooldown: avoid rapid switching thrash; though strategy minimizes switches already
-        self._cooldown_seconds = self.env.gap_seconds * 2.0
-        # Safety margin: account for discretization and overhead consumption granularity
-        self._safe_margin_seconds = max(self.env.gap_seconds * 0.5, self.restart_overhead)
-        self._initialized = True
+    def _time_on_demand(self, remaining_work: float, overhead: float) -> float:
+        # Minimal elapsed time to finish when using only on-demand, starting now,
+        # paying the given overhead exactly once at the beginning.
+        gap = self.env.gap_seconds
+        need = max(0.0, remaining_work)
+        # Number of steps required accounting for initial overhead lost from first step's credit.
+        steps = int(math.ceil((need + overhead) / gap))
+        return steps * gap + overhead
 
-    def _update_region_stats(self, region_idx: int, has_spot: bool):
-        # Update simple sample mean estimate
-        self._region_counts[region_idx] += 1.0
-        if has_spot:
-            self._region_success[region_idx] += 1.0
-            self._no_spot_streak[region_idx] = 0
-        else:
-            self._no_spot_streak[region_idx] += 1
-        self._region_scores[region_idx] = self._region_success[region_idx] / self._region_counts[region_idx]
-
-    def _compute_remaining(self) -> float:
-        return max(0.0, self.task_duration - sum(self.task_done_time))
-
-    def _must_commit_on_demand(self) -> bool:
-        remaining = self._compute_remaining()
-        time_left = self.deadline - self.env.elapsed_seconds
-        # If we switch to on-demand now and never stop, we need restart_overhead + remaining time.
-        # We add a small safety margin to avoid discretization misses.
-        required = self.restart_overhead + remaining + self._safe_margin_seconds
-        return time_left <= required
+    def _update_work_done_cache(self):
+        # Maintain a running sum to avoid summing an ever-growing list each step
+        l = len(self.task_done_time)
+        if l != self._last_done_len:
+            if l > self._last_done_len:
+                for i in range(self._last_done_len, l):
+                    self._work_done_sum += self.task_done_time[i]
+            else:
+                # Fallback if list was reset for any reason
+                self._work_done_sum = sum(self.task_done_time)
+            self._last_done_len = l
 
     def _step(self, last_cluster_type: ClusterType, has_spot: bool) -> ClusterType:
-        self._init_if_needed()
-
-        current_region = self.env.get_current_region()
-        # Update stats with current observation
-        self._update_region_stats(current_region, has_spot)
-
-        # If we've already committed to on-demand, keep running it to avoid extra overhead
-        if self._commit_on_demand:
+        # If we already committed to on-demand, never leave it.
+        if self._committed_od or last_cluster_type == ClusterType.ON_DEMAND:
+            self._committed_od = True
             return ClusterType.ON_DEMAND
 
-        # Check if we must switch to on-demand to guarantee deadline
-        if self._must_commit_on_demand():
-            self._commit_on_demand = True
-            self._on_demand_region = current_region
-            return ClusterType.ON_DEMAND
+        self._update_work_done_cache()
 
-        # We are still in the "spot-first" phase.
-        # If spot is available now, use it.
-        if has_spot:
-            # Prefer to stay in current region to avoid any potential region-switch overhead semantics.
-            return ClusterType.SPOT
+        gap = self.env.gap_seconds
+        elapsed = self.env.elapsed_seconds
+        deadline = self.deadline
+        restart_overhead = self.restart_overhead
 
-        # Spot not available now. We can pause if we still have slack.
-        # Decide whether we can afford to idle for one step safely.
-        remaining = self._compute_remaining()
-        time_left = self.deadline - self.env.elapsed_seconds
-        # If we idle one gap, the time left reduces by gap_seconds. After idling, we can still finish by
-        # switching to on-demand for remaining time with one restart overhead.
-        time_left_after_idle = time_left - self.env.gap_seconds
-        required_after_idle = self.restart_overhead + remaining + self._safe_margin_seconds
-        if time_left_after_idle > required_after_idle:
-            # We can safely idle and wait for spot later.
+        remaining_work = max(0.0, self.task_duration - self._work_done_sum)
+        if remaining_work <= 0.0:
             return ClusterType.NONE
 
-        # Not enough slack to idle this entire step; commit to on-demand now.
-        self._commit_on_demand = True
-        self._on_demand_region = current_region
-        return ClusterType.ON_DEMAND
+        time_remaining = deadline - elapsed
+
+        # If we're somehow out of time, best effort: go on-demand.
+        if time_remaining <= 0.0:
+            self._committed_od = True
+            return ClusterType.ON_DEMAND
+
+        # Decision logic:
+        # - If spot is available, check if taking one spot step (including possible overhead)
+        #   still leaves enough time to finish by switching to on-demand afterwards.
+        # - If spot is not available, check if we can afford to wait one NONE step,
+        #   and still finish via on-demand afterwards.
+        if has_spot:
+            # Determine the overhead for taking a SPOT step now.
+            # If last was SPOT, continuing SPOT incurs no new overhead; otherwise pay restart_overhead now.
+            if last_cluster_type == ClusterType.SPOT:
+                spot_step_overhead = 0.0
+            else:
+                spot_step_overhead = restart_overhead
+
+            # Progress and time after taking one SPOT step now
+            progress_spot = max(0.0, gap - spot_step_overhead)
+            remaining_after_spot = max(0.0, remaining_work - progress_spot)
+            time_after_spot = time_remaining - (gap + spot_step_overhead)
+
+            # Time required if we switch to ON_DEMAND after this SPOT step
+            od_time_after = self._time_on_demand(remaining_after_spot, restart_overhead)
+
+            if time_after_spot >= od_time_after:
+                return ClusterType.SPOT
+            else:
+                # Not safe to take another SPOT step; commit to ON_DEMAND now
+                self._committed_od = True
+                return ClusterType.ON_DEMAND
+        else:
+            # No spot available: can we afford to wait one step doing nothing?
+            time_after_none = time_remaining - gap
+            od_time_after = self._time_on_demand(remaining_work, restart_overhead)
+
+            if time_after_none >= od_time_after:
+                return ClusterType.NONE
+            else:
+                # Must commit to ON_DEMAND now to guarantee completion
+                self._committed_od = True
+                return ClusterType.ON_DEMAND

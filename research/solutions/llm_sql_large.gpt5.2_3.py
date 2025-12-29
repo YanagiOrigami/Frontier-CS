@@ -1,139 +1,126 @@
-import re
+import os
+import math
 import numpy as np
 import pandas as pd
 
 
 class Solution:
-    _ID_RE = re.compile(r"(^|[^a-z0-9])(id|uuid|guid)([^a-z0-9]|$)", re.IGNORECASE)
-
-    @staticmethod
-    def _safe_colname(existing, base):
-        if base not in existing:
-            return base
-        i = 2
-        while True:
-            name = f"{base}_{i}"
-            if name not in existing:
-                return name
-            i += 1
-
-    @staticmethod
-    def _col_to_u(series: pd.Series) -> np.ndarray:
-        # Use pandas' string conversion semantics
-        return series.astype(str).to_numpy(dtype="U", copy=True)
-
-    @staticmethod
-    def _gini_from_codes(codes: np.ndarray, n: int) -> float:
-        if n <= 0:
-            return 0.0
-        if codes.dtype.kind not in ("i", "u"):
-            codes = codes.astype(np.int64, copy=False)
-        if codes.size == 0:
-            return 0.0
-        if codes.min(initial=0) < 0:
-            codes = codes[codes >= 0]
-        if codes.size == 0:
-            return 0.0
-        counts = np.bincount(codes)
-        p = counts / float(n)
-        return float(np.dot(p, p))
-
-    @staticmethod
-    def _counts_from_codes(codes: np.ndarray) -> np.ndarray:
-        if codes.size == 0:
-            return np.zeros(0, dtype=np.int64)
-        if codes.min(initial=0) < 0:
-            codes = codes[codes >= 0]
-        if codes.size == 0:
-            return np.zeros(0, dtype=np.int64)
-        return np.bincount(codes)
-
-    @staticmethod
-    def _expected_lcp(arr_u: np.ndarray, lens: np.ndarray, K: int = 4):
-        n = int(arr_u.shape[0])
-        if n <= 1:
-            return 0.0, 0.0, 1.0, float(lens.mean()) if n > 0 else 0.0
-
-        codes, uniques = pd.factorize(arr_u, sort=False)
-        counts = Solution._counts_from_codes(codes)
-        inv_n = 1.0 / float(n)
-        p = counts * inv_n
-        gini_full = float(np.dot(p, p))
-        distinct_ratio = float(len(uniques) * inv_n)
-        avg_len = float(lens.mean())
-
-        # Expected truncated LCP for first K chars:
-        # E[min(LCP, K)] = sum_{k=1..K} P(LCP >= k)
-        # P(LCP >= k) = sum_{prefix_k} (count(prefix_k)/n)^2 with only strings len>=k.
-        exp_trunc = 0.0
-        for k in range(1, K + 1):
-            mask = lens >= k
-            mk = int(mask.sum())
-            if mk <= 1:
-                continue
-            sub = arr_u[mask]
-            pref = np.fromiter((x[:k] for x in sub), dtype=f"<U{k}", count=mk)
-            pcodes, _ = pd.factorize(pref, sort=False)
-            pcounts = Solution._counts_from_codes(pcodes)
-            pp = pcounts * inv_n
-            exp_trunc += float(np.dot(pp, pp))
-
-        # Extra beyond K only when values are fully equal:
-        # extra = sum_{val} (freq(val)/n)^2 * max(len(val) - K, 0)
-        if len(uniques) > 0:
-            uniques_u = np.array(uniques, dtype="U", copy=False)
-            u_lens = np.char.str_len(uniques_u).astype(np.int32, copy=False)
-            extra = float(np.dot((counts * inv_n) ** 2, np.maximum(u_lens - K, 0)))
-        else:
-            extra = 0.0
-
-        exp_lcp = exp_trunc + extra
-        return exp_lcp, gini_full, distinct_ratio, avg_len
-
-    def _apply_merges(self, df: pd.DataFrame, col_merge):
+    def _apply_col_merge(self, df: pd.DataFrame, col_merge):
         if not col_merge:
             return df
 
-        df2 = df.copy(deep=False)
-        original_cols = list(df2.columns)
-        existing = set(original_cols)
+        df = df.copy()
+        cols_all = list(df.columns)
 
         for group in col_merge:
-            if not group or len(group) < 2:
+            if not group:
                 continue
 
-            group_names = []
-            for c in group:
-                if isinstance(c, (int, np.integer)):
-                    idx = int(c)
-                    if 0 <= idx < len(original_cols):
-                        group_names.append(original_cols[idx])
+            cols = []
+            for x in group:
+                if isinstance(x, (int, np.integer)):
+                    if 0 <= int(x) < len(cols_all):
+                        c = cols_all[int(x)]
+                        if c in df.columns:
+                            cols.append(c)
                 else:
-                    group_names.append(c)
+                    c = str(x)
+                    if c in df.columns:
+                        cols.append(c)
 
-            # Deduplicate while preserving order
+            # de-dup preserve order
             seen = set()
-            group_names = [c for c in group_names if not (c in seen or seen.add(c))]
-            group_names = [c for c in group_names if c in df2.columns]
-            if len(group_names) < 2:
+            cols2 = []
+            for c in cols:
+                if c not in seen and c in df.columns:
+                    seen.add(c)
+                    cols2.append(c)
+            cols = cols2
+
+            if len(cols) <= 1:
                 continue
 
-            cols_list = list(df2.columns)
-            pos = min(cols_list.index(c) for c in group_names)
+            base_name = "+".join(cols)
+            new_name = base_name
+            if new_name in df.columns:
+                k = 1
+                while True:
+                    cand = f"{base_name}__m{k}"
+                    if cand not in df.columns:
+                        new_name = cand
+                        break
+                    k += 1
 
-            merged_base = "|".join(map(str, group_names))
-            merged_name = self._safe_colname(existing, merged_base)
-            existing.add(merged_name)
+            merged = df[cols[0]].fillna("").astype(str)
+            for c in cols[1:]:
+                merged = merged + df[c].fillna("").astype(str)
 
-            arr = self._col_to_u(df2[group_names[0]])
-            for c in group_names[1:]:
-                arr = np.char.add(arr, self._col_to_u(df2[c]))
-            merged_series = pd.Series(arr, index=df2.index, name=merged_name)
+            df = df.drop(columns=cols)
+            df[new_name] = merged
 
-            df2 = df2.drop(columns=group_names)
-            df2.insert(pos, merged_name, merged_series)
+        return df
 
-        return df2
+    def _col_stats(self, s: pd.Series, k_pref: int = 3):
+        arr = s.to_numpy(dtype=object, copy=False)
+        n = arr.shape[0]
+        if n == 0:
+            return {
+                "distinct_ratio": 1.0,
+                "avg_len": 0.0,
+                "collision": 0.0,
+                "p1": 0.0,
+                "p2": 0.0,
+                "p3": 0.0,
+                "elcp": 0.0,
+                "strength": 0.0,
+            }
+
+        lengths = np.fromiter((len(x) for x in arr), dtype=np.int32, count=n)
+        avg_len = float(lengths.mean()) if n else 0.0
+
+        codes, uniques = pd.factorize(arr, sort=False)
+        counts = np.bincount(codes, minlength=len(uniques)).astype(np.int64)
+        n2 = float(n) * float(n)
+        sumsq = float(np.dot(counts, counts))
+        collision = sumsq / n2 if n2 else 0.0
+        distinct_ratio = float(len(uniques)) / float(n) if n else 1.0
+
+        weights = (counts.astype(np.float64) ** 2)
+        den = float(weights.sum())
+        if den > 0.0:
+            lens_uniques = np.fromiter((len(u) for u in uniques), dtype=np.float64, count=len(uniques))
+            elen_match = float(np.dot(weights, lens_uniques) / den)
+        else:
+            elen_match = 0.0
+
+        p_list = []
+        for t in range(1, k_pref + 1):
+            pref = s.str.slice(0, t).to_numpy(dtype=object, copy=False)
+            c2, u2 = pd.factorize(pref, sort=False)
+            cnt2 = np.bincount(c2, minlength=len(u2)).astype(np.int64)
+            p_t = float(np.dot(cnt2, cnt2)) / n2 if n2 else 0.0
+            p_list.append(p_t)
+
+        p1 = p_list[0] if len(p_list) >= 1 else 0.0
+        p2 = p_list[1] if len(p_list) >= 2 else 0.0
+        p3 = p_list[2] if len(p_list) >= 3 else 0.0
+
+        elcp = p1 + p2 + p3
+        if collision > 0.0 and elen_match > k_pref:
+            elcp += collision * (elen_match - float(k_pref))
+
+        strength = elcp + 2.0 * p1 + 0.25 * (1.0 - distinct_ratio) * avg_len
+
+        return {
+            "distinct_ratio": distinct_ratio,
+            "avg_len": avg_len,
+            "collision": collision,
+            "p1": p1,
+            "p2": p2,
+            "p3": p3,
+            "elcp": elcp,
+            "strength": strength,
+        }
 
     def solve(
         self,
@@ -146,51 +133,119 @@ class Solution:
         distinct_value_threshold: float = 0.7,
         parallel: bool = True,
     ) -> pd.DataFrame:
-        df2 = self._apply_merges(df, col_merge)
+        df2 = self._apply_col_merge(df, col_merge)
+
+        # Normalize to string with empty for NaN
+        df2 = df2.copy()
+        df2 = df2.fillna("")
+        try:
+            df2 = df2.astype(str, copy=False)
+        except Exception:
+            df2 = df2.astype(str)
+
         cols = list(df2.columns)
-        n_rows = len(df2)
-        if n_rows <= 1 or len(cols) <= 1:
+        m = len(cols)
+        n = len(df2)
+
+        if m <= 1 or n <= 1:
             return df2
 
-        sample_n = min(n_rows, int(early_stop) if early_stop else n_rows, 10000)
-        if sample_n < 500:
-            sample_n = min(n_rows, 500)
+        stats = {}
+        for c in cols:
+            stats[c] = self._col_stats(df2[c], k_pref=3)
 
-        sample = df2.iloc[:sample_n]
+        # Initial global ordering by per-column strength
+        init_order = sorted(cols, key=lambda c: stats[c]["strength"], reverse=True)
 
-        col_infos = []
-        for idx, col in enumerate(cols):
-            name = str(col)
-            arr = self._col_to_u(sample[col])
-            lens = np.char.str_len(arr).astype(np.int32, copy=False)
+        # Greedy refine early columns using exact-duplicate preservation on sample
+        if n > 0 and m > 2:
+            sample_size = 8000
+            if early_stop is not None and early_stop > 0:
+                sample_size = min(sample_size, max(2000, int(early_stop // 10)))
+            sample_size = min(sample_size, n)
 
-            exp_lcp, gini_full, distinct_ratio, avg_len = self._expected_lcp(arr, lens, K=4)
-
-            # Ordering metric derived from pairwise swap condition for:
-            # sum exp_i * product prev_p, where prev_p is exact-match prob (gini_full).
-            metric = exp_lcp / (1.0 - gini_full + 1e-6)
-
-            lname = name.lower()
-            idlike = (distinct_ratio >= 0.98) and (lname == "id" or self._ID_RE.search(lname) is not None)
-
-            # Buckets: low distinct first, then high distinct, then id-like at end
-            if idlike:
-                bucket = 2
+            rng = np.random.default_rng(0)
+            if sample_size < n:
+                sample_idx = rng.choice(n, size=sample_size, replace=False)
             else:
-                bucket = 0 if distinct_ratio <= float(distinct_value_threshold) else 1
+                sample_idx = np.arange(n, dtype=np.int64)
 
-            col_infos.append(
-                (
-                    bucket,
-                    -metric,
-                    -exp_lcp,
-                    distinct_ratio,
-                    -avg_len,
-                    idx,
-                    col,
-                )
-            )
+            MASK = (1 << 64) - 1
+            P = np.uint64(11400714819323198485)
 
-        col_infos.sort()
-        new_cols = [t[-1] for t in col_infos]
-        return df2.loc[:, new_cols]
+            col_hash = {}
+            for c in cols:
+                a = df2[c].to_numpy(dtype=object, copy=False)[sample_idx]
+                h = np.fromiter(((hash(x) & MASK) for x in a), dtype=np.uint64, count=sample_size)
+                col_hash[c] = h
+
+            prefix_target = min(m, max(8, min(18, int(m * 0.30) + 6)))
+            selected = []
+            remaining = init_order.copy()
+
+            current = np.zeros(sample_size, dtype=np.uint64)
+
+            for step in range(prefix_target):
+                if not remaining:
+                    break
+                base = current * P
+
+                best_c = None
+                best_score = -1e300
+                best_new = None
+                best_share = 0.0
+
+                for c in remaining:
+                    h_new = base + col_hash[c]
+                    _, cnt = np.unique(h_new, return_counts=True)
+                    dup = int(cnt[cnt > 1].sum())
+                    share = float(dup) / float(sample_size) if sample_size else 0.0
+
+                    st = stats[c]
+                    score = (
+                        share * (1.0 + min(32.0, st["avg_len"]) + 0.75 * st["elcp"])
+                        + 0.05 * st["strength"]
+                        - 0.15 * st["distinct_ratio"]
+                    )
+
+                    if score > best_score:
+                        best_score = score
+                        best_c = c
+                        best_new = h_new
+                        best_share = share
+
+                if best_c is None:
+                    break
+
+                selected.append(best_c)
+                current = best_new
+                remaining.remove(best_c)
+
+                if step >= 8 and best_share < 0.02:
+                    break
+
+            rest = [c for c in init_order if c not in set(selected)]
+            rest_sorted = sorted(rest, key=lambda c: stats[c]["strength"], reverse=True)
+
+            low = [c for c in rest_sorted if stats[c]["distinct_ratio"] <= distinct_value_threshold]
+            high = [c for c in rest_sorted if stats[c]["distinct_ratio"] > distinct_value_threshold]
+
+            final_order = selected + low + high
+        else:
+            rest_sorted = init_order
+            low = [c for c in rest_sorted if stats[c]["distinct_ratio"] <= distinct_value_threshold]
+            high = [c for c in rest_sorted if stats[c]["distinct_ratio"] > distinct_value_threshold]
+            final_order = low + high
+
+        # Safety: include all columns exactly once
+        seen = set()
+        final_cols = []
+        for c in final_order:
+            if c in df2.columns and c not in seen:
+                seen.add(c)
+                final_cols.append(c)
+        for c in df2.columns:
+            if c not in seen:
+                final_cols.append(c)
+
+        return df2.reindex(columns=final_cols)

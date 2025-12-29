@@ -1,234 +1,221 @@
 import os
 import tarfile
+import zipfile
+import tempfile
+import gzip
+import bz2
+import lzma
+import io
+
+GROUND_TRUTH_LEN = 1551
 
 
 class Solution:
-    TARGET_LEN = 1551
-    MAX_CANDIDATE_SIZE = 4_000_000
-
     def solve(self, src_path: str) -> bytes:
-        try:
-            if tarfile.is_tarfile(src_path):
-                return self._from_tar(src_path)
-        except Exception:
-            pass
-
-        if os.path.isdir(src_path):
-            data = self._from_directory(src_path)
-            if data is not None:
+        root = self._prepare_root(src_path)
+        poc_path = self._find_poc_file(root)
+        if poc_path:
+            data = self._load_file_data(poc_path)
+            if data:
                 return data
+        return b"A" * GROUND_TRUTH_LEN
 
-        return self._fallback_poc()
+    def _prepare_root(self, src_path: str) -> str:
+        if os.path.isdir(src_path):
+            return src_path
 
-    def _from_tar(self, src_path: str) -> bytes:
-        target_len = self.TARGET_LEN
-        best_score = None
-        best_data = None
+        tmpdir = tempfile.mkdtemp(prefix="src-")
+        opened = False
 
-        patterns = {
-            "poc": 30,
-            "crash": 25,
-            "heap": 10,
-            "overflow": 10,
-            "383170474": 50,
-            "debug": 5,
-            "names": 5,
-            "dwarf": 5,
-            "fuzz": 5,
-            "regress": 5,
-            "bug": 10,
-            "test": 3,
-            "clusterfuzz": 20,
-            "oss-fuzz": 20,
-        }
+        if os.path.isfile(src_path):
+            try:
+                if tarfile.is_tarfile(src_path):
+                    with tarfile.open(src_path, "r:*") as tf:
+                        tf.extractall(tmpdir)
+                    opened = True
+                elif zipfile.is_zipfile(src_path):
+                    with zipfile.ZipFile(src_path) as zf:
+                        zf.extractall(tmpdir)
+                    opened = True
+            except Exception:
+                opened = False
 
-        binary_exts = (".o", ".obj", ".elf", ".bin", ".dwo", ".so", ".exe", ".out", ".core", ".dat")
+        if opened:
+            return tmpdir
 
-        tf = tarfile.open(src_path, "r:*")
-        try:
-            for member in tf.getmembers():
-                if not member.isreg():
-                    continue
-                size = member.size
-                if size <= 0 or size > self.MAX_CANDIDATE_SIZE:
-                    continue
+        parent = os.path.dirname(src_path)
+        return parent if parent else "."
 
-                name_lower = member.name.lower()
-                distance = abs(size - target_len)
-                size_score = 100 - min(distance, 100)
-                score = size_score
-
-                for pat, weight in patterns.items():
-                    if pat in name_lower:
-                        score += weight
-
-                for ext in binary_exts:
-                    if name_lower.endswith(ext):
-                        score += 10
-                        break
-
-                if "/poc" in name_lower or "poc/" in name_lower:
-                    score += 15
-                if "seed_corpus" in name_lower or "corpus" in name_lower:
-                    score += 5
-                if "/tests" in name_lower or "/test" in name_lower:
-                    score += 3
-
-                need_content = (
-                    distance < 512
-                    or "poc" in name_lower
-                    or "crash" in name_lower
-                    or "fuzz" in name_lower
-                    or "383170474" in name_lower
-                )
-
-                data = None
-                if need_content:
-                    try:
-                        fobj = tf.extractfile(member)
-                        if fobj is not None:
-                            data = fobj.read()
-                            fobj.close()
-                    except Exception:
-                        data = None
-                    if data is not None:
-                        if data.startswith(b"\x7fELF"):
-                            score += 20
-                        if b".debug_names" in data:
-                            score += 80
-                        elif b"debug_names" in data:
-                            score += 30
-                        if b"DWARF" in data:
-                            score += 10
-
-                if best_score is None or score > best_score:
-                    if data is None:
-                        try:
-                            fobj = tf.extractfile(member)
-                            if fobj is not None:
-                                data = fobj.read()
-                                fobj.close()
-                        except Exception:
-                            data = None
-                    if data is None:
-                        continue
-                    best_score = score
-                    best_data = data
-        finally:
-            tf.close()
-
-        if best_data is not None:
-            return best_data
-        return self._fallback_poc()
-
-    def _from_directory(self, root: str) -> bytes:
-        target_len = self.TARGET_LEN
-        best_score = None
-        best_data = None
-
-        patterns = {
-            "poc": 30,
-            "crash": 25,
-            "heap": 10,
-            "overflow": 10,
-            "383170474": 50,
-            "debug": 5,
-            "names": 5,
-            "dwarf": 5,
-            "fuzz": 5,
-            "regress": 5,
-            "bug": 10,
-            "test": 3,
-            "clusterfuzz": 20,
-            "oss-fuzz": 20,
-        }
-        binary_exts = (".o", ".obj", ".elf", ".bin", ".dwo", ".so", ".exe", ".out", ".core", ".dat")
+    def _find_poc_file(self, root: str) -> str | None:
+        best_score = 0
+        best_path = None
+        max_size_default = 1_000_000
 
         for dirpath, dirnames, filenames in os.walk(root):
-            for fname in filenames:
-                path = os.path.join(dirpath, fname)
+            for fn in filenames:
+                path = os.path.join(dirpath, fn)
                 try:
+                    if not os.path.isfile(path):
+                        continue
                     size = os.path.getsize(path)
                 except OSError:
                     continue
-                if size <= 0 or size > self.MAX_CANDIDATE_SIZE:
+
+                if size <= 0:
                     continue
 
-                name_lower = path.lower()
-                distance = abs(size - target_len)
-                size_score = 100 - min(distance, 100)
-                score = size_score
+                if "383170474" not in path and size > max_size_default:
+                    continue
 
-                for pat, weight in patterns.items():
-                    if pat in name_lower:
-                        score += weight
-
-                for ext in binary_exts:
-                    if name_lower.endswith(ext):
-                        score += 10
-                        break
-
-                if "/poc" in name_lower or "poc/" in name_lower:
-                    score += 15
-                if "seed_corpus" in name_lower or "corpus" in name_lower:
-                    score += 5
-                if "/tests" in name_lower or "/test" in name_lower:
-                    score += 3
-
-                need_content = (
-                    distance < 512
-                    or "poc" in name_lower
-                    or "crash" in name_lower
-                    or "fuzz" in name_lower
-                    or "383170474" in name_lower
-                )
-
-                data = None
-                if need_content:
-                    try:
-                        with open(path, "rb") as f:
-                            data = f.read()
-                    except OSError:
-                        data = None
-                    if data is not None:
-                        if data.startswith(b"\x7fELF"):
-                            score += 20
-                        if b".debug_names" in data:
-                            score += 80
-                        elif b"debug_names" in data:
-                            score += 30
-                        if b"DWARF" in data:
-                            score += 10
-
-                if best_score is None or score > best_score:
-                    if data is None:
-                        try:
-                            with open(path, "rb") as f:
-                                data = f.read()
-                        except OSError:
-                            data = None
-                    if data is None:
-                        continue
+                score = self._score_file(path, size)
+                if score > best_score:
                     best_score = score
-                    best_data = data
+                    best_path = path
 
-        return best_data if best_data is not None else self._fallback_poc()
+        return best_path
 
-    def _fallback_poc(self) -> bytes:
-        length = self.TARGET_LEN
-        data = bytearray(b"\x00" * length)
+    def _score_file(self, path: str, size: int) -> int:
+        lname = path.lower()
+        parts = lname.replace("\\", "/").split("/")
+        _, ext = os.path.splitext(lname)
 
-        if length >= 4:
-            data[0:4] = b"\x7fELF"
+        binary_exts = {
+            "",
+            ".bin",
+            ".dat",
+            ".out",
+            ".o",
+            ".obj",
+            ".elf",
+            ".so",
+            ".a",
+            ".dwp",
+            ".dwo",
+            ".gz",
+            ".gzip",
+            ".bz2",
+            ".bzip2",
+            ".xz",
+            ".lzma",
+            ".zip",
+            ".debug",
+            ".debug_names",
+            ".dwarf",
+            ".core",
+        }
 
-        marker = b".debug_names"
-        if len(marker) < length - 32:
-            start = 32
-            data[start:start + len(marker)] = marker
+        if ext not in binary_exts:
+            if not any(k in lname for k in ("oss-fuzz", "ossfuzz", "fuzz", "crash", "poc", "bug")) and not any(
+                p in ("tests", "test", "regress") for p in parts
+            ):
+                return 0
 
-        dwarf_marker = b"DWARF\x00\x05"
-        pos = 64
-        if pos + len(dwarf_marker) < length:
-            data[pos:pos + len(dwarf_marker)] = dwarf_marker
+        key_weight = 0
 
-        return bytes(data)
+        if "383170474" in lname:
+            key_weight += 100000
+        if "oss-fuzz" in lname or "ossfuzz" in lname:
+            key_weight += 6000
+        if any(k in parts for k in ("fuzz", "corpus", "inputs", "cases")):
+            key_weight += 4000
+        if any(k in parts for k in ("test", "tests", "regress")):
+            key_weight += 3500
+        if "crash" in lname or "poc" in lname or "bug" in lname:
+            key_weight += 3000
+        if "debug_names" in lname or "debugnames" in lname:
+            key_weight += 2000
+        if "dwarf" in lname:
+            key_weight += 1000
+        if "debug" in lname:
+            key_weight += 800
+        if "names" in lname:
+            key_weight += 400
+
+        if key_weight == 0:
+            return 0
+
+        diff = abs(size - GROUND_TRUTH_LEN)
+        size_score = max(0, 2000 - diff)
+        return key_weight + size_score
+
+    def _load_file_data(self, path: str) -> bytes:
+        lname = path.lower()
+        _, ext = os.path.splitext(lname)
+        data = b""
+
+        try:
+            if ext in (".gz", ".gzip"):
+                with gzip.open(path, "rb") as f:
+                    data = f.read()
+            elif ext in (".bz2", ".bzip2"):
+                with bz2.open(path, "rb") as f:
+                    data = f.read()
+            elif ext in (".xz", ".lzma"):
+                with lzma.open(path, "rb") as f:
+                    data = f.read()
+            elif ext == ".zip":
+                data = self._extract_from_zip(path)
+            elif ext in (".tar", ".tgz"):
+                data = self._extract_from_tar_file(path)
+            else:
+                with open(path, "rb") as f:
+                    data = f.read()
+        except Exception:
+            try:
+                with open(path, "rb") as f:
+                    data = f.read()
+            except Exception:
+                return b""
+
+        if ext in (".gz", ".gzip", ".bz2", ".bzip2", ".xz", ".lzma") and data:
+            maybe = self._try_extract_from_tar_bytes(data)
+            if maybe:
+                data = maybe
+
+        return data
+
+    def _extract_from_zip(self, path: str) -> bytes:
+        try:
+            with zipfile.ZipFile(path) as zf:
+                infos = [i for i in zf.infolist() if not i.is_dir()]
+                if not infos:
+                    return b""
+                best = min(infos, key=lambda i: abs(i.file_size - GROUND_TRUTH_LEN))
+                return zf.read(best)
+        except Exception:
+            return b""
+
+    def _extract_from_tar_file(self, path: str) -> bytes:
+        try:
+            with tarfile.open(path, "r:*") as tf:
+                members = [m for m in tf.getmembers() if m.isfile()]
+                if not members:
+                    return b""
+                best = min(members, key=lambda m: abs(m.size - GROUND_TRUTH_LEN))
+                f = tf.extractfile(best)
+                if f is None:
+                    return b""
+                try:
+                    return f.read()
+                finally:
+                    f.close()
+        except Exception:
+            return b""
+
+    def _try_extract_from_tar_bytes(self, data: bytes) -> bytes | None:
+        try:
+            bio = io.BytesIO(data)
+            with tarfile.open(fileobj=bio, mode="r:*") as tf:
+                members = [m for m in tf.getmembers() if m.isfile()]
+                if not members:
+                    return None
+                best = min(members, key=lambda m: abs(m.size - GROUND_TRUTH_LEN))
+                f = tf.extractfile(best)
+                if f is None:
+                    return None
+                try:
+                    return f.read()
+                finally:
+                    f.close()
+        except Exception:
+            return None

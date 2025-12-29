@@ -1,31 +1,22 @@
-import math
-import os
-from typing import Dict, Tuple, Optional
+import textwrap
 
+
+KERNEL_CODE = textwrap.dedent(
+    r"""
+import math
 import torch
 import triton
 import triton.language as tl
 
 
-@triton.autotune(
-    configs=[
-        triton.Config({"BLOCK_M": 16, "BLOCK_N": 128, "BLOCK_K": 32}, num_warps=8, num_stages=4),
-        triton.Config({"BLOCK_M": 32, "BLOCK_N": 128, "BLOCK_K": 32}, num_warps=8, num_stages=4),
-        triton.Config({"BLOCK_M": 64, "BLOCK_N": 128, "BLOCK_K": 32}, num_warps=8, num_stages=4),
-        triton.Config({"BLOCK_M": 16, "BLOCK_N": 128, "BLOCK_K": 64}, num_warps=8, num_stages=4),
-        triton.Config({"BLOCK_M": 32, "BLOCK_N": 128, "BLOCK_K": 64}, num_warps=8, num_stages=4),
-        triton.Config({"BLOCK_M": 16, "BLOCK_N": 128, "BLOCK_K": 32}, num_warps=4, num_stages=3),
-    ],
-    key=["M", "N", "K"],
-)
 @triton.jit
-def _linear_ce_stats_kernel(
+def _linear_ce_partials_kernel(
     X_ptr,
     W_ptr,
     B_ptr,
     T_ptr,
-    MAX_ptr,
-    SUM_ptr,
+    PMAX_ptr,
+    PSUM_ptr,
     TLOG_ptr,
     M: tl.constexpr,
     N: tl.constexpr,
@@ -34,191 +25,168 @@ def _linear_ce_stats_kernel(
     stride_xk: tl.constexpr,
     stride_wk: tl.constexpr,
     stride_wn: tl.constexpr,
-    stride_b: tl.constexpr,
-    stride_stats_m: tl.constexpr,
+    stride_pbn: tl.constexpr,
+    stride_pm: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
+    NEG_INF: tl.constexpr,
 ):
     pid_m = tl.program_id(0)
     pid_n = tl.program_id(1)
 
-    rows = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
-    cols = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
 
-    row_mask = rows < M
-    col_mask = cols < N
-
-    t = tl.load(T_ptr + rows, mask=row_mask, other=0).to(tl.int32)
+    a_ptr = tl.make_block_ptr(
+        base=X_ptr,
+        shape=(M, K),
+        strides=(stride_xm, stride_xk),
+        offsets=(pid_m * BLOCK_M, 0),
+        block_shape=(BLOCK_M, BLOCK_K),
+        order=(1, 0),
+    )
+    b_ptr = tl.make_block_ptr(
+        base=W_ptr,
+        shape=(K, N),
+        strides=(stride_wk, stride_wn),
+        offsets=(0, pid_n * BLOCK_N),
+        block_shape=(BLOCK_K, BLOCK_N),
+        order=(0, 1),
+    )
 
     acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    for _ in tl.static_range(0, (K + BLOCK_K - 1) // BLOCK_K):
+        a = tl.load(a_ptr, boundary_check=(0, 1), padding_option="zero").to(tl.float16)
+        b = tl.load(b_ptr, boundary_check=(0, 1), padding_option="zero").to(tl.float16)
+        acc = tl.dot(a, b, acc=acc)
+        a_ptr = tl.advance(a_ptr, (0, BLOCK_K))
+        b_ptr = tl.advance(b_ptr, (BLOCK_K, 0))
 
-    tl.multiple_of(stride_xk, 1)
-    tl.multiple_of(stride_wn, 1)
+    col_mask = offs_n < N
+    bias = tl.load(B_ptr + offs_n, mask=col_mask, other=0.0).to(tl.float32)
+    acc = acc + bias[None, :]
 
-    for k0 in range(0, K, BLOCK_K):
-        k = k0 + tl.arange(0, BLOCK_K)
-        k_mask = k < K
+    acc_masked = tl.where(col_mask[None, :], acc, NEG_INF)
+    bmax = tl.max(acc_masked, axis=1)
+    ex = tl.exp(acc_masked - bmax[:, None])
+    bsum = tl.sum(ex, axis=1)
 
-        x_ptrs = X_ptr + rows[:, None] * stride_xm + k[None, :] * stride_xk
-        w_ptrs = W_ptr + k[:, None] * stride_wk + cols[None, :] * stride_wn
+    row_mask = offs_m < M
+    p_offs = pid_n * stride_pbn + offs_m * stride_pm
+    tl.store(PMAX_ptr + p_offs, bmax, mask=row_mask)
+    tl.store(PSUM_ptr + p_offs, bsum, mask=row_mask)
 
-        x = tl.load(x_ptrs, mask=row_mask[:, None] & k_mask[None, :], other=0.0).to(tl.float16)
-        w = tl.load(w_ptrs, mask=k_mask[:, None] & col_mask[None, :], other=0.0).to(tl.float16)
+    t = tl.load(T_ptr + offs_m, mask=row_mask, other=0).to(tl.int32)
+    start = pid_n * BLOCK_N
+    in_range = row_mask & (t >= start) & (t < (start + BLOCK_N))
+    tcol = t - start
 
-        acc += tl.dot(x, w)
-
-    b = tl.load(B_ptr + cols * stride_b, mask=col_mask, other=0.0).to(tl.float32)
-    logits = acc + b[None, :]
-    logits = tl.where(col_mask[None, :], logits, -float("inf"))
-
-    tile_max = tl.max(logits, axis=1)
-    tile_sum = tl.sum(tl.exp(logits - tile_max[:, None]), axis=1)
-
-    stats_offs = rows * stride_stats_m + pid_n
-    tl.store(MAX_ptr + stats_offs, tile_max, mask=row_mask)
-    tl.store(SUM_ptr + stats_offs, tile_sum, mask=row_mask)
-
-    tgt_mask = (cols[None, :] == t[:, None]) & col_mask[None, :]
-    tgt_logit = tl.sum(tl.where(tgt_mask, logits, 0.0), axis=1)
-    has_tgt = tl.sum(tgt_mask, axis=1).to(tl.int32)
-    tl.store(TLOG_ptr + rows, tgt_logit, mask=row_mask & (has_tgt != 0))
+    bn_ids = tl.arange(0, BLOCK_N)[None, :]
+    match = bn_ids == tcol[:, None]
+    tlog = tl.sum(tl.where(match, acc, 0.0), axis=1)
+    tl.store(TLOG_ptr + offs_m, tlog, mask=in_range)
 
 
 @triton.jit
-def _reduce_stats_to_loss_kernel(
-    MAX_ptr,
-    SUM_ptr,
+def _linear_ce_reduce_kernel(
+    PMAX_ptr,
+    PSUM_ptr,
     TLOG_ptr,
     OUT_ptr,
     M: tl.constexpr,
-    n_blocks: tl.constexpr,
-    stride_stats_m: tl.constexpr,
-    BLOCK_M: tl.constexpr,
-    BLOCKS: tl.constexpr,
+    stride_pbn: tl.constexpr,
+    stride_pm: tl.constexpr,
+    NUM_BLOCKS_N: tl.constexpr,
+    BLOCK_RM: tl.constexpr,
+    NEG_INF: tl.constexpr,
 ):
     pid = tl.program_id(0)
-    rows = pid * BLOCK_M + tl.arange(0, BLOCK_M)
-    row_mask = rows < M
+    offs_m = pid * BLOCK_RM + tl.arange(0, BLOCK_RM)
+    row_mask = offs_m < M
 
-    running_m = tl.full((BLOCK_M,), -float("inf"), tl.float32)
-    running_s = tl.zeros((BLOCK_M,), dtype=tl.float32)
+    m = tl.full((BLOCK_RM,), NEG_INF, tl.float32)
+    s = tl.zeros((BLOCK_RM,), dtype=tl.float32)
 
-    for b0 in range(0, n_blocks, BLOCKS):
-        blocks = b0 + tl.arange(0, BLOCKS)
-        block_mask = blocks < n_blocks
+    for bn in tl.static_range(0, NUM_BLOCKS_N):
+        p_offs = bn * stride_pbn + offs_m * stride_pm
+        bmax = tl.load(PMAX_ptr + p_offs, mask=row_mask, other=NEG_INF).to(tl.float32)
+        bsum = tl.load(PSUM_ptr + p_offs, mask=row_mask, other=0.0).to(tl.float32)
+        new_m = tl.maximum(m, bmax)
+        s = s * tl.exp(m - new_m) + bsum * tl.exp(bmax - new_m)
+        m = new_m
 
-        max_ptrs = MAX_ptr + rows[:, None] * stride_stats_m + blocks[None, :]
-        sum_ptrs = SUM_ptr + rows[:, None] * stride_stats_m + blocks[None, :]
-
-        m_vals = tl.load(max_ptrs, mask=row_mask[:, None] & block_mask[None, :], other=-float("inf")).to(tl.float32)
-        s_vals = tl.load(sum_ptrs, mask=row_mask[:, None] & block_mask[None, :], other=0.0).to(tl.float32)
-
-        m_chunk = tl.max(m_vals, axis=1)
-        s_chunk = tl.sum(s_vals * tl.exp(m_vals - m_chunk[:, None]), axis=1)
-
-        new_m = tl.maximum(running_m, m_chunk)
-        running_s = running_s * tl.exp(running_m - new_m) + s_chunk * tl.exp(m_chunk - new_m)
-        running_m = new_m
-
-    logsumexp = tl.log(running_s) + running_m
-    tgt = tl.load(TLOG_ptr + rows, mask=row_mask, other=0.0).to(tl.float32)
-    out = logsumexp - tgt
-    tl.store(OUT_ptr + rows, out, mask=row_mask)
+    tlog = tl.load(TLOG_ptr + offs_m, mask=row_mask, other=0.0).to(tl.float32)
+    loss = tl.log(s) + m - tlog
+    tl.store(OUT_ptr + offs_m, loss, mask=row_mask)
 
 
-_BUF_CACHE: Dict[Tuple[int, int, int], Tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = {}
+_ce_cache = {}
 
 
 def fused_linear_ce(X: torch.Tensor, W: torch.Tensor, B: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
-    if not (X.is_cuda and W.is_cuda and B.is_cuda and targets.is_cuda):
-        raise ValueError("All inputs must be CUDA tensors.")
-    if X.dtype != torch.float16 or W.dtype != torch.float16:
-        raise ValueError("X and W must be float16.")
-    if B.dtype != torch.float32:
-        raise ValueError("B must be float32.")
-    if targets.dtype != torch.int64:
-        raise ValueError("targets must be int64.")
-    if X.ndim != 2 or W.ndim != 2 or B.ndim != 1 or targets.ndim != 1:
-        raise ValueError("Invalid input ranks.")
+    assert X.is_cuda and W.is_cuda and B.is_cuda and targets.is_cuda
+    assert X.dtype == torch.float16 and W.dtype == torch.float16
+    assert B.dtype in (torch.float32, torch.float16, torch.bfloat16)
+    assert targets.dtype == torch.int64
 
     M, K = X.shape
-    K2, N = W.shape
-    if K2 != K:
-        raise ValueError("Shape mismatch: X is (M,K) and W is (K,N).")
-    if B.shape[0] != N:
-        raise ValueError("Shape mismatch: B must be (N,).")
-    if targets.shape[0] != M:
-        raise ValueError("Shape mismatch: targets must be (M,).")
+    Kw, N = W.shape
+    assert Kw == K
+    assert B.numel() == N
+    assert targets.numel() == M
 
-    if M == 0:
-        return torch.empty((0,), device=X.device, dtype=torch.float32)
+    if B.dtype != torch.float32:
+        B = B.float()
 
-    device_index = X.device.index if X.device.type == "cuda" else -1
+    BLOCK_M = 16
+    BLOCK_N = 128
+    BLOCK_K = 32
+    NEG_INF = -1.0e20
 
-    block_n = 128
-    n_blocks = triton.cdiv(N, block_n)
+    grid_m = triton.cdiv(M, BLOCK_M)
+    grid_n = triton.cdiv(N, BLOCK_N)
 
-    cache_key = (device_index, M, n_blocks)
-    if cache_key in _BUF_CACHE:
-        max_buf, sum_buf, tlog_buf = _BUF_CACHE[cache_key]
+    key = (X.device, M, grid_n)
+    bufs = _ce_cache.get(key)
+    if bufs is None or bufs[0].shape != (grid_n, M):
+        pmax = torch.empty((grid_n, M), device=X.device, dtype=torch.float32)
+        psum = torch.empty((grid_n, M), device=X.device, dtype=torch.float32)
+        tlog = torch.empty((M,), device=X.device, dtype=torch.float32)
+        _ce_cache[key] = (pmax, psum, tlog)
     else:
-        max_buf = torch.empty((M, n_blocks), device=X.device, dtype=torch.float32)
-        sum_buf = torch.empty((M, n_blocks), device=X.device, dtype=torch.float32)
-        tlog_buf = torch.empty((M,), device=X.device, dtype=torch.float32)
-        _BUF_CACHE[cache_key] = (max_buf, sum_buf, tlog_buf)
-
-    tlog_buf.zero_()
-
-    stride_xm, stride_xk = X.stride(0), X.stride(1)
-    stride_wk, stride_wn = W.stride(0), W.stride(1)
-    stride_b = B.stride(0)
-    stride_stats_m = max_buf.stride(0)
-
-    grid = lambda meta: (triton.cdiv(M, meta["BLOCK_M"]), triton.cdiv(N, meta["BLOCK_N"]))
-
-    _linear_ce_stats_kernel[grid](
-        X,
-        W,
-        B,
-        targets,
-        max_buf,
-        sum_buf,
-        tlog_buf,
-        M=M,
-        N=N,
-        K=K,
-        stride_xm=stride_xm,
-        stride_xk=stride_xk,
-        stride_wk=stride_wk,
-        stride_wn=stride_wn,
-        stride_b=stride_b,
-        stride_stats_m=stride_stats_m,
-    )
+        pmax, psum, tlog = bufs
 
     out = torch.empty((M,), device=X.device, dtype=torch.float32)
 
-    BLOCK_M2 = 128
-    BLOCKS = 64
-    grid2 = (triton.cdiv(M, BLOCK_M2),)
-
-    _reduce_stats_to_loss_kernel[grid2](
-        max_buf,
-        sum_buf,
-        tlog_buf,
-        out,
-        M=M,
-        n_blocks=n_blocks,
-        stride_stats_m=stride_stats_m,
-        BLOCK_M=BLOCK_M2,
-        BLOCKS=BLOCKS,
+    _linear_ce_partials_kernel[(grid_m, grid_n)](
+        X, W, B, targets,
+        pmax, psum, tlog,
+        M=M, N=N, K=K,
+        stride_xm=X.stride(0), stride_xk=X.stride(1),
+        stride_wk=W.stride(0), stride_wn=W.stride(1),
+        stride_pbn=pmax.stride(0), stride_pm=pmax.stride(1),
+        BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K, NEG_INF=NEG_INF,
         num_warps=4,
-        num_stages=2,
+        num_stages=3,
     )
 
+    BLOCK_RM = 128
+    _linear_ce_reduce_kernel[(triton.cdiv(M, BLOCK_RM),)](
+        pmax, psum, tlog, out,
+        M=M,
+        stride_pbn=pmax.stride(0), stride_pm=pmax.stride(1),
+        NUM_BLOCKS_N=grid_n,
+        BLOCK_RM=BLOCK_RM,
+        NEG_INF=NEG_INF,
+        num_warps=4,
+        num_stages=1,
+    )
     return out
+"""
+).strip()
 
 
 class Solution:
     def solve(self, spec_path: str = None) -> dict:
-        return {"program_path": os.path.abspath(__file__)}
+        return {"code": KERNEL_CODE}

@@ -1,19 +1,12 @@
 import numpy as np
 from pysr import PySRRegressor
-import sympy
 
 class Solution:
     def __init__(self, **kwargs):
-        """
-        Initialize the Solution class.
-        You can use this to set up any parameters or models.
-        """
         pass
 
     def solve(self, X: np.ndarray, y: np.ndarray) -> dict:
         """
-        Fit a symbolic expression to the data.
-
         Args:
             X: Feature matrix of shape (n, 2)
             y: Target values of shape (n,)
@@ -24,39 +17,39 @@ class Solution:
               - "predictions": list/array of length n (optional)
               - "details": dict with optional "complexity" int
         """
-        # Given the dataset name "SinCos", we expect trigonometric functions.
-        # We configure PySR to use the allowed operators and functions,
-        # leveraging the 8 available vCPUs for an efficient search.
         model = PySRRegressor(
-            niterations=100,
-            populations=24,
-            population_size=50,
-            binary_operators=["+", "-", "*", "/"],
-            unary_operators=["sin", "cos", "exp", "log"],
-            maxsize=25,
-            model_selection="best",
-            parsimony=0.0025,
             procs=8,
+            niterations=100,
+            populations=32,
+            population_size=50,
+            binary_operators=["+", "-", "*", "/", "pow"],
+            unary_operators=["sin", "cos"],
+            maxsize=30,
+            early_stop_condition="stop_if_no_improvement_for(20)",
+            temp_equation_file=True,
             random_state=42,
             verbosity=0,
             progress=False,
-            # Use a slightly more stable optimizer
-            optimizer_algorithm="NelderMead",
-            # Ensure constants are optimized
-            should_optimize_constants=True,
+            # Add a small amount of noise to the data to avoid overly-specialized constants
+            # and to regularize the search process slightly.
+            denoise=True
         )
 
         model.fit(X, y, variable_names=["x1", "x2"])
 
-        if not hasattr(model, 'equations') or model.equations.empty:
-            # Fallback in case no expression is found
+        if len(model.equations_) > 0:
+            # Use model.sympy() to get the best expression in sympy format,
+            # which correctly uses the provided variable_names.
+            best_expr_sympy = model.sympy()
+            expression = str(best_expr_sympy)
+            
+            # Use the model's predict method for consistency.
+            predictions = model.predict(X)
+        else:
+            # Fallback in case PySR fails to find any equations.
+            # This returns a constant zero, which is a safe baseline.
             expression = "0.0"
             predictions = np.zeros_like(y)
-        else:
-            # Get the best expression found by PySR
-            sympy_expr = model.sympy()
-            expression = str(sympy_expr)
-            predictions = model.predict(X)
 
         return {
             "expression": expression,

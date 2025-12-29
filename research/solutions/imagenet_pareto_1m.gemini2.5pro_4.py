@@ -1,99 +1,86 @@
 import torch
 import torch.nn as nn
-import torch.optim as optim
-from copy import deepcopy
+import torch.optim
+import copy
+
+# A robust MLP architecture designed to maximize capacity under the 1M parameter limit.
+# It uses common modern techniques like Batch Normalization, GELU activation, and Dropout
+# for better training stability and regularization on the small dataset.
+class _CustomNet(nn.Module):
+    def __init__(self, input_dim: int, num_classes: int):
+        super().__init__()
+        
+        # Architecture: 384 -> 900 -> 512 -> 256 -> 128
+        # This structure is chosen to be close to, but under, 1,000,000 parameters.
+        # Parameter Calculation:
+        # Linear 1 (384->900): 384*900 + 900 = 346,500
+        # BatchNorm1d 1 (900): 2*900 = 1,800
+        # Linear 2 (900->512): 900*512 + 512 = 461,312
+        # BatchNorm1d 2 (512): 2*512 = 1,024
+        # Linear 3 (512->256): 512*256 + 256 = 131,328
+        # BatchNorm1d 3 (256): 2*256 = 512
+        # Linear 4 (256->128): 256*128 + 128 = 32,896
+        # Total Parameters = 975,372 < 1,000,000
+        
+        self.layers = nn.Sequential(
+            nn.Linear(input_dim, 900),
+            nn.BatchNorm1d(900),
+            nn.GELU(),
+            nn.Dropout(0.4),
+
+            nn.Linear(900, 512),
+            nn.BatchNorm1d(512),
+            nn.GELU(),
+            nn.Dropout(0.3),
+
+            nn.Linear(512, 256),
+            nn.BatchNorm1d(256),
+            nn.GELU(),
+            nn.Dropout(0.2),
+            
+            nn.Linear(256, num_classes)
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.layers(x)
+
 
 class Solution:
     def solve(self, train_loader, val_loader, metadata: dict = None) -> torch.nn.Module:
         """
         Train a model and return it.
         
-        Args:
-            train_loader: PyTorch DataLoader with training data
-            val_loader: PyTorch DataLoader with validation data
-            metadata: Dict with keys:
-                - num_classes: int (128)
-                - input_dim: int (384)
-                - param_limit: int (1,000,000)
-                - baseline_accuracy: float (0.8)
-                - train_samples: int
-                - val_samples: int
-                - test_samples: int
-                - device: str ("cpu")
+        This solution trains a custom MLP model (_CustomNet) designed to maximize accuracy
+        on the given synthetic dataset while adhering to a strict 1,000,000 parameter limit.
         
-        Returns:
-            Trained torch.nn.Module ready for evaluation
+        The training strategy includes:
+        - AdamW optimizer for better weight decay handling.
+        - CosineAnnealingLR scheduler to adjust the learning rate over epochs.
+        - Early stopping based on validation accuracy to prevent overfitting and
+          return the best performing model.
         """
-        
-        class ResidualBlock(nn.Module):
-            """A residual block for an MLP."""
-            def __init__(self, size, dropout_p=0.3):
-                super().__init__()
-                self.ffn = nn.Sequential(
-                    nn.Linear(size, size),
-                    nn.BatchNorm1d(size),
-                    nn.GELU(),
-                    nn.Dropout(p=dropout_p),
-                    nn.Linear(size, size),
-                    nn.BatchNorm1d(size),
-                )
-                self.act = nn.GELU()
-
-            def forward(self, x):
-                residual = x
-                out = self.ffn(x)
-                out += residual
-                out = self.act(out)
-                return out
-
-        class DeepMLP(nn.Module):
-            """A deep MLP with residual connections, designed to maximize parameters."""
-            def __init__(self, input_dim, num_classes, d_model=438, num_blocks=2, dropout_p=0.3):
-                super().__init__()
-                
-                self.pre_proc = nn.Sequential(
-                    nn.Linear(input_dim, d_model),
-                    nn.BatchNorm1d(d_model),
-                    nn.GELU(),
-                )
-                
-                blocks = [ResidualBlock(d_model, dropout_p=dropout_p) for _ in range(num_blocks)]
-                self.blocks = nn.Sequential(*blocks)
-                
-                self.classifier = nn.Linear(d_model, num_classes)
-                
-            def forward(self, x):
-                x = self.pre_proc(x)
-                x = self.blocks(x)
-                x = self.classifier(x)
-                return x
-
-        device = metadata.get("device", "cpu")
+        device = torch.device(metadata.get("device", "cpu"))
         input_dim = metadata["input_dim"]
         num_classes = metadata["num_classes"]
 
-        model = DeepMLP(input_dim=input_dim, num_classes=num_classes).to(device)
-        
-        # Hyperparameters
+        model = _CustomNet(input_dim, num_classes).to(device)
+
+        # Tuned hyperparameters for robust training
         EPOCHS = 250
         LEARNING_RATE = 3e-4
         WEIGHT_DECAY = 1e-4
-        LABEL_SMOOTHING = 0.1
-        PATIENCE = 30
-        WARMUP_EPOCHS = 10
+        PATIENCE = 40
 
-        criterion = nn.CrossEntropyLoss(label_smoothing=LABEL_SMOOTHING)
-        optimizer = optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
-        
-        warmup_scheduler = optim.lr_scheduler.LinearLR(optimizer, start_factor=0.1, total_iters=WARMUP_EPOCHS)
-        main_scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=EPOCHS - WARMUP_EPOCHS, eta_min=1e-6)
-        scheduler = optim.lr_scheduler.SequentialLR(optimizer, schedulers=[warmup_scheduler, main_scheduler], milestones=[WARMUP_EPOCHS])
+        optimizer = torch.optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
+        criterion = nn.CrossEntropyLoss()
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=EPOCHS, eta_min=1e-6)
 
-        best_val_acc = 0.0
+        best_val_accuracy = 0.0
         epochs_no_improve = 0
         best_model_state = None
 
         for epoch in range(EPOCHS):
+            # --- Training Phase ---
             model.train()
             for inputs, targets in train_loader:
                 inputs, targets = inputs.to(device), targets.to(device)
@@ -104,6 +91,7 @@ class Solution:
                 loss.backward()
                 optimizer.step()
 
+            # --- Validation Phase ---
             model.eval()
             val_correct = 0
             val_total = 0
@@ -114,23 +102,24 @@ class Solution:
                     _, predicted = torch.max(outputs.data, 1)
                     val_total += targets.size(0)
                     val_correct += (predicted == targets).sum().item()
-            
-            val_acc = val_correct / val_total if val_total > 0 else 0.0
 
-            if val_acc > best_val_acc:
-                best_val_acc = val_acc
-                best_model_state = deepcopy(model.state_dict())
+            current_val_accuracy = val_correct / val_total
+
+            # --- Early Stopping & Checkpointing ---
+            if current_val_accuracy > best_val_accuracy:
+                best_val_accuracy = current_val_accuracy
                 epochs_no_improve = 0
+                best_model_state = copy.deepcopy(model.state_dict())
             else:
                 epochs_no_improve += 1
-            
+
             if epochs_no_improve >= PATIENCE:
                 break
             
             scheduler.step()
 
+        # Load the best performing model state before returning
         if best_model_state:
             model.load_state_dict(best_model_state)
 
-        model.eval()
         return model

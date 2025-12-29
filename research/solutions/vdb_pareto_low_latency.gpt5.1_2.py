@@ -1,88 +1,87 @@
-import os
-from typing import Tuple
-
 import numpy as np
 import faiss
+from typing import Tuple
 
 
 class YourIndexClass:
     def __init__(self, dim: int, **kwargs):
         """
-        HNSW-based index optimized for low-latency approximate search.
+        Initialize the index for vectors of dimension `dim`.
+
+        Args:
+            dim: Vector dimensionality (e.g., 128 for SIFT1M)
+            **kwargs: Optional parameters (e.g., M, ef_construction, ef_search, num_threads)
         """
         self.dim = int(dim)
-        if self.dim <= 0:
-            raise ValueError("dim must be a positive integer")
 
-        # HNSW parameters
-        self.M = int(kwargs.get("M", 32))  # number of neighbors per node
-        if self.M <= 0:
-            self.M = 32
+        # Hyperparameters with reasonable high-recall defaults
+        self.M = int(kwargs.get("M", 32))
+        self.efConstruction = int(
+            kwargs.get("ef_construction", kwargs.get("efConstruction", 200))
+        )
+        self.efSearch = int(
+            kwargs.get("ef_search", kwargs.get("efSearch", 256))
+        )
 
-        self.ef_construction = int(kwargs.get("ef_construction", 200))
-        if self.ef_construction <= 0:
-            self.ef_construction = 200
-
-        # Search time / recall tradeoff parameter
-        # Higher ef_search -> higher recall, higher latency
-        self.ef_search = int(kwargs.get("ef_search", 40))
-        if self.ef_search <= 0:
-            self.ef_search = 40
-
-        # Threading
-        num_threads = kwargs.get("num_threads", None)
-        if num_threads is None:
-            num_threads = os.cpu_count()
-            if num_threads is None or num_threads <= 0:
-                num_threads = 1
-        self.num_threads = int(num_threads)
-        try:
+        # Configure OpenMP threads
+        max_threads = getattr(faiss, "omp_get_max_threads", lambda: 1)()
+        default_threads = min(8, max_threads) if max_threads > 0 else 1
+        self.num_threads = int(kwargs.get("num_threads", default_threads))
+        if hasattr(faiss, "omp_set_num_threads"):
             faiss.omp_set_num_threads(self.num_threads)
-        except AttributeError:
-            pass
 
-        # Build HNSW-Flat index (L2 metric by default)
+        # Create HNSW index (L2 by default)
         self.index = faiss.IndexHNSWFlat(self.dim, self.M)
-        hnsw = self.index.hnsw
-        hnsw.efConstruction = self.ef_construction
-        hnsw.efSearch = self.ef_search
+        self.index.hnsw.efConstruction = self.efConstruction
+        self.index.hnsw.efSearch = self.efSearch
 
     def add(self, xb: np.ndarray) -> None:
         """
-        Add base vectors to the index.
+        Add vectors to the index.
+
+        Args:
+            xb: Base vectors, shape (N, dim), dtype float32
         """
-        if xb is None:
-            return
-
-        xb = np.asarray(xb, dtype=np.float32)
         if xb.ndim != 2 or xb.shape[1] != self.dim:
-            raise ValueError(f"xb must have shape (N, {self.dim}), got {xb.shape}")
+            raise ValueError(
+                f"xb must have shape (N, {self.dim}), got {xb.shape}"
+            )
 
-        xb = np.ascontiguousarray(xb, dtype=np.float32)
+        if xb.dtype != np.float32:
+            xb = xb.astype(np.float32, copy=False)
+        xb = np.ascontiguousarray(xb)
+
         self.index.add(xb)
 
     def search(self, xq: np.ndarray, k: int) -> Tuple[np.ndarray, np.ndarray]:
         """
-        Search for k nearest neighbors.
+        Search for k nearest neighbors of query vectors.
+
+        Args:
+            xq: Query vectors, shape (nq, dim), dtype float32
+            k: Number of nearest neighbors to return
+
+        Returns:
+            (distances, indices):
+                - distances: shape (nq, k), dtype float32, L2-squared distances
+                - indices: shape (nq, k), dtype int64, indices into base vectors
         """
-        xq = np.asarray(xq, dtype=np.float32)
         if xq.ndim != 2 or xq.shape[1] != self.dim:
-            raise ValueError(f"xq must have shape (nq, {self.dim}), got {xq.shape}")
-        if k <= 0:
-            raise ValueError("k must be a positive integer")
-        if self.index.ntotal == 0:
-            raise RuntimeError("Index is empty. Call add() before search().")
+            raise ValueError(
+                f"xq must have shape (nq, {self.dim}), got {xq.shape}"
+            )
 
-        xq = np.ascontiguousarray(xq, dtype=np.float32)
+        if xq.dtype != np.float32:
+            xq = xq.astype(np.float32, copy=False)
+        xq = np.ascontiguousarray(xq)
 
-        # Ensure search parameter is set (in case user changed ef_search)
-        self.index.hnsw.efSearch = self.ef_search
+        # Ensure efSearch is set (in case user modified self.efSearch)
+        self.index.hnsw.efSearch = self.efSearch
 
         D, I = self.index.search(xq, k)
 
-        if D.dtype != np.float32:
-            D = D.astype(np.float32, copy=False)
-        if I.dtype != np.int64:
-            I = I.astype(np.int64, copy=False)
+        # Ensure expected dtypes and contiguity
+        D = np.ascontiguousarray(D, dtype=np.float32)
+        I = np.ascontiguousarray(I, dtype=np.int64)
 
         return D, I

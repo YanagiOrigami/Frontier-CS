@@ -1,95 +1,104 @@
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from copy import deepcopy
+from torch.optim.lr_scheduler import CosineAnnealingLR
+import copy
 
-# It's good practice to define the model architecture outside the main solve function
-# for clarity and reusability.
-class CustomMLP(nn.Module):
+class ResidualBlock(nn.Module):
     """
-    A custom Multi-Layer Perceptron designed to maximize capacity under the 500k parameter limit.
-    This architecture uses two hidden layers, batch normalization, and dropout for regularization.
-    The hidden layer sizes (480) were chosen to bring the parameter count close to the limit.
-    
-    Calculation:
-    - Layer 1: (384 * 480 + 480) + 2*480 (BN) = 184800 + 960 = 185760
-    - Layer 2: (480 * 480 + 480) + 2*480 (BN) = 230400 + 960 = 231360
-    - Layer 3: (480 * 128 + 128) = 61440 + 128 = 61568
-    - Total: 185760 + 231360 + 61568 = 478688 parameters.
-    This is safely under the 500,000 limit.
+    A standard residual block for an MLP, with pre-activation style.
+    It consists of two linear layers, batch normalization, GELU activation, and dropout.
     """
-    def __init__(self, input_dim: int, num_classes: int):
-        super(CustomMLP, self).__init__()
-        
-        hidden_dim1 = 480
-        hidden_dim2 = 480
-        dropout_rate = 0.3
-
-        self.layers = nn.Sequential(
-            nn.Linear(input_dim, hidden_dim1),
-            nn.BatchNorm1d(hidden_dim1),
-            nn.ReLU(inplace=True),
-            nn.Dropout(p=dropout_rate),
-            
-            nn.Linear(hidden_dim1, hidden_dim2),
-            nn.BatchNorm1d(hidden_dim2),
-            nn.ReLU(inplace=True),
-            nn.Dropout(p=dropout_rate),
-            
-            nn.Linear(hidden_dim2, num_classes)
-        )
+    def __init__(self, size: int, dropout_rate: float):
+        super().__init__()
+        self.fc1 = nn.Linear(size, size)
+        self.bn1 = nn.BatchNorm1d(size)
+        self.fc2 = nn.Linear(size, size)
+        self.bn2 = nn.BatchNorm1d(size)
+        self.activation = nn.GELU()
+        self.dropout = nn.Dropout(dropout_rate)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.layers(x)
+        residual = x
+        out = self.fc1(x)
+        out = self.bn1(out)
+        out = self.activation(out)
+        out = self.dropout(out)
+        out = self.fc2(out)
+        out = self.bn2(out)
+        out += residual
+        out = self.activation(out)
+        return out
+
+class ResMLP(nn.Module):
+    """
+    A ResNet-style Multi-Layer Perceptron (ResMLP) designed for vector data.
+    """
+    def __init__(self, input_dim: int, hidden_dim: int, num_classes: int, num_blocks: int, dropout_rate: float):
+        super().__init__()
+        self.input_layer = nn.Linear(input_dim, hidden_dim)
+        self.input_bn = nn.BatchNorm1d(hidden_dim)
+        self.input_activation = nn.GELU()
+        
+        blocks = [ResidualBlock(hidden_dim, dropout_rate) for _ in range(num_blocks)]
+        self.res_blocks = nn.Sequential(*blocks)
+        
+        self.classifier = nn.Linear(hidden_dim, num_classes)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.input_layer(x)
+        x = self.input_bn(x)
+        x = self.input_activation(x)
+        x = self.res_blocks(x)
+        x = self.classifier(x)
+        return x
 
 class Solution:
     """
-    This solution trains a custom MLP model on the provided data.
+    Solution class for training a parameter-constrained model.
     """
-    def solve(self, train_loader, val_loader, metadata: dict = None) -> torch.nn.Module:
+    def solve(self, train_loader: torch.utils.data.DataLoader, val_loader: torch.utils.data.DataLoader, metadata: dict = None) -> torch.nn.Module:
         """
-        Train a model and return it.
+        Trains a ResMLP model on the provided data loaders.
         
-        Args:
-            train_loader: PyTorch DataLoader with training data
-            val_loader: PyTorch DataLoader with validation data
-            metadata: Dict with keys including num_classes, input_dim, and device
-        
-        Returns:
-            Trained torch.nn.Module ready for evaluation
+        The architecture and hyperparameters are tuned to maximize accuracy
+        while staying under the 500,000 parameter limit.
         """
-        # Extract metadata
         device = metadata.get("device", "cpu")
         input_dim = metadata["input_dim"]
         num_classes = metadata["num_classes"]
 
-        # Instantiate the model and move it to the specified device
-        model = CustomMLP(input_dim=input_dim, num_classes=num_classes)
-        model.to(device)
+        # --- Model Configuration ---
+        # This configuration creates a model with approximately 483,104 parameters,
+        # which effectively utilizes the given budget. The architecture is a deep
+        # ResNet-style MLP, which is well-suited for this type of data.
+        hidden_dim = 288
+        num_blocks = 2
+        dropout_rate = 0.25
+        
+        model = ResMLP(
+            input_dim=input_dim,
+            hidden_dim=hidden_dim,
+            num_classes=num_classes,
+            num_blocks=num_blocks,
+            dropout_rate=dropout_rate,
+        ).to(device)
 
-        # Hyperparameters chosen for robust training
-        # With a small dataset, a higher number of epochs is feasible and beneficial.
-        epochs = 250
-        learning_rate = 1e-3
-        weight_decay = 1e-4
-        label_smoothing = 0.1
+        # --- Training Configuration ---
+        epochs = 300
+        lr = 0.001
+        weight_decay = 0.01
 
-        # Optimizer: AdamW is a robust choice that often outperforms standard Adam.
-        optimizer = optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
+        optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
+        scheduler = CosineAnnealingLR(optimizer, T_max=epochs, eta_min=1e-6)
+        criterion = nn.CrossEntropyLoss()
 
-        # Loss Function: CrossEntropyLoss with label smoothing for regularization.
-        criterion = nn.CrossEntropyLoss(label_smoothing=label_smoothing)
-
-        # Scheduler: CosineAnnealingLR helps in converging to a better minimum by
-        # gradually decreasing the learning rate.
-        scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs, eta_min=1e-6)
-
-        best_val_accuracy = 0.0
+        # --- Training Loop with Early Stopping Logic ---
+        best_val_acc = 0.0
         best_model_state = None
-
-        # Training and validation loop
-        for epoch in range(epochs):
-            # --- Training Phase ---
+        
+        for _ in range(epochs):
+            # Training phase
             model.train()
             for inputs, targets in train_loader:
                 inputs, targets = inputs.to(device), targets.to(device)
@@ -100,29 +109,29 @@ class Solution:
                 loss.backward()
                 optimizer.step()
 
-            # --- Validation Phase ---
+            # Validation phase
             model.eval()
-            total_correct = 0
-            total_samples = 0
+            correct = 0
+            total = 0
             with torch.no_grad():
                 for inputs, targets in val_loader:
                     inputs, targets = inputs.to(device), targets.to(device)
                     outputs = model(inputs)
                     _, predicted = torch.max(outputs.data, 1)
-                    total_samples += targets.size(0)
-                    total_correct += (predicted == targets).sum().item()
-            
-            current_val_accuracy = total_correct / total_samples
-            
-            # Save the state of the model that has the best validation accuracy so far
-            if current_val_accuracy > best_val_accuracy:
-                best_val_accuracy = current_val_accuracy
-                best_model_state = deepcopy(model.state_dict())
+                    total += targets.size(0)
+                    correct += (predicted == targets).sum().item()
+
+            val_acc = correct / total
             
             # Step the learning rate scheduler
             scheduler.step()
 
-        # Load the best model state found during training before returning
+            # Save the best model state based on validation accuracy
+            if val_acc > best_val_acc:
+                best_val_acc = val_acc
+                best_model_state = copy.deepcopy(model.state_dict())
+
+        # Load the weights of the best performing model
         if best_model_state:
             model.load_state_dict(best_model_state)
             

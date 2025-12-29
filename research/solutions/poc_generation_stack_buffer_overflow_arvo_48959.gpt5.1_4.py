@@ -1,101 +1,68 @@
-import struct
 import zlib
-
+import struct
 
 class Solution:
     def solve(self, src_path: str) -> bytes:
-        # Find a small original payload that produces a Huffman-coded DEFLATE stream
-        best_gzip = None
-        best_len = None
+        best_deflate = None
+        best_data = None
 
-        for size in range(1, 64):
-            orig = b"A" * size
-            comp = self._deflate_raw(orig)
-            if not comp:
-                continue
-            if not self._has_huffman_block(comp):
-                continue
-            gz = self._make_gzip(comp, orig)
-            l = len(gz)
-            if best_gzip is None or l < best_len:
-                best_gzip = gz
-                best_len = l
+        # Prepare strategies to try
+        strategies = []
+        if hasattr(zlib, "Z_HUFFMAN_ONLY"):
+            strategies.append(zlib.Z_HUFFMAN_ONLY)
+        if hasattr(zlib, "Z_FILTERED"):
+            strategies.append(zlib.Z_FILTERED)
+        if hasattr(zlib, "Z_DEFAULT_STRATEGY"):
+            strategies.append(zlib.Z_DEFAULT_STRATEGY)
+        if not strategies:
+            strategies = [0]
 
-        if best_gzip is None:
-            # Fallback: just compress a larger payload; zlib will definitely use Huffman coding
-            orig = b"A" * 1024
-            comp = self._deflate_raw(orig)
-            best_gzip = self._make_gzip(comp, orig)
+        # Try various small inputs and compression settings to get a dynamic Huffman block
+        for size in range(1, 65):
+            # Use a couple of patterns to encourage dynamic Huffman use
+            patterns = [b"A" * size, bytes((i % 256 for i in range(size)))]
+            for data in patterns:
+                for strategy in strategies:
+                    for level in (9, 6, 3, 1):
+                        try:
+                            co = zlib.compressobj(
+                                level,
+                                zlib.DEFLATED,
+                                wbits=-15,  # raw deflate
+                                memLevel=8,
+                                strategy=strategy,
+                            )
+                        except TypeError:
+                            # Older zlib: strategy may not be accepted
+                            co = zlib.compressobj(
+                                level,
+                                zlib.DEFLATED,
+                                wbits=-15,
+                                memLevel=8,
+                            )
+                        d = co.compress(data) + co.flush()
+                        if not d:
+                            continue
+                        # Check first block type: bits 1-2 of first byte (LSB first)
+                        btype = (d[0] >> 1) & 0x3
+                        if btype != 0b10:  # not dynamic Huffman
+                            continue
+                        if best_deflate is None or len(d) < len(best_deflate):
+                            best_deflate = d
+                            best_data = data
 
-        return best_gzip
+        # Fallback if, for some reason, no dynamic Huffman block was found
+        if best_deflate is None:
+            best_data = b"A" * 32
+            co = zlib.compressobj(9, zlib.DEFLATED, wbits=-15)
+            best_deflate = co.compress(best_data) + co.flush()
 
-    def _deflate_raw(self, data: bytes) -> bytes:
-        compobj = zlib.compressobj(level=9, method=zlib.DEFLATED, wbits=-15)
-        return compobj.compress(data) + compobj.flush()
+        # Build minimal gzip wrapper around the raw deflate stream
+        crc = zlib.crc32(best_data) & 0xFFFFFFFF
+        isize = len(best_data) & 0xFFFFFFFF
 
-    def _make_gzip(self, deflate_data: bytes, orig: bytes) -> bytes:
-        # GZIP header: ID1 ID2 CM FLG MTIME[4] XFL OS
-        header = b"\x1f\x8b"  # ID1, ID2
-        header += b"\x08"     # CM = DEFLATE
-        header += b"\x00"     # FLG = 0 (no extra fields)
-        header += b"\x00\x00\x00\x00"  # MTIME = 0
-        header += b"\x00"     # XFL = 0
-        header += b"\xff"     # OS = 255 (unknown)
+        # Gzip header: ID1 ID2 CM FLG MTIME(4) XFL OS
+        header = b"\x1f\x8b\x08\x00" + b"\x00\x00\x00\x00" + b"\x00" + b"\x03"
+        tail = struct.pack("<II", crc, isize)
 
-        crc = zlib.crc32(orig) & 0xFFFFFFFF
-        isize = len(orig) & 0xFFFFFFFF
-        footer = struct.pack("<II", crc, isize)
-
-        return header + deflate_data + footer
-
-    def _has_huffman_block(self, data: bytes) -> bool:
-        """Return True if the raw DEFLATE stream has at least one Huffman-coded block."""
-        bitpos = 0
-        nbits = len(data) * 8
-
-        while True:
-            if bitpos + 3 > nbits:
-                return False
-
-            byte_index = bitpos >> 3
-            bit_offset = bitpos & 7
-
-            if byte_index + 1 < len(data):
-                x = data[byte_index] | (data[byte_index + 1] << 8)
-            else:
-                x = data[byte_index]
-
-            x >>= bit_offset
-            bfinal = x & 1
-            btype = (x >> 1) & 0b11
-
-            if btype in (1, 2):
-                return True
-            if btype == 3:
-                # Reserved (invalid) - shouldn't happen for zlib output
-                return False
-
-            # btype == 0: uncompressed block
-            # Skip the remaining bits of header to the next byte boundary
-            bitpos += 3
-            bitpos = (bitpos + 7) & ~7  # align to next byte
-
-            if bitpos + 32 > nbits:
-                return False
-            byte_index = bitpos >> 3
-            if byte_index + 3 >= len(data):
-                return False
-
-            # LEN and NLEN (we only need LEN)
-            length = data[byte_index] | (data[byte_index + 1] << 8)
-            bitpos += 32  # skip LEN and NLEN fields
-
-            # Skip LEN bytes of uncompressed data
-            bitpos += length * 8
-            if bitpos > nbits:
-                return False
-
-            if bfinal:
-                break
-
-        return False
+        return header + best_deflate + tail

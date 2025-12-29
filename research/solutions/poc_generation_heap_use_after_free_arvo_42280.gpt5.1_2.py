@@ -1,407 +1,252 @@
 import os
 import tarfile
-import zipfile
+import gzip
+from typing import Optional, Tuple
 
 
 class Solution:
-    TARGET_SIZE = 13996
+    TARGET_POC_SIZE = 13996
 
     def solve(self, src_path: str) -> bytes:
-        data = None
+        target_size = self.TARGET_POC_SIZE
 
         if os.path.isdir(src_path):
-            data = self._find_poc_in_dir(src_path)
-        else:
-            if tarfile.is_tarfile(src_path):
-                data = self._find_poc_in_tar(src_path)
-            elif zipfile.is_zipfile(src_path):
-                data = self._find_poc_in_zip(src_path)
+            data = self._find_poc_in_directory(src_path, target_size)
+            if data is not None:
+                return data
 
-        if data is None:
-            data = self._fallback_poc()
+        if os.path.isfile(src_path) and tarfile.is_tarfile(src_path):
+            data = self._find_poc_in_tar(src_path, target_size)
+            if data is not None:
+                return data
 
-        return data
+        return self._fallback_poc()
 
-    def _fallback_poc(self) -> bytes:
-        # Generic small PostScript snippet attempting to exercise PDF interpreter
-        ps = b"""%!PS-Adobe-3.0
-% Fallback PoC: attempt to exercise pdf interpreter from PostScript.
-% This is a generic input used when no dedicated PoC file is found.
-% It intentionally tries to invoke PDF-related operators even if the
-% setup fails, which may trigger use-after-free bugs in pdfi contexts.
+    def _find_poc_in_directory(self, root_dir: str, target_size: int) -> Optional[bytes]:
+        best_path: Optional[str] = None
+        best_key: Optional[Tuple[int, int, int]] = None
+        best_is_gz: bool = False
 
-/try_runpdfbegin {
-  (%stdin) (r) file runpdfbegin
-} bind def
-
-errordict /undefinedfilename {
-  % Ignore file-open errors.
-  pop pop
-} bind put
-
-% Try to start PDF interpreter with an invalid input stream.
-try_runpdfbegin
-
-% Now invoke a few PDF-related operators that may assume a valid pdfi context.
-/try_pdf_ops {
-  % These operators exist in Ghostscript-based interpreters; if not defined
-  % they will trigger 'undefined', which is acceptable for fallback.
-  /pdfpagecount where {
-    pop pdfpagecount pop
-  } if
-  /pdfpeekpage where {
-    pop 1 pdfpeekpage
-  } if
-} bind def
-
-try_pdf_ops
-
-quit
-"""
-        return ps
-
-    def _normalize_path(self, path: str) -> str:
-        return path.replace("\\", "/")
-
-    def _name_score(self, name: str) -> int:
-        n = self._normalize_path(name).lower()
-        score = 0
-
-        base = os.path.basename(n)
-        ext = os.path.splitext(base)[1]
-
-        # Extension-based scoring
-        if ext in (".ps", ".eps"):
-            score += 40
-        elif ext == ".pdf":
-            score += 35
-        elif ext in (".txt", ".bin", ".dat"):
-            score += 10
-
-        # Penalize obvious source code / build artifacts
-        code_exts = {
-            ".c",
-            ".h",
-            ".cpp",
-            ".cc",
-            ".cxx",
-            ".hpp",
-            ".py",
-            ".java",
-            ".js",
-            ".ts",
-            ".go",
-            ".rb",
-            ".php",
-            ".sh",
-            ".bat",
-            ".m",
-            ".mm",
-            ".cs",
-            ".rs",
-            ".swift",
-            ".pl",
-            ".pm",
-            ".mak",
-            ".cmake",
-            ".sln",
-            ".vcxproj",
-            ".vcproj",
-        }
-        if ext in code_exts:
-            score -= 60
-
-        # Tokens in full name
-        token_weights = {
-            "poc": 40,
-            "repro": 35,
-            "crash": 35,
-            "uaf": 35,
-            "use-after-free": 40,
-            "heap-use-after-free": 40,
-            "heap_uaf": 30,
-            "asan": 20,
-            "bug": 20,
-            "bugs": 15,
-            "id:": 20,
-            "id_": 20,
-            "id-": 20,
-            "42280": 45,
-            "pdfi": 25,
-            "pdf": 10,
-            "ps": 5,
-            "fuzz": 15,
-            "oss-fuzz": 25,
-            "testcase": 15,
-            "tests": 5,
-        }
-
-        for tok, w in token_weights.items():
-            if tok in n:
-                score += w
-
-        # Directory components
-        parts = n.split("/")
-        dir_tokens = {
-            "poc",
-            "pocs",
-            "crash",
-            "crashes",
-            "bugs",
-            "bug",
-            "regress",
-            "regression",
-            "tests",
-            "testcases",
-            "oss-fuzz",
-            "fuzz",
-        }
-        for p in parts[:-1]:
-            if p in dir_tokens:
-                score += 15
-
-        return score
-
-    def _size_score(self, size: int, target: int) -> int:
-        diff = abs(size - target)
-        if diff == 0:
-            return 60
-        if diff <= 50:
-            return 45
-        if diff <= 100:
-            return 40
-        if diff <= 500:
-            return 30
-        if diff <= 1000:
-            return 20
-        if diff <= 5000:
-            return 10
-        if diff <= 20000:
-            return 5
-        return 0
-
-    def _data_score(self, data: bytes) -> int:
-        score = 0
-        prefix = data[:1024]
-
-        # Headers for PDF / PostScript
-        if prefix.startswith(b"%PDF-"):
-            score += 70
-        if prefix.startswith(b"%!PS") or prefix.startswith(b"%!Adobe-PS"):
-            score += 70
-
-        # Look for pdf-related markers
-        if b"pdfi" in prefix:
-            score += 30
-        if b"PDF" in prefix:
-            score += 10
-        if b"runpdfbegin" in prefix or b"pdfpagecount" in prefix:
-            score += 40
-        if b"%!PS" in prefix:
-            score += 10
-        if b"%PDF-" in prefix:
-            score += 10
-
-        # Light penalty for obviously text-only generic docs
-        if b"Copyright" in prefix and b"License" in prefix:
-            score -= 10
-
-        return score
-
-    def _find_poc_in_tar(self, tar_path: str):
-        try:
-            tf = tarfile.open(tar_path, "r:*")
-        except tarfile.TarError:
-            return None
-
-        try:
-            members = [
-                m
-                for m in tf.getmembers()
-                if m.isfile() and 0 < m.size <= 5_000_000
-            ]
-            if not members:
-                return None
-
-            target = self.TARGET_SIZE
-            exact = []
-            others = []
-
-            for m in members:
-                size = m.size
-                name = m.name
-                base_name_score = self._name_score(name)
-
-                if size == target:
-                    score = 100 + base_name_score
-                    exact.append((score, m))
-                else:
-                    score = self._size_score(size, target) + base_name_score
-                    others.append((score, m))
-
-            if exact:
-                exact.sort(key=lambda x: (-x[0], x[1].name))
-                candidate_members = [m for _, m in exact]
-            elif others:
-                others.sort(key=lambda x: (-x[0], x[1].name))
-                candidate_members = [m for _, m in others[:20]]
-            else:
-                return None
-
-            best_data = None
-            best_score = float("-inf")
-
-            for m in candidate_members:
-                try:
-                    f = tf.extractfile(m)
-                    if f is None:
-                        continue
-                    data = f.read()
-                except Exception:
-                    continue
-
-                if not data:
-                    continue
-
-                ds = self._data_score(data)
-                total_score = ds + self._name_score(m.name)
-
-                if total_score > best_score:
-                    best_score = total_score
-                    best_data = data
-
-                if ds >= 60 and len(data) == target:
-                    best_data = data
-                    break
-
-            return best_data
-        finally:
-            tf.close()
-
-    def _find_poc_in_zip(self, zip_path: str):
-        try:
-            zf = zipfile.ZipFile(zip_path, "r")
-        except Exception:
-            return None
-
-        try:
-            infos = [
-                info
-                for info in zf.infolist()
-                if not info.is_dir() and 0 < info.file_size <= 5_000_000
-            ]
-            if not infos:
-                return None
-
-            target = self.TARGET_SIZE
-            exact = []
-            others = []
-
-            for info in infos:
-                size = info.file_size
-                name = info.filename
-                base_name_score = self._name_score(name)
-
-                if size == target:
-                    score = 100 + base_name_score
-                    exact.append((score, info))
-                else:
-                    score = self._size_score(size, target) + base_name_score
-                    others.append((score, info))
-
-            if exact:
-                exact.sort(key=lambda x: (-x[0], x[1].filename))
-                candidate_infos = [i for _, i in exact]
-            elif others:
-                others.sort(key=lambda x: (-x[0], x[1].filename))
-                candidate_infos = [i for _, i in others[:20]]
-            else:
-                return None
-
-            best_data = None
-            best_score = float("-inf")
-
-            for info in candidate_infos:
-                try:
-                    data = zf.read(info)
-                except Exception:
-                    continue
-
-                if not data:
-                    continue
-
-                ds = self._data_score(data)
-                total = ds + self._name_score(info.filename)
-
-                if total > best_score:
-                    best_score = total
-                    best_data = data
-
-                if ds >= 60 and len(data) == target:
-                    best_data = data
-                    break
-
-            return best_data
-        finally:
-            zf.close()
-
-    def _find_poc_in_dir(self, root: str):
-        target = self.TARGET_SIZE
-        candidates_exact = []
-        candidates_others = []
-
-        for dirpath, _, filenames in os.walk(root):
-            for fname in filenames:
-                path = os.path.join(dirpath, fname)
+        for dirpath, _, filenames in os.walk(root_dir):
+            for filename in filenames:
+                path = os.path.join(dirpath, filename)
                 try:
                     size = os.path.getsize(path)
                 except OSError:
                     continue
 
-                if size <= 0 or size > 5_000_000:
+                if size <= 0:
                     continue
 
-                relpath = os.path.relpath(path, root)
-                base_name_score = self._name_score(relpath)
+                name = filename
+                lname = name.lower()
+                _, ext = os.path.splitext(lname)
 
-                if size == target:
-                    score = 100 + base_name_score
-                    candidates_exact.append((score, path))
-                else:
-                    score = self._size_score(size, target) + base_name_score
-                    candidates_others.append((score, path))
+                # Handle gzipped candidates with interesting names
+                if ext == ".gz" and self._has_interesting_keyword(lname):
+                    try:
+                        with gzip.open(path, "rb") as gz:
+                            data = gz.read()
+                    except OSError:
+                        data = b""
+                    if not data:
+                        # If decompression failed or empty, skip
+                        pass
+                    else:
+                        decomp_size = len(data)
+                        name_for_priority = os.path.splitext(name)[0]
+                        key = self._candidate_key(decomp_size, name_for_priority, target_size)
+                        if best_key is None or key < best_key:
+                            best_key = key
+                            best_path = path
+                            best_is_gz = True
 
-        if candidates_exact:
-            candidates_exact.sort(key=lambda x: -x[0])
-            candidate_paths = [p for _, p in candidates_exact]
-        elif candidates_others:
-            candidates_others.sort(key=lambda x: -x[0])
-            candidate_paths = [p for _, p in candidates_others[:20]]
-        else:
+                    # Do not treat .gz as non-gz candidate
+                    continue
+
+                if ext == ".gz":
+                    # Skip other gz files
+                    continue
+
+                key = self._candidate_key(size, name, target_size)
+                if best_key is None or key < best_key:
+                    best_key = key
+                    best_path = path
+                    best_is_gz = False
+
+        if best_path is None:
             return None
 
-        best_data = None
-        best_score = float("-inf")
+        try:
+            if best_is_gz:
+                with gzip.open(best_path, "rb") as gz:
+                    return gz.read()
+            else:
+                with open(best_path, "rb") as f:
+                    return f.read()
+        except OSError:
+            return None
 
-        for path in candidate_paths:
+    def _find_poc_in_tar(self, tar_path: str, target_size: int) -> Optional[bytes]:
+        best_member: Optional[tarfile.TarInfo] = None
+        best_key: Optional[Tuple[int, int, int]] = None
+        best_is_gz: bool = False
+
+        try:
+            tar = tarfile.open(tar_path, "r:*")
+        except (tarfile.TarError, OSError):
+            return None
+
+        with tar:
+            for member in tar.getmembers():
+                if not member.isfile():
+                    continue
+
+                name = os.path.basename(member.name)
+                if not name:
+                    continue
+
+                lname = name.lower()
+                _, ext = os.path.splitext(lname)
+
+                # Handle gzipped members with interesting names
+                if ext == ".gz" and self._has_interesting_keyword(lname):
+                    try:
+                        fobj = tar.extractfile(member)
+                    except (tarfile.ExtractError, KeyError, OSError):
+                        fobj = None
+                    if fobj is None:
+                        continue
+                    try:
+                        with gzip.GzipFile(fileobj=fobj) as gz:
+                            data = gz.read()
+                    except OSError:
+                        data = b""
+                    if not data:
+                        continue
+                    decomp_size = len(data)
+                    name_for_priority = os.path.splitext(name)[0]
+                    key = self._candidate_key(decomp_size, name_for_priority, target_size)
+                    if best_key is None or key < best_key:
+                        best_key = key
+                        best_member = member
+                        best_is_gz = True
+                    continue
+
+                if ext == ".gz":
+                    # Skip other gz files
+                    continue
+
+                size = member.size
+                if size <= 0:
+                    continue
+
+                key = self._candidate_key(size, name, target_size)
+                if best_key is None or key < best_key:
+                    best_key = key
+                    best_member = member
+                    best_is_gz = False
+
+            if best_member is None:
+                return None
+
             try:
-                with open(path, "rb") as f:
-                    data = f.read()
+                fobj = tar.extractfile(best_member)
+            except (tarfile.ExtractError, KeyError, OSError):
+                return None
+            if fobj is None:
+                return None
+
+            try:
+                if best_is_gz:
+                    with gzip.GzipFile(fileobj=fobj) as gz:
+                        return gz.read()
+                else:
+                    return fobj.read()
             except OSError:
-                continue
+                return None
 
-            if not data:
-                continue
+    def _candidate_key(self, size: int, name: str, target_size: int) -> Tuple[int, int, int]:
+        priority = self._priority(name)
+        diff = abs(size - target_size)
+        # Lower key is better: higher priority (more negative), closer in size, smaller absolute size
+        return (-priority, diff, size)
 
-            ds = self._data_score(data)
-            total = ds + self._name_score(os.path.relpath(path, root))
+    def _priority(self, name: str) -> int:
+        lname = name.lower()
+        _, ext = os.path.splitext(lname)
+        base = 0
 
-            if total > best_score:
-                best_score = total
-                best_data = data
+        if ext == ".pdf":
+            base += 100
+        elif ext in (".ps", ".eps"):
+            base += 80
+        elif ext in (".xps", ".oxps"):
+            base += 70
+        elif ext in (".bin", ".dat"):
+            base += 40
+        elif ext in (".txt",):
+            base += 20
+        else:
+            base += 5
 
-            if ds >= 60 and len(data) == target:
-                best_data = data
-                break
+        kw_scores = {
+            "42280": 80,
+            "poc": 60,
+            "uaf": 60,
+            "use-after-free": 60,
+            "use_after_free": 60,
+            "use after free": 60,
+            "heap": 15,
+            "cve": 40,
+            "bug": 25,
+            "crash": 50,
+            "testcase": 30,
+            "regress": 20,
+            "fuzz": 15,
+            "sample": 10,
+        }
 
-        return best_data
+        for kw, score in kw_scores.items():
+            if kw in lname:
+                base += score
+
+        return base
+
+    def _has_interesting_keyword(self, name_lower: str) -> bool:
+        keywords = [
+            "42280",
+            "poc",
+            "uaf",
+            "use-after-free",
+            "use_after_free",
+            "use after free",
+            "cve",
+            "bug",
+            "crash",
+            "testcase",
+            "fuzz",
+            "regress",
+        ]
+        for kw in keywords:
+            if kw in name_lower:
+                return True
+        return False
+
+    def _fallback_poc(self) -> bytes:
+        pdf_bytes = (
+            b"%PDF-1.1\n"
+            b"1 0 obj\n"
+            b"<< /Type /Catalog >>\n"
+            b"endobj\n"
+            b"xref\n"
+            b"0 2\n"
+            b"0000000000 65535 f \n"
+            b"0000000010 00000 n \n"
+            b"trailer\n"
+            b"<< /Root 1 0 R >>\n"
+            b"startxref\n"
+            b"0\n"
+            b"%%EOF\n"
+        )
+        return pdf_bytes

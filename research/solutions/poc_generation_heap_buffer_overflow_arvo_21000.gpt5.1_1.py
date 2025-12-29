@@ -1,159 +1,189 @@
+import os
 import tarfile
-import re
 
 
 class Solution:
-    def _find_embedded_poc(self, src_path: str):
+    def solve(self, src_path: str) -> bytes:
         try:
-            tar = tarfile.open(src_path, "r:*")
+            tf = tarfile.open(src_path, "r:*")
         except Exception:
-            return None
+            return b"A" * 33
 
         best_data = None
-        best_key = None
+        best_score = float("-inf")
 
-        for member in tar.getmembers():
-            if not member.isfile():
-                continue
-            size = member.size
-            if size <= 0 or size > 512:
-                continue
+        best_33_good_data = None
+        best_33_good_score = float("-inf")
 
-            name = member.name.lower()
-            score = 0
+        # Keywords strongly related to this bug
+        main_bug_keywords = [
+            "capwap",
+            "ndpi",
+            "poc",
+            "crash",
+            "heap",
+            "overflow",
+            "bug",
+            "fuzz",
+        ]
 
-            if "poc" in name:
-                score += 4
-            if "crash" in name or "heap" in name or "overflow" in name:
-                score += 3
-            if "capwap" in name:
-                score += 3
-            if "oss-fuzz" in name or "ossfuzz" in name:
-                score += 2
-            if re.search(r'id[:_ -]?\d+', name):
-                score += 1
-            if size == 33:
-                score += 3
-            elif size <= 128:
-                score += 1
-
-            if score <= 0:
-                continue
-
-            try:
-                f = tar.extractfile(member)
-                if not f:
+        try:
+            for m in tf.getmembers():
+                if not m.isfile():
                     continue
-                data = f.read()
-            except Exception:
-                continue
 
-            if len(data) != size:
-                continue
+                size = m.size
+                if size <= 0:
+                    continue
 
-            key = (score, -size)
-            if best_key is None or key > best_key:
-                best_key = key
-                best_data = data
+                name = m.name
+                lower = name.lower()
 
-        try:
-            tar.close()
-        except Exception:
-            pass
+                # Basic scoring
+                score = 0.0
 
-        return best_data
+                # Prefer sizes close to 33 bytes
+                score += max(0.0, 100.0 - 3.0 * abs(size - 33))
 
-    def _infer_hi_nibble(self, src_path: str) -> int:
-        hi = 0x40
-        try:
-            with tarfile.open(src_path, "r:*") as tar:
-                for member in tar.getmembers():
-                    if not member.isfile():
-                        continue
-                    if not member.name.endswith((".c", ".h", ".cc", ".cpp", ".cxx")):
-                        continue
-                    try:
-                        f = tar.extractfile(member)
-                        if not f:
-                            continue
-                        text = f.read().decode("utf-8", errors="ignore")
-                    except Exception:
-                        continue
-                    if "ndpi_search_setup_capwap" not in text:
-                        continue
+                # Path-based scoring
+                kw_score_map = [
+                    ("capwap", 200),
+                    ("setup_capwap", 200),
+                    ("ndpi", 50),
+                    ("poc", 100),
+                    ("crash", 60),
+                    ("heap", 40),
+                    ("overflow", 40),
+                    ("bug", 20),
+                    ("fuzz", 20),
+                    ("oss", 10),
+                    ("corpus", 15),
+                ]
+                for kw, kw_score in kw_score_map:
+                    if kw in lower:
+                        score += kw_score
 
-                    idx = text.find("ndpi_search_setup_capwap")
-                    if idx == -1:
-                        continue
-                    brace = text.find("{", idx)
-                    if brace == -1:
-                        continue
+                # Extension-based scoring
+                base = os.path.basename(lower)
+                if "." in base:
+                    ext = base.rsplit(".", 1)[1]
+                else:
+                    ext = ""
 
-                    depth = 0
-                    end = None
-                    for i in range(brace, len(text)):
-                        c = text[i]
-                        if c == "{":
-                            depth += 1
-                        elif c == "}":
-                            depth -= 1
-                            if depth == 0:
-                                end = i + 1
-                                break
-                    if end is None:
-                        func_body = text[brace:]
-                    else:
-                        func_body = text[brace:end]
+                bin_exts = {
+                    "bin",
+                    "dat",
+                    "poc",
+                    "raw",
+                    "pcap",
+                    "pkt",
+                    "input",
+                    "seed",
+                    "case",
+                }
+                txt_exts = {
+                    "c",
+                    "h",
+                    "txt",
+                    "md",
+                    "markdown",
+                    "json",
+                    "yaml",
+                    "yml",
+                    "xml",
+                    "html",
+                    "htm",
+                    "py",
+                    "sh",
+                    "cmake",
+                    "in",
+                    "ac",
+                    "am",
+                    "pc",
+                    "m4",
+                    "java",
+                    "go",
+                    "rs",
+                    "cpp",
+                    "cc",
+                    "hpp",
+                    "hh",
+                }
 
-                    pattern = re.compile(
-                        r'if\s*\([^)]*payload\s*\[\s*0\s*]\s*&\s*0x[fF]0[^)]*([=!]=)\s*(0x[0-9A-Fa-f]+|\d+)[^)]*\)'
-                    )
-                    m = pattern.search(func_body)
-                    if not m:
-                        break
+                if ext in bin_exts:
+                    score += 40.0
+                if ext in txt_exts:
+                    score -= 40.0
 
-                    sign = m.group(1)
-                    const_str = m.group(2)
-                    try:
-                        cval = int(const_str, 0) & 0xF0
-                    except Exception:
-                        break
+                # Directory-based scoring
+                dirs = lower.split("/")
+                for d in dirs:
+                    if d in {
+                        "tests",
+                        "test",
+                        "regress",
+                        "regression",
+                        "poc",
+                        "bugs",
+                        "bug",
+                        "cases",
+                        "inputs",
+                        "seeds",
+                        "crash",
+                        "crashes",
+                        "queue",
+                        "corpus",
+                        "clusterfuzz",
+                    }:
+                        score += 10.0
 
-                    if sign == "!=":
-                        hi = cval
-                    else:
-                        for cand in (0x40, 0x00, 0x10, 0x20, 0x30, 0x50, 0x60, 0x70, 0x80, 0x90, 0xA0):
-                            if (cand & 0xF0) != cval:
-                                hi = cand
-                                break
-                    break
-        except Exception:
-            pass
+                # Don't waste time on very large files – unlikely to be a minimal PoC
+                if size > 4096:
+                    continue
 
-        hi &= 0xF0
-        if hi == 0:
-            hi = 0x40
-        return hi
+                f = tf.extractfile(m)
+                if f is None:
+                    continue
 
-    def _generate_guess_poc(self, src_path: str) -> bytes:
-        hi = self._infer_hi_nibble(src_path)
-        low = 7  # choose a large header length nibble
-        first_byte = (hi & 0xF0) | (low & 0x0F)
+                try:
+                    data = f.read()
+                except Exception:
+                    continue
 
-        size = 33
-        data = bytearray(size)
-        data[0] = first_byte
+                if not data:
+                    continue
 
-        # Place likely inner IPv4 version/IHL markers at common CAPWAP header offsets.
-        # For nibble 7 and formulas hlen = n*4 or (n+1)*4, typical offsets are 28 or 32.
-        for offset in (28, 32):
-            if offset < size:
-                data[offset] = 0x45  # IPv4, IHL=5
+                # Determine if file looks binary
+                n_nonprint = 0
+                for b in data:
+                    if b < 9 or (b > 13 and b < 32) or b > 126:
+                        n_nonprint += 1
+                is_binary = n_nonprint > 0
+                if is_binary:
+                    binness = n_nonprint / float(len(data))
+                    score += binness * 30.0
+                else:
+                    score -= 20.0
 
-        return bytes(data)
+                # Check if path mentions bug-related keywords
+                path_has_kw = any(kw in lower for kw in main_bug_keywords)
 
-    def solve(self, src_path: str) -> bytes:
-        embedded = self._find_embedded_poc(src_path)
-        if embedded is not None:
-            return embedded
-        return self._generate_guess_poc(src_path)
+                # Track best overall candidate
+                if score > best_score:
+                    best_score = score
+                    best_data = data
+
+                # Track best 33-byte candidate that is likely relevant
+                if len(data) == 33 and (is_binary or path_has_kw):
+                    if score > best_33_good_score:
+                        best_33_good_score = score
+                        best_33_good_data = data
+        finally:
+            tf.close()
+
+        if best_33_good_data is not None:
+            return best_33_good_data
+        if best_data is not None:
+            return best_data
+
+        return b"A" * 33

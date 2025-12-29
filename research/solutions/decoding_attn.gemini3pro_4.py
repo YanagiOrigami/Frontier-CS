@@ -1,219 +1,209 @@
-from typing import Dict
-
-class Solution:
-    def solve(self, spec_path: str = None) -> Dict[str, str]:
-        code = r"""
 import torch
 import triton
 import triton.language as tl
 
+class Solution:
+    def solve(self, spec_path: str = None) -> dict:
+        return {
+            "code": """
+import torch
+import triton
+import triton.language as tl
+import math
+
+@triton.autotune(
+    configs=[
+        triton.Config({'BLOCK_N': 128, 'num_warps': 4}, num_stages=2),
+        triton.Config({'BLOCK_N': 64, 'num_warps': 4}, num_stages=2),
+        triton.Config({'BLOCK_N': 128, 'num_warps': 8}, num_stages=2),
+    ],
+    key=['N']
+)
 @triton.jit
-def _fwd_kernel(
+def _decode_split_kernel(
     Q, K, V, sm_scale,
-    Mid_O, Mid_L, Mid_M,
+    Out_acc, Out_l, Out_m,
     stride_qz, stride_qh, stride_qm, stride_qk,
     stride_kz, stride_kh, stride_kn, stride_kk,
     stride_vz, stride_vh, stride_vn, stride_vk,
-    stride_mo, stride_mh, stride_ms, stride_mv,
-    stride_mlz, stride_mlh, stride_mls,
-    stride_mmz, stride_mmh, stride_mms,
-    Z, H, N_CTX,
+    stride_oaz, stride_oah, stride_oam, stride_oas, stride_oak,
+    stride_olz, stride_olh, stride_olm, stride_ols,
+    Z, H, N,
     BLOCK_N: tl.constexpr,
     BLOCK_DMODEL: tl.constexpr,
-    BLOCK_DV: tl.constexpr,
     SPLIT_K: tl.constexpr
 ):
-    cur_pid = tl.program_id(0)
-    
-    # Grid: (Z * H * SPLIT_K)
-    # Decode pid
-    split_k_idx = cur_pid % SPLIT_K
-    rem = cur_pid // SPLIT_K
-    head_idx = rem % H
-    batch_idx = rem // H
-    
-    # Calculate N range for this split
-    total_blocks = tl.cdiv(N_CTX, BLOCK_N)
+    pid_s = tl.program_id(0)
+    pid_zh = tl.program_id(1)
+    pid_m = tl.program_id(2)
+
+    idx_z = pid_zh // H
+    idx_h = pid_zh % H
+
+    # Offsets for Q
+    q_ptr = Q + idx_z * stride_qz + idx_h * stride_qh + pid_m * stride_qm
+    q_offsets = tl.arange(0, BLOCK_DMODEL)
+    q = tl.load(q_ptr + q_offsets, mask=q_offsets < BLOCK_DMODEL, other=0.0)
+
+    # Split logic
+    total_blocks = tl.cdiv(N, BLOCK_N)
     blocks_per_split = tl.cdiv(total_blocks, SPLIT_K)
-    start_block = split_k_idx * blocks_per_split
-    end_block = min((split_k_idx + 1) * blocks_per_split, total_blocks)
-    
-    # Offsets
-    offs_d = tl.arange(0, BLOCK_DMODEL)
-    offs_dv = tl.arange(0, BLOCK_DV)
-    
-    # Load Q: (Z, H, 1, Dq) -> effectively (Dq) for this batch/head
-    off_q = batch_idx * stride_qz + head_idx * stride_qh
-    q_ptr = Q + off_q + offs_d * stride_qk
-    q = tl.load(q_ptr)
-    
+    start_block = pid_s * blocks_per_split
+    end_block = min((pid_s + 1) * blocks_per_split, total_blocks)
+
     # Accumulators
     m_i = -float('inf')
     l_i = 0.0
-    acc = tl.zeros([BLOCK_DV], dtype=tl.float32)
-    
-    # Base Pointers for K and V
-    k_base = K + batch_idx * stride_kz + head_idx * stride_kh
-    v_base = V + batch_idx * stride_vz + head_idx * stride_vh
-    
-    # Iterate over assigned blocks
+    acc = tl.zeros([BLOCK_DMODEL], dtype=tl.float32)
+
+    kv_offset_base = idx_z * stride_kz + idx_h * stride_kh
+    v_offset_base = idx_z * stride_vz + idx_h * stride_vh
+
     for block_idx in range(start_block, end_block):
         start_n = block_idx * BLOCK_N
-        offs_n = start_n + tl.arange(0, BLOCK_N)
-        mask_n = offs_n < N_CTX
-        
-        # Load K: (BLOCK_N, Dq)
-        k_ptrs = k_base + (offs_n[:, None] * stride_kn + offs_d[None, :] * stride_kk)
-        k = tl.load(k_ptrs, mask=mask_n[:, None], other=0.0)
-        
-        # Compute QK^T
-        # Q: (Dq), K: (BLOCK_N, Dq)
-        # We compute K @ Q_trans -> (BLOCK_N, 1)
-        qk = tl.dot(k, q[:, None])
-        qk = tl.view(qk, [BLOCK_N])
-        
-        qk *= sm_scale
-        qk = tl.where(mask_n, qk, -float('inf'))
-        
-        # Online Softmax updates
-        current_max = tl.max(qk, 0)
-        m_new = tl.maximum(m_i, current_max)
-        
-        p = tl.exp(qk - m_new)
-        alpha = tl.exp(m_i - m_new)
-        l_i = l_i * alpha + tl.sum(p, 0)
-        
-        # Load V: (BLOCK_N, Dv)
-        v_ptrs = v_base + (offs_n[:, None] * stride_vn + offs_dv[None, :] * stride_vk)
-        v = tl.load(v_ptrs, mask=mask_n[:, None], other=0.0)
-        
-        # Compute weighted sum
-        # p: (BLOCK_N), v: (BLOCK_N, Dv)
-        # p @ v -> (Dv)
-        p_v = tl.dot(p[None, :].to(v.dtype), v)
-        p_v = tl.view(p_v, [BLOCK_DV])
-        
-        acc = acc * alpha + p_v
-        m_i = m_new
+        cols = start_n + tl.arange(0, BLOCK_N)
+        mask_k = cols < N
 
-    # Store partial results to global memory
-    # Mid_O: (Z, H, SPLIT_K, Dv)
-    off_mid_o = batch_idx * stride_mo + head_idx * stride_mh + split_k_idx * stride_ms + offs_dv * stride_mv
-    tl.store(Mid_O + off_mid_o, acc)
-    
-    # Mid_L: (Z, H, SPLIT_K)
-    off_mid_l = batch_idx * stride_mlz + head_idx * stride_mlh + split_k_idx * stride_mls
-    tl.store(Mid_L + off_mid_l, l_i)
-    
-    # Mid_M: (Z, H, SPLIT_K)
-    off_mid_m = batch_idx * stride_mmz + head_idx * stride_mmh + split_k_idx * stride_mms
-    tl.store(Mid_M + off_mid_m, m_i)
+        # Load K
+        k_ptr = K + kv_offset_base + (cols[:, None] * stride_kn + q_offsets[None, :] * stride_kk)
+        k = tl.load(k_ptr, mask=mask_k[:, None] & (q_offsets[None, :] < BLOCK_DMODEL), other=0.0)
+
+        # Compute QK^T
+        qk = tl.sum(q[None, :] * k, axis=1)
+        qk *= sm_scale
+        qk = tl.where(mask_k, qk, -float('inf'))
+
+        # Online Softmax
+        m_curr = tl.max(qk, 0)
+        p = tl.exp(qk - m_curr)
+        l_curr = tl.sum(p, 0)
+
+        # Load V
+        v_ptr = V + v_offset_base + (cols[:, None] * stride_vn + q_offsets[None, :] * stride_vk)
+        v = tl.load(v_ptr, mask=mask_k[:, None] & (q_offsets[None, :] < BLOCK_DMODEL), other=0.0)
+
+        # Accumulate
+        w_v = tl.sum(p[:, None] * v, axis=0)
+
+        if m_curr > m_i:
+            alpha = tl.exp(m_i - m_curr)
+            l_i = l_i * alpha + l_curr
+            acc = acc * alpha + w_v
+            m_i = m_curr
+        else:
+            alpha = tl.exp(m_curr - m_i)
+            l_i = l_i + l_curr * alpha
+            acc = acc + w_v * alpha
+
+    # Store partial results
+    off_out_base = idx_z * stride_oaz + idx_h * stride_oah + pid_m * stride_oam + pid_s * stride_oas
+    tl.store(Out_acc + off_out_base + q_offsets, acc, mask=q_offsets < BLOCK_DMODEL)
+
+    off_l = idx_z * stride_olz + idx_h * stride_olh + pid_m * stride_olm + pid_s * stride_ols
+    tl.store(Out_l + off_l, l_i)
+    tl.store(Out_m + off_l, m_i)
 
 @triton.jit
 def _reduce_kernel(
-    Out, Mid_O, Mid_L, Mid_M,
-    stride_oz, stride_oh, stride_om, stride_ov,
-    stride_mo, stride_mh, stride_ms, stride_mv,
-    stride_mlz, stride_mlh, stride_mls,
-    stride_mmz, stride_mmh, stride_mms,
-    Z, H,
-    BLOCK_DV: tl.constexpr,
-    SPLIT_K: tl.constexpr
+    Out_acc, Out_l, Out_m,
+    Out,
+    stride_oaz, stride_oah, stride_oam, stride_oas, stride_oak,
+    stride_olz, stride_olh, stride_olm, stride_ols,
+    stride_oz, stride_oh, stride_om, stride_od,
+    Z, H, M,
+    SPLIT_K: tl.constexpr, BLOCK_DMODEL: tl.constexpr
 ):
-    # Grid: (Z * H)
-    pid = tl.program_id(0)
-    head_idx = pid % H
-    batch_idx = pid // H
-    
-    offs_dv = tl.arange(0, BLOCK_DV)
-    
-    # Base pointers for this batch/head
-    mid_o_ptr = Mid_O + batch_idx * stride_mo + head_idx * stride_mh
-    mid_l_ptr = Mid_L + batch_idx * stride_mlz + head_idx * stride_mlh
-    mid_m_ptr = Mid_M + batch_idx * stride_mmz + head_idx * stride_mmh
-    
-    # Global accumulator
+    pid_zh = tl.program_id(0)
+    pid_m = tl.program_id(1)
+
+    idx_z = pid_zh // H
+    idx_h = pid_zh % H
+
+    off_acc_base = idx_z * stride_oaz + idx_h * stride_oah + pid_m * stride_oam
+    off_l_base = idx_z * stride_olz + idx_h * stride_olh + pid_m * stride_olm
+
     m_global = -float('inf')
     l_global = 0.0
-    acc_global = tl.zeros([BLOCK_DV], dtype=tl.float32)
-    
-    # Iterate over splits to reduce
-    for k in range(SPLIT_K):
-        m_k = tl.load(mid_m_ptr + k * stride_mms)
-        l_k = tl.load(mid_l_ptr + k * stride_mls)
+    acc_global = tl.zeros([BLOCK_DMODEL], dtype=tl.float32)
+
+    offs_d = tl.arange(0, BLOCK_DMODEL)
+
+    for s in range(SPLIT_K):
+        m_curr = tl.load(Out_m + off_l_base + s * stride_ols)
         
-        if l_k == 0:
+        # Skip if block was empty (init to -inf)
+        if m_curr == -float('inf'):
             continue
             
-        o_k = tl.load(mid_o_ptr + k * stride_ms + offs_dv * stride_mv)
-        
-        m_new = tl.maximum(m_global, m_k)
-        alpha_global = tl.exp(m_global - m_new)
-        alpha_k = tl.exp(m_k - m_new)
-        
-        l_global = l_global * alpha_global + l_k * alpha_k
-        acc_global = acc_global * alpha_global + o_k * alpha_k
-        m_global = m_new
-        
-    # Store final output
+        l_curr = tl.load(Out_l + off_l_base + s * stride_ols)
+        acc_curr = tl.load(Out_acc + off_acc_base + s * stride_oas + offs_d, mask=offs_d < BLOCK_DMODEL)
+
+        if m_curr > m_global:
+            alpha = tl.exp(m_global - m_curr)
+            l_global = l_global * alpha + l_curr
+            acc_global = acc_global * alpha + acc_curr
+            m_global = m_curr
+        else:
+            alpha = tl.exp(m_curr - m_global)
+            l_global = l_global + l_curr * alpha
+            acc_global = acc_global + acc_curr * alpha
+
     out = acc_global / l_global
-    off_out = batch_idx * stride_oz + head_idx * stride_oh + offs_dv * stride_ov
-    tl.store(Out + off_out, out.to(Out.dtype.element_ty))
+    
+    out_ptr = Out + idx_z * stride_oz + idx_h * stride_oh + pid_m * stride_om + offs_d
+    tl.store(out_ptr, out.to(Out.dtype.element_ty), mask=offs_d < BLOCK_DMODEL)
 
 def decoding_attn(Q: torch.Tensor, K: torch.Tensor, V: torch.Tensor) -> torch.Tensor:
-    Z, H, M, Dq = Q.shape
-    _, _, N, Dv = V.shape
+    Z, H, M, D = Q.shape
+    _, _, N, _ = K.shape
+
+    sm_scale = 1.0 / math.sqrt(D)
+
+    # Calculate BLOCK_DMODEL (next power of 2)
+    BLOCK_DMODEL = 1 << (D - 1).bit_length()
+
+    # Heuristic for Split-K
+    # Target ~128+ blocks to fill GPU
+    # Total tasks = Z * H * M
+    target_blocks = 128
+    tasks = Z * H * M
+    split_k = max(1, target_blocks // tasks)
     
-    # Block size configuration
-    BLOCK_N = 128
-    
-    # Split-K Heuristic
-    # Aim for enough blocks to saturate the GPU (L4 ~60 SMs)
-    target_blocks = 64
-    base_grid = Z * H
-    split_k = max(1, target_blocks // base_grid)
-    
-    # Limit split_k by available data
-    n_blocks = (N + BLOCK_N - 1) // BLOCK_N
-    split_k = min(split_k, n_blocks)
-    split_k = max(1, split_k)
-    
-    # Allocate intermediate buffers (Float32 for accumulation precision)
-    mid_o = torch.empty((Z, H, split_k, Dv), device=Q.device, dtype=torch.float32)
-    mid_l = torch.empty((Z, H, split_k), device=Q.device, dtype=torch.float32)
-    mid_m = torch.empty((Z, H, split_k), device=Q.device, dtype=torch.float32)
-    
-    Out = torch.empty((Z, H, M, Dv), device=Q.device, dtype=Q.dtype)
-    
-    sm_scale = 1.0 / (Dq ** 0.5)
-    
-    # Launch Forward Kernel
-    grid_fwd = (Z * H * split_k,)
-    _fwd_kernel[grid_fwd](
+    # Clamp split_k so we don't have tiny blocks (min 128 elems per split)
+    max_splits = max(1, N // 128)
+    split_k = min(split_k, max_splits)
+
+    Out_acc = torch.empty((Z, H, M, split_k, D), device=Q.device, dtype=torch.float32)
+    Out_l = torch.empty((Z, H, M, split_k), device=Q.device, dtype=torch.float32)
+    Out_m = torch.empty((Z, H, M, split_k), device=Q.device, dtype=torch.float32)
+    Output = torch.empty((Z, H, M, D), device=Q.device, dtype=Q.dtype)
+
+    grid_split = (split_k, Z * H, M)
+    _decode_split_kernel[grid_split](
         Q, K, V, sm_scale,
-        mid_o, mid_l, mid_m,
+        Out_acc, Out_l, Out_m,
         Q.stride(0), Q.stride(1), Q.stride(2), Q.stride(3),
         K.stride(0), K.stride(1), K.stride(2), K.stride(3),
         V.stride(0), V.stride(1), V.stride(2), V.stride(3),
-        mid_o.stride(0), mid_o.stride(1), mid_o.stride(2), mid_o.stride(3),
-        mid_l.stride(0), mid_l.stride(1), mid_l.stride(2),
-        mid_m.stride(0), mid_m.stride(1), mid_m.stride(2),
+        Out_acc.stride(0), Out_acc.stride(1), Out_acc.stride(2), Out_acc.stride(3), Out_acc.stride(4),
+        Out_l.stride(0), Out_l.stride(1), Out_l.stride(2), Out_l.stride(3),
         Z, H, N,
-        BLOCK_N=BLOCK_N, BLOCK_DMODEL=Dq, BLOCK_DV=Dv, SPLIT_K=split_k
+        BLOCK_DMODEL=BLOCK_DMODEL,
+        SPLIT_K=split_k
     )
-    
-    # Launch Reduction Kernel
-    grid_red = (Z * H,)
-    _reduce_kernel[grid_red](
-        Out, mid_o, mid_l, mid_m,
-        Out.stride(0), Out.stride(1), Out.stride(2), Out.stride(3),
-        mid_o.stride(0), mid_o.stride(1), mid_o.stride(2), mid_o.stride(3),
-        mid_l.stride(0), mid_l.stride(1), mid_l.stride(2),
-        mid_m.stride(0), mid_m.stride(1), mid_m.stride(2),
-        Z, H,
-        BLOCK_DV=Dv, SPLIT_K=split_k
+
+    grid_reduce = (Z * H, M)
+    _reduce_kernel[grid_reduce](
+        Out_acc, Out_l, Out_m,
+        Output,
+        Out_acc.stride(0), Out_acc.stride(1), Out_acc.stride(2), Out_acc.stride(3), Out_acc.stride(4),
+        Out_l.stride(0), Out_l.stride(1), Out_l.stride(2), Out_l.stride(3),
+        Output.stride(0), Output.stride(1), Output.stride(2), Output.stride(3),
+        Z, H, M,
+        SPLIT_K=split_k,
+        BLOCK_DMODEL=BLOCK_DMODEL
     )
-    
-    return Out
+
+    return Output
 """
-        return {"code": code}
+        }

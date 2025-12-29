@@ -1,7 +1,6 @@
 import pandas as pd
-from collections import defaultdict
-from typing import List, Dict, Tuple, Any
-
+import numpy as np
+from typing import List, Dict, Tuple
 
 class Solution:
     def solve(
@@ -15,266 +14,151 @@ class Solution:
         distinct_value_threshold: float = 0.7,
         parallel: bool = True,
     ) -> pd.DataFrame:
-        # Apply column merges if specified
-        def apply_col_merge(df_in: pd.DataFrame, merges: List[List[Any]]) -> pd.DataFrame:
+        # 1) Apply column merges
+        def apply_merges(df_in: pd.DataFrame, merges: List[List[str]]) -> pd.DataFrame:
             if not merges:
                 return df_in
             df_out = df_in.copy()
-            to_drop = set()
-            new_cols_added = []
-            cols_list = list(df_out.columns)
-
-            def name_from_group(group_names: List[str]) -> str:
-                base = "MERGED_" + "||".join(group_names)
-                base = base if len(base) <= 128 else f"MERGED_{hash(tuple(group_names)) & 0xffffffff:x}"
-                candidate = base
-                k = 1
-                while candidate in df_out.columns or candidate in new_cols_added:
-                    candidate = f"{base}_{k}"
-                    k += 1
-                return candidate
-
-            for g in merges:
-                if not g:
+            used_columns = set()
+            for group in merges:
+                cols = [c for c in group if c in df_out.columns]
+                if not cols:
                     continue
-                # Resolve names/indices
-                resolved = []
-                for item in g:
-                    if isinstance(item, int):
-                        if 0 <= item < len(cols_list):
-                            resolved.append(cols_list[item])
-                    else:
-                        if item in df_out.columns:
-                            resolved.append(item)
-                if not resolved:
-                    continue
-                # Deduplicate while preserving order
-                seen = set()
-                ordered = []
-                for c in resolved:
-                    if c not in seen:
-                        seen.add(c)
-                        ordered.append(c)
-                if not ordered:
-                    continue
-                # Build merged series with vectorized string concatenation
-                s = df_out[ordered[0]].astype(str)
-                for c in ordered[1:]:
+                # Build merged string column
+                s = df_out[cols[0]].astype(str)
+                for c in cols[1:]:
                     s = s + df_out[c].astype(str)
-                new_name = name_from_group(ordered)
-                df_out[new_name] = s
-                new_cols_added.append(new_name)
-                to_drop.update(ordered)
-            if to_drop:
-                df_out = df_out.drop(columns=[c for c in to_drop if c in df_out.columns])
+                # Create a unique merged column name
+                base_name = "__MERGED__" + "___".join(cols)
+                new_name = base_name
+                k = 1
+                while new_name in df_out.columns:
+                    k += 1
+                    new_name = f"{base_name}__{k}"
+                # Insert the new column at the position of the first column in the group
+                first_idx = df_out.columns.get_loc(cols[0])
+                df_out.insert(first_idx, new_name, s)
+                # Drop original columns in the group
+                df_out.drop(columns=cols, inplace=True)
+                used_columns.update(cols)
             return df_out
 
-        df_work = apply_col_merge(df, col_merge)
+        df2 = apply_merges(df, col_merge)
 
-        columns: List[str] = list(df_work.columns)
-        N = len(df_work)
-        M = len(columns)
-        if M <= 1 or N <= 1:
-            return df_work
+        cols = list(df2.columns)
+        N = len(df2)
+        if N == 0 or len(cols) <= 1:
+            return df2
 
-        Lmax = int(col_stop) if isinstance(col_stop, int) and col_stop >= 0 else 2
-        if Lmax > 8:
-            Lmax = 8
+        # 2) Prepare per-column data: string representations, lengths, codes, distincts
+        str_series: Dict[str, pd.Series] = {}
+        lengths: Dict[str, np.ndarray] = {}
+        len_avg: Dict[str, float] = {}
+        distinct_count: Dict[str, int] = {}
+        codes_by_col: Dict[str, np.ndarray] = {}
 
-        # Precompute per-column strings, lengths, and prefixes up to Lmax
-        values_str_map: Dict[str, List[str]] = {}
-        lens_map: Dict[str, List[int]] = {}
-        prefix_map: Dict[str, Dict[int, List[str]]] = {}
+        for c in cols:
+            s = df2[c].astype(str)
+            str_series[c] = s
+            ln = s.str.len().to_numpy(np.int32, copy=False)
+            lengths[c] = ln
+            len_avg[c] = float(ln.mean()) if N > 0 else 0.0
+            # Using factorize for codes to later compute unique counts efficiently
+            codes = pd.factorize(s, sort=False)[0].astype(np.int32, copy=False)
+            codes_by_col[c] = codes
+            # Distinct including NaN (string "nan")
+            distinct_count[c] = int(pd.unique(s).size)
 
-        for c in columns:
-            # Convert to string
-            s = df_work[c].astype(str)
-            arr = s.tolist()
-            values_str_map[c] = arr
-            lens_map[c] = [len(v) for v in arr]
-            if Lmax > 0:
-                pmap = {}
-                for l in range(1, Lmax + 1):
-                    pmap[l] = [v[:l] if len(v) >= l else v for v in arr]
-                prefix_map[c] = pmap
+        # 3) Compute per-column intrinsic char-prefix gain for first position
+        #    Use up to K prefix characters per column for efficiency
+        #    K determined by row_stop * 4 (default 16), but limited by max length in the column
+        def charprefix_gain_for_column(col: str, max_k: int) -> float:
+            s = str_series[col]
+            ln = lengths[col]
+            # We'll sum (N_k - D_k) / N over k=1..K
+            # where N_k = count of rows with length >= k
+            # and D_k = number of distinct prefixes of length k among those rows
+            K = int(max_k)
+            if K <= 0:
+                return 0.0
+            res = 0.0
+            for k in range(1, K + 1):
+                m = ln >= k
+                Nk = int(m.sum())
+                if Nk <= 1:
+                    # no contribution possible from this k
+                    continue
+                pref_k = s[m].str.slice(0, k)
+                Dk = int(pd.unique(pref_k).size)
+                res += float(Nk - Dk) / float(N)
+            return res
+
+        # Determine per-column K limit (min of row_stop * 4 and per-column max length, and cap at 24)
+        base_K = max(1, int(row_stop) * 4)
+        base_K = min(base_K, 24)
+
+        charprefix_gain: Dict[str, float] = {}
+        for c in cols:
+            max_len_c = int(lengths[c].max()) if N > 0 else 0
+            Kc = min(base_K, max_len_c)
+            if Kc <= 0:
+                charprefix_gain[c] = 0.0
             else:
-                prefix_map[c] = {}
+                charprefix_gain[c] = charprefix_gain_for_column(c, Kc)
 
-        # Greedy selection of column order
-        def compute_incremental_gain(col: str, group_ids: List[int]) -> int:
-            strings = values_str_map[col]
-            lengths = lens_map[col]
-            pmap = prefix_map[col]
-            gain = 0
-            seen_full_by_group: Dict[int, set] = {}
-            if Lmax > 0:
-                seen_prefix_by_l: List[Dict[int, set]] = [dict() for _ in range(Lmax)]
-            else:
-                seen_prefix_by_l = []
+        # 4) Helper: count unique rows for a set of columns using codes
+        unique_cache: Dict[Tuple[str, ...], int] = {}
 
-            for i in range(N):
-                gid = group_ids[i]
-                v = strings[i]
-                lenc = lengths[i]
-                sfull = seen_full_by_group.get(gid)
-                if sfull is None:
-                    sfull = set()
-                    seen_full_by_group[gid] = sfull
-                if v in sfull:
-                    gain += lenc
-                else:
-                    if Lmax > 0 and lenc > 0:
-                        ll = lenc if lenc < Lmax else Lmax
-                        added = False
-                        for l in range(ll, 0, -1):
-                            sprefix_map = seen_prefix_by_l[l - 1]
-                            sp = sprefix_map.get(gid)
-                            if sp is not None:
-                                pv = pmap[l][i]
-                                if pv in sp:
-                                    gain += l
-                                    added = True
-                                    break
-                    # Update sets after scoring
-                    sfull.add(v)
-                    if Lmax > 0 and lenc > 0:
-                        ll = lenc if lenc < Lmax else Lmax
-                        for l in range(1, ll + 1):
-                            sprefix_map = seen_prefix_by_l[l - 1]
-                            sp = sprefix_map.get(gid)
-                            if sp is None:
-                                sp = set()
-                                sprefix_map[gid] = sp
-                            sp.add(pmap[l][i])
-            return gain
+        def unique_count_for_columns(col_list: List[str]) -> int:
+            key = tuple(sorted(col_list))
+            if key in unique_cache:
+                return unique_cache[key]
+            if len(col_list) == 1:
+                arr = codes_by_col[col_list[0]]
+                u = int(np.unique(arr).size)
+                unique_cache[key] = u
+                return u
+            arr = np.column_stack([codes_by_col[c] for c in col_list]).astype(np.int32, copy=False)
+            # view as contiguous bytes
+            arr = np.ascontiguousarray(arr)
+            dtype_void = np.dtype((np.void, arr.dtype.itemsize * arr.shape[1]))
+            viewed = arr.view(dtype_void).ravel()
+            u = int(np.unique(viewed).size)
+            unique_cache[key] = u
+            return u
 
-        def update_group_ids(prev_group_ids: List[int], col: str) -> List[int]:
-            strings = values_str_map[col]
-            mapping: Dict[Tuple[int, str], int] = {}
-            new_ids = [0] * N
-            next_id = 0
-            for i in range(N):
-                key = (prev_group_ids[i], strings[i])
-                gid = mapping.get(key)
-                if gid is None:
-                    gid = next_id
-                    next_id += 1
-                    mapping[key] = gid
-                new_ids[i] = gid
-            return new_ids
+        # 5) Select first column: combine intrinsic char-prefix gain with duplicate-based gain
+        #    duplicates-based gain for first position is len_avg * (N - distinct)/N
+        dup_gain_first: Dict[str, float] = {}
+        for c in cols:
+            dup_gain_first[c] = len_avg[c] * float(N - distinct_count[c]) / float(N) if N > 0 else 0.0
 
-        remaining = columns[:]
-        selected_order: List[str] = []
-        group_ids = [0] * N
+        # weight between prefix-structure and exact-duplicate gains
+        alpha = 0.7
+        first_scores = {c: alpha * charprefix_gain[c] + (1.0 - alpha) * dup_gain_first[c] for c in cols}
+        first_col = max(cols, key=lambda x: (first_scores[x], -distinct_count[x], len_avg[x]))
 
+        order = [first_col]
+        remaining = [c for c in cols if c != first_col]
+
+        # 6) Greedy selection for remaining positions using duplicate-based incremental gain
+        # Score for candidate c given prefix P is:
+        # gain(c | P) = len_avg[c] * (N - unique_count(P ∪ {c})) / N
         while remaining:
-            best_col = None
-            best_score = -1
-            # Evaluate each candidate
+            best_c = None
+            best_score = -1.0
+            P = order
             for c in remaining:
-                score = compute_incremental_gain(c, group_ids)
-                if score > best_score:
-                    best_score = score
-                    best_col = c
-            if best_col is None:
-                # Fallback: append remaining in current order
-                selected_order.extend(remaining)
-                remaining.clear()
-            else:
-                selected_order.append(best_col)
-                remaining.remove(best_col)
-                group_ids = update_group_ids(group_ids, best_col)
+                uniq = unique_count_for_columns(P + [c])
+                gain = len_avg[c] * float(N - uniq) / float(N)
+                if gain > best_score:
+                    best_score = gain
+                    best_c = c
+            if best_c is None:
+                # fallback if something went wrong
+                best_c = remaining[0]
+            order.append(best_c)
+            remaining.remove(best_c)
 
-        # Approximate evaluation for an order using prefix up to Lmax; used for local improvement
-        def evaluate_order(order: List[str]) -> int:
-            if not order:
-                return 0
-            steps = len(order)
-            # For each step index, maintain seen_full and seen_prefix dicts keyed by group id
-            seen_full_step: List[Dict[int, set]] = [dict() for _ in range(steps)]
-            if Lmax > 0:
-                seen_prefix_step: List[List[Dict[int, set]]] = [[dict() for _ in range(steps)] for _ in range(Lmax)]
-            else:
-                seen_prefix_step = []
-            step_maps: List[Dict[Tuple[int, str], int]] = [dict() for _ in range(steps)]
-            step_next_id: List[int] = [0 for _ in range(steps)]
-
-            total = 0
-            for i in range(N):
-                gid = 0
-                for t in range(steps):
-                    col = order[t]
-                    strings = values_str_map[col]
-                    v = strings[i]
-                    lenc = lens_map[col][i]
-                    sfull_map = seen_full_step[t]
-                    sfull = sfull_map.get(gid)
-                    if sfull is None:
-                        sfull = set()
-                        sfull_map[gid] = sfull
-                    if v in sfull:
-                        total += lenc
-                        # advance group id
-                        smap = step_maps[t]
-                        key = (gid, v)
-                        gnext = smap.get(key)
-                        if gnext is None:
-                            gnext = step_next_id[t]
-                            step_next_id[t] += 1
-                            smap[key] = gnext
-                        gid = gnext
-                        continue
-                    # compute partial prefix
-                    p_len = 0
-                    if Lmax > 0 and lenc > 0:
-                        ll = lenc if lenc < Lmax else Lmax
-                        pmap = prefix_map[col]
-                        for l in range(ll, 0, -1):
-                            sprefix_map = seen_prefix_step[l - 1][t]
-                            sp = sprefix_map.get(gid)
-                            if sp is not None:
-                                pv = pmap[l][i]
-                                if pv in sp:
-                                    p_len = l
-                                    break
-                    total += p_len
-                    # update sets and mapping for this column
-                    sfull.add(v)
-                    if Lmax > 0 and lenc > 0:
-                        ll = lenc if lenc < Lmax else Lmax
-                        pmap = prefix_map[col]
-                        for l in range(1, ll + 1):
-                            sprefix_map = seen_prefix_step[l - 1][t]
-                            sp = sprefix_map.get(gid)
-                            if sp is None:
-                                sp = set()
-                                sprefix_map[gid] = sp
-                            sp.add(pmap[l][i])
-                    smap = step_maps[t]
-                    key = (gid, v)
-                    gnext = smap.get(key)
-                    if gnext is None:
-                        gnext = step_next_id[t]
-                        step_next_id[t] += 1
-                        smap[key] = gnext
-                    # LCP stops at first mismatch
-                    break
-            return total
-
-        # Local adjacent swap improvement (single pass)
-        if M >= 2:
-            current_order = selected_order[:]
-            current_score = evaluate_order(current_order)
-            improved = True
-            # Single pass of adjacent swaps with first-improvement strategy
-            for i in range(len(current_order) - 1):
-                new_order = current_order[:]
-                new_order[i], new_order[i + 1] = new_order[i + 1], new_order[i]
-                new_score = evaluate_order(new_order)
-                if new_score > current_score:
-                    current_order = new_order
-                    current_score = new_score
-            selected_order = current_order
-
-        # Return DataFrame with reordered columns
-        return df_work[selected_order]
+        # 7) Return DataFrame with columns in the new order
+        return df2[order]

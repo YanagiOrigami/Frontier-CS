@@ -2,119 +2,137 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 import numpy as np
+import math
+import random
 
+# Define model components
 class ResidualBlock(nn.Module):
-    def __init__(self, dim, dropout_rate=0.3):
+    def __init__(self, dim, dropout_rate=0.2):
         super(ResidualBlock, self).__init__()
-        self.net = nn.Sequential(
+        self.block = nn.Sequential(
             nn.Linear(dim, dim),
             nn.BatchNorm1d(dim),
-            nn.SiLU(),
+            nn.ReLU(),
+            nn.Dropout(dropout_rate),
+            nn.Linear(dim, dim),
+            nn.BatchNorm1d(dim),
             nn.Dropout(dropout_rate)
         )
-        
-    def forward(self, x):
-        return x + self.net(x)
+        self.relu = nn.ReLU()
 
-class Net(nn.Module):
-    def __init__(self, input_dim, num_classes):
-        super(Net, self).__init__()
-        self.hidden_dim = 384
-        
-        # Calculate parameters to ensure strict adherence to 500k limit
-        # Input BN: 384*2 = 768
-        # L1 (In->H): 384*384 + 384 = 147840
-        # BN1: 768
-        # L2 (H->H): 147840
-        # BN2: 768
-        # L3 (H->H): 147840
-        # BN3: 768
-        # Out (H->C): 384*128 + 128 = 49280
-        # Total: 495,872 < 500,000
-        
-        self.input_bn = nn.BatchNorm1d(input_dim)
-        
-        # Layer 1: Projection + Activation
-        self.l1 = nn.Linear(input_dim, self.hidden_dim)
-        self.bn1 = nn.BatchNorm1d(self.hidden_dim)
-        self.act1 = nn.SiLU()
-        self.drop1 = nn.Dropout(0.3)
-        
-        # Layer 2: Residual Block
-        self.l2 = ResidualBlock(self.hidden_dim, dropout_rate=0.3)
-        
-        # Layer 3: Residual Block
-        self.l3 = ResidualBlock(self.hidden_dim, dropout_rate=0.3)
-        
-        # Output Layer
-        self.out = nn.Linear(self.hidden_dim, num_classes)
-        
     def forward(self, x):
-        x = self.input_bn(x)
+        identity = x
+        out = self.block(x)
+        return self.relu(identity + out)
+
+class AdaptiveMLP(nn.Module):
+    def __init__(self, input_dim, num_classes, hidden_dim):
+        super(AdaptiveMLP, self).__init__()
+        # Initial normalization of raw features
+        self.input_norm = nn.BatchNorm1d(input_dim)
         
-        x = self.l1(x)
-        x = self.bn1(x)
-        x = self.act1(x)
-        x = self.drop1(x)
+        # Projection to hidden dimension
+        self.entry = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.BatchNorm1d(hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(0.25)
+        )
         
-        x = self.l2(x)
-        x = self.l3(x)
+        # Deep processing with residual connection
+        self.res_block = ResidualBlock(hidden_dim, dropout_rate=0.25)
         
-        return self.out(x)
+        # Classification head
+        self.classifier = nn.Linear(hidden_dim, num_classes)
+
+    def forward(self, x):
+        x = self.input_norm(x)
+        x = self.entry(x)
+        x = self.res_block(x)
+        x = self.classifier(x)
+        return x
 
 class Solution:
     def solve(self, train_loader, val_loader, metadata: dict = None) -> torch.nn.Module:
+        # Set seeds for reproducibility
+        torch.manual_seed(42)
+        np.random.seed(42)
+        random.seed(42)
+        
         # Extract metadata
         input_dim = metadata.get("input_dim", 384)
         num_classes = metadata.get("num_classes", 128)
+        param_limit = metadata.get("param_limit", 500000)
         device = metadata.get("device", "cpu")
         
+        # Dynamic Architecture Sizing
+        # We model the parameter count as a function of hidden_dim (H)
+        # Params breakdown:
+        # Input BN: 2*Input
+        # Entry Layer: H*Input + H + 2*H (Linear + Bias + BN) = H*Input + 3H
+        # ResBlock: 2*(H^2 + H + 2H) = 2*H^2 + 6H
+        # Classifier: H*Classes + Classes
+        # Total = 2*H^2 + H*(Input + Classes + 9) + (2*Input + Classes)
+        
+        a = 2
+        b = input_dim + num_classes + 9
+        c_val = (2 * input_dim + num_classes) - param_limit
+        
+        # Quadratic formula: (-b + sqrt(b^2 - 4ac)) / 2a
+        delta = b**2 - 4*a*c_val
+        if delta < 0:
+            hidden_dim = 128 # Fallback safe value
+        else:
+            hidden_dim = int((-b + math.sqrt(delta)) / (2*a))
+            
+        # Verify strict compliance and adjust downward if floating point errors occurred
+        while True:
+            total_params = 2*(hidden_dim**2) + hidden_dim*(input_dim + num_classes + 9) + (2*input_dim + num_classes)
+            if total_params <= param_limit:
+                break
+            hidden_dim -= 1
+            
         # Initialize model
-        model = Net(input_dim, num_classes).to(device)
+        model = AdaptiveMLP(input_dim, num_classes, hidden_dim).to(device)
         
-        # Verify parameter constraint
-        param_count = sum(p.numel() for p in model.parameters() if p.requires_grad)
-        if param_count > 500000:
-            # Fallback to a smaller model if budget exceeded (should not happen with 384/128)
-            # This is a safety mechanism
-            model = nn.Sequential(
-                nn.Linear(input_dim, 256),
-                nn.ReLU(),
-                nn.Linear(256, 256),
-                nn.ReLU(),
-                nn.Linear(256, num_classes)
-            ).to(device)
+        # Optimization setup
+        # Using AdamW with weight decay for regularization on small dataset
+        optimizer = optim.AdamW(model.parameters(), lr=0.001, weight_decay=0.02)
         
-        # Hyperparameters
-        epochs = 120
-        lr = 2e-3
-        weight_decay = 1e-4
-        
-        # Optimizer and Scheduler
-        optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
-        scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs, eta_min=1e-6)
+        # Label smoothing helps with calibration and generalization
         criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
         
-        # Training state
-        best_acc = 0.0
-        best_state = None
-        alpha = 0.4  # Mixup alpha
+        # Train for sufficient epochs given small dataset size
+        epochs = 100
+        scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
+        
+        best_val_acc = -1.0
+        best_model_state = None
+        
+        # Mixup parameters
+        use_mixup = True
+        mixup_alpha = 0.4
         
         for epoch in range(epochs):
             model.train()
             for inputs, targets in train_loader:
                 inputs, targets = inputs.to(device), targets.to(device)
+                
                 optimizer.zero_grad()
                 
-                # Mixup Augmentation
-                if alpha > 0 and np.random.random() < 0.7:
-                    lam = np.random.beta(alpha, alpha)
+                # Apply Mixup Augmentation (turn off near end of training for fine-tuning)
+                if use_mixup and epoch < epochs - 15:
+                    # Sample lambda from Beta distribution
+                    lam = np.random.beta(mixup_alpha, mixup_alpha)
+                    
+                    # Permute indices for mixing
                     index = torch.randperm(inputs.size(0)).to(device)
+                    
                     mixed_inputs = lam * inputs + (1 - lam) * inputs[index]
-                    y_a, y_b = targets, targets[index]
+                    target_a, target_b = targets, targets[index]
                     
                     outputs = model(mixed_inputs)
-                    loss = lam * criterion(outputs, y_a) + (1 - lam) * criterion(outputs, y_b)
+                    loss = lam * criterion(outputs, target_a) + (1 - lam) * criterion(outputs, target_b)
                 else:
                     outputs = model(inputs)
                     loss = criterion(outputs, targets)
@@ -124,9 +142,8 @@ class Solution:
             
             scheduler.step()
             
-            # Validation
-            # Validate frequently to catch peak performance on small dataset
-            if epoch % 2 == 0 or epoch > epochs - 20:
+            # Validation Step
+            if epoch % 1 == 0: 
                 model.eval()
                 correct = 0
                 total = 0
@@ -134,17 +151,20 @@ class Solution:
                     for inputs, targets in val_loader:
                         inputs, targets = inputs.to(device), targets.to(device)
                         outputs = model(inputs)
-                        _, predicted = torch.max(outputs.data, 1)
+                        _, predicted = torch.max(outputs, 1)
                         total += targets.size(0)
                         correct += (predicted == targets).sum().item()
                 
-                acc = correct / total
-                if acc >= best_acc:
-                    best_acc = acc
-                    best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
+                val_acc = correct / total if total > 0 else 0.0
+                
+                # Save best model
+                if val_acc > best_val_acc:
+                    best_val_acc = val_acc
+                    # Deep copy the state dict to preserve best weights
+                    best_model_state = {k: v.clone() for k, v in model.state_dict().items()}
         
         # Restore best model
-        if best_state is not None:
-            model.load_state_dict(best_state)
+        if best_model_state is not None:
+            model.load_state_dict(best_model_state)
             
         return model

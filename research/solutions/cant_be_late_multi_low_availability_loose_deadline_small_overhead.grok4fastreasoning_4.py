@@ -7,20 +7,9 @@ from sky_spot.utils import ClusterType
 
 
 class Solution(MultiRegionStrategy):
-    """Your multi-region scheduling strategy."""
-
-    NAME = "my_strategy"  # REQUIRED: unique identifier
+    NAME = "my_strategy"
 
     def solve(self, spec_path: str) -> "Solution":
-        """
-        Initialize the solution from spec_path config.
-
-        The spec file contains:
-        - deadline: deadline in hours
-        - duration: task duration in hours
-        - overhead: restart overhead in hours
-        - trace_files: list of trace file paths (one per region)
-        """
         with open(spec_path) as f:
             config = json.load(f)
 
@@ -31,38 +20,54 @@ class Solution(MultiRegionStrategy):
             inter_task_overhead=[0.0],
         )
         super().__init__(args)
-        self.consecutive_pauses = 0
+
+        self.traces: List[List[bool]] = []
+        self.streaks: List[List[int]] = []
+        self.num_regions = len(config["trace_files"])
+        for path in config["trace_files"]:
+            with open(path, 'r') as tf:
+                trace = json.load(tf)
+            self.traces.append(trace)
+
+            n = len(trace)
+            streaks_r = [0] * n
+            if n > 0 and trace[n - 1]:
+                streaks_r[n - 1] = 1
+            for t in range(n - 2, -1, -1):
+                if trace[t]:
+                    streaks_r[t] = 1 + streaks_r[t + 1]
+            self.streaks.append(streaks_r)
+
         return self
 
     def _step(self, last_cluster_type: ClusterType, has_spot: bool) -> ClusterType:
-        """
-        Decide next action based on current state.
+        current_region = self.env.get_current_region()
+        elapsed = self.env.elapsed_seconds
+        current_step = int(elapsed // self.env.gap_seconds)
+        done = sum(self.task_done_time)
+        if done >= self.task_duration or elapsed >= self.deadline:
+            return ClusterType.NONE
 
-        Available attributes:
-        - self.env.get_current_region(): Get current region index
-        - self.env.get_num_regions(): Get total number of regions
-        - self.env.switch_region(idx): Switch to region by index
-        - self.env.elapsed_seconds: Current time elapsed
-        - self.task_duration: Total task duration needed (seconds)
-        - self.deadline: Deadline time (seconds)
-        - self.restart_overhead: Restart overhead (seconds)
-        - self.task_done_time: List of completed work segments
-        - self.remaining_restart_overhead: Current pending overhead
+        if current_step >= len(self.traces[current_region]):
+            return ClusterType.ON_DEMAND
 
-        Returns: ClusterType.SPOT, ClusterType.ON_DEMAND, or ClusterType.NONE
-        """
-        # Your decision logic here
-        if has_spot:
-            self.consecutive_pauses = 0
+        current_has_spot = self.traces[current_region][current_step]
+        if current_has_spot:
             return ClusterType.SPOT
 
-        self.consecutive_pauses += 1
-        current = self.env.get_current_region()
-        num = self.env.get_num_regions()
-        if self.consecutive_pauses > 10 or num <= 1:
-            self.consecutive_pauses = 0
-            return ClusterType.ON_DEMAND
+        max_streak = 0
+        best_r = current_region
+        for r in range(self.num_regions):
+            if current_step >= len(self.traces[r]):
+                continue
+            streak = self.streaks[r][current_step]
+            if streak > max_streak:
+                max_streak = streak
+                best_r = r
+
+        if max_streak > 0:
+            if best_r != current_region:
+                self.env.switch_region(best_r)
+            return ClusterType.SPOT
         else:
-            next_r = (current + 1) % num
-            self.env.switch_region(next_r)
-            return ClusterType.NONE
+            return ClusterType.ON_DEMAND

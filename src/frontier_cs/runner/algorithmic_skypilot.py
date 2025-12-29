@@ -129,6 +129,10 @@ class AlgorithmicSkyPilotRunner(AlgorithmicRunner):
         try:
             task = sky.Task.from_yaml(str(yaml_path))
 
+            # Set absolute path for file_mounts to avoid CWD issues
+            algorithmic_dir = str(self.base_dir / "algorithmic")
+            task.update_file_mounts({"~/algorithmic": algorithmic_dir})
+
             if self.cloud or self.region:
                 resources = list(task.resources)[0] if task.resources else sky.Resources()
                 new_resources = resources.copy(

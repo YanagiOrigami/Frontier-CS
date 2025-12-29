@@ -2,6 +2,9 @@ import numpy as np
 import pandas as pd
 import sympy
 from pysr import PySRRegressor
+import tempfile
+import os
+import shutil
 
 class Solution:
     def __init__(self, **kwargs):
@@ -11,53 +14,58 @@ class Solution:
         """
         Solves the symbolic regression problem using PySR.
         """
-        # Configure PySRRegressor
-        # Optimized for 8 vCPUs (populations=8, procs=8)
-        # Includes all allowed operators
-        model = PySRRegressor(
-            niterations=50,
-            binary_operators=["+", "-", "*", "/", "pow"],
-            unary_operators=["sin", "cos", "exp", "log"],
-            populations=8,
-            population_size=40,
-            maxsize=30,
-            loss="L2DistLoss",
-            model_selection="best",
-            verbosity=0,
-            progress=False,
-            random_state=42,
-            procs=8,
-            multithreading=False,
-            deterministic=True
-        )
-
-        # Fit the model
-        # variable_names ensures the output expression uses x1, x2
-        model.fit(X, y, variable_names=["x1", "x2"])
+        # Create a temporary directory for PySR's equation file
+        temp_dir = tempfile.mkdtemp()
+        equation_file = os.path.join(temp_dir, "hall_of_fame.csv")
 
         try:
-            # Retrieve the best expression found as a SymPy object
+            # Initialize PySRRegressor
+            # Configured for trigonometric discovery based on 'SinCos' dataset
+            model = PySRRegressor(
+                niterations=100,
+                binary_operators=["+", "-", "*", "/", "^"],
+                unary_operators=["sin", "cos", "exp", "log"],
+                populations=20,
+                population_size=33,
+                maxsize=30,
+                verbosity=0,
+                progress=False,
+                random_state=42,
+                equation_file=equation_file,
+                model_selection="best",
+                temp_equation_file=True,
+                delete_tempfiles=True,
+                loss="L2DistLoss()",
+            )
+
+            # Fit the model
+            model.fit(X, y, variable_names=["x1", "x2"])
+
+            # Retrieve the best expression as a sympy object
             best_expr = model.sympy()
-            
-            # Convert SymPy object to a valid Python expression string
             expression = str(best_expr)
-            
-            # Generate predictions using the fitted model
+
+            # Compute predictions
             predictions = model.predict(X)
-            
+            predictions = predictions.tolist()
+
         except Exception:
-            # Fallback to Linear Regression if symbolic regression fails
-            # This ensures the method always returns a valid dictionary
+            # Fallback to linear regression if PySR fails
             x1, x2 = X[:, 0], X[:, 1]
-            A = np.column_stack([x1, x2, np.ones(len(x1))])
+            A = np.column_stack([x1, x2, np.ones_like(x1)])
             coeffs, _, _, _ = np.linalg.lstsq(A, y, rcond=None)
-            
             a, b, c = coeffs
+            
             expression = f"{a}*x1 + {b}*x2 + {c}"
-            predictions = A @ coeffs
+            predictions = (a * x1 + b * x2 + c).tolist()
+
+        finally:
+            # Cleanup temporary directory
+            if os.path.exists(temp_dir):
+                shutil.rmtree(temp_dir)
 
         return {
             "expression": expression,
-            "predictions": predictions.tolist(),
+            "predictions": predictions,
             "details": {}
         }

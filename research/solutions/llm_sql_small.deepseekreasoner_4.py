@@ -1,10 +1,9 @@
 import pandas as pd
 import numpy as np
 from collections import defaultdict
+import heapq
+from itertools import permutations
 import time
-from typing import List, Tuple
-import itertools
-from functools import lru_cache
 
 class Solution:
     def solve(
@@ -19,58 +18,28 @@ class Solution:
         parallel: bool = True,
     ) -> pd.DataFrame:
         
-        start_time = time.time()
-        
         # Apply column merges if specified
-        if col_merge is not None and len(col_merge) > 0:
+        if col_merge is not None:
             df = self._apply_column_merges(df, col_merge)
         
-        # If 1 or 0 columns, return as is
+        # If 0 or 1 columns, return as is
         if len(df.columns) <= 1:
             return df
-        
-        # Get column names
-        columns = list(df.columns)
-        n_cols = len(columns)
         
         # Convert all values to strings
         df_str = df.astype(str)
         
-        # Precompute column data
-        col_data = {}
-        for col in columns:
-            col_data[col] = df_str[col].values
+        # Get column data for analysis
+        col_data = self._analyze_columns(df_str)
         
-        # Analyze column characteristics
-        col_stats = self._analyze_columns(col_data, df_str)
+        # Try different reordering strategies
+        best_order = self._find_best_column_order(df_str, col_data, early_stop)
         
-        # Generate candidate permutations
-        candidates = self._generate_candidates(columns, col_stats, n_cols, 
-                                             early_stop, col_stop, distinct_value_threshold)
-        
-        # Evaluate candidates
-        best_order = None
-        best_score = -1
-        
-        for order in candidates:
-            if time.time() - start_time > 9.5:  # Leave 0.5s buffer
-                break
-                
-            score = self._evaluate_order(order, col_data, df_str.shape[0], row_stop)
-            
-            if score > best_score:
-                best_score = score
-                best_order = order
-        
-        # If no order found (shouldn't happen), use original
-        if best_order is None:
-            best_order = columns
-        
-        # Return reordered dataframe
+        # Return dataframe with reordered columns
         return df[best_order]
     
     def _apply_column_merges(self, df: pd.DataFrame, col_merge: list) -> pd.DataFrame:
-        """Apply column merges as specified."""
+        """Merge columns as specified in col_merge"""
         result_df = df.copy()
         
         for merge_group in col_merge:
@@ -78,178 +47,225 @@ class Solution:
                 continue
                 
             # Get the columns to merge
-            merge_cols = [col for col in merge_group if col in result_df.columns]
-            if len(merge_cols) <= 1:
+            cols_to_merge = [col for col in merge_group if col in df.columns]
+            if len(cols_to_merge) <= 1:
                 continue
             
-            # Create merged column
-            merged_name = merge_cols[0] + "_merged"
-            merged_values = result_df[merge_cols[0]].astype(str)
+            # Create merged column name
+            merged_name = "_".join(cols_to_merge)
             
-            for col in merge_cols[1:]:
-                merged_values = merged_values + result_df[col].astype(str)
+            # Merge columns (concatenate as strings)
+            merged_vals = df[cols_to_merge[0]].astype(str)
+            for col in cols_to_merge[1:]:
+                merged_vals += df[col].astype(str)
             
             # Add merged column and remove original columns
-            result_df[merged_name] = merged_values
-            result_df = result_df.drop(columns=merge_cols)
+            result_df[merged_name] = merged_vals
+            result_df = result_df.drop(columns=cols_to_merge)
         
         return result_df
     
-    def _analyze_columns(self, col_data: dict, df_str: pd.DataFrame) -> dict:
-        """Analyze column statistics for better ordering."""
-        n_rows = len(next(iter(col_data.values())))
-        stats = {}
+    def _analyze_columns(self, df: pd.DataFrame) -> dict:
+        """Analyze columns for distinct values and patterns"""
+        col_data = {}
         
-        for col, values in col_data.items():
-            # Calculate distinct ratio
-            unique_values = len(set(values))
-            distinct_ratio = unique_values / n_rows
-            
-            # Calculate average string length
-            avg_len = sum(len(str(v)) for v in values) / n_rows
-            
-            # Calculate prefix stability (how often values start with same char)
-            first_chars = [str(v)[0] if len(str(v)) > 0 else '' for v in values]
-            unique_first = len(set(first_chars))
-            first_char_stability = (n_rows - unique_first) / n_rows if n_rows > 0 else 0
-            
-            stats[col] = {
-                'distinct_ratio': distinct_ratio,
-                'avg_len': avg_len,
-                'first_char_stability': first_char_stability,
-                'unique_count': unique_values
+        for col in df.columns:
+            values = df[col].values
+            unique_vals = np.unique(values)
+            col_data[col] = {
+                'unique_count': len(unique_vals),
+                'unique_ratio': len(unique_vals) / len(values),
+                'avg_len': np.mean([len(str(v)) for v in values]),
+                'values': values
             }
         
-        return stats
+        return col_data
     
-    def _generate_candidates(self, columns: List[str], col_stats: dict, 
-                           n_cols: int, early_stop: int, col_stop: int,
-                           distinct_value_threshold: float) -> List[List[str]]:
-        """Generate candidate column orderings."""
-        candidates = []
+    def _calculate_lcp_score(self, df: pd.DataFrame, col_order: list) -> float:
+        """Calculate the LCP score for a given column order"""
+        n_rows = len(df)
         
-        # 1. Original order (baseline)
-        candidates.append(columns.copy())
+        # Build concatenated strings with given column order
+        strings = []
+        for i in range(n_rows):
+            s = ''.join(df.iloc[i][col_order].values)
+            strings.append(s)
         
-        # 2. Sort by distinct ratio (lowest first) - more repeating values first
-        sorted_by_distinct = sorted(columns, 
-                                   key=lambda x: col_stats[x]['distinct_ratio'])
-        if sorted_by_distinct != columns:
-            candidates.append(sorted_by_distinct)
-        
-        # 3. Sort by first character stability (highest first)
-        sorted_by_stability = sorted(columns, 
-                                    key=lambda x: -col_stats[x]['first_char_stability'])
-        if sorted_by_stability != columns:
-            candidates.append(sorted_by_stability)
-        
-        # 4. Sort by average length (shortest first) - shorter prefixes first
-        sorted_by_length = sorted(columns, 
-                                 key=lambda x: col_stats[x]['avg_len'])
-        if sorted_by_length != columns:
-            candidates.append(sorted_by_length)
-        
-        # 5. Composite score: prioritize low distinct ratio and high stability
-        def composite_score(col):
-            stats = col_stats[col]
-            # Weight distinct ratio more heavily
-            return (0.7 * (1 - stats['distinct_ratio']) + 
-                    0.3 * stats['first_char_stability'])
-        
-        sorted_by_composite = sorted(columns, key=composite_score, reverse=True)
-        if sorted_by_composite != columns:
-            candidates.append(sorted_by_composite)
-        
-        # 6. Generate additional permutations for small number of columns
-        if n_cols <= 6:
-            # Generate all permutations for small n (max 720 for n=6)
-            all_perms = list(itertools.permutations(columns))
-            # Add a few more random permutations
-            for perm in all_perms[:min(20, len(all_perms))]:
-                if list(perm) not in candidates:
-                    candidates.append(list(perm))
-        else:
-            # For larger n, use heuristic swaps
-            base_order = sorted_by_composite
-            
-            # Generate variations by swapping adjacent pairs
-            for i in range(min(n_cols-1, 10)):
-                new_order = base_order.copy()
-                new_order[i], new_order[i+1] = new_order[i+1], new_order[i]
-                if new_order not in candidates:
-                    candidates.append(new_order)
-            
-            # Generate variations by moving low-distinct columns to front
-            low_distinct_cols = [c for c in columns 
-                                if col_stats[c]['distinct_ratio'] < distinct_value_threshold]
-            high_distinct_cols = [c for c in columns 
-                                 if c not in low_distinct_cols]
-            
-            if low_distinct_cols and high_distinct_cols:
-                new_order = low_distinct_cols + high_distinct_cols
-                if new_order not in candidates:
-                    candidates.append(new_order)
-        
-        # Remove duplicates while preserving order
-        seen = set()
-        unique_candidates = []
-        for cand in candidates:
-            cand_tuple = tuple(cand)
-            if cand_tuple not in seen:
-                seen.add(cand_tuple)
-                unique_candidates.append(cand)
-        
-        return unique_candidates[:early_stop]
-    
-    def _evaluate_order(self, order: List[str], col_data: dict, 
-                       n_rows: int, row_stop: int) -> float:
-        """Evaluate a column ordering by calculating prefix hit rate."""
-        if n_rows <= 1:
-            return 0.0
-        
-        # Use all rows for evaluation (row_stop seems to be misnamed parameter)
-        sample_size = n_rows
-        
-        # Build prefix tree for fast LCP calculation
-        prefix_tree = {}
+        # Calculate prefix hit rate
         total_lcp = 0
-        total_len = 0
+        total_length = 0
         
-        for i in range(sample_size):
-            # Build string for current row in given order
-            row_str = ''.join(str(col_data[col][i]) for col in order)
-            row_len = len(row_str)
-            total_len += row_len
+        # Use incremental LCP calculation
+        for i in range(n_rows):
+            s_i = strings[i]
+            total_length += len(s_i)
             
             if i == 0:
-                # Insert first row into prefix tree
-                node = prefix_tree
-                for char in row_str:
-                    if char not in node:
-                        node[char] = {}
-                    node = node[char]
                 continue
             
-            # Find LCP with previous rows using prefix tree
-            node = prefix_tree
-            lcp = 0
-            for char in row_str:
-                if char in node:
+            # Find max LCP with previous strings
+            max_lcp = 0
+            for j in range(i):
+                # Calculate LCP efficiently
+                lcp = 0
+                min_len = min(len(s_i), len(strings[j]))
+                while lcp < min_len and s_i[lcp] == strings[j][lcp]:
                     lcp += 1
-                    node = node[char]
-                else:
-                    break
+                
+                if lcp > max_lcp:
+                    max_lcp = lcp
+                    # Early break if we find perfect match
+                    if max_lcp == len(s_i):
+                        break
             
-            total_lcp += lcp
-            
-            # Insert current row into prefix tree
-            node = prefix_tree
-            for char in row_str:
-                if char not in node:
-                    node[char] = {}
-                node = node[char]
+            total_lcp += max_lcp
         
-        if total_len == 0:
+        if total_length == 0:
             return 0.0
         
-        return total_lcp / total_len
+        return total_lcp / total_length
+    
+    def _find_best_column_order(self, df: pd.DataFrame, col_data: dict, early_stop: int) -> list:
+        """Find the best column order using heuristic search"""
+        columns = list(df.columns)
+        n_cols = len(columns)
+        
+        # If small number of columns, try all permutations
+        if n_cols <= 6:
+            best_order = columns
+            best_score = self._calculate_lcp_score(df, best_order)
+            
+            for perm in permutations(columns):
+                score = self._calculate_lcp_score(df, list(perm))
+                if score > best_score:
+                    best_score = score
+                    best_order = list(perm)
+            
+            return best_order
+        
+        # For larger number of columns, use heuristic approach
+        
+        # Strategy 1: Sort by unique ratio (fewer unique values first)
+        order1 = sorted(columns, 
+                       key=lambda c: (col_data[c]['unique_ratio'], 
+                                     -col_data[c]['avg_len']))
+        
+        # Strategy 2: Sort by average length (shorter first)
+        order2 = sorted(columns, 
+                       key=lambda c: (col_data[c]['avg_len'], 
+                                     col_data[c]['unique_ratio']))
+        
+        # Strategy 3: Use column similarity clustering
+        order3 = self._cluster_based_order(df, col_data)
+        
+        # Try the three strategies and pick the best
+        orders = [order1, order2, order3]
+        scores = [self._calculate_lcp_score(df, order) for order in orders]
+        
+        # Also try reverse orders
+        for i in range(3):
+            rev_order = list(reversed(orders[i]))
+            rev_score = self._calculate_lcp_score(df, rev_order)
+            orders.append(rev_order)
+            scores.append(rev_score)
+        
+        # Try some random permutations for diversity
+        np.random.seed(42)
+        for _ in range(min(10, early_stop // 1000)):
+            rand_order = np.random.permutation(columns).tolist()
+            rand_score = self._calculate_lcp_score(df, rand_order)
+            orders.append(rand_order)
+            scores.append(rand_score)
+        
+        # Find best order
+        best_idx = np.argmax(scores)
+        best_order = orders[best_idx]
+        best_score = scores[best_idx]
+        
+        # Local optimization: try swapping adjacent pairs
+        improved = True
+        while improved:
+            improved = False
+            current_order = best_order.copy()
+            current_score = best_score
+            
+            for i in range(n_cols - 1):
+                new_order = current_order.copy()
+                new_order[i], new_order[i + 1] = new_order[i + 1], new_order[i]
+                
+                new_score = self._calculate_lcp_score(df, new_order)
+                if new_score > current_score:
+                    best_order = new_order
+                    best_score = new_score
+                    improved = True
+                    break
+        
+        # Try moving each column to front
+        for i in range(n_cols):
+            if i == 0:
+                continue
+                
+            new_order = best_order.copy()
+            col = new_order.pop(i)
+            new_order.insert(0, col)
+            
+            new_score = self._calculate_lcp_score(df, new_order)
+            if new_score > best_score:
+                best_score = new_score
+                best_order = new_order
+        
+        return best_order
+    
+    def _cluster_based_order(self, df: pd.DataFrame, col_data: dict) -> list:
+        """Order columns based on value similarity clustering"""
+        columns = list(df.columns)
+        n_cols = len(columns)
+        
+        if n_cols <= 2:
+            return columns
+        
+        # Calculate pairwise column similarity
+        similarity = np.zeros((n_cols, n_cols))
+        
+        # Use value overlap as similarity metric
+        for i in range(n_cols):
+            for j in range(i + 1, n_cols):
+                col_i = columns[i]
+                col_j = columns[j]
+                
+                # For efficiency, sample rows
+                n_samples = min(1000, len(df))
+                indices = np.random.choice(len(df), n_samples, replace=False)
+                
+                vals_i = df.iloc[indices][col_i].values
+                vals_j = df.iloc[indices][col_j].values
+                
+                # Calculate exact match ratio
+                matches = np.sum(vals_i == vals_j)
+                similarity[i, j] = matches / n_samples
+                similarity[j, i] = similarity[i, j]
+        
+        # Build order using greedy approach: start with column that has highest average similarity
+        avg_similarity = np.mean(similarity, axis=1)
+        start_idx = np.argmax(avg_similarity)
+        
+        order = [columns[start_idx]]
+        used = {start_idx}
+        
+        while len(order) < n_cols:
+            last_idx = columns.index(order[-1])
+            best_next = -1
+            best_sim = -1
+            
+            for i in range(n_cols):
+                if i not in used:
+                    sim = similarity[last_idx, i]
+                    if sim > best_sim:
+                        best_sim = sim
+                        best_next = i
+            
+            if best_next != -1:
+                order.append(columns[best_next])
+                used.add(best_next)
+        
+        return order

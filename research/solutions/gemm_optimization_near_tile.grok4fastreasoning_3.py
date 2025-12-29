@@ -1,3 +1,11 @@
+import torch
+import triton
+import triton.language as tl
+
+@triton.jit
+def gelu(x):
+    return x * 0.5 * (1.0 + tl.extra.cuda.libdevice.erf(x * 0.7071067811865476))
+
 class Solution:
     def solve(self, spec_path: str = None) -> dict:
         code = """
@@ -9,139 +17,134 @@ import triton.language as tl
 def gelu(x):
     return x * 0.5 * (1.0 + tl.extra.cuda.libdevice.erf(x * 0.7071067811865476))
 
+@triton.jit
+def kernel(
+    A_PTR,
+    B_PTR,
+    C_PTR,
+    M: tl.int32,
+    N: tl.int32,
+    K: tl.int32,
+    stride_am: tl.int64,
+    stride_ak: tl.int64,
+    stride_bk: tl.int64,
+    stride_bn: tl.int64,
+    stride_cm: tl.int64,
+    stride_cn: tl.int64,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+    block_m = tl.arange(0, BLOCK_M)
+    block_n = tl.arange(0, BLOCK_N)
+    block_k = tl.arange(0, BLOCK_K)
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    m_mask = pid_m * BLOCK_M + block_m < M
+    n_mask = pid_n * BLOCK_N + block_n < N
+    lo = 0
+    while lo < K:
+        k_mask = lo + block_k < K
+        offs_am = pid_m * BLOCK_M + block_m
+        offs_ak = lo + block_k
+        a_ptrs = A_PTR + (offs_am[:, None] * stride_am + offs_ak[None, :] * stride_ak)
+        a_mask = m_mask[:, None] & k_mask[None, :]
+        a = tl.load(a_ptrs, mask=a_mask, other=0.0)
+        offs_bn = pid_n * BLOCK_N + block_n
+        offs_bk = lo + block_k
+        b_ptrs = B_PTR + (offs_bk[:, None] * stride_bk + offs_bn[None, :] * stride_bn)
+        b_mask = k_mask[:, None] & n_mask[None, :]
+        b = tl.load(b_ptrs, mask=b_mask, other=0.0)
+        acc += tl.dot(a, b)
+        lo += BLOCK_K
+    acc = gelu(acc)
+    offs_cm = pid_m * BLOCK_M + block_m
+    offs_cn = pid_n * BLOCK_N + block_n
+    c_ptrs = C_PTR + (offs_cm[:, None] * stride_cm + offs_cn[None, :] * stride_cn)
+    c_mask = m_mask[:, None] & n_mask[None, :]
+    tl.store(c_ptrs, acc, mask=c_mask)
+
 def matmul(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
-    M, K = a.shape
+    M, K1 = a.shape
     K2, N = b.shape
-    assert K == K2
-    assert a.dtype == b.dtype
-    C = torch.empty((M, N), dtype=a.dtype, device=a.device)
+    assert K1 == K2
+    K = K1
+    output = torch.empty((M, N), dtype=a.dtype, device=a.device)
     if M == 0 or N == 0 or K == 0:
-        return C
-
-    def get_dtype():
-        if a.dtype == torch.float16:
-            return tl.float16
-        elif a.dtype == torch.bfloat16:
-            return tl.bfloat16
-        elif a.dtype == torch.float32:
-            return tl.float32
-        else:
-            raise ValueError(f"Unsupported dtype {a.dtype}")
-
-    INPUT_DTYPE = get_dtype()
-    element_size = a.element_size()
-    stride_am_bytes = a.stride(0) * element_size
-    stride_ak_bytes = a.stride(1) * element_size
-    stride_bk_bytes = b.stride(0) * element_size
-    stride_bn_bytes = b.stride(1) * element_size
-    stride_cm_bytes = N * element_size
-    stride_cn_bytes = element_size
-
-    @triton.jit
-    def kernel(
-        A_PTR,
-        B_PTR,
-        C_PTR,
-        M: tl.int32,
-        N: tl.int32,
-        K: tl.int32,
-        stride_am: tl.int32,
-        stride_ak: tl.int32,
-        stride_bk: tl.int32,
-        stride_bn: tl.int32,
-        stride_cm: tl.int32,
-        stride_cn: tl.int32,
-        INPUT_DTYPE: tl.constexpr,
+        return output
+    stride_am = a.stride(0)
+    stride_ak = a.stride(1)
+    stride_bk = b.stride(0)
+    stride_bn = b.stride(1)
+    stride_cm = output.stride(0)
+    stride_cn = output.stride(1)
+    configs = [
+        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 64}),
+        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 128, 'BLOCK_K': 64}),
+        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 64, 'BLOCK_K': 64}),
+        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 64, 'BLOCK_K': 32}),
+        triton.Config({'BLOCK_M': 256, 'BLOCK_N': 128, 'BLOCK_K': 128}),
+        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 256, 'BLOCK_K': 128}),
+        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 256, 'BLOCK_K': 64}),
+        triton.Config({'BLOCK_M': 256, 'BLOCK_N': 64, 'BLOCK_K': 128}),
+        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 32}),
+        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 128, 'BLOCK_K': 32}),
+        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 64, 'BLOCK_K': 32}),
+    ]
+    @triton.autotune(
+        configs=configs,
+        key=(M, N, K, stride_am, stride_ak, stride_bk, stride_bn),
+    )
+    def wrapper(
+        a_ptr,
+        b_ptr,
+        c_ptr,
+        M,
+        N,
+        K,
+        stride_am,
+        stride_ak,
+        stride_bk,
+        stride_bn,
         BLOCK_M: tl.constexpr,
         BLOCK_N: tl.constexpr,
         BLOCK_K: tl.constexpr,
     ):
-        pid_m = tl.program_id(0)
-        pid_n = tl.program_id(1)
-
-        offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
-        offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
-        acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
-
-        for start_k in range(0, K, BLOCK_K):
-            block_k = start_k + tl.arange(0, BLOCK_K)
-            mask_k = block_k < K
-
-            a_ptrs = A_PTR + offs_m[:, None] * stride_am + block_k[None, :] * stride_ak
-            mask_a = (offs_m[:, None] < M) & mask_k[None, :]
-            a_block = tl.load(a_ptrs, mask=mask_a, other=INPUT_DTYPE(0.0)).to(tl.float32)
-
-            b_ptrs = B_PTR + block_k[:, None] * stride_bk + offs_n[None, :] * stride_bn
-            mask_b = mask_k[:, None] & (offs_n[None, :] < N)
-            b_block = tl.load(b_ptrs, mask=mask_b, other=INPUT_DTYPE(0.0)).to(tl.float32)
-
-            acc += tl.dot(a_block, b_block)
-
-        c_ptrs = C_PTR + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn
-        mask_c = (offs_m[:, None] < M) & (offs_n[None, :] < N)
-        c_block = gelu(acc).to(INPUT_DTYPE)
-        tl.store(c_ptrs, c_block, mask=mask_c)
-
-    configs = [
-        triton.Config(
-            {'BLOCK_M': 64, 'BLOCK_N': 64, 'BLOCK_K': 32},
-            num_stages=3,
-            num_warps=8
-        ),
-        triton.Config(
-            {'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 64},
-            num_stages=4,
-            num_warps=8
-        ),
-        triton.Config(
-            {'BLOCK_M': 256, 'BLOCK_N': 256, 'BLOCK_K': 128},
-            num_stages=5,
-            num_warps=4
-        ),
-        triton.Config(
-            {'BLOCK_M': 128, 'BLOCK_N': 64, 'BLOCK_K': 64},
-            num_stages=4,
-            num_warps=8
-        ),
-        triton.Config(
-            {'BLOCK_M': 64, 'BLOCK_N': 128, 'BLOCK_K': 32},
-            num_stages=3,
-            num_warps=8
-        ),
-    ]
-
-    def make_key(A_PTR, B_PTR, C_PTR, M, N, K, stride_am, stride_ak, stride_bk, stride_bn, stride_cm, stride_cn, INPUT_DTYPE):
-        return (M, N, K, stride_am, stride_ak, stride_bk, stride_bn)
-
-    kernel = triton.autotune(
-        configs=[triton.Config({**c, 'INPUT_DTYPE': INPUT_DTYPE}) for c in configs],
-        key=make_key,
-    )(kernel)
-
-    def grid(meta):
-        return (
-            triton.cdiv(M, meta['BLOCK_M']),
-            triton.cdiv(N, meta['BLOCK_N']),
+        grid = (triton.cdiv(M, BLOCK_M), triton.cdiv(N, BLOCK_N))
+        if BLOCK_K == 128:
+            num_stages = 4
+            num_warps = 8
+        elif BLOCK_K == 64:
+            num_stages = 3
+            num_warps = 4
+        else:
+            num_stages = 2
+            num_warps = 4
+        kernel[grid, num_stages=num_stages, num_warps=num_warps](
+            a_ptr,
+            b_ptr,
+            c_ptr,
+            tl.int32(M),
+            tl.int32(N),
+            tl.int32(K),
+            tl.int64(stride_am),
+            tl.int64(stride_ak),
+            tl.int64(stride_bk),
+            tl.int64(stride_bn),
+            tl.int64(stride_cm),
+            tl.int64(stride_cn),
+            BLOCK_M=BLOCK_M,
+            BLOCK_N=BLOCK_N,
+            BLOCK_K=BLOCK_K,
         )
-
-    A_PTR = a.data_ptr()
-    B_PTR = b.data_ptr()
-    C_PTR = C.data_ptr()
-    kernel[grid](
-        A_PTR,
-        B_PTR,
-        C_PTR,
-        M,
-        N,
-        K,
-        stride_am_bytes,
-        stride_ak_bytes,
-        stride_bk_bytes,
-        stride_bn_bytes,
-        stride_cm_bytes,
-        stride_cn_bytes,
-        INPUT_DTYPE,
+    wrapper(
+        a.data_ptr(),
+        b.data_ptr(),
+        output.data_ptr(),
+        M, N, K,
+        stride_am, stride_ak, stride_bk, stride_bn,
     )
-    return C
+    return output
 """
         return {"code": code}

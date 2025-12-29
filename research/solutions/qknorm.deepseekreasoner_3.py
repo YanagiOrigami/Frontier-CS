@@ -1,88 +1,62 @@
 import torch
 import flashinfer
-from typing import Tuple
-
-def qknorm(q: torch.Tensor, k: torch.Tensor, norm_weight: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-    # Reshape to 2D without forcing contiguous if already correct layout
-    q_shape = q.shape
-    k_shape = k.shape
-    
-    # Check if last dimension is contiguous
-    q_last_dim = q_shape[-1]
-    k_last_dim = k_shape[-1]
-    
-    # Efficient reshaping without unnecessary copies
-    if q.is_contiguous() and q.dim() > 2:
-        q_2d = q.view(-1, q_last_dim)
-    else:
-        # If non-contiguous, check if we can view without copy
-        if q.stride(-1) == 1 and q.numel() == q.size(-1) * (q.numel() // q.size(-1)):
-            q_2d = q.view(-1, q_last_dim)
-        else:
-            q_2d = q.reshape(-1, q_last_dim)
-    
-    if k.is_contiguous() and k.dim() > 2:
-        k_2d = k.view(-1, k_last_dim)
-    else:
-        if k.stride(-1) == 1 and k.numel() == k.size(-1) * (k.numel() // k.size(-1)):
-            k_2d = k.view(-1, k_last_dim)
-        else:
-            k_2d = k.reshape(-1, k_last_dim)
-    
-    # Use single kernel launch when possible by processing both tensors
-    # Create output tensors with optimal memory layout
-    q_o_2d = torch.empty_like(q_2d)
-    k_o_2d = torch.empty_like(k_2d)
-    
-    # Apply RMSNorm - flashinfer handles efficient kernel launches
-    flashinfer.norm.rmsnorm(q_2d, norm_weight, out=q_o_2d)
-    flashinfer.norm.rmsnorm(k_2d, norm_weight, out=k_o_2d)
-    
-    # Reshape back to original shape
-    return q_o_2d.view(q_shape), k_o_2d.view(k_shape)
+import torch.utils.cpp_extension
 
 class Solution:
     def solve(self, spec_path: str = None) -> dict:
-        return {"code": """import torch
+        code = '''
+import torch
 import flashinfer
-from typing import Tuple
 
-def qknorm(q: torch.Tensor, k: torch.Tensor, norm_weight: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-    # Reshape to 2D without forcing contiguous if already correct layout
+def qknorm(q: torch.Tensor, k: torch.Tensor, norm_weight: torch.Tensor):
+    """
+    Apply RMSNorm to query and key tensors with optimized handling of non-contiguous inputs.
+    """
+    # Save original shapes and strides
     q_shape = q.shape
     k_shape = k.shape
     
-    # Check if last dimension is contiguous
-    q_last_dim = q_shape[-1]
-    k_last_dim = k_shape[-1]
+    # Get last dimension for normalization
+    hidden_dim = q.shape[-1]
     
-    # Efficient reshaping without unnecessary copies
-    if q.is_contiguous() and q.dim() > 2:
-        q_2d = q.view(-1, q_last_dim)
+    # Reshape to 2D without forcing contiguous if possible
+    # Use as_strided to handle non-contiguous tensors efficiently
+    if q.is_contiguous():
+        q_2d = q.view(-1, hidden_dim)
     else:
-        # If non-contiguous, check if we can view without copy
-        if q.stride(-1) == 1 and q.numel() == q.size(-1) * (q.numel() // q.size(-1)):
-            q_2d = q.view(-1, q_last_dim)
-        else:
-            q_2d = q.reshape(-1, q_last_dim)
+        # For non-contiguous q, create a view with proper strides
+        num_elements = q.numel() // hidden_dim
+        q_2d = torch.as_strided(q, (num_elements, hidden_dim), 
+                               (q.stride()[-2] if q.dim() > 1 else hidden_dim, 1))
     
-    if k.is_contiguous() and k.dim() > 2:
-        k_2d = k.view(-1, k_last_dim)
+    if k.is_contiguous():
+        k_2d = k.view(-1, hidden_dim)
     else:
-        if k.stride(-1) == 1 and k.numel() == k.size(-1) * (k.numel() // k.size(-1)):
-            k_2d = k.view(-1, k_last_dim)
-        else:
-            k_2d = k.reshape(-1, k_last_dim)
+        # For non-contiguous k, create a view with proper strides
+        num_elements = k.numel() // hidden_dim
+        k_2d = torch.as_strided(k, (num_elements, hidden_dim),
+                               (k.stride()[-2] if k.dim() > 1 else hidden_dim, 1))
     
-    # Use single kernel launch when possible by processing both tensors
     # Create output tensors with optimal memory layout
-    q_o_2d = torch.empty_like(q_2d)
-    k_o_2d = torch.empty_like(k_2d)
+    # Use empty_strided to preserve output layout matching input when possible
+    if q.is_contiguous():
+        q_out = torch.empty_like(q_2d)
+    else:
+        # For non-contiguous input, output will be contiguous for efficiency
+        q_out = torch.empty((q_2d.size(0), hidden_dim), 
+                           device=q.device, dtype=q.dtype)
     
-    # Apply RMSNorm - flashinfer handles efficient kernel launches
-    flashinfer.norm.rmsnorm(q_2d, norm_weight, out=q_o_2d)
-    flashinfer.norm.rmsnorm(k_2d, norm_weight, out=k_o_2d)
+    if k.is_contiguous():
+        k_out = torch.empty_like(k_2d)
+    else:
+        k_out = torch.empty((k_2d.size(0), hidden_dim), 
+                           device=k.device, dtype=k.dtype)
+    
+    # Apply normalization using flashinfer
+    flashinfer.norm.rmsnorm(q_2d, norm_weight, out=q_out)
+    flashinfer.norm.rmsnorm(k_2d, norm_weight, out=k_out)
     
     # Reshape back to original shape
-    return q_o_2d.view(q_shape), k_o_2d.view(k_shape)
-"""}
+    return q_out.view(q_shape), k_out.view(k_shape)
+'''
+        return {"code": code}

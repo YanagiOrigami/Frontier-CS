@@ -1,19 +1,37 @@
 import torch
-import triton
-import triton.language as tl
 
 class Solution:
     def solve(self, spec_path: str = None) -> dict:
         """
-        Returns a dict with either:
-        - {"code": "python_code_string"}
-        - {"program_path": "path/to/kernel.py"}
+        Returns a dict with a string containing the Python code for the Triton kernel.
         """
-        return {"code": """import torch
+        
+        # The code is returned as a string. The evaluation environment will
+        # execute this string to get access to the `add` function.
+        code = """
+import torch
 import triton
 import triton.language as tl
 
-
+@triton.autotune(
+    configs=[
+        # Basic configurations
+        triton.Config({'BLOCK_SIZE': 128}, num_warps=4, num_stages=2),
+        triton.Config({'BLOCK_SIZE': 256}, num_warps=8, num_stages=2),
+        triton.Config({'BLOCK_SIZE': 512}, num_warps=8, num_stages=2),
+        triton.Config({'BLOCK_SIZE': 1024}, num_warps=8, num_stages=2),
+        # Larger block sizes to maximize memory bandwidth for large vectors
+        triton.Config({'BLOCK_SIZE': 2048}, num_warps=8, num_stages=2),
+        triton.Config({'BLOCK_SIZE': 4096}, num_warps=8, num_stages=2),
+        triton.Config({'BLOCK_SIZE': 8192}, num_warps=8, num_stages=2),
+        # Very large block sizes, may reduce stages to manage register pressure
+        triton.Config({'BLOCK_SIZE': 16384}, num_warps=8, num_stages=1),
+        triton.Config({'BLOCK_SIZE': 32768}, num_warps=8, num_stages=1),
+        triton.Config({'BLOCK_SIZE': 65536}, num_warps=8, num_stages=1),
+        triton.Config({'BLOCK_SIZE': 131072}, num_warps=8, num_stages=1),
+    ],
+    key=['n_elements'],
+)
 @triton.jit
 def add_kernel(
     x_ptr,
@@ -22,33 +40,36 @@ def add_kernel(
     n_elements,
     BLOCK_SIZE: tl.constexpr,
 ):
-    # Each program instance computes a block of the output.
+    \"\"\"
+    Triton kernel for element-wise vector addition.
+    \"\"\"
+    # Each program instance computes a block of BLOCK_SIZE elements.
     pid = tl.program_id(axis=0)
 
-    # Calculate memory offsets for the block of data this program instance will handle.
+    # Calculate memory offsets for the block this program will handle.
     block_start = pid * BLOCK_SIZE
     offsets = block_start + tl.arange(0, BLOCK_SIZE)
 
-    # Create a mask to prevent out-of-bounds memory accesses. This is essential
-    # for the last block if n_elements is not a multiple of BLOCK_SIZE.
+    # Create a mask to safely handle vectors where the size is not a multiple of BLOCK_SIZE.
+    # While not strictly necessary for N=2^24, it's a robust programming practice.
     mask = offsets < n_elements
 
-    # Load data from global memory (DRAM) to SRAM.
-    # The loads are masked to ensure we only read valid data.
+    # Load data from global memory (DRAM).
+    # The mask prevents out-of-bounds reads.
     x = tl.load(x_ptr + offsets, mask=mask)
     y = tl.load(y_ptr + offsets, mask=mask)
 
     # Perform the element-wise addition.
     output = x + y
 
-    # Store the result from SRAM back to global memory.
-    # The store is also masked to prevent out-of-bounds writes.
+    # Store the result back to global memory (DRAM).
+    # The mask prevents out-of-bounds writes.
     tl.store(output_ptr + offsets, output, mask=mask)
 
 
 def add(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     \"\"\"
-    Element-wise addition of two vectors.
+    Element-wise addition of two vectors using a Triton kernel.
     
     Args:
         x: Input tensor of shape (16777216,)
@@ -57,34 +78,19 @@ def add(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     Returns:
         Output tensor of shape (16777216,) with x + y
     \"\"\"
-    # Allocate the output tensor on the same device as the inputs.
+    n_elements = x.numel()
+    
+    # Allocate the output tensor.
     output = torch.empty_like(x)
     
-    # Check that the number of elements is as specified.
-    n_elements = x.numel()
-    assert n_elements == 16777216
-
-    # For a memory-bound kernel on large vectors, a large block size is optimal
-    # to maximize memory bandwidth utilization. A larger block size allows each
-    # streaming multiprocessor (SM) to process a larger contiguous chunk of memory,
-    # which helps hide memory latency and saturate the memory bus.
-    # 2^18 = 262144 is chosen as an aggressive but effective size for modern GPUs.
-    # For N=2^24, this results in (2^24 / 2^18) = 2^6 = 64 blocks, a good number
-    # to keep all SMs on a GPU like the L4 busy.
-    BLOCK_SIZE = 262144
+    # Define the grid for launching the kernel. It's a 1D grid.
+    # The number of programs is the total number of elements divided by the block size.
+    # triton.cdiv ensures we have enough blocks to cover all elements.
+    grid = lambda meta: (triton.cdiv(n_elements, meta['BLOCK_SIZE']),)
     
-    # Calculate the grid size. The grid is 1D and has a size equal to the
-    # number of blocks needed to cover all elements.
-    grid = (triton.cdiv(n_elements, BLOCK_SIZE),)
-
-    # Launch the Triton kernel.
-    add_kernel[grid](
-        x,
-        y,
-        output,
-        n_elements,
-        BLOCK_SIZE=BLOCK_SIZE,
-    )
+    # Launch the kernel. The autotuner will find the best BLOCK_SIZE.
+    add_kernel[grid](x, y, output, n_elements)
     
     return output
-"""}
+"""
+        return {"code": code}

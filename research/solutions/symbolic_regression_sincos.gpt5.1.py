@@ -2,155 +2,209 @@ import numpy as np
 
 try:
     from pysr import PySRRegressor
-    _HAS_PYSR = True
+
+    _HAVE_PYSR = True
 except Exception:
     PySRRegressor = None
-    _HAS_PYSR = False
+    _HAVE_PYSR = False
 
 
 class Solution:
     def __init__(self, **kwargs):
-        # PySR hyperparameters (can be overridden via kwargs)
-        self.niterations = kwargs.get("niterations", 40)
-        self.populations = kwargs.get("populations", 15)
-        self.population_size = kwargs.get("population_size", 33)
-        self.maxsize = kwargs.get("maxsize", 25)
-        self.random_state = kwargs.get("random_state", 42)
-        self.use_pysr = kwargs.get("use_pysr", True)
+        pass
 
-    def _fit_pysr(self, X: np.ndarray, y: np.ndarray):
-        if not _HAS_PYSR:
-            return None
-        try:
-            model = PySRRegressor(
-                niterations=self.niterations,
-                binary_operators=["+", "-", "*", "/"],
-                unary_operators=["sin", "cos", "exp", "log"],
-                populations=self.populations,
-                population_size=self.population_size,
-                maxsize=self.maxsize,
-                verbosity=0,
-                progress=False,
-                random_state=self.random_state,
-            )
-            model.fit(X, y, variable_names=["x1", "x2"])
+    def solve(self, X: np.ndarray, y: np.ndarray) -> dict:
+        X = np.asarray(X, dtype=float)
+        y = np.asarray(y, dtype=float).ravel()
 
-            # Try to get best equation and its complexity
-            best_expr = None
-            complexity = None
+        if _HAVE_PYSR:
             try:
-                best_eq = model.get_best()
-                if hasattr(best_eq, "sympy_format"):
-                    best_expr = best_eq.sympy_format
-                else:
-                    best_expr = model.sympy()
-                if hasattr(best_eq, "complexity"):
-                    complexity = int(best_eq.complexity)
+                return self._solve_with_pysr(X, y)
             except Exception:
-                best_expr = model.sympy()
-                try:
-                    eqs = model.equations_
-                    if eqs is not None and "complexity" in eqs.columns and len(eqs) > 0:
-                        complexity = int(eqs.iloc[0]["complexity"])
-                except Exception:
-                    complexity = None
+                pass
 
-            expression = str(best_expr)
-            predictions = model.predict(X)
+        return self._solve_with_trig_basis(X, y)
 
-            details = {}
-            if complexity is not None:
-                details["complexity"] = complexity
+    def _solve_with_pysr(self, X: np.ndarray, y: np.ndarray) -> dict:
+        model = PySRRegressor(
+            niterations=40,
+            binary_operators=["+", "-", "*", "/"],
+            unary_operators=["sin", "cos", "exp", "log"],
+            populations=10,
+            population_size=25,
+            maxsize=20,
+            verbosity=0,
+            progress=False,
+            random_state=42,
+        )
+        model.fit(X, y, variable_names=["x1", "x2"])
+        best_expr = model.sympy()
+        if best_expr is None:
+            raise RuntimeError("PySR did not return an expression.")
+        expression = str(best_expr)
 
-            return expression, predictions, details
-        except Exception:
-            return None
+        return {
+            "expression": expression,
+            "predictions": None,
+            "details": {},
+        }
 
-    def _fit_fallback(self, X: np.ndarray, y: np.ndarray):
+    def _solve_with_trig_basis(self, X: np.ndarray, y: np.ndarray) -> dict:
         x1 = X[:, 0]
         x2 = X[:, 1]
+        n = y.shape[0]
 
-        s1 = np.sin(x1)
-        c1 = np.cos(x1)
-        s2 = np.sin(x2)
-        c2 = np.cos(x2)
-        ones = np.ones_like(x1)
+        sin_x1 = np.sin(x1)
+        cos_x1 = np.cos(x1)
+        sin_x2 = np.sin(x2)
+        cos_x2 = np.cos(x2)
 
-        # Linear regression on basic trig basis
-        A = np.column_stack([s1, c1, s2, c2, ones])
-        coeffs, _, _, _ = np.linalg.lstsq(A, y, rcond=None)
-        a_s1, a_c1, a_s2, a_c2, c0 = coeffs
-
-        def simplify_coeff(val, tol=1e-3):
-            targets = [0.0, 1.0, -1.0, 0.5, -0.5, 2.0, -2.0]
-            for t in targets:
-                if abs(val - t) < tol:
-                    return t
-            return val
-
-        coeffs_simplified = [
-            simplify_coeff(a_s1),
-            simplify_coeff(a_c1),
-            simplify_coeff(a_s2),
-            simplify_coeff(a_c2),
-            simplify_coeff(c0),
+        base_exprs = [
+            "sin(x1)",               # 0
+            "cos(x1)",               # 1
+            "sin(x2)",               # 2
+            "cos(x2)",               # 3
+            "sin(x1)*cos(x2)",       # 4
+            "cos(x1)*sin(x2)",       # 5
+            "sin(x1 + x2)",          # 6
+            "sin(x1 - x2)",          # 7
+            "cos(x1 + x2)",          # 8
+            "cos(x1 - x2)",          # 9
         ]
-        a_s1, a_c1, a_s2, a_c2, c0 = coeffs_simplified
+
+        base_vals = [
+            sin_x1,
+            cos_x1,
+            sin_x2,
+            cos_x2,
+            sin_x1 * cos_x2,
+            cos_x1 * sin_x2,
+            np.sin(x1 + x2),
+            np.sin(x1 - x2),
+            np.cos(x1 + x2),
+            np.cos(x1 - x2),
+        ]
+
+        ones = np.ones(n, dtype=float)
+
+        # Intercept-only candidate
+        mean_y = float(np.mean(y))
+        best_pred = np.full(n, mean_y, dtype=float)
+        best_mse = float(np.mean((y - best_pred) ** 2))
+        best_indices = []
+        best_coeffs = np.array([mean_y], dtype=float)
+
+        # Single-basis models
+        for i, vals in enumerate(base_vals):
+            A = np.column_stack([vals, ones])
+            coefs, _, _, _ = np.linalg.lstsq(A, y, rcond=None)
+            y_hat = A @ coefs
+            mse = float(np.mean((y - y_hat) ** 2))
+            if mse < best_mse - 1e-12:
+                best_mse = mse
+                best_indices = [i]
+                best_coeffs = coefs
+                best_pred = y_hat
+
+        # Two-basis models
+        m = len(base_vals)
+        for i in range(m):
+            vi = base_vals[i]
+            for j in range(i + 1, m):
+                vj = base_vals[j]
+                A = np.column_stack([vi, vj, ones])
+                coefs, _, _, _ = np.linalg.lstsq(A, y, rcond=None)
+                y_hat = A @ coefs
+                mse = float(np.mean((y - y_hat) ** 2))
+                if mse < best_mse - 1e-12:
+                    best_mse = mse
+                    best_indices = [i, j]
+                    best_coeffs = coefs
+                    best_pred = y_hat
+
+        if not best_indices:
+            expression = self._format_float(best_coeffs[0])
+        else:
+            expression = self._build_expression_from_linear(
+                best_indices, best_coeffs, base_exprs
+            )
+
+        return {
+            "expression": expression,
+            "predictions": None,
+            "details": {},
+        }
+
+    def _format_float(self, x: float) -> str:
+        if not np.isfinite(x):
+            return "0"
+        if abs(x) < 1e-12:
+            x = 0.0
+        return format(float(x), ".12g")
+
+    def _build_expression_from_linear(
+        self,
+        base_indices,
+        coeffs,
+        base_exprs,
+    ) -> str:
+        tol_zero = 1e-6
+        tol_one = 1e-3
+
+        feature_coefs = np.array(coeffs[:-1], dtype=float)
+        intercept = float(coeffs[-1])
 
         terms = []
 
-        def add_term(coef, base):
-            if abs(coef) < 1e-8:
-                return
-            coef_str = f"{abs(coef):.10f}"
-            if not terms:
-                sign = "-" if coef < 0 else ""
-                terms.append(f"{sign}{coef_str}*{base}")
-            else:
-                op = "-" if coef < 0 else "+"
-                terms.append(f"{op} {coef_str}*{base}")
+        # Feature terms
+        for idx, coef in zip(base_indices, feature_coefs):
+            a = float(coef)
+            if abs(a) < tol_zero:
+                continue
 
-        add_term(a_s1, "sin(x1)")
-        add_term(a_c1, "cos(x1)")
-        add_term(a_s2, "sin(x2)")
-        add_term(a_c2, "cos(x2)")
+            base_expr = base_exprs[idx]
 
-        # Constant term
-        if abs(c0) >= 1e-8:
-            c_str = f"{abs(c0):.10f}"
-            if not terms:
-                sign = "-" if c0 < 0 else ""
-                terms.append(f"{sign}{c_str}")
+            sign = 1.0
+            if a < 0:
+                sign = -1.0
+                a = -a
+
+            if abs(a - 1.0) < tol_one:
+                coeff_str = ""
             else:
-                op = "-" if c0 < 0 else "+"
-                terms.append(f"{op} {c_str}")
+                coeff_str = self._format_float(a)
+
+            if coeff_str:
+                core = coeff_str + "*(" + base_expr + ")"
+            else:
+                core = "(" + base_expr + ")"
+
+            terms.append((sign, core))
+
+        # Intercept term
+        if abs(intercept) >= tol_zero:
+            c = float(intercept)
+            sign = 1.0
+            if c < 0:
+                sign = -1.0
+                c = -c
+            const_str = self._format_float(c)
+            terms.append((sign, const_str))
 
         if not terms:
-            expression = "0.0"
-        else:
-            expression = " ".join(terms)
+            return "0"
 
-        predictions = (
-            a_s1 * s1 + a_c1 * c1 + a_s2 * s2 + a_c2 * c2 + c0 * ones
-        )
+        expr_parts = []
+        for k, (sign, core) in enumerate(terms):
+            if k == 0:
+                if sign > 0:
+                    expr_parts.append(core)
+                else:
+                    expr_parts.append("-(" + core + ")")
+            else:
+                if sign > 0:
+                    expr_parts.append(" + " + core)
+                else:
+                    expr_parts.append(" - " + core)
 
-        return expression, predictions
-
-    def solve(self, X: np.ndarray, y: np.ndarray) -> dict:
-        if self.use_pysr and _HAS_PYSR:
-            result = self._fit_pysr(X, y)
-            if result is not None:
-                expression, predictions, details = result
-                return {
-                    "expression": expression,
-                    "predictions": predictions.tolist(),
-                    "details": details,
-                }
-
-        # Fallback: manual trig regression
-        expression, predictions = self._fit_fallback(X, y)
-        return {
-            "expression": expression,
-            "predictions": predictions.tolist(),
-            "details": {},
-        }
+        return "".join(expr_parts)

@@ -6,9 +6,9 @@ from sky_spot.utils import ClusterType
 
 
 class Solution(MultiRegionStrategy):
-    """Deadline-safe, cost-aware multi-region scheduling strategy."""
+    """Multi-region scheduling strategy that prioritizes Spot while guaranteeing deadline."""
 
-    NAME = "deadline_safe_spot_first"
+    NAME = "cant_be_late_v1"
 
     def solve(self, spec_path: str) -> "Solution":
         """
@@ -30,66 +30,69 @@ class Solution(MultiRegionStrategy):
             inter_task_overhead=[0.0],
         )
         super().__init__(args)
+
+        # Internal state for efficient tracking of work done
+        self._work_done = 0.0
+        self._segments_seen = 0
+        self._commit_to_on_demand = False
+
         return self
+
+    def _update_work_done(self) -> None:
+        """Incrementally update total work done from task_done_time segments."""
+        segments = self.task_done_time
+        n = len(segments)
+        if n > self._segments_seen:
+            # Sum only the new segments to keep amortized O(1) per step.
+            self._work_done += sum(segments[self._segments_seen:n])
+            self._segments_seen = n
 
     def _step(self, last_cluster_type: ClusterType, has_spot: bool) -> ClusterType:
         """
         Decide next action based on current state.
 
-        Strategy:
-        - Always guarantee finishing before the deadline under worst-case Spot behavior.
-        - Use Spot when available and when it's safe to "risk" one more timestep with
-          potentially no progress.
-        - When Spot is unavailable but it is still safe to wait, idle (NONE) to avoid
-          expensive On-Demand.
-        - Once it's no longer safe to risk delay, switch to On-Demand and never go
-          back to Spot.
+        Returns: ClusterType.SPOT, ClusterType.ON_DEMAND, or ClusterType.NONE
         """
-        env = self.env
+        # Update cached progress
+        self._update_work_done()
 
-        # Basic state
-        t = env.elapsed_seconds
-        gap = env.gap_seconds
-
-        # Total work done so far
-        done = sum(self.task_done_time) if self.task_done_time else 0.0
-        total_work = self.task_duration
-        remaining_work = max(total_work - done, 0.0)
-
-        # Time left until the hard deadline
-        time_left = self.deadline - t
-
-        # If task is finished or we are past the deadline, stop spending money.
-        if remaining_work <= 0 or time_left <= 0:
+        remaining_work = max(self.task_duration - self._work_done, 0.0)
+        if remaining_work <= 0.0:
+            # Task already completed; avoid incurring any further cost.
             return ClusterType.NONE
 
-        overhead = self.restart_overhead
+        current_time = self.env.elapsed_seconds
+        margin = self.deadline - current_time
 
-        # If even switching to On-Demand immediately would barely be enough (or not enough),
-        # choose On-Demand to maximize chance of meeting the deadline.
-        # This also handles any numerical / modeling edge cases safely.
-        if time_left <= overhead + remaining_work:
+        # If we've already passed the deadline (should be rare), further work is pointless for scoring.
+        if margin <= 0.0:
+            return ClusterType.NONE
+
+        # "Slack" is the time left beyond what is needed (ignoring future restart overheads).
+        slack = margin - remaining_work
+
+        # Determine a safety buffer that accounts for discretization (gap) and some extra cushion.
+        gap = getattr(self.env, "gap_seconds", 1.0)
+        base_buffer = 600.0  # 10 minutes base safety margin
+        dynamic_buffer = max(base_buffer, 2.0 * gap)
+
+        # To safely complete on On-Demand with discrete steps, we need at least:
+        # restart_overhead + gap of extra slack at commit time.
+        threshold_slack = self.restart_overhead + dynamic_buffer
+
+        # If we've already committed to On-Demand, keep using it to avoid extra restarts.
+        if self._commit_to_on_demand:
             return ClusterType.ON_DEMAND
 
-        # Check if it's safe (under worst-case) to "risk" one more timestep where we
-        # might make no progress (e.g., Spot preempted or we idle).
-        #
-        # Worst-case plan for one more risky step:
-        #   - We lose 'gap' seconds with zero progress.
-        #   - After that, we may need to pay one restart_overhead and finish all remaining work.
-        #
-        # So we require:
-        #   time_left >= gap + overhead + remaining_work
-        safe_to_risk_one_step = time_left >= (gap + overhead + remaining_work)
+        # Check whether it's time to commit to On-Demand to guarantee completion.
+        if slack <= threshold_slack:
+            self._commit_to_on_demand = True
+            return ClusterType.ON_DEMAND
 
-        if safe_to_risk_one_step:
-            # We have enough slack to afford one more "risky" timestep.
-            if has_spot:
-                # Use cheap Spot; any progress we get is a bonus.
-                return ClusterType.SPOT
-            else:
-                # No Spot right now, and it's safe to wait hoping Spot appears later.
-                return ClusterType.NONE
+        # Before committing to On-Demand, always prefer Spot if available.
+        if has_spot:
+            return ClusterType.SPOT
 
-        # Not safe to risk further delay: lock in On-Demand until finish.
-        return ClusterType.ON_DEMAND
+        # Spot unavailable and we still have enough slack:
+        # wait (NONE) to preserve budget, relying on future Spot or the eventual On-Demand fallback.
+        return ClusterType.NONE

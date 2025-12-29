@@ -1,6 +1,7 @@
 import json
-from argparse import Namespace
+import math
 import os
+from argparse import Namespace
 
 from sky_spot.strategies.multi_strategy import MultiRegionStrategy
 from sky_spot.utils import ClusterType
@@ -14,12 +15,6 @@ class Solution(MultiRegionStrategy):
     def solve(self, spec_path: str) -> "Solution":
         """
         Initialize the solution from spec_path config.
-
-        The spec file contains:
-        - deadline: deadline in hours
-        - duration: task duration in hours
-        - overhead: restart overhead in hours
-        - trace_files: list of trace file paths (one per region)
         """
         with open(spec_path) as f:
             config = json.load(f)
@@ -32,88 +27,87 @@ class Solution(MultiRegionStrategy):
         )
         super().__init__(args)
 
-        self.traces = []
-        for trace_filename in config["trace_files"]:
-            try:
-                with open(trace_filename) as f:
-                    trace_data = json.load(f)
-                    self.traces.append([bool(x) for x in trace_data])
-            except (IOError, json.JSONDecodeError):
-                self.traces.append([])
-
-        self.num_regions = len(self.traces)
-
-        if self.traces and self.traces[0] and self.deadline > 0:
-            num_trace_steps = len(self.traces[0])
-            if num_trace_steps > 0:
-                self.gap_seconds = self.deadline / num_trace_steps
+        self.spot_traces = []
+        spec_dir = os.path.dirname(spec_path)
+        for trace_file in config["trace_files"]:
+            if not os.path.isabs(trace_file):
+                trace_file_path = os.path.join(spec_dir, trace_file)
             else:
-                self.gap_seconds = 3600.0  # Fallback
-        else:
-            self.gap_seconds = 3600.0  # Fallback
+                trace_file_path = trace_file
 
-        self.panic_safety_buffer_seconds = 3600.0
-        self.wait_threshold_multiplier = 1.5
+            trace = []
+            with open(trace_file_path) as tf:
+                for line in tf:
+                    trace.append(bool(int(line.strip())))
+            self.spot_traces.append(trace)
+        
+        self.lookahead_hours = 3.0
+        self.safety_buffer_factor = 2.0
+        self.wait_slack_factor = 4.0
 
         return self
 
     def _step(self, last_cluster_type: ClusterType, has_spot: bool) -> ClusterType:
         """
         Decide next action based on current state.
-
-        Available attributes:
-        - self.env.get_current_region(): Get current region index
-        - self.env.get_num_regions(): Get total number of regions
-        - self.env.switch_region(idx): Switch to region by index
-        - self.env.elapsed_seconds: Current time elapsed
-        - self.task_duration: Total task duration needed (seconds)
-        - self.deadline: Deadline time (seconds)
-        - self.restart_overhead: Restart overhead (seconds)
-        - self.task_done_time: List of completed work segments
-        - self.remaining_restart_overhead: Current pending overhead
-
-        Returns: ClusterType.SPOT, ClusterType.ON_DEMAND, or ClusterType.NONE
         """
-        work_done = sum(self.task_done_time)
-        work_remaining = self.task_duration - work_done
-
-        if work_remaining <= 0:
+        work_rem = self.task_duration - sum(self.task_done_time)
+        if work_rem <= 0:
             return ClusterType.NONE
 
-        elapsed_time = self.env.elapsed_seconds
-        time_to_deadline = self.deadline - elapsed_time
+        time_now = self.env.elapsed_seconds
+        current_step = int(time_now / self.env.gap_seconds) if self.env.gap_seconds > 0 else 0
+        time_available = self.deadline - time_now
 
-        if time_to_deadline <= 0:
-            return ClusterType.NONE
-
-        required_time_on_demand = work_remaining
+        od_steps_needed = math.ceil(work_rem / self.env.gap_seconds)
+        time_for_od_work = od_steps_needed * self.env.gap_seconds
+        
+        potential_overhead = 0
         if last_cluster_type != ClusterType.ON_DEMAND:
-            required_time_on_demand += self.restart_overhead
+            potential_overhead = self.restart_overhead
+        
+        time_needed_to_finish_on_od = time_for_od_work + potential_overhead
+        safety_buffer = self.restart_overhead * self.safety_buffer_factor
 
-        if time_to_deadline <= required_time_on_demand + self.panic_safety_buffer_seconds:
+        if time_needed_to_finish_on_od + safety_buffer >= time_available:
             return ClusterType.ON_DEMAND
 
-        current_region = self.env.get_current_region()
-        
-        time_idx = int(elapsed_time // self.gap_seconds)
-        
         if has_spot:
             return ClusterType.SPOT
 
-        best_alt_region = -1
-        for i in range(1, self.num_regions):
-            region_to_check = (current_region + i) % self.num_regions
-            
-            trace = self.traces[region_to_check]
-            if time_idx < len(trace) and trace[time_idx]:
-                best_alt_region = region_to_check
-                break
+        current_region = self.env.get_current_region()
+        num_regions = self.env.get_num_regions()
         
-        if best_alt_region != -1:
-            self.env.switch_region(best_alt_region)
-            return ClusterType.SPOT
+        lookahead_steps = int((self.lookahead_hours * 3600) / self.env.gap_seconds)
+        lookahead_steps = max(1, lookahead_steps)
 
-        if time_to_deadline > work_remaining * self.wait_threshold_multiplier:
-            return ClusterType.NONE
+        promise = [0.0] * num_regions
+        for r_idx in range(num_regions):
+            trace = self.spot_traces[r_idx]
+            if current_step >= len(trace):
+                continue
+            
+            end_step = min(current_step + lookahead_steps, len(trace))
+            future_availability = trace[current_step:end_step]
+            
+            if future_availability:
+                promise[r_idx] = sum(future_availability) / len(future_availability)
+
+        best_region_idx = promise.index(max(promise))
+        
+        promise_gain = promise[best_region_idx] - promise[current_region]
+        cost_of_switch_in_promise = (self.restart_overhead / self.env.gap_seconds) / lookahead_steps
+        
+        if promise[best_region_idx] > 0 and best_region_idx != current_region and promise_gain > cost_of_switch_in_promise:
+            self.env.switch_region(best_region_idx)
+            if current_step < len(self.spot_traces[best_region_idx]) and self.spot_traces[best_region_idx][current_step]:
+                return ClusterType.SPOT
+            else:
+                return ClusterType.NONE
         else:
-            return ClusterType.ON_DEMAND
+            slack = time_available - time_needed_to_finish_on_od
+            wait_threshold = self.restart_overhead * self.wait_slack_factor
+            if slack > wait_threshold:
+                return ClusterType.NONE
+            else:
+                return ClusterType.ON_DEMAND

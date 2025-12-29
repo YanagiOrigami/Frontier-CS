@@ -1,6 +1,5 @@
 import json
 from argparse import Namespace
-from typing import Any
 
 from sky_spot.strategies.multi_strategy import MultiRegionStrategy
 from sky_spot.utils import ClusterType
@@ -53,9 +52,9 @@ class Solution(MultiRegionStrategy):
         # Your decision logic here
         if has_spot:
             return ClusterType.SPOT
-        if last_cluster_type == ClusterType.SPOT:
-            current = self.env.get_current_region()
-            num = self.env.get_num_regions()
-            new_r = (current + 1) % num
-            self.env.switch_region(new_r)
-        return ClusterType.ON_DEMAND
+        else:
+            num_regions = self.env.get_num_regions()
+            current_region = self.env.get_current_region()
+            next_region = (current_region + 1) % num_regions
+            self.env.switch_region(next_region)
+            return ClusterType.ON_DEMAND

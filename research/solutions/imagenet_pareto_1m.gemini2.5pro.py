@@ -1,8 +1,35 @@
 import torch
 import torch.nn as nn
 import torch.optim as optim
-import numpy as np
 from copy import deepcopy
+
+class ParetoMLP(nn.Module):
+    """
+    A Multi-Layer Perceptron designed to maximize parameter usage under a 1M limit.
+    Architecture:
+        - Input (384) -> Linear(1024) -> BN -> GELU -> Dropout
+        - -> Linear(520) -> BN -> GELU -> Dropout
+        - -> Linear(128) -> Output
+    Parameter Count: ~997,016
+    """
+    def __init__(self, input_dim: int, num_classes: int):
+        super().__init__()
+        self.layers = nn.Sequential(
+            nn.Linear(input_dim, 1024),
+            nn.BatchNorm1d(1024),
+            nn.GELU(),
+            nn.Dropout(0.4),
+
+            nn.Linear(1024, 520),
+            nn.BatchNorm1d(520),
+            nn.GELU(),
+            nn.Dropout(0.3),
+
+            nn.Linear(520, num_classes)
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.layers(x)
 
 class Solution:
     def solve(self, train_loader, val_loader, metadata: dict = None) -> torch.nn.Module:
@@ -17,9 +44,6 @@ class Solution:
                 - input_dim: int (384)
                 - param_limit: int (1,000,000)
                 - baseline_accuracy: float (0.8)
-                - train_samples: int
-                - val_samples: int
-                - test_samples: int
                 - device: str ("cpu")
         
         Returns:
@@ -29,125 +53,68 @@ class Solution:
         input_dim = metadata["input_dim"]
         num_classes = metadata["num_classes"]
 
-        # Hyperparameters chosen to balance model capacity and regularization
-        # within the parameter budget.
-        HIDDEN_DIM = 420
-        NUM_BLOCKS = 2
-        DROPOUT_P = 0.3
-        
-        LEARNING_RATE = 3e-4
-        WEIGHT_DECAY = 1e-4
-        EPOCHS = 350
-        PATIENCE = 40
-        MIXUP_ALPHA = 0.4
+        model = ParetoMLP(input_dim=input_dim, num_classes=num_classes).to(device)
 
-        # Model definition is nested to keep the solution self-contained.
-        class ResBlock(nn.Module):
-            def __init__(self, dim, dropout_p=0.2):
-                super().__init__()
-                self.block = nn.Sequential(
-                    nn.Linear(dim, dim),
-                    nn.BatchNorm1d(dim),
-                    nn.SiLU(),
-                    nn.Dropout(p=dropout_p),
-                    nn.Linear(dim, dim),
-                    nn.BatchNorm1d(dim)
-                )
-                self.activation = nn.SiLU()
+        # Training Hyperparameters
+        NUM_EPOCHS = 400
+        MAX_LR = 2e-3
+        WEIGHT_DECAY = 0.05
+        PATIENCE = 50
 
-            def forward(self, x):
-                return self.activation(x + self.block(x))
-
-        class Net(nn.Module):
-            def __init__(self, input_dim, num_classes, hidden_dim, num_blocks, dropout_p):
-                super().__init__()
-                self.input_layer = nn.Sequential(
-                    nn.Linear(input_dim, hidden_dim),
-                    nn.BatchNorm1d(hidden_dim),
-                    nn.SiLU(),
-                )
-                
-                blocks = [ResBlock(hidden_dim, dropout_p) for _ in range(num_blocks)]
-                self.blocks = nn.Sequential(*blocks)
-                
-                self.output_layer = nn.Linear(hidden_dim, num_classes)
-
-            def forward(self, x):
-                x = self.input_layer(x)
-                x = self.blocks(x)
-                x = self.output_layer(x)
-                return x
-
-        model = Net(
-            input_dim=input_dim,
-            num_classes=num_classes,
-            hidden_dim=HIDDEN_DIM,
-            num_blocks=NUM_BLOCKS,
-            dropout_p=DROPOUT_P
-        ).to(device)
-
-        optimizer = optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
         criterion = nn.CrossEntropyLoss()
-        scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=EPOCHS)
+        optimizer = optim.AdamW(model.parameters(), lr=MAX_LR, weight_decay=WEIGHT_DECAY)
+        
+        scheduler = optim.lr_scheduler.OneCycleLR(
+            optimizer,
+            max_lr=MAX_LR,
+            epochs=NUM_EPOCHS,
+            steps_per_epoch=len(train_loader)
+        )
 
-        def mixup_criterion(pred, y_a, y_b, lam):
-            return lam * criterion(pred, y_a) + (1 - lam) * criterion(pred, y_b)
-            
-        def mixup_data(x, y, alpha=1.0):
-            if alpha > 0:
-                lam = np.random.beta(alpha, alpha)
-            else:
-                lam = 1.0
-
-            batch_size = x.size()[0]
-            index = torch.randperm(batch_size).to(x.device)
-
-            mixed_x = lam * x + (1 - lam) * x[index, :]
-            y_a, y_b = y, y[index]
-            return mixed_x, y_a, y_b, lam
-
-        best_val_loss = float('inf')
-        patience_counter = 0
+        best_val_acc = 0.0
+        epochs_no_improve = 0
         best_model_state = None
 
-        for epoch in range(EPOCHS):
+        for epoch in range(NUM_EPOCHS):
+            # Training Phase
             model.train()
             for inputs, targets in train_loader:
                 inputs, targets = inputs.to(device), targets.to(device)
-                
-                mixed_inputs, targets_a, targets_b, lam = mixup_data(inputs, targets, MIXUP_ALPHA)
-                
+
                 optimizer.zero_grad()
-                outputs = model(mixed_inputs)
-                loss = mixup_criterion(outputs, targets_a, targets_b, lam)
-                
+                outputs = model(inputs)
+                loss = criterion(outputs, targets)
                 loss.backward()
                 optimizer.step()
-            
-            scheduler.step()
-            
+                scheduler.step()
+
+            # Validation Phase
             model.eval()
-            val_loss = 0.0
+            val_correct = 0
+            val_total = 0
             with torch.no_grad():
                 for inputs, targets in val_loader:
                     inputs, targets = inputs.to(device), targets.to(device)
                     outputs = model(inputs)
-                    loss = criterion(outputs, targets)
-                    val_loss += loss.item()
-            
-            val_loss /= len(val_loader)
+                    _, predicted = torch.max(outputs.data, 1)
+                    val_total += targets.size(0)
+                    val_correct += (predicted == targets).sum().item()
 
-            if val_loss < best_val_loss:
-                best_val_loss = val_loss
+            current_val_acc = val_correct / val_total
+
+            # Early Stopping and Best Model Checkpointing
+            if current_val_acc > best_val_acc:
+                best_val_acc = current_val_acc
                 best_model_state = deepcopy(model.state_dict())
-                patience_counter = 0
+                epochs_no_improve = 0
             else:
-                patience_counter += 1
+                epochs_no_improve += 1
 
-            if patience_counter >= PATIENCE:
+            if epochs_no_improve >= PATIENCE:
                 break
-        
+
+        # Load the best model state found during validation
         if best_model_state:
             model.load_state_dict(best_model_state)
-            
+
         return model

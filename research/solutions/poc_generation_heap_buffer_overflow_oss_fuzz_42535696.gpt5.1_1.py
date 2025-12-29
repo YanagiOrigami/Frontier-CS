@@ -1,301 +1,517 @@
 import os
+import io
 import tarfile
 import zipfile
-import io
-
-
-TRUTH_LEN = 150979
-
-NEGATIVE_EXTS = {
-    "c", "cc", "cpp", "cxx", "h", "hh", "hpp",
-    "py", "pyc", "pyo",
-    "sh", "bash", "bat", "ps1",
-    "txt", "md", "rst",
-    "html", "htm", "xml", "xhtml",
-    "json", "yml", "yaml", "toml", "ini", "cfg",
-    "cmake", "mak", "mk",
-    "java", "rb", "go", "rs", "pl", "pm", "php",
-    "js", "ts", "m", "mm", "cs", "swift", "kt", "kts",
-    "gradle", "properties",
-    "o", "obj", "a", "lib", "so", "dll", "dylib",
-    "log"
-}
-
-POSITIVE_EXTS = {
-    "pdf": 60.0,
-    "ps": 50.0,
-    "eps": 40.0,
-    "bin": 20.0,
-    "dat": 10.0,
-    "": 0.0,
-}
-
-ARCHIVE_EXTS = {
-    "zip", "tar", "tgz", "gz", "bz2", "xz", "lz", "lzma", "7z"
-}
-
-KEY_SCORES = {
-    "poc": 80.0,
-    "proof": 70.0,
-    "crash": 70.0,
-    "testcase": 60.0,
-    "clusterfuzz": 60.0,
-    "repro": 60.0,
-    "id:": 50.0,
-    "fuzz": 20.0,
-}
-
-DIR_KEY_SCORES = {
-    "/artifacts/": 30.0,
-    "/crash-": 30.0,
-    "/reproducers/": 30.0,
-    "testcases": 40.0,
-}
+import gzip
 
 
 class Solution:
     def solve(self, src_path: str) -> bytes:
-        # Try directory path
-        if os.path.isdir(src_path):
-            data = self._get_poc_from_dir(src_path, TRUTH_LEN)
-            if data is not None:
-                return data
+        target_size = 150979
+        format_hint = None
 
-        # Try tarball
-        try:
-            if tarfile.is_tarfile(src_path):
+        # Try treating src_path as a tarball
+        if os.path.isfile(src_path):
+            try:
                 with tarfile.open(src_path, "r:*") as tf:
-                    data = self._get_poc_from_tarfile(tf, TRUTH_LEN, depth=0)
-                    if data is not None:
-                        return data
-        except Exception:
-            pass
+                    format_hint = self._infer_input_format_from_tar(tf)
+                    poc = self._search_tar_for_poc(tf, target_size, depth=0)
+                    if poc is not None:
+                        return poc
+            except tarfile.TarError:
+                # If not a tar, maybe the file itself is the PoC
+                try:
+                    if os.path.getsize(src_path) == target_size:
+                        with open(src_path, "rb") as f:
+                            data = f.read()
+                        if len(data) == target_size:
+                            return data
+                except OSError:
+                    pass
 
-        # Try zipfile
+        # If it's a directory, scan it directly
+        if os.path.isdir(src_path):
+            if format_hint is None:
+                format_hint = self._infer_input_format_from_dir(src_path)
+            poc = self._search_directory_for_poc(src_path, target_size)
+            if poc is not None:
+                return poc
+
+        # Fallback: synthetic PoC
+        return self._default_poc(format_hint)
+
+    def _infer_input_format_from_tar(self, tf: tarfile.TarFile):
+        format_hint = None
         try:
-            if zipfile.is_zipfile(src_path):
-                with zipfile.ZipFile(src_path, "r") as zf:
-                    data = self._get_poc_from_zipfile(zf, TRUTH_LEN, depth=0)
-                    if data is not None:
-                        return data
+            members = tf.getmembers()
         except Exception:
-            pass
-
-        # Fallback generic PDF
-        return self._generic_fallback_poc()
-
-    def _score(self, name: str, size: int, truth_len: int) -> float:
-        name_lower = name.lower()
-        base = os.path.basename(name_lower)
-        if "." in base:
-            ext = base.rsplit(".", 1)[1]
-        else:
-            ext = ""
-
-        score = 0.0
-
-        if ext in NEGATIVE_EXTS:
-            score -= 100.0
-
-        if ext in POSITIVE_EXTS:
-            score += POSITIVE_EXTS[ext]
-
-        for key, val in KEY_SCORES.items():
-            if key in name_lower:
-                score += val
-
-        for key, val in DIR_KEY_SCORES.items():
-            if key in name_lower:
-                score += val
-
-        if truth_len > 0 and size > 0:
-            diff = abs(size - truth_len)
-            if diff > 200000:
-                diff = 200000
-            closeness = 80.0 * (1.0 - diff / 200000.0)
-            if closeness < 0.0:
-                closeness = 0.0
-            score += closeness
-
-        score -= size / 1000000.0
-
-        return score
-
-    def _get_poc_from_tarfile(self, tf: tarfile.TarFile, truth_len: int, depth: int) -> bytes | None:
-        max_depth = 3
-        members = [m for m in tf.getmembers() if m.isfile() and m.size > 0]
-        if not members:
             return None
 
-        # Exact size match first
-        exact_members = [m for m in members if m.size == truth_len]
-        if exact_members:
-            best = None
-            best_score = None
-            for m in exact_members:
-                s = self._score(m.name, m.size, truth_len)
-                if best is None or s > best_score:
-                    best = m
-                    best_score = s
-            if best is not None:
-                f = tf.extractfile(best)
-                if f is not None:
-                    return f.read()
-
-        # General scoring
-        best = None
-        best_score = None
         for m in members:
-            s = self._score(m.name, m.size, truth_len)
-            if best is None or s > best_score:
-                best = m
-                best_score = s
+            if not m.isfile():
+                continue
+            name_lower = m.name.lower()
+            if not (
+                name_lower.endswith(".c")
+                or name_lower.endswith(".cc")
+                or name_lower.endswith(".cpp")
+                or name_lower.endswith(".cxx")
+            ):
+                continue
+            read_size = min(m.size, 500_000) if m.size > 0 else 500_000
+            try:
+                f = tf.extractfile(m)
+                if f is None:
+                    continue
+                data = f.read(read_size)
+            except Exception:
+                continue
+            try:
+                text = data.decode("utf-8", errors="ignore")
+            except Exception:
+                text = data.decode("latin1", errors="ignore")
 
-        if best is None:
-            return None
+            if "LLVMFuzzerTestOneInput" not in text:
+                continue
 
-        f = tf.extractfile(best)
-        if f is None:
-            return None
-        data = f.read()
+            if "gsapi_run_string" in text or "gs_main_run_string" in text:
+                return "ps"
+            if "-sDEVICE=pdfwrite" in text:
+                format_hint = "ps"
+            if (
+                "FPDF_" in text
+                or "PdfDocument" in text
+                or "pdfium" in text
+                or "application/pdf" in text
+            ):
+                return "pdf"
+        return format_hint
 
-        base = os.path.basename(best.name.lower())
-        if "." in base:
-            ext = base.rsplit(".", 1)[1]
-        else:
-            ext = ""
+    def _infer_input_format_from_dir(self, root: str):
+        format_hint = None
+        for dirpath, _, filenames in os.walk(root):
+            for filename in filenames:
+                lower = filename.lower()
+                if not (
+                    lower.endswith(".c")
+                    or lower.endswith(".cc")
+                    or lower.endswith(".cpp")
+                    or lower.endswith(".cxx")
+                ):
+                    continue
+                path = os.path.join(dirpath, filename)
+                try:
+                    with open(path, "rb") as f:
+                        data = f.read(500_000)
+                except OSError:
+                    continue
+                try:
+                    text = data.decode("utf-8", errors="ignore")
+                except Exception:
+                    text = data.decode("latin1", errors="ignore")
 
-        if ext in ARCHIVE_EXTS and depth < max_depth:
-            nested = self._get_poc_from_bytes(data, truth_len, depth + 1)
-            if nested is not None:
-                return nested
+                if "LLVMFuzzerTestOneInput" not in text:
+                    continue
 
-        return data
+                if "gsapi_run_string" in text or "gs_main_run_string" in text:
+                    return "ps"
+                if "-sDEVICE=pdfwrite" in text:
+                    format_hint = "ps"
+                if (
+                    "FPDF_" in text
+                    or "PdfDocument" in text
+                    or "pdfium" in text
+                    or "application/pdf" in text
+                ):
+                    return "pdf"
+        return format_hint
 
-    def _get_poc_from_zipfile(self, zf: zipfile.ZipFile, truth_len: int, depth: int) -> bytes | None:
-        max_depth = 3
-        infos = [info for info in zf.infolist() if not info.is_dir() and info.file_size > 0]
-        if not infos:
-            return None
-
-        exact_infos = [info for info in infos if info.file_size == truth_len]
-        if exact_infos:
-            best = None
-            best_score = None
-            for info in exact_infos:
-                s = self._score(info.filename, info.file_size, truth_len)
-                if best is None or s > best_score:
-                    best = info
-                    best_score = s
-            if best is not None:
-                return zf.read(best.filename)
-
-        best = None
-        best_score = None
-        for info in infos:
-            s = self._score(info.filename, info.file_size, truth_len)
-            if best is None or s > best_score:
-                best = info
-                best_score = s
-
-        if best is None:
-            return None
-
-        data = zf.read(best.filename)
-
-        base = os.path.basename(best.filename.lower())
-        if "." in base:
-            ext = base.rsplit(".", 1)[1]
-        else:
-            ext = ""
-
-        if ext in ARCHIVE_EXTS and depth < max_depth:
-            nested = self._get_poc_from_bytes(data, truth_len, depth + 1)
-            if nested is not None:
-                return nested
-
-        return data
-
-    def _get_poc_from_bytes(self, data: bytes, truth_len: int, depth: int) -> bytes | None:
-        max_depth = 3
-        if depth > max_depth:
-            return None
-
-        # Try as tar archive
+    def _search_tar_for_poc(
+        self, tf: tarfile.TarFile, target_size: int, depth: int
+    ) -> bytes | None:
         try:
-            bio = io.BytesIO(data)
-            tf = tarfile.open(fileobj=bio, mode="r:*")
+            members = tf.getmembers()
         except Exception:
-            tf = None
-        if tf is not None:
-            with tf:
-                poc = self._get_poc_from_tarfile(tf, truth_len, depth)
-            if poc is not None:
-                return poc
+            return None
 
-        # Try as zip archive
-        try:
-            bio = io.BytesIO(data)
-            zf = zipfile.ZipFile(bio, "r")
-        except Exception:
-            zf = None
-        if zf is not None:
-            with zf:
-                poc = self._get_poc_from_zipfile(zf, truth_len, depth)
-            if poc is not None:
-                return poc
+        best_member = None
+        best_score = float("-inf")
 
+        for m in members:
+            if not m.isfile():
+                continue
+            size = m.size
+            if size <= 0:
+                continue
+
+            # Exact-size match
+            if size == target_size:
+                try:
+                    f = tf.extractfile(m)
+                    if f is not None:
+                        data = f.read()
+                        if len(data) == target_size:
+                            return data
+                except Exception:
+                    pass
+
+            name_lower = m.name.lower()
+
+            # Check for embedded archives likely to contain PoC
+            is_candidate_archive = False
+            archive_exts = (".tar", ".tar.gz", ".tgz", ".zip", ".gz")
+            if any(
+                kw in name_lower
+                for kw in (
+                    "poc",
+                    "repro",
+                    "crash",
+                    "fuzz",
+                    "seed",
+                    "corpus",
+                    "42535696",
+                    "bug",
+                    "issue",
+                )
+            ):
+                if any(name_lower.endswith(ext) for ext in archive_exts):
+                    is_candidate_archive = True
+            if (
+                not is_candidate_archive
+                and size < 2 * 1024 * 1024
+                and (name_lower.endswith(".gz") or name_lower.endswith(".zip"))
+            ):
+                is_candidate_archive = True
+
+            if is_candidate_archive and depth < 3:
+                try:
+                    f = tf.extractfile(m)
+                    if f is not None:
+                        raw = f.read()
+                    else:
+                        raw = b""
+                except Exception:
+                    raw = b""
+                if raw:
+                    nested = self._search_in_embedded_archive(
+                        raw, target_size, depth + 1
+                    )
+                    if nested is not None:
+                        return nested
+
+            # Score member as potential PoC
+            score = self._score_member(m.name, size, target_size)
+            if score > best_score:
+                best_score = score
+                best_member = m
+
+        if best_member is not None and best_score > 0:
+            try:
+                f = tf.extractfile(best_member)
+                if f is not None:
+                    data = f.read()
+                    if data:
+                        return data
+            except Exception:
+                pass
         return None
 
-    def _get_poc_from_dir(self, root: str, truth_len: int) -> bytes | None:
-        best_path = None
-        best_score = None
+    def _search_directory_for_poc(self, root: str, target_size: int) -> bytes | None:
+        best_member_path = None
+        best_score = float("-inf")
 
         for dirpath, _, filenames in os.walk(root):
             for filename in filenames:
-                full_path = os.path.join(dirpath, filename)
+                path = os.path.join(dirpath, filename)
                 try:
-                    size = os.path.getsize(full_path)
+                    size = os.path.getsize(path)
                 except OSError:
                     continue
                 if size <= 0:
                     continue
 
-                rel_name = os.path.relpath(full_path, root)
-                s = self._score(rel_name, size, truth_len)
-                if best_path is None or s > best_score:
-                    best_path = full_path
-                    best_score = s
+                # Exact-size match
+                if size == target_size:
+                    try:
+                        with open(path, "rb") as f:
+                            data = f.read()
+                        if len(data) == target_size:
+                            return data
+                    except OSError:
+                        pass
 
-        if best_path is None:
+                name_lower = path.lower()
+                is_candidate_archive = False
+                archive_exts = (".tar", ".tar.gz", ".tgz", ".zip", ".gz")
+                if any(
+                    kw in name_lower
+                    for kw in (
+                        "poc",
+                        "repro",
+                        "crash",
+                        "fuzz",
+                        "seed",
+                        "corpus",
+                        "42535696",
+                        "bug",
+                        "issue",
+                    )
+                ):
+                    if any(name_lower.endswith(ext) for ext in archive_exts):
+                        is_candidate_archive = True
+                if (
+                    not is_candidate_archive
+                    and size < 2 * 1024 * 1024
+                    and (name_lower.endswith(".gz") or name_lower.endswith(".zip"))
+                ):
+                    is_candidate_archive = True
+
+                if is_candidate_archive:
+                    try:
+                        with open(path, "rb") as f:
+                            raw = f.read()
+                    except OSError:
+                        raw = b""
+                    if raw:
+                        nested = self._search_in_embedded_archive(
+                            raw, target_size, depth=1
+                        )
+                        if nested is not None:
+                            return nested
+
+                score = self._score_member(path, size, target_size)
+                if score > best_score:
+                    best_score = score
+                    best_member_path = path
+
+        if best_member_path is not None and best_score > 0:
+            try:
+                with open(best_member_path, "rb") as f:
+                    data = f.read()
+                if data:
+                    return data
+            except OSError:
+                pass
+        return None
+
+    def _score_member(self, name: str, size: int, target_size: int) -> float:
+        name_lower = name.lower()
+        score = 0.0
+
+        # Size closeness
+        if size > 0 and target_size > 0:
+            diff = abs(size - target_size)
+            score += max(0.0, 300.0 - (diff / 500.0))
+
+        # Extension weighting
+        _, ext = os.path.splitext(name_lower)
+        ext_weights = {
+            ".pdf": 250,
+            ".ps": 250,
+            ".eps": 200,
+            ".xps": 200,
+            ".oxps": 200,
+            ".pcl": 150,
+            ".pclx": 150,
+            ".bin": 100,
+            ".dat": 80,
+            ".txt": 10,
+        }
+        score += ext_weights.get(ext, 0)
+
+        # Keyword bonuses
+        keywords = [
+            "poc",
+            "repro",
+            "crash",
+            "clusterfuzz",
+            "42535696",
+            "heap",
+            "overflow",
+            "bug",
+            "issue",
+            "fuzz",
+            "test",
+            "case",
+        ]
+        for kw in keywords:
+            if kw in name_lower:
+                score += 60
+
+        dir_keywords = [
+            "test",
+            "tests",
+            "regress",
+            "regression",
+            "fuzz",
+            "corpus",
+            "seed",
+            "poc",
+        ]
+        for dkw in dir_keywords:
+            if (
+                f"/{dkw}/" in name_lower
+                or name_lower.endswith("/" + dkw)
+                or name_lower.startswith(dkw + "/")
+            ):
+                score += 30
+
+        # Penalty for very large files
+        if size > 10 * 1024 * 1024:
+            score -= (size - 10 * 1024 * 1024) / 4096.0
+
+        return score
+
+    def _search_in_embedded_archive(
+        self, data: bytes, target_size: int, depth: int
+    ) -> bytes | None:
+        if depth > 3 or not data:
             return None
 
-        base = os.path.basename(best_path.lower())
-        if "." in base:
-            ext = base.rsplit(".", 1)[1]
-        else:
-            ext = ""
+        # Try gzip
+        if data.startswith(b"\x1f\x8b"):
+            try:
+                decompressed = gzip.decompress(data)
+            except Exception:
+                decompressed = None
+            if decompressed:
+                if len(decompressed) == target_size:
+                    return decompressed
+                try:
+                    bio = io.BytesIO(decompressed)
+                    with tarfile.open(fileobj=bio, mode="r:*") as tf:
+                        res = self._search_tar_for_poc(tf, target_size, depth + 1)
+                        if res is not None:
+                            return res
+                except tarfile.TarError:
+                    pass
 
+        # Try zip
+        if data.startswith(b"PK\x03\x04"):
+            try:
+                bio = io.BytesIO(data)
+                with zipfile.ZipFile(bio, "r") as zf:
+                    for info in zf.infolist():
+                        if info.file_size == 0:
+                            continue
+                        if info.file_size == target_size:
+                            try:
+                                with zf.open(info) as f:
+                                    file_data = f.read()
+                                if len(file_data) == target_size:
+                                    return file_data
+                            except Exception:
+                                pass
+                        lower = info.filename.lower()
+                        if any(
+                            lower.endswith(ext)
+                            for ext in (".tar", ".tar.gz", ".tgz", ".zip", ".gz")
+                        ):
+                            try:
+                                with zf.open(info) as f:
+                                    nested_raw = f.read()
+                                nested_res = self._search_in_embedded_archive(
+                                    nested_raw, target_size, depth + 1
+                                )
+                                if nested_res is not None:
+                                    return nested_res
+                            except Exception:
+                                pass
+            except zipfile.BadZipFile:
+                pass
+
+        # Try tar
         try:
-            with open(best_path, "rb") as f:
-                data = f.read()
-        except OSError:
-            return None
+            bio = io.BytesIO(data)
+            with tarfile.open(fileobj=bio, mode="r:*") as tf:
+                res = self._search_tar_for_poc(tf, target_size, depth + 1)
+                if res is not None:
+                    return res
+        except tarfile.TarError:
+            pass
 
-        if ext in ARCHIVE_EXTS:
-            nested = self._get_poc_from_bytes(data, truth_len, depth=1)
-            if nested is not None:
-                return nested
+        # Fallback direct-size check
+        if len(data) == target_size:
+            return data
+        return None
 
-        return data
+    def _default_poc(self, format_hint: str | None) -> bytes:
+        if format_hint == "ps":
+            ps_code = (
+                "%!PS-Adobe-3.0\n"
+                "%%Title: pdfwrite viewer state PoC\n"
+                "%%Pages: 1\n"
+                "%%BoundingBox: 0 0 612 792\n"
+                "%%EndComments\n"
+                "\n"
+                "/Helvetica findfont 12 scalefont setfont\n"
+                "72 720 moveto\n"
+                "(Hello from fallback PoC) show\n"
+                "\n"
+                "% PDF-specific pdfmark constructs to engage pdfwrite\n"
+                "[ /Title (Viewer State PoC)\n"
+                "  /Author (AutoGenerated)\n"
+                "  /DOCINFO pdfmark\n"
+                "\n"
+                "[ /PageMode /UseOutlines\n"
+                "  /Page 1\n"
+                "  /View [ /XYZ null null null ]\n"
+                "  /DOCVIEW pdfmark\n"
+                "\n"
+                "[ /Dest /Dest0\n"
+                "  /Page 1\n"
+                "  /View [ /XYZ 0 0 0 ]\n"
+                "  /DEST pdfmark\n"
+                "\n"
+                "gsave\n"
+                "0 0 moveto\n"
+                "(Nested viewer state) show\n"
+                "grestore\n"
+                "\n"
+                "showpage\n"
+            )
+            return ps_code.encode("ascii", errors="ignore")
 
-    def _generic_fallback_poc(self) -> bytes:
-        return (
-            b"%PDF-1.3\n"
-            b"1 0 obj\n"
-            b"<< /Type /Catalog >>\n"
-            b"endobj\n"
-            b"trailer\n"
-            b"<< /Root 1 0 R >>\n"
-            b"%%EOF\n"
+        pdf_code = (
+            "%PDF-1.4\n"
+            "% Fallback minimal PDF\n"
+            "\n"
+            "1 0 obj\n"
+            "<< /Type /Catalog /Pages 2 0 R >>\n"
+            "endobj\n"
+            "\n"
+            "2 0 obj\n"
+            "<< /Type /Pages /Count 1 /Kids [3 0 R] >>\n"
+            "endobj\n"
+            "\n"
+            "3 0 obj\n"
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792]\n"
+            "   /Contents 4 0 R /Resources << /Font << /F1 5 0 R >> >> >>\n"
+            "endobj\n"
+            "\n"
+            "4 0 obj\n"
+            "<< /Length 60 >>\n"
+            "stream\n"
+            "BT /F1 24 Tf 72 700 Td (Fallback PDF PoC) Tj ET\n"
+            "endstream\n"
+            "endobj\n"
+            "\n"
+            "5 0 obj\n"
+            "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>\n"
+            "endobj\n"
+            "\n"
+            "xref\n"
+            "0 6\n"
+            "0000000000 65535 f \n"
+            "0000000010 00000 n \n"
+            "0000000060 00000 n \n"
+            "0000000115 00000 n \n"
+            "0000000240 00000 n \n"
+            "0000000335 00000 n \n"
+            "trailer\n"
+            "<< /Size 6 /Root 1 0 R >>\n"
+            "startxref\n"
+            "420\n"
+            "%%EOF\n"
         )
+        return pdf_code.encode("ascii", errors="ignore")

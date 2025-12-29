@@ -1,135 +1,139 @@
 import torch
+import flashinfer
+import triton
+import triton.language as tl
 
 class Solution:
     def solve(self, spec_path: str = None) -> dict:
-        code = r"""
+        return {"code": self.code()}
+
+    def code(self):
+        return """
 import torch
+import flashinfer
 import triton
 import triton.language as tl
-import flashinfer
 
 @triton.jit
-def _qknorm_fused_kernel(
+def _fused_qknorm_kernel(
     Q_ptr, K_ptr, W_ptr,
     Q_out_ptr, K_out_ptr,
     stride_q_row, stride_k_row,
-    stride_q_out, stride_k_out,
-    N_q, N_k,
-    H, eps,
+    stride_q_out_row, stride_k_out_row,
+    N_q, N_k, D,
+    eps,
     BLOCK_SIZE: tl.constexpr
 ):
     pid = tl.program_id(0)
     
-    # Load Weights (once per block, broadcast to rows)
-    off = tl.arange(0, BLOCK_SIZE)
-    mask = off < H
-    w = tl.load(W_ptr + off, mask=mask, other=0.0).to(tl.float32)
-    
-    # Determine if we are processing Q or K
+    # Determine if we are processing Q (0..N_q-1) or K (N_q..N_q+N_k-1)
     if pid < N_q:
-        # Process Q
+        # Process Query
         row_idx = pid
-        src_ptr = Q_ptr + row_idx * stride_q_row
-        dst_ptr = Q_out_ptr + row_idx * stride_q_out
+        # Calculate pointers
+        row_start_ptr = Q_ptr + row_idx * stride_q_row
+        out_start_ptr = Q_out_ptr + row_idx * stride_q_out_row
         
-        # Load Data
-        x = tl.load(src_ptr + off, mask=mask, other=0.0).to(tl.float32)
+        # Load Q row
+        cols = tl.arange(0, BLOCK_SIZE)
+        mask = cols < D
+        x_ptr = row_start_ptr + cols
+        x = tl.load(x_ptr, mask=mask, other=0.0).to(tl.float32)
         
-        # RMSNorm computation
-        x_sq = x * x
-        mean_sq = tl.sum(x_sq, axis=0) / H
-        rstd = tl.rsqrt(mean_sq + eps)
-        out = x * rstd * w
+        # Compute RMSNorm
+        # x_norm = x * w / sqrt(mean(x^2) + eps)
+        var = tl.sum(x * x, axis=0) / D
+        rstd = 1 / tl.sqrt(var + eps)
+        
+        # Load weight
+        w_ptr = W_ptr + cols
+        w = tl.load(w_ptr, mask=mask, other=0.0).to(tl.float32)
+        
+        # Normalize and scale
+        y = x * rstd * w
         
         # Store
-        tl.store(dst_ptr + off, out, mask=mask)
+        tl.store(out_start_ptr + cols, y, mask=mask)
         
-    elif pid < N_q + N_k:
-        # Process K
+    else:
+        # Process Key
         row_idx = pid - N_q
-        src_ptr = K_ptr + row_idx * stride_k_row
-        dst_ptr = K_out_ptr + row_idx * stride_k_out
         
-        # Load Data
-        x = tl.load(src_ptr + off, mask=mask, other=0.0).to(tl.float32)
+        # Calculate pointers
+        row_start_ptr = K_ptr + row_idx * stride_k_row
+        out_start_ptr = K_out_ptr + row_idx * stride_k_out_row
         
-        # RMSNorm computation
-        x_sq = x * x
-        mean_sq = tl.sum(x_sq, axis=0) / H
-        rstd = tl.rsqrt(mean_sq + eps)
-        out = x * rstd * w
+        # Load K row
+        cols = tl.arange(0, BLOCK_SIZE)
+        mask = cols < D
+        x_ptr = row_start_ptr + cols
+        x = tl.load(x_ptr, mask=mask, other=0.0).to(tl.float32)
+        
+        # Compute RMSNorm
+        var = tl.sum(x * x, axis=0) / D
+        rstd = 1 / tl.sqrt(var + eps)
+        
+        # Load weight (same weight for Q and K)
+        w_ptr = W_ptr + cols
+        w = tl.load(w_ptr, mask=mask, other=0.0).to(tl.float32)
+        
+        # Normalize and scale
+        y = x * rstd * w
         
         # Store
-        tl.store(dst_ptr + off, out, mask=mask)
+        tl.store(out_start_ptr + cols, y, mask=mask)
 
 def qknorm(q: torch.Tensor, k: torch.Tensor, norm_weight: torch.Tensor):
-    # Function to check layout and get flattening params without copy if possible
-    def get_flatten_params(t):
-        # Must be contiguous in the last dimension (HeadDim) for vectorization
-        if t.stride(-1) != 1:
-            t = t.contiguous()
-        
-        H = t.shape[-1]
-        
-        # Check if the tensor can be treated as a 2D matrix of (N, H)
-        # where rows are separated by a constant stride.
-        if t.dim() > 1:
-            stride_row = t.stride(-2)
-            # Check regularity of higher dimensions (batch/seq dims)
-            # Logic: For the tensor to be viewable as (N, H) with stride_row,
-            # higher dimensions must be flattened/merged correctly.
-            # E.g. stride[i] == shape[i+1] * stride[i+1]
-            is_regular = True
-            for i in range(t.dim() - 3, -1, -1):
-                if t.stride(i) != t.shape[i+1] * t.stride(i+1):
-                    is_regular = False
-                    break
-            
-            if is_regular:
-                # Optimized path: Use strides directly (handles QKV fusion slice gaps)
-                return t, t.numel() // H, stride_row
-            else:
-                # Fallback: Contiguous copy required due to complex layout
-                t = t.contiguous()
-                return t, t.numel() // H, H
-        else:
-            # 1D Tensor (H,)
-            return t, 1, H
-
-    q_in, N_q, stride_q = get_flatten_params(q)
-    k_in, N_k, stride_k = get_flatten_params(k)
-
-    # Allocate outputs
-    # Using torch.empty creates contiguous tensors, which is efficient
-    q_o = torch.empty(q.shape, device=q.device, dtype=q.dtype)
-    k_o = torch.empty(k.shape, device=k.device, dtype=k.dtype)
+    # Flatten Q and K to (N, D) while preserving the last dimension D.
+    # We attempt to create a view. If not contiguous in memory logic, we use reshape (copy).
+    # To maximize performance on strided inputs, we'd ideally handle strides in kernel,
+    # but the fused launch + triton overhead reduction is the primary gain here.
     
-    H = norm_weight.shape[0]
+    # Check if last dimension is contiguous (stride 1) for optimal vector load
+    # If q or k are not last-dim contiguous, we force contiguous.
+    if q.stride(-1) != 1:
+        q = q.contiguous()
+    if k.stride(-1) != 1:
+        k = k.contiguous()
+        
+    # Reshape to 2D: (Total_Rows, Hidden_Dim)
+    # We use reshape() which returns a view if possible, or a copy if needed.
+    # Since we ensured last dim is contiguous, view logic often works if dims are packed.
+    # If not packed (gaps between rows), reshape might copy.
+    q_2d = q.reshape(-1, q.shape[-1])
+    k_2d = k.reshape(-1, k.shape[-1])
     
-    # Kernel Launch Configuration
-    # We fuse Q and K processing into a single grid launch to reduce overhead
+    # We must ensure the 2D view is effectively contiguous for the kernel to use a simple stride.
+    # If reshape caused a copy, it's contiguous. If it's a view of a strided tensor,
+    # stride(0) might be non-uniform? No, view(-1, D) requires compatible strides.
+    # If view fails, reshape copies. So q_2d is safe to use with stride(0).
+    
+    # However, to avoid implicit copies in reshape when possible, we can check.
+    # But for robustness and strict 2D grid mapping, we stick to this.
+    
+    N_q, D = q_2d.shape
+    N_k = k_2d.shape[0]
+    
+    # Alloc outputs
+    q_out = torch.empty_like(q_2d)
+    k_out = torch.empty_like(k_2d)
+    
+    # Heuristic: Block size
+    # Power of 2 >= D
+    BLOCK_SIZE = triton.next_power_of_2(D)
+    
+    # Launch Grid: Total rows of Q + Total rows of K
     grid = (N_q + N_k,)
-    BLOCK_SIZE = triton.next_power_of_2(H)
     
-    _qknorm_fused_kernel[grid](
-        q_in, k_in, norm_weight,
-        q_o, k_o,
-        stride_q, stride_k,
-        H, H, # Output strides are H (contiguous)
-        N_q, N_k,
-        H, 1e-6,
+    _fused_qknorm_kernel[grid](
+        q_2d, k_2d, norm_weight,
+        q_out, k_out,
+        q_2d.stride(0), k_2d.stride(0),
+        q_out.stride(0), k_out.stride(0),
+        N_q, N_k, D,
+        1e-6,
         BLOCK_SIZE=BLOCK_SIZE
     )
     
-    return q_o, k_o
-
-def default_qknorm(q: torch.Tensor, k: torch.Tensor, norm_weight: torch.Tensor):
-    q_2d = q.contiguous().view(-1, q.shape[-1])
-    k_2d = k.contiguous().view(-1, k.shape[-1])
-    q_o = torch.empty_like(q_2d)
-    k_o = torch.empty_like(k_2d)
-    flashinfer.norm.rmsnorm(q_2d, norm_weight, out=q_o)
-    flashinfer.norm.rmsnorm(k_2d, norm_weight, out=k_o)
-    return q_o.view(q.shape), k_o.view(k.shape)
+    return q_out.view(q.shape), k_out.view(k.shape)
 """
-        return {"code": code}

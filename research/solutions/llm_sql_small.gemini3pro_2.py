@@ -13,66 +13,125 @@ class Solution:
         distinct_value_threshold: float = 0.7,
         parallel: bool = True,
     ) -> pd.DataFrame:
-        # Convert all data to string type for uniform handling and concatenation
-        df_str = df.astype(str)
+        # Create a working copy
+        df_curr = df.copy()
         
-        # Apply column merges if specified
+        # 1. Apply Column Merges
         if col_merge:
             for group in col_merge:
-                # Identify columns in the group that exist in the DataFrame
-                valid_cols = [c for c in group if c in df_str.columns]
-                if not valid_cols:
-                    continue
-                
-                # Merge columns by concatenating their string values
-                new_col_name = "".join(valid_cols)
-                merged_vals = df_str[valid_cols[0]]
-                for c in valid_cols[1:]:
-                    merged_vals = merged_vals + df_str[c]
-                
-                # Replace original columns with the merged column
-                df_str = df_str.drop(columns=valid_cols)
-                df_str[new_col_name] = merged_vals
-
-        # Optimize column order to maximize prefix hit rate
-        # We use a greedy strategy: select columns that minimize the number of distinct 
-        # prefix rows (branching factor) at each step.
+                # Filter columns that are actually in the dataframe
+                valid_group = [c for c in group if c in df_curr.columns]
+                if len(valid_group) > 1:
+                    # Construct merged column values
+                    merged_series = df_curr[valid_group[0]].astype(str)
+                    for c in valid_group[1:]:
+                        merged_series = merged_series + df_curr[c].astype(str)
+                    
+                    # Create new column name
+                    new_col = "|".join(valid_group)
+                    
+                    # Assign new column
+                    df_curr[new_col] = merged_series
+                    
+                    # Drop original columns
+                    df_curr = df_curr.drop(columns=valid_group)
         
-        # Factorize columns to integers for faster cardinality checks
-        df_codes = df_str.apply(lambda x: pd.factorize(x)[0])
+        # 2. Preprocess columns
+        cols = list(df_curr.columns)
+        n_rows = len(df_curr)
         
-        candidates = list(df_codes.columns)
-        ordered_cols = []
-        n_rows = len(df_codes)
-        
-        # Track current number of unique rows to enable early stopping
-        current_unique_count = 1
-        
-        while candidates:
-            # If all rows are already unique, order of remaining columns doesn't improve hit rate
-            if n_rows > 0 and current_unique_count == n_rows:
-                ordered_cols.extend(candidates)
-                break
-                
-            best_col = None
-            min_uniques = float('inf')
+        if n_rows == 0 or not cols:
+            return df_curr
             
-            # Greedy search for the next best column
+        # Precompute integer codes and string lengths
+        col_codes = {}
+        col_lengths = {}
+        
+        for c in cols:
+            vals = df_curr[c].astype(str).values
+            codes, uniques = pd.factorize(vals, sort=False)
+            unique_lens = np.array([len(s) for s in uniques])
+            col_codes[c] = codes
+            col_lengths[c] = unique_lens[codes]
+            
+        # 3. Greedy Optimization
+        remaining_cols = set(cols)
+        ordered_cols = []
+        
+        # Initial partition contains all row indices [0, ..., N-1]
+        partitions = [np.arange(n_rows)]
+        
+        while remaining_cols:
+            best_col = None
+            max_score = -1
+            
+            # If partitions are all singletons, order doesn't matter for the metric
+            if not partitions:
+                ordered_cols.extend(sorted(list(remaining_cols)))
+                break
+            
+            candidates = sorted(list(remaining_cols))
+            
             for col in candidates:
-                # Check uniqueness of the potential new prefix
-                subset = ordered_cols + [col]
-                n_unique = len(df_codes[subset].drop_duplicates())
+                current_score = 0
+                c_codes = col_codes[col]
+                c_lens = col_lengths[col]
                 
-                if n_unique < min_uniques:
-                    min_uniques = n_unique
+                # Evaluate score across all current partitions
+                for indices in partitions:
+                    if len(indices) < 2:
+                        continue
+                        
+                    subset_codes = c_codes[indices]
+                    subset_lens = c_lens[indices]
+                    
+                    # Find first occurrences of each code in this partition
+                    # indices are sorted by row index, so first occurrence corresponds to earliest row j
+                    _, first_indices = np.unique(subset_codes, return_index=True)
+                    
+                    # Score is total length minus length of first occurrences
+                    # (Only subsequent occurrences contribute to LCP with a predecessor)
+                    total_len = np.sum(subset_lens)
+                    first_len = np.sum(subset_lens[first_indices])
+                    current_score += (total_len - first_len)
+                
+                if current_score > max_score:
+                    max_score = current_score
                     best_col = col
             
+            # If we didn't find a column (should not happen unless empty), pick first
             if best_col is None:
-                ordered_cols.extend(candidates)
-                break
+                best_col = candidates[0]
                 
             ordered_cols.append(best_col)
-            candidates.remove(best_col)
-            current_unique_count = min_uniques
+            remaining_cols.remove(best_col)
             
-        return df_str[ordered_cols]
+            # Update partitions based on the chosen column
+            new_partitions = []
+            b_codes = col_codes[best_col]
+            
+            for indices in partitions:
+                if len(indices) < 2:
+                    continue
+                
+                subset_codes = b_codes[indices]
+                
+                # Stable sort by code to group identical values while preserving time order
+                sort_idx = np.argsort(subset_codes, kind='stable')
+                sorted_codes = subset_codes[sort_idx]
+                sorted_indices = indices[sort_idx]
+                
+                # Split where codes change
+                split_indices = np.flatnonzero(sorted_codes[1:] != sorted_codes[:-1]) + 1
+                
+                if len(split_indices) > 0:
+                    sub_groups = np.split(sorted_indices, split_indices)
+                    for grp in sub_groups:
+                        if len(grp) > 1:
+                            new_partitions.append(grp)
+                else:
+                    new_partitions.append(sorted_indices)
+            
+            partitions = new_partitions
+            
+        return df_curr[ordered_cols]

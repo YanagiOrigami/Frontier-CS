@@ -1,5 +1,6 @@
 import json
 from argparse import Namespace
+from typing import List
 
 from sky_spot.strategies.multi_strategy import MultiRegionStrategy
 from sky_spot.utils import ClusterType
@@ -19,21 +20,27 @@ class Solution(MultiRegionStrategy):
             inter_task_overhead=[0.0],
         )
         super().__init__(args)
-        self.consecutive_no_spot = 0
         return self
 
     def _step(self, last_cluster_type: ClusterType, has_spot: bool) -> ClusterType:
-        curr_region = self.env.get_current_region()
-        num_regions = self.env.get_num_regions()
+        if self.env.elapsed_seconds >= self.deadline:
+            return ClusterType.NONE
+
+        remaining_work = self.task_duration - sum(self.task_done_time)
+        if remaining_work <= 0:
+            return ClusterType.NONE
+
+        remaining_time = self.deadline - self.env.elapsed_seconds
+        safe_ratio = remaining_work / max(remaining_time, 1.0)
+
+        if safe_ratio > 0.9:
+            return ClusterType.ON_DEMAND
+
         if has_spot:
-            self.consecutive_no_spot = 0
             return ClusterType.SPOT
         else:
-            self.consecutive_no_spot += 1
-            if self.consecutive_no_spot >= 2 and num_regions > 1:
-                new_region = (curr_region + 1) % num_regions
-                self.env.switch_region(new_region)
-                self.consecutive_no_spot = 0
-                return ClusterType.ON_DEMAND
-            else:
-                return ClusterType.ON_DEMAND
+            current = self.env.get_current_region()
+            num = self.env.get_num_regions()
+            next_r = (current + 1) % num
+            self.env.switch_region(next_r)
+            return ClusterType.ON_DEMAND

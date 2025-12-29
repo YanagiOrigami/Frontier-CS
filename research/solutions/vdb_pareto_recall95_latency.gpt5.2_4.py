@@ -1,104 +1,95 @@
 import os
-from typing import Tuple, Optional, List
-
 import numpy as np
+from typing import Tuple
 
 try:
     import faiss  # type: ignore
-except Exception as e:  # pragma: no cover
+except Exception:  # pragma: no cover
     faiss = None
 
 
 class YourIndexClass:
     def __init__(self, dim: int, **kwargs):
         self.dim = int(dim)
-        self.nlist = int(kwargs.get("nlist", 4096))
-        self.nprobe = int(kwargs.get("nprobe", kwargs.get("ef_search", 96)))
-        self.train_size = int(kwargs.get("train_size", 200_000))
-        self.min_train_points = int(kwargs.get("min_train_points", max(10_000, self.nlist * 20)))
-        self.threads = int(kwargs.get("threads", min(8, os.cpu_count() or 1)))
+
+        self.num_threads = int(kwargs.get("num_threads", min(8, os.cpu_count() or 1)))
+
+        self.M = int(kwargs.get("M", 32))
+        self.ef_construction = int(kwargs.get("ef_construction", 200))
+        self.ef_search = int(kwargs.get("ef_search", 128))
+
         self.metric = kwargs.get("metric", "l2")
+        if self.metric not in ("l2", "L2"):
+            raise ValueError("Only L2 metric is supported in this implementation.")
 
-        if faiss is None:
-            raise RuntimeError("faiss is required for this solution but could not be imported.")
+        self.index = None
+        self.ntotal = 0
 
-        if self.metric not in ("l2", "L2", faiss.METRIC_L2):
-            raise ValueError("Only L2 metric is supported.")
-
-        faiss.omp_set_num_threads(self.threads)
-
-        self.quantizer = faiss.IndexFlatL2(self.dim)
-        self.index = faiss.IndexIVFFlat(self.quantizer, self.dim, self.nlist, faiss.METRIC_L2)
-        self.index.nprobe = self.nprobe
-
-        self._pending: List[np.ndarray] = []
-        self._pending_rows: int = 0
-        self._trained: bool = False
-
-    def _maybe_train(self) -> None:
-        if self._trained or self.index.is_trained:
-            self._trained = True
-            return
-        if self._pending_rows < self.min_train_points:
+        if faiss is None:  # pragma: no cover
+            self._xb = None
             return
 
-        if len(self._pending) == 1:
-            xall = self._pending[0]
-        else:
-            xall = np.vstack(self._pending)
+        faiss.omp_set_num_threads(self.num_threads)
 
-        n = xall.shape[0]
-        ts = min(self.train_size, n)
-        if ts < self.nlist:
-            ts = n
-        if ts < self.nlist:
-            return
-
-        if ts == n:
-            train_x = xall
-        else:
-            rs = np.random.RandomState(12345)
-            idx = rs.choice(n, size=ts, replace=False)
-            train_x = xall[idx]
-
-        train_x = np.ascontiguousarray(train_x, dtype=np.float32)
-        self.index.train(train_x)
-        self._trained = True
-
-        for chunk in self._pending:
-            self.index.add(chunk)
-        self._pending.clear()
-        self._pending_rows = 0
+        self.index = faiss.IndexHNSWFlat(self.dim, self.M, faiss.METRIC_L2)
+        self.index.hnsw.efConstruction = self.ef_construction
+        self.index.hnsw.efSearch = self.ef_search
+        try:
+            self.index.hnsw.search_bounded_queue = 1
+        except Exception:
+            pass
 
     def add(self, xb: np.ndarray) -> None:
-        if xb is None:
-            return
         xb = np.ascontiguousarray(xb, dtype=np.float32)
         if xb.ndim != 2 or xb.shape[1] != self.dim:
             raise ValueError(f"xb must have shape (N, {self.dim})")
 
-        if self._trained or self.index.is_trained:
-            self._trained = True
-            self.index.add(xb)
+        if faiss is None:  # pragma: no cover
+            if self._xb is None:
+                self._xb = xb.copy()
+            else:
+                self._xb = np.vstack((self._xb, xb))
+            self.ntotal = int(self._xb.shape[0])
             return
 
-        self._pending.append(xb)
-        self._pending_rows += xb.shape[0]
-        self._maybe_train()
+        self.index.add(xb)
+        self.ntotal = int(self.index.ntotal)
 
     def search(self, xq: np.ndarray, k: int) -> Tuple[np.ndarray, np.ndarray]:
+        k = int(k)
         if k <= 0:
             raise ValueError("k must be >= 1")
-        if not (self._trained or self.index.is_trained):
-            self._maybe_train()
-        if not (self._trained or self.index.is_trained):
-            raise RuntimeError("Index is not trained; add more vectors before searching.")
 
         xq = np.ascontiguousarray(xq, dtype=np.float32)
         if xq.ndim != 2 or xq.shape[1] != self.dim:
             raise ValueError(f"xq must have shape (nq, {self.dim})")
 
-        D, I = self.index.search(xq, int(k))
+        if faiss is None:  # pragma: no cover
+            if self._xb is None or self._xb.shape[0] == 0:
+                nq = xq.shape[0]
+                D = np.full((nq, k), np.inf, dtype=np.float32)
+                I = np.full((nq, k), -1, dtype=np.int64)
+                return D, I
+            xb = self._xb
+            xq_norm = (xq * xq).sum(axis=1, keepdims=True)
+            xb_norm = (xb * xb).sum(axis=1)[None, :]
+            dist = xq_norm + xb_norm - 2.0 * (xq @ xb.T)
+            I = np.argpartition(dist, kth=min(k - 1, dist.shape[1] - 1), axis=1)[:, :k]
+            row = np.arange(dist.shape[0])[:, None]
+            dsel = dist[row, I]
+            order = np.argsort(dsel, axis=1)
+            I = I[row, order].astype(np.int64, copy=False)
+            D = dsel[row, order].astype(np.float32, copy=False)
+            return D, I
+
+        if self.index is None or self.index.ntotal == 0:
+            nq = xq.shape[0]
+            D = np.full((nq, k), np.inf, dtype=np.float32)
+            I = np.full((nq, k), -1, dtype=np.int64)
+            return D, I
+
+        self.index.hnsw.efSearch = self.ef_search
+        D, I = self.index.search(xq, k)
         if D.dtype != np.float32:
             D = D.astype(np.float32, copy=False)
         if I.dtype != np.int64:

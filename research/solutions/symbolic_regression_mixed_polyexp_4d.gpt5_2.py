@@ -2,259 +2,238 @@ import numpy as np
 
 class Solution:
     def __init__(self, **kwargs):
-        self.deg = int(kwargs.get("deg", 3))
-        self.max_terms = int(kwargs.get("max_terms", 25))
-        self.alpha_grid_size = int(kwargs.get("alpha_grid_size", 30))
-        self.top_k_alphas = int(kwargs.get("top_k_alphas", 6))
-        self.rcond = float(kwargs.get("rcond", 1e-9))
-        self.coeff_threshold_rel = float(kwargs.get("coeff_threshold_rel", 1e-4))
+        self.random_state = kwargs.get("random_state", 42)
+        self.max_passes = kwargs.get("max_passes", 12)
+        self.b_clip = kwargs.get("b_clip", (0.0, 10.0))
+        self.subsample_size = kwargs.get("subsample_size", 4000)
+        self.scale_factors = kwargs.get("scale_factors", [0.5, 0.7, 0.9, 1.1, 1.4, 2.0])
+        self.abs_candidates = kwargs.get("abs_candidates", [0.0, 0.02, 0.05, 0.1, 0.2, 0.5, 1.0, 2.0, 5.0])
+        self.init_b_values = kwargs.get("init_b_values", [0.0, 0.1, 0.3, 0.5, 1.0, 2.0])
 
-    def _build_monomials(self, X, deg):
-        n = X.shape[0]
-        # Precompute powers up to deg for each variable
-        powX = []
-        for j in range(4):
-            pj = [np.ones(n)]
-            if deg >= 1:
-                pj.append(X[:, j].copy())
-                for p in range(2, deg + 1):
-                    pj.append(pj[-1] * X[:, j])
-            powX.append(pj)
+    def _build_features(self, X):
+        x1 = X[:, 0]
+        x2 = X[:, 1]
+        x3 = X[:, 2]
+        x4 = X[:, 3]
+        ones = np.ones_like(x1)
+        x1_2 = x1 * x1
+        x2_2 = x2 * x2
+        x3_2 = x3 * x3
+        x4_2 = x4 * x4
 
-        # Generate exponent tuples for monomials with total degree <= deg
-        exps = []
-        for s in range(deg + 1):
-            for e1 in range(s + 1):
-                rem1 = s - e1
-                for e2 in range(rem1 + 1):
-                    rem2 = rem1 - e2
-                    for e3 in range(rem2 + 1):
-                        e4 = rem2 - e3
-                        exps.append((e1, e2, e3, e4))
-
-        # Build numeric features and corresponding strings
-        feats = []
-        terms_str = []
-        for e in exps:
-            f = powX[0][e[0]] * powX[1][e[1]] * powX[2][e[2]] * powX[3][e[3]]
-            feats.append(f)
-            parts = []
-            if e[0] == 1:
-                parts.append("x1")
-            elif e[0] > 1:
-                parts.append(f"x1**{e[0]}")
-            if e[1] == 1:
-                parts.append("x2")
-            elif e[1] > 1:
-                parts.append(f"x2**{e[1]}")
-            if e[2] == 1:
-                parts.append("x3")
-            elif e[2] > 1:
-                parts.append(f"x3**{e[2]}")
-            if e[3] == 1:
-                parts.append("x4")
-            elif e[3] > 1:
-                parts.append(f"x4**{e[3]}")
-            if len(parts) == 0:
-                terms_str.append("1")
-            else:
-                terms_str.append("*".join(parts))
-
-        B = np.column_stack(feats)
-        return B, terms_str
-
-    def _lstsq(self, A, y):
-        try:
-            coef, _, _, _ = np.linalg.lstsq(A, y, rcond=self.rcond)
-        except Exception:
-            # Fallback to pseudo-inverse
-            coef = np.linalg.pinv(A) @ y
-        return coef
-
-    def _fit_with_alphas(self, B, y, r2, alphas):
-        # Alphas is a list (possibly empty)
-        n, m = B.shape
-        blocks = [B]
-        g_cache = {}
-        for a in alphas:
-            if a not in g_cache:
-                g_cache[a] = np.exp(-a * r2)
-            g = g_cache[a]
-            blocks.append(B * g[:, None])
-        A = np.hstack(blocks)
-        coef = self._lstsq(A, y)
-        pred = A @ coef
-        mse = float(np.mean((y - pred) ** 2))
-        return mse, coef, A
-
-    def _select_alphas(self, B, y, r2, alpha_candidates):
-        # Baseline (no gaussian)
-        best_mse0, best_coef0, best_A0 = self._fit_with_alphas(B, y, r2, [])
-        best_single = (best_mse0, [], best_coef0, best_A0)
-
-        # Single alpha search
-        single_results = []
-        for a in alpha_candidates:
-            if a <= 0:
-                continue
-            mse, coef, A = self._fit_with_alphas(B, y, r2, [a])
-            single_results.append((mse, [a], coef, A))
-        if single_results:
-            single_results.sort(key=lambda t: t[0])
-            best_single = single_results[0]
-
-        # Two alphas search over top-k single candidates
-        best_double = (best_single[0], best_single[1], best_single[2], best_single[3])
-        top_k = min(self.top_k_alphas, len(single_results))
-        if top_k >= 1:
-            top_alphas = [single_results[i][1][0] for i in range(top_k)]
-            seen_pairs = set()
-            for i in range(top_k):
-                for j in range(i, top_k):
-                    a1, a2 = top_alphas[i], top_alphas[j]
-                    pair_key = (min(a1, a2), max(a1, a2))
-                    if pair_key in seen_pairs:
-                        continue
-                    seen_pairs.add(pair_key)
-                    mse, coef, A = self._fit_with_alphas(B, y, r2, [a1, a2])
-                    if mse < best_double[0]:
-                        best_double = (mse, [a1, a2], coef, A)
-
-        # Choose best among baseline, single, double
-        candidates = [
-            (best_mse0, [], best_coef0, best_A0),
-            best_single,
-            best_double,
+        # Order: [1, x1, x2, x3, x4, x1^2, x2^2, x3^2, x4^2, x1x2, x1x3, x1x4, x2x3, x2x4, x3x4]
+        psi = np.column_stack([
+            ones,
+            x1, x2, x3, x4,
+            x1_2, x2_2, x3_2, x4_2,
+            x1 * x2, x1 * x3, x1 * x4,
+            x2 * x3, x2 * x4, x3 * x4,
+        ])
+        monoms = [
+            "1",
+            "x1", "x2", "x3", "x4",
+            "x1**2", "x2**2", "x3**2", "x4**2",
+            "x1*x2", "x1*x3", "x1*x4",
+            "x2*x3", "x2*x4", "x3*x4",
         ]
-        candidates.sort(key=lambda t: t[0])
-        return candidates[0]
+        X2 = np.column_stack([x1_2, x2_2, x3_2, x4_2])
+        return psi, monoms, X2
 
-    def _build_expression(self, kept_blocks, kept_idx_in_block, kept_coefs, base_terms_str, alphas):
-        # kept_blocks: list of block indices (0=base, 1=first gaussian, 2=second gaussian)
-        # kept_idx_in_block: list of indices within base terms (0..M-1)
-        # kept_coefs: list of coefficients
-        # alphas: list of gaussian alphas (length K)
-        # Construct g strings
-        r2_str = "(x1**2 + x2**2 + x3**2 + x4**2)"
-        g_strs = []
-        for a in alphas:
-            g_strs.append(f"exp(-({float(a):.12g})*{r2_str})")
+    def _fit_given_b(self, psi, X2, y, b):
+        g = np.exp(-X2.dot(b))
+        H = psi * g[:, None]
+        # lstsq for stability
+        a, _, _, _ = np.linalg.lstsq(H, y, rcond=None)
+        pred = H.dot(a)
+        mse = np.mean((y - pred) ** 2)
+        return a, mse, pred, g
+
+    def _coordinate_search(self, psi, X2, y, b_start):
+        b = np.array(b_start, dtype=float).copy()
+        b = np.clip(b, self.b_clip[0], self.b_clip[1])
+        best_a, best_mse, _, _ = self._fit_given_b(psi, X2, y, b)
+        improved_global = True
+        passes = 0
+        while improved_global and passes < self.max_passes:
+            improved_global = False
+            passes += 1
+            for j in range(4):
+                current_bj = b[j]
+                best_local_mse = best_mse
+                best_local_bj = current_bj
+                # Prepare candidate list
+                cand_vals = []
+                for s in self.scale_factors:
+                    cand_vals.append(current_bj * s)
+                cand_vals.extend(self.abs_candidates)
+                # Clip and deduplicate candidates
+                cand_vals = [min(max(v, self.b_clip[0]), self.b_clip[1]) for v in cand_vals]
+                cand_vals = np.unique(np.array(cand_vals))
+                for cand in cand_vals:
+                    if abs(cand - current_bj) < 1e-12:
+                        continue
+                    b_try = b.copy()
+                    b_try[j] = cand
+                    a_try, mse_try, _, _ = self._fit_given_b(psi, X2, y, b_try)
+                    if mse_try + 1e-12 < best_local_mse:
+                        best_local_mse = mse_try
+                        best_local_bj = cand
+                        best_a = a_try
+                if best_local_mse + 1e-12 < best_mse:
+                    b[j] = best_local_bj
+                    best_mse = best_local_mse
+                    improved_global = True
+        # Final fit with best b
+        best_a, best_mse, _, _ = self._fit_given_b(psi, X2, y, b)
+        return b, best_a, best_mse
+
+    def _polynomial_only(self, psi, y):
+        a, _, _, _ = np.linalg.lstsq(psi, y, rcond=None)
+        pred = psi.dot(a)
+        mse = np.mean((y - pred) ** 2)
+        return a, mse, pred
+
+    def _threshold_and_refit(self, psi, y, X2, b, a, keep_min=1, rel_thresh=1e-3):
+        # Threshold small coefficients to reduce complexity and refit using retained features
+        a_abs = np.abs(a)
+        max_a = np.max(a_abs) if a_abs.size > 0 else 0.0
+        if max_a == 0:
+            return a
+        thresh = rel_thresh * max_a
+        keep_idx = np.where(a_abs >= thresh)[0]
+        if keep_idx.size < keep_min:
+            keep_idx = np.argsort(-a_abs)[:keep_min]
+        keep_idx = np.sort(keep_idx)
+        g = np.exp(-X2.dot(b))
+        Hk = psi[:, keep_idx] * g[:, None]
+        ak, _, _, _ = np.linalg.lstsq(Hk, y, rcond=None)
+        a_new = np.zeros_like(a)
+        a_new[keep_idx] = ak
+        return a_new
+
+    def _build_expression(self, a, b, monoms, coeff_prec=12):
+        # Build polynomial string
+        def fmt(v):
+            if abs(v) < 1e-14:
+                v = 0.0
+            s = f"{v:.{coeff_prec}g}"
+            if s == "-0":
+                s = "0"
+            return s
 
         terms = []
-        for blk, j, c in zip(kept_blocks, kept_idx_in_block, kept_coefs):
-            c_val = float(c)
-            if abs(c_val) < 1e-15:
+        for coeff, m in zip(a, monoms):
+            if abs(coeff) < 1e-12:
                 continue
-            base_str = base_terms_str[j]
-            if blk == 0:
-                # base polynomial term
-                if base_str == "1":
-                    term_str = f"{c_val:.12g}"
-                else:
-                    term_str = f"({c_val:.12g})*({base_str})"
+            if m == "1":
+                term = fmt(coeff)
             else:
-                g_idx = blk - 1
-                g_str = g_strs[g_idx]
-                if base_str == "1":
-                    term_str = f"({c_val:.12g})*{g_str}"
-                else:
-                    term_str = f"({c_val:.12g})*(({base_str})*{g_str})"
-            terms.append(term_str)
+                term = f"{fmt(coeff)}*{m}"
+            terms.append(term)
 
         if not terms:
-            # Fallback to zero
-            return "0"
-        expression = " + ".join(terms)
+            poly_str = "0"
+        else:
+            # Combine with proper signs
+            poly_str = terms[0]
+            for t in terms[1:]:
+                if t.startswith("-"):
+                    poly_str += " - " + t[1:]
+                else:
+                    poly_str += " + " + t
+
+        # Build exponent string
+        exp_terms = []
+        xb = ["x1", "x2", "x3", "x4"]
+        for bi, xi in zip(b, xb):
+            if abs(bi) < 1e-14:
+                continue
+            exp_terms.append(f"{fmt(bi)}*{xi}**2")
+        if not exp_terms:
+            exponent = "0"
+        else:
+            expr = exp_terms[0]
+            for t in exp_terms[1:]:
+                if t.startswith("-"):
+                    expr += " - " + t[1:]
+                else:
+                    expr += " + " + t
+            exponent = expr
+
+        if exponent == "0":
+            expression = f"({poly_str})"
+        else:
+            expression = f"({poly_str})*exp(-({exponent}))"
         return expression
 
     def solve(self, X: np.ndarray, y: np.ndarray) -> dict:
-        X = np.asarray(X, dtype=float)
-        y = np.asarray(y, dtype=float).ravel()
-        n, d = X.shape
-        if d != 4:
-            # Fallback: simple linear if dimensions mismatch
-            A_lin = np.column_stack([X, np.ones(n)])
-            coef, _, _, _ = np.linalg.lstsq(A_lin, y, rcond=None)
-            a, b, c, dcoef, e = coef
-            expression = f"{a:.6f}*x1 + {b:.6f}*x2 + {c:.6f}*x3 + {dcoef:.6f}*x4 + {e:.6f}"
-            preds = A_lin @ coef
-            return {
-                "expression": expression,
-                "predictions": preds.tolist(),
-                "details": {}
-            }
+        rng = np.random.default_rng(self.random_state)
+        n = X.shape[0]
+        psi_full, monoms, X2_full = self._build_features(X)
 
-        # Build polynomial basis up to degree 3
-        try:
-            B, base_terms_str = self._build_monomials(X, self.deg)
-        except Exception:
-            # Fallback to degree 2 if memory or other issues
-            B, base_terms_str = self._build_monomials(X, 2)
+        # Baseline polynomial-only model
+        a_poly, mse_poly, pred_poly = self._polynomial_only(psi_full, y)
 
-        # Compute r2
-        r2 = np.sum(X * X, axis=1)
+        # Subsample for b search to speed up
+        if n > self.subsample_size:
+            idx = rng.choice(n, size=self.subsample_size, replace=False)
+            psi = psi_full[idx]
+            X2 = X2_full[idx]
+            y_sub = y[idx]
+        else:
+            psi = psi_full
+            X2 = X2_full
+            y_sub = y
 
-        # Alpha candidates (avoid degenerate median)
-        med_r2 = float(np.median(r2))
-        if med_r2 <= 1e-12:
-            med_r2 = 1.0
-        # Log-spaced around a wide range scaled by median r2
-        try:
-            alphas_nonzero = (10.0 ** np.linspace(-3, 3, self.alpha_grid_size)) / med_r2
-        except Exception:
-            alphas_nonzero = (10.0 ** np.linspace(-3, 3, 30)) / med_r2
+        # Try multiple initializations for b, run coordinate search, keep best
+        best_b = np.zeros(4, dtype=float)
+        best_a = a_poly.copy()
+        best_mse = mse_poly
 
-        # Select alphas and fit
-        mse_best, chosen_alphas, coef_best, A_best = self._select_alphas(B, y, r2, list(alphas_nonzero))
+        for b0 in self.init_b_values:
+            b_start = np.array([b0, b0, b0, b0], dtype=float)
+            b_fit, a_fit, mse_fit = self._coordinate_search(psi, X2, y_sub, b_start)
+            if mse_fit + 1e-12 < best_mse:
+                best_mse = mse_fit
+                best_b = b_fit
+                best_a = a_fit
 
-        # Prune coefficients to reduce complexity
-        w = coef_best.copy()
-        abs_w = np.abs(w)
-        if abs_w.size == 0:
-            # Fallback to constant mean
-            c0 = float(np.mean(y))
-            expression = f"{c0:.12g}"
-            preds = np.full_like(y, c0)
-            return {"expression": expression, "predictions": preds.tolist(), "details": {}}
+        # Refit best model on full data
+        a_full, mse_full, _, _ = self._fit_given_b(psi_full, X2_full, y, best_b)
 
-        # Determine block structure
-        M = B.shape[1]
-        n_blocks = 1 + len(chosen_alphas)  # base + gaussians
-        # Map linear index to (block, idx_in_block)
-        blocks_for_cols = []
-        idx_in_block = []
-        for blk in range(n_blocks):
-            for j in range(M):
-                blocks_for_cols.append(blk)
-                idx_in_block.append(j)
-        blocks_for_cols = np.array(blocks_for_cols)
-        idx_in_block = np.array(idx_in_block)
+        # Optionally threshold and refit to reduce complexity
+        a_full_thresh = self._threshold_and_refit(psi_full, y, X2_full, best_b, a_full, keep_min=3, rel_thresh=1e-3)
+        # Evaluate after thresholding
+        g_full = np.exp(-X2_full.dot(best_b))
+        pred_thresh = (psi_full.dot(a_full_thresh)) * g_full
+        mse_thresh = np.mean((y - pred_thresh) ** 2)
 
-        # Thresholding
-        thr = float(np.max(abs_w)) * self.coeff_threshold_rel
-        keep_mask = abs_w >= thr
-        keep_idx = np.where(keep_mask)[0]
-        if keep_idx.size == 0:
-            keep_idx = np.array([int(np.argmax(abs_w))])
+        # Compare polynomial-only vs exponential model
+        final_use_poly = False
+        final_a = a_full_thresh
+        final_b = best_b
+        final_pred = pred_thresh
+        final_mse = mse_thresh
 
-        # Limit to max_terms
-        if keep_idx.size > self.max_terms:
-            order = np.argsort(-abs_w)[:self.max_terms]
-            keep_idx = np.sort(order)
+        if final_mse > mse_full + 1e-10:
+            # Thresholding degraded; use non-thresholded
+            final_a = a_full
+            final_pred = (psi_full.dot(final_a)) * g_full
+            final_mse = np.mean((y - final_pred) ** 2)
 
-        # Refit with reduced feature set
-        A_reduced = A_best[:, keep_idx]
-        w_reduced = self._lstsq(A_reduced, y)
-        preds = A_reduced @ w_reduced
+        # If exponential model is not better than polynomial-only, use polynomial-only
+        if final_mse > mse_poly * 0.999 + 1e-12:
+            final_use_poly = True
 
-        kept_blocks = blocks_for_cols[keep_idx].tolist()
-        kept_idx_in_block = idx_in_block[keep_idx].tolist()
-        kept_coefs = w_reduced.tolist()
-
-        expression = self._build_expression(kept_blocks, kept_idx_in_block, kept_coefs, base_terms_str, chosen_alphas)
+        if final_use_poly:
+            expression = self._build_expression(a_poly, np.zeros(4), monoms)
+            predictions = pred_poly
+        else:
+            expression = self._build_expression(final_a, final_b, monoms)
+            predictions = final_pred
 
         return {
             "expression": expression,
-            "predictions": preds.tolist(),
+            "predictions": predictions.tolist(),
             "details": {}
         }

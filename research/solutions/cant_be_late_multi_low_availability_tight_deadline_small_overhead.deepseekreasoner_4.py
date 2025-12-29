@@ -1,23 +1,14 @@
 import json
-from argparse import Namespace
 import math
-from typing import List
+from argparse import Namespace
+from typing import List, Tuple
 
 from sky_spot.strategies.multi_strategy import MultiRegionStrategy
 from sky_spot.utils import ClusterType
 
 
 class Solution(MultiRegionStrategy):
-    NAME = "cost_aware_deadline_scheduler"
-
-    def __init__(self, args):
-        super().__init__(args)
-        self.region_stats = []
-        self.last_decision = None
-        self.spot_price = 0.9701
-        self.ondemand_price = 3.06
-        self.spot_availability_history = []
-        self.region_switch_penalty = 0
+    NAME = "cbl_strategy"
 
     def solve(self, spec_path: str) -> "Solution":
         with open(spec_path) as f:
@@ -30,119 +21,145 @@ class Solution(MultiRegionStrategy):
             inter_task_overhead=[0.0],
         )
         super().__init__(args)
+
+        self.on_demand_price = 3.06
+        self.spot_price = 0.9701
+        self.price_ratio = self.on_demand_price / self.spot_price
+
         return self
-
-    def _update_region_stats(self, current_region: int, has_spot: bool):
-        if len(self.region_stats) <= current_region:
-            for _ in range(current_region - len(self.region_stats) + 1):
-                self.region_stats.append({
-                    "spot_available_count": 0,
-                    "total_steps": 0,
-                    "last_spot_availability": False
-                })
-        
-        self.region_stats[current_region]["total_steps"] += 1
-        if has_spot:
-            self.region_stats[current_region]["spot_available_count"] += 1
-        self.region_stats[current_region]["last_spot_availability"] = has_spot
-
-    def _get_spot_availability_probability(self, region_idx: int) -> float:
-        if region_idx >= len(self.region_stats) or self.region_stats[region_idx]["total_steps"] == 0:
-            return 0.0
-        stats = self.region_stats[region_idx]
-        return stats["spot_available_count"] / stats["total_steps"]
-
-    def _get_remaining_work(self) -> float:
-        total_done = sum(self.task_done_time)
-        return max(0.0, self.task_duration - total_done)
-
-    def _get_required_rate(self) -> float:
-        remaining_work = self._get_remaining_work()
-        time_left = self.deadline - self.env.elapsed_seconds
-        
-        if time_left <= 0:
-            return float('inf')
-        
-        return remaining_work / time_left
-
-    def _get_best_alternative_region(self, current_region: int) -> int:
-        best_region = current_region
-        best_prob = self._get_spot_availability_probability(current_region)
-        
-        for i in range(self.env.get_num_regions()):
-            if i == current_region:
-                continue
-            prob = self._get_spot_availability_probability(i)
-            if prob > best_prob:
-                best_prob = prob
-                best_region = i
-        
-        return best_region
-
-    def _should_use_ondemand(self) -> bool:
-        remaining_work = self._get_remaining_work()
-        time_left = self.deadline - self.env.elapsed_seconds
-        
-        if time_left <= 0:
-            return True
-        
-        remaining_steps = time_left / self.env.gap_seconds
-        work_steps_needed = remaining_work / self.env.gap_seconds
-        
-        safety_margin = 2.0
-        if remaining_steps - work_steps_needed < safety_margin:
-            return True
-        
-        required_rate = self._get_required_rate()
-        if required_rate > 0.8:
-            return True
-        
-        return False
 
     def _step(self, last_cluster_type: ClusterType, has_spot: bool) -> ClusterType:
         current_region = self.env.get_current_region()
-        
-        self._update_region_stats(current_region, has_spot)
-        
-        remaining_work = self._get_remaining_work()
-        if remaining_work <= 0:
+        num_regions = self.env.get_num_regions()
+
+        elapsed = self.env.elapsed_seconds
+        deadline = self.deadline
+        task_duration = self.task_duration
+
+        work_done = sum(self.task_done_time)
+        work_remaining = task_duration - work_done
+        time_remaining = deadline - elapsed
+
+        if work_remaining <= 0:
             return ClusterType.NONE
-        
-        time_left = self.deadline - self.env.elapsed_seconds
-        
-        if time_left <= 0:
-            return ClusterType.NONE
-        
-        required_rate = self._get_required_rate()
-        
-        if self._should_use_ondemand():
-            if self.remaining_restart_overhead > 0:
-                return ClusterType.NONE
-            return ClusterType.ON_DEMAND
-        
-        if has_spot:
-            if self.remaining_restart_overhead > 0:
-                return ClusterType.NONE
-            
-            if required_rate < 0.3:
-                spot_prob = self._get_spot_availability_probability(current_region)
-                if spot_prob < 0.5:
-                    best_alt = self._get_best_alternative_region(current_region)
-                    if best_alt != current_region:
-                        self.env.switch_region(best_alt)
-                        return ClusterType.NONE
-            
-            return ClusterType.SPOT
+
+        overhead = self.restart_overhead
+        gap = self.env.gap_seconds
+
+        critical_ratio = work_remaining / max(time_remaining, 0.001)
+
+        if critical_ratio > 1.0:
+            must_use_od = True
+        elif critical_ratio > 0.8:
+            must_use_od = not has_spot
         else:
-            if self.remaining_restart_overhead > 0:
-                return ClusterType.NONE
-            
-            best_alt = self._get_best_alternative_region(current_region)
-            if best_alt != current_region:
-                self.env.switch_region(best_alt)
-                return ClusterType.NONE
-            
-            if required_rate > 0.6:
-                return ClusterType.ON_DEMAND
-            
-            return ClusterType.NONE
+            must_use_od = False
+
+        if must_use_od:
+            if last_cluster_type != ClusterType.ON_DEMAND:
+                best_region = self._find_best_region_for_od()
+                if best_region != current_region:
+                    self.env.switch_region(best_region)
+            return ClusterType.ON_DEMAND
+
+        if has_spot:
+            if last_cluster_type == ClusterType.SPOT:
+                return ClusterType.SPOT
+            else:
+                if self.remaining_restart_overhead > 0:
+                    remaining_overhead = self.remaining_restart_overhead
+                else:
+                    remaining_overhead = overhead
+
+                effective_time = gap - remaining_overhead
+                if effective_time <= 0:
+                    return ClusterType.NONE
+
+                expected_work = min(effective_time, work_remaining)
+                expected_cost = self.spot_price * (gap / 3600.0)
+
+                cost_per_work = expected_cost / expected_work if expected_work > 0 else float('inf')
+
+                od_expected_work = min(gap, work_remaining)
+                od_cost = self.on_demand_price * (gap / 3600.0)
+                od_cost_per_work = od_cost / od_expected_work if od_expected_work > 0 else float('inf')
+
+                if cost_per_work < od_cost_per_work and expected_work > 0:
+                    return ClusterType.SPOT
+                else:
+                    if last_cluster_type != ClusterType.ON_DEMAND:
+                        best_region = self._find_best_region_for_od()
+                        if best_region != current_region:
+                            self.env.switch_region(best_region)
+                    return ClusterType.ON_DEMAND
+
+        best_region, spot_available = self._find_best_spot_region()
+
+        if spot_available:
+            if best_region != current_region:
+                self.env.switch_region(best_region)
+            return ClusterType.SPOT
+
+        best_region = self._find_best_region_for_od()
+        if best_region != current_region:
+            self.env.switch_region(best_region)
+        return ClusterType.ON_DEMAND
+
+    def _find_best_spot_region(self) -> Tuple[int, bool]:
+        num_regions = self.env.get_num_regions()
+        current_region = self.env.get_current_region()
+
+        best_region = current_region
+        best_score = -1.0
+        any_spot = False
+
+        for region in range(num_regions):
+            if region == current_region:
+                continue
+
+            try:
+                self.env.switch_region(region)
+                self.env.switch_region(current_region)
+
+                score = self._evaluate_region(region)
+                if score > best_score:
+                    best_score = score
+                    best_region = region
+                    any_spot = True
+            except:
+                continue
+
+        self.env.switch_region(current_region)
+        return best_region, any_spot
+
+    def _find_best_region_for_od(self) -> int:
+        num_regions = self.env.get_num_regions()
+        current_region = self.env.get_current_region()
+
+        best_region = current_region
+        best_score = self._evaluate_region(current_region)
+
+        for region in range(num_regions):
+            if region == current_region:
+                continue
+
+            try:
+                score = self._evaluate_region(region)
+                if score > best_score:
+                    best_score = score
+                    best_region = region
+            except:
+                continue
+
+        return best_region
+
+    def _evaluate_region(self, region: int) -> float:
+        work_done = sum(self.task_done_time)
+        work_remaining = self.task_duration - work_done
+        time_remaining = self.deadline - self.env.elapsed_seconds
+
+        if time_remaining <= 0 or work_remaining <= 0:
+            return 0.0
+
+        critical_ratio = work_remaining / time_remaining
+        return 1.0 / (critical_ratio + 0.1)

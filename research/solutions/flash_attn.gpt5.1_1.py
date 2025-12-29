@@ -1,188 +1,166 @@
-import os
-import math
 import torch
 import triton
 import triton.language as tl
+import inspect
 
 
 @triton.jit
-def flash_attn_fwd_kernel(
-    Q, K, V, sm_scale, Out,
-    stride_qz, stride_qh, stride_qm, stride_qd,
-    stride_kz, stride_kh, stride_kn, stride_kd,
-    stride_vz, stride_vh, stride_vn, stride_vd,
-    stride_oz, stride_oh, stride_om, stride_od,
-    Z, H,
-    N_CTX: tl.constexpr,
+def _flash_attn_fwd(
+    Q, K, V, Out,
+    sm_scale,
+    stride_qb, stride_qm, stride_qd,
+    stride_kb, stride_kn, stride_kd,
+    stride_vb, stride_vn, stride_vd,
+    stride_ob, stride_om, stride_od,
+    B, M, N, D_HEAD, D_VALUE,
     CAUSAL: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
-    D_HEAD: tl.constexpr,
-    D_VALUE: tl.constexpr,
+    BLOCK_DMODEL: tl.constexpr,
+    BLOCK_DV: tl.constexpr,
 ):
-    pid_m = tl.program_id(0)
-    pid_zh = tl.program_id(1)
-
-    z = pid_zh // H
-    h = pid_zh % H
+    pid_bh = tl.program_id(0)
+    pid_m = tl.program_id(1)
 
     offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
-    offs_n_init = tl.arange(0, BLOCK_N)
-    offs_d = tl.arange(0, D_HEAD)
-    offs_dv = tl.arange(0, D_VALUE)
+    offs_d = tl.arange(0, BLOCK_DMODEL)
+    offs_dv = tl.arange(0, BLOCK_DV)
 
-    q_ptrs = (
-        Q
-        + z * stride_qz
-        + h * stride_qh
-        + offs_m[:, None] * stride_qm
-        + offs_d[None, :] * stride_qd
-    )
-    q = tl.load(q_ptrs, mask=offs_m[:, None] < N_CTX, other=0.0).to(tl.float32)
+    mask_m = offs_m < M
+    mask_d = offs_d < D_HEAD
+    mask_dv = offs_dv < D_VALUE
 
-    m_i = tl.full((BLOCK_M,), -float("inf"), tl.float32)
-    l_i = tl.zeros((BLOCK_M,), tl.float32)
-    acc = tl.zeros((BLOCK_M, D_VALUE), tl.float32)
+    q_ptrs = Q + pid_bh * stride_qb + offs_m[:, None] * stride_qm + offs_d[None, :] * stride_qd
+    q = tl.load(q_ptrs, mask=mask_m[:, None] & mask_d[None, :], other=0.0)
+    q = q.to(tl.float32)
 
-    for start_n in range(0, N_CTX, BLOCK_N):
-        offs_n = start_n + offs_n_init
+    m_i = tl.full([BLOCK_M], -float('inf'), dtype=tl.float32)
+    l_i = tl.zeros([BLOCK_M], dtype=tl.float32)
+    m_i = tl.where(mask_m, m_i, 0.0)
+    l_i = tl.where(mask_m, l_i, 1.0)
+    acc = tl.zeros([BLOCK_M, BLOCK_DV], dtype=tl.float32)
 
-        k_ptrs = (
-            K
-            + z * stride_kz
-            + h * stride_kh
-            + offs_n[:, None] * stride_kn
-            + offs_d[None, :] * stride_kd
-        )
-        v_ptrs = (
-            V
-            + z * stride_vz
-            + h * stride_vh
-            + offs_n[:, None] * stride_vn
-            + offs_dv[None, :] * stride_vd
-        )
+    k_ptrs_base = K + pid_bh * stride_kb
+    v_ptrs_base = V + pid_bh * stride_vb
 
-        k = tl.load(k_ptrs, mask=offs_n[:, None] < N_CTX, other=0.0).to(tl.float32)
-        v = tl.load(v_ptrs, mask=offs_n[:, None] < N_CTX, other=0.0).to(tl.float32)
+    start_n = 0
+    while start_n < N:
+        offs_n = start_n + tl.arange(0, BLOCK_N)
+        mask_n = offs_n < N
 
-        qk = tl.dot(q, tl.trans(k)) * sm_scale
+        k_ptrs = k_ptrs_base + offs_n[:, None] * stride_kn + offs_d[None, :] * stride_kd
+        k = tl.load(k_ptrs, mask=mask_n[:, None] & mask_d[None, :], other=0.0)
+        k = k.to(tl.float32)
 
-        q_idx = offs_m[:, None]
-        k_idx = offs_n[None, :]
-        mask = (q_idx < N_CTX) & (k_idx < N_CTX)
+        qk = tl.dot(q, tl.trans(k))
+        qk = qk * sm_scale
+
+        mask = mask_m[:, None] & mask_n[None, :]
         if CAUSAL:
-            mask = mask & (k_idx <= q_idx)
-        qk = tl.where(mask, qk, -float("inf"))
+            mask = mask & (offs_m[:, None] >= offs_n[None, :])
 
-        max_curr = tl.max(qk, axis=1)
-        m_new = tl.maximum(m_i, max_curr)
+        qk = tl.where(mask, qk, -float('inf'))
+
+        m_ij = tl.max(qk, axis=1)
+        m_new = tl.maximum(m_i, m_ij)
+
         p = tl.exp(qk - m_new[:, None])
-        alpha = tl.exp(m_i - m_new)
-        l_i = l_i * alpha + tl.sum(p, axis=1)
-        acc = acc * alpha[:, None] + tl.dot(p, v)
+        l_ij = tl.sum(p, axis=1)
+
+        l_new = l_i * tl.exp(m_i - m_new) + l_ij
+
+        v_ptrs = v_ptrs_base + offs_n[:, None] * stride_vn + offs_dv[None, :] * stride_vd
+        v = tl.load(v_ptrs, mask=mask_n[:, None] & mask_dv[None, :], other=0.0)
+        v = v.to(tl.float32)
+
+        inv_l_new = 1.0 / l_new
+        inv_l_new = tl.where(l_new > 0, inv_l_new, 0.0)
+        scale_old = l_i * tl.exp(m_i - m_new) * inv_l_new
+        scale_new = inv_l_new
+
+        acc = acc * scale_old[:, None] + tl.dot(p, v) * scale_new[:, None]
+
         m_i = m_new
+        l_i = l_new
 
-    out = acc / l_i[:, None]
+        start_n += BLOCK_N
 
-    o_ptrs = (
-        Out
-        + z * stride_oz
-        + h * stride_oh
-        + offs_m[:, None] * stride_om
-        + offs_dv[None, :] * stride_od
-    )
-    tl.store(o_ptrs, out.to(tl.float16), mask=offs_m[:, None] < N_CTX)
-
-
-def _flash_attn_ref(Q: torch.Tensor, K: torch.Tensor, V: torch.Tensor, causal: bool = True) -> torch.Tensor:
-    Z, H, M, Dq = Q.shape
-    _, _, N, _ = K.shape
-    _, _, N2, Dv = V.shape
-    assert N == N2
-    Qf = Q.float()
-    Kf = K.float()
-    Vf = V.float()
-    scale = 1.0 / math.sqrt(Dq)
-    scores = torch.matmul(Qf, Kf.transpose(-2, -1)) * scale  # (Z,H,M,N)
-    if causal:
-        mask = torch.triu(
-            torch.ones(M, N, device=scores.device, dtype=torch.bool),
-            diagonal=1,
-        )
-        scores = scores.masked_fill(mask, float("-inf"))
-    probs = torch.softmax(scores, dim=-1)
-    out = torch.matmul(probs, Vf)
-    return out.to(Q.dtype)
+    out_ptrs = Out + pid_bh * stride_ob + offs_m[:, None] * stride_om + offs_dv[None, :] * stride_od
+    tl.store(out_ptrs, acc.to(tl.float16), mask=mask_m[:, None] & mask_dv[None, :])
 
 
 def flash_attn(Q: torch.Tensor, K: torch.Tensor, V: torch.Tensor, causal: bool = True) -> torch.Tensor:
-    if (
-        (not Q.is_cuda)
-        or (not K.is_cuda)
-        or (not V.is_cuda)
-        or Q.dtype != torch.float16
-        or K.dtype != torch.float16
-        or V.dtype != torch.float16
-    ):
-        return _flash_attn_ref(Q, K, V, causal=causal)
+    assert Q.is_cuda and K.is_cuda and V.is_cuda
+    assert Q.dtype == torch.float16 and K.dtype == torch.float16 and V.dtype == torch.float16
 
-    Z, H, M, Dq = Q.shape
+    Zq, Hq, M, Dq = Q.shape
     Zk, Hk, N, Dk = K.shape
     Zv, Hv, Nv, Dv = V.shape
 
-    assert Z == Zk == Zv
-    assert H == Hk == Hv
-    assert M == N == Nv
+    assert Zq == Zk == Zv
+    assert Hq == Hk == Hv
+    assert N == Nv
     assert Dq == Dk
+    assert M <= 65535 and N <= 65535  # basic bounds for safety
 
-    sm_scale = 1.0 / math.sqrt(Dq)
+    Z = Zq
+    H = Hq
+    B = Z * H
 
-    Out = torch.empty((Z, H, M, Dv), device=Q.device, dtype=Q.dtype)
+    Q_ = Q.contiguous().view(B, M, Dq)
+    K_ = K.contiguous().view(B, N, Dk)
+    V_ = V.contiguous().view(B, N, Dv)
 
-    BLOCK_M = 64
+    Out = torch.empty((B, M, Dv), device=Q.device, dtype=torch.float16)
+
+    BLOCK_M = 128
     BLOCK_N = 64
-    num_warps = 4
-    num_stages = 2
+    BLOCK_DMODEL = 64
+    BLOCK_DV = 64
 
-    grid = (triton.cdiv(M, BLOCK_M), Z * H)
+    assert Dq <= BLOCK_DMODEL
+    assert Dv <= BLOCK_DV
 
-    flash_attn_fwd_kernel[grid](
-        Q,
-        K,
-        V,
+    stride_qb, stride_qm, stride_qd = Q_.stride()
+    stride_kb, stride_kn, stride_kd = K_.stride()
+    stride_vb, stride_vn, stride_vd = V_.stride()
+    stride_ob, stride_om, stride_od = Out.stride()
+
+    grid = (B, triton.cdiv(M, BLOCK_M))
+
+    sm_scale = 1.0 / (float(Dq) ** 0.5)
+
+    _flash_attn_fwd[grid](
+        Q_, K_, V_, Out,
         sm_scale,
-        Out,
-        Q.stride(0),
-        Q.stride(1),
-        Q.stride(2),
-        Q.stride(3),
-        K.stride(0),
-        K.stride(1),
-        K.stride(2),
-        K.stride(3),
-        V.stride(0),
-        V.stride(1),
-        V.stride(2),
-        V.stride(3),
-        Out.stride(0),
-        Out.stride(1),
-        Out.stride(2),
-        Out.stride(3),
-        Z,
-        H,
-        N_CTX=M,
+        stride_qb, stride_qm, stride_qd,
+        stride_kb, stride_kn, stride_kd,
+        stride_vb, stride_vn, stride_vd,
+        stride_ob, stride_om, stride_od,
+        B, M, N, Dq, Dv,
         CAUSAL=causal,
         BLOCK_M=BLOCK_M,
         BLOCK_N=BLOCK_N,
-        D_HEAD=Dq,
-        D_VALUE=Dv,
-        num_warps=num_warps,
-        num_stages=num_stages,
+        BLOCK_DMODEL=BLOCK_DMODEL,
+        BLOCK_DV=BLOCK_DV,
+        num_warps=4,
+        num_stages=2,
     )
 
-    return Out
+    return Out.view(Z, H, M, Dv)
 
 
 class Solution:
     def solve(self, spec_path: str = None) -> dict:
-        return {"program_path": os.path.abspath(__file__)}
+        kernel_src = inspect.getsource(_flash_attn_fwd)
+        func_src = inspect.getsource(flash_attn)
+        code = (
+            "import torch\n"
+            "import triton\n"
+            "import triton.language as tl\n\n"
+            + kernel_src
+            + "\n\n"
+            + func_src
+            + "\n"
+        )
+        return {"code": code}

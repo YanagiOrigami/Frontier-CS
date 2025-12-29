@@ -1,5 +1,4 @@
 import json
-import random
 from argparse import Namespace
 
 from sky_spot.strategies.multi_strategy import MultiRegionStrategy
@@ -7,11 +6,20 @@ from sky_spot.utils import ClusterType
 
 
 class Solution(MultiRegionStrategy):
-    """Cant-Be-Late Multi-Region Scheduling Strategy."""
+    """Your multi-region scheduling strategy."""
 
-    NAME = "cant_be_late_strategy"
+    NAME = "robust_cost_optimizer"
 
     def solve(self, spec_path: str) -> "Solution":
+        """
+        Initialize the solution from spec_path config.
+
+        The spec file contains:
+        - deadline: deadline in hours
+        - duration: task duration in hours
+        - overhead: restart overhead in hours
+        - trace_files: list of trace file paths (one per region)
+        """
         with open(spec_path) as f:
             config = json.load(f)
 
@@ -25,53 +33,52 @@ class Solution(MultiRegionStrategy):
         return self
 
     def _step(self, last_cluster_type: ClusterType, has_spot: bool) -> ClusterType:
-        # State variables
+        """
+        Decide next action based on current state.
+        
+        Strategy:
+        1. Calculate remaining work and remaining time.
+        2. If time is running out (critical slack), force On-Demand to guarantee completion.
+        3. If there is slack:
+           - Use Spot if available in current region.
+           - If Spot unavailable, switch to next region and wait (NONE) to probe availability.
+        """
+        # Gather state
         elapsed = self.env.elapsed_seconds
-        work_done = sum(self.task_done_time)
-        work_needed = self.task_duration - work_done
+        done = sum(self.task_done_time)
+        remaining_work = self.task_duration - done
+        time_left = self.deadline - elapsed
+        
+        # Check if task is complete
+        if remaining_work <= 1e-6:
+            return ClusterType.NONE
+
+        # Parameters
         gap = self.env.gap_seconds
         overhead = self.restart_overhead
         
-        # If finished, stop
-        if work_needed <= 0:
-            return ClusterType.NONE
-
-        time_remaining = self.deadline - elapsed
+        # Calculate Safety Threshold
+        # We need time for: Remaining Work + Potential Overhead + Timestep Alignment Buffer
+        # If time_left drops below this, we cannot risk searching or preemption.
+        safety_buffer = overhead + (2.0 * gap)
         
-        # Calculate time required if we switched to OD right now
-        # We conservatively assume we might need a restart (overhead)
-        time_required_od = work_needed + overhead
-        
-        # Define Safety Buffer
-        # We use a dynamic buffer based on remaining work and gap size
-        # 10% of remaining work or 2 gaps, whichever is larger, to be safe against variance
-        safety_buffer = max(work_needed * 0.1, 2.0 * gap)
-        
-        # Panic Condition: Check if we have enough slack
-        # Slack = Time Available - Time Needed
-        # If Slack < Cost of searching (Gap) + Buffer, we panic
-        slack = time_remaining - time_required_od
-        is_panic = slack < (gap + safety_buffer)
-
-        # Decision Logic
-        if is_panic:
-            # We are close to deadline. Prioritize completion over cost.
-            # ON_DEMAND is guaranteed and avoids further search penalties.
+        if time_left < (remaining_work + safety_buffer):
+            # Critical zone: Force On-Demand for reliability
             return ClusterType.ON_DEMAND
-        
+
+        # If not critical, optimize for cost
         if has_spot:
-            # Spot is available and we have slack. Use it to save money.
+            # Spot is available here, use it
             return ClusterType.SPOT
         else:
-            # Spot unavailable, but we have slack.
-            # Strategy: Switch region to try and find Spot availability.
-            # We use a simple round-robin approach to cycle through regions.
-            current_region = self.env.get_current_region()
+            # Spot unavailable here, and we have slack.
+            # Switch region to find Spot.
+            curr_region = self.env.get_current_region()
             num_regions = self.env.get_num_regions()
-            next_region = (current_region + 1) % num_regions
+            next_region = (curr_region + 1) % num_regions
+            
             self.env.switch_region(next_region)
             
-            # We return NONE to probe the new region in the next step.
-            # We cannot return SPOT immediately because we don't know the new region's status,
-            # and returning SPOT when unavailable raises an error.
+            # Return NONE because we don't know if the new region has Spot yet.
+            # We must wait for next step to check 'has_spot' for the new region.
             return ClusterType.NONE

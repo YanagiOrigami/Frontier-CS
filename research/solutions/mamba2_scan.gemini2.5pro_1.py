@@ -2,86 +2,125 @@ import torch
 import triton
 import triton.language as tl
 
-_mamba2_scan_code = """
+class Solution:
+    def solve(self, spec_path: str = None) -> dict:
+        code = """
 import torch
 import triton
 import triton.language as tl
 
 @triton.jit
-def _intra_chunk_scan_kernel(
-    X_ptr, A_ptr, B_ptr, Y_ptr, A_reduced_ptr, Z_reduced_ptr,
-    L, D, C,
-    stride_x_l, stride_a_l, stride_b_l, stride_y_l,
-    stride_ar_c, stride_zr_c,
-    BLOCK_SIZE_C: tl.constexpr,
-    BLOCK_SIZE_D: tl.constexpr,
+def _forward_intra_scan(
+    X, A, B, Y, A_carry, H_carry,
+    L, D,
+    stride_x_l, stride_x_d,
+    stride_a_l, stride_a_d,
+    stride_b_l, stride_b_d,
+    stride_y_l, stride_y_d,
+    stride_ac_c, stride_ac_d,
+    stride_hc_c, stride_hc_d,
+    CHUNK: tl.constexpr,
+    BD: tl.constexpr
 ):
-    pid_c = tl.program_id(0)
-    pid_d = tl.program_id(1)
+    pid_chunk = tl.program_id(0)
+    pid_d_block = tl.program_id(1)
 
-    d_offsets = pid_d * BLOCK_SIZE_D + tl.arange(0, BLOCK_SIZE_D)
+    d_offsets = pid_d_block * BD + tl.arange(0, BD)
     d_mask = d_offsets < D
 
-    c_start = pid_c * BLOCK_SIZE_C
+    l_base = pid_chunk * CHUNK
     
-    h = tl.zeros((BLOCK_SIZE_D,), dtype=tl.float32)
-    a_total = tl.ones((BLOCK_SIZE_D,), dtype=tl.float32)
+    X_chunk_ptr = X + l_base * stride_x_l + d_offsets
+    A_chunk_ptr = A + l_base * stride_a_l + d_offsets
+    B_chunk_ptr = B + l_base * stride_b_l + d_offsets
+    Y_chunk_ptr = Y + l_base * stride_y_l + d_offsets
 
-    for t in range(0, BLOCK_SIZE_C):
-        l_idx = c_start + t
+    h = tl.zeros((BD,), dtype=tl.float32)
+    a_carry_val = tl.ones((BD,), dtype=tl.float32)
+    
+    for i in range(CHUNK):
+        a = tl.load(A_chunk_ptr + i * stride_a_l, mask=d_mask).to(tl.float32)
+        b = tl.load(B_chunk_ptr + i * stride_b_l, mask=d_mask).to(tl.float32)
+        x = tl.load(X_chunk_ptr + i * stride_x_l, mask=d_mask).to(tl.float32)
+
+        h = a * h + b * x
         
-        a = tl.load(A_ptr + l_idx * stride_a_l + d_offsets, mask=d_mask).to(tl.float32)
-        b = tl.load(B_ptr + l_idx * stride_b_l + d_offsets, mask=d_mask).to(tl.float32)
-        x = tl.load(X_ptr + l_idx * stride_x_l + d_offsets, mask=d_mask).to(tl.float32)
+        tl.store(Y_chunk_ptr + i * stride_y_l, h.to(tl.float16), mask=d_mask)
         
-        z = b * x
-        h = a * h + z
-        
-        tl.store(Y_ptr + l_idx * stride_y_l + d_offsets, h.to(tl.float16), mask=d_mask)
-        
-        a_total = a_total * a
-        
-    tl.store(A_reduced_ptr + pid_c * stride_ar_c + d_offsets, a_total, mask=d_mask)
-    tl.store(Z_reduced_ptr + pid_c * stride_zr_c + d_offsets, h.to(tl.float16), mask=d_mask)
+        a_carry_val = a_carry_val * a
+
+    A_carry_chunk_ptr = A_carry + pid_chunk * stride_ac_c + d_offsets
+    H_carry_chunk_ptr = H_carry + pid_chunk * stride_hc_c + d_offsets
+    
+    tl.store(A_carry_chunk_ptr, a_carry_val, mask=d_mask)
+    tl.store(H_carry_chunk_ptr, h, mask=d_mask)
 
 
 @triton.jit
-def _inter_chunk_propagate_kernel(
-    Y_ptr, A_ptr, A_reduced_ptr, Z_reduced_ptr,
-    L, D, C, num_chunks,
-    stride_y_l, stride_a_l,
-    stride_ar_c, stride_zr_c,
-    BLOCK_SIZE_D: tl.constexpr,
+def _forward_inter_scan(
+    A_carry, H_carry, H_global,
+    D,
+    stride_ac_c, stride_ac_d,
+    stride_hc_c, stride_hc_d,
+    stride_hg_c, stride_hg_d,
+    NUM_CHUNKS: tl.constexpr,
+    BD: tl.constexpr
 ):
-    pid_d = tl.program_id(1)
-    
-    d_offsets = pid_d * BLOCK_SIZE_D + tl.arange(0, BLOCK_SIZE_D)
+    pid_d_block = tl.program_id(0)
+
+    d_offsets = pid_d_block * BD + tl.arange(0, BD)
     d_mask = d_offsets < D
     
-    h_carry = tl.zeros((BLOCK_SIZE_D,), dtype=tl.float32)
+    A_carry_col_ptr = A_carry + d_offsets
+    H_carry_col_ptr = H_carry + d_offsets
+    H_global_col_ptr = H_global + d_offsets
+
+    h = tl.zeros((BD,), dtype=tl.float32)
+
+    for i in range(NUM_CHUNKS):
+        tl.store(H_global_col_ptr + i * stride_hg_c, h, mask=d_mask)
+        
+        a_c = tl.load(A_carry_col_ptr + i * stride_ac_c, mask=d_mask)
+        h_c = tl.load(H_carry_col_ptr + i * stride_hc_c, mask=d_mask)
+        
+        h = a_c * h + h_c
+
+@triton.jit
+def _forward_final_update(
+    Y, A, H_global,
+    L, D,
+    stride_y_l, stride_y_d,
+    stride_a_l, stride_a_d,
+    stride_hg_c, stride_hg_d,
+    CHUNK: tl.constexpr,
+    BD: tl.constexpr
+):
+    pid_chunk = tl.program_id(0)
+    pid_d_block = tl.program_id(1)
+
+    d_offsets = pid_d_block * BD + tl.arange(0, BD)
+    d_mask = d_offsets < D
+
+    H_global_chunk_ptr = H_global + pid_chunk * stride_hg_c + d_offsets
+    h_init = tl.load(H_global_chunk_ptr, mask=d_mask)
+
+    l_base = pid_chunk * CHUNK
     
-    for c_idx in range(1, num_chunks):
-        prev_c_idx = c_idx - 1
+    Y_chunk_ptr = Y + l_base * stride_y_l + d_offsets
+    A_chunk_ptr = A + l_base * stride_a_l + d_offsets
+
+    delta = h_init
+    for i in range(CHUNK):
+        y_ptr_i = Y_chunk_ptr + i * stride_y_l
+        a_ptr_i = A_chunk_ptr + i * stride_a_l
+
+        y_inter = tl.load(y_ptr_i, mask=d_mask).to(tl.float32)
+        a = tl.load(a_ptr_i, mask=d_mask).to(tl.float32)
         
-        a_red_prev = tl.load(A_reduced_ptr + prev_c_idx * stride_ar_c + d_offsets, mask=d_mask)
-        z_red_prev = tl.load(Z_reduced_ptr + prev_c_idx * stride_zr_c + d_offsets, mask=d_mask).to(tl.float32)
+        delta = delta * a
+        y_final = y_inter + delta
         
-        h_carry = a_red_prev * h_carry + z_red_prev
-        
-        c_start = c_idx * C
-        a_prod_acc = tl.ones((BLOCK_SIZE_D,), dtype=tl.float32)
-        
-        for t in range(0, C):
-            l_idx = c_start + t
-            
-            y_intra = tl.load(Y_ptr + l_idx * stride_y_l + d_offsets, mask=d_mask).to(tl.float32)
-            a_t = tl.load(A_ptr + l_idx * stride_a_l + d_offsets, mask=d_mask).to(tl.float32)
-            
-            a_prod_acc = a_prod_acc * a_t
-            
-            y_new = y_intra + a_prod_acc * h_carry
-            
-            tl.store(Y_ptr + l_idx * stride_y_l + d_offsets, y_new.to(tl.float16), mask=d_mask)
+        tl.store(y_ptr_i, y_final.to(tl.float16), mask=d_mask)
 
 def chunk_scan(X: torch.Tensor, A: torch.Tensor, B: torch.Tensor, chunk: int = 128, BD: int = 128) -> torch.Tensor:
     L, D = X.shape
@@ -89,40 +128,44 @@ def chunk_scan(X: torch.Tensor, A: torch.Tensor, B: torch.Tensor, chunk: int = 1
     
     Y = torch.empty_like(X)
     
-    A_reduced = torch.empty(num_chunks, D, device=X.device, dtype=torch.float32)
-    Z_reduced = torch.empty(num_chunks, D, device=X.device, dtype=X.dtype)
+    A_carry = torch.empty((num_chunks, D), device=X.device, dtype=torch.float32)
+    H_carry = torch.empty((num_chunks, D), device=X.device, dtype=torch.float32)
+    H_global = torch.empty((num_chunks, D), device=X.device, dtype=torch.float32)
     
-    grid1 = (num_chunks, triton.cdiv(D, BD))
-    
-    _intra_chunk_scan_kernel[grid1](
-        X, A, B, Y, A_reduced, Z_reduced,
-        L, D, chunk,
-        X.stride(0), A.stride(0), B.stride(0), Y.stride(0),
-        A_reduced.stride(0), Z_reduced.stride(0),
-        BLOCK_SIZE_C=chunk,
-        BLOCK_SIZE_D=BD,
-        num_warps=4,
+    grid1 = (num_chunks, D // BD)
+    _forward_intra_scan[grid1](
+        X, A, B, Y, A_carry, H_carry,
+        L, D,
+        X.stride(0), X.stride(1),
+        A.stride(0), A.stride(1),
+        B.stride(0), B.stride(1),
+        Y.stride(0), Y.stride(1),
+        A_carry.stride(0), A_carry.stride(1),
+        H_carry.stride(0), H_carry.stride(1),
+        CHUNK=chunk, BD=BD
     )
-    
-    grid2 = (1, triton.cdiv(D, BD))
-    
-    _inter_chunk_propagate_kernel[grid2](
-        Y, A, A_reduced, Z_reduced,
-        L, D, chunk, num_chunks,
-        Y.stride(0), A.stride(0),
-        A_reduced.stride(0), Z_reduced.stride(0),
-        BLOCK_SIZE_D=BD,
-        num_warps=4,
+
+    grid2 = (D // BD,)
+    _forward_inter_scan[grid2](
+        A_carry, H_carry, H_global,
+        D,
+        A_carry.stride(0), A_carry.stride(1),
+        H_carry.stride(0), H_carry.stride(1),
+        H_global.stride(0), H_global.stride(1),
+        NUM_CHUNKS=num_chunks, BD=BD
+    )
+
+    grid3 = (num_chunks, D // BD)
+    _forward_final_update[grid3](
+        Y, A, H_global,
+        L, D,
+        Y.stride(0), Y.stride(1),
+        A.stride(0), A.stride(1),
+        H_global.stride(0), H_global.stride(1),
+        CHUNK=chunk, BD=BD
     )
     
     return Y
 """
-
-class Solution:
-    def solve(self, spec_path: str = None) -> dict:
-        """
-        Returns a dict with either:
-        - {"code": "python_code_string"}
-        - {"program_path": "path/to/kernel.py"}
-        """
-        return {"code": _mamba2_scan_code}
+        # The split/join logic is to remove the initial newline and trailing whitespace
+        return {"code": "\n".join(code.splitlines()[1:])}

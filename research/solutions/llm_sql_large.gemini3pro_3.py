@@ -13,71 +13,109 @@ class Solution:
         distinct_value_threshold: float = 0.7,
         parallel: bool = True,
     ) -> pd.DataFrame:
-        # Work on a copy of the dataframe
-        df_out = df.copy()
+        # Convert all data to string to ensure consistent concatenation and length calculations
+        df_process = df.astype(str)
         
         # 1. Apply Column Merges
         if col_merge:
             for group in col_merge:
-                # Filter to columns that exist in the current dataframe
-                valid_group = [c for c in group if c in df_out.columns]
+                # Identify columns from the group that are present in the dataframe
+                valid_group = [c for c in group if c in df_process.columns]
+                if not valid_group:
+                    continue
                 
-                # We need at least 2 columns to merge
-                if len(valid_group) > 1:
-                    # Construct new column name
-                    new_col_name = "_".join(map(str, valid_group))
-                    
-                    # Concatenate the string representations of the columns
-                    # Initialize with the first column
-                    combined = df_out[valid_group[0]].astype(str)
-                    
-                    # Add subsequent columns
-                    for col in valid_group[1:]:
-                        combined = combined + df_out[col].astype(str)
-                    
-                    # Assign the new merged column
-                    df_out[new_col_name] = combined
-                    
-                    # Remove the original columns
-                    df_out.drop(columns=valid_group, inplace=True)
+                # Create the merged column name
+                new_col_name = "_".join(valid_group)
+                while new_col_name in df_process.columns and new_col_name not in valid_group:
+                    new_col_name += "_"
+                
+                # Concatenate the string values
+                new_series = df_process[valid_group[0]]
+                for c in valid_group[1:]:
+                    new_series = new_series + df_process[c]
+                
+                df_process[new_col_name] = new_series
+                
+                # Drop the original columns
+                df_process.drop(columns=valid_group, inplace=True)
         
-        # 2. Compute Column Statistics
-        # We want to order columns to maximize the expected length of the common prefix.
-        # We use a greedy heuristic based on Smith's rule for scheduling: (p * L) / (1 - p)
-        # p: collision probability (sum of squared frequencies)
-        # L: average string length
-        # Higher score -> Earlier position
+        # 2. Precompute Statistics for Heuristic and Greedy Search
+        cols = list(df_process.columns)
+        n_rows = len(df_process)
         
-        col_stats = []
+        # Calculate length of string representation for each cell
+        col_lengths = {c: df_process[c].str.len().values for c in cols}
         
-        for col in df_out.columns:
-            # Convert to string to calculate length and probability statistics
-            s_str = df_out[col].astype(str)
+        # Calculate heuristics: unique count and average length
+        col_stats = {}
+        for c in cols:
+            nunique = df_process[c].nunique()
+            mean_len = np.mean(col_lengths[c])
+            col_stats[c] = (nunique, mean_len)
             
-            # Calculate Average Length (L)
-            avg_len = s_str.str.len().mean()
-            
-            # Calculate Collision Probability (p)
-            # This is the probability that two randomly selected rows share the same value
-            freqs = s_str.value_counts(normalize=True)
-            p = (freqs * freqs).sum()
-            
-            # Calculate Score
-            # If p is 1.0 (constant column), score is infinite (highest priority)
-            if p >= 0.9999999:
-                score = float('inf')
-            else:
-                score = (p * avg_len) / (1.0 - p)
-            
-            col_stats.append((score, avg_len, col))
-            
-        # 3. Sort Columns
-        # Primary sort key: Score (descending)
-        # Secondary sort key: Average Length (descending) - prefers longer matches for same probability
-        col_stats.sort(key=lambda x: (x[0], x[1]), reverse=True)
+        # Sort candidates by heuristic: Primary = nunique (asc), Secondary = mean_len (desc)
+        sorted_candidates = sorted(cols, key=lambda c: (col_stats[c][0], -col_stats[c][1]))
         
-        # Extract the ordered column names
-        new_column_order = [item[2] for item in col_stats]
+        # 3. Greedy Optimization Loop
+        ordered_cols = []
+        remaining_cols = set(cols)
         
-        # Return the DataFrame with reordered columns
-        return df_out[new_column_order]
+        # Track groups of rows that share the same prefix so far
+        group_ids = np.zeros(n_rows, dtype=np.int32)
+        
+        # Limit the number of candidates evaluated per step for performance
+        CANDIDATE_LIMIT = 15
+        
+        for _ in range(len(cols)):
+            if not remaining_cols:
+                break
+                
+            # If every row is in its own unique group, no further prefix matches are possible.
+            if group_ids.max() == n_rows - 1:
+                remaining_sorted = [c for c in sorted_candidates if c in remaining_cols]
+                ordered_cols.extend(remaining_sorted)
+                break
+            
+            # Select top candidates to evaluate
+            candidates = []
+            count = 0
+            for c in sorted_candidates:
+                if c in remaining_cols:
+                    candidates.append(c)
+                    count += 1
+                    if count >= CANDIDATE_LIMIT:
+                        break
+            
+            best_col = None
+            max_gain = -1.0
+            
+            # Prepare a temporary DataFrame for duplicate checking
+            check_df = pd.DataFrame({'g': group_ids})
+            
+            for c in candidates:
+                check_df['v'] = df_process[c]
+                
+                # Check for duplicates (matches with previous rows in the same group)
+                is_dup = check_df.duplicated(subset=['g', 'v'], keep='first')
+                
+                if not is_dup.any():
+                    gain = 0.0
+                else:
+                    gain = np.sum(col_lengths[c][is_dup])
+                
+                if gain > max_gain:
+                    max_gain = gain
+                    best_col = c
+            
+            if best_col is None:
+                best_col = candidates[0]
+            
+            ordered_cols.append(best_col)
+            remaining_cols.remove(best_col)
+            
+            # Update groups for the next iteration
+            if remaining_cols:
+                check_df['v'] = df_process[best_col]
+                group_ids = check_df.groupby(['g', 'v'], sort=False).ngroup().values
+        
+        return df_process[ordered_cols]

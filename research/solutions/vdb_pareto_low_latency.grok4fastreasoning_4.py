@@ -1,21 +1,20 @@
+import faiss
 import numpy as np
 from typing import Tuple
-import faiss
 
-class YourIndexClass:
+class LowLatencyIndex:
     def __init__(self, dim: int, **kwargs):
         self.dim = dim
-        self.M = kwargs.get('M', 16)
-        self.ef_construction = kwargs.get('ef_construction', 100)
-        self.ef_search = kwargs.get('ef_search', 40)
-        self.index = faiss.IndexHNSWFlat(dim, self.M)
-        self.index.efConstruction = self.ef_construction
-        self.index.max_codes = 1 << 32
+        M = kwargs.get('M', 8)
+        ef_construction = kwargs.get('ef_construction', 64)
+        ef_search = kwargs.get('ef_search', 32)
+        self.index = faiss.IndexHNSWFlat(dim, M)
+        self.index.hnsw.efConstruction = ef_construction
+        self.index.hnsw.efSearch = ef_search
 
     def add(self, xb: np.ndarray) -> None:
-        self.index.add(xb.astype('float32'))
+        self.index.add(xb)
 
     def search(self, xq: np.ndarray, k: int) -> Tuple[np.ndarray, np.ndarray]:
-        self.index.efSearch = self.ef_search
-        D, I = self.index.search(xq.astype('float32'), k)
-        return D, I
+        distances, indices = self.index.search(xq, k)
+        return distances, indices

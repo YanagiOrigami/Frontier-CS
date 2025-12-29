@@ -1,13 +1,9 @@
-import torch
-import triton
-import triton.language as tl
 import textwrap
 
 
 class Solution:
     def solve(self, spec_path: str = None) -> dict:
-        kernel_code = textwrap.dedent(
-            '''
+        code = textwrap.dedent('''\
             import torch
             import triton
             import triton.language as tl
@@ -20,18 +16,18 @@ class Solution:
 
             @triton.autotune(
                 configs=[
-                    triton.Config({"BLOCK_M": 128, "BLOCK_N": 128, "BLOCK_K": 32}, num_stages=3, num_warps=8),
-                    triton.Config({"BLOCK_M": 64, "BLOCK_N": 128, "BLOCK_K": 32}, num_stages=3, num_warps=4),
-                    triton.Config({"BLOCK_M": 128, "BLOCK_N": 64, "BLOCK_K": 32}, num_stages=3, num_warps=4),
-                    triton.Config({"BLOCK_M": 64, "BLOCK_N": 64, "BLOCK_K": 32}, num_stages=3, num_warps=4),
-                    triton.Config({"BLOCK_M": 32, "BLOCK_N": 128, "BLOCK_K": 32}, num_stages=2, num_warps=4),
-                    triton.Config({"BLOCK_M": 128, "BLOCK_N": 32, "BLOCK_K": 32}, num_stages=2, num_warps=4),
+                    triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 32}, num_warps=8, num_stages=3),
+                    triton.Config({'BLOCK_M': 64, 'BLOCK_N': 128, 'BLOCK_K': 32}, num_warps=4, num_stages=4),
+                    triton.Config({'BLOCK_M': 128, 'BLOCK_N': 64, 'BLOCK_K': 32}, num_warps=4, num_stages=4),
+                    triton.Config({'BLOCK_M': 64, 'BLOCK_N': 64, 'BLOCK_K': 32}, num_warps=4, num_stages=4),
+                    triton.Config({'BLOCK_M': 32, 'BLOCK_N': 128, 'BLOCK_K': 32}, num_warps=4, num_stages=5),
+                    triton.Config({'BLOCK_M': 128, 'BLOCK_N': 32, 'BLOCK_K': 32}, num_warps=4, num_stages=5),
                 ],
-                key=["M", "N", "K"],
+                key=['M', 'N', 'K'],
             )
             @triton.jit
-            def matmul_kernel(
-                a_ptr, b_ptr, c_ptr,
+            def _matmul_gelu_kernel(
+                A_ptr, B_ptr, C_ptr,
                 M, N, K,
                 stride_am, stride_ak,
                 stride_bk, stride_bn,
@@ -48,89 +44,90 @@ class Solution:
 
                 acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
 
-                for k in range(0, K, BLOCK_K):
-                    k_offsets = k + offs_k
+                a_ptrs = A_ptr + (offs_m[:, None] * stride_am + offs_k[None, :] * stride_ak)
+                b_ptrs = B_ptr + (offs_k[:, None] * stride_bk + offs_n[None, :] * stride_bn)
 
-                    a_ptrs = a_ptr + offs_m[:, None] * stride_am + k_offsets[None, :] * stride_ak
-                    b_ptrs = b_ptr + k_offsets[:, None] * stride_bk + offs_n[None, :] * stride_bn
+                k = 0
+                while k < K:
+                    k_remaining = K - k
 
-                    a_mask = (offs_m[:, None] < M) & (k_offsets[None, :] < K)
-                    b_mask = (k_offsets[:, None] < K) & (offs_n[None, :] < N)
+                    a_mask = (offs_m[:, None] < M) & (offs_k[None, :] < k_remaining)
+                    b_mask = (offs_n[None, :] < N) & (offs_k[:, None] < k_remaining)
 
                     a = tl.load(a_ptrs, mask=a_mask, other=0.0)
                     b = tl.load(b_ptrs, mask=b_mask, other=0.0)
 
-                    acc += tl.dot(a, b, out_dtype=tl.float32)
+                    acc += tl.dot(a.to(tl.float32), b.to(tl.float32))
+
+                    a_ptrs += BLOCK_K * stride_ak
+                    b_ptrs += BLOCK_K * stride_bk
+                    k += BLOCK_K
 
                 acc = gelu(acc)
 
-                c_ptrs = c_ptr + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn
+                c_ptrs = C_ptr + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn
                 c_mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
 
-                if OUT_DTYPE == 0:
-                    out = acc
-                elif OUT_DTYPE == 1:
-                    out = acc.to(tl.float16)
-                elif OUT_DTYPE == 2:
-                    out = acc.to(tl.bfloat16)
-                else:
-                    out = acc
+                acc_converted = acc.to(OUT_DTYPE)
+                tl.store(c_ptrs, acc_converted, mask=c_mask)
 
-                tl.store(c_ptrs, out, mask=c_mask)
+
+            def _torch_dtype_to_triton(dtype: torch.dtype):
+                if dtype == torch.float16:
+                    return tl.float16
+                if dtype == torch.bfloat16:
+                    return tl.bfloat16
+                if dtype == torch.float32:
+                    return tl.float32
+                # Default to float32 for unsupported dtypes
+                return tl.float32
 
 
             def matmul(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
                 if a.ndim != 2 or b.ndim != 2:
-                    raise ValueError("Inputs must be 2D matrices")
+                    raise ValueError("Inputs must be 2D tensors")
                 if a.shape[1] != b.shape[0]:
-                    raise ValueError("Incompatible matrix shapes for multiplication")
-
-                if not (a.is_cuda and b.is_cuda):
-                    c = torch.matmul(a, b)
-                    return torch.nn.functional.gelu(c)
+                    raise ValueError(f"Incompatible shapes for matmul: {a.shape} and {b.shape}")
 
                 M, K = a.shape
                 Kb, N = b.shape
-                if Kb != K:
-                    raise ValueError("Inner dimensions must match")
 
-                device = a.device
-                if b.device != device:
-                    b = b.to(device)
+                # Fallback to PyTorch if tensors are on CPU or not floating-point
+                if (not a.is_cuda) or (not b.is_cuda):
+                    c = a @ b
+                    return torch.nn.functional.gelu(c)
+
+                if a.dtype not in (torch.float16, torch.bfloat16, torch.float32) or \
+                   b.dtype not in (torch.float16, torch.bfloat16, torch.float32):
+                    c = a @ b
+                    return torch.nn.functional.gelu(c)
 
                 out_dtype = torch.result_type(a, b)
                 if out_dtype not in (torch.float16, torch.bfloat16, torch.float32):
                     out_dtype = torch.float32
 
-                c = torch.empty((M, N), device=device, dtype=out_dtype)
+                C = torch.empty((M, N), device=a.device, dtype=out_dtype)
 
                 stride_am, stride_ak = a.stride()
                 stride_bk, stride_bn = b.stride()
-                stride_cm, stride_cn = c.stride()
+                stride_cm, stride_cn = C.stride()
 
-                if out_dtype == torch.float32:
-                    out_type_id = 0
-                elif out_dtype == torch.float16:
-                    out_type_id = 1
-                else:  # torch.bfloat16
-                    out_type_id = 2
+                out_triton_dtype = _torch_dtype_to_triton(out_dtype)
 
-                def grid(meta):
-                    return (
-                        triton.cdiv(M, meta["BLOCK_M"]),
-                        triton.cdiv(N, meta["BLOCK_N"]),
-                    )
+                grid = lambda META: (
+                    triton.cdiv(M, META['BLOCK_M']),
+                    triton.cdiv(N, META['BLOCK_N']),
+                )
 
-                matmul_kernel[grid](
-                    a, b, c,
+                _matmul_gelu_kernel[grid](
+                    a, b, C,
                     M, N, K,
                     stride_am, stride_ak,
                     stride_bk, stride_bn,
                     stride_cm, stride_cn,
-                    OUT_DTYPE=out_type_id,
+                    OUT_DTYPE=out_triton_dtype,
                 )
 
-                return c
-            '''
-        )
-        return {"code": kernel_code}
+                return C
+        ''')
+        return {"code": code}

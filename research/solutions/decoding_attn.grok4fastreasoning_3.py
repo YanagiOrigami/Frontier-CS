@@ -11,121 +11,121 @@ import triton
 import triton.language as tl
 import math
 
-@triton.jit
-def stats_kernel(
-    Q_PTR, K_PTR, STATS_PTR,
-    stride_qz, stride_qh, stride_qm, stride_qd,
-    stride_kz, stride_kh, stride_kn, stride_kd,
-    stride_statsz, stride_statsh, stride_statsm, stride_statsd,
-    Z, H, M, N, D,
-    BLOCK_N: tl.constexpr,
-    scale: tl.float32
-):
-    pid = tl.program_id(0)
-    z = pid // H
-    h = pid % H
-    m = 0
-    q_offset = z * stride_qz + h * stride_qh + m * stride_qm
-    q = tl.load(Q_PTR + q_offset + tl.arange(0, D) * stride_qd).to(tl.float32)
-    m_s = float("-inf")
-    sum_exp_f = 0.0
-    k_base = K_PTR + z * stride_kz + h * stride_kh
-    start_n = 0
-    while start_n < N:
-        offs_n = start_n + tl.arange(0, BLOCK_N)
-        mask = offs_n < N
-        k_ptrs = k_base + offs_n[:, None] * stride_kn + tl.arange(0, D)[None, :] * stride_kd
-        k = tl.load(k_ptrs, mask=mask[:, None], other=0.0).to(tl.float32)
-        s = tl.sum(q[None, :] * k, axis=1) * scale
-        m_block = tl.max(tl.where(mask, s, float("-inf")), axis=0)
-        m_new = tl.max(m_s, m_block)
-        exp_old = tl.exp(m_s - m_new)
-        s_adj = tl.where(mask, s - m_new, float("-inf"))
-        exp_s_adj = tl.exp(s_adj)
-        sum_exp_block = tl.sum(exp_s_adj, axis=0)
-        sum_exp_f = sum_exp_f * exp_old + sum_exp_block
-        m_s = m_new
-        start_n += BLOCK_N
-    stats_offset = z * stride_statsz + h * stride_statsh + m * stride_statsm
-    tl.store(STATS_PTR + stats_offset + 0 * stride_statsd, m_s)
-    tl.store(STATS_PTR + stats_offset + 1 * stride_statsd, sum_exp_f)
+configs_qk = [
+    triton.Config({'BLOCK_D': 64, 'BLOCK_N': 512}, num_warps=4, num_stages=1),
+    triton.Config({'BLOCK_D': 64, 'BLOCK_N': 1024}, num_warps=8, num_stages=2),
+    triton.Config({'BLOCK_D': 64, 'BLOCK_N': 2048}, num_warps=8, num_stages=4),
+]
 
-@triton.jit
-def out_kernel(
-    Q_PTR, K_PTR, V_PTR, O_PTR, STATS_PTR,
-    stride_qz, stride_qh, stride_qm, stride_qd,
-    stride_kz, stride_kh, stride_kn, stride_kd,
-    stride_vz, stride_vh, stride_vn, stride_vd,
-    stride_oz, stride_oh, stride_om, stride_od,
-    stride_statsz, stride_statsh, stride_statsm, stride_statsd,
-    Z, H, M, N, Dq, Dv,
+@triton.autotune(configs_qk, key=['N'])
+def qk_kernel(
+    Q_ptr, K_ptr, Scores_ptr, scale: tl.float32,
+    Z: tl.int32, H: tl.int32, M: tl.int32, N: tl.int32, D: tl.int32,
+    stride_qz: tl.int32, stride_qh: tl.int32, stride_qm: tl.int32, stride_qd: tl.int32,
+    stride_kz: tl.int32, stride_kh: tl.int32, stride_kn: tl.int32, stride_kd: tl.int32,
+    stride_sz: tl.int32, stride_sh: tl.int32, stride_sm: tl.int32, stride_sn: tl.int32,
     BLOCK_N: tl.constexpr,
-    scale: tl.float32
+    BLOCK_D: tl.constexpr
 ):
-    pid = tl.program_id(0)
-    z = pid // H
-    h = pid % H
-    m = 0
-    q_offset = z * stride_qz + h * stride_qh + m * stride_qm
-    q = tl.load(Q_PTR + q_offset + tl.arange(0, Dq) * stride_qd).to(tl.float32)
-    stats_offset = z * stride_statsz + h * stride_statsh + m * stride_statsm
-    m_s = tl.load(STATS_PTR + stats_offset + 0 * stride_statsd)
-    sum_exp_f = tl.load(STATS_PTR + stats_offset + 1 * stride_statsd)
-    row_scale = tl.where(sum_exp_f > 0, 1.0 / sum_exp_f, 0.0)
-    out = tl.zeros([Dv], dtype=tl.float32)
-    k_base = K_PTR + z * stride_kz + h * stride_kh
-    v_base = V_PTR + z * stride_vz + h * stride_vh
-    start_n = 0
-    while start_n < N:
-        offs_n = start_n + tl.arange(0, BLOCK_N)
-        mask = offs_n < N
-        k_ptrs = k_base + offs_n[:, None] * stride_kn + tl.arange(0, Dq)[None, :] * stride_kd
-        k = tl.load(k_ptrs, mask=mask[:, None], other=0.0).to(tl.float32)
-        s = tl.sum(q[None, :] * k, axis=1) * scale
-        s_adj = tl.where(mask, s - m_s, float("-inf"))
-        exp_s_adj = tl.exp(s_adj)
-        p = exp_s_adj * row_scale
-        v_ptrs = v_base + offs_n[:, None] * stride_vn + tl.arange(0, Dv)[None, :] * stride_vd
-        v = tl.load(v_ptrs, mask=mask[:, None], other=0.0).to(tl.float32)
-        out += tl.sum(p[:, None] * v, axis=0)
-        start_n += BLOCK_N
-    o_offset = z * stride_oz + h * stride_oh + m * stride_om
-    tl.store(O_PTR + o_offset + tl.arange(0, Dv) * stride_od, out.to(tl.float16))
+    pid_z = tl.program_id(0)
+    pid_h = tl.program_id(1)
+    pid_n = tl.program_id(2)
+    offs_d = tl.arange(0, BLOCK_D)
+    q_ptr = Q_ptr + pid_z * stride_qz + pid_h * stride_qh + 0 * stride_qm + offs_d * stride_qd
+    q = tl.load(q_ptr, mask=offs_d < D, other=0.0).to(tl.float32)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    k_ptr = K_ptr + pid_z * stride_kz + pid_h * stride_kh + offs_n[:, None] * stride_kn + offs_d[None, :] * stride_kd
+    k_mask = (offs_n[:, None] < N) & (offs_d[None, :] < D)
+    k = tl.load(k_ptr, mask=k_mask, other=0.0).to(tl.float32)
+    scores_block = tl.sum(q[None, :] * k, axis=1) * scale
+    scores_ptr = Scores_ptr + pid_z * stride_sz + pid_h * stride_sh + 0 * stride_sm + offs_n * stride_sn
+    tl.store(scores_ptr, scores_block.to(tl.float16), mask=offs_n < N)
+
+configs_pv = [
+    triton.Config({'BLOCK_DV': 64, 'BLOCK_N': 512}, num_warps=4, num_stages=1),
+    triton.Config({'BLOCK_DV': 64, 'BLOCK_N': 1024}, num_warps=8, num_stages=2),
+    triton.Config({'BLOCK_DV': 64, 'BLOCK_N': 2048}, num_warps=8, num_stages=4),
+]
+
+@triton.autotune(configs_pv, key=['N'])
+def pv_kernel(
+    P_ptr, V_ptr, Out_ptr,
+    Z: tl.int32, H: tl.int32, M: tl.int32, N: tl.int32, Dv: tl.int32,
+    stride_pz: tl.int32, stride_ph: tl.int32, stride_pm: tl.int32, stride_pn: tl.int32,
+    stride_vz: tl.int32, stride_vh: tl.int32, stride_vn: tl.int32, stride_vd: tl.int32,
+    stride_oz: tl.int32, stride_oh: tl.int32, stride_om: tl.int32, stride_od: tl.int32,
+    BLOCK_N: tl.constexpr,
+    BLOCK_DV: tl.constexpr
+):
+    pid_z = tl.program_id(0)
+    pid_h = tl.program_id(1)
+    pid_n = tl.program_id(2)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    p_ptr = P_ptr + pid_z * stride_pz + pid_h * stride_ph + 0 * stride_pm + offs_n * stride_pn
+    p = tl.load(p_ptr, mask=offs_n < N, other=0.0).to(tl.float32)
+    offs_dv = tl.arange(0, BLOCK_DV)
+    v_ptr = V_ptr + pid_z * stride_vz + pid_h * stride_vh + offs_n[:, None] * stride_vn + offs_dv[None, :] * stride_vd
+    v_mask = (offs_n[:, None] < N) & (offs_dv[None, :] < Dv)
+    v = tl.load(v_ptr, mask=v_mask, other=0.0).to(tl.float32)
+    partial = tl.sum(p[:, None] * v, axis=0)
+    partial = partial.to(tl.float16)
+    o_ptr = Out_ptr + pid_z * stride_oz + pid_h * stride_oh + 0 * stride_om + offs_dv * stride_od
+    tl.atomic_add(o_ptr, partial, mask=offs_dv < Dv)
 
 def decoding_attn(Q: torch.Tensor, K: torch.Tensor, V: torch.Tensor) -> torch.Tensor:
     Z, H, M, Dq = Q.shape
-    N, Dv = K.shape[-2], V.shape[-1]
-    scale = 1 / math.sqrt(Dq)
+    _, _, N, Dv = V.shape
+    Dk = K.shape[3]
+    assert Dq == Dk
+    assert M == 1
+    D = Dq
     device = Q.device
-    stats = torch.empty((Z, H, M, 2), dtype=torch.float32, device=device)
-    O = torch.empty((Z, H, M, Dv), dtype=Q.dtype, device=device)
-    s_q = Q.stride()
-    s_k = K.stride()
-    s_v = V.stride()
-    s_o = O.stride()
-    s_stats = stats.stride()
-    BLOCK_N = 256
-    grid = (Z * H,)
-    stats_kernel[grid](
-        Q, K, stats,
-        s_q[0], s_q[1], s_q[2], s_q[3],
-        s_k[0], s_k[1], s_k[2], s_k[3],
-        s_stats[0], s_stats[1], s_stats[2], s_stats[3],
-        Z, H, M, N, Dq,
-        BLOCK_N=BLOCK_N,
-        scale=scale,
+    scale_val = 1.0 / math.sqrt(D)
+    scale_tensor = torch.tensor(scale_val, dtype=torch.float32, device=device)
+    scores = torch.empty((Z, H, M, N), dtype=torch.float16, device=device)
+    stride_sz = scores.stride(0)
+    stride_sh = scores.stride(1)
+    stride_sm = scores.stride(2)
+    stride_sn = scores.stride(3)
+    stride_qz = Q.stride(0)
+    stride_qh = Q.stride(1)
+    stride_qm = Q.stride(2)
+    stride_qd = Q.stride(3)
+    stride_kz = K.stride(0)
+    stride_kh = K.stride(1)
+    stride_kn = K.stride(2)
+    stride_kd = K.stride(3)
+    stride_vz = V.stride(0)
+    stride_vh = V.stride(1)
+    stride_vn = V.stride(2)
+    stride_vd = V.stride(3)
+    grid_qk = (Z, H, triton.cdiv(N, 1024))
+    qk_kernel[grid_qk](
+        Q, K, scores, scale_tensor,
+        Z, H, M, N, D,
+        stride_qz, stride_qh, stride_qm, stride_qd,
+        stride_kz, stride_kh, stride_kn, stride_kd,
+        stride_sz, stride_sh, stride_sm, stride_sn,
     )
-    out_kernel[grid](
-        Q, K, V, O, stats,
-        s_q[0], s_q[1], s_q[2], s_q[3],
-        s_k[0], s_k[1], s_k[2], s_k[3],
-        s_v[0], s_v[1], s_v[2], s_v[3],
-        s_o[0], s_o[1], s_o[2], s_o[3],
-        s_stats[0], s_stats[1], s_stats[2], s_stats[3],
-        Z, H, M, N, Dq, Dv,
-        BLOCK_N=BLOCK_N,
-        scale=scale,
+    scores_f32 = scores.float()
+    probs = torch.softmax(scores_f32, dim=-1).to(torch.float16)
+    out = torch.zeros((Z, H, M, Dv), dtype=torch.float16, device=device)
+    stride_oz = out.stride(0)
+    stride_oh = out.stride(1)
+    stride_om = out.stride(2)
+    stride_od = out.stride(3)
+    stride_pz = probs.stride(0)
+    stride_ph = probs.stride(1)
+    stride_pm = probs.stride(2)
+    stride_pn = probs.stride(3)
+    grid_pv = (Z, H, triton.cdiv(N, 1024))
+    pv_kernel[grid_pv](
+        probs, V, out,
+        Z, H, M, N, Dv,
+        stride_pz, stride_ph, stride_pm, stride_pn,
+        stride_vz, stride_vh, stride_vn, stride_vd,
+        stride_oz, stride_oh, stride_om, stride_od,
     )
-    return O
+    return out
 """
         return {"code": code}

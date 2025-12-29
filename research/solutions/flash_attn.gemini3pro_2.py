@@ -10,6 +10,14 @@ import triton
 import triton.language as tl
 import math
 
+@triton.autotune(
+    configs=[
+        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 64}, num_warps=4, num_stages=4),
+        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 64}, num_warps=8, num_stages=3),
+        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 64}, num_warps=4, num_stages=4),
+    ],
+    key=['N_CTX', 'BLOCK_DMODEL'],
+)
 @triton.jit
 def _flash_attn_fwd_kernel(
     Q, K, V, sm_scale,
@@ -18,120 +26,136 @@ def _flash_attn_fwd_kernel(
     stride_kz, stride_kh, stride_kn, stride_kk,
     stride_vz, stride_vh, stride_vn, stride_vk,
     stride_oz, stride_oh, stride_om, stride_on,
-    Z, H, M, N,
+    Z, H, N_CTX,
     BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
-    D_Q: tl.constexpr, D_V: tl.constexpr,
-    BLOCK_D_Q: tl.constexpr, BLOCK_D_V: tl.constexpr,
-    IS_CAUSAL: tl.constexpr
+    BLOCK_DMODEL: tl.constexpr,
+    CAUSAL: tl.constexpr
 ):
-    # Program IDs
     start_m = tl.program_id(0)
-    off_h = tl.program_id(1)
-    off_z = tl.program_id(2)
-
-    # Tensor pointers calculation
+    off_hz = tl.program_id(1)
+    
+    off_z = off_hz // H
+    off_h = off_hz % H
+    
     q_offset = off_z * stride_qz + off_h * stride_qh
     k_offset = off_z * stride_kz + off_h * stride_kh
     v_offset = off_z * stride_vz + off_h * stride_vh
     o_offset = off_z * stride_oz + off_h * stride_oh
 
-    # Block offsets
-    offs_m = start_m * BLOCK_M + tl.arange(0, BLOCK_M)
-    offs_k = tl.arange(0, BLOCK_D_Q)
-    offs_v = tl.arange(0, BLOCK_D_V)
+    # Q Block: (BLOCK_M, BLOCK_DMODEL)
+    Q_ptr = tl.make_block_ptr(
+        base=Q + q_offset,
+        shape=(N_CTX, BLOCK_DMODEL),
+        strides=(stride_qm, stride_qk),
+        offsets=(start_m * BLOCK_M, 0),
+        block_shape=(BLOCK_M, BLOCK_DMODEL),
+        order=(1, 0)
+    )
     
-    # Q Pointers
-    q_ptrs = Q + q_offset + (offs_m[:, None] * stride_qm + offs_k[None, :] * stride_qk)
+    # K Block: Transposed to (BLOCK_DMODEL, BLOCK_N) for dot product
+    # Logic: K is (N, D), we load (D, N) chunks transposed
+    K_ptr = tl.make_block_ptr(
+        base=K + k_offset,
+        shape=(BLOCK_DMODEL, N_CTX),
+        strides=(stride_kk, stride_kn),
+        offsets=(0, 0),
+        block_shape=(BLOCK_DMODEL, BLOCK_N),
+        order=(0, 1)
+    )
+    
+    # V Block: (BLOCK_N, BLOCK_DMODEL)
+    V_ptr = tl.make_block_ptr(
+        base=V + v_offset,
+        shape=(N_CTX, BLOCK_DMODEL),
+        strides=(stride_vn, stride_vk),
+        offsets=(0, 0),
+        block_shape=(BLOCK_N, BLOCK_DMODEL),
+        order=(1, 0)
+    )
+
+    # Accumulators
+    m_i = tl.zeros([BLOCK_M], dtype=tl.float32) - float("inf")
+    l_i = tl.zeros([BLOCK_M], dtype=tl.float32) + 1.0
+    acc = tl.zeros([BLOCK_M, BLOCK_DMODEL], dtype=tl.float32)
     
     # Load Q
-    # Apply masking for sequence length M and dimension D_Q
-    q = tl.load(q_ptrs, mask=(offs_m[:, None] < M) & (offs_k[None, :] < D_Q), other=0.0)
-
-    # Initialize accumulators
-    m_i = tl.zeros([BLOCK_M], dtype=tl.float32) - float("inf")
-    l_i = tl.zeros([BLOCK_M], dtype=tl.float32)
-    acc = tl.zeros([BLOCK_M, BLOCK_D_V], dtype=tl.float32)
-
-    qk_scale = sm_scale
-
-    # Loop bounds for causal or non-causal
-    lo = 0
-    hi = N
-    if IS_CAUSAL:
-        hi = (start_m + 1) * BLOCK_M
-        if hi > N:
-            hi = N
-
-    # Helper pointers
-    k_base = K + k_offset
-    v_base = V + v_offset
-    offs_n_base = tl.arange(0, BLOCK_N)
-
-    # Inner loop over K, V blocks
-    for start_n in range(lo, hi, BLOCK_N):
-        cols_n = start_n + offs_n_base
-        
-        # Load K (BLOCK_D_Q, BLOCK_N) -- Transposed for dot(Q, K)
-        k_ptrs = k_base + (offs_k[:, None] * stride_kk + cols_n[None, :] * stride_kn)
-        k = tl.load(k_ptrs, mask=(cols_n[None, :] < N) & (offs_k[:, None] < D_Q), other=0.0)
-
-        # Load V (BLOCK_N, BLOCK_D_V)
-        v_ptrs = v_base + (cols_n[:, None] * stride_vn + offs_v[None, :] * stride_vk)
-        v = tl.load(v_ptrs, mask=(cols_n[:, None] < N) & (offs_v[None, :] < D_V), other=0.0)
-
-        # Compute Attention Score: QK = Q @ K.T
-        qk = tl.dot(q, k)
-        qk *= qk_scale
-
-        # Apply Causal Mask
-        if IS_CAUSAL:
-            # Mask if the current block overlaps with or exceeds the diagonal
-            if start_n + BLOCK_N > start_m * BLOCK_M:
-                 mask = offs_m[:, None] >= cols_n[None, :]
-                 qk = tl.where(mask, qk, float("-inf"))
-        
-        # Online Softmax Update
-        m_i_new = tl.max(qk, 1)
-        alpha = tl.exp(m_i - m_i_new)
-        p = tl.exp(qk - m_i_new[:, None])
-        
-        # Accumulate Output
-        acc = acc * alpha[:, None] + tl.dot(p, v)
-        l_i = l_i * alpha + tl.sum(p, 1)
-        m_i = m_i_new
-
-    # Finalize Output
-    acc = acc / l_i[:, None]
+    q = tl.load(Q_ptr)
     
-    # Store Output
-    o_ptrs = Out + o_offset + (offs_m[:, None] * stride_om + offs_v[None, :] * stride_on)
-    tl.store(o_ptrs, acc.to(tl.float16), mask=(offs_m[:, None] < M) & (offs_v[None, :] < D_V))
+    # Loop bounds
+    lo = 0
+    hi = (start_m + 1) * BLOCK_M if CAUSAL else N_CTX
+    if CAUSAL and hi > N_CTX:
+        hi = N_CTX
+
+    for start_n in range(lo, hi, BLOCK_N):
+        start_n = tl.multiple_of(start_n, BLOCK_N)
+        
+        # Load K
+        k = tl.load(K_ptr)
+        
+        # Compute QK^T
+        qk = tl.dot(q, k)
+        
+        # Causal Masking
+        if CAUSAL:
+            # Check if block overlaps diagonal
+            if start_n + BLOCK_N > start_m * BLOCK_M:
+                offs_m = start_m * BLOCK_M + tl.arange(0, BLOCK_M)
+                offs_n = start_n + tl.arange(0, BLOCK_N)
+                mask = offs_m[:, None] >= offs_n[None, :]
+                qk = tl.where(mask, qk, float("-inf"))
+        
+        qk *= sm_scale
+        
+        # Online Softmax
+        m_ij = tl.max(qk, 1)
+        m_new = tl.maximum(m_i, m_ij)
+        alpha = tl.exp(m_i - m_new)
+        p = tl.exp(qk - m_new[:, None])
+        
+        l_new = alpha * l_i + tl.sum(p, 1)
+        
+        # Update Accumulator
+        v = tl.load(V_ptr)
+        acc = acc * alpha[:, None]
+        p = p.to(tl.float16)
+        acc += tl.dot(p, v)
+        
+        # Update stats
+        l_i = l_new
+        m_i = m_new
+        
+        # Advance pointers
+        K_ptr = tl.advance(K_ptr, (0, BLOCK_N))
+        V_ptr = tl.advance(V_ptr, (BLOCK_N, 0))
+
+    # Epilogue
+    acc = acc / l_i[:, None]
+    acc = acc.to(tl.float16)
+    
+    O_ptr = tl.make_block_ptr(
+        base=Out + o_offset,
+        shape=(N_CTX, BLOCK_DMODEL),
+        strides=(stride_om, stride_on),
+        offsets=(start_m * BLOCK_M, 0),
+        block_shape=(BLOCK_M, BLOCK_DMODEL),
+        order=(1, 0)
+    )
+    tl.store(O_ptr, acc)
 
 def flash_attn(Q, K, V, causal=True):
-    Z, H, M, Dq = Q.shape
-    _, _, N, Dv = V.shape
+    Z, H, N_CTX, D_HEAD = Q.shape
     
-    # Allocate Output
-    Out = torch.empty((Z, H, M, Dv), device=Q.device, dtype=Q.dtype)
+    # Ensure inputs are contiguous
+    if not Q.is_contiguous(): Q = Q.contiguous()
+    if not K.is_contiguous(): K = K.contiguous()
+    if not V.is_contiguous(): V = V.contiguous()
     
-    # Scaling factor
-    sm_scale = 1.0 / math.sqrt(Dq)
+    Out = torch.empty_like(Q)
+    sm_scale = 1.0 / math.sqrt(D_HEAD)
     
-    # Tuning configurations for L4
-    BLOCK_M = 128
-    BLOCK_N = 64
-    BLOCK_D_Q = triton.next_power_of_2(Dq)
-    BLOCK_D_V = triton.next_power_of_2(Dv)
-    
-    # Adjust block size for larger head dimensions to manage shared memory/register pressure
-    if Dq > 64:
-        BLOCK_M = 64
-        
-    num_warps = 4
-    num_stages = 4
-    
-    # Grid: (M blocks, Heads, Batch)
-    grid = (triton.cdiv(M, BLOCK_M), H, Z)
+    def grid(META):
+        return ((N_CTX + META['BLOCK_M'] - 1) // META['BLOCK_M'], Z * H)
     
     _flash_attn_fwd_kernel[grid](
         Q, K, V, sm_scale,
@@ -140,14 +164,11 @@ def flash_attn(Q, K, V, causal=True):
         K.stride(0), K.stride(1), K.stride(2), K.stride(3),
         V.stride(0), V.stride(1), V.stride(2), V.stride(3),
         Out.stride(0), Out.stride(1), Out.stride(2), Out.stride(3),
-        Z, H, M, N,
-        BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N,
-        D_Q=Dq, D_V=Dv,
-        BLOCK_D_Q=BLOCK_D_Q, BLOCK_D_V=BLOCK_D_V,
-        IS_CAUSAL=causal,
-        num_warps=num_warps,
-        num_stages=num_stages
+        Z, H, N_CTX,
+        BLOCK_DMODEL=D_HEAD,
+        CAUSAL=causal
     )
+    
     return Out
 """
         return {"code": code}

@@ -1,4 +1,5 @@
 import pandas as pd
+import numpy as np
 
 class Solution:
     def solve(
@@ -12,75 +13,108 @@ class Solution:
         distinct_value_threshold: float = 0.7,
         parallel: bool = True,
     ) -> pd.DataFrame:
-        """
-        Reorder columns in the DataFrame to maximize prefix hit rate.
-        Strategy:
-        1. Apply column merges if specified.
-        2. Calculate a heuristic score for each column based on repetition and length.
-           Score = Sum((count - 1) * length) for all values in the column.
-           This approximates the contribution of the column to the prefix LCP.
-        3. Sort columns by Score (descending) and Cardinality (ascending).
-        """
         
-        # Work on a copy to prevent side effects
+        # Work on a copy to avoid modifying the original dataframe inplace if not intended
         df_curr = df.copy()
-
+        
         # 1. Apply Column Merges
         if col_merge:
+            cols_to_drop = set()
+            new_cols = {}
+            # Process merges
             for group in col_merge:
-                # Identify columns from the group that exist in the dataframe
-                current_cols = [c for c in group if c in df_curr.columns]
-                
-                # If less than 1 column, nothing to merge
-                if not current_cols:
+                if not group:
                     continue
-                
-                # Create a new column name by concatenating original names
-                # Handle potential naming conflicts
-                new_col_name = "".join([str(c) for c in current_cols])
-                base_name = new_col_name
-                counter = 1
-                while new_col_name in df_curr.columns and new_col_name not in current_cols:
-                    new_col_name = f"{base_name}_{counter}"
-                    counter += 1
-                
-                # Concatenate values row-wise to form the merged column
-                merged_series = df_curr[current_cols[0]].astype(str)
-                for col in current_cols[1:]:
+                # Columns in each merge group are concatenated into a single column
+                # We convert to string first as per problem description
+                merged_series = df_curr[group[0]].astype(str)
+                cols_to_drop.add(group[0])
+                for col in group[1:]:
                     merged_series = merged_series + df_curr[col].astype(str)
+                    cols_to_drop.add(col)
                 
-                # Drop original columns and add the new merged column
-                df_curr.drop(columns=current_cols, inplace=True)
-                df_curr[new_col_name] = merged_series
+                # The merged column replaces the original columns
+                # We create a composite name to avoid collisions
+                new_col_name = "_".join(str(c) for c in group)
+                new_cols[new_col_name] = merged_series
+            
+            # Drop old columns and add new ones
+            df_curr.drop(columns=list(cols_to_drop), inplace=True)
+            for name, series in new_cols.items():
+                df_curr[name] = series
 
-        # 2. Calculate Heuristic Scores
-        # Convert to string to ensure length calculations are consistent with the target metric
-        df_str = df_curr.astype(str)
-        col_scores = []
+        # 2. Greedy Optimization
+        # Algorithm: Iteratively pick the column that maximizes the sum of 
+        # (current_length + potential_future_length) for all rows that continue to have a prefix match.
         
-        for col in df_str.columns:
-            vc = df_str[col].value_counts()
-            
-            # Calculate Score:
-            # We want columns that have frequent, long values to be at the beginning.
-            # Contribution to LCP is roughly: (Frequency - 1) * Length
-            score = 0
-            for val, count in vc.items():
-                if count > 1:
-                    score += (count - 1) * len(str(val))
-            
-            # Secondary metric: Cardinality (number of unique values).
-            # Lower cardinality is better as it implies fewer branches in the prefix tree.
-            cardinality = len(vc)
-            
-            # Store tuple for sorting: (Primary Score (Desc), Secondary Score (Desc so -cardinality), Column Name)
-            col_scores.append((score, -cardinality, col))
-            
-        # 3. Sort Columns
-        # Python's sort is stable; we sort by the tuple keys defined above.
-        col_scores.sort(key=lambda x: (x[0], x[1]), reverse=True)
+        available_cols = list(df_curr.columns)
+        N = len(df_curr)
         
-        ordered_columns = [x[2] for x in col_scores]
+        # Precompute integer codes and string lengths for efficiency
+        col_data = {}
+        for col in available_cols:
+            s_str = df_curr[col].astype(str)
+            codes, uniques = pd.factorize(s_str)
+            unique_lens = np.array([len(u) for u in uniques])
+            # Store codes and length per row
+            col_data[col] = {
+                'codes': codes,
+                'lengths': unique_lens[codes]
+            }
+            
+        # Calculate total remaining length per row (sum of lengths of all available columns)
+        current_remaining_len = np.zeros(N, dtype=np.int64)
+        for col in available_cols:
+            current_remaining_len += col_data[col]['lengths']
+            
+        # Track group identifiers for prefix matches
+        # Initially all rows are in group 0 (empty prefix)
+        current_group_ids = np.zeros(N, dtype=np.int64)
         
-        # 4. Return reordered DataFrame
-        return df_curr[ordered_columns]
+        ordered_cols = []
+        
+        while available_cols:
+            best_col = None
+            best_score = -1.0
+            
+            # Evaluate each candidate column
+            for col in available_cols:
+                # A row is a "survivor" (has a match) if the pair (current_group, new_val)
+                # has appeared before in the sequence 1..i-1.
+                # pd.duplicated(keep='first') correctly identifies these occurrences.
+                
+                # We construct a temporary DataFrame to check duplicates on the pair of arrays
+                # Using integer codes is much faster than strings
+                is_dup = pd.DataFrame({
+                    'g': current_group_ids, 
+                    'c': col_data[col]['codes']
+                }).duplicated(keep='first').to_numpy()
+                
+                # Heuristic Score: Sum of (length of this col + length of all other remaining cols)
+                # for the rows that survive. This maximizes the expected "hit volume".
+                score = np.sum(current_remaining_len[is_dup])
+                
+                if score > best_score:
+                    best_score = score
+                    best_col = col
+            
+            # Fallback (e.g. if no duplicates found at all)
+            if best_col is None:
+                best_col = available_cols[0]
+                
+            ordered_cols.append(best_col)
+            available_cols.remove(best_col)
+            
+            # Update state
+            # Subtract the length of the chosen column from the potential future length
+            current_remaining_len -= col_data[best_col]['lengths']
+            
+            # Update group IDs to reflect the new longer prefix
+            # New groups are formed by unique pairs of (old_group, new_col_val)
+            if available_cols:
+                current_group_ids = pd.DataFrame({
+                    'g': current_group_ids,
+                    'c': col_data[best_col]['codes']
+                }).groupby(['g', 'c'], sort=False).ngroup().to_numpy()
+            
+        return df_curr[ordered_cols]

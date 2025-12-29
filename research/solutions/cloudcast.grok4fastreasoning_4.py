@@ -5,19 +5,24 @@ import networkx as nx
 
 def search_algorithm(src: str, dsts: list[str], G: nx.DiGraph, num_partitions: int) -> BroadCastTopology:
     bc_topology = BroadCastTopology(src, dsts, num_partitions)
+    k = min(num_partitions, 4)
     for dst in dsts:
-        try:
-            node_path = nx.shortest_path(G, src, dst, weight='cost')
-        except nx.NetworkXNoPath:
+        paths_gen = nx.shortest_simple_paths(G, src, dst, weight='cost')
+        path_list = []
+        for _ in range(k):
+            try:
+                node_path = next(paths_gen)
+                path_list.append(node_path)
+            except StopIteration:
+                break
+        m = len(path_list)
+        if m == 0:
             continue
-        edge_list = []
-        for i in range(len(node_path) - 1):
-            u = node_path[i]
-            v = node_path[i + 1]
-            edge_data = G[u][v]
-            edge_list.append([u, v, edge_data])
-        for partition_id in range(num_partitions):
-            bc_topology.set_dst_partition_paths(dst, partition_id, edge_list)
+        for p in range(num_partitions):
+            path_idx = p % m
+            node_path = path_list[path_idx]
+            edges = [[node_path[j], node_path[j+1], G[node_path[j]][node_path[j+1]]] for j in range(len(node_path)-1)]
+            bc_topology.set_dst_partition_paths(dst, p, edges)
     return bc_topology
 """
         return {"code": code}

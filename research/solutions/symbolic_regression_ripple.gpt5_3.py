@@ -2,280 +2,287 @@ import numpy as np
 
 class Solution:
     def __init__(self, **kwargs):
-        self.max_terms = int(kwargs.get("max_terms", 22))
-        self.random_state = int(kwargs.get("random_state", 42))
-
-    def _fmt(self, x):
-        return format(float(x), ".16g")
-
-    def _ridge(self, A, y, alpha):
-        m = A.shape[1]
-        G = A.T @ A
-        G.flat[::m + 1] += alpha
-        try:
-            w = np.linalg.solve(G, A.T @ y)
-        except np.linalg.LinAlgError:
-            w = np.linalg.lstsq(G, A.T @ y, rcond=None)[0]
-        return w
-
-    def _standardize(self, Fraw, has_constant=True):
-        F = Fraw.astype(np.float64, copy=True)
-        n, m = F.shape
-        mu = np.zeros(m, dtype=np.float64)
-        sigma = np.ones(m, dtype=np.float64)
-        start = 1 if has_constant else 0
-        if start < m:
-            mu[start:] = F[:, start:].mean(axis=0)
-            sigma[start:] = F[:, start:].std(axis=0)
-            sigma[sigma < 1e-12] = 1.0
-            F[:, start:] = (F[:, start:] - mu[start:]) / sigma[start:]
-        return F, mu, sigma
-
-    def _convert_to_original(self, w, mu, sigma, has_constant=True):
-        m = w.shape[0]
-        start = 1 if has_constant else 0
-        coef = np.zeros(m, dtype=np.float64)
-        coef[start:] = w[start:] / sigma[start:]
-        intercept = (w[0] if has_constant else 0.0) - float(np.sum(w[start:] * (mu[start:] / sigma[start:])))
-        return intercept, coef
-
-    def _choose_alpha(self, F, y, rng, alphas):
-        n = F.shape[0]
-        idx = rng.permutation(n)
-        split = int(0.8 * n)
-        tr = idx[:split]
-        va = idx[split:]
-        A_tr = F[tr]
-        y_tr = y[tr]
-        A_va = F[va]
-        y_va = y[va]
-        best_alpha = alphas[0]
-        best_mse = np.inf
-        for a in alphas:
-            w = self._ridge(A_tr, y_tr, a)
-            pred = A_va @ w
-            mse = float(np.mean((pred - y_va) ** 2))
-            if mse < best_mse:
-                best_mse = mse
-                best_alpha = a
-        return best_alpha
-
-    def _build_features(self, x1, x2):
-        n = x1.shape[0]
-        features = []
-
-        def add(expr, val):
-            if np.any(~np.isfinite(val)):
-                return
-            features.append((expr, val))
-
-        # Precompute basics
-        r2_val = x1 * x1 + x2 * x2
-        r_val = np.sqrt(r2_val)
-        ones = np.ones_like(x1)
-
-        r_str = "((x1**2 + x2**2)**0.5)"
-        r2_str = "((x1**2 + x2**2))"
-
-        # Base polynomial features
-        add("x1", x1)
-        add("x2", x2)
-        add("x1**2", x1**2)
-        add("x2**2", x2**2)
-        add("(x1*x2)", x1 * x2)
-        add(r_str, r_val)
-        add(r2_str, r2_val)
-        add("log(1.0 + " + r_str + ")", np.log1p(r_val))
-
-        # Amplitudes
-        amp_list = []
-        # 1/(1 + c*r2)
-        for c in [0.2, 0.5, 1.0]:
-            expr = "1.0/(1.0 + " + self._fmt(c) + "*" + r2_str + ")"
-            val = 1.0 / (1.0 + c * r_val * r_val)
-            amp_list.append((expr, val))
-            add(expr, val)
-        # 1/(1 + c*r)
-        for c in [0.5, 1.0]:
-            expr = "1.0/(1.0 + " + self._fmt(c) + "*" + r_str + ")"
-            val = 1.0 / (1.0 + c * r_val)
-            amp_list.append((expr, val))
-            add(expr, val)
-        # (1 + r)^-2 and (1 + r2)^-2
-        expr = "1.0/(1.0 + " + r_str + ")**2"
-        val = 1.0 / (1.0 + r_val) ** 2
-        amp_list.append((expr, val))
-        add(expr, val)
-        expr = "1.0/(1.0 + " + r2_str + ")**2"
-        val = 1.0 / (1.0 + r_val * r_val) ** 2
-        amp_list.append((expr, val))
-        add(expr, val)
-        # exp(-a*r2)
-        for a in [0.2, 0.5, 1.0]:
-            expr = "exp(-" + self._fmt(a) + "*" + r2_str + ")"
-            val = np.exp(-a * r_val * r_val)
-            amp_list.append((expr, val))
-            add(expr, val)
-
-        # Radial trig features with amplitudes
-        w_r = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0]
-        # include amplitude 1.0 explicitly for carriers
-        amp_for_trig = [("1.0", ones)] + amp_list
-
-        for w in w_r:
-            carrier_expr_sin = "sin(" + self._fmt(w) + "*" + r_str + ")"
-            carrier_expr_cos = "cos(" + self._fmt(w) + "*" + r_str + ")"
-            sin_val = np.sin(w * r_val)
-            cos_val = np.cos(w * r_val)
-            for amp_expr, amp_val in amp_for_trig:
-                if amp_expr == "1.0":
-                    add(carrier_expr_sin, sin_val)
-                    add(carrier_expr_cos, cos_val)
-                else:
-                    add("(" + amp_expr + ")*" + carrier_expr_sin, amp_val * sin_val)
-                    add("(" + amp_expr + ")*" + carrier_expr_cos, amp_val * cos_val)
-
-        # r2 trig features
-        w_r2 = [0.5, 1.0, 2.0, 3.0]
-        for w in w_r2:
-            carrier_expr_sin = "sin(" + self._fmt(w) + "*" + r2_str + ")"
-            carrier_expr_cos = "cos(" + self._fmt(w) + "*" + r2_str + ")"
-            arg = w * r_val * r_val
-            sin_val = np.sin(arg)
-            cos_val = np.cos(arg)
-            for amp_expr, amp_val in amp_for_trig:
-                if amp_expr == "1.0":
-                    add(carrier_expr_sin, sin_val)
-                    add(carrier_expr_cos, cos_val)
-                else:
-                    add("(" + amp_expr + ")*" + carrier_expr_sin, amp_val * sin_val)
-                    add("(" + amp_expr + ")*" + carrier_expr_cos, amp_val * cos_val)
-
-        # x1/x2 trig with mild amplitude
-        amp_xy = [("1.0", ones), ("1.0/(1.0 + " + r2_str + ")", 1.0 / (1.0 + r_val * r_val))]
-        k_list = [1.0, 2.0, 3.0, 4.0, 5.0]
-        for k in k_list:
-            sin1_expr = "sin(" + self._fmt(k) + "*x1)"
-            cos1_expr = "cos(" + self._fmt(k) + "*x1)"
-            sin2_expr = "sin(" + self._fmt(k) + "*x2)"
-            cos2_expr = "cos(" + self._fmt(k) + "*x2)"
-            sin1_val = np.sin(k * x1)
-            cos1_val = np.cos(k * x1)
-            sin2_val = np.sin(k * x2)
-            cos2_val = np.cos(k * x2)
-            for amp_expr, amp_val in amp_xy:
-                if amp_expr == "1.0":
-                    add(sin1_expr, sin1_val)
-                    add(cos1_expr, cos1_val)
-                    add(sin2_expr, sin2_val)
-                    add(cos2_expr, cos2_val)
-                else:
-                    add("(" + amp_expr + ")*" + sin1_expr, amp_val * sin1_val)
-                    add("(" + amp_expr + ")*" + cos1_expr, amp_val * cos1_val)
-                    add("(" + amp_expr + ")*" + sin2_expr, amp_val * sin2_val)
-                    add("(" + amp_expr + ")*" + cos2_expr, amp_val * cos2_val)
-
-        return features
+        self.kwargs = kwargs
 
     def solve(self, X: np.ndarray, y: np.ndarray) -> dict:
-        X = np.asarray(X, dtype=np.float64)
-        y = np.asarray(y, dtype=np.float64)
-        n = X.shape[0]
-        x1 = X[:, 0]
-        x2 = X[:, 1]
+        x1 = X[:, 0].astype(float)
+        x2 = X[:, 1].astype(float)
+        y = y.astype(float)
+        r = np.sqrt(x1 * x1 + x2 * x2)
 
-        rng = np.random.default_rng(self.random_state)
+        # Precompute powers of r
+        r1 = r
+        r2 = r * r
 
-        # Build features
-        features = self._build_features(x1, x2)
+        # Helper to build feature matrix
+        def build_features(kind, k1=None, k2=None, d=0.0, deg1=2, deg2=2, bias=True):
+            g = 1.0 / (1.0 + d * r1)  # denominator modulation
+            cols = []
 
-        # Prepare design matrix with intercept
-        m = len(features) + 1
-        Fraw = np.empty((n, m), dtype=np.float64)
-        exprs = ["1.0"]
-        Fraw[:, 0] = 1.0
-        for j, (expr, val) in enumerate(features, start=1):
-            exprs.append(expr)
-            Fraw[:, j] = val
+            if kind in ("kr", "both"):
+                s1 = np.sin(k1 * r1)
+                c1 = np.cos(k1 * r1)
+                # degree deg1 polynomial times sin/cos
+                # degrees: 0..deg1
+                cols.extend([s1, r1 * s1, r2 * s1][:deg1 + 1])
+                cols.extend([c1, r1 * c1, r2 * c1][:deg1 + 1])
 
-        # Standardize
-        F, mu, sigma = self._standardize(Fraw, has_constant=True)
+            if kind in ("kr2", "both"):
+                s2v = np.sin(k2 * r2)
+                c2v = np.cos(k2 * r2)
+                cols.extend([s2v, r1 * s2v, r2 * s2v][:deg2 + 1])
+                cols.extend([c2v, r1 * c2v, r2 * c2v][:deg2 + 1])
 
-        # Alpha selection
-        alphas = np.array([1e-8, 3e-8, 1e-7, 3e-7, 1e-6, 3e-6, 1e-5, 3e-5, 1e-4, 3e-4, 1e-3, 3e-3, 1e-2], dtype=np.float64)
-        alpha = self._choose_alpha(F, y, rng, alphas)
+            if bias:
+                cols.append(np.ones_like(r))
 
-        # Fit on full data
-        w = self._ridge(F, y, alpha)
-        intercept_full, coef_full = self._convert_to_original(w, mu, sigma, has_constant=True)
+            if not cols:
+                A0 = np.ones((r.shape[0], 1))
+            else:
+                A0 = np.column_stack(cols)
+            A = A0 * g[:, None]
+            return A, g
 
-        # Select top terms (exclude intercept index 0)
-        max_terms = self.max_terms
-        if n < 1000:
-            max_terms = max(10, self.max_terms - 6)
-        elif n > 6000:
-            max_terms = self.max_terms + 4
+        def fit_and_eval(kind, k1=None, k2=None, d=0.0, deg1=2, deg2=2, bias=True):
+            A, g = build_features(kind, k1=k1, k2=k2, d=d, deg1=deg1, deg2=deg2, bias=bias)
+            # Solve least squares
+            c, _, _, _ = np.linalg.lstsq(A, y, rcond=None)
+            yhat = A @ c
+            mse = float(np.mean((y - yhat) ** 2))
+            return mse, c, yhat
 
-        coef_mag = np.abs(coef_full[1:])
-        if coef_mag.size > 0:
-            idx_sorted = np.argsort(-coef_mag)
-            k = min(max_terms, idx_sorted.size)
-            sel_indices = idx_sorted[:k] + 1  # shift due to intercept at 0
-        else:
-            sel_indices = np.array([], dtype=int)
+        # Search grids
+        d_list_main = [0.0, 0.1, 0.25, 0.5]
+        # KR: sin(k*r), cos(k*r)
+        k_list_kr = np.arange(0.5, 15.0001, 0.25)  # 0.5 to 15.0
+        # KR2: sin(k*r^2), cos(k*r^2)
+        k_list_kr2 = [0.5, 1.0, 1.5, 2.0, 3.0, 5.0]
+        # BOTH coarse
+        k1_list_both = [1.0, 2.0, 3.0, 5.0, 7.0, 10.0, 12.0]
+        k2_list_both = [0.5, 1.0, 2.0]
+        d_list_both = [0.0, 0.25]
 
-        # Refit with selected features for sparsity
-        mask = np.zeros(m, dtype=bool)
-        mask[0] = True
-        mask[sel_indices] = True
+        best = {
+            "mse": np.inf,
+            "kind": None,
+            "k1": None,
+            "k2": None,
+            "d": 0.0,
+            "deg1": None,
+            "deg2": None,
+            "bias": True,
+            "coeffs": None,
+            "pred": None,
+        }
 
-        Fraw_sub = Fraw[:, mask]
-        exprs_sub = [exprs[i] for i in np.where(mask)[0]]
+        # Model 1: 'kr' with deg 2
+        for d in d_list_main:
+            for k in k_list_kr:
+                mse, coeffs, pred = fit_and_eval("kr", k1=k, k2=None, d=d, deg1=2, deg2=0, bias=True)
+                if mse < best["mse"]:
+                    best.update(dict(mse=mse, kind="kr", k1=k, k2=None, d=d, deg1=2, deg2=0, coeffs=coeffs, pred=pred))
 
-        F_sub, mu_sub, sigma_sub = self._standardize(Fraw_sub, has_constant=True)
+        # Model 2: 'kr2' with deg 2
+        for d in d_list_main:
+            for k in k_list_kr2:
+                mse, coeffs, pred = fit_and_eval("kr2", k1=None, k2=k, d=d, deg1=0, deg2=2, bias=True)
+                if mse < best["mse"]:
+                    best.update(dict(mse=mse, kind="kr2", k1=None, k2=k, d=d, deg1=0, deg2=2, coeffs=coeffs, pred=pred))
 
-        alpha_refit = max(alpha * 0.1, 1e-8)
-        w_sub = self._ridge(F_sub, y, alpha_refit)
-        intercept_final, coef_final = self._convert_to_original(w_sub, mu_sub, sigma_sub, has_constant=True)
+        # Model 3: 'both' with lower degree to control complexity (deg1=1, deg2=1)
+        for d in d_list_both:
+            for k1 in k1_list_both:
+                for k2 in k2_list_both:
+                    mse, coeffs, pred = fit_and_eval("both", k1=k1, k2=k2, d=d, deg1=1, deg2=1, bias=True)
+                    if mse < best["mse"]:
+                        best.update(dict(mse=mse, kind="both", k1=k1, k2=k2, d=d, deg1=1, deg2=1, coeffs=coeffs, pred=pred))
 
-        # Remove tiny coefficients
-        nonconst_idx = np.arange(1, coef_final.shape[0])
-        keep = np.abs(coef_final[1:]) > (1e-10 * (1.0 + np.std(y)))
-        keep_indices = nonconst_idx[keep]
-        # Limit to max_terms again (in case refit added more due to numerical)
-        if keep_indices.size > max_terms:
-            order = np.argsort(-np.abs(coef_final[keep_indices]))
-            keep_indices = keep_indices[order[:max_terms]]
+        # Refinement around the best k(s)
+        def refine_k(best_state):
+            if best_state["kind"] == "kr":
+                k0 = best_state["k1"]
+                d = best_state["d"]
+                # local fine search around k0
+                deltas = np.linspace(-0.5, 0.5, 11)
+                improved = False
+                for dk in deltas:
+                    k = max(0.05, k0 + dk)
+                    mse, coeffs, pred = fit_and_eval("kr", k1=k, k2=None, d=d, deg1=2, deg2=0, bias=True)
+                    if mse < best_state["mse"]:
+                        best_state.update(dict(mse=mse, k1=k, coeffs=coeffs, pred=pred))
+                        improved = True
+                return improved
+            elif best_state["kind"] == "kr2":
+                k0 = best_state["k2"]
+                d = best_state["d"]
+                deltas = np.linspace(-0.3, 0.3, 9)
+                improved = False
+                for dk in deltas:
+                    k = max(0.05, k0 + dk)
+                    mse, coeffs, pred = fit_and_eval("kr2", k1=None, k2=k, d=d, deg1=0, deg2=2, bias=True)
+                    if mse < best_state["mse"]:
+                        best_state.update(dict(mse=mse, k2=k, coeffs=coeffs, pred=pred))
+                        improved = True
+                return improved
+            elif best_state["kind"] == "both":
+                k10 = best_state["k1"]
+                k20 = best_state["k2"]
+                d = best_state["d"]
+                deltas = [-0.3, -0.15, 0.0, 0.15, 0.3]
+                improved = False
+                for dk1 in deltas:
+                    for dk2 in deltas:
+                        k1 = max(0.05, k10 + dk1)
+                        k2 = max(0.05, k20 + dk2)
+                        mse, coeffs, pred = fit_and_eval("both", k1=k1, k2=k2, d=d, deg1=1, deg2=1, bias=True)
+                        if mse < best_state["mse"]:
+                            best_state.update(dict(mse=mse, k1=k1, k2=k2, coeffs=coeffs, pred=pred))
+                            improved = True
+                return improved
+            else:
+                return False
+
+        # Perform a couple of refinement passes
+        for _ in range(2):
+            changed = refine_k(best)
+            if not changed:
+                break
 
         # Build expression string
-        terms = []
-        if abs(intercept_final) > 1e-12:
-            terms.append(self._fmt(intercept_final))
-        for idx in keep_indices:
-            cj = coef_final[idx]
-            ej = exprs_sub[idx]
-            if abs(cj) <= 1e-12:
-                continue
-            terms.append(self._fmt(cj) + "*(" + ej + ")")
-        if not terms:
-            # Fallback to simple linear model if everything pruned
-            a, b, c = np.linalg.lstsq(np.column_stack([x1, x2, np.ones_like(x1)]), y, rcond=None)[0]
-            expression = f"{self._fmt(a)}*x1 + {self._fmt(b)}*x2 + {self._fmt(c)}"
-            preds = a * x1 + b * x2 + c
-            return {"expression": expression, "predictions": preds.tolist(), "details": {}}
+        def fmt_num(v):
+            # format float with sufficient precision but compact
+            if np.isfinite(v):
+                return f"{float(v):.12g}"
+            else:
+                return "0.0"
 
-        expression = " + ".join(terms)
+        r_expr = "(x1**2 + x2**2)**0.5"
+        parts = []
 
-        # Predictions using final selected model
-        y_pred = np.full(n, intercept_final, dtype=np.float64)
-        for idx in keep_indices:
-            ej_idx = idx
-            # Compute corresponding feature values from Fraw_sub (original scale)
-            col_values = Fraw_sub[:, ej_idx]
-            y_pred += coef_final[ej_idx] * col_values
+        coeffs = best["coeffs"]
+        idx = 0
+
+        def poly_from_coeffs(coeff_list):
+            terms = []
+            for p, c in enumerate(coeff_list):
+                if abs(c) < 1e-10:
+                    continue
+                cn = fmt_num(c)
+                if p == 0:
+                    terms.append(f"{cn}")
+                elif p == 1:
+                    terms.append(f"{cn}*{r_expr}")
+                else:
+                    terms.append(f"{cn}*({r_expr}**{p})")
+            if not terms:
+                return "0.0"
+            # Combine terms; negative signs included in cn
+            return "(" + " + ".join(terms) + ")"
+
+        # Extract and build according to kind
+        if best["kind"] == "kr":
+            deg = best["deg1"]
+            # sin poly deg+1
+            sin_coeffs = coeffs[idx:idx + (deg + 1)]
+            idx += (deg + 1)
+            cos_coeffs = coeffs[idx:idx + (deg + 1)]
+            idx += (deg + 1)
+            bias_c = coeffs[idx] if idx < len(coeffs) else 0.0
+
+            poly_sin = poly_from_coeffs(sin_coeffs)
+            poly_cos = poly_from_coeffs(cos_coeffs)
+
+            sin_arg = f"{fmt_num(best['k1'])}*{r_expr}"
+            sin_part = None if poly_sin == "0.0" else f"{poly_sin}*sin({sin_arg})"
+            cos_part = None if poly_cos == "0.0" else f"{poly_cos}*cos({sin_arg})"
+            if sin_part:
+                parts.append(sin_part)
+            if cos_part:
+                parts.append(cos_part)
+            if abs(bias_c) >= 1e-10:
+                parts.append(fmt_num(bias_c))
+
+        elif best["kind"] == "kr2":
+            deg = best["deg2"]
+            sin_coeffs = coeffs[idx:idx + (deg + 1)]
+            idx += (deg + 1)
+            cos_coeffs = coeffs[idx:idx + (deg + 1)]
+            idx += (deg + 1)
+            bias_c = coeffs[idx] if idx < len(coeffs) else 0.0
+
+            poly_sin = poly_from_coeffs(sin_coeffs)
+            poly_cos = poly_from_coeffs(cos_coeffs)
+
+            sin_arg = f"{fmt_num(best['k2'])}*({r_expr}**2)"
+            sin_part = None if poly_sin == "0.0" else f"{poly_sin}*sin({sin_arg})"
+            cos_part = None if poly_cos == "0.0" else f"{poly_cos}*cos({sin_arg})"
+            if sin_part:
+                parts.append(sin_part)
+            if cos_part:
+                parts.append(cos_part)
+            if abs(bias_c) >= 1e-10:
+                parts.append(fmt_num(bias_c))
+
+        elif best["kind"] == "both":
+            deg1 = best["deg1"]
+            deg2 = best["deg2"]
+
+            sin1_coeffs = coeffs[idx:idx + (deg1 + 1)]
+            idx += (deg1 + 1)
+            cos1_coeffs = coeffs[idx:idx + (deg1 + 1)]
+            idx += (deg1 + 1)
+
+            sin2_coeffs = coeffs[idx:idx + (deg2 + 1)]
+            idx += (deg2 + 1)
+            cos2_coeffs = coeffs[idx:idx + (deg2 + 1)]
+            idx += (deg2 + 1)
+
+            bias_c = coeffs[idx] if idx < len(coeffs) else 0.0
+
+            poly_sin1 = poly_from_coeffs(sin1_coeffs)
+            poly_cos1 = poly_from_coeffs(cos1_coeffs)
+            poly_sin2 = poly_from_coeffs(sin2_coeffs)
+            poly_cos2 = poly_from_coeffs(cos2_coeffs)
+
+            arg1 = f"{fmt_num(best['k1'])}*{r_expr}"
+            arg2 = f"{fmt_num(best['k2'])}*({r_expr}**2)"
+
+            s1 = None if poly_sin1 == "0.0" else f"{poly_sin1}*sin({arg1})"
+            c1 = None if poly_cos1 == "0.0" else f"{poly_cos1}*cos({arg1})"
+            s2 = None if poly_sin2 == "0.0" else f"{poly_sin2}*sin({arg2})"
+            c2 = None if poly_cos2 == "0.0" else f"{poly_cos2}*cos({arg2})"
+
+            for part in (s1, c1, s2, c2):
+                if part:
+                    parts.append(part)
+            if abs(bias_c) >= 1e-10:
+                parts.append(fmt_num(bias_c))
+
+        # Combine numerator parts
+        if not parts:
+            numerator_expr = "0.0"
+        else:
+            numerator_expr = "(" + " + ".join(parts) + ")"
+
+        # Apply g
+        if best["d"] != 0.0:
+            g_expr = f"1.0/(1.0 + {fmt_num(best['d'])}*{r_expr})"
+            final_expr = f"{g_expr}*{numerator_expr}"
+        else:
+            final_expr = numerator_expr
+
+        predictions = best["pred"].tolist() if best["pred"] is not None else None
+
+        details = {
+            "mse": best["mse"],
+            "kind": best["kind"],
+            "k1": best["k1"],
+            "k2": best["k2"],
+            "d": best["d"],
+        }
 
         return {
-            "expression": expression,
-            "predictions": y_pred.tolist(),
-            "details": {}
+            "expression": final_expr,
+            "predictions": predictions,
+            "details": details,
         }

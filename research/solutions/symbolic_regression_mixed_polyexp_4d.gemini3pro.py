@@ -2,70 +2,85 @@ import numpy as np
 import pandas as pd
 import sympy
 from pysr import PySRRegressor
-import warnings
-
-warnings.filterwarnings("ignore")
 
 class Solution:
     def __init__(self, **kwargs):
-        pass
+        self.random_state = kwargs.get('random_state', 42)
 
     def solve(self, X: np.ndarray, y: np.ndarray) -> dict:
         """
         Solves the symbolic regression problem using PySR.
+        Falls back to linear regression if symbolic regression fails.
         """
-        # Define model hyperparameters tailored for 4D Mixed PolyExp data
-        # Using 40 iterations and adequate population size to explore the search space
-        model = PySRRegressor(
-            niterations=40,
-            binary_operators=["+", "-", "*", "/"],
-            unary_operators=["sin", "cos", "exp", "log"],
-            populations=20,
-            population_size=40,
-            maxsize=45,  # Allow complexity for cross-terms and dampening
-            ncyclesperiteration=500,
-            model_selection="best",
-            loss="loss(x, y) = (x - y)^2",
-            verbosity=0,
-            progress=False,
-            random_state=42,
-            deterministic=True,
-            temp_equation_file=True,
-            delete_tempfiles=True
-        )
-
         try:
-            # Fit the model specifying variable names to match output requirements
+            # Initialize PySRRegressor
+            # Using configurations optimized for 8 vCPUs and the problem complexity
+            model = PySRRegressor(
+                niterations=100,
+                binary_operators=["+", "-", "*", "/", "^"],
+                unary_operators=["sin", "cos", "exp", "log"],
+                model_selection="best",
+                maxsize=40,
+                timeout_in_seconds=300,  # 5 minutes max
+                random_state=self.random_state,
+                verbosity=0,
+                progress=False,
+                populations=30,  # ~4x core count for better diversity
+                deterministic=True
+            )
+
+            # Fit the model
             model.fit(X, y, variable_names=["x1", "x2", "x3", "x4"])
 
-            # Extract the best symbolic expression
-            # PySR's model.sympy() returns a sympy expression object
+            # Retrieve the best expression found
+            # PySR returns a sympy object which we convert to string
             best_expr = model.sympy()
             expression = str(best_expr)
 
-            # Generate predictions using the fitted model
+            # Compute predictions using the fitted model
             predictions = model.predict(X)
 
-        except Exception:
-            # Fallback to Linear Regression if symbolic regression fails
-            # This ensures we always return a valid result
-            n_samples, n_features = X.shape
-            X_aug = np.column_stack([X, np.ones(n_samples)])
-            coeffs, _, _, _ = np.linalg.lstsq(X_aug, y, rcond=None)
+            # Extract complexity if available, else 0
+            complexity = 0
+            if hasattr(model, 'equations_') and model.equations_ is not None:
+                try:
+                    # Get complexity of the selected model (score max or best selection)
+                    best_idx = model.equations_['score'].idxmax()
+                    complexity = int(model.equations_.loc[best_idx, 'complexity'])
+                except:
+                    pass
 
-            # Construct linear expression string
-            terms = [f"({coeffs[i]} * x{i+1})" for i in range(n_features)]
-            terms.append(str(coeffs[-1]))
-            expression = " + ".join(terms)
+            return {
+                "expression": expression,
+                "predictions": predictions.tolist(),
+                "details": {
+                    "complexity": complexity
+                }
+            }
 
-            predictions = X_aug @ coeffs
+        except Exception as e:
+            # Fallback to linear regression in case of any failure
+            return self._linear_fallback(X, y)
 
-        # Ensure predictions are a list/array
-        if isinstance(predictions, np.ndarray):
-            predictions = predictions.tolist()
+    def _linear_fallback(self, X: np.ndarray, y: np.ndarray) -> dict:
+        # Add bias term
+        n_samples = X.shape[0]
+        X_aug = np.hstack([X, np.ones((n_samples, 1))])
+
+        # Least squares fit
+        coeffs, _, _, _ = np.linalg.lstsq(X_aug, y, rcond=None)
+
+        # Construct linear expression string
+        terms = []
+        for i in range(4):
+            terms.append(f"({coeffs[i]} * x{i+1})")
+        terms.append(f"({coeffs[4]})")  # Bias
+
+        expression = " + ".join(terms)
+        predictions = X_aug @ coeffs
 
         return {
             "expression": expression,
-            "predictions": predictions,
-            "details": {}
+            "predictions": predictions.tolist(),
+            "details": {"fallback": True, "complexity": 5}
         }

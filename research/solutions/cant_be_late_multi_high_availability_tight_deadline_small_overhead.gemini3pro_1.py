@@ -6,9 +6,9 @@ from sky_spot.utils import ClusterType
 
 
 class Solution(MultiRegionStrategy):
-    """Multi-region scheduling strategy that optimizes cost while meeting deadline."""
+    """Your multi-region scheduling strategy."""
 
-    NAME = "cost_aware_robust_scheduler"
+    NAME = "robust_cost_optimizer"
 
     def solve(self, spec_path: str) -> "Solution":
         """
@@ -29,64 +29,54 @@ class Solution(MultiRegionStrategy):
     def _step(self, last_cluster_type: ClusterType, has_spot: bool) -> ClusterType:
         """
         Decide next action based on current state.
-        Prioritize Spot instances when slack permits.
-        Switch regions to find Spot if current region is unavailable.
-        Fall back to On-Demand when deadline approaches to guarantee completion.
+        Prioritize Spot instances to minimize cost, but switch to On-Demand
+        when the deadline approaches (Panic Mode).
+        If Spot is unavailable in the current region and slack permits, 
+        switch regions to search for Spot.
         """
-        # Calculate progress and slack
-        work_done = sum(self.task_done_time)
-        work_remaining = self.task_duration - work_done
+        # 1. Update Progress
+        current_work = sum(self.task_done_time)
+        remaining_work = self.task_duration - current_work
         
-        # If work is complete, do nothing
-        if work_remaining <= 1e-6:
-            return ClusterType.NONE
-            
-        time_remaining = self.deadline - self.env.elapsed_seconds
-        slack = time_remaining - work_remaining
-        
-        # Strategy parameters
+        # 2. Check Time Constraints
+        elapsed = self.env.elapsed_seconds
+        time_left = self.deadline - elapsed
         gap = self.env.gap_seconds
+        overhead = self.restart_overhead
         
-        # Safety buffer: 2 hours.
-        # If slack falls below this, we stop hunting for Spot and use reliable On-Demand.
-        # This protects against trace variability and ensures we finish before deadline.
-        # We need a buffer > 0 to account for potential restart overheads and small variations.
-        SAFETY_BUFFER = 7200.0
+        # Calculate minimum time needed to finish using On-Demand (safe path).
+        # needed = work + overhead (worst case for restart/switch).
+        time_needed_od = remaining_work + overhead
         
-        # 1. Critical Phase: Low Slack
-        if slack < SAFETY_BUFFER:
-            # We are close to the "point of no return".
-            # Prioritize reliability.
-            # If Spot is available right now, we could use it, but if it fails, we might miss deadline.
-            # However, prompt says "finish before deadline while minimizing cost".
-            # Running OD guarantees finishing if slack >= 0.
-            # We stick to OD to be safe given the heavy penalty for failure.
+        # Safety Buffer:
+        # We need a buffer to account for step granularity (gap_seconds) and 
+        # ensure we don't accidentally cross the deadline.
+        # 3.0 * gap provides a robust margin (e.g., 3 hours if gap is 1h).
+        # If remaining slack drops below this buffer, we force OD.
+        buffer = 3.0 * gap
+        
+        # 3. Decision Logic
+        
+        # PANIC MODE: Not enough time to risk searching or Spot interruptions.
+        if time_left < time_needed_od + buffer:
             return ClusterType.ON_DEMAND
-            
-        # 2. Normal Phase: High Slack
-        # We prefer Spot instances.
-        
+
+        # NORMAL MODE: Try to use Spot.
         if has_spot:
-            # Spot is available in current region. Use it.
             return ClusterType.SPOT
         else:
-            # Spot is not available in current region.
-            # We have slack. Should we hunt for Spot in another region?
+            # Spot unavailable in current region.
+            # Since we are not in panic mode, we have slack to "hunt" for Spot.
+            # Strategy: Switch to next region and wait 1 step (NONE) to check availability.
+            # We accept the time cost of NONE (gap_seconds) to save money.
             
-            # Hunting (Switch + Wait) costs 'gap' seconds of slack.
-            # We only hunt if we will still have a safe buffer after wasting this step.
-            if slack - gap > SAFETY_BUFFER:
-                # Switch to next region in round-robin fashion
-                current_region_idx = self.env.get_current_region()
-                num_regions = self.env.get_num_regions()
-                next_region_idx = (current_region_idx + 1) % num_regions
-                
-                self.env.switch_region(next_region_idx)
-                
-                # Return NONE to pause execution for this step (incurring gap time),
-                # allowing us to check spot availability in the new region at next step.
-                return ClusterType.NONE
-            else:
-                # Not enough slack to justify wasting time hunting.
-                # Run On-Demand to ensure progress.
-                return ClusterType.ON_DEMAND
+            num_regions = self.env.get_num_regions()
+            current_region = self.env.get_current_region()
+            next_region = (current_region + 1) % num_regions
+            
+            self.env.switch_region(next_region)
+            
+            # We must return NONE here because:
+            # 1. We cannot return SPOT (has_spot is False for the call).
+            # 2. Returning ON_DEMAND defeats the purpose of searching (high cost).
+            return ClusterType.NONE

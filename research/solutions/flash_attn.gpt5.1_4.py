@@ -1,10 +1,7 @@
 import textwrap
 
-
-class Solution:
-    def solve(self, spec_path: str = None) -> dict:
-        code = textwrap.dedent(
-            '''
+CODE = textwrap.dedent('''
+import math
 import torch
 import triton
 import triton.language as tl
@@ -13,85 +10,78 @@ import triton.language as tl
 @triton.jit
 def _flash_attn_fwd(
     Q, K, V, Out,
-    stride_qb, stride_qm, stride_qd,
-    stride_kb, stride_kn, stride_kd,
-    stride_vb, stride_vn, stride_vd,
-    stride_ob, stride_om, stride_od,
-    B, M, N, D_HEAD, D_VALUE, sm_scale,
-    causal: tl.constexpr,
-    BLOCK_M: tl.constexpr,
-    BLOCK_N: tl.constexpr,
-    BLOCK_DMODEL: tl.constexpr,
-    BLOCK_DV: tl.constexpr,
+    stride_qz, stride_qm, stride_qd,
+    stride_kz, stride_kn, stride_kd,
+    stride_vz, stride_vn, stride_vd,
+    stride_oz, stride_om, stride_od,
+    N_CTX, D_HEAD_Q, D_HEAD_V, scale,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
+    BLOCK_DMODEL_Q: tl.constexpr, BLOCK_DMODEL_V: tl.constexpr,
+    CAUSAL: tl.constexpr,
 ):
-    pid_m = tl.program_id(0)
-    pid_b = tl.program_id(1)
+    pid = tl.program_id(axis=0)
+    num_m_blocks = tl.cdiv(N_CTX, BLOCK_M)
+    batch_idx = pid // num_m_blocks
+    m_block_idx = pid % num_m_blocks
 
-    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
-    offs_d = tl.arange(0, BLOCK_DMODEL)
+    offs_m = m_block_idx * BLOCK_M + tl.arange(0, BLOCK_M)
     offs_n_init = tl.arange(0, BLOCK_N)
-    offs_dv = tl.arange(0, BLOCK_DV)
+    offs_dq = tl.arange(0, BLOCK_DMODEL_Q)
+    offs_dv = tl.arange(0, BLOCK_DMODEL_V)
 
-    row_mask = offs_m < M
-    dq_mask = offs_d < D_HEAD
+    # Load Q: shape [BLOCK_M, D_HEAD_Q]
+    q_ptrs = Q + batch_idx * stride_qz + offs_m[:, None] * stride_qm + offs_dq[None, :] * stride_qd
+    q_mask = (offs_m[:, None] < N_CTX) & (offs_dq[None, :] < D_HEAD_Q)
+    q = tl.load(q_ptrs, mask=q_mask, other=0.0).to(tl.float32)
 
-    # Load Q block [BLOCK_M, BLOCK_DMODEL]
-    q_ptrs = Q + pid_b * stride_qb + offs_m[:, None] * stride_qm + offs_d[None, :] * stride_qd
-    q = tl.load(q_ptrs, mask=row_mask[:, None] & dq_mask[None, :], other=0.0)
-    q = q.to(tl.float32)
+    # Initialize softmax statistics and accumulator
+    m_i = tl.full((BLOCK_M,), -float("inf"), dtype=tl.float32)
+    l_i = tl.zeros((BLOCK_M,), dtype=tl.float32)
+    acc = tl.zeros((BLOCK_M, BLOCK_DMODEL_V), dtype=tl.float32)
 
-    NEG_INF = -1.0e9
-    m_i = tl.full((BLOCK_M,), NEG_INF, tl.float32)
-    l_i = tl.zeros((BLOCK_M,), tl.float32)
-    acc = tl.zeros((BLOCK_M, BLOCK_DV), tl.float32)
+    n_start = 0
+    while n_start < N_CTX:
+        offs_n = n_start + offs_n_init
 
-    for start_n in range(0, N, BLOCK_N):
-        offs_n = start_n + offs_n_init
-        col_mask = offs_n < N
+        k_ptrs = K + batch_idx * stride_kz + offs_n[:, None] * stride_kn + offs_dq[None, :] * stride_kd
+        v_ptrs = V + batch_idx * stride_vz + offs_n[:, None] * stride_vn + offs_dv[None, :] * stride_vd
 
-        # K block [BLOCK_N, BLOCK_DMODEL]
-        k_ptrs = K + pid_b * stride_kb + offs_n[:, None] * stride_kn + offs_d[None, :] * stride_kd
-        k = tl.load(k_ptrs, mask=col_mask[:, None] & dq_mask[None, :], other=0.0)
-        k = k.to(tl.float32)
+        k_mask = (offs_n[:, None] < N_CTX) & (offs_dq[None, :] < D_HEAD_Q)
+        v_mask = (offs_n[:, None] < N_CTX) & (offs_dv[None, :] < D_HEAD_V)
 
-        # V block [BLOCK_N, BLOCK_DV]
-        dv_mask = offs_dv < D_VALUE
-        v_ptrs = V + pid_b * stride_vb + offs_n[:, None] * stride_vn + offs_dv[None, :] * stride_vd
-        v = tl.load(v_ptrs, mask=col_mask[:, None] & dv_mask[None, :], other=0.0)
-        v = v.to(tl.float32)
+        k = tl.load(k_ptrs, mask=k_mask, other=0.0).to(tl.float32)
+        v = tl.load(v_ptrs, mask=v_mask, other=0.0).to(tl.float32)
 
-        # Attention scores [BLOCK_M, BLOCK_N]
-        qk = tl.dot(q, tl.trans(k)) * sm_scale
+        # Compute attention scores [BLOCK_M, BLOCK_N]
+        qk = tl.dot(q, tl.trans(k)) * scale
 
-        # Base mask for sequence bounds
-        mask = row_mask[:, None] & col_mask[None, :]
+        # Apply padding and (optional) causal mask
+        valid_m = offs_m < N_CTX
+        valid_n = offs_n < N_CTX
 
-        # Causal mask if requested
-        if causal:
-            q_idx = offs_m[:, None]
-            k_idx = offs_n[None, :]
-            causal_mask = k_idx <= q_idx
-            mask = mask & causal_mask
+        qk = tl.where(valid_n[None, :], qk, float("-inf"))
+        qk = tl.where(valid_m[:, None], qk, float("-inf"))
 
-        qk = tl.where(mask, qk, NEG_INF)
+        if CAUSAL:
+            causal_mask = offs_m[:, None] >= offs_n[None, :]
+            qk = tl.where(causal_mask, qk, float("-inf"))
 
-        # Streaming softmax
+        # Numerically-stable streaming softmax
         m_ij = tl.max(qk, axis=1)
         m_i_new = tl.maximum(m_i, m_ij)
         p = tl.exp(qk - m_i_new[:, None])
-        l_ij = tl.sum(p, axis=1)
         alpha = tl.exp(m_i - m_i_new)
-        l_i = l_i * alpha + l_ij
+        l_i = l_i * alpha + tl.sum(p, axis=1)
         acc = acc * alpha[:, None] + tl.dot(p, v)
         m_i = m_i_new
 
-    # Normalize
-    out = acc / l_i[:, None]
+        n_start += BLOCK_N
 
-    # Store result
-    dv_mask = offs_dv < D_VALUE
-    out_ptrs = Out + pid_b * stride_ob + offs_m[:, None] * stride_om + offs_dv[None, :] * stride_od
-    tl.store(out_ptrs, out, mask=row_mask[:, None] & dv_mask[None, :])
+    # Normalize and store result
+    o = acc / l_i[:, None]
+    out_ptrs = Out + batch_idx * stride_oz + offs_m[:, None] * stride_om + offs_dv[None, :] * stride_od
+    out_mask = (offs_m[:, None] < N_CTX) & (offs_dv[None, :] < D_HEAD_V)
+    tl.store(out_ptrs, o.to(tl.float16), mask=out_mask)
 
 
 def flash_attn(Q: torch.Tensor, K: torch.Tensor, V: torch.Tensor, causal: bool = True) -> torch.Tensor:
@@ -99,79 +89,77 @@ def flash_attn(Q: torch.Tensor, K: torch.Tensor, V: torch.Tensor, causal: bool =
     Flash attention computation with optional causal masking.
 
     Args:
-        Q: (Z, H, M, Dq) float16
-        K: (Z, H, N, Dq) float16
-        V: (Z, H, N, Dv) float16
-        causal: bool
-
+        Q: (Z, H, M, Dq) float16 CUDA tensor
+        K: (Z, H, N, Dq) float16 CUDA tensor
+        V: (Z, H, N, Dv) float16 CUDA tensor
+        causal: whether to apply causal masking
     Returns:
-        (Z, H, M, Dv) float16
+        (Z, H, M, Dv) float16 CUDA tensor
     """
-    assert Q.is_cuda and K.is_cuda and V.is_cuda, "Inputs must be CUDA tensors"
-    assert Q.dtype == torch.float16 and K.dtype == torch.float16 and V.dtype == torch.float16, "Inputs must be float16"
-    assert Q.device == K.device == V.device, "All inputs must be on the same device"
+    assert Q.is_cuda and K.is_cuda and V.is_cuda, "Q, K, V must be CUDA tensors"
+    assert Q.dtype == torch.float16 and K.dtype == torch.float16 and V.dtype == torch.float16, "Q, K, V must be float16"
 
-    Z, H, M, D_HEAD = Q.shape
-    Zk, Hk, N, D_HEAD_k = K.shape
-    Zv, Hv, N_v, D_VALUE = V.shape
+    Z, H, M, Dq = Q.shape
+    zk, hk, N, Dk = K.shape
+    zv, hv, Nv, Dv = V.shape
+    assert Z == zk == zv and H == hk == hv, "Batch/head dimensions must match"
+    assert N == M and Nv == N, "Sequence lengths must satisfy N == M"
+    assert Dk == Dq, "Key dimension must match query dimension"
 
-    assert Z == Zk == Zv, "Batch dimension mismatch"
-    assert H == Hk == Hv, "Head dimension mismatch"
-    assert N == M == N_v, "Sequence length mismatch"
-    assert D_HEAD == D_HEAD_k, "Q/K head dimension mismatch"
+    # Flatten batch and heads into a single dimension
+    BH = Z * H
+    Q_ = Q.contiguous().view(BH, M, Dq)
+    K_ = K.contiguous().view(BH, N, Dq)
+    V_ = V.contiguous().view(BH, N, Dv)
+    O_ = torch.empty((BH, M, Dv), device=Q.device, dtype=torch.float16)
 
-    B = Z * H
+    # Strides
+    stride_qz, stride_qm, stride_qd = Q_.stride()
+    stride_kz, stride_kn, stride_kd = K_.stride()
+    stride_vz, stride_vn, stride_vd = V_.stride()
+    stride_oz, stride_om, stride_od = O_.stride()
 
-    Q_ = Q.reshape(B, M, D_HEAD)
-    K_ = K.reshape(B, N, D_HEAD)
-    V_ = V.reshape(B, N, D_VALUE)
+    head_dim_q = Dq
+    head_dim_v = Dv
 
-    def next_power_of_2(x: int) -> int:
-        y = 1
-        while y < x:
-            y <<= 1
-        return y
+    if head_dim_q > 128 or head_dim_v > 128:
+        raise ValueError("Head dimensions larger than 128 are not supported by this kernel")
 
-    BLOCK_DMODEL = next_power_of_2(D_HEAD)
-    BLOCK_DV = next_power_of_2(D_VALUE)
+    # Choose block sizes
+    BLOCK_DMODEL_Q = 64 if head_dim_q <= 64 else 128
+    BLOCK_DMODEL_V = 64 if head_dim_v <= 64 else 128
+    BLOCK_M = 64
+    BLOCK_N = 64
 
-    # Cap to keep register usage reasonable
-    if BLOCK_DMODEL > 256:
-        BLOCK_DMODEL = 256
-    if BLOCK_DV > 256:
-        BLOCK_DV = 256
+    num_m_blocks = triton.cdiv(M, BLOCK_M)
+    grid = (BH * num_m_blocks,)
 
-    # Sequence blocking
-    if M <= 64:
-        BLOCK_M = 32
-        BLOCK_N = 64
-    else:
-        BLOCK_M = 64
-        BLOCK_N = 64
-
-    sm_scale = 1.0 / (D_HEAD ** 0.5)
-
-    Out = torch.empty((B, M, D_VALUE), device=Q.device, dtype=torch.float16)
-
-    grid = (triton.cdiv(M, BLOCK_M), B)
+    scale = 1.0 / math.sqrt(head_dim_q)
 
     _flash_attn_fwd[grid](
-        Q_, K_, V_, Out,
-        Q_.stride(0), Q_.stride(1), Q_.stride(2),
-        K_.stride(0), K_.stride(1), K_.stride(2),
-        V_.stride(0), V_.stride(1), V_.stride(2),
-        Out.stride(0), Out.stride(1), Out.stride(2),
-        B, M, N, D_HEAD, D_VALUE, sm_scale,
-        causal=causal,
+        Q_, K_, V_, O_,
+        stride_qz, stride_qm, stride_qd,
+        stride_kz, stride_kn, stride_kd,
+        stride_vz, stride_vn, stride_vd,
+        stride_oz, stride_om, stride_od,
+        M, head_dim_q, head_dim_v, scale,
         BLOCK_M=BLOCK_M,
         BLOCK_N=BLOCK_N,
-        BLOCK_DMODEL=BLOCK_DMODEL,
-        BLOCK_DV=BLOCK_DV,
+        BLOCK_DMODEL_Q=BLOCK_DMODEL_Q,
+        BLOCK_DMODEL_V=BLOCK_DMODEL_V,
+        CAUSAL=causal,
         num_warps=4,
         num_stages=2,
     )
 
-    return Out.reshape(Z, H, M, D_VALUE)
-'''
-        )
-        return {"code": code}
+    return O_.view(Z, H, M, Dv)
+''')
+
+# Execute the kernel code in this module's namespace so flash_attn is available here too
+exec_globals = globals()
+exec(CODE, exec_globals)
+
+
+class Solution:
+    def solve(self, spec_path: str = None) -> dict:
+        return {"code": CODE}

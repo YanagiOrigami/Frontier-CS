@@ -1,111 +1,111 @@
 import torch
 import triton
 import triton.language as tl
-import inspect
-import sys
 
-# Required GELU implementation
+class Solution:
+    def solve(self, spec_path: str = None) -> dict:
+        """
+        Returns a dict with either:
+        - {"code": "python_code_string"}
+        - {"program_path": "path/to/kernel.py"}
+        """
+        code = """
+import torch
+import triton
+import triton.language as tl
+
 @triton.jit
 def gelu(x):
-    """
+    \"\"\"
     GeLU activation function, as specified in the problem.
-    This is equivalent to x * Phi(x) where Phi is the standard normal CDF.
-    """
+    \"\"\"
     return x * 0.5 * (1.0 + tl.extra.cuda.libdevice.erf(x * 0.7071067811865476))
+
 
 @triton.autotune(
     configs=[
-        # Basic configurations with varying block sizes and stages
-        triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 256, 'BLOCK_SIZE_K': 64, 'GROUP_SIZE_M': 8, 'num_stages': 2, 'num_warps': 8}),
-        triton.Config({'BLOCK_SIZE_M': 256, 'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 64, 'GROUP_SIZE_M': 8, 'num_stages': 2, 'num_warps': 8}),
-        triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 128, 'GROUP_SIZE_M': 8, 'num_stages': 3, 'num_warps': 8}),
-        triton.Config({'BLOCK_SIZE_M': 64,  'BLOCK_SIZE_N': 256, 'BLOCK_SIZE_K': 128, 'GROUP_SIZE_M': 8, 'num_stages': 3, 'num_warps': 8}),
-        triton.Config({'BLOCK_SIZE_M': 256, 'BLOCK_SIZE_N': 64,  'BLOCK_SIZE_K': 128, 'GROUP_SIZE_M': 8, 'num_stages': 3, 'num_warps': 8}),
-        triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 64,  'BLOCK_SIZE_K': 128, 'GROUP_SIZE_M': 8, 'num_stages': 4, 'num_warps': 4}),
-        triton.Config({'BLOCK_SIZE_M': 64,  'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 128, 'GROUP_SIZE_M': 8, 'num_stages': 4, 'num_warps': 4}),
-        # Configurations optimized for large K values
-        triton.Config({'BLOCK_SIZE_M': 64,  'BLOCK_SIZE_N': 64,  'BLOCK_SIZE_K': 256, 'GROUP_SIZE_M': 16, 'num_stages': 3, 'num_warps': 4}),
-        triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 32,  'BLOCK_SIZE_K': 256, 'GROUP_SIZE_M': 16, 'num_stages': 4, 'num_warps': 4}),
-        triton.Config({'BLOCK_SIZE_M': 32,  'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 256, 'GROUP_SIZE_M': 16, 'num_stages': 4, 'num_warps': 4}),
-        # A simpler configuration without grouping as a fallback
-        triton.Config({'BLOCK_SIZE_M': 64,  'BLOCK_SIZE_N': 64,  'BLOCK_SIZE_K': 64,  'GROUP_SIZE_M': 1, 'num_stages': 2, 'num_warps': 4}),
+        # Basic configurations
+        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 256, 'BLOCK_K': 64, 'GROUP_M': 8, 'num_stages': 3, 'num_warps': 8}),
+        triton.Config({'BLOCK_M': 256, 'BLOCK_N': 128, 'BLOCK_K': 64, 'GROUP_M': 8, 'num_stages': 3, 'num_warps': 8}),
+        triton.Config({'BLOCK_M': 256, 'BLOCK_N': 64, 'BLOCK_K': 64, 'GROUP_M': 8, 'num_stages': 4, 'num_warps': 4}),
+        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 256, 'BLOCK_K': 64, 'GROUP_M': 8, 'num_stages': 4, 'num_warps': 4}),
+        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 128, 'GROUP_M': 8, 'num_stages': 3, 'num_warps': 4}),
+        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 64, 'BLOCK_K': 128, 'GROUP_M': 8, 'num_stages': 4, 'num_warps': 4}),
+        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 128, 'BLOCK_K': 128, 'GROUP_M': 8, 'num_stages': 4, 'num_warps': 4}),
+        # Configurations for larger K
+        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 32, 'BLOCK_K': 256, 'GROUP_M': 8, 'num_stages': 4, 'num_warps': 4}),
+        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 32, 'BLOCK_K': 256, 'GROUP_M': 8, 'num_stages': 5, 'num_warps': 2}),
+        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 256, 'GROUP_M': 16, 'num_stages': 3, 'num_warps': 8}),
+        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 128, 'BLOCK_K': 256, 'GROUP_M': 8, 'num_stages': 3, 'num_warps': 8}),
+        # Configurations for smaller K
+        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 32, 'GROUP_M': 8, 'num_stages': 2, 'num_warps': 4}),
+        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 64, 'BLOCK_K': 32, 'GROUP_M': 8, 'num_stages': 2, 'num_warps': 4}),
+        # More balanced configurations
+        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 64, 'GROUP_M': 8, 'num_stages': 4, 'num_warps': 4}),
+        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 64, 'BLOCK_K': 128, 'GROUP_M': 8, 'num_stages': 4, 'num_warps': 4}),
+        # Additional configurations for wider coverage
+        triton.Config({'BLOCK_M': 32, 'BLOCK_N': 64, 'BLOCK_K': 256, 'GROUP_M': 8, 'num_stages': 3, 'num_warps': 2}),
+        triton.Config({'BLOCK_M': 256, 'BLOCK_N': 256, 'BLOCK_K': 32, 'GROUP_M': 16, 'num_stages': 3, 'num_warps': 8}),
+        triton.Config({'BLOCK_M': 256, 'BLOCK_N': 256, 'BLOCK_K': 64, 'GROUP_M': 8, 'num_stages': 3, 'num_warps': 8}),
     ],
     key=['M', 'N', 'K'],
 )
 @triton.jit
-def matmul_kernel(
+def gemm_kernel(
     a_ptr, b_ptr, c_ptr,
     M, N, K,
     stride_am, stride_ak,
     stride_bk, stride_bn,
     stride_cm, stride_cn,
-    BLOCK_SIZE_M: tl.constexpr, BLOCK_SIZE_N: tl.constexpr, BLOCK_SIZE_K: tl.constexpr,
-    GROUP_SIZE_M: tl.constexpr,
-    num_stages: tl.constexpr,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+    GROUP_M: tl.constexpr,
 ):
-    """
-    Triton kernel for matrix multiplication with GeLU activation.
-    This kernel uses tiling, software pipelining (via num_stages), and grouped
-    scheduling to improve performance and L2 cache hit rate.
-    """
     pid = tl.program_id(axis=0)
-    grid_m = tl.cdiv(M, BLOCK_SIZE_M)
-    grid_n = tl.cdiv(N, BLOCK_SIZE_N)
+    num_pid_m = tl.cdiv(M, BLOCK_M)
+    num_pid_n = tl.cdiv(N, BLOCK_N)
 
-    # Re-order program IDs to improve L2 cache performance (grouped scheduling)
-    width = GROUP_SIZE_M * grid_n
-    group_id = pid // width
-    group_size = min(grid_m - group_id * GROUP_SIZE_M, GROUP_SIZE_M)
-    pid_m = group_id * GROUP_SIZE_M + (pid % group_size)
-    pid_n = (pid % width) // group_size
+    if GROUP_M > 1:
+        num_pid_in_group = GROUP_M * num_pid_n
+        group_id = pid // num_pid_in_group
+        first_pid_m = group_id * GROUP_M
+        group_size = min(num_pid_m - first_pid_m, GROUP_M)
+        pid_m = first_pid_m + (pid % group_size)
+        pid_n = (pid % num_pid_in_group) // group_size
+    else:
+        pid_m = pid // num_pid_n
+        pid_n = pid % num_pid_n
 
-    # Offsets for the M and N dimensions for the current block
-    offs_m = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
-    offs_n = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
-    
-    # Offsets for the K dimension
-    offs_k = tl.arange(0, BLOCK_SIZE_K)
-    
-    # Initialize pointers to the A and B matrices for the first K-block
-    a_ptrs = a_ptr + (offs_m[:, None] * stride_am + offs_k[None, :] * stride_ak)
-    b_ptrs = b_ptr + (offs_k[:, None] * stride_bk + offs_n[None, :] * stride_bn)
+    offs_am = (pid_m * BLOCK_M + tl.arange(0, BLOCK_M))
+    offs_bn = (pid_n * BLOCK_N + tl.arange(0, BLOCK_N))
+    offs_k = tl.arange(0, BLOCK_K)
 
-    # Initialize accumulator with float32 for precision
-    accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+    a_ptrs = a_ptr + (offs_am[:, None] * stride_am + offs_k[None, :] * stride_ak)
+    b_ptrs = b_ptr + (offs_k[:, None] * stride_bk + offs_bn[None, :] * stride_bn)
+
+    accumulator = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
     
-    # Main loop over the K dimension, iterating in steps of BLOCK_SIZE_K
-    for k in range(0, K, BLOCK_SIZE_K):
-        # Define masks for the current K-block to handle edge cases
-        k_offsets = k + offs_k
-        a_mask = (offs_m[:, None] < M) & (k_offsets[None, :] < K)
-        b_mask = (k_offsets[:, None] < K) & (offs_n[None, :] < N)
+    for k in range(0, K, BLOCK_K):
+        k_mask = (k + offs_k) < K
+        a = tl.load(a_ptrs, mask=k_mask[None, :], other=0.0)
+        b = tl.load(b_ptrs, mask=k_mask[:, None], other=0.0)
         
-        # Load tiles from A and B matrices from global memory
-        a = tl.load(a_ptrs, mask=a_mask, other=0.0)
-        b = tl.load(b_ptrs, mask=b_mask, other=0.0)
+        accumulator += tl.dot(a, b, allow_tf32=True)
         
-        # Perform matrix multiplication on the tiles and accumulate the result
-        accumulator += tl.dot(a, b, out_dtype=tl.float32)
-        
-        # Advance pointers to the next K-block
-        a_ptrs += BLOCK_SIZE_K * stride_ak
-        b_ptrs += BLOCK_SIZE_K * stride_bk
+        a_ptrs += BLOCK_K * stride_ak
+        b_ptrs += BLOCK_K * stride_bk
 
-    # Apply GELU activation to the accumulated result
-    result = gelu(accumulator)
-    
-    # Cast the result to the output tensor's data type
-    result = result.to(c_ptr.dtype.element_ty)
+    c_activated = gelu(accumulator)
+    c_out = c_activated.to(c_ptr.dtype.element_ty)
 
-    # Initialize pointers to the C matrix
-    c_ptrs = c_ptr + (offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn)
-    c_mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
-    
-    # Write the final result back to global memory
-    tl.store(c_ptrs, result, mask=c_mask)
+    offs_cm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_cn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    c_ptrs = c_ptr + stride_cm * offs_cm[:, None] + stride_cn * offs_cn[None, :]
+    c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
+    tl.store(c_ptrs, c_out, mask=c_mask)
+
 
 def matmul(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
-    """
+    \"\"\"
     Matrix multiplication with GELU activation.
     
     Args:
@@ -114,37 +114,24 @@ def matmul(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     
     Returns:
         Output tensor of shape (M, N) with GELU activation applied
-    """
-    # Check for compatibility of dimensions
+    \"\"\"
+    assert a.shape[1] == b.shape[0], "Incompatible matrix dimensions for matmul"
     M, K = a.shape
-    K_b, N = b.shape
-    assert K == K_b, f"Incompatible dimensions: A has shape ({M}, {K}) and B has shape ({K_b}, {N})"
-
-    # Create the output tensor on the same device as the inputs
-    # The dtype is inferred from the inputs, which allows for fp16/bf16/fp32.
+    _, N = b.shape
+    
     c = torch.empty((M, N), device=a.device, dtype=a.dtype)
 
-    # Define the grid for launching the kernel
-    # This uses a 1D grid, and the kernel internally computes 2D block IDs
-    def grid(meta):
-        return (triton.cdiv(M, meta['BLOCK_SIZE_M']) * triton.cdiv(N, meta['BLOCK_SIZE_N']),)
+    grid = lambda META: (
+        triton.cdiv(M, META['BLOCK_M']) * triton.cdiv(N, META['BLOCK_N']),
+    )
 
-    # Launch the Triton kernel
-    matmul_kernel[grid](
+    gemm_kernel[grid](
         a, b, c,
         M, N, K,
         a.stride(0), a.stride(1),
         b.stride(0), b.stride(1),
         c.stride(0), c.stride(1),
     )
-    
     return c
-
-class Solution:
-    def solve(self, spec_path: str = None) -> dict:
-        """
-        Returns a dict with the Python code for the matmul implementation.
-        """
-        # This method packages the entire file's source code to be sent
-        # to the evaluation environment.
-        return {"code": inspect.getsource(sys.modules[__name__])}
+"""
+        return {"code": code}

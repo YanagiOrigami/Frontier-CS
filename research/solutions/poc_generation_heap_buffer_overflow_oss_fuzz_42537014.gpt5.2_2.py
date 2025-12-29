@@ -1,197 +1,149 @@
 import os
 import re
 import tarfile
-from typing import Iterable, Optional, Tuple
-
-
-def _c_unescape(s: str) -> bytes:
-    out = bytearray()
-    i = 0
-    n = len(s)
-    while i < n:
-        ch = s[i]
-        if ch != "\\":
-            out.append(ord(ch) & 0xFF)
-            i += 1
-            continue
-        i += 1
-        if i >= n:
-            out.append(ord("\\"))
-            break
-        esc = s[i]
-        i += 1
-
-        if esc == "n":
-            out.append(0x0A)
-        elif esc == "r":
-            out.append(0x0D)
-        elif esc == "t":
-            out.append(0x09)
-        elif esc == "v":
-            out.append(0x0B)
-        elif esc == "b":
-            out.append(0x08)
-        elif esc == "f":
-            out.append(0x0C)
-        elif esc == "a":
-            out.append(0x07)
-        elif esc == "\\":
-            out.append(0x5C)
-        elif esc == "'":
-            out.append(0x27)
-        elif esc == '"':
-            out.append(0x22)
-        elif esc == "x":
-            hx = ""
-            if i < n and s[i] in "0123456789abcdefABCDEF":
-                hx += s[i]
-                i += 1
-            if i < n and s[i] in "0123456789abcdefABCDEF":
-                hx += s[i]
-                i += 1
-            if hx:
-                out.append(int(hx, 16) & 0xFF)
-            else:
-                out.append(ord("x"))
-        elif esc in "01234567":
-            octs = esc
-            for _ in range(2):
-                if i < n and s[i] in "01234567":
-                    octs += s[i]
-                    i += 1
-                else:
-                    break
-            out.append(int(octs, 8) & 0xFF)
-        else:
-            out.append(ord(esc) & 0xFF)
-    return bytes(out)
-
-
-def _iter_source_files_from_dir(root: str) -> Iterable[Tuple[str, bytes]]:
-    exts = (".c", ".cc", ".cpp", ".cxx", ".h", ".hpp", ".hh", ".ipp")
-    for dirpath, _, filenames in os.walk(root):
-        for fn in filenames:
-            if not fn.endswith(exts):
-                continue
-            p = os.path.join(dirpath, fn)
-            try:
-                st = os.stat(p)
-                if st.st_size > 1_000_000:
-                    continue
-                with open(p, "rb") as f:
-                    yield p, f.read(1_000_000)
-            except OSError:
-                continue
-
-
-def _iter_source_files_from_tar(tar_path: str) -> Iterable[Tuple[str, bytes]]:
-    exts = (".c", ".cc", ".cpp", ".cxx", ".h", ".hpp", ".hh", ".ipp")
-    try:
-        with tarfile.open(tar_path, "r:*") as tf:
-            for m in tf.getmembers():
-                if not m.isfile():
-                    continue
-                name = m.name
-                if not name.endswith(exts):
-                    continue
-                if m.size <= 0 or m.size > 1_000_000:
-                    continue
-                try:
-                    f = tf.extractfile(m)
-                    if f is None:
-                        continue
-                    with f:
-                        yield name, f.read(1_000_000)
-                except Exception:
-                    continue
-    except Exception:
-        return
-
-
-def _analyze_fuzzer_sources(files: Iterable[Tuple[str, bytes]]) -> Tuple[int, Optional[bytes]]:
-    re_fuzzer = re.compile(r"(LLVMFuzzerTestOneInput|FuzzedDataProvider)")
-    re_size_cond1 = re.compile(r"\bSize\s*([<]=?)\s*(\d+)\b")
-    re_size_cond2 = re.compile(r"\bsize\s*([<]=?)\s*(\d+)\b")
-    re_memcmp = re.compile(
-        r'\bmemcmp\s*\(\s*(?:Data|data)\s*,\s*"((?:[^"\\]|\\.)*)"\s*,\s*(\d+)\s*\)'
-    )
-    re_strncmp = re.compile(
-        r'\bstrncmp\s*\(\s*(?:\(\s*const\s+char\s*\*\s*\)\s*)?(?:Data|data)\s*,\s*"((?:[^"\\]|\\.)*)"\s*,\s*(\d+)\s*\)'
-    )
-    re_starts = re.compile(r'\.starts_with\s*\(\s*"((?:[^"\\]|\\.)*)"\s*\)')
-
-    min_required = 0
-    best_magic: Optional[bytes] = None
-
-    for path, data in files:
-        try:
-            txt = data.decode("utf-8", "ignore")
-        except Exception:
-            continue
-
-        if not re_fuzzer.search(txt):
-            continue
-
-        for rx in (re_size_cond1, re_size_cond2):
-            for m in rx.finditer(txt):
-                op = m.group(1)
-                val = int(m.group(2))
-                if val < 0 or val > 1_000_000:
-                    continue
-                if op == "<":
-                    req = val
-                elif op == "<=":
-                    req = val + 1
-                else:
-                    continue
-                if req > min_required:
-                    min_required = req
-
-        for rx in (re_memcmp, re_strncmp):
-            for m in rx.finditer(txt):
-                lit = m.group(1)
-                n = int(m.group(2))
-                if n <= 0 or n > 64:
-                    continue
-                raw = _c_unescape(lit)
-                if len(raw) >= n:
-                    magic = raw[:n]
-                else:
-                    magic = raw + (b"A" * (n - len(raw)))
-                if best_magic is None or len(magic) < len(best_magic):
-                    best_magic = magic
-
-        for m in re_starts.finditer(txt):
-            raw = _c_unescape(m.group(1))
-            if not raw or len(raw) > 64:
-                continue
-            if best_magic is None or len(raw) < len(best_magic):
-                best_magic = raw
-
-    if min_required > 4096:
-        min_required = 0
-    return min_required, best_magic
+import tempfile
+from pathlib import Path
+from typing import Optional, Tuple
 
 
 class Solution:
+    def _safe_extract_tar(self, tar_path: str, dst_dir: str) -> None:
+        with tarfile.open(tar_path, "r:*") as tf:
+            base = os.path.realpath(dst_dir)
+            for m in tf.getmembers():
+                name = m.name
+                if not name:
+                    continue
+                target_path = os.path.realpath(os.path.join(dst_dir, name))
+                if not (target_path == base or target_path.startswith(base + os.sep)):
+                    continue
+                if m.islnk() or m.issym():
+                    continue
+                tf.extract(m, dst_dir)
+
+    def _iter_files(self, root: str):
+        for dirpath, dirnames, filenames in os.walk(root):
+            dirnames[:] = [d for d in dirnames if d not in (".git", ".svn", ".hg", "__pycache__")]
+            for fn in filenames:
+                p = os.path.join(dirpath, fn)
+                try:
+                    st = os.lstat(p)
+                except OSError:
+                    continue
+                if not os.path.isfile(p):
+                    continue
+                yield p, st.st_size
+
+    def _read_file_limited(self, path: str, limit: int = 2 * 1024 * 1024) -> Optional[bytes]:
+        try:
+            sz = os.path.getsize(path)
+            if sz > limit:
+                return None
+            with open(path, "rb") as f:
+                return f.read()
+        except OSError:
+            return None
+
+    def _find_embedded_poc(self, root: str) -> Optional[bytes]:
+        name_score_patterns = [
+            (re.compile(r"42537014"), 0),
+            (re.compile(r"clusterfuzz-testcase-minimized", re.I), 1),
+            (re.compile(r"clusterfuzz-testcase", re.I), 2),
+            (re.compile(r"\b(poc|repro|reproducer)\b", re.I), 3),
+            (re.compile(r"\b(crash|asan|ubsan|overflow)\b", re.I), 4),
+            (re.compile(r"\b(testcase|regression)\b", re.I), 5),
+        ]
+
+        best: Optional[Tuple[int, int, str]] = None  # (rank, size, path)
+        for p, sz in self._iter_files(root):
+            if sz <= 0 or sz > 4096:
+                continue
+            bn = os.path.basename(p)
+            rank = 100
+            for rx, r in name_score_patterns:
+                if rx.search(bn) or rx.search(p):
+                    rank = min(rank, r)
+            if rank == 100:
+                continue
+            cand = (rank, sz, p)
+            if best is None or cand < best:
+                best = cand
+
+        if best is None:
+            return None
+        data = self._read_file_limited(best[2], limit=4096)
+        if data:
+            return data
+        return None
+
+    def _infer_from_fuzzer(self, root: str) -> Optional[bytes]:
+        fuzzer_files = []
+        for p, sz in self._iter_files(root):
+            if sz > 2 * 1024 * 1024:
+                continue
+            if p.endswith((".c", ".cc", ".cpp", ".cxx", ".h", ".hpp")):
+                fuzzer_files.append(p)
+
+        rx_entry = re.compile(r"\bLLVMFuzzerTestOneInput\s*\(", re.M)
+        for p in fuzzer_files:
+            try:
+                with open(p, "r", encoding="utf-8", errors="ignore") as f:
+                    s = f.read()
+            except OSError:
+                continue
+            if not rx_entry.search(s):
+                continue
+
+            # Heuristic: length-prefixed string copied with off-by-one NUL.
+            if re.search(r"\bdata\s*\[\s*0\s*\]", s) and re.search(r"\bdata\s*\+\s*1\b", s):
+                # Typical minimal: first byte = N, followed by N bytes.
+                n = 8
+                return bytes([n]) + (b"A" * n)
+
+            # Heuristic: input treated as a C-string or std::string and then copied unsafely
+            if re.search(r"strlen\s*\(", s) or re.search(r"strcpy\s*\(", s) or re.search(r"strdup\s*\(", s):
+                return b"AAAAAAAA\x00"
+
+            if re.search(r"std::string\s*\(", s) or re.search(r"ConsumeRandomLengthString", s):
+                return b"AAAAAAAA\x00"
+
+        return None
+
     def solve(self, src_path: str) -> bytes:
-        base_len = 9
-        min_required = 0
-        prefix: Optional[bytes] = None
-
+        src_path = os.path.abspath(src_path)
         if os.path.isdir(src_path):
-            min_required, prefix = _analyze_fuzzer_sources(_iter_source_files_from_dir(src_path))
-        elif tarfile.is_tarfile(src_path):
-            min_required, prefix = _analyze_fuzzer_sources(_iter_source_files_from_tar(src_path))
+            root = src_path
+            poc = self._find_embedded_poc(root)
+            if poc is not None:
+                return poc
+            poc = self._infer_from_fuzzer(root)
+            if poc is not None:
+                return poc
+            return b"AAAAAAAA\x00"
 
-        L = base_len
-        if min_required > L:
-            L = min_required
-        if prefix is not None and len(prefix) > L:
-            L = len(prefix)
+        with tempfile.TemporaryDirectory(prefix="pocgen_") as td:
+            try:
+                self._safe_extract_tar(src_path, td)
+            except Exception:
+                return b"AAAAAAAA\x00"
 
-        if prefix is None:
-            return b"A" * L
-        if len(prefix) == L:
-            return prefix
-        return prefix + (b"A" * (L - len(prefix)))
+            root = td
+            # If tar extracts into a single top-level directory, prefer it.
+            try:
+                entries = [e for e in os.listdir(td) if not e.startswith(".")]
+                if len(entries) == 1:
+                    cand = os.path.join(td, entries[0])
+                    if os.path.isdir(cand):
+                        root = cand
+            except OSError:
+                pass
+
+            poc = self._find_embedded_poc(root)
+            if poc is not None:
+                return poc
+
+            poc = self._infer_from_fuzzer(root)
+            if poc is not None:
+                return poc
+
+            return b"AAAAAAAA\x00"

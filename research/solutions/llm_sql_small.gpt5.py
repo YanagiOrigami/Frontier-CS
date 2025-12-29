@@ -1,5 +1,15 @@
 import pandas as pd
 import numpy as np
+from typing import List, Dict, Tuple
+
+
+def _lcp_len(a: str, b: str) -> int:
+    n = min(len(a), len(b))
+    i = 0
+    while i < n and a[i] == b[i]:
+        i += 1
+    return i
+
 
 class Solution:
     def solve(
@@ -13,140 +23,190 @@ class Solution:
         distinct_value_threshold: float = 0.7,
         parallel: bool = True,
     ) -> pd.DataFrame:
-        # Step 1: Apply column merges if specified
-        def apply_col_merge(dataframe: pd.DataFrame, merge_spec: list) -> pd.DataFrame:
-            if not merge_spec:
-                return dataframe
-            df_orig = dataframe.copy()
-            # Prepare a string version for efficient concatenation (avoids NaN issues)
-            df_str = df_orig.fillna('').astype(str)
-            orig_cols = list(df_orig.columns)
-            used_cols = set()
-            new_cols = {}
-            for idx, group in enumerate(merge_spec):
-                # Resolve column names
-                names = []
-                for it in group:
-                    if isinstance(it, int):
-                        if 0 <= it < len(orig_cols):
-                            names.append(orig_cols[it])
-                    else:
-                        if it in df_orig.columns:
-                            names.append(it)
-                # Filter existing names and remove duplicates
-                names = [n for n in dict.fromkeys(names) if n in df_str.columns]
-                if not names:
+        # Prepare merged columns as arrays of strings without creating heavy intermediate DataFrames
+        n_rows = len(df)
+        orig_cols = list(df.columns)
+
+        # Build mapping from column to its merge group
+        col_to_group: Dict[str, int] = {}
+        groups: List[List[str]] = []
+        if col_merge:
+            for gi, grp in enumerate(col_merge):
+                valid_grp = [c for c in grp if c in df.columns]
+                if not valid_grp:
                     continue
-                # Concatenate without separator
-                s = df_str[names[0]]
-                for nm in names[1:]:
-                    s = s.str.cat(df_str[nm], na_rep='')
-                # Create unique merge column name
-                base_name = f"MERGE_{idx}"
-                new_name = base_name
-                suf = 1
-                while new_name in df_orig.columns or new_name in new_cols:
-                    new_name = f"{base_name}_{suf}"
-                    suf += 1
-                new_cols[new_name] = s
-                used_cols.update(names)
-            # Drop merged columns and add new merged columns
-            df_out = df_orig.drop(columns=list(used_cols), errors='ignore').copy()
-            for k, v in new_cols.items():
-                df_out[k] = v
-            return df_out
+                for c in valid_grp:
+                    if c not in col_to_group:
+                        col_to_group[c] = gi
+                groups.append(valid_grp)
+        # Build final column arrays and names after applying merges
+        final_arrays: List[np.ndarray] = []
+        final_names: List[str] = []
+        processed_cols = set()
 
-        df_merged = apply_col_merge(df, col_merge)
+        # Helper to generate a unique merged name
+        def merged_name(grp_cols: List[str], index: int) -> str:
+            base = "MERGE_" + str(index) + "_" + "_".join(grp_cols)
+            return base
 
-        # If 0 or 1 columns, nothing to reorder
-        if df_merged.shape[1] <= 1:
-            return df_merged
-
-        # String version for scoring computations
-        df_s = df_merged.fillna('').astype(str)
-        cols = list(df_s.columns)
-        N = len(df_s)
-
-        # Early stop sampling (optional): if dataset too large, sample rows to estimate order
-        # Keep deterministic behavior: sample first early_stop rows
-        if N > early_stop:
-            df_s_sample = df_s.iloc[:early_stop].copy()
-            N_sample = early_stop
-        else:
-            df_s_sample = df_s
-            N_sample = N
-
-        # Precompute categorical codes for selected-group speed
-        codes_map = {}
-        uniques_count = {}
-        for c in cols:
-            cat = pd.Categorical(df_s_sample[c], ordered=False)
-            codes_map[c] = cat.codes.astype(np.int32)
-            uniques_count[c] = len(cat.categories)
-
-        # Precompute value -> length map per column
-        val_len_map = {}
-        str_series_map = {}
-        for c in cols:
-            s = df_s_sample[c]
-            str_series_map[c] = s
-            uniq_vals = pd.unique(s)
-            lengths = pd.Series(uniq_vals).str.len().to_numpy()
-            val_len_map[c] = pd.Series(lengths, index=uniq_vals)
-
-        # Precompute a simple char-level prefix score per column (for tie-breaking)
-        # E_partial approximated by K-prefix counts squared
-        K = max(1, int(row_stop))
-        char_prefix_score = {}
-        for c in cols:
-            s = str_series_map[c]
-            score = 0
-            # Limit K to reasonable values (avoid very large K)
-            max_len = min(int(s.str.len().max()) if len(s) else 0, 12)
-            use_k = min(K, max_len) if max_len > 0 else 0
-            for k in range(1, use_k + 1):
-                pref = s.str.slice(0, k)
-                vc = pref.value_counts(dropna=False)
-                arr = vc.to_numpy(dtype=np.int64)
-                score += int(np.dot(arr, arr))
-            char_prefix_score[c] = score
-
-        # Base series of ones for fast groupby count
-        base_series = pd.Series(np.ones(N_sample, dtype=np.int8))
-
-        # Greedy selection of columns maximizing sum of squared counts times value length within current groups
-        selected = []
-        remaining = cols.copy()
-
-        # Helper to compute score for candidate column given currently selected
-        def compute_score_for_candidate(cand_col: str) -> (int, int):
-            if not selected:
-                # Group by only candidate column
-                keys = [str_series_map[cand_col]]
+        used_groups = set()
+        for c in orig_cols:
+            if c in processed_cols:
+                continue
+            if c in col_to_group:
+                gid = col_to_group[c]
+                if gid in used_groups:
+                    continue
+                # retrieve group columns preserving original order
+                grp_cols = [col for col in orig_cols if col in col_to_group and col_to_group[col] == gid]
+                if not grp_cols:
+                    continue
+                # build merged array
+                arr = df[grp_cols[0]].astype(str).to_numpy(copy=False)
+                # ensure np.str_ or python str; np.char.add handles both
+                for col in grp_cols[1:]:
+                    arr = np.char.add(arr, df[col].astype(str).to_numpy(copy=False))
+                final_arrays.append(arr)
+                final_names.append(merged_name(grp_cols, gid))
+                for col in grp_cols:
+                    processed_cols.add(col)
+                used_groups.add(gid)
             else:
-                # Use codes for selected columns plus raw string for candidate
-                keys = [codes_map[scol] for scol in selected] + [str_series_map[cand_col]]
-            counts = base_series.groupby(keys, sort=False).count()
-            cvals = counts.index.get_level_values(-1)
-            lengths = val_len_map[cand_col].reindex(cvals).to_numpy()
-            arr_counts = counts.to_numpy(dtype=np.int64)
-            score = int(np.dot(arr_counts * arr_counts, lengths))
-            tie = char_prefix_score.get(cand_col, 0)
-            return score, tie
+                arr = df[c].astype(str).to_numpy(copy=False)
+                final_arrays.append(arr)
+                final_names.append(c)
+                processed_cols.add(c)
+
+        # If no merges processed and no columns were added (unlikely), fallback to original as strings
+        if not final_arrays:
+            # convert all columns to string and return
+            stringified = df.astype(str)
+            return stringified
+
+        K = len(final_arrays)
+        N = n_rows
+
+        # Precompute lengths per column, distinct ratio for tie-break, and sorted orders for scanning
+        lens_list: List[np.ndarray] = []
+        distinct_ratio: List[float] = []
+        orders: List[np.ndarray] = []
+
+        for arr in final_arrays:
+            # length array
+            lengths = np.fromiter((len(s) for s in arr), dtype=np.int32, count=N)
+            lens_list.append(lengths)
+            # distinct ratio
+            try:
+                # set() on numpy array of strings is OK
+                uniq_count = len(set(arr.tolist()))
+            except Exception:
+                uniq_count = pd.Series(arr).nunique(dropna=False)
+            distinct_ratio.append(uniq_count / N if N > 0 else 0.0)
+            # sorted order
+            # Using mergesort for stability, but default is fine
+            try:
+                order = np.argsort(arr, kind="mergesort")
+            except Exception:
+                # Fallback: Python sort by key
+                order = np.array(sorted(range(N), key=lambda i: arr[i]), dtype=np.int64)
+            orders.append(order)
+
+        # Greedy construction of permutation
+        selected: List[int] = []
+        remaining: List[int] = list(range(K))
+
+        # Initialize group ids (all rows in one group)
+        grp_id = np.zeros(N, dtype=np.int64)
+
+        # Initialize current best LCP length per row across selected prefix
+        L = np.zeros(N, dtype=np.int32)
+
+        # Prefix length (sum of lengths of selected columns) per row
+        prefix_len = np.zeros(N, dtype=np.int32)
+
+        # Pre-allocate best array to avoid reallocation overhead in loop
+        best = np.empty(N, dtype=np.int32)
 
         while remaining:
-            best_col = None
-            best_score = -1
-            best_tie = -1
-            # Evaluate each remaining column
-            for c in remaining:
-                s, t = compute_score_for_candidate(c)
-                if s > best_score or (s == best_score and t > best_tie):
-                    best_score = s
-                    best_tie = t
-                    best_col = c
-            selected.append(best_col)
-            remaining.remove(best_col)
+            best_candidate = None
+            best_gain = -1
+            best_per_row_lcp: np.ndarray = None
 
-        # Return DataFrame with reordered columns
-        return df_merged.loc[:, selected]
+            # Evaluate each remaining column as next choice
+            for c in remaining:
+                order = orders[c]
+                vals = final_arrays[c]
+                # Reset best to -1
+                best.fill(-1)
+                last_pos_by_group: Dict[int, int] = {}
+
+                # Single left-to-right scan; for each pair of consecutive same-group elements,
+                # compute LCP and update both rows' best LCP within this group for this column
+                for pos in range(N):
+                    idx_i = int(order[pos])
+                    g = int(grp_id[idx_i])
+                    prev_pos = last_pos_by_group.get(g)
+                    if prev_pos is not None:
+                        idx_j = int(order[prev_pos])
+                        l = _lcp_len(vals[idx_i], vals[idx_j])
+                        if l > best[idx_i]:
+                            best[idx_i] = l
+                        if l > best[idx_j]:
+                            best[idx_j] = l
+                    last_pos_by_group[g] = pos
+
+                # Compute improvement: new LCP if this column appended now
+                # candidate_subprefix = prefix_len + max(0, best)
+                # improvement = max(0, candidate_subprefix - L)
+                # Sum across rows
+                np.maximum(best, 0, out=best)  # clip to [0, inf)
+                candidate_subprefix = prefix_len + best
+                delta = candidate_subprefix - L
+                # Clip at zero
+                delta[delta < 0] = 0
+                gain = int(delta.sum())
+
+                if gain > best_gain or (gain == best_gain and best_candidate is not None and distinct_ratio[c] < distinct_ratio[best_candidate]):
+                    best_gain = gain
+                    best_candidate = c
+                    # Store a copy of best per row (since it'll be overwritten next iteration)
+                    best_per_row_lcp = best.copy()
+
+            # Append best_candidate to selection
+            csel = best_candidate
+            selected.append(csel)
+            remaining.remove(csel)
+
+            # Update L with contributions from new column using the best per-row lcp computed with old groups
+            # Note: prefix_len still refers to previous prefix; use this then update prefix_len
+            if best_per_row_lcp is not None:
+                # clip best to >= 0
+                best_imp = best_per_row_lcp
+                candidate_subprefix = prefix_len + best_imp
+                # L = max(L, candidate_subprefix)
+                np.maximum(L, candidate_subprefix, out=L)
+
+            # Update prefix_len to include full length of the selected column
+            prefix_len = prefix_len + lens_list[csel]
+
+            # Update group ids based on equality across selected prefix including the new column value
+            # Next grouping: new_id = f(old_id, value_of_selected_column)
+            new_grp_id = np.zeros(N, dtype=np.int64)
+            map2id: Dict[Tuple[int, str], int] = {}
+            next_id = 1
+            vals_sel = final_arrays[csel]
+            for i in range(N):
+                key = (int(grp_id[i]), vals_sel[i])
+                nid = map2id.get(key)
+                if nid is None:
+                    nid = next_id
+                    next_id += 1
+                    map2id[key] = nid
+                new_grp_id[i] = nid
+            grp_id = new_grp_id
+
+        # Build output DataFrame with columns in selected order
+        out = pd.DataFrame(index=df.index)
+        for idx in selected:
+            out[final_names[idx]] = final_arrays[idx]
+        return out

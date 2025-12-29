@@ -1,118 +1,156 @@
 import torch
 import torch.nn as nn
-import copy
-from torch.optim.lr_scheduler import OneCycleLR
-
-class Net(nn.Module):
-    def __init__(self, input_dim: int, num_classes: int, dropout_p: float = 0.3):
-        super().__init__()
-        self.layers = nn.Sequential(
-            nn.Linear(input_dim, 256),
-            nn.BatchNorm1d(256),
-            nn.ReLU(inplace=True),
-            nn.Dropout(dropout_p),
-
-            nn.Linear(256, 192),
-            nn.BatchNorm1d(192),
-            nn.ReLU(inplace=True),
-            nn.Dropout(dropout_p),
-
-            nn.Linear(192, 128),
-            nn.BatchNorm1d(128),
-            nn.ReLU(inplace=True),
-            nn.Dropout(dropout_p),
-
-            nn.Linear(128, num_classes)
-        )
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.layers(x)
+import torch.optim as optim
+from torch.utils.data import TensorDataset, DataLoader
 
 class Solution:
-    def solve(self, train_loader, val_loader, metadata: dict = None) -> torch.nn.Module:
+    """
+    Solution for the ImageNet Pareto Optimization problem.
+    """
+    def solve(self, train_loader: DataLoader, val_loader: DataLoader, metadata: dict = None) -> torch.nn.Module:
         """
-        Train a model and return it.
-        
-        Args:
-            train_loader: PyTorch DataLoader with training data
-            val_loader: PyTorch DataLoader with validation data
-            metadata: Dict with keys:
-                - num_classes: int (128)
-                - input_dim: int (384)
-                - param_limit: int (200,000)
-                - baseline_accuracy: float (0.65)
-                - train_samples: int
-                - val_samples: int
-                - test_samples: int
-                - device: str ("cpu")
-        
-        Returns:
-            Trained torch.nn.Module ready for evaluation
+        Trains a neural network model to maximize accuracy on a synthetic ImageNet-like dataset,
+        while adhering to a strict parameter limit of 200,000.
+
+        The approach uses a deep, residual MLP architecture, which allows for greater depth
+        and representational capacity compared to a simple MLP, while managing the parameter count.
+        Key components of the solution:
+        1.  **Architecture**: A ResNet-inspired MLP with two residual blocks. The hidden dimension
+            is carefully chosen (167) to maximize model capacity just under the 200K parameter limit.
+            This deeper, narrower architecture often generalizes better than shallower, wider ones.
+        2.  **Regularization**: To combat overfitting on the small dataset, multiple regularization
+            techniques are employed:
+            - **AdamW Optimizer**: An extension of Adam that decouples weight decay from the optimization
+              step, often leading to better generalization.
+            - **Dropout**: Applied within the residual blocks to prevent co-adaptation of neurons.
+            - **Label Smoothing**: A technique that prevents the model from becoming too confident
+              in its predictions, improving calibration and generalization.
+        3.  **Training Strategy**:
+            - **Cosine Annealing Scheduler**: The learning rate is cyclically annealed, which helps
+              the model converge to wider, more robust minima.
+            - **Combined Dataset**: The model is trained on the full combined training and validation
+              datasets to leverage all available data before final evaluation.
+            - **Epochs**: A relatively high number of epochs (450) is used, as the model and dataset
+              are small enough to train quickly on a CPU, allowing the learning rate scheduler to
+              complete its full cycle and the model to converge properly.
+
+        The combination of a parameter-efficient deep architecture and robust training/regularization
+        techniques aims to achieve the highest possible accuracy within the given constraints.
         """
+
+        # --- Model Definition (scoped within the solve method) ---
+        class ResBlock(nn.Module):
+            """A residual block for an MLP."""
+            def __init__(self, dim, dropout_p):
+                super().__init__()
+                self.block = nn.Sequential(
+                    nn.Linear(dim, dim),
+                    nn.BatchNorm1d(dim),
+                    nn.GELU(),
+                    nn.Dropout(dropout_p),
+                    nn.Linear(dim, dim),
+                    nn.BatchNorm1d(dim),
+                )
+                self.final_activation = nn.GELU()
+                self.dropout = nn.Dropout(dropout_p)
+
+            def forward(self, x: torch.Tensor) -> torch.Tensor:
+                residual = self.block(x)
+                x = x + residual
+                x = self.final_activation(x)
+                x = self.dropout(x)
+                return x
+
+        class DeepResNetMLP(nn.Module):
+            """A deep residual MLP model."""
+            def __init__(self, input_dim, hidden_dim, num_classes, dropout_p):
+                super().__init__()
+                self.input_layer = nn.Sequential(
+                    nn.Linear(input_dim, hidden_dim),
+                    nn.BatchNorm1d(hidden_dim),
+                    nn.GELU(),
+                )
+                self.res_blocks = nn.Sequential(
+                    ResBlock(hidden_dim, dropout_p),
+                    ResBlock(hidden_dim, dropout_p),
+                )
+                self.output_layer = nn.Linear(hidden_dim, num_classes)
+
+            def forward(self, x: torch.Tensor) -> torch.Tensor:
+                x = self.input_layer(x)
+                x = self.res_blocks(x)
+                x = self.output_layer(x)
+                return x
+
+        # --- Hyperparameters ---
+        HIDDEN_DIM = 167
+        DROPOUT_P = 0.2
+        EPOCHS = 450
+        LEARNING_RATE = 2e-3
+        WEIGHT_DECAY = 1.5e-2
+        LABEL_SMOOTHING = 0.1
+        
+        # --- Setup ---
         device = torch.device(metadata.get("device", "cpu"))
+        num_classes = metadata["num_classes"]
+        input_dim = metadata["input_dim"]
+        
+        # For reproducibility
+        torch.manual_seed(42)
 
-        # Hyperparameters
-        num_epochs = 300
-        patience = 40
-        max_lr = 0.01
-        weight_decay = 5e-4
-        label_smoothing = 0.1
-        dropout_p = 0.3
+        # --- Data Preparation ---
+        # Combine train and validation data for final training
+        train_inputs, train_targets = [], []
+        for inputs, targets in train_loader:
+            train_inputs.append(inputs)
+            train_targets.append(targets)
+        for inputs, targets in val_loader:
+            train_inputs.append(inputs)
+            train_targets.append(targets)
 
-        # Model Initialization
-        model = Net(
-            input_dim=metadata["input_dim"],
-            num_classes=metadata["num_classes"],
-            dropout_p=dropout_p
+        full_train_inputs = torch.cat(train_inputs, dim=0)
+        full_train_targets = torch.cat(train_targets, dim=0)
+        full_train_dataset = TensorDataset(full_train_inputs, full_train_targets)
+        
+        batch_size = train_loader.batch_size if hasattr(train_loader, 'batch_size') and train_loader.batch_size is not None else 64
+        
+        full_train_loader = DataLoader(
+            full_train_dataset,
+            batch_size=batch_size,
+            shuffle=True,
+            num_workers=0, # Optimal for CPU-only environment
+            pin_memory=False
+        )
+
+        # --- Model Initialization ---
+        model = DeepResNetMLP(
+            input_dim=input_dim,
+            hidden_dim=HIDDEN_DIM,
+            num_classes=num_classes,
+            dropout_p=DROPOUT_P,
         ).to(device)
 
-        # Loss Function, Optimizer, and Scheduler
-        criterion = nn.CrossEntropyLoss(label_smoothing=label_smoothing)
-        optimizer = torch.optim.AdamW(model.parameters(), lr=max_lr, weight_decay=weight_decay)
-        
-        total_steps = num_epochs * len(train_loader)
-        scheduler = OneCycleLR(optimizer, max_lr=max_lr, total_steps=total_steps)
+        # --- Training ---
+        criterion = nn.CrossEntropyLoss(label_smoothing=LABEL_SMOOTHING)
+        optimizer = optim.AdamW(
+            model.parameters(),
+            lr=LEARNING_RATE,
+            weight_decay=WEIGHT_DECAY
+        )
+        scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=EPOCHS)
 
-        # Training Loop with Early Stopping
-        best_val_acc = 0.0
-        epochs_no_improve = 0
-        best_model_state = None
-
-        for epoch in range(num_epochs):
-            model.train()
-            for inputs, targets in train_loader:
+        model.train()
+        for _ in range(EPOCHS):
+            for inputs, targets in full_train_loader:
                 inputs, targets = inputs.to(device), targets.to(device)
-
+                
                 optimizer.zero_grad()
                 outputs = model(inputs)
                 loss = criterion(outputs, targets)
                 loss.backward()
                 optimizer.step()
-                scheduler.step()
-
-            model.eval()
-            total_correct = 0
-            total_samples = 0
-            with torch.no_grad():
-                for inputs, targets in val_loader:
-                    inputs, targets = inputs.to(device), targets.to(device)
-                    outputs = model(inputs)
-                    _, predicted = torch.max(outputs.data, 1)
-                    total_samples += targets.size(0)
-                    total_correct += (predicted == targets).sum().item()
-
-            val_acc = total_correct / total_samples
-
-            if val_acc > best_val_acc:
-                best_val_acc = val_acc
-                best_model_state = copy.deepcopy(model.state_dict())
-                epochs_no_improve = 0
-            else:
-                epochs_no_improve += 1
-                if epochs_no_improve >= patience:
-                    break
+            
+            scheduler.step()
         
-        if best_model_state:
-            model.load_state_dict(best_model_state)
-
+        model.eval()
         return model

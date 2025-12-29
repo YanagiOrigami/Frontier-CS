@@ -1,3 +1,8 @@
+import torch
+import triton
+import triton.language as tl
+import math
+
 class Solution:
     def solve(self, spec_path: str = None) -> dict:
         code = """
@@ -9,80 +14,80 @@ import triton.language as tl
 def gelu(x):
     return x * 0.5 * (1.0 + tl.extra.cuda.libdevice.erf(x * 0.7071067811865476))
 
-@triton.autotune(
-    configs=[
-        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 64}),
-        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 64, 'BLOCK_K': 32}),
-        triton.Config({'BLOCK_M': 256, 'BLOCK_N': 256, 'BLOCK_K': 128}),
-        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 256, 'BLOCK_K': 64}),
-        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 128, 'BLOCK_K': 128}),
-        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 64, 'BLOCK_K': 32}),
-        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 32}),
-        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 128}),
-        triton.Config({'BLOCK_M': 256, 'BLOCK_N': 128, 'BLOCK_K': 256}),
-        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 256, 'BLOCK_K': 128}),
-        triton.Config({'BLOCK_M': 256, 'BLOCK_N': 64, 'BLOCK_K': 64}),
-        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 256, 'BLOCK_K': 64}),
-    ],
-    key=['M', 'N', 'K'],
-)
+def triton_cdiv(x, y):
+    return (x + y - 1) // y
+
+BLOCK_M = 128
+BLOCK_N = 128
+BLOCK_K = 64
+NUM_STAGES = 4
+NUM_WARPS = 8
+
 @triton.jit
 def matmul_kernel(
-    A, B, C,
-    M: tl.constexpr,
-    N: tl.constexpr,
-    K: tl.constexpr,
-    stride_am: tl.constexpr,
-    stride_ak: tl.constexpr,
-    stride_bk: tl.constexpr,
-    stride_bn: tl.constexpr,
-    stride_cm: tl.constexpr,
-    stride_cn: tl.constexpr,
-    BLOCK_M: tl.constexpr,
-    BLOCK_N: tl.constexpr,
-    BLOCK_K: tl.constexpr
+    A_PTR,
+    B_PTR,
+    C_PTR,
+    M,
+    N,
+    K,
+    stride_am,
+    stride_ak,
+    stride_bk,
+    stride_bn,
+    stride_cm,
+    stride_cn
 ):
+    bm = BLOCK_M
+    bn = BLOCK_N
+    bk = BLOCK_K
     pid_m = tl.program_id(0)
     pid_n = tl.program_id(1)
-    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
-    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
-    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
-    for start_k in range(0, K, BLOCK_K):
-        offs_k = start_k + tl.arange(0, BLOCK_K)
-        a_ptrs = A + (offs_m[:, None] * stride_am + offs_k[None, :] * stride_ak)
-        a_mask = (offs_m[:, None] < M) & (offs_k[None, :] < K)
-        a = tl.load(a_ptrs, mask=a_mask, other=0.0)
-        b_ptrs = B + (offs_k[:, None] * stride_bk + offs_n[None, :] * stride_bn)
-        b_mask = (offs_k[:, None] < K) & (offs_n[None, :] < N)
-        b = tl.load(b_ptrs, mask=b_mask, other=0.0)
+    rm = tl.arange(0, bm)
+    rn = tl.arange(0, bn)
+    acc = tl.zeros((bm, bn), dtype=tl.float32)
+    k = 0
+    while k < K:
+        offs_k = tl.arange(0, bk)
+        offs_am = pid_m * bm + rm[:, None]
+        offs_ak = k + offs_k[None, :]
+        a_ptrs = A_PTR + offs_am * stride_am + offs_ak * stride_ak
+        a_mask = (offs_am < M)[:, None] & (offs_ak < K)[None, :]
+        a = tl.load(a_ptrs, mask=a_mask, other=0.0).to(tl.float32)
+        offs_bk = k + offs_k[:, None]
+        offs_bn = pid_n * bn + rn[None, :]
+        b_ptrs = B_PTR + offs_bk * stride_bk + offs_bn * stride_bn
+        b_mask = (offs_bk < K)[:, None] & (offs_bn < N)[None, :]
+        b = tl.load(b_ptrs, mask=b_mask, other=0.0).to(tl.float32)
         acc += tl.dot(a, b)
-    c = gelu(acc)
-    c_ptrs = C + (offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn)
-    c_mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
-    tl.store(c_ptrs, c, mask=c_mask)
+        k += bk
+    acc = gelu(acc)
+    offs_cm = pid_m * bm + rm[:, None]
+    offs_cn = pid_n * bn + rn[None, :]
+    c_mask = (offs_cm < M)[:, None] & (offs_cn < N)[None, :]
+    c_ptrs = C_PTR + offs_cm * stride_cm + offs_cn * stride_cn
+    tl.store(c_ptrs, acc, mask=c_mask)
 
 def matmul(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
-    assert a.shape[1] == b.shape[0], f"Incompatible dims: {a.shape} x {b.shape}"
-    M, K = a.shape
-    N = b.shape[1]
-    C = torch.empty((M, N), dtype=a.dtype, device=a.device)
-    if M == 0 or N == 0 or K == 0:
-        return torch.zeros((M, N), dtype=a.dtype, device=a.device)
-    def grid(meta):
-        return (
-            triton.cdiv(M, meta['BLOCK_M']),
-            triton.cdiv(N, meta['BLOCK_N'])
-        )
-    stride_am, stride_ak = a.stride()
-    stride_bk, stride_bn = b.stride()
-    stride_cm, stride_cn = C.stride()
-    matmul_kernel[grid](
-        a, b, C,
+    M, K1 = a.shape
+    K2, N = b.shape
+    assert K1 == K2
+    K = K1
+    c = torch.empty((M, N), dtype=a.dtype, device=a.device)
+    stride_am = a.stride(0)
+    stride_ak = a.stride(1)
+    stride_bk = b.stride(0)
+    stride_bn = b.stride(1)
+    stride_cm = c.stride(0)
+    stride_cn = c.stride(1)
+    grid = (triton_cdiv(M, BLOCK_M), triton_cdiv(N, BLOCK_N))
+    matmul_kernel[grid, NUM_STAGES, NUM_WARPS](
+        a, b, c,
         M, N, K,
         stride_am, stride_ak,
         stride_bk, stride_bn,
-        stride_cm, stride_cn,
+        stride_cm, stride_cn
     )
-    return C
+    return c
 """
         return {"code": code}

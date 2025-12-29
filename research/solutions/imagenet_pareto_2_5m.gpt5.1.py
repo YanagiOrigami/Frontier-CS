@@ -1,137 +1,172 @@
-import math
-import random
-import copy
-import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
+import random
+import numpy as np
+import copy
 
 
-class MLPBlock(nn.Module):
-    def __init__(self, in_dim: int, out_dim: int, dropout: float = 0.1):
+class ResidualBlock(nn.Module):
+    def __init__(self, hidden_dim: int, dropout: float = 0.1):
         super().__init__()
-        self.linear = nn.Linear(in_dim, out_dim)
-        self.norm = nn.LayerNorm(out_dim)
+        self.fc = nn.Linear(hidden_dim, hidden_dim)
+        self.norm = nn.LayerNorm(hidden_dim)
         self.act = nn.GELU()
         self.dropout = nn.Dropout(dropout)
-        self.use_residual = in_dim == out_dim
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        out = self.linear(x)
+    def forward(self, x):
+        residual = x
+        out = self.fc(x)
         out = self.norm(out)
         out = self.act(out)
         out = self.dropout(out)
-        if self.use_residual:
-            out = out + x
+        out = out + residual
         return out
 
 
-class ClassifierMLP(nn.Module):
-    def __init__(self, input_dim: int, num_classes: int, hidden_dims, dropout: float = 0.1):
+class ResidualMLP(nn.Module):
+    def __init__(self, input_dim: int, num_classes: int, hidden_dim: int, num_blocks: int, dropout: float = 0.1):
         super().__init__()
-        layers = []
-        prev_dim = input_dim
-        for h in hidden_dims:
-            layers.append(MLPBlock(prev_dim, h, dropout))
-            prev_dim = h
-        self.features = nn.Sequential(*layers)
-        self.head = nn.Linear(prev_dim, num_classes)
+        self.fc_in = nn.Linear(input_dim, hidden_dim)
+        self.norm_in = nn.LayerNorm(hidden_dim)
+        self.act_in = nn.GELU()
+        self.dropout_in = nn.Dropout(dropout)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.features(x)
-        x = self.head(x)
+        self.blocks = nn.ModuleList(
+            [ResidualBlock(hidden_dim, dropout=dropout) for _ in range(num_blocks)]
+        )
+
+        self.norm_final = nn.LayerNorm(hidden_dim)
+        self.fc_out = nn.Linear(hidden_dim, num_classes)
+
+    def forward(self, x):
+        x = self.fc_in(x)
+        x = self.norm_in(x)
+        x = self.act_in(x)
+        x = self.dropout_in(x)
+
+        for block in self.blocks:
+            x = block(x)
+
+        x = self.norm_final(x)
+        x = self.fc_out(x)
         return x
 
 
-def count_parameters(model: nn.Module) -> int:
-    return sum(p.numel() for p in model.parameters() if p.requires_grad)
-
-
 class Solution:
-    def _build_best_model(self, input_dim: int, num_classes: int, param_limit: int) -> nn.Module:
-        # Candidate architectures (hidden layer sizes)
-        candidate_hidden_layers = [
-            [1152, 1152, 512],
-            [1024, 1024, 512, 512],
-            [1024, 1024, 512],
-            [960, 960, 960],
-            [896, 896, 896],
-            [896, 896, 512, 512],
-            [768, 768, 768, 512, 512],
-            [768, 768, 768],
-            [768, 768, 512, 512],
-            [768, 768, 512],
-            [768, 768],
-            [512, 512, 512, 512],
-            [512, 512, 512],
-            [512, 512],
-        ]
+    def __init__(self):
+        pass
+
+    def _set_seed(self, seed: int = 42):
+        random.seed(seed)
+        np.random.seed(seed)
+        torch.manual_seed(seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(seed)
+
+    def _count_params(self, model: nn.Module) -> int:
+        return sum(p.numel() for p in model.parameters() if p.requires_grad)
+
+    def _build_model(self, input_dim: int, num_classes: int, param_limit: int) -> nn.Module:
+        # Search over a small grid of widths and number of residual blocks
+        width_candidates = list(range(256, 1217, 32))  # 256..1216 step 32
+        block_candidates = [2, 3, 4, 5]
 
         best_model = None
         best_params = -1
 
-        for hidden in candidate_hidden_layers:
-            model = ClassifierMLP(input_dim, num_classes, hidden_dims=hidden, dropout=0.1)
-            n_params = count_parameters(model)
-            if n_params <= param_limit and n_params > best_params:
-                best_params = n_params
-                best_model = model
-
-        if best_model is None:
-            # Fallback: simple linear classifier, guaranteed to fit under the limit for this task
-            best_model = nn.Sequential(nn.Linear(input_dim, num_classes))
-            # Safety check (should always pass with given constraints)
-            if count_parameters(best_model) > param_limit:
-                # As an extreme fallback, use a tiny projection before classifier
-                proj_dim = max(8, param_limit // (num_classes + 8) - 1)
-                best_model = nn.Sequential(
-                    nn.Linear(input_dim, proj_dim, bias=False),
-                    nn.Linear(proj_dim, num_classes, bias=True),
+        for num_blocks in block_candidates:
+            for hidden_dim in width_candidates:
+                model = ResidualMLP(
+                    input_dim=input_dim,
+                    num_classes=num_classes,
+                    hidden_dim=hidden_dim,
+                    num_blocks=num_blocks,
+                    dropout=0.1,
                 )
+                n_params = self._count_params(model)
+                if n_params <= param_limit and n_params > best_params:
+                    best_params = n_params
+                    best_model = model
+
+        # Fallback: if for some reason nothing fits, use a simple smaller MLP
+        if best_model is None:
+            hidden_dim = min(512, max(128, param_limit // (input_dim + num_classes + 10)))
+            model = nn.Sequential(
+                nn.Linear(input_dim, hidden_dim),
+                nn.ReLU(),
+                nn.Linear(hidden_dim, num_classes),
+            )
+            if self._count_params(model) > param_limit:
+                # As a last resort, logistic regression
+                model = nn.Linear(input_dim, num_classes)
+            best_model = model
 
         return best_model
 
-    def _evaluate_accuracy(self, model: nn.Module, data_loader, device: torch.device) -> float:
-        model_was_training = model.training
+    def _evaluate(self, model: nn.Module, data_loader, device: torch.device):
         model.eval()
         correct = 0
         total = 0
+        loss_sum = 0.0
+        criterion = nn.CrossEntropyLoss(label_smoothing=0.0)
+
         with torch.no_grad():
             for inputs, targets in data_loader:
-                inputs = inputs.to(device=device, dtype=torch.float32)
-                targets = targets.to(device=device, dtype=torch.long)
+                inputs = inputs.to(device).float()
+                targets = targets.to(device).long()
                 outputs = model(inputs)
+                loss = criterion(outputs, targets)
+                loss_sum += loss.item() * targets.size(0)
                 preds = outputs.argmax(dim=1)
                 correct += (preds == targets).sum().item()
                 total += targets.numel()
-        if model_was_training:
-            model.train()
-        return correct / total if total > 0 else 0.0
 
-    def _train_model(
-        self,
-        model: nn.Module,
-        train_loader,
-        val_loader,
-        device: torch.device,
-        max_epochs: int = 200,
-        lr: float = 1e-3,
-        weight_decay: float = 1e-4,
-    ) -> nn.Module:
+        avg_loss = loss_sum / max(total, 1)
+        accuracy = correct / max(total, 1)
+        return avg_loss, accuracy
+
+    def solve(self, train_loader, val_loader, metadata: dict = None) -> torch.nn.Module:
+        if metadata is None:
+            metadata = {}
+        input_dim = int(metadata.get("input_dim", 384))
+        num_classes = int(metadata.get("num_classes", 128))
+        param_limit = int(metadata.get("param_limit", 2_500_000))
+        device_str = metadata.get("device", "cpu")
+        if "cuda" in device_str and not torch.cuda.is_available():
+            device_str = "cpu"
+        device = torch.device(device_str)
+
+        self._set_seed(42)
+
+        model = self._build_model(input_dim, num_classes, param_limit)
         model.to(device)
+
+        # Ensure we respect the parameter limit
+        n_params = self._count_params(model)
+        if n_params > param_limit:
+            # As a safety fallback, use a smaller simple model
+            model = nn.Sequential(
+                nn.Linear(input_dim, 512),
+                nn.ReLU(),
+                nn.Linear(512, num_classes),
+            ).to(device)
+
         criterion = nn.CrossEntropyLoss(label_smoothing=0.05)
-        optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
+        optimizer = optim.AdamW(model.parameters(), lr=1e-3, weight_decay=5e-4)
 
-        best_state = copy.deepcopy(model.state_dict())
-        best_val_acc = -math.inf
-        patience = 25
-        epochs_no_improve = 0
+        max_epochs = 120
+        min_epochs = 30
+        patience = 20
+        best_val_acc = 0.0
+        best_state = None
+        no_improve_epochs = 0
 
-        for _ in range(max_epochs):
+        for epoch in range(max_epochs):
             model.train()
             for inputs, targets in train_loader:
-                inputs = inputs.to(device=device, dtype=torch.float32)
-                targets = targets.to(device=device, dtype=torch.long)
+                inputs = inputs.to(device).float()
+                targets = targets.to(device).long()
 
                 optimizer.zero_grad()
                 outputs = model(inputs)
@@ -140,51 +175,22 @@ class Solution:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
                 optimizer.step()
 
-            val_acc = self._evaluate_accuracy(model, val_loader, device)
+            # Validation
+            val_loss, val_acc = self._evaluate(model, val_loader, device)
 
             if val_acc > best_val_acc + 1e-4:
                 best_val_acc = val_acc
                 best_state = copy.deepcopy(model.state_dict())
-                epochs_no_improve = 0
+                no_improve_epochs = 0
             else:
-                epochs_no_improve += 1
-                if epochs_no_improve >= patience:
-                    break
+                no_improve_epochs += 1
 
-        model.load_state_dict(best_state)
-        return model
+            if epoch + 1 >= min_epochs and no_improve_epochs >= patience:
+                break
 
-    def solve(self, train_loader, val_loader, metadata: dict = None) -> torch.nn.Module:
-        if metadata is None:
-            raise ValueError("metadata dict is required")
+        if best_state is not None:
+            model.load_state_dict(best_state)
 
-        # Reproducibility
-        seed = 42
-        random.seed(seed)
-        np.random.seed(seed)
-        torch.manual_seed(seed)
-
-        input_dim = int(metadata.get("input_dim", 384))
-        num_classes = int(metadata.get("num_classes", 128))
-        param_limit = int(metadata.get("param_limit", 2_500_000))
-        device_str = metadata.get("device", "cpu")
-        device = torch.device(device_str)
-
-        model = self._build_best_model(input_dim, num_classes, param_limit)
-        # Final safety check on parameter count
-        if count_parameters(model) > param_limit:
-            # Should not happen, but enforce constraint
-            model = nn.Sequential(nn.Linear(input_dim, num_classes))
-
-        model = self._train_model(
-            model=model,
-            train_loader=train_loader,
-            val_loader=val_loader,
-            device=device,
-            max_epochs=200,
-            lr=1e-3,
-            weight_decay=1e-4,
-        )
-
+        model.to(torch.device("cpu"))
         model.eval()
         return model

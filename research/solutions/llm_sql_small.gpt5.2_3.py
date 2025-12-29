@@ -1,171 +1,354 @@
-import time
-from collections import Counter
 import pandas as pd
+from collections import Counter
+from array import array
+import time
+
+
+class _TreapNode:
+    __slots__ = ("key", "prio", "left", "right", "count")
+
+    def __init__(self, key: str, prio: int):
+        self.key = key
+        self.prio = prio
+        self.left = None
+        self.right = None
+        self.count = 1
+
+
+class _XorShift32:
+    __slots__ = ("state",)
+
+    def __init__(self, seed: int = 2463534242):
+        self.state = seed & 0xFFFFFFFF
+
+    def next(self) -> int:
+        x = self.state
+        x ^= (x << 13) & 0xFFFFFFFF
+        x ^= (x >> 17) & 0xFFFFFFFF
+        x ^= (x << 5) & 0xFFFFFFFF
+        self.state = x & 0xFFFFFFFF
+        return self.state
 
 
 def _lcp_len(a: str, b: str) -> int:
-    la = len(a)
-    lb = len(b)
-    m = la if la < lb else lb
+    n = len(a)
+    m = len(b)
+    lim = n if n < m else m
     i = 0
-    while i < m and a[i] == b[i]:
+    while i < lim and a[i] == b[i]:
         i += 1
     return i
 
 
-def _build_sparse_table_min(arr):
-    n = len(arr)
-    if n <= 0:
+def _treap_split(root: _TreapNode, key: str):
+    if root is None:
         return None, None
-    logs = [0] * (n + 1)
-    for i in range(2, n + 1):
-        logs[i] = logs[i >> 1] + 1
-    st = [arr]
-    k = 1
-    length = 1
-    while (length << 1) <= n:
-        prev = st[-1]
-        half = length
-        length <<= 1
-        size = n - length + 1
-        cur = [0] * size
-        for i in range(size):
-            a = prev[i]
-            b = prev[i + half]
-            cur[i] = a if a < b else b
-        st.append(cur)
-        k += 1
-    return st, logs
+    if key <= root.key:
+        left, right = _treap_split(root.left, key)
+        root.left = right
+        return left, root
+    else:
+        left, right = _treap_split(root.right, key)
+        root.right = left
+        return root, right
 
 
-def _rmq_query_min(st, logs, l: int, r: int) -> int:
-    # query on [l, r), assumes l < r
-    length = r - l
-    k = logs[length]
-    a = st[k][l]
-    b = st[k][r - (1 << k)]
-    return a if a < b else b
+def _treap_merge(a: _TreapNode, b: _TreapNode):
+    if a is None:
+        return b
+    if b is None:
+        return a
+    if a.prio < b.prio:
+        a.right = _treap_merge(a.right, b)
+        return a
+    else:
+        b.left = _treap_merge(a, b.left)
+        return b
 
 
-def _fenwick_add(bit, idx0: int, delta: int):
-    i = idx0 + 1
-    n = len(bit) - 1
-    while i <= n:
-        bit[i] += delta
-        i += i & -i
+def _treap_insert(root: _TreapNode, node: _TreapNode):
+    if root is None:
+        return node
+    if node.prio < root.prio:
+        left, right = _treap_split(root, node.key)
+        node.left = left
+        node.right = right
+        return node
+    if node.key < root.key:
+        root.left = _treap_insert(root.left, node)
+    else:
+        root.right = _treap_insert(root.right, node)
+    return root
 
 
-def _fenwick_sum_excl(bit, idx0_excl: int) -> int:
-    # sum [0, idx0_excl)
-    i = idx0_excl
-    s = 0
-    while i > 0:
-        s += bit[i]
-        i -= i & -i
-    return s
-
-
-def _fenwick_find_by_order(bit, n: int, k: int) -> int:
-    # 1 <= k <= total, return 0-index idx such that prefix_sum(idx) >= k and minimal
-    idx = 0
-    bitmask = 1 << (n.bit_length() - 1)
-    while bitmask:
-        t = idx + bitmask
-        if t <= n and bit[t] < k:
-            idx = t
-            k -= bit[t]
-        bitmask >>= 1
-    return idx  # already 0-index
-
-
-def _eval_prefix_hits(strings):
-    n = len(strings)
-    if n <= 1:
-        return 0
-
-    u = sorted(set(strings))
-    U = len(u)
-    if U == 1:
-        return (n - 1) * len(u[0])
-
-    pos_map = {s: i for i, s in enumerate(u)}
-    pos_list = [pos_map[s] for s in strings]
-    lens = [len(s) for s in u]
-
-    lcp_adj = [0] * (U - 1)
-    for i in range(U - 1):
-        lcp_adj[i] = _lcp_len(u[i], u[i + 1])
-
-    st, logs = _build_sparse_table_min(lcp_adj)
-
-    def lcp_between_indices(i, j):
-        if i == j:
-            return lens[i]
-        if i > j:
-            i, j = j, i
-        return _rmq_query_min(st, logs, i, j)
-
-    bit = [0] * (U + 1)
-    freq = [0] * U
-
-    total = 0
-    # insert first
-    p0 = pos_list[0]
-    freq[p0] = 1
-    _fenwick_add(bit, p0, 1)
-
-    for i in range(1, n):
-        p = pos_list[i]
-        if freq[p] > 0:
-            best = lens[p]
+def _treap_add(root: _TreapNode, key: str, rng: _XorShift32):
+    if root is None:
+        return _TreapNode(key, rng.next())
+    cur = root
+    while cur is not None:
+        if key == cur.key:
+            cur.count += 1
+            return root
+        if key < cur.key:
+            if cur.left is None:
+                break
+            cur = cur.left
         else:
-            left = _fenwick_sum_excl(bit, p)  # count of inserted indices < p
-            best = 0
-            if left > 0:
-                pred_idx = _fenwick_find_by_order(bit, U, left)
-                best = lcp_between_indices(pred_idx, p)
-            if left < i:  # there exists inserted index > p
-                succ_idx = _fenwick_find_by_order(bit, U, left + 1)
-                l2 = lcp_between_indices(p, succ_idx)
-                if l2 > best:
-                    best = l2
-        total += best
-        freq[p] += 1
-        _fenwick_add(bit, p, 1)
-
-    return total
+            if cur.right is None:
+                break
+            cur = cur.right
+    node = _TreapNode(key, rng.next())
+    return _treap_insert(root, node)
 
 
-def _prefix_lcp_expectation(values, max_l=4):
-    n = len(values)
-    if n <= 1:
-        return 0.0
-    exp = 0.0
-    for l in range(1, max_l + 1):
-        cnt = Counter()
-        for s in values:
-            cnt[s[:l]] += 1
-        inv = 1.0 / n
-        p = 0.0
-        for c in cnt.values():
-            p += (c * inv) * (c * inv)
-        exp += p
-    return exp
-
-
-def _build_strings_for_perm(col_vals, perm):
-    cols_in_order = [col_vals[i] for i in perm]
-    K = len(cols_in_order[0]) if cols_in_order else 0
-    out = [None] * K
-    for r in range(K):
-        parts = []
-        for c in cols_in_order:
-            parts.append(c[r])
-        out[r] = "".join(parts)
-    return out
+def _treap_best_lcp(root: _TreapNode, key: str) -> int:
+    cur = root
+    pred = None
+    succ = None
+    while cur is not None:
+        ck = cur.key
+        if key == ck:
+            return len(key)
+        if key < ck:
+            succ = ck
+            cur = cur.left
+        else:
+            pred = ck
+            cur = cur.right
+    best = 0
+    if pred is not None:
+        x = _lcp_len(key, pred)
+        if x > best:
+            best = x
+    if succ is not None:
+        x = _lcp_len(key, succ)
+        if x > best:
+            best = x
+    return best
 
 
 class Solution:
+    def _apply_col_merge(self, df: pd.DataFrame, col_merge):
+        if not col_merge:
+            return df
+        df = df.copy()
+        orig_cols = list(df.columns)
+        merge_counter = 0
+
+        for group in col_merge:
+            if not group or len(group) <= 1:
+                continue
+
+            names = []
+            for g in group:
+                name = None
+                if isinstance(g, int):
+                    if 0 <= g < len(orig_cols):
+                        name = orig_cols[g]
+                    elif 0 <= g < len(df.columns):
+                        name = df.columns[g]
+                else:
+                    name = g
+                if name in df.columns:
+                    names.append(name)
+
+            seen = set()
+            names2 = []
+            for n in names:
+                if n not in seen:
+                    names2.append(n)
+                    seen.add(n)
+            names = names2
+
+            if len(names) <= 1:
+                continue
+
+            pos = min(int(df.columns.get_loc(n)) for n in names)
+            merged = df[names[0]].astype(str)
+            for n in names[1:]:
+                merged = merged + df[n].astype(str)
+
+            base_name = "__".join(str(n) for n in names)
+            new_name = base_name
+            while new_name in df.columns:
+                merge_counter += 1
+                new_name = f"{base_name}__m{merge_counter}"
+
+            df[new_name] = merged
+            df = df.drop(columns=names)
+            cols = list(df.columns)
+            cols.remove(new_name)
+            cols.insert(pos, new_name)
+            df = df.loc[:, cols]
+
+        return df
+
+    def _approx_firstcol_total(self, vals, L=8):
+        n = len(vals)
+        if n <= 1:
+            return 0
+        seen_vals = set()
+        prefix_sets = [set() for _ in range(L)]
+        total = 0
+
+        v0 = vals[0]
+        seen_vals.add(v0)
+        lim0 = len(v0)
+        if lim0 > L:
+            lim0 = L
+        for l in range(1, lim0 + 1):
+            prefix_sets[l - 1].add(v0[:l])
+
+        for i in range(1, n):
+            v = vals[i]
+            if v in seen_vals:
+                total += len(v)
+            else:
+                mx = 0
+                lim = len(v)
+                if lim > L:
+                    lim = L
+                for l in range(lim, 0, -1):
+                    if v[:l] in prefix_sets[l - 1]:
+                        mx = l
+                        break
+                total += mx
+
+            if v not in seen_vals:
+                seen_vals.add(v)
+                lim = len(v)
+                if lim > L:
+                    lim = L
+                for l in range(1, lim + 1):
+                    prefix_sets[l - 1].add(v[:l])
+            else:
+                # already present; still add prefixes (no-op for sets)
+                lim = len(v)
+                if lim > L:
+                    lim = L
+                for l in range(1, lim + 1):
+                    prefix_sets[l - 1].add(v[:l])
+
+        return total
+
+    def _compute_score_hash(self, order, hv_cols, len_cols, K, P, mask):
+        t = len(order)
+        if t == 0 or K <= 1:
+            return 0
+        if t == 1:
+            # caller should use firstcol_total
+            return 0
+
+        seen = [set() for _ in range(t)]
+        total = 0
+        for r in range(K):
+            h = 0
+            pref = 0
+            best = 0
+            for k, ci in enumerate(order):
+                h = (h * P + hv_cols[ci][r]) & mask
+                pref += len_cols[ci][r]
+                sk = seen[k]
+                if h in sk:
+                    best = pref
+                sk.add(h)
+            if r:
+                total += best
+        return total
+
+    def _beam_search(
+        self,
+        M,
+        hv_cols,
+        len_cols,
+        desirability,
+        firstcol_total,
+        K,
+        beam_width,
+        expand_limit,
+        early_stop,
+        distinct_ratio,
+        distinct_value_threshold,
+        time_limit_s,
+    ):
+        start = time.perf_counter()
+        P = 1469598103934665603  # FNV offset basis-ish; used as multiplier here
+        mask = (1 << 64) - 1
+
+        col_all = list(range(M))
+        beam = [(tuple(), 0)]
+
+        eval_count = 0
+        for step in range(M):
+            if time.perf_counter() - start > time_limit_s:
+                break
+            new_states = []
+            for order, _score in beam:
+                used = set(order)
+                rem = [c for c in col_all if c not in used]
+                # prioritize remaining by desirability
+                rem.sort(key=lambda x: desirability[x], reverse=True)
+
+                # enforce threshold bias for early columns: postpone high-distinct cols
+                if step <= 1 and distinct_value_threshold is not None:
+                    low = [c for c in rem if distinct_ratio[c] < distinct_value_threshold]
+                    high = [c for c in rem if distinct_ratio[c] >= distinct_value_threshold]
+                    rem = low + high
+
+                rem = rem[:expand_limit]
+                for c in rem:
+                    order2 = order + (c,)
+                    if len(order2) == 1:
+                        score2 = firstcol_total[c]
+                    else:
+                        score2 = self._compute_score_hash(order2, hv_cols, len_cols, K, P, mask)
+                    new_states.append((order2, score2))
+                    eval_count += 1
+                    if eval_count >= early_stop:
+                        break
+                if eval_count >= early_stop:
+                    break
+            if not new_states:
+                break
+            new_states.sort(key=lambda x: x[1], reverse=True)
+            beam = new_states[:beam_width]
+
+        # if incomplete, fill greedily
+        results = []
+        for order, sc in beam:
+            used = set(order)
+            rem = [c for c in range(M) if c not in used]
+            rem.sort(key=lambda x: desirability[x], reverse=True)
+            full = list(order) + rem
+            results.append((tuple(full[:M]), sc))
+        # dedup preserving best approx score
+        best_for = {}
+        for o, sc in results:
+            prev = best_for.get(o)
+            if prev is None or sc > prev:
+                best_for[o] = sc
+        outs = [(o, sc) for o, sc in best_for.items()]
+        outs.sort(key=lambda x: x[1], reverse=True)
+        return outs
+
+    def _exact_score_treap(self, order, col_vals):
+        K = len(col_vals[0])
+        cols = [col_vals[i] for i in order]
+        root = None
+        rng = _XorShift32(123456789)
+        total = 0
+        if K <= 1:
+            return 0
+
+        for i in range(K):
+            s = cols[0][i]
+            for c in cols[1:]:
+                s += c[i]
+            if i:
+                total += _treap_best_lcp(root, s)
+            root = _treap_add(root, s, rng)
+        return total
+
     def solve(
         self,
         df: pd.DataFrame,
@@ -177,32 +360,10 @@ class Solution:
         distinct_value_threshold: float = 0.7,
         parallel: bool = True,
     ) -> pd.DataFrame:
-        start_time = time.time()
-        time_budget = 9.2
+        start = time.perf_counter()
 
         df2 = df.copy()
-
-        # Apply column merges (if any)
-        if col_merge:
-            for group in col_merge:
-                if not group or len(group) <= 1:
-                    continue
-                resolved = []
-                for g in group:
-                    if isinstance(g, int):
-                        if 0 <= g < len(df2.columns):
-                            resolved.append(df2.columns[g])
-                    else:
-                        resolved.append(g)
-                existing = [c for c in resolved if c in df2.columns]
-                if len(existing) <= 1:
-                    continue
-                new_name = "+".join(str(c) for c in existing)
-                merged = df2[existing[0]].astype(str)
-                for c in existing[1:]:
-                    merged = merged + df2[c].astype(str)
-                df2[new_name] = merged
-                df2.drop(columns=existing, inplace=True)
+        df2 = self._apply_col_merge(df2, col_merge)
 
         cols = list(df2.columns)
         M = len(cols)
@@ -213,145 +374,134 @@ class Solution:
         if N <= 1:
             return df2
 
-        # Choose sample size
-        k_cap = 6000
-        k_min = 2000
-        K = min(N, int(early_stop) if early_stop is not None else N, k_cap)
-        if N >= k_min:
-            K = max(k_min, K)
-        K = min(K, N)
-        sample_df = df2.iloc[:K]
+        # sample size
+        K = row_stop * 2000
+        if K < 2000:
+            K = 2000
+        if K > 12000:
+            K = 12000
+        if K > N:
+            K = N
 
-        # Precompute per-column sample strings
+        sample = df2.iloc[:K]
+
+        mask = (1 << 64) - 1
+        hv_cols = []
+        len_cols = []
         col_vals = []
-        for c in cols:
-            col_vals.append(sample_df[c].astype(str).tolist())
+        desirability = [0.0] * M
+        distinct_ratio = [1.0] * M
+        firstcol_total = [0] * M
 
-        # Column metrics (use full N for nunique to be more stable)
-        distinct_ratio = {}
-        avg_len = {}
-        prefix_exp = {}
-        for idx, c in enumerate(cols):
-            nunq = df2[c].nunique(dropna=False)
-            distinct_ratio[idx] = float(nunq) / float(N) if N else 1.0
-            vals = col_vals[idx]
-            if vals:
-                avg_len[idx] = sum(len(s) for s in vals) / float(len(vals))
-                prefix_exp[idx] = _prefix_lcp_expectation(vals, max_l=4)
-            else:
-                avg_len[idx] = 0.0
-                prefix_exp[idx] = 0.0
+        for j, c in enumerate(cols):
+            vals = sample[c].astype(str).tolist()
+            col_vals.append(vals)
 
-        def eval_perm(perm):
-            strings = _build_strings_for_perm(col_vals, perm)
-            return _eval_prefix_hits(strings)
+            lens = array("H", (len(x) for x in vals))
+            hvs = array("Q", ((hash(x) & mask) for x in vals))
 
-        # Candidate initial permutations
-        candidates = []
-        candidates.append(list(range(M)))
+            len_cols.append(lens)
+            hv_cols.append(hvs)
 
-        candidates.append(sorted(range(M), key=lambda i: (distinct_ratio[i], -avg_len[i])))
-        candidates.append(sorted(range(M), key=lambda i: (-prefix_exp[i], distinct_ratio[i], -avg_len[i])))
-        candidates.append(sorted(range(M), key=lambda i: (distinct_ratio[i] > distinct_value_threshold, distinct_ratio[i], -prefix_exp[i])))
-        candidates.append(sorted(range(M), key=lambda i: (-(prefix_exp[i] * avg_len[i]), distinct_ratio[i])))
+            cnt = Counter(vals)
+            dr = (len(cnt) / K) if K else 1.0
+            distinct_ratio[j] = dr
+            top_freq = (max(cnt.values()) / K) if K else 0.0
+            avg_len = (sum(lens) / K) if K else 0.0
 
-        # Deduplicate candidates
-        seen = set()
-        uniq_candidates = []
-        for p in candidates:
-            t = tuple(p)
-            if t not in seen:
-                seen.add(t)
-                uniq_candidates.append(p)
-        candidates = uniq_candidates[:8]
+            # intrinsic approx for first column (captures common prefixes + duplicates)
+            fc_total = self._approx_firstcol_total(vals, L=8)
+            firstcol_total[j] = fc_total
+            intrinsic_avg = (fc_total / (K - 1)) if K > 1 else 0.0
 
-        best_perm = candidates[0]
-        best_score = -1
+            # desirability heuristic
+            # emphasize early cache benefit: repeated/full matches, plus intrinsic partial matches
+            desirability[j] = (1.0 - dr) * avg_len * 1.5 + intrinsic_avg * 1.8 + top_freq * avg_len * 0.6
 
-        for p in candidates:
-            if time.time() - start_time > time_budget:
-                break
-            sc = eval_perm(p)
-            if sc > best_score:
-                best_score = sc
-                best_perm = p
+        # quick fallback if time budget already tight
+        if time.perf_counter() - start > 7.0:
+            order = list(range(M))
+            order.sort(key=lambda x: desirability[x], reverse=True)
+            return df2.loc[:, [cols[i] for i in order]]
 
-        # Greedy forward selection optimizing prefix hits on growing prefix strings
-        if time.time() - start_time <= time_budget:
-            remaining = list(range(M))
-            prefix = [""] * K
-            greedy_perm = []
-            greedy_score = -1
-            for step in range(M):
-                if time.time() - start_time > time_budget:
+        beam_width = col_stop * 4
+        if beam_width < 3:
+            beam_width = 3
+        if beam_width > 12:
+            beam_width = 12
+
+        expand_limit = col_stop * 3
+        if expand_limit < 2:
+            expand_limit = 2
+        if expand_limit > M:
+            expand_limit = M
+
+        time_limit_s = 8.8  # overall per dataset target < 10s; reserve headroom
+
+        candidates = self._beam_search(
+            M=M,
+            hv_cols=hv_cols,
+            len_cols=len_cols,
+            desirability=desirability,
+            firstcol_total=firstcol_total,
+            K=K,
+            beam_width=beam_width,
+            expand_limit=expand_limit,
+            early_stop=early_stop,
+            distinct_ratio=distinct_ratio,
+            distinct_value_threshold=distinct_value_threshold,
+            time_limit_s=max(1.0, time_limit_s - (time.perf_counter() - start)),
+        )
+
+        # If beam search yielded nothing, use desirability sorting
+        if not candidates:
+            order = list(range(M))
+            order.sort(key=lambda x: desirability[x], reverse=True)
+        else:
+            # Exact evaluation on top candidates (treap)
+            topk = candidates[: min(len(candidates), beam_width)]
+            best_order = topk[0][0]
+            best_score = -1
+
+            for o, _sc in topk:
+                if time.perf_counter() - start > time_limit_s:
                     break
-                best_c = None
-                best_c_score = -1
-                best_c_strings = None
+                s = self._exact_score_treap(o, col_vals)
+                if s > best_score:
+                    best_score = s
+                    best_order = o
+            order = list(best_order)
 
-                for c in remaining:
-                    if time.time() - start_time > time_budget:
+        # Apply one-way dependencies if provided (best-effort)
+        if one_way_dep:
+            pos = {cols[i]: idx for idx, i in enumerate(order)}
+            # normalize deps as column names if possible
+            deps = []
+            for a, b in one_way_dep:
+                an = a
+                bn = b
+                if isinstance(a, int) and 0 <= a < len(cols):
+                    an = cols[a]
+                if isinstance(b, int) and 0 <= b < len(cols):
+                    bn = cols[b]
+                if an in pos and bn in pos:
+                    deps.append((an, bn))
+            # iterative fix
+            for _ in range(M * 2):
+                changed = False
+                pos = {cols[i]: idx for idx, i in enumerate(order)}
+                for an, bn in deps:
+                    ia = pos[an]
+                    ib = pos[bn]
+                    if ia > ib:
+                        a_idx = order.pop(ia)
+                        # insert before b's current position
+                        ib = pos[bn]
+                        order.insert(ib, a_idx)
+                        changed = True
                         break
-                    cv = col_vals[c]
-                    cand_strings = [prefix[i] + cv[i] for i in range(K)]
-                    sc = _eval_prefix_hits(cand_strings)
-                    if sc > best_c_score:
-                        best_c_score = sc
-                        best_c = c
-                        best_c_strings = cand_strings
-
-                if best_c is None:
+                if not changed:
                     break
 
-                greedy_perm.append(best_c)
-                remaining.remove(best_c)
-                prefix = best_c_strings
-                greedy_score = best_c_score
-
-            if len(greedy_perm) < M:
-                remaining_sorted = sorted(remaining, key=lambda i: (distinct_ratio[i], -prefix_exp[i], -avg_len[i]))
-                greedy_perm.extend(remaining_sorted)
-
-            # Evaluate full greedy if not already full
-            if len(greedy_perm) == M:
-                sc = eval_perm(greedy_perm)
-                if sc > best_score:
-                    best_score = sc
-                    best_perm = greedy_perm
-
-        # Hill-climb with swaps on full permutation
-        max_iter = max(1, int(col_stop) + 1)
-        cur_perm = best_perm[:]
-        cur_score = best_score
-
-        for _ in range(max_iter):
-            if time.time() - start_time > time_budget:
-                break
-            improved = False
-            best_local_perm = cur_perm
-            best_local_score = cur_score
-
-            for i in range(M - 1):
-                if time.time() - start_time > time_budget:
-                    break
-                for j in range(i + 1, M):
-                    if time.time() - start_time > time_budget:
-                        break
-                    p2 = cur_perm[:]
-                    p2[i], p2[j] = p2[j], p2[i]
-                    sc = eval_perm(p2)
-                    if sc > best_local_score:
-                        best_local_score = sc
-                        best_local_perm = p2
-                        improved = True
-
-            if improved:
-                cur_perm = best_local_perm
-                cur_score = best_local_score
-            else:
-                break
-
-        final_perm = cur_perm
-
-        ordered_cols = [cols[i] for i in final_perm]
-        return df2.loc[:, ordered_cols]
+        out_cols = [cols[i] for i in order]
+        return df2.loc[:, out_cols]

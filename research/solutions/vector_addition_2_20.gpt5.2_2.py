@@ -1,83 +1,67 @@
 import os
-import textwrap
+import sys
 import torch
 import triton
 import triton.language as tl
 
-_VECTOR_SIZE = 1 << 20
-_BLOCK_SIZE = 4096
-_NUM_WARPS = 8
-_NUM_STAGES = 4
+_N = 1048576
+_BLOCK = 4096
 
 
 @triton.jit
 def _add_kernel(x_ptr, y_ptr, out_ptr, BLOCK: tl.constexpr):
-    pid = tl.program_id(0)
-    offs = pid * BLOCK + tl.arange(0, BLOCK)
-    tl.multiple_of(offs, 16)
-    x = tl.load(x_ptr + offs)
-    y = tl.load(y_ptr + offs)
-    tl.store(out_ptr + offs, x + y)
+    pid = tl.program_id(axis=0)
+    block_start = pid * BLOCK
+
+    tl.multiple_of(x_ptr, 16)
+    tl.multiple_of(y_ptr, 16)
+    tl.multiple_of(out_ptr, 16)
+    tl.multiple_of(block_start, 256)
+
+    offsets = block_start + tl.arange(0, BLOCK)
+    x = tl.load(x_ptr + offsets, cache_modifier=".cg", eviction_policy="evict_last")
+    y = tl.load(y_ptr + offsets, cache_modifier=".cg", eviction_policy="evict_last")
+    tl.store(out_ptr + offsets, x + y, cache_modifier=".cg")
 
 
 def add(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
-    if not (isinstance(x, torch.Tensor) and isinstance(y, torch.Tensor)):
-        raise TypeError("x and y must be torch.Tensor")
-    if x.device.type != "cuda" or y.device.type != "cuda":
+    if not x.is_cuda:
         return x + y
-    if x.numel() != _VECTOR_SIZE or y.numel() != _VECTOR_SIZE:
-        raise ValueError(f"Expected tensors with numel={_VECTOR_SIZE}")
-    if x.dtype != y.dtype:
-        return x + y
-    if not x.is_contiguous() or not y.is_contiguous():
-        x = x.contiguous()
-        y = y.contiguous()
-
     out = torch.empty_like(x)
-    grid = (_VECTOR_SIZE // _BLOCK_SIZE,)
-    _add_kernel[grid](x, y, out, BLOCK=_BLOCK_SIZE, num_warps=_NUM_WARPS, num_stages=_NUM_STAGES)
+    grid = (_N // _BLOCK,)
+    _add_kernel[grid](x, y, out, BLOCK=_BLOCK, num_warps=8, num_stages=2)
     return out
 
 
-_KERNEL_CODE = textwrap.dedent(
-    f"""
-    import torch
-    import triton
-    import triton.language as tl
-
-    _VECTOR_SIZE = {1<<20}
-    _BLOCK_SIZE = {4096}
-    _NUM_WARPS = {8}
-    _NUM_STAGES = {4}
-
-    @triton.jit
-    def _add_kernel(x_ptr, y_ptr, out_ptr, BLOCK: tl.constexpr):
-        pid = tl.program_id(0)
-        offs = pid * BLOCK + tl.arange(0, BLOCK)
-        tl.multiple_of(offs, 16)
-        x = tl.load(x_ptr + offs)
-        y = tl.load(y_ptr + offs)
-        tl.store(out_ptr + offs, x + y)
-
-    def add(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
-        if not (isinstance(x, torch.Tensor) and isinstance(y, torch.Tensor)):
-            raise TypeError("x and y must be torch.Tensor")
-        if x.device.type != "cuda" or y.device.type != "cuda":
-            return x + y
-        if x.numel() != _VECTOR_SIZE or y.numel() != _VECTOR_SIZE:
-            raise ValueError(f"Expected tensors with numel={{_VECTOR_SIZE}}")
-        if x.dtype != y.dtype:
-            return x + y
-        if not x.is_contiguous() or not y.is_contiguous():
-            x = x.contiguous()
-            y = y.contiguous()
-
-        out = torch.empty_like(x)
-        grid = (_VECTOR_SIZE // _BLOCK_SIZE,)
-        _add_kernel[grid](x, y, out, BLOCK=_BLOCK_SIZE, num_warps=_NUM_WARPS, num_stages=_NUM_STAGES)
-        return out
-    """
-).lstrip()
+_KERNEL_CODE = (
+    "import torch\n"
+    "import triton\n"
+    "import triton.language as tl\n"
+    "\n"
+    "_N = 1048576\n"
+    "_BLOCK = 4096\n"
+    "\n"
+    "@triton.jit\n"
+    "def _add_kernel(x_ptr, y_ptr, out_ptr, BLOCK: tl.constexpr):\n"
+    "    pid = tl.program_id(axis=0)\n"
+    "    block_start = pid * BLOCK\n"
+    "    tl.multiple_of(x_ptr, 16)\n"
+    "    tl.multiple_of(y_ptr, 16)\n"
+    "    tl.multiple_of(out_ptr, 16)\n"
+    "    tl.multiple_of(block_start, 256)\n"
+    "    offsets = block_start + tl.arange(0, BLOCK)\n"
+    "    x = tl.load(x_ptr + offsets, cache_modifier='.cg', eviction_policy='evict_last')\n"
+    "    y = tl.load(y_ptr + offsets, cache_modifier='.cg', eviction_policy='evict_last')\n"
+    "    tl.store(out_ptr + offsets, x + y, cache_modifier='.cg')\n"
+    "\n"
+    "def add(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:\n"
+    "    if not x.is_cuda:\n"
+    "        return x + y\n"
+    "    out = torch.empty_like(x)\n"
+    "    grid = (_N // _BLOCK,)\n"
+    "    _add_kernel[grid](x, y, out, BLOCK=_BLOCK, num_warps=8, num_stages=2)\n"
+    "    return out\n"
+)
 
 
 class Solution:

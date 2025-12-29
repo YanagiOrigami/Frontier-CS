@@ -4,34 +4,36 @@ import triton.language as tl
 
 class Solution:
     def solve(self, spec_path: str = None) -> dict:
-        code = r"""
+        return {"code": """
 import torch
 import triton
 import triton.language as tl
 
 @triton.autotune(
     configs=[
-        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 32, 'GROUP_SIZE_M': 8}, num_stages=3, num_warps=8),
-        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 64, 'BLOCK_K': 32, 'GROUP_SIZE_M': 8}, num_stages=4, num_warps=4),
-        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 128, 'BLOCK_K': 32, 'GROUP_SIZE_M': 8}, num_stages=4, num_warps=4),
-        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 64, 'BLOCK_K': 32, 'GROUP_SIZE_M': 8}, num_stages=4, num_warps=4),
+        triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 8}, num_stages=3, num_warps=8),
+        triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 64, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 8}, num_stages=4, num_warps=4),
+        triton.Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 8}, num_stages=4, num_warps=4),
+        triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 32, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 8}, num_stages=4, num_warps=4),
+        triton.Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 64, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 8}, num_stages=4, num_warps=4),
+        triton.Config({'BLOCK_SIZE_M': 32, 'BLOCK_SIZE_N': 64, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 8}, num_stages=5, num_warps=2),
     ],
     key=['M', 'N', 'K'],
 )
 @triton.jit
-def fused_linear_gelu_kernel(
-    x_ptr, w_ptr, b_ptr, out_ptr,
+def mixed_gemm_gelu_kernel(
+    a_ptr, b_ptr, c_ptr, bias_ptr,
     M, N, K,
-    stride_xm, stride_xk,
-    stride_wk, stride_wn,
-    stride_om, stride_on,
-    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+    stride_am, stride_ak,
+    stride_bk, stride_bn,
+    stride_cm, stride_cn,
+    BLOCK_SIZE_M: tl.constexpr, BLOCK_SIZE_N: tl.constexpr, BLOCK_SIZE_K: tl.constexpr,
     GROUP_SIZE_M: tl.constexpr,
 ):
     # Program ID
     pid = tl.program_id(axis=0)
-    num_pid_m = tl.cdiv(M, BLOCK_M)
-    num_pid_n = tl.cdiv(N, BLOCK_N)
+    num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
+    num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
     num_pid_in_group = GROUP_SIZE_M * num_pid_n
     group_id = pid // num_pid_in_group
     first_pid_m = group_id * GROUP_SIZE_M
@@ -39,74 +41,72 @@ def fused_linear_gelu_kernel(
     pid_m = first_pid_m + (pid % group_size_m)
     pid_n = (pid % num_pid_in_group) // group_size_m
 
-    # Block offsets
-    offs_am = (pid_m * BLOCK_M + tl.arange(0, BLOCK_M)) % M
-    offs_bn = (pid_n * BLOCK_N + tl.arange(0, BLOCK_N)) % N
-    offs_k = tl.arange(0, BLOCK_K)
+    # Offsets
+    offs_am = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+    offs_bn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+    offs_k = tl.arange(0, BLOCK_SIZE_K)
 
     # Pointers
-    # X is (M, K), W is (K, N)
-    x_ptrs = x_ptr + (offs_am[:, None] * stride_xm + offs_k[None, :] * stride_xk)
-    w_ptrs = w_ptr + (offs_k[:, None] * stride_wk + offs_bn[None, :] * stride_wn)
+    a_ptrs = a_ptr + (offs_am[:, None] * stride_am + offs_k[None, :] * stride_ak)
+    b_ptrs = b_ptr + (offs_k[:, None] * stride_bk + offs_bn[None, :] * stride_bn)
 
-    # Accumulator (float32 for stability)
-    accumulator = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    # Accumulator
+    accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
 
-    # Matrix Multiplication loop
-    for k in range(0, tl.cdiv(K, BLOCK_K)):
-        # Load with masking for K dimension
-        x = tl.load(x_ptrs, mask=offs_k[None, :] < K - k * BLOCK_K, other=0.0)
-        w = tl.load(w_ptrs, mask=offs_k[:, None] < K - k * BLOCK_K, other=0.0)
+    # Loop
+    for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
+        # Correctly handling K masks and boundary conditions
+        load_k = k * BLOCK_SIZE_K + offs_k
         
-        # Accumulate
-        accumulator = tl.dot(x, w, accumulator)
+        # Load A and B with masking
+        # Note: Optimization for specific shapes could remove masks, but we keep for correctness
+        a = tl.load(a_ptrs, mask=(offs_am[:, None] < M) & (load_k[None, :] < K), other=0.0)
+        b = tl.load(b_ptrs, mask=(load_k[:, None] < K) & (offs_bn[None, :] < N), other=0.0)
+        
+        accumulator += tl.dot(a, b)
         
         # Advance pointers
-        x_ptrs += BLOCK_K * stride_xk
-        w_ptrs += BLOCK_K * stride_wk
+        a_ptrs += BLOCK_SIZE_K * stride_ak
+        b_ptrs += BLOCK_SIZE_K * stride_bk
 
-    # Bias Addition (float32)
-    # Bias is shape (N,)
-    bias_ptrs = b_ptr + offs_bn
+    # Bias Addition
+    bias_ptrs = bias_ptr + offs_bn
     bias = tl.load(bias_ptrs, mask=offs_bn < N, other=0.0)
     accumulator = accumulator + bias[None, :]
 
     # GELU Activation
-    # gelu(x) = x * 0.5 * (1.0 + erf(x * 0.70710678))
-    v_sqrt1_2 = 0.70710678
-    v_0_5 = 0.5
-    v_one = 1.0
-    
-    erf_arg = accumulator * v_sqrt1_2
-    erf_val = tl.math.erf(erf_arg)
-    gelu_val = accumulator * v_0_5 * (v_one + erf_val)
+    # Formula: 0.5 * x * (1 + erf(x * 0.7071067811865476))
+    c = 0.7071067811865476
+    erf_val = tl.math.erf(accumulator * c)
+    accumulator = 0.5 * accumulator * (1.0 + erf_val)
 
-    # Store result (float16)
-    out_ptrs = out_ptr + (offs_am[:, None] * stride_om + offs_bn[None, :] * stride_on)
-    tl.store(out_ptrs, gelu_val.to(tl.float16), mask=(offs_am[:, None] < M) & (offs_bn[None, :] < N))
+    # Convert to FP16
+    c_out = accumulator.to(tl.float16)
+    
+    # Store Output
+    offs_cm = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+    offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+    c_ptrs = c_ptr + stride_cm * offs_cm[:, None] + stride_cn * offs_cn[None, :]
+    tl.store(c_ptrs, c_out, mask=(offs_cm[:, None] < M) & (offs_cn[None, :] < N))
 
 def linear_gelu(X: torch.Tensor, W: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
-    # Validation
-    assert X.is_cuda and W.is_cuda and B.is_cuda
     M, K = X.shape
-    Kw, N = W.shape
-    assert K == Kw, "Dimension mismatch between X and W"
-    assert B.shape[0] == N, "Dimension mismatch between W and B"
+    K_W, N = W.shape
     
-    # Output buffer
+    # Ensure inputs are contiguous if necessary, though strides handle it
+    # Output tensor
     out = torch.empty((M, N), device=X.device, dtype=torch.float16)
     
-    # Kernel launch
-    grid = lambda META: (triton.cdiv(M, META['BLOCK_M']) * triton.cdiv(N, META['BLOCK_N']), )
+    # Grid definition
+    grid = lambda META: (triton.cdiv(M, META['BLOCK_SIZE_M']) * triton.cdiv(N, META['BLOCK_SIZE_N']), )
     
-    fused_linear_gelu_kernel[grid](
-        X, W, B, out,
+    mixed_gemm_gelu_kernel[grid](
+        X, W, out, B,
         M, N, K,
         X.stride(0), X.stride(1),
         W.stride(0), W.stride(1),
-        out.stride(0), out.stride(1)
+        out.stride(0), out.stride(1),
     )
     
     return out
-"""
-        return {"code": code}
+"""}

@@ -1,410 +1,551 @@
 import os
 import math
 import copy
-from typing import Optional, Tuple, List
+import time
+from typing import Dict, Optional, Tuple, List
 
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 
-def _set_cpu_threads():
+def _set_torch_threads():
     try:
         n = os.cpu_count() or 8
-        torch.set_num_threads(min(8, n))
+        torch.set_num_threads(min(8, max(1, n)))
+        torch.set_num_interop_threads(1)
     except Exception:
         pass
 
 
-def _loader_to_tensors(loader, device: torch.device) -> Tuple[torch.Tensor, torch.Tensor]:
-    xs = []
-    ys = []
-    for batch in loader:
-        if isinstance(batch, (list, tuple)) and len(batch) >= 2:
-            x, y = batch[0], batch[1]
-        else:
-            raise ValueError("Expected DataLoader to yield (inputs, targets).")
-        x = torch.as_tensor(x)
-        y = torch.as_tensor(y)
-        if x.dtype != torch.float32:
-            x = x.float()
-        if y.dtype != torch.long:
-            y = y.long()
-        xs.append(x)
-        ys.append(y)
-    X = torch.cat(xs, dim=0).to(device)
-    Y = torch.cat(ys, dim=0).to(device)
-    return X.contiguous(), Y.contiguous()
-
-
-def _param_count(model: nn.Module) -> int:
+def _count_trainable_params(model: nn.Module) -> int:
     return sum(p.numel() for p in model.parameters() if p.requires_grad)
 
 
-class CosineHead(nn.Module):
-    def __init__(self, in_dim: int, num_classes: int, init_scale: float = 10.0):
+class InputNorm(nn.Module):
+    def __init__(self, mean: torch.Tensor, std: torch.Tensor):
         super().__init__()
-        self.weight = nn.Parameter(torch.empty(num_classes, in_dim))
-        nn.init.normal_(self.weight, mean=0.0, std=0.02)
-        self.log_scale = nn.Parameter(torch.tensor(float(math.log(max(1e-6, init_scale))), dtype=torch.float32))
+        self.register_buffer("mean", mean)
+        self.register_buffer("std", std)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = F.normalize(x, dim=1)
-        w = F.normalize(self.weight, dim=1)
-        scale = torch.exp(self.log_scale).clamp(1.0, 100.0)
-        return scale * (x @ w.t())
+        if x.dim() > 2:
+            x = x.view(x.size(0), -1)
+        return (x - self.mean) / self.std
 
 
-class ResMLPClassifier(nn.Module):
-    def __init__(
-        self,
-        input_dim: int,
-        num_classes: int,
-        width: int,
-        num_blocks: int,
-        dropout: float,
-        x_mean: torch.Tensor,
-        x_std: torch.Tensor,
-    ):
+class WideMLPNet(nn.Module):
+    def __init__(self, input_dim: int, num_classes: int, h1: int, h2: int, dropout: float = 0.10):
         super().__init__()
-        self.input_dim = int(input_dim)
-        self.num_classes = int(num_classes)
-        self.width = int(width)
-        self.num_blocks = int(num_blocks)
-        self.dropout_p = float(dropout)
+        self.fc1 = nn.Linear(input_dim, h1, bias=True)
+        self.ln1 = nn.LayerNorm(h1)
+        self.fc2 = nn.Linear(h1, h2, bias=True)
+        self.ln2 = nn.LayerNorm(h2)
+        self.fc3 = nn.Linear(h2, num_classes, bias=True)
+        self.drop = nn.Dropout(dropout)
+        self.act = nn.GELU()
 
-        self.register_buffer("x_mean", x_mean.detach().clone().view(1, -1))
-        invstd = 1.0 / x_std.detach().clone().clamp_min(1e-6).view(1, -1)
-        self.register_buffer("x_invstd", invstd)
-
-        self.ln_in = nn.LayerNorm(self.input_dim)
-        self.fc_in = nn.Linear(self.input_dim, self.width)
-
-        self.block_lns = nn.ModuleList([nn.LayerNorm(self.width) for _ in range(self.num_blocks)])
-        self.block_fcs = nn.ModuleList([nn.Linear(self.width, self.width) for _ in range(self.num_blocks)])
-        self.block_gates = nn.Parameter(torch.ones(self.num_blocks, dtype=torch.float32) * 0.35)
-
-        self.ln_out = nn.LayerNorm(self.width)
-        self.head = CosineHead(self.width, self.num_classes, init_scale=12.0)
-        self.drop = nn.Dropout(self.dropout_p)
-
-        self.register_buffer("proto", torch.empty(0), persistent=False)
-        self.register_buffer("proto_temp", torch.tensor(10.0, dtype=torch.float32), persistent=False)
-        self.register_buffer("blend_alpha", torch.tensor(1.0, dtype=torch.float32), persistent=False)
-        self.mode = 0  # 0=linear, 1=proto, 2=blend
-
-    def forward_features(self, x: torch.Tensor) -> torch.Tensor:
-        x = (x - self.x_mean) * self.x_invstd
-        x = self.ln_in(x)
-        x = self.fc_in(x)
-        x = F.gelu(x, approximate="tanh")
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if x.dim() > 2:
+            x = x.view(x.size(0), -1)
+        x = self.fc1(x)
+        x = self.ln1(x)
+        x = self.act(x)
         x = self.drop(x)
-        for gate, ln, fc in zip(self.block_gates, self.block_lns, self.block_fcs):
-            h = ln(x)
-            h = fc(h)
-            h = F.gelu(h, approximate="tanh")
-            h = self.drop(h)
-            x = x + gate * h
-        x = self.ln_out(x)
+        x = self.fc2(x)
+        x = self.ln2(x)
+        x = self.act(x)
+        x = self.drop(x)
+        x = self.fc3(x)
         return x
 
-    def _proto_logits(self, feats: torch.Tensor) -> torch.Tensor:
-        if self.proto.numel() == 0:
-            return torch.zeros(feats.shape[0], self.num_classes, device=feats.device, dtype=feats.dtype)
-        feats = F.normalize(feats, dim=1)
-        temp = float(self.proto_temp.item()) if isinstance(self.proto_temp, torch.Tensor) else float(self.proto_temp)
-        return (feats @ self.proto.t()) * temp
+
+class ResidualFFNBlock(nn.Module):
+    def __init__(self, d: int, expansion: int = 2, dropout: float = 0.10):
+        super().__init__()
+        h = d * expansion
+        self.ln = nn.LayerNorm(d)
+        self.fc1 = nn.Linear(d, h, bias=True)
+        self.fc2 = nn.Linear(h, d, bias=True)
+        self.act = nn.GELU()
+        self.drop = nn.Dropout(dropout)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        feats = self.forward_features(x)
-        if self.mode == 0:
-            return self.head(feats)
-        elif self.mode == 1:
-            return self._proto_logits(feats)
+        r = x
+        x = self.ln(x)
+        x = self.fc1(x)
+        x = self.act(x)
+        x = self.drop(x)
+        x = self.fc2(x)
+        x = self.drop(x)
+        return r + x
+
+
+class ResMLPNet(nn.Module):
+    def __init__(self, input_dim: int, num_classes: int, d: int, n_blocks: int, expansion: int = 2, dropout: float = 0.10):
+        super().__init__()
+        self.inp = nn.Linear(input_dim, d, bias=True)
+        self.blocks = nn.ModuleList([ResidualFFNBlock(d, expansion=expansion, dropout=dropout) for _ in range(n_blocks)])
+        self.out_ln = nn.LayerNorm(d)
+        self.head = nn.Linear(d, num_classes, bias=True)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if x.dim() > 2:
+            x = x.view(x.size(0), -1)
+        x = self.inp(x)
+        for b in self.blocks:
+            x = b(x)
+        x = self.out_ln(x)
+        x = self.head(x)
+        return x
+
+
+class EMA:
+    def __init__(self, model: nn.Module, decay: float = 0.995):
+        self.decay = float(decay)
+        self.shadow = {}
+        self.backup = {}
+        for n, p in model.named_parameters():
+            if p.requires_grad:
+                self.shadow[n] = p.detach().clone()
+
+    @torch.no_grad()
+    def update(self, model: nn.Module):
+        d = self.decay
+        for n, p in model.named_parameters():
+            if p.requires_grad:
+                self.shadow[n].mul_(d).add_(p.detach(), alpha=(1.0 - d))
+
+    @torch.no_grad()
+    def store(self, model: nn.Module):
+        if not self.backup:
+            for n, p in model.named_parameters():
+                if p.requires_grad:
+                    self.backup[n] = p.detach().clone()
         else:
-            alpha = float(self.blend_alpha.item()) if isinstance(self.blend_alpha, torch.Tensor) else float(self.blend_alpha)
-            return self.head(feats) + alpha * self._proto_logits(feats)
+            for n, p in model.named_parameters():
+                if p.requires_grad:
+                    self.backup[n].copy_(p.detach())
 
-    def set_prototypes(self, proto: torch.Tensor, temp: float, mode: int = 1, blend_alpha: float = 1.0):
-        if proto is None or proto.numel() == 0:
-            self.proto = torch.empty(0, device=self.x_mean.device)
-            self.mode = 0
-            return
-        self.proto = proto.detach()
-        self.proto_temp = torch.tensor(float(temp), device=self.x_mean.device, dtype=torch.float32)
-        self.blend_alpha = torch.tensor(float(blend_alpha), device=self.x_mean.device, dtype=torch.float32)
-        self.mode = int(mode)
+    @torch.no_grad()
+    def copy_to(self, model: nn.Module):
+        for n, p in model.named_parameters():
+            if p.requires_grad:
+                p.data.copy_(self.shadow[n])
 
-
-def _compute_arch_params(input_dim: int, num_classes: int, width: int, blocks: int) -> int:
-    # Linear in: input_dim*width + width
-    # Each block: width*width + width
-    # LN: ln_in (2*input_dim), block lns (blocks*2*width), ln_out (2*width)
-    # Gates: blocks
-    # Head (Cosine): num_classes*width + log_scale (1)
-    count = 0
-    count += input_dim * width + width
-    count += blocks * (width * width + width)
-    count += 2 * input_dim
-    count += blocks * (2 * width)
-    count += 2 * width
-    count += blocks
-    count += num_classes * width + 1
-    return int(count)
+    @torch.no_grad()
+    def restore(self, model: nn.Module):
+        for n, p in model.named_parameters():
+            if p.requires_grad:
+                p.data.copy_(self.backup[n])
 
 
-def _pick_arch(input_dim: int, num_classes: int, param_limit: int) -> Tuple[int, int]:
-    margin = 8000
-    limit = max(1, param_limit - margin)
-
-    preferred_blocks = [3, 4, 2, 5, 1]
-    max_w = 2048
-    min_w = 128
-    step = 16
-
-    for blocks in preferred_blocks:
-        best_w = None
-        for w in range(max_w, min_w - 1, -step):
-            if _compute_arch_params(input_dim, num_classes, w, blocks) <= limit:
-                best_w = w
-                break
-        if best_w is not None:
-            return best_w, blocks
-
-    # Fallback: smallest width / 1 block
-    w = min_w
-    b = 1
-    while _compute_arch_params(input_dim, num_classes, w, b) > limit and w > 32:
-        w -= 8
-    return max(32, w), b
+def _compute_dataset_norm(train_loader, input_dim: int, device: torch.device) -> Tuple[torch.Tensor, torch.Tensor]:
+    s = torch.zeros(input_dim, dtype=torch.float64)
+    ss = torch.zeros(input_dim, dtype=torch.float64)
+    n = 0
+    for xb, _ in train_loader:
+        xb = xb.detach()
+        if xb.dim() > 2:
+            xb = xb.view(xb.size(0), -1)
+        xb = xb.to(dtype=torch.float64, device="cpu")
+        if xb.size(1) != input_dim:
+            xb = xb[:, :input_dim]
+        s += xb.sum(dim=0)
+        ss += (xb * xb).sum(dim=0)
+        n += xb.size(0)
+    mean = (s / max(1, n)).to(dtype=torch.float32)
+    var = (ss / max(1, n) - mean.to(dtype=torch.float64) ** 2).to(dtype=torch.float32)
+    std = torch.sqrt(torch.clamp(var, min=1e-6))
+    mean = mean.to(device=device)
+    std = std.to(device=device)
+    return mean, std
 
 
-def _accuracy(model: nn.Module, X: torch.Tensor, y: torch.Tensor, batch_size: int = 512) -> float:
+def _accuracy(model: nn.Module, loader, device: torch.device) -> float:
     model.eval()
     correct = 0
-    total = int(y.numel())
+    total = 0
     with torch.inference_mode():
-        for i in range(0, total, batch_size):
-            xb = X[i : i + batch_size]
-            yb = y[i : i + batch_size]
+        for xb, yb in loader:
+            xb = xb.to(device=device, dtype=torch.float32)
+            yb = yb.to(device=device, dtype=torch.long)
             logits = model(xb)
-            pred = logits.argmax(dim=1)
-            correct += int((pred == yb).sum().item())
-    return float(correct) / float(total) if total > 0 else 0.0
+            pred = torch.argmax(logits, dim=1)
+            correct += (pred == yb).sum().item()
+            total += yb.numel()
+    return float(correct) / float(max(1, total))
 
 
-def _build_prototypes(model: ResMLPClassifier, X: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
-    model.eval()
-    num_classes = model.num_classes
-    with torch.inference_mode():
-        feats = model.forward_features(X)
-        feats = F.normalize(feats, dim=1)
-        proto = torch.zeros(num_classes, feats.shape[1], device=feats.device, dtype=feats.dtype)
-        counts = torch.zeros(num_classes, device=feats.device, dtype=torch.float32)
-        for c in range(num_classes):
-            mask = (y == c)
-            if mask.any():
-                fc = feats[mask]
-                proto[c] = fc.mean(dim=0)
-                counts[c] = float(mask.sum().item())
-        proto = F.normalize(proto, dim=1)
-    return proto
+def _set_lr(optimizer: torch.optim.Optimizer, lr: float):
+    for pg in optimizer.param_groups:
+        pg["lr"] = lr
+
+
+def _train(
+    model: nn.Module,
+    train_loader,
+    val_loader,
+    device: torch.device,
+    max_epochs: int,
+    base_lr: float,
+    weight_decay: float,
+    mixup_p: float,
+    mixup_alpha: float,
+    label_smoothing: float,
+    grad_clip: float,
+    ema_decay: float,
+    patience: int,
+    eval_every: int = 1,
+    max_seconds: Optional[float] = None,
+) -> Tuple[nn.Module, float]:
+    model.to(device)
+    model.train()
+
+    criterion = nn.CrossEntropyLoss(label_smoothing=float(label_smoothing))
+    optimizer = torch.optim.AdamW(model.parameters(), lr=base_lr, weight_decay=weight_decay, betas=(0.9, 0.95), eps=1e-8)
+
+    steps_per_epoch = max(1, len(train_loader))
+    total_steps = max_epochs * steps_per_epoch
+    warmup_steps = min(200, max(20, total_steps // 20))
+    min_lr = base_lr * 0.05
+
+    ema = EMA(model, decay=ema_decay)
+    best_acc = -1.0
+    best_shadow = None
+    bad_epochs = 0
+
+    start_time = time.time()
+    global_step = 0
+
+    for epoch in range(max_epochs):
+        model.train()
+        for xb, yb in train_loader:
+            if max_seconds is not None and (time.time() - start_time) > max_seconds:
+                break
+
+            xb = xb.to(device=device, dtype=torch.float32)
+            yb = yb.to(device=device, dtype=torch.long)
+
+            bs = xb.size(0)
+            do_mix = (mixup_p > 0.0) and (bs >= 2) and (np.random.rand() < mixup_p)
+
+            if global_step < warmup_steps:
+                lr = base_lr * (global_step + 1) / float(warmup_steps)
+            else:
+                t = (global_step - warmup_steps) / float(max(1, total_steps - warmup_steps))
+                lr = min_lr + (base_lr - min_lr) * 0.5 * (1.0 + math.cos(math.pi * min(1.0, t)))
+            _set_lr(optimizer, lr)
+
+            optimizer.zero_grad(set_to_none=True)
+
+            if do_mix:
+                lam = float(np.random.beta(mixup_alpha, mixup_alpha))
+                perm = torch.randperm(bs, device=device)
+                xb2 = xb[perm]
+                yb2 = yb[perm]
+                xmix = xb.mul(lam).add(xb2, alpha=(1.0 - lam))
+                logits = model(xmix)
+                loss = lam * criterion(logits, yb) + (1.0 - lam) * criterion(logits, yb2)
+            else:
+                logits = model(xb)
+                loss = criterion(logits, yb)
+
+            loss.backward()
+            if grad_clip is not None and grad_clip > 0:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=grad_clip)
+            optimizer.step()
+            ema.update(model)
+
+            global_step += 1
+
+        if max_seconds is not None and (time.time() - start_time) > max_seconds:
+            break
+
+        if val_loader is not None and (epoch + 1) % eval_every == 0:
+            ema.store(model)
+            ema.copy_to(model)
+            val_acc = _accuracy(model, val_loader, device)
+            ema.restore(model)
+
+            if val_acc > best_acc + 1e-5:
+                best_acc = val_acc
+                best_shadow = {k: v.detach().clone() for k, v in ema.shadow.items()}
+                bad_epochs = 0
+            else:
+                bad_epochs += 1
+
+            if best_acc >= 0.999:
+                break
+            if bad_epochs >= patience:
+                break
+
+    if best_shadow is not None:
+        with torch.no_grad():
+            for n, p in model.named_parameters():
+                if p.requires_grad and n in best_shadow:
+                    p.data.copy_(best_shadow[n])
+
+    return model, best_acc
+
+
+def _params_wide_mlp(input_dim: int, num_classes: int, h1: int, h2: int) -> int:
+    # Linear + LayerNorm each hidden, biases included
+    p = 0
+    p += input_dim * h1 + h1  # fc1
+    p += 2 * h1  # ln1
+    p += h1 * h2 + h2  # fc2
+    p += 2 * h2  # ln2
+    p += h2 * num_classes + num_classes  # fc3
+    return int(p)
+
+
+def _params_resmlp(input_dim: int, num_classes: int, d: int, n_blocks: int, expansion: int = 2) -> int:
+    # inp: (input_dim+1)*d
+    # each block: ln 2d + fc1 d*(ed)+ed + fc2 (ed)*d + d = 2d + (e d^2 + e d) + (e d^2 + d) = 2d + 2e d^2 + (e+1)d
+    # for e=2 => 2d +4d^2 +3d =4d^2 +5d
+    e = expansion
+    p = 0
+    p += (input_dim + 1) * d
+    p += n_blocks * (2 * d + 2 * e * d * d + (e + 1) * d)
+    p += 2 * d  # out_ln
+    p += d * num_classes + num_classes
+    return int(p)
+
+
+def _choose_wide_mlp_dims(input_dim: int, num_classes: int, param_limit: int) -> Tuple[int, int]:
+    candidates = [
+        (1024, 512),
+        (1024, 448),
+        (960, 512),
+        (896, 512),
+        (896, 448),
+        (832, 512),
+        (768, 512),
+        (768, 448),
+        (768, 384),
+        (704, 448),
+        (640, 512),
+        (640, 384),
+        (576, 384),
+    ]
+    best = None
+    best_p = -1
+    for h1, h2 in candidates:
+        if h2 < num_classes:
+            continue
+        p = _params_wide_mlp(input_dim, num_classes, h1, h2)
+        if p <= param_limit and p > best_p:
+            best_p = p
+            best = (h1, h2)
+    if best is None:
+        # fallback: keep h2 = max(num_classes, 128) and binary search h1
+        h2 = max(num_classes, 128)
+        lo, hi = h2, 4096
+        while lo < hi:
+            mid = (lo + hi + 1) // 2
+            p = _params_wide_mlp(input_dim, num_classes, mid, h2)
+            if p <= param_limit:
+                lo = mid
+            else:
+                hi = mid - 1
+        return lo, h2
+    return best
+
+
+def _choose_resmlp_dims(input_dim: int, num_classes: int, param_limit: int, expansion: int = 2) -> Tuple[int, int]:
+    best = None
+    best_score = -1.0
+    for n_blocks in (6, 5, 4, 3, 2, 1):
+        lo, hi = max(64, num_classes), 2048
+        while lo < hi:
+            mid = (lo + hi + 1) // 2
+            p = _params_resmlp(input_dim, num_classes, mid, n_blocks, expansion=expansion)
+            if p <= param_limit:
+                lo = mid
+            else:
+                hi = mid - 1
+        d = lo
+        p = _params_resmlp(input_dim, num_classes, d, n_blocks, expansion=expansion)
+        if p <= param_limit:
+            # heuristic: prefer using param budget, slight preference for depth
+            score = float(p) + 1500.0 * float(n_blocks)
+            if score > best_score:
+                best_score = score
+                best = (d, n_blocks)
+    if best is None:
+        return max(64, num_classes), 1
+    return best
+
+
+def _build_combined_loader(train_loader, val_loader):
+    try:
+        from torch.utils.data import ConcatDataset, DataLoader
+        if train_loader is None or val_loader is None:
+            return None
+        if not hasattr(train_loader, "dataset") or not hasattr(val_loader, "dataset"):
+            return None
+        ds = ConcatDataset([train_loader.dataset, val_loader.dataset])
+        bs = getattr(train_loader, "batch_size", None) or 64
+        num_workers = getattr(train_loader, "num_workers", 0)
+        return DataLoader(ds, batch_size=bs, shuffle=True, num_workers=num_workers, drop_last=False)
+    except Exception:
+        return None
 
 
 class Solution:
     def solve(self, train_loader, val_loader, metadata: dict = None) -> torch.nn.Module:
-        _set_cpu_threads()
-
+        _set_torch_threads()
         if metadata is None:
             metadata = {}
-        input_dim = int(metadata.get("input_dim", 384))
-        num_classes = int(metadata.get("num_classes", 128))
-        param_limit = int(metadata.get("param_limit", 1_000_000))
+
         device = torch.device(metadata.get("device", "cpu"))
+        num_classes = int(metadata.get("num_classes", 128))
+        input_dim = int(metadata.get("input_dim", 384))
+        param_limit = int(metadata.get("param_limit", 1_000_000))
 
-        X_train, y_train = _loader_to_tensors(train_loader, device=device)
-        X_val, y_val = _loader_to_tensors(val_loader, device=device)
+        torch.manual_seed(0)
+        np.random.seed(0)
 
-        with torch.inference_mode():
-            x_mean = X_train.mean(dim=0, keepdim=False).float()
-            x_std = X_train.std(dim=0, unbiased=False, keepdim=False).float().clamp_min(1e-3)
+        mean, std = _compute_dataset_norm(train_loader, input_dim=input_dim, device=device)
+        norm = InputNorm(mean, std)
 
-        width, blocks = _pick_arch(input_dim, num_classes, param_limit)
+        # Candidates
+        h1, h2 = _choose_wide_mlp_dims(input_dim, num_classes, param_limit)
+        wide = nn.Sequential(norm, WideMLPNet(input_dim, num_classes, h1=h1, h2=h2, dropout=0.10))
 
-        dropout = 0.10
-        model = ResMLPClassifier(
-            input_dim=input_dim,
-            num_classes=num_classes,
-            width=width,
-            num_blocks=blocks,
-            dropout=dropout,
-            x_mean=x_mean.to(device),
-            x_std=x_std.to(device),
-        ).to(device)
+        d, n_blocks = _choose_resmlp_dims(input_dim, num_classes, param_limit, expansion=2)
+        res = nn.Sequential(norm, ResMLPNet(input_dim, num_classes, d=d, n_blocks=n_blocks, expansion=2, dropout=0.10))
 
-        if _param_count(model) > param_limit:
-            # Aggressive fallback if anything unexpected happens
-            for b in [2, 1]:
-                for w in range(max(64, width - 128), 63, -16):
-                    tmp = ResMLPClassifier(
-                        input_dim=input_dim,
-                        num_classes=num_classes,
-                        width=w,
-                        num_blocks=b,
-                        dropout=dropout,
-                        x_mean=x_mean.to(device),
-                        x_std=x_std.to(device),
-                    ).to(device)
-                    if _param_count(tmp) <= param_limit:
-                        model = tmp
-                        width, blocks = w, b
-                        break
-                if _param_count(model) <= param_limit:
-                    break
+        # Ensure both are within limit
+        if _count_trainable_params(wide) > param_limit:
+            # fallback smaller
+            wide = nn.Sequential(norm, WideMLPNet(input_dim, num_classes, h1=768, h2=384, dropout=0.10))
+        if _count_trainable_params(res) > param_limit:
+            res = nn.Sequential(norm, ResMLPNet(input_dim, num_classes, d=max(num_classes, 192), n_blocks=2, expansion=2, dropout=0.10))
 
-        n_train = int(X_train.shape[0])
-        batch_size = 256
-        if n_train <= 256:
-            batch_size = max(32, n_train)
+        # Quick pilot to pick architecture
+        pilot_epochs = 40
+        pilot_patience = 10
 
-        steps_per_epoch = max(1, (n_train + batch_size - 1) // batch_size)
-        max_epochs = 80
-        total_steps = max(steps_per_epoch * max_epochs, 1)
+        # Heuristic LR scaling by batch size
+        try:
+            first_batch = next(iter(train_loader))[0]
+            bs = int(first_batch.size(0))
+        except Exception:
+            bs = 64
+        lr_scale = max(0.5, min(2.0, bs / 64.0))
 
-        optimizer = torch.optim.AdamW(model.parameters(), lr=3.5e-3, weight_decay=1.0e-2, betas=(0.9, 0.98))
-        scheduler = torch.optim.lr_scheduler.OneCycleLR(
-            optimizer,
-            max_lr=3.5e-3,
-            total_steps=total_steps,
-            pct_start=0.12,
-            anneal_strategy="cos",
-            div_factor=20.0,
-            final_div_factor=200.0,
+        candidates: List[Tuple[str, nn.Module, float]] = [
+            ("wide", wide, 2.5e-3 * lr_scale),
+            ("res", res, 3.0e-3 * lr_scale),
+        ]
+
+        best_name = None
+        best_acc = -1.0
+        best_kind = None
+
+        for name, model, lr in candidates:
+            model = copy.deepcopy(model)
+            if _count_trainable_params(model) > param_limit:
+                continue
+            model, vacc = _train(
+                model=model,
+                train_loader=train_loader,
+                val_loader=val_loader,
+                device=device,
+                max_epochs=pilot_epochs,
+                base_lr=lr,
+                weight_decay=0.015,
+                mixup_p=0.35,
+                mixup_alpha=0.20,
+                label_smoothing=0.05,
+                grad_clip=1.0,
+                ema_decay=0.995,
+                patience=pilot_patience,
+                eval_every=1,
+                max_seconds=None,
+            )
+            if vacc > best_acc:
+                best_acc = vacc
+                best_name = name
+                best_kind = (name, model, lr)
+
+        if best_kind is None:
+            model = wide
+            final_lr = 2.5e-3 * lr_scale
+        else:
+            # Rebuild a fresh model of chosen architecture for full training
+            if best_name == "wide":
+                model = nn.Sequential(norm, WideMLPNet(input_dim, num_classes, h1=h1, h2=h2, dropout=0.10))
+                final_lr = 2.5e-3 * lr_scale
+            else:
+                model = nn.Sequential(norm, ResMLPNet(input_dim, num_classes, d=d, n_blocks=n_blocks, expansion=2, dropout=0.10))
+                final_lr = 3.0e-3 * lr_scale
+
+        # Full training
+        model, _ = _train(
+            model=model,
+            train_loader=train_loader,
+            val_loader=val_loader,
+            device=device,
+            max_epochs=220,
+            base_lr=final_lr,
+            weight_decay=0.02,
+            mixup_p=0.40,
+            mixup_alpha=0.20,
+            label_smoothing=0.06,
+            grad_clip=1.0,
+            ema_decay=0.996,
+            patience=25,
+            eval_every=1,
+            max_seconds=3300.0,  # keep within overall budget
         )
 
-        criterion = nn.CrossEntropyLoss(label_smoothing=0.08)
+        # Optional fine-tune on train+val with small LR
+        combined = _build_combined_loader(train_loader, val_loader)
+        if combined is not None:
+            model, _ = _train(
+                model=model,
+                train_loader=combined,
+                val_loader=None,
+                device=device,
+                max_epochs=20,
+                base_lr=final_lr * 0.25,
+                weight_decay=0.02,
+                mixup_p=0.20,
+                mixup_alpha=0.15,
+                label_smoothing=0.04,
+                grad_clip=1.0,
+                ema_decay=0.998,
+                patience=9999,
+                eval_every=9999,
+                max_seconds=3500.0,
+            )
 
-        best_state = None
-        best_acc = -1.0
-        patience = 12
-        bad = 0
+        # Final safety: if over limit, fall back to a smaller wide MLP
+        if _count_trainable_params(model) > param_limit:
+            h1s, h2s = _choose_wide_mlp_dims(input_dim, num_classes, param_limit - 4096)
+            model = nn.Sequential(norm, WideMLPNet(input_dim, num_classes, h1=h1s, h2=h2s, dropout=0.10)).to(device)
+            model, _ = _train(
+                model=model,
+                train_loader=train_loader,
+                val_loader=val_loader,
+                device=device,
+                max_epochs=160,
+                base_lr=2.5e-3 * lr_scale,
+                weight_decay=0.02,
+                mixup_p=0.35,
+                mixup_alpha=0.20,
+                label_smoothing=0.06,
+                grad_clip=1.0,
+                ema_decay=0.996,
+                patience=20,
+                eval_every=1,
+                max_seconds=3500.0,
+            )
 
-        gen = torch.Generator(device=device)
-        gen.manual_seed(12345)
-
-        ema_decay = 0.995
-        ema_params: Optional[List[torch.Tensor]] = None
-        try:
-            ema_params = [p.detach().clone() for p in model.parameters() if p.requires_grad]
-        except Exception:
-            ema_params = None
-
-        step_idx = 0
-        for epoch in range(max_epochs):
-            model.train()
-            perm = torch.randperm(n_train, generator=gen, device=device)
-            for s in range(0, n_train, batch_size):
-                idx = perm[s : s + batch_size]
-                xb = X_train[idx]
-                yb = y_train[idx]
-
-                if model.dropout_p > 0.0:
-                    noise = torch.randn_like(xb) * 0.015
-                    xb = xb + noise
-
-                logits = model(xb)
-                loss = criterion(logits, yb)
-
-                optimizer.zero_grad(set_to_none=True)
-                loss.backward()
-                nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-                optimizer.step()
-                scheduler.step()
-
-                if ema_params is not None:
-                    j = 0
-                    for p in model.parameters():
-                        if not p.requires_grad:
-                            continue
-                        ema_params[j].mul_(ema_decay).add_(p.detach(), alpha=(1.0 - ema_decay))
-                        j += 1
-
-                step_idx += 1
-                if step_idx >= total_steps:
-                    break
-            if step_idx >= total_steps:
-                break
-
-            val_acc = _accuracy(model, X_val, y_val, batch_size=512)
-
-            if val_acc > best_acc + 1e-6:
-                best_acc = val_acc
-                best_state = copy.deepcopy(model.state_dict())
-                bad = 0
-            else:
-                bad += 1
-                if bad >= patience and epoch >= 12:
-                    break
-
-        if best_state is not None:
-            model.load_state_dict(best_state, strict=True)
-
-        # Optional: compare with EMA snapshot if available
-        if ema_params is not None:
-            backup = [p.detach().clone() for p in model.parameters() if p.requires_grad]
-            with torch.no_grad():
-                j = 0
-                for p in model.parameters():
-                    if not p.requires_grad:
-                        continue
-                    p.copy_(ema_params[j])
-                    j += 1
-            ema_acc = _accuracy(model, X_val, y_val, batch_size=512)
-            cur_acc = _accuracy(model, X_val, y_val, batch_size=512)
-            if ema_acc + 1e-6 < cur_acc:
-                # restore backup
-                with torch.no_grad():
-                    j = 0
-                    for p in model.parameters():
-                        if not p.requires_grad:
-                            continue
-                        p.copy_(backup[j])
-                        j += 1
-
-        # Prototype / blend selection on validation
-        proto = _build_prototypes(model, X_train, y_train)
-        temps = [6.0, 10.0, 16.0, 24.0]
-        alphas = [0.4, 0.7, 1.0, 1.4, 2.0]
-
-        model.set_prototypes(proto=proto, temp=10.0, mode=0, blend_alpha=1.0)
-        base_acc = _accuracy(model, X_val, y_val, batch_size=512)
-
-        best_mode = 0
-        best_t = 10.0
-        best_a = 1.0
-        best_val = base_acc
-
-        for t in temps:
-            model.set_prototypes(proto=proto, temp=t, mode=1, blend_alpha=1.0)
-            acc = _accuracy(model, X_val, y_val, batch_size=512)
-            if acc > best_val + 1e-6:
-                best_val = acc
-                best_mode = 1
-                best_t = t
-                best_a = 1.0
-
-        for t in temps:
-            for a in alphas:
-                model.set_prototypes(proto=proto, temp=t, mode=2, blend_alpha=a)
-                acc = _accuracy(model, X_val, y_val, batch_size=512)
-                if acc > best_val + 1e-6:
-                    best_val = acc
-                    best_mode = 2
-                    best_t = t
-                    best_a = a
-
-        model.set_prototypes(proto=proto, temp=best_t, mode=best_mode, blend_alpha=best_a)
-
+        model.to(device)
         model.eval()
-        model.to(torch.device("cpu"))
         return model

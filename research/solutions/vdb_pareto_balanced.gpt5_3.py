@@ -1,104 +1,75 @@
+import os
 import numpy as np
 from typing import Tuple
-import faiss
+
+try:
+    import faiss
+except Exception:
+    faiss = None
 
 
 class YourIndexClass:
     def __init__(self, dim: int, **kwargs):
         self.dim = int(dim)
-        # Parameters with sensible defaults tuned for SIFT1M
-        self.nlist = int(kwargs.get("nlist", 4096))
-        self.nprobe = int(kwargs.get("nprobe", 64))
-        self.train_samples = int(kwargs.get("train_samples", 200000))
-        self.seed = int(kwargs.get("seed", 1234))
-        self.threads = int(kwargs.get("threads", max(1, faiss.omp_get_max_threads())))
-        self.add_block_size = int(kwargs.get("add_block_size", 131072))
-        self.use_flat_fallback_threshold = int(kwargs.get("flat_threshold", 50000))
+        self.M = int(kwargs.get("M", 32))
+        self.ef_construction = int(kwargs.get("ef_construction", 200))
+        self.ef_search = int(kwargs.get("ef_search", 320))
+        self.num_threads = int(kwargs.get("num_threads", max(1, (os.cpu_count() or 8))))
+        self._index = None
+        self._ntotal = 0
 
-        faiss.omp_set_num_threads(self.threads)
+        if faiss is None:
+            raise ImportError("FAISS-CPU is required for this solution.")
+        try:
+            faiss.omp_set_num_threads(self.num_threads)
+        except Exception:
+            pass
 
-        self.index = None
-        self.ntotal = 0
-        self._rng = np.random.RandomState(self.seed)
-        self._is_trained = False
-        self._use_flat = False
-
-    def _build_ivf_index(self):
-        quantizer = faiss.IndexFlatL2(self.dim)
-        index = faiss.IndexIVFFlat(quantizer, self.dim, self.nlist, faiss.METRIC_L2)
-        return index
-
-    def _build_flat_index(self):
-        return faiss.IndexFlatL2(self.dim)
+        index = faiss.IndexHNSWFlat(self.dim, self.M)
+        index.hnsw.efConstruction = self.ef_construction
+        index.hnsw.efSearch = self.ef_search
+        self._index = index
 
     def add(self, xb: np.ndarray) -> None:
-        if xb is None or len(xb) == 0:
+        if xb is None or xb.size == 0:
             return
-        xb = np.ascontiguousarray(xb, dtype=np.float32)
-        n, d = xb.shape
-        if d != self.dim:
-            raise ValueError(f"Input dimension {d} does not match index dimension {self.dim}")
-
-        # Choose index type if not created yet
-        if self.index is None:
-            # For small datasets, fall back to flat for simplicity and perfect recall
-            if n < self.use_flat_fallback_threshold:
-                self.index = self._build_flat_index()
-                self._use_flat = True
-                self._is_trained = True
-            else:
-                self.index = self._build_ivf_index()
-
-        # Train if needed (IVF only)
-        if not self._use_flat and not self._is_trained:
-            train_n = min(self.train_samples, n)
-            # Sample without replacement for training
-            if train_n < n:
-                train_idx = self._rng.choice(n, size=train_n, replace=False)
-                xtrain = xb[train_idx]
-            else:
-                xtrain = xb
-            self.index.train(xtrain)
-            self._is_trained = True
-            if hasattr(self.index, "nprobe"):
-                self.index.nprobe = self.nprobe
-
-        # Add in blocks to manage memory
-        start = 0
-        while start < n:
-            end = min(start + self.add_block_size, n)
-            self.index.add(xb[start:end])
-            self.ntotal += (end - start)
-            start = end
-
-        # Ensure search params are set
-        if hasattr(self.index, "nprobe"):
-            self.index.nprobe = self.nprobe
+        if xb.shape[1] != self.dim:
+            raise ValueError(f"Expected xb with dim={self.dim}, got {xb.shape[1]}")
+        xb = np.ascontiguousarray(xb.astype(np.float32, copy=False))
+        self._index.add(xb)
+        self._ntotal = self._index.ntotal
 
     def search(self, xq: np.ndarray, k: int) -> Tuple[np.ndarray, np.ndarray]:
-        if self.index is None or self.ntotal == 0:
-            raise RuntimeError("Index is empty. Call add() before search().")
-        xq = np.ascontiguousarray(xq, dtype=np.float32)
-        nq, d = xq.shape
-        if d != self.dim:
-            raise ValueError(f"Query dimension {d} does not match index dimension {self.dim}")
-        if k <= 0:
-            raise ValueError("k must be positive")
-        if k > max(1, self.ntotal):
-            k = max(1, self.ntotal)
+        if self._ntotal == 0:
+            nq = xq.shape[0]
+            return np.full((nq, k), np.inf, dtype=np.float32), np.full((nq, k), -1, dtype=np.int64)
 
-        faiss.omp_set_num_threads(self.threads)
-        if hasattr(self.index, "nprobe"):
-            self.index.nprobe = self.nprobe
+        if xq.shape[1] != self.dim:
+            raise ValueError(f"Expected xq with dim={self.dim}, got {xq.shape[1]}")
 
-        D, I = self.index.search(xq, k)
+        xq = np.ascontiguousarray(xq.astype(np.float32, copy=False))
+        try:
+            faiss.omp_set_num_threads(self.num_threads)
+        except Exception:
+            pass
 
-        # Ensure correct dtypes and shapes
-        if not isinstance(D, np.ndarray):
-            D = np.array(D, dtype=np.float32)
-        if not isinstance(I, np.ndarray):
-            I = np.array(I, dtype=np.int64)
+        # Ensure efSearch is set before querying
+        try:
+            self._index.hnsw.efSearch = max(self.ef_search, k)
+        except Exception:
+            pass
 
-        D = np.ascontiguousarray(D, dtype=np.float32).reshape(nq, k)
-        I = np.ascontiguousarray(I, dtype=np.int64).reshape(nq, k)
-        return D, I
+        k_eff = min(k, self._ntotal)
+        D, I = self._index.search(xq, k_eff)
+
+        if k_eff == k:
+            return D, I
+
+        # Pad results if requested k > ntotal
+        nq = xq.shape[0]
+        D_full = np.full((nq, k), np.inf, dtype=np.float32)
+        I_full = np.full((nq, k), -1, dtype=np.int64)
+        if k_eff > 0:
+            D_full[:, :k_eff] = D
+            I_full[:, :k_eff] = I
+        return D_full, I_full

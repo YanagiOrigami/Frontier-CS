@@ -8,86 +8,78 @@ except Exception as e:
     faiss = None
 
 
-def _as_float32_contig(x: np.ndarray) -> np.ndarray:
-    if x.dtype != np.float32:
-        x = x.astype(np.float32, copy=False)
-    if not x.flags["C_CONTIGUOUS"]:
-        x = np.ascontiguousarray(x)
-    return x
-
-
 class YourIndexClass:
     def __init__(self, dim: int, **kwargs):
-        if faiss is None:
-            raise ImportError("faiss is required for this solution")
-
         self.dim = int(dim)
 
-        self.nlist = int(kwargs.get("nlist", 8192))
-        self.nprobe = int(kwargs.get("nprobe", 192))
-        self.train_size = int(kwargs.get("train_size", 200_000))
-        self.n_threads = int(kwargs.get("n_threads", min(8, os.cpu_count() or 1)))
+        self.nlist = int(kwargs.get("nlist", 4096))
+        self.nprobe = int(kwargs.get("nprobe", 384))
+        self.train_size = int(kwargs.get("train_size", 400_000))
+        self.seed = int(kwargs.get("seed", 123))
+        self.n_threads = int(kwargs.get("n_threads", min(8, (os.cpu_count() or 1))))
 
-        self._index = None
-        self._trained = False
-        self._ntotal = 0
+        if faiss is None:
+            raise ImportError("faiss is required but could not be imported")
 
-        faiss.omp_set_num_threads(self.n_threads)
-
-    def _build_and_train(self, xb: np.ndarray) -> None:
-        quantizer = faiss.IndexFlatL2(self.dim)
-        index = faiss.IndexIVFFlat(quantizer, self.dim, self.nlist, faiss.METRIC_L2)
-
+        faiss.omp_set_num_threads(max(1, self.n_threads))
         try:
-            cp = index.cp
-            cp.niter = int(getattr(cp, "niter", 20))
-            cp.verbose = False
+            faiss.cvar.rand_seed = self.seed
         except Exception:
             pass
 
-        index.nprobe = self.nprobe
+        self.index = faiss.index_factory(self.dim, f"IVF{self.nlist},Flat", faiss.METRIC_L2)
+        if hasattr(self.index, "nprobe"):
+            self.index.nprobe = max(1, min(self.nprobe, self.nlist))
 
-        n = xb.shape[0]
-        if n <= self.train_size:
-            xt = xb
-        else:
-            step = max(1, n // self.train_size)
-            xt = xb[0 : step * self.train_size : step]
+        if hasattr(self.index, "cp"):
+            try:
+                self.index.cp.seed = self.seed
+            except Exception:
+                pass
 
-        if xt.shape[0] < self.nlist:
-            xt = xb[: min(n, max(self.nlist, 10_000))]
-
-        index.train(xt)
-        self._index = index
-        self._trained = True
+        self._ntotal_added = 0
 
     def add(self, xb: np.ndarray) -> None:
-        xb = _as_float32_contig(xb)
-        if xb.ndim != 2 or xb.shape[1] != self.dim:
-            raise ValueError(f"xb must have shape (N, {self.dim})")
+        if xb is None:
+            return
+        xb = np.asarray(xb, dtype=np.float32, order="C")
+        if xb.ndim != 2 or xb.shape[1] != self.dim or xb.shape[0] == 0:
+            return
 
-        if not self._trained:
-            self._build_and_train(xb)
+        if not self.index.is_trained:
+            n = xb.shape[0]
+            ts = min(self.train_size, n)
 
-        self._index.add(xb)
-        self._ntotal += xb.shape[0]
+            if ts < n:
+                rng = np.random.default_rng(self.seed)
+                idx = rng.choice(n, size=ts, replace=False)
+                xtrain = np.ascontiguousarray(xb[idx])
+            else:
+                xtrain = xb
+
+            self.index.train(xtrain)
+
+        self.index.add(xb)
+        self._ntotal_added += xb.shape[0]
 
     def search(self, xq: np.ndarray, k: int) -> Tuple[np.ndarray, np.ndarray]:
-        if self._index is None or not self._trained:
-            raise RuntimeError("Index not trained/initialized. Call add() first.")
-
         k = int(k)
         if k <= 0:
-            raise ValueError("k must be positive")
+            xq = np.asarray(xq)
+            nq = int(xq.shape[0]) if xq.ndim >= 1 else 0
+            return np.empty((nq, 0), dtype=np.float32), np.empty((nq, 0), dtype=np.int64)
 
-        xq = _as_float32_contig(xq)
+        xq = np.asarray(xq, dtype=np.float32, order="C")
         if xq.ndim != 2 or xq.shape[1] != self.dim:
-            raise ValueError(f"xq must have shape (nq, {self.dim})")
+            raise ValueError("xq must have shape (nq, dim)")
 
-        if self._index.nprobe != self.nprobe:
-            self._index.nprobe = self.nprobe
+        if (not self.index.is_trained) or (self.index.ntotal == 0):
+            nq = xq.shape[0]
+            D = np.full((nq, k), np.inf, dtype=np.float32)
+            I = np.full((nq, k), -1, dtype=np.int64)
+            return D, I
 
-        D, I = self._index.search(xq, k)
+        D, I = self.index.search(xq, k)
         if D.dtype != np.float32:
             D = D.astype(np.float32, copy=False)
         if I.dtype != np.int64:

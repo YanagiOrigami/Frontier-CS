@@ -1,69 +1,149 @@
 import os
+import textwrap
 import torch
+import triton
+import triton.language as tl
 
-try:
-    import triton
-    import triton.language as tl
-except Exception:  # pragma: no cover
-    triton = None
-    tl = None
-
-_N = 1 << 24
+_N_ELEMENTS = 1 << 24
 
 
-if triton is not None:
+@triton.jit
+def _add_kernel(
+    x_ptr,
+    y_ptr,
+    out_ptr,
+    BLOCK: tl.constexpr,
+    UNROLL: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    base = pid * BLOCK * UNROLL
 
-    @triton.jit
-    def _add_kernel(x_ptr, y_ptr, z_ptr, BLOCK: tl.constexpr):
-        pid = tl.program_id(axis=0)
-        base = pid * BLOCK
+    tl.multiple_of(base, BLOCK)
+    tl.multiple_of(base, 32)
 
-        x_blk = x_ptr + base
-        y_blk = y_ptr + base
-        z_blk = z_ptr + base
+    r = tl.arange(0, BLOCK)
+    tl.multiple_of(r, 1)
+    tl.max_contiguous(r, BLOCK)
 
-        tl.multiple_of(x_blk, 16)
-        tl.multiple_of(y_blk, 16)
-        tl.multiple_of(z_blk, 16)
-
-        offs = tl.arange(0, BLOCK)
-        x = tl.load(x_blk + offs, cache_modifier=".cg", eviction_policy="evict_first")
-        y = tl.load(y_blk + offs, cache_modifier=".cg", eviction_policy="evict_first")
-        tl.store(z_blk + offs, x + y, cache_modifier=".cg")
+    for i in tl.static_range(UNROLL):
+        offs = base + i * BLOCK + r
+        tl.max_contiguous(offs, BLOCK)
+        x = tl.load(x_ptr + offs, cache_modifier=".cg", eviction_policy="evict_first")
+        y = tl.load(y_ptr + offs, cache_modifier=".cg", eviction_policy="evict_first")
+        tl.store(out_ptr + offs, x + y, cache_modifier=".cg", eviction_policy="evict_first")
 
 
 def add(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     if not (isinstance(x, torch.Tensor) and isinstance(y, torch.Tensor)):
         raise TypeError("x and y must be torch.Tensors")
-    if x.numel() != _N or y.numel() != _N:
-        raise ValueError(f"Input tensors must have exactly {_N} elements")
+    if x.numel() != _N_ELEMENTS or y.numel() != _N_ELEMENTS:
+        raise ValueError(f"Expected tensors with numel == {_N_ELEMENTS}")
     if x.device != y.device:
         raise ValueError("x and y must be on the same device")
     if x.dtype != y.dtype:
         raise ValueError("x and y must have the same dtype")
     if x.dim() != 1 or y.dim() != 1:
-        raise ValueError("x and y must be 1D tensors")
+        x = x.view(-1)
+        y = y.view(-1)
+        if x.numel() != _N_ELEMENTS or y.numel() != _N_ELEMENTS:
+            raise ValueError(f"Expected tensors with numel == {_N_ELEMENTS}")
     if not x.is_contiguous() or not y.is_contiguous():
-        x = x.contiguous()
-        y = y.contiguous()
+        raise ValueError("x and y must be contiguous")
 
-    if triton is None or (not x.is_cuda):
+    if not x.is_cuda:
         return x + y
 
     out = torch.empty_like(x)
-    BLOCK = 1024
-    grid = (_N // BLOCK,)
-    _add_kernel[grid](x, y, out, BLOCK=BLOCK, num_warps=8, num_stages=2)
+
+    BLOCK = 256
+    UNROLL = 8
+    grid = (_N_ELEMENTS // (BLOCK * UNROLL),)
+
+    _add_kernel[grid](
+        x,
+        y,
+        out,
+        BLOCK=BLOCK,
+        UNROLL=UNROLL,
+        num_warps=8,
+        num_stages=1,
+    )
     return out
+
+
+_KERNEL_CODE = textwrap.dedent(
+    r"""
+    import torch
+    import triton
+    import triton.language as tl
+
+    _N_ELEMENTS = 1 << 24
+
+    @triton.jit
+    def _add_kernel(
+        x_ptr,
+        y_ptr,
+        out_ptr,
+        BLOCK: tl.constexpr,
+        UNROLL: tl.constexpr,
+    ):
+        pid = tl.program_id(0)
+        base = pid * BLOCK * UNROLL
+
+        tl.multiple_of(base, BLOCK)
+        tl.multiple_of(base, 32)
+
+        r = tl.arange(0, BLOCK)
+        tl.multiple_of(r, 1)
+        tl.max_contiguous(r, BLOCK)
+
+        for i in tl.static_range(UNROLL):
+            offs = base + i * BLOCK + r
+            tl.max_contiguous(offs, BLOCK)
+            x = tl.load(x_ptr + offs, cache_modifier=".cg", eviction_policy="evict_first")
+            y = tl.load(y_ptr + offs, cache_modifier=".cg", eviction_policy="evict_first")
+            tl.store(out_ptr + offs, x + y, cache_modifier=".cg", eviction_policy="evict_first")
+
+    def add(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+        if not (isinstance(x, torch.Tensor) and isinstance(y, torch.Tensor)):
+            raise TypeError("x and y must be torch.Tensors")
+        if x.numel() != _N_ELEMENTS or y.numel() != _N_ELEMENTS:
+            raise ValueError(f"Expected tensors with numel == {_N_ELEMENTS}")
+        if x.device != y.device:
+            raise ValueError("x and y must be on the same device")
+        if x.dtype != y.dtype:
+            raise ValueError("x and y must have the same dtype")
+        if x.dim() != 1 or y.dim() != 1:
+            x = x.view(-1)
+            y = y.view(-1)
+            if x.numel() != _N_ELEMENTS or y.numel() != _N_ELEMENTS:
+                raise ValueError(f"Expected tensors with numel == {_N_ELEMENTS}")
+        if not x.is_contiguous() or not y.is_contiguous():
+            raise ValueError("x and y must be contiguous")
+
+        if not x.is_cuda:
+            return x + y
+
+        out = torch.empty_like(x)
+
+        BLOCK = 256
+        UNROLL = 8
+        grid = (_N_ELEMENTS // (BLOCK * UNROLL),)
+
+        _add_kernel[grid](
+            x,
+            y,
+            out,
+            BLOCK=BLOCK,
+            UNROLL=UNROLL,
+            num_warps=8,
+            num_stages=1,
+        )
+        return out
+    """
+).lstrip()
 
 
 class Solution:
     def solve(self, spec_path: str = None) -> dict:
-        try:
-            path = __file__
-            if path and os.path.isfile(path):
-                with open(path, "r", encoding="utf-8") as f:
-                    return {"code": f.read()}
-        except Exception:
-            pass
-        return {"code": ""}
+        return {"code": _KERNEL_CODE}

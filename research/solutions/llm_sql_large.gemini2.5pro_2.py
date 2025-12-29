@@ -1,22 +1,30 @@
 import pandas as pd
 import numpy as np
-from multiprocessing import Pool, cpu_count
-from functools import partial
+from collections import defaultdict
+from concurrent.futures import ProcessPoolExecutor, as_completed
+import os
 
-# This function must be defined at the top level for multiprocessing to work.
-def _score_column_worker(col, col_to_idx, df_values, active_partitions):
+# This function must be defined at the top-level to be pickleable for multiprocessing.
+def _calculate_cond_entropy_pair_job(series_c1: pd.Series, series_c2: pd.Series, h_c1: float) -> float:
     """
-    Calculates the score for a single column.
-    The score is the number of new partitions this column would create in the active partitions.
+    Calculates the conditional entropy H(c2|c1).
+    H(c2|c1) = H(c1, c2) - H(c1)
     """
-    col_idx = col_to_idx[col]
-    score = 0
-    for p_indices_set in active_partitions:
-        # Slicing numpy array is faster with a list/array of indices
-        p_indices = list(p_indices_set)
-        partition_values = df_values[p_indices, col_idx]
-        score += len(np.unique(partition_values))
-    return col, score
+    if series_c1.empty:
+        return 0.0
+    
+    df_pair = pd.concat([series_c1, series_c2], axis=1)
+    c1_name, c2_name = df_pair.columns
+    
+    joint_counts = df_pair.groupby([c1_name, c2_name], observed=True, sort=False).size()
+    
+    if joint_counts.empty:
+        return -h_c1 
+
+    joint_probs = joint_counts / len(df_pair)
+    joint_entropy = -np.sum(joint_probs * np.log2(joint_probs))
+    
+    return joint_entropy - h_c1
 
 class Solution:
     def solve(
@@ -34,127 +42,107 @@ class Solution:
         Reorder columns in the DataFrame to maximize prefix hit rate.
         """
         
-        # Handle column merges
+        work_df = df.copy()
+
         if col_merge:
-            df = df.copy()
-            new_cols_data = {}
-            cols_to_drop = set()
-            
-            for merge_group in col_merge:
-                if len(merge_group) > 1 and all(c in df.columns for c in merge_group):
-                    new_col_name = "_".join(map(str, merge_group))
-                    new_cols_data[new_col_name] = df[merge_group].astype(str).apply("".join, axis=1)
-                    for col in merge_group:
-                        cols_to_drop.add(col)
-
-            if cols_to_drop:
-                df = df.drop(columns=list(cols_to_drop))
-            for new_col_name, new_col_series in new_cols_data.items():
-                df[new_col_name] = new_col_series
-
-        columns_to_order = list(df.columns)
-        if not columns_to_order:
-            return df
-            
-        num_rows = df.shape[0]
-        if num_rows == 0:
-            return df
-
-        final_order = []
-
-        # Greedy phase to find the best initial columns
-        if col_stop > 0:
-            partitions = {frozenset(range(num_rows))}
-            
-            df_values = df.to_numpy()
-            col_to_idx = {col: i for i, col in enumerate(df.columns)}
-
-            for _ in range(min(col_stop, len(df.columns))):
-                if not columns_to_order:
-                    break
-
-                active_partitions = {p for p in partitions if len(p) > row_stop}
-                if not active_partitions:
-                    break
-
-                best_col = None
+            original_cols = work_df.columns.tolist()
+            merged_cols_set = set()
+            new_col_names = []
+            for group in col_merge:
+                if not group: continue
+                mergable_group = [c for c in group if c in work_df.columns]
+                if not mergable_group: continue
                 
-                # Score candidate columns
-                if parallel and len(columns_to_order) > 1:
-                    worker_func = partial(
-                        _score_column_worker,
-                        col_to_idx=col_to_idx,
-                        df_values=df_values,
-                        active_partitions=active_partitions,
-                    )
-                    num_processes = min(cpu_count(), len(columns_to_order))
-                    with Pool(processes=num_processes) as pool:
-                        scores = pool.map(worker_func, columns_to_order)
-                    
-                    scores_dict = dict(scores)
-                    if scores_dict:
-                        best_col = min(scores_dict, key=scores_dict.get)
-                else: 
-                    min_score = float('inf')
-                    for col in columns_to_order:
-                        _, score = _score_column_worker(col, col_to_idx, df_values, active_partitions)
-                        if score < min_score:
-                            min_score = score
-                            best_col = col
+                merged_cols_set.update(mergable_group)
+                new_col_name = '_'.join(mergable_group)
+                new_col_names.append(new_col_name)
+                work_df[new_col_name] = work_df[mergable_group].astype(str).agg(''.join, axis=1)
+            
+            unmerged_cols = [c for c in original_cols if c not in merged_cols_set]
+            work_df = work_df[unmerged_cols + new_col_names]
 
-                if best_col is None:
-                    break
+        if work_df.shape[1] <= 1:
+            return work_df
 
-                final_order.append(best_col)
-                columns_to_order.remove(best_col)
+        sample_df = work_df.head(min(len(work_df), early_stop)).astype(str)
+        
+        final_permutation = self._find_best_permutation(sample_df, parallel)
+        
+        if not final_permutation:
+            return work_df
+        
+        return work_df[final_permutation]
 
-                # Update partitions based on the chosen column
-                new_partitions = set()
-                for part in partitions:
-                    if len(part) <= row_stop:
-                        new_partitions.add(part)
-                        continue
-                    
-                    part_list = list(part)
-                    p_df = df.iloc[part_list]
-                    sub_groups = p_df.groupby(best_col, sort=False)
-                    
-                    if sub_groups.ngroups <= 1:
-                        new_partitions.add(part)
-                    else:
-                        for _, group_indices in sub_groups.groups.items():
-                            new_partitions.add(frozenset(group_indices.tolist()))
+    def _get_entropy(self, series: pd.Series) -> float:
+        if series.empty:
+            return 0.0
+        counts = series.value_counts()
+        if counts.empty:
+            return 0.0
+        probs = counts / len(series)
+        return -np.sum(probs * np.log2(probs))
+
+    def _find_best_permutation(self, df_sample: pd.DataFrame, parallel: bool) -> list:
+        columns = df_sample.columns.tolist()
+        num_cols = len(columns)
+
+        if num_cols <= 1:
+            return columns
+            
+        entropies = {col: self._get_entropy(df_sample[col]) for col in columns}
+        
+        cond_entropies = defaultdict(dict)
+        
+        cpu_cores = os.cpu_count() or 1
+        use_parallel = parallel and num_cols > 5 and cpu_cores > 1
+        
+        if use_parallel:
+            with ProcessPoolExecutor(max_workers=cpu_cores) as executor:
+                futures = {}
+                for c1 in columns:
+                    for c2 in columns:
+                        if c1 != c2:
+                            future = executor.submit(
+                                _calculate_cond_entropy_pair_job, 
+                                df_sample[c1], df_sample[c2], entropies[c1]
+                            )
+                            futures[future] = (c2, c1)
                 
-                partitions = new_partitions
+                for future in as_completed(futures):
+                    c2, c1 = futures[future]
+                    try:
+                        cond_entropies[c1][c2] = future.result()
+                    except Exception:
+                        cond_entropies[c1][c2] = float('inf')
+        else:
+            for c1 in columns:
+                for c2 in columns:
+                    if c1 != c2:
+                        cond_entropies[c1][c2] = _calculate_cond_entropy_pair_job(
+                            df_sample[c1], df_sample[c2], entropies[c1]
+                        )
+        
+        best_perm = []
+        min_total_entropy = float('inf')
 
-                if len(partitions) > early_stop:
-                    break
-        
-        # Heuristic phase for remaining columns
-        if columns_to_order:
-            remaining_cols_nunique = df[columns_to_order].nunique()
-            
-            low_card_rem = [
-                c for c in columns_to_order 
-                if (remaining_cols_nunique[c] / num_rows) < distinct_value_threshold
-            ]
-            high_card_rem = [
-                c for c in columns_to_order if c not in low_card_rem
-            ]
+        num_starts = min(num_cols, max(1, int(num_cols * 0.2)))
+        start_candidates = sorted(columns, key=lambda c: entropies[c])[:num_starts]
 
-            low_card_rem.sort(key=lambda c: remaining_cols_nunique[c])
-            high_card_rem.sort(key=lambda c: remaining_cols_nunique[c])
+        for start_col in start_candidates:
+            perm = [start_col]
+            remaining = set(columns) - {start_col}
+            current_col = start_col
+            total_entropy = entropies[start_col]
+
+            while remaining:
+                next_col = min(remaining, key=lambda c: cond_entropies[current_col].get(c, float('inf')))
+                perm.append(next_col)
+                total_entropy += cond_entropies[current_col].get(next_col, float('inf'))
+                remaining.remove(next_col)
+                current_col = next_col
             
-            final_order.extend(low_card_rem)
-            final_order.extend(high_card_rem)
+            if total_entropy < min_total_entropy:
+                min_total_entropy = total_entropy
+                best_perm = perm
         
-        # Ensure all columns are included in the final order
-        if len(final_order) != len(df.columns):
-            current_cols = set(final_order)
-            missing_cols = [c for c in df.columns if c not in current_cols]
-            if missing_cols:
-                missing_cols_nunique = df[missing_cols].nunique()
-                missing_cols.sort(key=lambda c: missing_cols_nunique[c])
-                final_order.extend(missing_cols)
-        
-        return df[final_order]
+        return best_perm if best_perm else columns

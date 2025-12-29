@@ -6,116 +6,113 @@ from sky_spot.utils import ClusterType
 
 
 class Solution(MultiRegionStrategy):
-    """Your multi-region scheduling strategy."""
+    """Cant-Be-Late multi-region scheduling strategy."""
 
-    NAME = "my_strategy"  # REQUIRED: unique identifier
+    NAME = "cant_be_late_safe_strategy"
 
     def solve(self, spec_path: str) -> "Solution":
-        """
-        Initialize the solution from spec_path config.
-        """
+        """Initialize the solution from spec_path config."""
         with open(spec_path) as f:
             config = json.load(f)
 
+        # Basic required arguments for MultiRegionStrategy.
         args = Namespace(
             deadline_hours=float(config["deadline"]),
             task_duration_hours=[float(config["duration"])],
             restart_overhead_hours=[float(config["overhead"])],
             inter_task_overhead=[0.0],
         )
+
+        # Pass through any additional fields if present (e.g., trace_files),
+        # so MultiRegionStrategy can use them if it expects them.
+        for key in ("trace_files", "trace_dir"):
+            if key in config:
+                setattr(args, key, config[key])
+
         super().__init__(args)
 
-        # Cache scalar versions of core parameters for internal use
-        td = getattr(self, "task_duration", None)
-        if isinstance(td, (list, tuple)):
-            self._task_duration_total = float(td[0])
-        else:
-            self._task_duration_total = float(td)
-
-        dl = getattr(self, "deadline", None)
-        if isinstance(dl, (list, tuple)):
-            self._deadline_total = float(dl[0])
-        else:
-            self._deadline_total = float(dl)
-
-        ro = getattr(self, "restart_overhead", None)
-        if isinstance(ro, (list, tuple)):
-            self._restart_overhead = float(ro[0])
-        else:
-            self._restart_overhead = float(ro)
-
-        # Internal episode state
-        self._prev_elapsed = None
-        self._locked_to_on_demand = False
-        self._dt_max = None
-        self._spot_safety_offset = None
-        self._task_done_accum = 0.0
-        self._last_task_done_len = 0
+        # Internal bookkeeping (lazy-initialized in _step once env is ready).
+        self._initialized_internal = False
+        self._done_cache_len = 0
+        self._done_cache_sum = 0.0
+        self._safety_slack = None
+        self.force_on_demand = False
 
         return self
 
-    def _reset_episode_state(self) -> None:
-        """Reset internal state at the start of each new episode."""
-        self._locked_to_on_demand = False
-        self._task_done_accum = 0.0
-        self._last_task_done_len = 0
+    def _lazy_init_internal(self):
+        """Initialize internal state on first _step call."""
+        if self._initialized_internal:
+            return
+        self._initialized_internal = True
 
-        gap = getattr(self.env, "gap_seconds", 0.0) or 0.0
-        restart = self._restart_overhead
-        # Maximum wall-clock increase during one risky (non-OD-locked) step:
-        # baseline step + at most one restart_overhead.
-        self._dt_max = gap + restart
-        # Additional time we must reserve before deadline when taking a risky step:
-        # dt_max (time we may waste before we can react) + one restart_overhead
-        # for when we finally commit to ON_DEMAND.
-        self._spot_safety_offset = self._dt_max + restart
+        # Initialize cached progress.
+        self._done_cache_len = len(self.task_done_time)
+        self._done_cache_sum = float(sum(self.task_done_time)) if self.task_done_time else 0.0
+
+        # Safety slack: ensure enough extra time to pay for a final restart
+        # overhead plus a couple of time steps of discretization.
+        gap = float(getattr(self.env, "gap_seconds", 0.0))
+        self._safety_slack = float(self.restart_overhead) + 2.0 * gap
+
+        self.force_on_demand = False
+
+    def _update_done_cache(self):
+        """Efficiently maintain total work done using incremental sum."""
+        current_len = len(self.task_done_time)
+        if current_len > self._done_cache_len:
+            # Sum only new segments since last call.
+            new_segments = self.task_done_time[self._done_cache_len : current_len]
+            if new_segments:
+                self._done_cache_sum += float(sum(new_segments))
+            self._done_cache_len = current_len
 
     def _step(self, last_cluster_type: ClusterType, has_spot: bool) -> ClusterType:
         """
         Decide next action based on current state.
+
+        Returns: ClusterType.SPOT, ClusterType.ON_DEMAND, or ClusterType.NONE
         """
-        t = self.env.elapsed_seconds
+        # Ensure internal fields are ready (env is guaranteed to exist here).
+        self._lazy_init_internal()
 
-        # Detect new episode by elapsed_seconds reset
-        if self._prev_elapsed is None or t < self._prev_elapsed:
-            self._reset_episode_state()
-        self._prev_elapsed = t
+        # Update cached work-done total.
+        self._update_done_cache()
+        work_done = self._done_cache_sum
+        work_remaining = max(self.task_duration - work_done, 0.0)
 
-        # Incremental computation of total work done to avoid O(N^2) summations
-        segments = getattr(self, "task_done_time", [])
-        n = len(segments)
-        if n > self._last_task_done_len:
-            # Sum only the newly added segments
-            self._task_done_accum += sum(segments[self._last_task_done_len:n])
-            self._last_task_done_len = n
-        elif n < self._last_task_done_len:
-            # In case of unexpected shrink, recompute from scratch
-            self._task_done_accum = sum(segments)
-            self._last_task_done_len = n
-
-        work_done = self._task_done_accum
-        rem_work = self._task_duration_total - work_done
-
-        # If task is (numerically) complete, don't run more compute
-        if rem_work <= 0.0:
+        # If task already finished, avoid running anything further.
+        if work_remaining <= 0.0:
             return ClusterType.NONE
 
-        time_left = self._deadline_total - t
+        # Time left until deadline.
+        time_left = self.deadline - self.env.elapsed_seconds
 
-        # Decide whether to lock into ON_DEMAND to guarantee meeting deadline
-        if not self._locked_to_on_demand:
-            # Safe to continue using SPOT (or idling) for another step only if:
-            #   t + dt_max + restart_overhead + rem_work <= deadline
-            # => time_left >= rem_work + spot_safety_offset
-            if time_left < rem_work + self._spot_safety_offset:
-                self._locked_to_on_demand = True
+        # If somehow past deadline already, stop running to avoid extra cost.
+        if time_left <= 0.0:
+            return ClusterType.NONE
 
-        if self._locked_to_on_demand:
-            # From now until completion, always use ON_DEMAND to avoid further risk.
+        # Slack: extra time beyond what is strictly needed to finish remaining
+        # work assuming ideal uninterrupted run at full speed (1 sec work/sec).
+        slack = time_left - work_remaining
+
+        # Once we decide to go on-demand to guarantee completion, we never
+        # revert to spot to avoid further restart overheads or risk.
+        if self.force_on_demand:
             return ClusterType.ON_DEMAND
 
-        # Still in SPOT-preferred phase: use SPOT when available, otherwise pause.
+        # If slack is too small to safely pay for at least one full restart
+        # overhead (plus discretization margin), immediately commit to
+        # on-demand and stay there for the remainder of the job.
+        if slack <= self._safety_slack:
+            self.force_on_demand = True
+            return ClusterType.ON_DEMAND
+
+        # We are comfortably ahead of schedule: prefer Spot when available.
         if has_spot:
             return ClusterType.SPOT
-        else:
-            return ClusterType.NONE
+
+        # Spot not available and we still have ample slack: pause to save cost.
+        # This is safe because we only switch to on-demand once slack shrinks
+        # near the safety margin.
+        return ClusterType.NONE

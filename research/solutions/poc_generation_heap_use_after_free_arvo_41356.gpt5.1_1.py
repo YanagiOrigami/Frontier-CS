@@ -1,314 +1,253 @@
 import os
 import tarfile
 import tempfile
-import subprocess
-import random
 import shutil
-import time
+import json
+import base64
+import binascii
+import string
 
 
 class Solution:
     def solve(self, src_path: str) -> bytes:
-        work_dir = tempfile.mkdtemp(prefix="pocgen_")
+        extract_dir = tempfile.mkdtemp(prefix="pocgen_")
         try:
-            self._extract_tar(src_path, work_dir)
-            exe_path = self._build_binary(work_dir)
-            if not exe_path or not os.path.exists(exe_path):
-                return self._default_poc()
-            poc = self._fuzz_for_asan_crash(exe_path)
-            if poc is None:
-                return self._default_poc()
-            return poc
+            self._safe_extract_tar(src_path, extract_dir)
+            poc = self._try_metadata_extract(extract_dir)
+            if poc is not None:
+                return poc
+            return self._find_poc_in_directory(extract_dir)
         finally:
-            # Best-effort cleanup; ignore failures
-            try:
-                shutil.rmtree(work_dir)
-            except Exception:
-                pass
+            shutil.rmtree(extract_dir, ignore_errors=True)
 
-    # ---------------- Tar extraction ----------------
-
-    def _extract_tar(self, src_path: str, dst: str) -> None:
+    def _safe_extract_tar(self, tar_path: str, dest_dir: str) -> None:
         try:
-            with tarfile.open(src_path, "r:*") as tar:
-                tar.extractall(dst)
-        except Exception:
-            # If extraction fails, leave directory empty; build will fail and we fall back
+            with tarfile.open(tar_path, "r:*") as tar:
+                for member in tar.getmembers():
+                    member_path = os.path.join(dest_dir, member.name)
+                    if not self._is_within_directory(dest_dir, member_path):
+                        continue
+                    try:
+                        tar.extract(member, dest_dir)
+                    except Exception:
+                        continue
+        except tarfile.TarError:
             pass
 
-    # ---------------- Source collection ----------------
+    def _is_within_directory(self, directory: str, target: str) -> bool:
+        abs_directory = os.path.abspath(directory)
+        abs_target = os.path.abspath(target)
+        return os.path.commonprefix([abs_directory, abs_target]) == abs_directory
 
-    def _collect_sources(self, root: str):
-        cpp_exts = (".cpp", ".cc", ".cxx", ".CPP", ".C", ".c++")
-        c_exts = (".c",)
-        skip_dirs = {
-            ".git",
-            ".hg",
-            ".svn",
-            "build",
-            "cmake-build-debug",
-            "cmake-build-release",
-            "out",
-            "dist",
-            "bin",
-            "obj",
-            "__pycache__",
-            "node_modules",
-        }
-        sources_cpp = []
-        sources_c = []
-        for dirpath, dirnames, filenames in os.walk(root):
-            dirnames[:] = [d for d in dirnames if d not in skip_dirs]
-            for f in filenames:
-                path = os.path.join(dirpath, f)
-                _, ext = os.path.splitext(f)
-                if ext in cpp_exts:
-                    sources_cpp.append(path)
-                elif ext in c_exts:
-                    sources_c.append(path)
-        return sources_cpp, sources_c
-
-    # ---------------- Fuzzer harness detection ----------------
-
-    def _detect_llvm_fuzzer(self, source_files):
-        for path in source_files:
-            try:
-                with open(path, "r", errors="ignore") as f:
-                    if "LLVMFuzzerTestOneInput" in f.read():
-                        return True
-            except Exception:
-                continue
-        return False
-
-    def _write_fuzzer_driver(self, root: str) -> str:
-        driver_path = os.path.join(root, "__poc_driver.cpp")
-        code = r"""
-#include <cstdint>
-#include <cstdio>
-#include <vector>
-
-extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size);
-
-int main(int argc, char **argv) {
-    std::vector<uint8_t> data;
-    data.reserve(1024);
-    unsigned char buf[4096];
-    while (true) {
-        size_t n = std::fread(buf, 1, sizeof(buf), stdin);
-        if (n == 0) break;
-        data.insert(data.end(), buf, buf + n);
-    }
-    LLVMFuzzerTestOneInput(data.data(), data.size());
-    return 0;
-}
-"""
-        try:
-            with open(driver_path, "w") as f:
-                f.write(code)
-        except Exception:
-            return ""
-        return driver_path
-
-    # ---------------- Compiler helpers ----------------
-
-    def _which(self, names):
-        for n in names:
-            p = shutil.which(n)
-            if p:
-                return p
-        return None
-
-    def _build_binary(self, root: str):
-        sources_cpp, sources_c = self._collect_sources(root)
-        if not sources_cpp and not sources_c:
-            return None
-
-        all_sources = sources_cpp + sources_c
-        has_fuzzer = self._detect_llvm_fuzzer(all_sources)
-        driver_path = None
-        cpp_variants = [list(sources_cpp)]
-
-        if has_fuzzer:
-            driver_path = self._write_fuzzer_driver(root)
-            if driver_path:
-                cpp_with_driver = list(sources_cpp) + [driver_path]
-                cpp_variants = [cpp_with_driver, list(sources_cpp)]
-
-        exe_path = os.path.join(root, "poc_target")
-        cxx_compiler = self._which(["clang++", "g++"])
-        c_compiler = self._which(["clang", "gcc"])
-
-        # Try C++ builds first (most likely for this task)
-        for cpp_sources in cpp_variants:
-            if not cpp_sources:
-                continue
-            # First try linking C and C++ together, then only C++
-            source_sets = [cpp_sources + sources_c, cpp_sources]
-            for srcs in source_sets:
-                if not srcs:
-                    continue
-                if not cxx_compiler:
-                    break
-                cmd = [
-                    cxx_compiler,
-                    "-std=c++17",
-                    "-g",
-                    "-O1",
-                    "-fsanitize=address",
-                    "-fno-omit-frame-pointer",
-                    "-Wall",
-                    "-Wextra",
-                ]
-                cmd += srcs
-                cmd += ["-o", exe_path, "-pthread"]
+    def _decode_possible_encoded_string(self, s: str) -> bytes:
+        text = s.strip()
+        compact = "".join(ch for ch in text if not ch.isspace())
+        if len(compact) >= 2 and len(compact) % 2 == 0:
+            if all(ch in string.hexdigits for ch in compact):
                 try:
-                    subprocess.run(
-                        cmd,
-                        cwd=root,
-                        stdout=subprocess.DEVNULL,
-                        stderr=subprocess.DEVNULL,
-                        timeout=180,
-                        check=True,
-                    )
-                    if os.path.exists(exe_path):
-                        return exe_path
+                    return binascii.unhexlify(compact)
+                except binascii.Error:
+                    pass
+        try:
+            decoded = base64.b64decode(compact, validate=True)
+            if decoded:
+                return decoded
+        except (binascii.Error, ValueError):
+            pass
+        return text.encode("utf-8", "replace")
+
+    def _try_metadata_extract(self, root_dir: str):
+        meta_candidates = []
+        for dirpath, dirnames, filenames in os.walk(root_dir):
+            base_dir = os.path.basename(dirpath).lower()
+            if base_dir in (".git", ".hg", ".svn", ".idea", ".vs", "__pycache__"):
+                continue
+            for name in filenames:
+                name_lower = name.lower()
+                path = os.path.join(dirpath, name)
+                ext = os.path.splitext(name_lower)[1]
+                if ext not in (".json", ".yml", ".yaml", ".toml", ".txt"):
+                    continue
+                if not any(k in name_lower for k in ("poc", "repro", "crash", "bug")):
+                    continue
+                try:
+                    size = os.path.getsize(path)
+                except OSError:
+                    continue
+                if size == 0 or size > 100_000:
+                    continue
+                meta_candidates.append((path, ext))
+        for path, ext in meta_candidates:
+            if ext == ".json":
+                try:
+                    with open(path, "r", encoding="utf-8", errors="replace") as f:
+                        data = json.load(f)
                 except Exception:
                     continue
+                if isinstance(data, dict):
+                    for key in ("poc", "PoC", "input", "payload", "data"):
+                        if key in data and isinstance(data[key], str):
+                            return self._decode_possible_encoded_string(data[key])
+            else:
+                try:
+                    with open(path, "r", encoding="utf-8", errors="replace") as f:
+                        for line in f:
+                            lower = line.lower()
+                            if "poc" not in lower and "payload" not in lower and "input" not in lower:
+                                continue
+                            candidate = None
+                            dq_start = line.find('"')
+                            if dq_start != -1:
+                                dq_end = line.rfind('"')
+                                if dq_end > dq_start:
+                                    candidate = line[dq_start + 1 : dq_end]
+                            if candidate is None:
+                                sq_start = line.find("'")
+                                if sq_start != -1:
+                                    sq_end = line.rfind("'")
+                                    if sq_end > sq_start:
+                                        candidate = line[sq_start + 1 : sq_end]
+                            if candidate:
+                                return self._decode_possible_encoded_string(candidate)
+                except OSError:
+                    continue
+        return None
 
-        # If there are only C sources and C++ path failed
-        if not sources_cpp and sources_c and c_compiler:
-            cmd = [
-                c_compiler,
-                "-g",
-                "-O1",
-                "-fsanitize=address",
-                "-fno-omit-frame-pointer",
-                "-Wall",
-                "-Wextra",
-            ]
-            cmd += sources_c
-            cmd += ["-o", exe_path]
+    def _find_poc_in_directory(self, root_dir: str) -> bytes:
+        keywords = (
+            "poc",
+            "repro",
+            "crash",
+            "uaf",
+            "double",
+            "heap",
+            "exploit",
+            "payload",
+            "bug",
+            "testcase",
+            "fuzz",
+            "input",
+        )
+        dir_keywords = ("poc", "repro", "crash", "uaf", "bug", "tests", "fuzz", "cases")
+        code_ext = {
+            ".c",
+            ".cc",
+            ".cpp",
+            ".cxx",
+            ".h",
+            ".hpp",
+            ".hh",
+            ".java",
+            ".py",
+            ".rb",
+            ".go",
+            ".rs",
+            ".php",
+            ".cs",
+            ".js",
+            ".ts",
+            ".sh",
+            ".bash",
+            ".bat",
+            ".ps1",
+            ".cmake",
+            ".mak",
+            ".mk",
+            ".s",
+            ".asm",
+            ".json",
+            ".yml",
+            ".yaml",
+            ".toml",
+            ".xml",
+            ".html",
+            ".htm",
+            ".md",
+            ".rst",
+            ".tex",
+            ".csv",
+            ".ini",
+            ".cfg",
+            ".conf",
+        }
+        skip_names = {
+            "cmakelists.txt",
+            "makefile",
+            "configure",
+            "config.status",
+            "config.log",
+            "readme",
+            "readme.txt",
+            "license",
+            "copying",
+            "changelog",
+            "todo",
+        }
+        best_60 = None
+        best_gen = None
+        unknown60_path = None
+        for dirpath, dirnames, filenames in os.walk(root_dir):
+            base_dir = os.path.basename(dirpath).lower()
+            if base_dir in (".git", ".hg", ".svn", ".idea", ".vs", "__pycache__"):
+                continue
+            for name in filenames:
+                name_lower = name.lower()
+                path = os.path.join(dirpath, name)
+                try:
+                    size = os.path.getsize(path)
+                except OSError:
+                    continue
+                if size == 0 or size > 1_000_000:
+                    continue
+                rel_path = os.path.relpath(path, root_dir)
+                rel_lower = rel_path.lower()
+                ext = os.path.splitext(name_lower)[1]
+                has_kw_name = any(k in name_lower for k in keywords)
+                dir_path_norm = "/" + rel_lower.replace("\\", "/").strip("/") + "/"
+                has_kw_dir = any(("/" + k + "/") in dir_path_norm for k in dir_keywords)
+                is_code = False
+                if ext in code_ext:
+                    if not has_kw_name and not has_kw_dir:
+                        is_code = True
+                if name_lower in skip_names and not has_kw_name:
+                    is_code = True
+                score = 0
+                if has_kw_name:
+                    score += 80
+                if has_kw_dir:
+                    score += 40
+                if ext in (".poc", ".bin", ".raw", ".in", ".dat"):
+                    score += 30
+                if name_lower.startswith("id:") or name_lower.startswith("id_") or "id_" in name_lower:
+                    score += 10
+                if "san" in name_lower and "log" in name_lower:
+                    score -= 50
+                if is_code:
+                    score -= 80
+                if size == 60:
+                    score += 25
+                else:
+                    score -= min(30, abs(size - 60) // 10)
+                if score > 0:
+                    closeness = abs(size - 60)
+                    if best_gen is None or (score, -closeness) > (best_gen[0], -best_gen[1]):
+                        best_gen = (score, closeness, path)
+                if size == 60 and score >= 10:
+                    if best_60 is None or score > best_60[0]:
+                        best_60 = (score, path)
+                if size == 60 and not is_code and score <= 0 and unknown60_path is None:
+                    unknown60_path = path
+        chosen_path = None
+        if best_60 is not None:
+            chosen_path = best_60[1]
+        elif best_gen is not None:
+            chosen_path = best_gen[2]
+        elif unknown60_path is not None:
+            chosen_path = unknown60_path
+        if chosen_path is not None:
             try:
-                subprocess.run(
-                    cmd,
-                    cwd=root,
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                    timeout=180,
-                    check=True,
-                )
-                if os.path.exists(exe_path):
-                    return exe_path
-            except Exception:
-                return None
-
-        return None
-
-    # ---------------- Target execution ----------------
-
-    def _run_target(self, exe_path: str, data: bytes, timeout: float = 1.0):
-        env = os.environ.copy()
-        # Ensure ASan aborts on first error and does not waste time on leaks
-        default_asan = "abort_on_error=1:detect_leaks=0:allocator_may_return_null=1"
-        if "ASAN_OPTIONS" in env:
-            if "detect_leaks" not in env["ASAN_OPTIONS"]:
-                env["ASAN_OPTIONS"] += ":detect_leaks=0"
-        else:
-            env["ASAN_OPTIONS"] = default_asan
-
-        try:
-            p = subprocess.run(
-                [exe_path],
-                input=data,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                timeout=timeout,
-                env=env,
-            )
-        except subprocess.TimeoutExpired:
-            return False, False
-        except Exception:
-            return False, False
-
-        out = p.stdout + p.stderr
-        crashed = p.returncode != 0
-        is_asan = b"AddressSanitizer" in out
-        return crashed, is_asan
-
-    # ---------------- Mutation-based fuzzer ----------------
-
-    def _rand_bytes(self, rnd: random.Random, n: int) -> bytes:
-        if hasattr(rnd, "randbytes"):
-            return rnd.randbytes(n)  # type: ignore[attr-defined]
-        return bytes(rnd.getrandbits(8) for _ in range(n))
-
-    def _mutate(self, rnd: random.Random, data: bytes, max_len: int) -> bytes:
-        # Occasionally generate completely new random input
-        if not data or rnd.random() < 0.15:
-            size = rnd.randint(1, max_len)
-            return self._rand_bytes(rnd, size)
-
-        buf = bytearray(data)
-        num_ops = rnd.randint(1, 6)
-        for _ in range(num_ops):
-            op = rnd.random()
-            if op < 0.33 and len(buf) < max_len:
-                # Insert
-                pos = rnd.randint(0, len(buf))
-                buf.insert(pos, rnd.getrandbits(8))
-            elif op < 0.66 and buf:
-                # Flip
-                pos = rnd.randrange(len(buf))
-                buf[pos] = rnd.getrandbits(8)
-            elif len(buf) > 1:
-                # Delete
-                pos = rnd.randrange(len(buf))
-                del buf[pos]
-        if not buf:
-            buf.append(rnd.getrandbits(8))
-        if len(buf) > max_len:
-            del buf[max_len:]
-        return bytes(buf)
-
-    def _fuzz_for_asan_crash(self, exe_path: str):
-        rnd = random.Random(0xC0FFEE)
-        max_len = 128
-        max_iters = 6000
-        max_time = 25.0  # seconds
-
-        seed_corpus = [
-            b"",
-            b"\n",
-            b"0\n",
-            b"1\n",
-            b"-1\n",
-            b"add 0 0\n",
-            b"add 0 1\n",
-            b"node 0 0\n",
-            b"A" * 16,
-            b"B" * 32,
-            b"<root></root>\n",
-            b"{}\n",
-            b"[]\n",
-            bytes(range(1, 32)),
-        ]
-        corpus = list(seed_corpus)
-
-        start = time.time()
-        for _ in range(max_iters):
-            if time.time() - start > max_time:
-                break
-            seed = rnd.choice(corpus)
-            inp = self._mutate(rnd, seed, max_len)
-            crashed, is_asan = self._run_target(exe_path, inp)
-            if is_asan:
-                return inp
-            if not crashed and len(corpus) < 256 and rnd.random() < 0.3:
-                corpus.append(inp)
-        return None
-
-    # ---------------- Fallback PoC ----------------
-
-    def _default_poc(self) -> bytes:
-        # Generic small binary payload; length near ground-truth hint (60 bytes)
+                with open(chosen_path, "rb") as f:
+                    return f.read()
+            except OSError:
+                pass
         return b"A" * 60

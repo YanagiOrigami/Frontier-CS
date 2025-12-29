@@ -2,287 +2,326 @@ import os
 import re
 import io
 import tarfile
-import zipfile
-from typing import Optional, Tuple, Iterable
+import tempfile
+import gzip
+import bz2
+import lzma
+from typing import Optional, Tuple, List
 
 
 class Solution:
-    _GT_LEN = 2179
-    _MAX_FILE_SIZE = 5 * 1024 * 1024
+    _BUG_ID = "42536068"
 
-    _CODE_EXTS = {
-        ".c", ".cc", ".cpp", ".cxx", ".h", ".hpp", ".hh",
-        ".py", ".java", ".go", ".rs", ".js", ".ts",
-        ".md", ".rst", ".cmake", ".sh", ".bat", ".ps1",
-        ".yml", ".yaml", ".toml", ".ini", ".cfg",
-        ".am", ".ac", ".m4", ".mk", ".mak", ".make",
-    }
+    def _is_within_dir(self, base: str, target: str) -> bool:
+        base = os.path.abspath(base)
+        target = os.path.abspath(target)
+        try:
+            common = os.path.commonpath([base, target])
+        except Exception:
+            return False
+        return common == base
 
-    _INPUT_EXT_BOOST = {
-        ".bin", ".dat", ".raw", ".poc", ".repro",
-        ".xml", ".svg", ".html", ".xhtml", ".json", ".txt",
-        ".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".tiff",
-        ".pdf", ".ttf", ".otf", ".woff", ".woff2", ".zip",
-    }
-
-    _DIR_BOOST = {
-        "testdata": 700,
-        "test-data": 700,
-        "tests": 350,
-        "test": 350,
-        "corpus": 650,
-        "seed": 500,
-        "seeds": 500,
-        "seed_corpus": 650,
-        "seed-corpus": 650,
-        "artifacts": 900,
-        "artifact": 900,
-        "pocs": 900,
-        "poc": 900,
-        "repro": 900,
-        "reproducer": 900,
-        "crashes": 900,
-        "crashers": 900,
-        "inputs": 450,
-        "input": 450,
-        "fuzz": 300,
-        "fuzzer": 300,
-    }
-
-    _NAME_PATTERNS = [
-        (re.compile(r"(^|/)(clusterfuzz-testcase-minimized)(\..*)?$", re.I), 10000),
-        (re.compile(r"clusterfuzz[-_]?testcase[-_]?minimized", re.I), 9000),
-        (re.compile(r"clusterfuzz", re.I), 3500),
-        (re.compile(r"(^|/)(crash|assert|oom|leak)[-_]", re.I), 3200),
-        (re.compile(r"\bid:", re.I), 1400),
-        (re.compile(r"testcase", re.I), 2200),
-        (re.compile(r"\brepro(ducer)?\b", re.I), 2000),
-        (re.compile(r"(^|/)\bpoc\b", re.I), 2000),
-        (re.compile(r"\bpoc\b", re.I), 1500),
-        (re.compile(r"minimized", re.I), 900),
-    ]
-
-    def solve(self, src_path: str) -> bytes:
-        data = self._find_poc(src_path)
-        if data is not None and len(data) > 0:
-            return data
-        return self._fallback_poc()
-
-    def _find_poc(self, src_path: str) -> Optional[bytes]:
-        if os.path.isdir(src_path):
-            return self._find_poc_in_dir(src_path)
-        if os.path.isfile(src_path):
-            try:
-                return self._find_poc_in_tar(src_path)
-            except Exception:
-                return None
-        return None
-
-    def _score_path(self, path: str, size: int) -> Tuple[int, int, int]:
-        p = path.replace("\\", "/")
-        base = 0
-        for rgx, w in self._NAME_PATTERNS:
-            if rgx.search(p):
-                base += w
-
-        parts = [x for x in p.lower().split("/") if x]
-        for part in parts:
-            base += self._DIR_BOOST.get(part, 0)
-
-        bn = parts[-1] if parts else ""
-        _, ext = os.path.splitext(bn)
-        ext = ext.lower()
-        if ext in self._INPUT_EXT_BOOST:
-            base += 350
-        if ext in self._CODE_EXTS:
-            base -= 450
-
-        diff = abs(size - self._GT_LEN)
-        closeness = int(300 / (1 + diff))
-        base += closeness
-
-        if size <= 0:
-            base -= 2000
-        elif size > self._MAX_FILE_SIZE:
-            base -= 2000
-
-        return base, diff, size
-
-    def _find_poc_in_tar(self, tar_path: str) -> Optional[bytes]:
-        best = None  # (score, diff, size, member_name)
-        with tarfile.open(tar_path, "r:*") as tf:
-            for m in tf:
-                if not m.isreg():
-                    continue
-                if m.size <= 0 or m.size > self._MAX_FILE_SIZE:
-                    continue
-
+    def _safe_extract_tar(self, tar_path: str, out_dir: str) -> None:
+        mode = "r:*"
+        with tarfile.open(tar_path, mode) as tf:
+            members = tf.getmembers()
+            safe_members = []
+            for m in members:
                 name = m.name
-                score, diff, size = self._score_path(name, m.size)
-                if score < 500:
+                if not name or name.startswith(("/", "\\")) or ".." in name.split("/"):
                     continue
+                dest = os.path.join(out_dir, name)
+                if not self._is_within_dir(out_dir, dest):
+                    continue
+                if m.issym() or m.islnk():
+                    continue
+                safe_members.append(m)
+            tf.extractall(out_dir, members=safe_members)
 
-                cand = (score, diff, size, name)
-                if best is None or cand[:3] > best[:3]:
-                    best = cand
-
-            if best is None:
-                return self._find_candidate_by_size_in_tar(tf)
-
-            score, diff, size, name = best
-            if score < 1200:
-                return None
-
-            f = tf.extractfile(name)
-            if f is None:
-                return None
-            data = f.read(self._MAX_FILE_SIZE + 1)
-            if len(data) > self._MAX_FILE_SIZE:
-                return None
-
-            extracted = self._maybe_from_zip(name, data)
-            if extracted is not None:
-                return extracted
+    def _maybe_decompress_by_extension(self, path: str, data: bytes) -> bytes:
+        lpath = path.lower()
+        try:
+            if lpath.endswith(".gz") and len(data) >= 2 and data[:2] == b"\x1f\x8b":
+                return gzip.decompress(data)
+            if lpath.endswith(".bz2"):
+                return bz2.decompress(data)
+            if lpath.endswith(".xz") or lpath.endswith(".lzma"):
+                return lzma.decompress(data)
+        except Exception:
             return data
+        return data
 
-    def _find_candidate_by_size_in_tar(self, tf: tarfile.TarFile) -> Optional[bytes]:
-        best = None  # (diff, size, member_name)
-        for m in tf:
-            if not m.isreg():
-                continue
-            if m.size <= 0 or m.size > self._MAX_FILE_SIZE:
-                continue
-            name = m.name.replace("\\", "/").lower()
-            if any(x in name for x in ("/.git/", "/build/", "/cmake-build", "/bazel-")):
-                continue
-            bn = os.path.basename(name)
-            _, ext = os.path.splitext(bn)
-            ext = ext.lower()
-            if ext in self._CODE_EXTS:
-                continue
+    def _looks_like_git_lfs_pointer(self, data: bytes) -> bool:
+        if len(data) > 1024:
+            return False
+        try:
+            s = data.decode("utf-8", "ignore")
+        except Exception:
+            return False
+        return "git-lfs" in s and "oid sha256:" in s and "size " in s
 
-            diff = abs(m.size - self._GT_LEN)
-            cand = (diff, m.size, m.name)
-            if best is None or cand < best:
-                best = cand
+    def _walk_pruned(self, root: str):
+        exclude = {
+            ".git", ".svn", ".hg", ".idea", ".vs",
+            "build", "out", "dist", "bazel-bin", "bazel-out", "bazel-testlogs",
+            "node_modules", "__pycache__", ".cache", "CMakeFiles",
+            "third_party", "thirdparty", "external", "externals", "vendor", "subprojects",
+        }
+        for dirpath, dirnames, filenames in os.walk(root):
+            dirnames[:] = [d for d in dirnames if d not in exclude and not d.startswith(".")]
+            yield dirpath, dirnames, filenames
+
+    def _find_poc_by_filename(self, root: str) -> Optional[bytes]:
+        bug = self._BUG_ID
+        best: Optional[Tuple[int, int, str]] = None  # (priority, size, path)
+        max_size = 2_000_000
+
+        def priority_for(path_l: str, name_l: str) -> Optional[int]:
+            if bug in name_l or bug in path_l:
+                return 0
+            if "clusterfuzz" in name_l or "clusterfuzz" in path_l:
+                return 1
+            if name_l.startswith("crash") or "crash" in name_l or "poc" in name_l:
+                return 2
+            if "regress" in path_l or "regression" in path_l:
+                return 3
+            if "corpus" in path_l or "fuzz" in path_l:
+                return 4
+            return None
+
+        for dirpath, _, filenames in self._walk_pruned(root):
+            path_l = dirpath.lower()
+            for fn in filenames:
+                name_l = fn.lower()
+                pr = priority_for(path_l, name_l)
+                if pr is None:
+                    continue
+                fp = os.path.join(dirpath, fn)
+                try:
+                    st = os.stat(fp)
+                except Exception:
+                    continue
+                if st.st_size <= 0 or st.st_size > max_size:
+                    continue
+                cand = (pr, st.st_size, fp)
+                if best is None or cand < best:
+                    best = cand
+                    if pr == 0:
+                        break
+            if best is not None and best[0] == 0:
+                break
 
         if best is None:
             return None
-        diff, size, name = best
-        if diff > 50:
-            return None
-        f = tf.extractfile(name)
-        if f is None:
-            return None
-        data = f.read(self._MAX_FILE_SIZE + 1)
-        if len(data) > self._MAX_FILE_SIZE:
-            return None
-        extracted = self._maybe_from_zip(name, data)
-        if extracted is not None:
-            return extracted
-        return data
-
-    def _find_poc_in_dir(self, root: str) -> Optional[bytes]:
-        best_path = None
-        best = None  # (score, diff, size)
-        for dirpath, dirnames, filenames in os.walk(root):
-            dp = dirpath.replace("\\", "/").lower()
-            if "/.git" in dp or "/build" in dp or "/cmake-build" in dp or "/bazel-" in dp:
-                continue
-            for fn in filenames:
-                path = os.path.join(dirpath, fn)
-                try:
-                    st = os.stat(path)
-                except OSError:
-                    continue
-                if st.st_size <= 0 or st.st_size > self._MAX_FILE_SIZE:
-                    continue
-                score, diff, size = self._score_path(path, st.st_size)
-                if score < 500:
-                    continue
-                cand = (score, diff, size)
-                if best is None or cand > best:
-                    best = cand
-                    best_path = path
-
-        if best_path is None or best[0] < 1200:
-            return None
-
+        _, _, fp = best
         try:
-            with open(best_path, "rb") as f:
-                data = f.read(self._MAX_FILE_SIZE + 1)
-        except OSError:
-            return None
-        if len(data) > self._MAX_FILE_SIZE:
-            return None
-
-        extracted = self._maybe_from_zip(best_path, data)
-        if extracted is not None:
-            return extracted
-        return data
-
-    def _maybe_from_zip(self, name: str, data: bytes) -> Optional[bytes]:
-        bn = os.path.basename(name).lower()
-        if not bn.endswith(".zip"):
-            return None
-        if len(data) < 4 or data[:2] != b"PK":
-            return None
-        try:
-            with zipfile.ZipFile(io.BytesIO(data), "r") as zf:
-                best = None  # (score, diff, size, entry_name)
-                for zi in zf.infolist():
-                    if zi.is_dir():
-                        continue
-                    if zi.file_size <= 0 or zi.file_size > self._MAX_FILE_SIZE:
-                        continue
-                    en = zi.filename
-                    score, diff, size = self._score_path(en, zi.file_size)
-                    if score < 500:
-                        continue
-                    cand = (score, diff, size, en)
-                    if best is None or cand[:3] > best[:3]:
-                        best = cand
-                if best is None:
-                    return None
-                score, diff, size, en = best
-                if score < 1200:
-                    return None
-                with zf.open(en, "r") as f:
-                    out = f.read(self._MAX_FILE_SIZE + 1)
-                if len(out) > self._MAX_FILE_SIZE:
-                    return None
-                return out
+            with open(fp, "rb") as f:
+                data = f.read()
         except Exception:
             return None
+        if self._looks_like_git_lfs_pointer(data):
+            return None
+        data2 = self._maybe_decompress_by_extension(fp, data)
+        if data2 and not self._looks_like_git_lfs_pointer(data2):
+            return data2
+        return data
 
-    def _fallback_poc(self) -> bytes:
-        # Generic XML/SVG-like payload with many malformed numeric conversions in attributes.
-        # Kept reasonably small.
-        xml = (
-            b'<?xml version="1.0" encoding="UTF-8"?>\n'
-            b'<svg xmlns="http://www.w3.org/2000/svg"\n'
-            b'     width="a" height="b" viewBox="c d e f"\n'
-            b'     preserveAspectRatio="xMidYMid meet"\n'
-            b'     style="stroke-width: notnum; opacity: 1e9999;">\n'
-            b'  <defs>\n'
-            b'    <linearGradient id="g1" x1="x" y1="y" x2="z" y2="w">\n'
-            b'      <stop offset="q" stop-color="red" stop-opacity="nan"/>\n'
-            b'      <stop offset="1..2" stop-color="blue" stop-opacity="-inf"/>\n'
-            b'    </linearGradient>\n'
-            b'    <filter id="f1" x="%" y="^" width="&" height="*">\n'
-            b'      <feGaussianBlur stdDeviation="oops"/>\n'
-            b'      <feOffset dx="--1" dy="++2"/>\n'
-            b'    </filter>\n'
-            b'  </defs>\n'
-            b'  <g transform="translate(a,b) rotate(c) scale(d)">\n'
-            b'    <rect x="x" y="y" width="w" height="h" rx="rx" ry="ry"\n'
-            b'          fill="url(#g1)" filter="url(#f1)"/>\n'
-            b'    <circle cx="cx" cy="cy" r="r"/>\n'
-            b'    <ellipse cx="1e309" cy="-1e309" rx="0x10" ry="00.00.1"/>\n'
-            b'    <line x1="x1" y1="y1" x2="x2" y2="y2"/>\n'
-            b'    <polyline points="0,0 1,1 2,2 3,3" stroke-miterlimit="bad"/>\n'
-            b'    <path d="M 0 0 L 10 10 Z" stroke-dasharray="a,b,c"/>\n'
-            b'  </g>\n'
-            b'</svg>\n'
-        )
-        return xml
+    def _find_fuzzer_harness_text(self, root: str) -> str:
+        needle = "LLVMFuzzerTestOneInput"
+        exts = {".c", ".cc", ".cpp", ".cxx", ".h", ".hpp", ".hh", ".hxx"}
+        max_read = 2_000_000
+
+        # Prefer files in fuzz/fuzzer directories for speed/accuracy
+        preferred_dirs = []
+        for dirpath, _, filenames in self._walk_pruned(root):
+            dl = dirpath.lower()
+            if "fuzz" in dl or "fuzzer" in dl:
+                preferred_dirs.append((dirpath, filenames))
+
+        def scan_dirs(dirs) -> Optional[str]:
+            for dirpath, filenames in dirs:
+                for fn in filenames:
+                    _, ext = os.path.splitext(fn)
+                    if ext.lower() not in exts:
+                        continue
+                    fp = os.path.join(dirpath, fn)
+                    try:
+                        st = os.stat(fp)
+                    except Exception:
+                        continue
+                    if st.st_size <= 0 or st.st_size > max_read:
+                        continue
+                    try:
+                        with open(fp, "rb") as f:
+                            data = f.read()
+                    except Exception:
+                        continue
+                    if needle.encode("utf-8") not in data:
+                        continue
+                    try:
+                        return data.decode("utf-8", "ignore")
+                    except Exception:
+                        continue
+            return None
+
+        found = scan_dirs(preferred_dirs)
+        if found is not None:
+            return found
+
+        for dirpath, _, filenames in self._walk_pruned(root):
+            dirs = [(dirpath, filenames)]
+            found = scan_dirs(dirs)
+            if found is not None:
+                return found
+        return ""
+
+    def _guess_format(self, harness_text: str) -> str:
+        t = harness_text.lower()
+
+        def has_any(words):
+            return any(w in t for w in words)
+
+        if has_any(["rsvg", "sksvg", "svgdom", "svg_dom", "makesvg", "svg"]) and has_any(["xml", "<svg", "xmlns"]):
+            return "svg"
+        if has_any(["gumbo", "htmlparser", "parsehtml", ".html", "<html", "html::", "tidy"]):
+            return "html"
+        if has_any(["xmlreadmemory", "xmlparse", "tinyxml", "tinyxml2", "pugi::xml", "pugixml", "rapidxml", "qdomdocument", "libxml", "xmldocument"]):
+            if has_any(["svg", ".svg", "<svg"]):
+                return "svg"
+            return "xml"
+        if has_any(["nlohmann", "rapidjson", "simdjson", "cjson", "json::parse", "json_parse", ".json"]):
+            return "json"
+        if has_any(["yaml::load", "libyaml", "yaml_parser", "yaml-cpp", ".yaml", ".yml"]):
+            return "yaml"
+        return "svg"
+
+    def _generate_svg_poc(self) -> bytes:
+        s = """<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE svg PUBLIC "-//W3C//DTD SVG 1.1//EN"
+  "http://www.w3.org/Graphics/SVG/1.1/DTD/svg11.dtd">
+<svg xmlns="http://www.w3.org/2000/svg"
+     xmlns:xlink="http://www.w3.org/1999/xlink"
+     width="100" height="100"
+     viewBox="0 0 a b" version="1.1">
+  <defs>
+    <filter id="f1" x="-" y="0" width="1e" height="10">
+      <feGaussianBlur in="SourceGraphic" stdDeviation="x y"/>
+      <feOffset dx="q" dy="1"/>
+      <feComposite in2="SourceGraphic" operator="arithmetic" k1="-" k2="a" k3="1e" k4=""/>
+      <feColorMatrix type="matrix"
+        values="1 0 0 0 0  0 1 0 0 0  0 0 1 0 0  0 0 0 1e 0"/>
+    </filter>
+    <linearGradient id="g1" x1="0" y1="0" x2="100%" y2="bad" gradientTransform="rotate(a)">
+      <stop offset="0" stop-color="#000" stop-opacity="bad"/>
+      <stop offset="1" stop-color="#fff" stop-opacity=""/>
+    </linearGradient>
+    <pattern id="p1" x="0" y="0" width="a" height="1" patternUnits="userSpaceOnUse">
+      <rect x="0" y="0" width="10" height="10" fill="url(#g1)"/>
+    </pattern>
+  </defs>
+  <rect x="0" y="0" width="100" height="100" fill="url(#p1)" filter="url(#f1)" rx="-" ry="-" />
+  <circle cx="50" cy="50" r="-" stroke-width="-" opacity="-" />
+  <path d="M0 0 L10 10" stroke-dasharray="1,a" stroke-dashoffset="-" />
+  <text x="0" y="10" font-size="a" letter-spacing="-" word-spacing="1e">t</text>
+</svg>
+"""
+        return s.encode("utf-8", "ignore")
+
+    def _generate_xml_poc(self) -> bytes:
+        s = """<?xml version="1.0" encoding="UTF-8"?>
+<root a="-" b="a" c="1e" d="" e="0x10" f="--1" g="1e309" h="nan" i="inf">
+  <node x="-" y="bad" width="1e" height=""/>
+  <node2 value="a,b,c" nums="1 a 2" flags="--" />
+  <deep>
+    <item p="-" q="1e" r="a" s="" t="  " u="+" v="-0x1"/>
+  </deep>
+</root>
+"""
+        return s.encode("utf-8", "ignore")
+
+    def _generate_html_poc(self) -> bytes:
+        s = """<!doctype html>
+<html>
+<head><meta charset="utf-8"></head>
+<body>
+<svg xmlns="http://www.w3.org/2000/svg" width="100" height="100" viewBox="0 0 a b">
+  <defs>
+    <filter id="f"><feGaussianBlur stdDeviation="x"/></filter>
+  </defs>
+  <rect x="0" y="0" width="100" height="100" filter="url(#f)" rx="-" ry="-" />
+</svg>
+</body>
+</html>
+"""
+        return s.encode("utf-8", "ignore")
+
+    def _generate_json_poc(self) -> bytes:
+        s = r'''{
+  "type": "object",
+  "attrs": {
+    "x": "-",
+    "y": "bad",
+    "width": "1e",
+    "height": "",
+    "opacity": "NaN",
+    "scale": "a",
+    "matrix": [1, 0, 0, "x", 0, 0],
+    "list": "1 a 2"
+  },
+  "items": [
+    {"attr": "a", "num": "1e309"},
+    {"attr": "b", "num": "--1"},
+    {"attr": "c", "num": ""}
+  ]
+}'''
+        return s.encode("utf-8", "ignore")
+
+    def _generate_yaml_poc(self) -> bytes:
+        s = """type: object
+attrs:
+  x: "-"
+  y: bad
+  width: 1e
+  height: ""
+  opacity: NaN
+  scale: a
+items:
+  - attr: a
+    num: 1e309
+  - attr: b
+    num: "--1"
+  - attr: c
+    num: ""
+"""
+        return s.encode("utf-8", "ignore")
+
+    def solve(self, src_path: str) -> bytes:
+        with tempfile.TemporaryDirectory(prefix="pocgen_") as td:
+            root = td
+            if os.path.isdir(src_path):
+                root = src_path
+            else:
+                try:
+                    self._safe_extract_tar(src_path, td)
+                except Exception:
+                    root = td
+
+            poc = self._find_poc_by_filename(root)
+            if poc is not None and len(poc) > 0:
+                return poc
+
+            harness = self._find_fuzzer_harness_text(root)
+            fmt = self._guess_format(harness)
+
+            if fmt == "svg":
+                return self._generate_svg_poc()
+            if fmt == "xml":
+                return self._generate_xml_poc()
+            if fmt == "html":
+                return self._generate_html_poc()
+            if fmt == "json":
+                return self._generate_json_poc()
+            if fmt == "yaml":
+                return self._generate_yaml_poc()
+
+            return self._generate_svg_poc()

@@ -1,31 +1,35 @@
 class Solution:
     def solve(self, src_path: str) -> bytes:
         """
-        Generate a PoC that triggers the vulnerability.
+        Generates a PoC input that triggers a Heap Use After Free vulnerability
+        in libsepol/cil.
 
-        Args:
-            src_path: Path to the vulnerable source code tarball
+        The vulnerability is a double free that occurs during the destruction of the
+        CIL Abstract Syntax Tree (AST). It can be triggered by creating a specific
+        structure in the CIL policy:
 
-        Returns:
-            bytes: The PoC input that should trigger the vulnerability
+        1.  An anonymous `classpermission` is created. This happens when a
+            `classpermission` is used directly in an expression without being
+            assigned a name, e.g., `(file (read))`.
+
+        2.  This anonymous `classpermission` is passed as an argument to a macro.
+
+        3.  The macro uses this argument to define a `classpermissionset`. The
+            `classpermissionset` stores a pointer to the `classpermission` object.
+
+        During AST destruction, two separate cleanup processes lead to the double
+        free:
+        - First, a general cleanup function frees all anonymous AST nodes, including
+          the `classpermission` created in step 1.
+        - Later, the `classpermissionset` defined in the macro is destroyed. Its
+          destructor iterates through its members and frees them, attempting to
+          free the same `classpermission` object a second time.
+
+        This PoC constructs the minimal CIL code to create this scenario.
         """
-        # The vulnerability is a double-free caused by mishandling of an anonymous
-        # classpermission passed through a macro to a classpermissionset rule.
-        #
-        # PoC structure:
-        # 1. (class c): Define a class.
-        # 2. (permission p): Define a permission.
-        # 3. (macro m((classpermission cp))(classpermissionset x(c cp))):
-        #    Define a macro 'm' that takes a classpermission 'cp' and uses it
-        #    to create a classpermissionset 'x'.
-        # 4. (call m((p))): Call the macro with an anonymous classpermission '(p)'.
-        #    This creates a temporary object for '(p)' which is then freed twice:
-        #    once by the macro context and once by the classpermissionset destructor.
-        
         poc = (
-            b"(class c)"
-            b"(permission p)"
-            b"(macro m((classpermission cp))(classpermissionset x(c cp)))"
-            b"(call m((p)))"
+            b"(class c (p)) "
+            b"(macro m ((classpermission cp)) (classpermissionset s (cp))) "
+            b"(call m ((cp (c (p)))))"
         )
         return poc

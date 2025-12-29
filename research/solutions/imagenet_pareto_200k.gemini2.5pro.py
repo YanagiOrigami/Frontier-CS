@@ -3,54 +3,34 @@ import torch.nn as nn
 import torch.optim as optim
 import copy
 
-# Define model architecture outside the Solution class for clarity
-class ResBlock(nn.Module):
-    """A residual block for an MLP with a bottleneck design."""
-    def __init__(self, dim, bottleneck_dim, dropout=0.25):
-        super().__init__()
-        self.block = nn.Sequential(
-            nn.Linear(dim, bottleneck_dim),
-            nn.BatchNorm1d(bottleneck_dim),
-            nn.GELU(),
-            nn.Dropout(p=dropout),
-            nn.Linear(bottleneck_dim, dim),
-            nn.BatchNorm1d(dim),
-        )
-        self.activation = nn.GELU()
-        self.dropout = nn.Dropout(p=dropout)
-
-    def forward(self, x):
-        identity = x
-        out = self.block(x)
-        out = out + identity
-        out = self.activation(out)
-        out = self.dropout(out)
-        return out
-
-class ParetoMLP(nn.Module):
+class ParetopNet(nn.Module):
     """
-    An MLP designed to maximize accuracy under a 200K parameter constraint.
-    It uses a residual block with a bottleneck design for parameter efficiency and depth.
-    - Parameter count is ~198,656.
+    A custom MLP architecture designed to maximize parameter usage under the 200,000 limit.
+    Architecture: 384 -> 319 -> 169 -> 128
+    Total parameters: 199,631
     """
-    def __init__(self, input_dim, num_classes, hidden_dim=256, bottleneck_dim=128, dropout=0.25):
-        super().__init__()
-        self.net = nn.Sequential(
-            # Input projection layer
-            nn.Linear(input_dim, hidden_dim),
-            nn.BatchNorm1d(hidden_dim),
-            nn.GELU(),
-            nn.Dropout(p=dropout),
+    def __init__(self, input_dim: int, num_classes: int, dropout_rate: float = 0.4):
+        super(ParetopNet, self).__init__()
+        
+        h1 = 319
+        h2 = 169
+        
+        self.network = nn.Sequential(
+            nn.Linear(input_dim, h1),
+            nn.BatchNorm1d(h1),
+            nn.ReLU(inplace=True),
+            nn.Dropout(p=dropout_rate),
             
-            # Residual block
-            ResBlock(hidden_dim, bottleneck_dim, dropout),
+            nn.Linear(h1, h2),
+            nn.BatchNorm1d(h2),
+            nn.ReLU(inplace=True),
+            nn.Dropout(p=dropout_rate),
             
-            # Output classifier head
-            nn.Linear(hidden_dim, num_classes)
+            nn.Linear(h2, num_classes)
         )
 
-    def forward(self, x):
-        return self.net(x)
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.network(x)
 
 class Solution:
     def solve(self, train_loader, val_loader, metadata: dict = None) -> torch.nn.Module:
@@ -60,15 +40,7 @@ class Solution:
         Args:
             train_loader: PyTorch DataLoader with training data
             val_loader: PyTorch DataLoader with validation data
-            metadata: Dict with keys:
-                - num_classes: int (128)
-                - input_dim: int (384)
-                - param_limit: int (200,000)
-                - baseline_accuracy: float (0.65)
-                - train_samples: int
-                - val_samples: int
-                - test_samples: int
-                - device: str ("cpu")
+            metadata: Dict with problem-specific information
         
         Returns:
             Trained torch.nn.Module ready for evaluation
@@ -77,46 +49,34 @@ class Solution:
         input_dim = metadata["input_dim"]
         num_classes = metadata["num_classes"]
 
-        # Instantiate the model
-        model = ParetoMLP(
-            input_dim=input_dim,
-            num_classes=num_classes,
-            hidden_dim=256,
-            bottleneck_dim=128,
-            dropout=0.25
-        ).to(device)
-        
-        # Hyperparameters tuned for this problem
-        EPOCHS = 400
-        MAX_LR = 2e-3
-        WEIGHT_DECAY = 1.5e-2
+        model = ParetopNet(input_dim=input_dim, num_classes=num_classes).to(device)
+
+        # Hyperparameters chosen for robust training on a small dataset
+        N_EPOCHS = 250
+        LEARNING_RATE = 3e-4
+        WEIGHT_DECAY = 1e-2
         LABEL_SMOOTHING = 0.1
+        PATIENCE = 35  # For early stopping
 
-        # Setup for training: Loss, Optimizer, Scheduler
+        optimizer = optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
         criterion = nn.CrossEntropyLoss(label_smoothing=LABEL_SMOOTHING)
-        optimizer = optim.AdamW(model.parameters(), lr=MAX_LR, weight_decay=WEIGHT_DECAY)
-        
-        total_steps = len(train_loader) * EPOCHS
-        scheduler = optim.lr_scheduler.OneCycleLR(optimizer, max_lr=MAX_LR, total_steps=total_steps)
+        scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=N_EPOCHS, eta_min=1e-6)
 
-        best_val_accuracy = 0.0
+        best_val_acc = 0.0
         best_model_state = None
+        epochs_no_improve = 0
 
-        # Main training loop
-        for epoch in range(EPOCHS):
+        for epoch in range(N_EPOCHS):
             # Training phase
             model.train()
             for inputs, targets in train_loader:
                 inputs, targets = inputs.to(device), targets.to(device)
-
-                optimizer.zero_grad(set_to_none=True)
                 
+                optimizer.zero_grad()
                 outputs = model(inputs)
                 loss = criterion(outputs, targets)
-                
                 loss.backward()
                 optimizer.step()
-                scheduler.step()
 
             # Validation phase
             model.eval()
@@ -130,17 +90,23 @@ class Solution:
                     total += targets.size(0)
                     correct += (predicted == targets).sum().item()
             
-            current_val_accuracy = correct / total
-            
-            # Save the model with the best validation accuracy
-            if current_val_accuracy > best_val_accuracy:
-                best_val_accuracy = current_val_accuracy
-                # Use deepcopy to ensure the state is fully saved at this point
-                best_model_state = copy.deepcopy(model.state_dict())
+            val_acc = correct / total
 
-        # Load the best model state before returning
+            scheduler.step()
+
+            # Early stopping logic: save the best model and stop if no improvement
+            if val_acc > best_val_acc:
+                best_val_acc = val_acc
+                best_model_state = copy.deepcopy(model.state_dict())
+                epochs_no_improve = 0
+            else:
+                epochs_no_improve += 1
+                if epochs_no_improve >= PATIENCE:
+                    break
+        
+        # Load the best performing model state
         if best_model_state:
             model.load_state_dict(best_model_state)
-        
-        model.eval()
-        return model
+            
+        # Ensure the final model is on CPU for the evaluation environment
+        return model.to("cpu")

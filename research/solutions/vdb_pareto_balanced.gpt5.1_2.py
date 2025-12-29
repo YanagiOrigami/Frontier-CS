@@ -1,57 +1,70 @@
+import os
+from typing import Tuple
+
 import numpy as np
 import faiss
-from typing import Tuple
 
 
 class YourIndexClass:
     def __init__(self, dim: int, **kwargs):
         """
-        HNSW-based index optimized for high recall under latency constraints.
-        Parameters (with defaults chosen for SIFT1M):
-            M: HNSW connectivity (default 32)
-            ef_construction: construction exploration factor (default 200)
-            ef_search: search exploration factor (default 800)
-            num_threads: optional, number of FAISS threads
+        Initialize an HNSW index optimized for high recall under latency constraints.
         """
-        self.dim = dim
+        self.dim = int(dim)
 
-        M = int(kwargs.get("M", 32))
-        ef_construction = int(kwargs.get("ef_construction", 200))
-        self.ef_search = int(kwargs.get("ef_search", 800))
+        # HNSW hyperparameters with sensible high-recall defaults
+        self.M = int(kwargs.get("M", 16))
+        self.ef_construction = int(kwargs.get("ef_construction", 200))
+        self.ef_search = int(kwargs.get("ef_search", 256))
 
-        # Optional: control FAISS threading if requested
-        num_threads = kwargs.get("num_threads", None)
-        if num_threads is not None:
+        # Threads for Faiss (use all available cores by default)
+        n_threads = kwargs.get("n_threads", None)
+        if n_threads is None:
             try:
-                faiss.omp_set_num_threads(int(num_threads))
+                n_threads = os.cpu_count() or 1
             except Exception:
-                pass
+                n_threads = 1
+        n_threads = int(max(1, n_threads))
+        faiss.omp_set_num_threads(n_threads)
 
-        # Create HNSW index with L2 metric
-        self.index = faiss.IndexHNSWFlat(dim, M)
-        self.index.hnsw.efConstruction = ef_construction
-        # efSearch will be set before each search call
+        # Create HNSW index (L2 metric by default)
+        self.index = faiss.IndexHNSWFlat(self.dim, self.M)
+        self.index.hnsw.efConstruction = self.ef_construction
+        self.index.hnsw.efSearch = self.ef_search
 
     def add(self, xb: np.ndarray) -> None:
+        """
+        Add base vectors to the index. Can be called multiple times.
+        """
         if xb is None:
             return
 
         xb = np.asarray(xb, dtype=np.float32)
         if xb.ndim != 2 or xb.shape[1] != self.dim:
-            xb = xb.reshape(-1, self.dim)
+            raise ValueError(f"xb must have shape (N, {self.dim}), got {xb.shape}")
 
-        xb = np.ascontiguousarray(xb, dtype=np.float32)
+        xb = np.ascontiguousarray(xb)
         self.index.add(xb)
 
     def search(self, xq: np.ndarray, k: int) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        Search for k nearest neighbors for each query vector.
+        """
         xq = np.asarray(xq, dtype=np.float32)
         if xq.ndim != 2 or xq.shape[1] != self.dim:
-            xq = xq.reshape(-1, self.dim)
+            raise ValueError(f"xq must have shape (nq, {self.dim}), got {xq.shape}")
 
-        xq = np.ascontiguousarray(xq, dtype=np.float32)
+        xq = np.ascontiguousarray(xq)
 
-        # Ensure efSearch is set appropriately (can be adjusted per-call if desired)
-        self.index.hnsw.efSearch = max(self.ef_search, k)
+        # Ensure efSearch is set (allows user to modify between calls if desired)
+        self.index.hnsw.efSearch = self.ef_search
 
-        D, I = self.index.search(xq, k)
-        return D, I
+        distances, indices = self.index.search(xq, int(k))
+
+        # Ensure correct dtypes
+        if distances.dtype != np.float32:
+            distances = distances.astype(np.float32, copy=False)
+        if indices.dtype != np.int64:
+            indices = indices.astype(np.int64, copy=False)
+
+        return distances, indices

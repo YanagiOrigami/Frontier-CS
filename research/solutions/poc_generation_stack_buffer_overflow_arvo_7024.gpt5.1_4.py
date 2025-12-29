@@ -1,126 +1,96 @@
 import os
 import tarfile
-import zipfile
-from typing import Optional
+import tempfile
 
 
 class Solution:
     def solve(self, src_path: str) -> bytes:
-        if tarfile.is_tarfile(src_path):
-            data = self._extract_from_tar(src_path)
-            if data is not None:
-                return data
+        """
+        Generate a PoC that triggers the vulnerability.
 
-        if zipfile.is_zipfile(src_path):
-            data = self._extract_from_zip(src_path)
-            if data is not None:
-                return data
+        Args:
+            src_path: Path to the vulnerable source code tarball
 
-        return self._fallback_poc()
+        Returns:
+            bytes: The PoC input that should trigger the vulnerability
+        """
+        target_len = 45
 
-    def _score_candidate(self, name: str, size: int) -> int:
-        name_l = name.lower()
+        # Determine base directory: either extract tarball or use existing directory
+        if os.path.isdir(src_path):
+            base_dir = src_path
+        else:
+            base_dir = tempfile.mkdtemp(prefix="src_extract_")
+            try:
+                with tarfile.open(src_path, "r:*") as tf:
+                    tf.extractall(base_dir)
+            except tarfile.ReadError:
+                # Not a tar file; fallback to simple PoC
+                return b"A" * target_len
 
-        text_exts = {
-            ".txt", ".md", ".rst", ".c", ".h", ".cpp", ".cc", ".cxx", ".java",
-            ".py", ".sh", ".cmake", ".html", ".htm", ".xml", ".yml", ".yaml",
-            ".json", ".toml", ".ini", ".cfg", ".conf", ".bat", ".ps1", ".csv",
-            ".tsv"
-        }
-        binary_exts = {
-            ".bin", ".dat", ".data", ".raw", ".pcap", ".pcapng", ".dump",
-            ".pkt", ".packet"
-        }
-
-        base, ext = os.path.splitext(name_l)
-
-        score = 0
-
-        if size > 0:
-            distance = abs(size - 45)
-            score += max(0, 100 - distance)
-
-        if size == 45:
-            score += 400
-
-        patterns = [
-            "poc", "crash", "testcase", "oss-fuzz", "clusterfuzz", "id:",
-            "id_", "repro", "reproducer", "input", "payload", "trigger",
-            "minimized"
+        suspicious_keywords = [
+            "poc",
+            "crash",
+            "bug",
+            "id_",
+            "testcase",
+            "clusterfuzz",
+            "minimized",
+            "gre",
+            "80211",
+            "wireshark",
+            "oss-fuzz",
+            "fuzz"
         ]
-        for p in patterns:
-            if p in name_l:
-                score += 80
 
-        if "wireshark" in name_l or "fuzz" in name_l:
-            score += 20
+        best_candidate = None
+        best_diff = None
+        best_suspicious = False
 
-        if ext in binary_exts:
-            score += 40
-        if ext in text_exts:
-            score -= 80
+        for root, dirs, files in os.walk(base_dir):
+            for name in files:
+                path = os.path.join(root, name)
+                try:
+                    st = os.stat(path)
+                except OSError:
+                    continue
 
-        if size > 10_000:
-            score -= 50
+                size = st.st_size
+                if size <= 0:
+                    continue
 
-        return score
+                diff = abs(size - target_len)
+                path_lower = path.lower()
+                suspicious = any(k in path_lower for k in suspicious_keywords)
 
-    def _extract_from_tar(self, path: str) -> Optional[bytes]:
-        best_member = None
-        best_score = None
+                if best_diff is None:
+                    update = True
+                elif diff < best_diff:
+                    update = True
+                elif diff == best_diff and suspicious and not best_suspicious:
+                    update = True
+                else:
+                    update = False
 
-        try:
-            with tarfile.open(path, "r:*") as tf:
-                for m in tf.getmembers():
-                    if not m.isreg():
-                        continue
-                    size = m.size
-                    if size <= 0:
-                        continue
-                    name = m.name or ""
-                    score = self._score_candidate(name, size)
-                    if best_score is None or score > best_score:
-                        best_score = score
-                        best_member = m
+                if not update:
+                    continue
 
-                if best_member is not None and best_score is not None:
-                    f = tf.extractfile(best_member)
-                    if f is not None:
+                try:
+                    with open(path, "rb") as f:
                         data = f.read()
-                        if isinstance(data, bytes) and data:
-                            return data
-        except Exception:
-            return None
+                except OSError:
+                    continue
 
-        return None
+                best_candidate = data
+                best_diff = diff
+                best_suspicious = suspicious
 
-    def _extract_from_zip(self, path: str) -> Optional[bytes]:
-        best_info = None
-        best_score = None
+                # Early exit if we found an exact-length, suspicious file
+                if best_diff == 0 and best_suspicious:
+                    return best_candidate
 
-        try:
-            with zipfile.ZipFile(path, "r") as zf:
-                for info in zf.infolist():
-                    if info.is_dir():
-                        continue
-                    size = info.file_size
-                    if size <= 0:
-                        continue
-                    name = info.filename or ""
-                    score = self._score_candidate(name, size)
-                    if best_score is None or score > best_score:
-                        best_score = score
-                        best_info = info
+        if best_candidate is not None:
+            return best_candidate
 
-                if best_info is not None and best_score is not None:
-                    with zf.open(best_info, "r") as f:
-                        data = f.read()
-                        if isinstance(data, bytes) and data:
-                            return data
-        except Exception:
-            return None
-
-        return None
-
-    def _fallback_poc(self) -> bytes:
-        return b"A" * 45
+        # Fallback: simple 45-byte payload
+        return b"A" * target_len

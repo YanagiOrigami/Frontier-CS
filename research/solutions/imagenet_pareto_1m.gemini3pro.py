@@ -3,121 +3,131 @@ import torch.nn as nn
 import torch.optim as optim
 import copy
 
-class ResidualBlock(nn.Module):
-    def __init__(self, hidden_dim, dropout_rate):
-        super(ResidualBlock, self).__init__()
-        self.block = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.BatchNorm1d(hidden_dim),
-            nn.GELU(),
-            nn.Dropout(dropout_rate)
-        )
-
-    def forward(self, x):
-        return x + self.block(x)
-
-class Model(nn.Module):
+class SubModel(nn.Module):
     def __init__(self, input_dim, num_classes):
-        super(Model, self).__init__()
-        # Architecture configured to maximize capacity within 1M parameter budget
-        # Calculation:
-        # Input BN: 2 * 384 = 768
-        # Stem: 384 * 576 + 576 + 2 * 576 = 222,912
-        # ResBlock 1: 576 * 576 + 576 + 2 * 576 = 333,504
-        # ResBlock 2: 576 * 576 + 576 + 2 * 576 = 333,504
-        # Head: 576 * 128 + 128 = 73,856
-        # Total: ~964,544 parameters (Safe under 1,000,000 limit)
-        self.hidden_dim = 576
+        super().__init__()
+        # Architecture designed to be parameter efficient
+        # Width 248 allows for ~315k parameters per model
+        # 3 models in ensemble = ~945k parameters (< 1M limit)
+        self.width = 248
         
+        # Initial batch norm to handle unnormalized inputs
         self.input_bn = nn.BatchNorm1d(input_dim)
         
-        self.stem = nn.Sequential(
-            nn.Linear(input_dim, self.hidden_dim),
-            nn.BatchNorm1d(self.hidden_dim),
-            nn.GELU(),
-            nn.Dropout(0.2)
+        # Projection to hidden dimension
+        self.proj = nn.Sequential(
+            nn.Linear(input_dim, self.width),
+            nn.BatchNorm1d(self.width),
+            nn.SiLU()
         )
         
-        self.res1 = ResidualBlock(self.hidden_dim, dropout_rate=0.25)
-        self.res2 = ResidualBlock(self.hidden_dim, dropout_rate=0.25)
+        # Residual blocks for depth
+        self.layers = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(self.width, self.width),
+                nn.BatchNorm1d(self.width),
+                nn.SiLU(),
+                nn.Dropout(0.25)
+            ) for _ in range(3)
+        ])
         
-        self.head = nn.Linear(self.hidden_dim, num_classes)
+        # Classification head
+        self.head = nn.Linear(self.width, num_classes)
 
     def forward(self, x):
         x = self.input_bn(x)
-        x = self.stem(x)
-        x = self.res1(x)
-        x = self.res2(x)
+        x = self.proj(x)
+        for layer in self.layers:
+            # Residual connection
+            x = x + layer(x)
         return self.head(x)
+
+class EnsembleModel(nn.Module):
+    def __init__(self, models):
+        super().__init__()
+        self.models = nn.ModuleList(models)
+    
+    def forward(self, x):
+        # Average probabilities across ensemble members
+        # SubModels return logits, so we apply softmax first
+        probs = [torch.softmax(m(x), dim=1) for m in self.models]
+        avg_prob = torch.stack(probs).mean(dim=0)
+        return avg_prob
 
 class Solution:
     def solve(self, train_loader, val_loader, metadata: dict = None) -> torch.nn.Module:
         """
-        Train a model on the provided data within 1M parameter budget.
+        Train a 3-model ensemble within the 1M parameter budget.
         """
+        # Extract metadata
         input_dim = metadata.get("input_dim", 384)
         num_classes = metadata.get("num_classes", 128)
-        device = metadata.get("device", "cpu")
+        device_str = metadata.get("device", "cpu")
+        device = torch.device(device_str)
         
-        model = Model(input_dim, num_classes).to(device)
+        # Configuration
+        # We train 3 models. Total params will be ~946k, well within 1M limit.
+        num_models = 3
+        epochs = 45 
         
-        # Verify parameter count constraint
-        param_count = sum(p.numel() for p in model.parameters() if p.requires_grad)
-        if param_count > 1000000:
-            raise ValueError(f"Model exceeds parameter limit: {param_count}")
-
-        # Optimization setup
-        # Using AdamW with weight decay for regularization on small dataset
-        optimizer = optim.AdamW(model.parameters(), lr=1e-3, weight_decay=0.02)
+        best_models = []
         
-        # Label smoothing helps prevent overfitting on small datasets
-        criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
-        
-        epochs = 55
-        # OneCycleLR typically converges faster and reaches better optima than CosineAnnealing alone
-        scheduler = optim.lr_scheduler.OneCycleLR(
-            optimizer, 
-            max_lr=1e-3, 
-            epochs=epochs, 
-            steps_per_epoch=len(train_loader),
-            pct_start=0.3
-        )
-        
-        best_acc = 0.0
-        best_weights = copy.deepcopy(model.state_dict())
-        
-        # Training loop
-        for epoch in range(epochs):
-            model.train()
-            for inputs, targets in train_loader:
-                inputs, targets = inputs.to(device), targets.to(device)
-                
-                optimizer.zero_grad()
-                outputs = model(inputs)
-                loss = criterion(outputs, targets)
-                loss.backward()
-                optimizer.step()
-                scheduler.step()
+        for i in range(num_models):
+            # Initialize model
+            model = SubModel(input_dim, num_classes).to(device)
             
-            # Validation
-            model.eval()
-            correct = 0
-            total = 0
-            with torch.no_grad():
-                for inputs, targets in val_loader:
+            # Optimizer settings with weight decay for regularization
+            optimizer = optim.AdamW(model.parameters(), lr=0.001, weight_decay=0.02)
+            scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
+            # Label smoothing helps with generalization on synthetic data
+            criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
+            
+            best_val_acc = -1.0
+            best_model_state = copy.deepcopy(model.state_dict())
+            
+            for epoch in range(epochs):
+                # Training phase
+                model.train()
+                for inputs, targets in train_loader:
                     inputs, targets = inputs.to(device), targets.to(device)
+                    optimizer.zero_grad()
                     outputs = model(inputs)
-                    _, predicted = torch.max(outputs.data, 1)
-                    total += targets.size(0)
-                    correct += (predicted == targets).sum().item()
+                    loss = criterion(outputs, targets)
+                    loss.backward()
+                    optimizer.step()
+                
+                scheduler.step()
+                
+                # Validation phase
+                model.eval()
+                correct = 0
+                total = 0
+                with torch.no_grad():
+                    for inputs, targets in val_loader:
+                        inputs, targets = inputs.to(device), targets.to(device)
+                        outputs = model(inputs)
+                        _, preds = outputs.max(1)
+                        correct += preds.eq(targets).sum().item()
+                        total += targets.size(0)
+                
+                # Save best model based on validation accuracy
+                if total > 0:
+                    val_acc = correct / total
+                    if val_acc >= best_val_acc:
+                        best_val_acc = val_acc
+                        best_model_state = copy.deepcopy(model.state_dict())
             
-            acc = correct / total
+            # Retrieve best state for this ensemble member
+            model.load_state_dict(best_model_state)
+            model.cpu() # Move to CPU to assemble later
+            best_models.append(model)
             
-            # Save best model
-            if acc >= best_acc:
-                best_acc = acc
-                best_weights = copy.deepcopy(model.state_dict())
+        # Create and return the ensemble
+        ensemble = EnsembleModel(best_models)
+        ensemble.to(device)
         
-        # Restore best performing model
-        model.load_state_dict(best_weights)
-        return model
+        # Verify parameter count (internal check)
+        # param_count = sum(p.numel() for p in ensemble.parameters() if p.requires_grad)
+        # assert param_count <= 1000000
+        
+        return ensemble

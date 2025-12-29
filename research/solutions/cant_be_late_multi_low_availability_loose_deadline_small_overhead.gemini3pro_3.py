@@ -1,14 +1,12 @@
 import json
 from argparse import Namespace
-
 from sky_spot.strategies.multi_strategy import MultiRegionStrategy
 from sky_spot.utils import ClusterType
-
 
 class Solution(MultiRegionStrategy):
     """Your multi-region scheduling strategy."""
 
-    NAME = "cant_be_late_strategy"
+    NAME = "my_strategy"  # REQUIRED: unique identifier
 
     def solve(self, spec_path: str) -> "Solution":
         """
@@ -30,50 +28,44 @@ class Solution(MultiRegionStrategy):
         """
         Decide next action based on current state.
         """
-        # Current state
-        current_time = self.env.elapsed_seconds
-        total_done = sum(self.task_done_time)
-        needed_work = self.task_duration - total_done
-
-        # If task is complete (or effectively complete)
-        if needed_work <= 1e-6:
+        # Calculate current state
+        elapsed = self.env.elapsed_seconds
+        done = sum(self.task_done_time)
+        total_work = self.task_duration
+        remaining_work = total_work - done
+        
+        # Check if work is already done (handling float precision)
+        if remaining_work <= 1e-6:
             return ClusterType.NONE
 
-        time_remaining = self.deadline - current_time
-        overhead = self.restart_overhead
+        remaining_time = self.deadline - elapsed
         gap = self.env.gap_seconds
-
-        # Calculate slack: Time available minus time needed to work and one restart overhead
-        slack = time_remaining - needed_work - overhead
-
-        # Panic threshold: Minimum slack required to feel safe relying on Spot or searching.
-        # We keep a buffer of 1.5 steps (gap) plus overhead to handle transitions safely.
-        panic_threshold = (gap * 1.5) + overhead
-
-        # 1. Critical Deadline Protection
-        # If slack is below the safe threshold, we must use On-Demand to guarantee completion.
-        if slack < panic_threshold:
+        overhead = self.restart_overhead
+        
+        # Calculate panic threshold.
+        # We switch to ON_DEMAND if time is running out.
+        # Buffer required:
+        # 1. remaining_work: Time needed to execute code.
+        # 2. switch_overhead: Time needed to spin up OD (if not already running).
+        # 3. gap: To account for the granularity of the current step (safety margin).
+        
+        switch_overhead = 0.0 if last_cluster_type == ClusterType.ON_DEMAND else overhead
+        panic_threshold = remaining_work + switch_overhead + 1.1 * gap
+        
+        # If we are close to the deadline, force On-Demand to guarantee completion.
+        if remaining_time < panic_threshold:
             return ClusterType.ON_DEMAND
-
-        # 2. Cost Optimization
-        # If we have slack and Spot is available, use it.
+            
+        # Normal operation: Prefer Spot to save costs
         if has_spot:
             return ClusterType.SPOT
-
-        # 3. Region Exploration
-        # If Spot is unavailable in current region, but we have plenty of slack,
-        # switch to another region and wait (NONE) for the next step.
-        # We pay 'gap' time to search. Ensure we still have enough slack after paying 'gap'.
-        if slack > (panic_threshold + gap):
+        else:
+            # Spot is not available in the current region.
+            # Since we have slack (not in panic mode), we search for Spot in other regions.
+            # Switch to the next region and return NONE (pause) for this step.
+            # The availability in the new region will be checked in the next step.
             num_regions = self.env.get_num_regions()
-            if num_regions > 1:
-                current_region = self.env.get_current_region()
-                # Round-robin switch
-                next_region = (current_region + 1) % num_regions
-                self.env.switch_region(next_region)
+            current_region = self.env.get_current_region()
+            next_region = (current_region + 1) % num_regions
+            self.env.switch_region(next_region)
             return ClusterType.NONE
-
-        # 4. Fallback
-        # Spot is unavailable and we don't have enough slack to search.
-        # Must run now to meet deadline, so use On-Demand.
-        return ClusterType.ON_DEMAND

@@ -1,216 +1,293 @@
 import numpy as np
-import sympy as sp
 
 class Solution:
     def __init__(self, **kwargs):
-        self.kwargs = kwargs
+        self.random_state = int(kwargs.get("random_state", 42))
 
-    def _format_float(self, x):
-        if not np.isfinite(x):
-            return "0"
-        if abs(x) < 1e-14:
-            return "0"
-        s = f"{x:.12g}"
-        # Remove trailing decimal point if integer-like
-        if "." in s:
-            s = s.rstrip("0").rstrip(".")
-            if s == "-0":
-                s = "0"
-        return s
-
-    def _predict_params(self, x1, x2, a, b, c, b1, f, py, use_const=False, d0=0.0):
-        x1_sq = x1 * x1
-        x2_sq = x2 * x2
-        e00 = np.exp(-(x1_sq + x2_sq))
-        e01 = np.exp(-(x1_sq + (x2 + b1) * (x2 + b1)))
-        e10 = np.exp(-((x1 + f) * (x1 + f) + x2_sq))
-        t1 = (1.0 - x1) ** 2 * e01
-        t2 = (x1 / 5.0 - x1 ** 3 - x2 ** py) * e00
-        t3 = e10
-        out = a * t1 + b * t2 + c * t3
-        if use_const:
-            out = out + d0
-        return out
-
-    def _build_expression(self, a, b, c, b1, f, py, use_const=False, d0=0.0):
-        sa = self._format_float(a)
-        sb = self._format_float(b)
-        sc = self._format_float(c)
-        sb1 = self._format_float(b1)
-        sf = self._format_float(f)
-        term1 = f"{sa}*(1 - x1)**2*exp(-x1**2 - (x2 + {sb1})**2)"
-        term2 = f"{sb}*(x1/5 - x1**3 - x2**{int(py)})*exp(-x1**2 - x2**2)"
-        term3 = f"{sc}*exp(-(x1 + {sf})**2 - x2**2)"
-        expr = f"{term1} + {term2} + {term3}"
-        if use_const and abs(d0) > 0:
-            sd0 = self._format_float(d0)
-            if sd0.startswith("-"):
-                expr = f"{expr} {sd0}"
-            else:
-                expr = f"{expr} + {sd0}"
-        return expr
-
-    def _compute_complexity(self, expr_str):
-        try:
-            expr = sp.sympify(expr_str, locals={"exp": sp.exp, "sin": sp.sin, "cos": sp.cos, "log": sp.log})
-        except Exception:
-            return None
-
-        binary_ops = 0
-        unary_ops = 0
-
-        def count_ops(e):
-            nonlocal binary_ops, unary_ops
-            if isinstance(e, sp.Add):
-                # n-ary add uses n-1 binary additions
-                binary_ops += max(len(e.args) - 1, 0)
-            elif isinstance(e, sp.Mul):
-                # n-ary mul uses n-1 binary multiplications
-                binary_ops += max(len(e.args) - 1, 0)
-            elif isinstance(e, sp.Pow):
-                binary_ops += 1
-            elif isinstance(e, sp.Function):
-                if e.func in (sp.exp, sp.sin, sp.cos, sp.log):
-                    unary_ops += 1
-            for arg in e.args:
-                count_ops(arg)
-
-        count_ops(expr)
-        return 2 * binary_ops + unary_ops
-
-    def solve(self, X: np.ndarray, y: np.ndarray) -> dict:
+    def _poly_terms(self, X, spec):
         x1 = X[:, 0]
         x2 = X[:, 1]
+        if spec == "linxy":
+            # [1, x1, x2, x1*x2]
+            return np.column_stack((np.ones_like(x1), x1, x2, x1 * x2))
+        elif spec == "quad":
+            # [1, x1, x2, x1^2, x1*x2, x2^2]
+            return np.column_stack((np.ones_like(x1), x1, x2, x1 * x1, x1 * x2, x2 * x2))
+        else:
+            # default to quad
+            return np.column_stack((np.ones_like(x1), x1, x2, x1 * x1, x1 * x2, x2 * x2))
 
-        # Precompute reusable components
-        x1_sq = x1 * x1
-        x2_sq = x2 * x2
-        ones = np.ones_like(x1)
+    def _poly_str(self, coeffs, spec):
+        # Build polynomial string with given coefficients and spec
+        terms = []
+        def fmt(c):
+            return f"{c:.12g}"
 
-        e00 = np.exp(-(x1_sq + x2_sq))
+        if spec == "linxy":
+            # c0 + c1*x1 + c2*x2 + c3*x1*x2
+            if abs(coeffs[0]) > 0:
+                terms.append(fmt(coeffs[0]))
+            if abs(coeffs[1]) > 0:
+                terms.append(f"({fmt(coeffs[1])}*x1)")
+            if abs(coeffs[2]) > 0:
+                terms.append(f"({fmt(coeffs[2])}*x2)")
+            if abs(coeffs[3]) > 0:
+                terms.append(f"({fmt(coeffs[3])}*x1*x2)")
+        else:
+            # quad: c0 + c1*x1 + c2*x2 + c3*x1**2 + c4*x1*x2 + c5*x2**2
+            if abs(coeffs[0]) > 0:
+                terms.append(fmt(coeffs[0]))
+            if abs(coeffs[1]) > 0:
+                terms.append(f"({fmt(coeffs[1])}*x1)")
+            if abs(coeffs[2]) > 0:
+                terms.append(f"({fmt(coeffs[2])}*x2)")
+            if abs(coeffs[3]) > 0:
+                terms.append(f"({fmt(coeffs[3])}*x1**2)")
+            if abs(coeffs[4]) > 0:
+                terms.append(f"({fmt(coeffs[4])}*x1*x2)")
+            if abs(coeffs[5]) > 0:
+                terms.append(f"({fmt(coeffs[5])}*x2**2)")
 
-        # Candidate parameters near the classic "peaks" function
-        b1_candidates = [1.0, 0.9, 1.1]
-        f_candidates = [1.0, 0.9, 1.1]
-        py_candidates = [5, 3, 7]
+        if not terms:
+            return "0"
+        return " + ".join(terms)
 
-        # Precompute exponentials for candidate shifts
-        e01_map = {}
-        for b1 in b1_candidates:
-            e01_map[b1] = np.exp(-(x1_sq + (x2 + b1) * (x2 + b1)))
-        e10_map = {}
-        for f in f_candidates:
-            e10_map[f] = np.exp(-((x1 + f) * (x1 + f) + x2_sq))
+    def _kmeans_2d(self, X, k, steps=20, seed=42):
+        n = X.shape[0]
+        rng = np.random.default_rng(seed)
+        # Initialize centers with k random points
+        if n < k:
+            k = n
+        idx = rng.choice(n, size=k, replace=False)
+        centers = X[idx].astype(float).copy()
 
-        # Precompute x2 powers
-        x2_pow_map = {}
-        for py in py_candidates:
-            x2_pow_map[py] = x2 ** py
+        for _ in range(steps):
+            # Compute squared distances [n,k]
+            d2 = ((X[:, None, :] - centers[None, :, :]) ** 2).sum(axis=2)
+            labels = np.argmin(d2, axis=1)
+            new_centers = centers.copy()
+            for j in range(k):
+                mask = labels == j
+                if np.any(mask):
+                    new_centers[j] = X[mask].mean(axis=0)
+                else:
+                    # Reinitialize empty cluster to a random point
+                    ridx = rng.integers(0, n)
+                    new_centers[j] = X[ridx]
+            if np.allclose(new_centers, centers):
+                centers = new_centers
+                break
+            centers = new_centers
+        return centers
 
-        candidates = []
+    def _compute_alphas(self, centers, width_factor, X):
+        k = centers.shape[0]
+        alphas = np.zeros(k, dtype=float)
+        # Fallback scale based on data dispersion
+        s_global = float(np.mean(np.std(X, axis=0))) + 1e-12
+        for j in range(k):
+            d = np.sqrt(((centers[j][None, :] - centers) ** 2).sum(axis=1))
+            d = d[d > 1e-12]
+            if d.size == 0:
+                s = s_global
+            else:
+                s = float(np.median(d))
+                if not np.isfinite(s) or s < 1e-12:
+                    s = s_global
+            alphas[j] = float(width_factor / (s * s + 1e-12))
+        return alphas
 
-        # Exact MATLAB-style peaks as a candidate
+    def _build_design(self, X, centers, alphas, poly_spec_base, poly_spec_gauss):
+        # Base polynomial
+        Phi_base = self._poly_terms(X, poly_spec_base)
+        P_base = Phi_base.shape[1]
+        n = X.shape[0]
+
+        # Gaussian-polynomial features
+        x1 = X[:, 0]
+        x2 = X[:, 1]
+        k = centers.shape[0]
+        Phi_list = [Phi_base]
+        P_gauss = 4 if poly_spec_gauss == "linxy" else 6
+
+        for j in range(k):
+            cx, cy = centers[j]
+            alpha = alphas[j]
+            r2 = (x1 - cx) ** 2 + (x2 - cy) ** 2
+            e = np.exp(-alpha * r2)
+            if poly_spec_gauss == "linxy":
+                # e, x1*e, x2*e, x1*x2*e
+                Gj = np.column_stack((e, x1 * e, x2 * e, (x1 * x2) * e))
+            else:
+                # quad: e, x1*e, x2*e, x1^2*e, x1*x2*e, x2^2*e
+                Gj = np.column_stack((e, x1 * e, x2 * e, (x1 * x1) * e, (x1 * x2) * e, (x2 * x2) * e))
+            Phi_list.append(Gj)
+
+        Phi = np.concatenate(Phi_list, axis=1)
+        return Phi, P_base, P_gauss
+
+    def _ridge_solve(self, Phi, y, lam):
+        # Solve (Phi^T Phi + lam*I) w = Phi^T y
+        # Use Cholesky if possible; else fall back to lstsq
+        P = Phi.shape[1]
+        A = Phi.T @ Phi
+        b = Phi.T @ y
+        A.flat[:: P + 1] += lam
         try:
-            t1_exact = (1.0 - x1) ** 2 * e01_map[1.0]
-            t2_exact = (x1 / 5.0 - x1 ** 3 - x2_pow_map[5]) * e00
-            t3_exact = e10_map[1.0]
-            pred_exact = 3.0 * t1_exact - 10.0 * t2_exact - (1.0 / 3.0) * t3_exact
-            mse_exact = float(np.mean((y - pred_exact) ** 2))
-            expr_exact = "3*(1 - x1)**2*exp(-x1**2 - (x2 + 1)**2) - 10*(x1/5 - x1**3 - x2**5)*exp(-x1**2 - x2**2) - 1/3*exp(-(x1 + 1)**2 - x2**2)"
-            comp_exact = self._compute_complexity(expr_exact)
-            candidates.append({
-                "mse": mse_exact,
-                "expr": expr_exact,
-                "pred": pred_exact,
-                "complexity": comp_exact if comp_exact is not None else 0
-            })
-        except Exception:
-            pass
+            w = np.linalg.solve(A, b)
+        except np.linalg.LinAlgError:
+            w, _, _, _ = np.linalg.lstsq(Phi, y, rcond=None)
+        return w
 
-        # Fit linear coefficients for template basis functions across parameter grid
-        for b1 in b1_candidates:
-            e01 = e01_map[b1]
-            base_t1 = (1.0 - x1) ** 2 * e01
-            for f in f_candidates:
-                e10 = e10_map[f]
-                base_t3 = e10
-                for py in py_candidates:
-                    x2p = x2_pow_map[py]
-                    base_t2 = (x1 / 5.0 - x1 ** 3 - x2p) * e00
+    def _mse(self, y, yhat):
+        d = y - yhat
+        return float(np.mean(d * d))
 
-                    # Fit without constant
-                    A3 = np.column_stack([base_t1, base_t2, base_t3])
-                    try:
-                        coef3, _, _, _ = np.linalg.lstsq(A3, y, rcond=None)
-                        a3, b3, c3 = coef3
-                        pred3 = A3 @ coef3
-                        mse3 = float(np.mean((y - pred3) ** 2))
-                        expr3 = self._build_expression(a3, b3, c3, b1, f, py, use_const=False, d0=0.0)
-                        comp3 = self._compute_complexity(expr3)
-                        candidates.append({
-                            "mse": mse3,
-                            "expr": expr3,
-                            "pred": pred3,
-                            "complexity": comp3 if comp3 is not None else 0
-                        })
-                    except Exception:
-                        pass
+    def _peaks_like_values(self, X):
+        x = X[:, 0]
+        y = X[:, 1]
+        term1 = 3.0 * (1.0 - x) ** 2 * np.exp(-(x ** 2) - (y + 1.0) ** 2)
+        term2 = -10.0 * (x / 5.0 - x ** 3 - y ** 5) * np.exp(-(x ** 2) - (y ** 2))
+        term3 = -1.0 / 3.0 * np.exp(-((x + 1.0) ** 2) - (y ** 2))
+        return term1 + term2 + term3
 
-                    # Fit with constant
-                    A4 = np.column_stack([base_t1, base_t2, base_t3, ones])
-                    try:
-                        coef4, _, _, _ = np.linalg.lstsq(A4, y, rcond=None)
-                        a4, b4, c4, d0 = coef4
-                        pred4 = A4 @ coef4
-                        mse4 = float(np.mean((y - pred4) ** 2))
-                        expr4 = self._build_expression(a4, b4, c4, b1, f, py, use_const=True, d0=d0)
-                        comp4 = self._compute_complexity(expr4)
-                        candidates.append({
-                            "mse": mse4,
-                            "expr": expr4,
-                            "pred": pred4,
-                            "complexity": comp4 if comp4 is not None else 0
-                        })
-                    except Exception:
-                        pass
+    def _format_gaussian_term(self, coeffs, spec, alpha, cx, cy):
+        # returns string like: (poly(x1,x2)) * exp(-alpha*((x1-cx)**2 + (x2-cy)**2))
+        poly_str = self._poly_str(coeffs, spec)
+        alpha_s = f"{alpha:.12g}"
+        cx_s = f"{cx:.12g}"
+        cy_s = f"{cy:.12g}"
+        exp_str = f"exp(-({alpha_s})*((x1-({cx_s}))**2 + (x2-({cy_s}))**2))"
+        if poly_str == "0":
+            return "0"
+        # If polynomial reduces to a single number (no 'x'), still wrap in parentheses for clarity
+        return f"({poly_str})*{exp_str}"
 
-        # Also include a simple linear baseline as a fallback candidate
-        try:
-            A_lin = np.column_stack([x1, x2, np.ones_like(x1)])
-            coef_lin, _, _, _ = np.linalg.lstsq(A_lin, y, rcond=None)
-            aL, bL, cL = coef_lin
-            pred_lin = A_lin @ coef_lin
-            mse_lin = float(np.mean((y - pred_lin) ** 2))
-            expr_lin = f"{self._format_float(aL)}*x1 + {self._format_float(bL)}*x2 + {self._format_float(cL)}"
-            comp_lin = self._compute_complexity(expr_lin)
-            candidates.append({
-                "mse": mse_lin,
-                "expr": expr_lin,
-                "pred": pred_lin,
-                "complexity": comp_lin if comp_lin is not None else 0
-            })
-        except Exception:
-            pass
+    def _build_expression(self, centers, alphas, w, P_base, P_gauss, poly_spec_base, poly_spec_gauss):
+        # w: concatenated weights [P_base + k*P_gauss]
+        def is_near_zero(v):
+            return abs(v) < 1e-14
 
-        # Choose best candidate by MSE, ties broken by lower complexity
-        if not candidates:
-            # Fallback very simple expression
-            expression = "x1 + x2"
-            predictions = X[:, 0] + X[:, 1]
-            return {
-                "expression": expression,
-                "predictions": predictions.tolist(),
-                "details": {}
-            }
+        base_coeffs = w[:P_base]
+        expr_parts = []
+        base_str = self._poly_str(base_coeffs, poly_spec_base)
+        if base_str != "0":
+            expr_parts.append(base_str)
 
-        candidates.sort(key=lambda d: (d["mse"], d["complexity"]))
-        best = candidates[0]
-        expression = best["expr"]
-        predictions = best["pred"]
-        details = {"complexity": best["complexity"]}
+        # Gaussian parts
+        k = centers.shape[0]
+        for j in range(k):
+            start = P_base + j * P_gauss
+            end = start + P_gauss
+            coeffs = w[start:end]
+            # Skip if all near zero
+            if np.all(np.abs(coeffs) < 1e-14):
+                continue
+            term_str = self._format_gaussian_term(coeffs, poly_spec_gauss, alphas[j], centers[j, 0], centers[j, 1])
+            if term_str != "0":
+                expr_parts.append(term_str)
+
+        if not expr_parts:
+            return "0"
+        return " + ".join(expr_parts)
+
+    def _predict_with_model(self, X, centers, alphas, w, P_base, P_gauss, poly_spec_base, poly_spec_gauss):
+        # Compute predictions given model parameters
+        Phi, _, _ = self._build_design(X, centers, alphas, poly_spec_base, poly_spec_gauss)
+        return Phi @ w
+
+    def _linear_baseline(self, X, y):
+        # Linear regression baseline with bias
+        A = np.column_stack([X, np.ones(X.shape[0])])
+        coeffs, _, _, _ = np.linalg.lstsq(A, y, rcond=None)
+        a, b, c = coeffs
+        expr = f"({a:.12g}*x1 + {b:.12g}*x2 + {c:.12g})"
+        preds = A @ coeffs
+        mse = self._mse(y, preds)
+        return expr, preds, mse
+
+    def solve(self, X: np.ndarray, y: np.ndarray) -> dict:
+        # Ensure numpy arrays
+        X = np.asarray(X, dtype=float)
+        y = np.asarray(y, dtype=float).ravel()
+        n, d = X.shape
+        if d != 2:
+            # Fallback: treat extra dims with only first 2
+            X = X[:, :2]
+        if n == 0:
+            return {"expression": "0", "predictions": [], "details": {}}
+
+        # Edge case: constant y
+        if np.allclose(y, y.mean(), atol=1e-12):
+            c = float(y.mean())
+            expr_const = f"{c:.12g}"
+            return {"expression": expr_const, "predictions": (np.ones(n) * c).tolist(), "details": {}}
+
+        rng = np.random.default_rng(self.random_state)
+
+        # Baseline linear model
+        best_expr, best_preds, best_mse = self._linear_baseline(X, y)
+        best_details = {"model": "linear"}
+
+        # Candidate: peaks-like formula scaled
+        p_vals = self._peaks_like_values(X)
+        if np.all(np.isfinite(p_vals)) and (not np.allclose(p_vals.std(), 0.0)):
+            A = np.column_stack([p_vals, np.ones_like(p_vals)])
+            ab, _, _, _ = np.linalg.lstsq(A, y, rcond=None)
+            a_scale, b_off = ab
+            preds_peaks = a_scale * p_vals + b_off
+            mse_peaks = self._mse(y, preds_peaks)
+            peaks_expr = (
+                f"({a_scale:.12g})*(3*(1 - x1)**2*exp(-(x1**2) - (x2 + 1)**2) - "
+                f"10*(x1/5 - x1**3 - x2**5)*exp(-(x1**2) - (x2**2)) - "
+                f"(1/3)*exp(-((x1 + 1)**2) - (x2**2))) + ({b_off:.12g})"
+            )
+            if mse_peaks < best_mse:
+                best_mse = mse_peaks
+                best_preds = preds_peaks
+                best_expr = peaks_expr
+                best_details = {"model": "peaks_scaled"}
+
+        # RBF-Gaussian polynomial mixture candidates
+        # Precompute centers for different k to avoid repeated kmeans for each grid
+        k_values = [3, 4, 5]
+        centers_dict = {}
+        for k in k_values:
+            centers_dict[k] = self._kmeans_2d(X, k, steps=20, seed=self.random_state)
+
+        width_factors = [0.25, 0.5, 1.0]
+        lam_list = [1e-6, 1e-3]
+        poly_specs = [("quad", "quad"), ("quad", "linxy")]
+
+        for k in k_values:
+            centers = centers_dict[k]
+            for wf in width_factors:
+                alphas = self._compute_alphas(centers, wf, X)
+                for lam in lam_list:
+                    for poly_spec_base, poly_spec_gauss in poly_specs:
+                        Phi, P_base, P_gauss = self._build_design(X, centers, alphas, poly_spec_base, poly_spec_gauss)
+                        w = self._ridge_solve(Phi, y, lam)
+                        preds = Phi @ w
+                        mse = self._mse(y, preds)
+                        if mse < best_mse:
+                            expr = self._build_expression(centers, alphas, w, P_base, P_gauss, poly_spec_base, poly_spec_gauss)
+                            # Keep slightly simplified expression: if empty, fallback to linear
+                            if expr.strip() == "":
+                                continue
+                            best_mse = mse
+                            best_preds = preds
+                            best_expr = expr
+                            best_details = {
+                                "model": "rbf_poly",
+                                "k": int(k),
+                                "width_factor": float(wf),
+                                "lambda": float(lam),
+                                "poly_base": poly_spec_base,
+                                "poly_gauss": poly_spec_gauss,
+                            }
 
         return {
-            "expression": expression,
-            "predictions": predictions.tolist(),
-            "details": details
+            "expression": best_expr,
+            "predictions": best_preds.tolist(),
+            "details": best_details,
         }

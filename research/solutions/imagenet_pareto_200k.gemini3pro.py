@@ -1,139 +1,160 @@
 import torch
 import torch.nn as nn
 import torch.optim as optim
+import numpy as np
+import copy
 
 class ResidualBlock(nn.Module):
-    def __init__(self, in_features, out_features, dropout=0.25):
+    def __init__(self, hidden_dim, dropout_p=0.3):
         super().__init__()
-        self.linear = nn.Linear(in_features, out_features)
-        self.bn = nn.BatchNorm1d(out_features)
-        self.act = nn.SiLU()
-        self.dropout = nn.Dropout(dropout)
-        self.has_skip = (in_features == out_features)
-        
-    def forward(self, x):
-        out = self.linear(x)
-        out = self.bn(out)
-        out = self.act(out)
-        out = self.dropout(out)
-        if self.has_skip:
-            return out + x
-        return out
+        self.block = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim, bias=False),
+            nn.BatchNorm1d(hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(dropout_p),
+            nn.Linear(hidden_dim, hidden_dim, bias=False),
+            nn.BatchNorm1d(hidden_dim),
+            nn.Dropout(dropout_p)
+        )
+        self.relu = nn.ReLU()
 
-class ParameterConstrainedModel(nn.Module):
-    def __init__(self, input_dim, num_classes):
+    def forward(self, x):
+        return self.relu(x + self.block(x))
+
+class OptimizedModel(nn.Module):
+    def __init__(self, input_dim, num_classes, hidden_dim, num_blocks, dropout_p=0.2):
         super().__init__()
-        # Architecture designed to maximize capacity within 200,000 parameter budget
-        # Calculation assumes input_dim=384, num_classes=128
-        
-        # Normalize input features
+        # Initial normalization of inputs
         self.input_bn = nn.BatchNorm1d(input_dim)
         
-        # Layer 1: 384 -> 256
-        # Params: 384*256 + 256 (bias) + 256*2 (BN) = 99,072
-        self.l1 = nn.Sequential(
-            nn.Linear(input_dim, 256),
-            nn.BatchNorm1d(256),
-            nn.SiLU(),
-            nn.Dropout(0.25)
+        # Project to hidden dimension
+        self.entry = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim, bias=False),
+            nn.BatchNorm1d(hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(dropout_p)
         )
         
-        # Layer 2: 256 -> 160
-        # Params: 256*160 + 160 + 160*2 = 41,440
-        self.l2 = nn.Sequential(
-            nn.Linear(256, 160),
-            nn.BatchNorm1d(160),
-            nn.SiLU(),
-            nn.Dropout(0.25)
-        )
+        # Residual backbone
+        layers = []
+        for _ in range(num_blocks):
+            layers.append(ResidualBlock(hidden_dim, dropout_p=0.3))
+        self.blocks = nn.Sequential(*layers)
         
-        # Layer 3: 160 -> 128
-        # Params: 160*128 + 128 + 128*2 = 20,864
-        self.l3 = nn.Sequential(
-            nn.Linear(160, 128),
-            nn.BatchNorm1d(128),
-            nn.SiLU(),
-            nn.Dropout(0.25)
-        )
-        
-        # Layer 4: 128 -> 128 (Residual)
-        # Params: 128*128 + 128 + 128*2 = 16,768
-        self.l4 = ResidualBlock(128, 128, dropout=0.25)
-        
-        # Output Head: 128 -> 128
-        # Params: 128*128 + 128 = 16,512
-        self.head = nn.Linear(128, num_classes)
-        
-        # Total Estimated: ~195,424 parameters (Safe under 200k limit)
+        # Classifier
+        self.classifier = nn.Linear(hidden_dim, num_classes)
 
     def forward(self, x):
         x = self.input_bn(x)
-        x = self.l1(x)
-        x = self.l2(x)
-        x = self.l3(x)
-        x = self.l4(x)
-        x = self.head(x)
-        return x
+        x = self.entry(x)
+        x = self.blocks(x)
+        return self.classifier(x)
 
 class Solution:
     def solve(self, train_loader, val_loader, metadata: dict = None) -> torch.nn.Module:
-        """
-        Train a model and return it.
-        """
-        device = metadata.get("device", "cpu")
+        if metadata is None:
+            metadata = {}
+            
         input_dim = metadata.get("input_dim", 384)
         num_classes = metadata.get("num_classes", 128)
+        param_limit = metadata.get("param_limit", 200000)
+        device = metadata.get("device", "cpu")
         
-        # Instantiate the model
-        model = ParameterConstrainedModel(input_dim, num_classes)
-        model = model.to(device)
+        # 1. Architecture Optimization
+        # We perform a greedy search to maximize model capacity (width and depth)
+        # while strictly adhering to the parameter constraint.
         
-        # Training Hyperparameters
-        epochs = 45
-        lr = 0.002
-        weight_decay = 0.02
+        safety_margin = 100  # Ensure we are strictly under the limit
+        effective_limit = param_limit - safety_margin
         
-        # Optimizer and Scheduler
-        optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
+        best_config = (64, 1) # Fallback configuration
         
-        # OneCycleLR for efficient training within limited epochs
-        scheduler = optim.lr_scheduler.OneCycleLR(
-            optimizer,
-            max_lr=lr,
-            epochs=epochs,
-            steps_per_epoch=len(train_loader),
-            pct_start=0.3,
-            div_factor=25.0,
-            final_div_factor=1000.0
-        )
-        
-        # Loss function with label smoothing for regularization
-        criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
-        
-        best_acc = 0.0
-        best_model_state = None
-        
-        # Training Loop
-        for epoch in range(epochs):
-            model.train()
-            for inputs, targets in train_loader:
-                inputs, targets = inputs.to(device), targets.to(device)
+        # Iterate over preferred widths (descending)
+        for width in [128, 112, 96, 64]:
+            # Fixed costs:
+            # 1. Input BN: 2 * input_dim
+            # 2. Entry Proj: input_dim * width (weights) + 2 * width (BN params)
+            # 3. Classifier: width * num_classes (weights) + num_classes (bias)
+            cost_fixed = (2 * input_dim) + \
+                         (input_dim * width + 2 * width) + \
+                         (width * num_classes + num_classes)
+            
+            if cost_fixed >= effective_limit:
+                continue
                 
-                # Data Augmentation: Feature noise injection
-                # Helps prevent overfitting on small synthetic dataset
-                if epoch < int(epochs * 0.8):
-                    noise = torch.randn_like(inputs) * 0.05
-                    inputs = inputs + noise
+            # Block cost (ResidualBlock):
+            # 2 x Linear(w, w, bias=False) -> 2 * w^2
+            # 2 x BatchNorm(w) -> 2 * (2 * w) = 4 * w
+            cost_per_block = 2 * (width * width) + 4 * width
+            
+            remaining_budget = effective_limit - cost_fixed
+            max_blocks = int(remaining_budget // cost_per_block)
+            
+            # Prefer configurations with at least 2 blocks
+            if max_blocks >= 2:
+                best_config = (width, max_blocks)
+                break
+        
+        hidden_dim, num_blocks = best_config
+        
+        # Double check exact parameter count
+        def create_model():
+            return OptimizedModel(input_dim, num_classes, hidden_dim, num_blocks)
+            
+        temp_model = create_model()
+        current_params = sum(p.numel() for p in temp_model.parameters() if p.requires_grad)
+        
+        # Reduction loop if calculation was slightly off or margin insufficient
+        while current_params > param_limit:
+            num_blocks -= 1
+            if num_blocks < 1:
+                hidden_dim = 64 # Emergency fallback
+                num_blocks = 1
+            temp_model = create_model()
+            current_params = sum(p.numel() for p in temp_model.parameters() if p.requires_grad)
+            
+        # 2. Training with Restarts
+        # We train multiple models and select the best one based on validation accuracy
+        # to handle the high variance from small dataset size.
+        
+        num_restarts = 3
+        epochs = 60
+        best_val_acc = -1.0
+        best_state_dict = None
+        
+        for run in range(num_restarts):
+            model = create_model().to(device)
+            
+            # Regularization is key for this small dataset
+            optimizer = optim.AdamW(model.parameters(), lr=0.001, weight_decay=0.005)
+            scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
+            # Label smoothing helps with synthetic clusters
+            criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
+            
+            for epoch in range(epochs):
+                model.train()
+                for inputs, targets in train_loader:
+                    inputs, targets = inputs.to(device), targets.to(device)
+                    
+                    # Mixup Augmentation
+                    # Helps smooth decision boundaries for feature vectors
+                    if np.random.random() < 0.4:
+                        lam = np.random.beta(0.4, 0.4)
+                        index = torch.randperm(inputs.size(0)).to(device)
+                        
+                        mixed_inputs = lam * inputs + (1 - lam) * inputs[index]
+                        target_a, target_b = targets, targets[index]
+                        
+                        outputs = model(mixed_inputs)
+                        loss = lam * criterion(outputs, target_a) + (1 - lam) * criterion(outputs, target_b)
+                    else:
+                        outputs = model(inputs)
+                        loss = criterion(outputs, targets)
+                    
+                    optimizer.zero_grad()
+                    loss.backward()
+                    optimizer.step()
                 
-                optimizer.zero_grad()
-                outputs = model(inputs)
-                loss = criterion(outputs, targets)
-                loss.backward()
-                
-                # Gradient Clipping
-                nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-                
-                optimizer.step()
                 scheduler.step()
             
             # Validation
@@ -144,19 +165,19 @@ class Solution:
                 for inputs, targets in val_loader:
                     inputs, targets = inputs.to(device), targets.to(device)
                     outputs = model(inputs)
-                    preds = outputs.argmax(dim=1)
+                    _, preds = torch.max(outputs, 1)
                     correct += (preds == targets).sum().item()
                     total += targets.size(0)
             
-            val_acc = correct / total
+            val_acc = correct / total if total > 0 else 0.0
             
-            # Save best state
-            if val_acc >= best_acc:
-                best_acc = val_acc
-                best_model_state = {k: v.cpu() for k, v in model.state_dict().items()}
+            if val_acc > best_val_acc:
+                best_val_acc = val_acc
+                best_state_dict = copy.deepcopy(model.state_dict())
         
-        # Restore best model
-        if best_model_state is not None:
-            model.load_state_dict(best_model_state)
+        # Return best model
+        final_model = create_model().to(device)
+        if best_state_dict is not None:
+            final_model.load_state_dict(best_state_dict)
             
-        return model
+        return final_model

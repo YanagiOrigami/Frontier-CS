@@ -1,9 +1,10 @@
 import torch
-import textwrap
+import triton
+import triton.language as tl
 
 class Solution:
     def solve(self, spec_path: str = None) -> dict:
-        code = r"""
+        code_str = r"""
 import torch
 import triton
 import triton.language as tl
@@ -12,55 +13,55 @@ import triton.language as tl
     configs=[
         triton.Config({'BLOCK_SIZE': 1024}, num_warps=4),
         triton.Config({'BLOCK_SIZE': 1024}, num_warps=8),
-        triton.Config({'BLOCK_SIZE': 2048}, num_warps=4),
         triton.Config({'BLOCK_SIZE': 2048}, num_warps=8),
         triton.Config({'BLOCK_SIZE': 4096}, num_warps=8),
-        triton.Config({'BLOCK_SIZE': 4096}, num_warps=16),
-        triton.Config({'BLOCK_SIZE': 8192}, num_warps=8),
-        triton.Config({'BLOCK_SIZE': 8192}, num_warps=16),
     ],
     key=['n_elements'],
 )
 @triton.jit
-def vector_add_kernel(
-    x_ptr,
-    y_ptr,
-    output_ptr,
-    n_elements,
-    BLOCK_SIZE: tl.constexpr,
+def add_kernel(
+    x_ptr, 
+    y_ptr, 
+    output_ptr, 
+    n_elements, 
+    BLOCK_SIZE: tl.constexpr
 ):
     pid = tl.program_id(axis=0)
     block_start = pid * BLOCK_SIZE
     offsets = block_start + tl.arange(0, BLOCK_SIZE)
     mask = offsets < n_elements
     
-    # Vectorized load
+    # Load inputs
+    # x and y are guaranteed to be contiguous
     x = tl.load(x_ptr + offsets, mask=mask)
     y = tl.load(y_ptr + offsets, mask=mask)
     
     output = x + y
     
-    # Vectorized store
+    # Store output
     tl.store(output_ptr + offsets, output, mask=mask)
 
 def add(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     """
     Element-wise addition of two vectors using Triton.
-    Optimized for large vectors (2^24 elements).
+    
+    Args:
+        x: Input tensor of shape (16777216,)
+        y: Input tensor of shape (16777216,)
+    
+    Returns:
+        Output tensor of shape (16777216,) with x + y
     """
-    # Verify inputs are contiguous (Triton performance relies on this)
-    if not x.is_contiguous():
-        x = x.contiguous()
-    if not y.is_contiguous():
-        y = y.contiguous()
-        
+    # Allocate output
     output = torch.empty_like(x)
-    n_elements = output.numel()
+    n_elements = x.numel()
     
-    grid = lambda META: ((n_elements + META['BLOCK_SIZE'] - 1) // META['BLOCK_SIZE'],)
+    # Define grid
+    grid = lambda meta: (triton.cdiv(n_elements, meta['BLOCK_SIZE']),)
     
-    vector_add_kernel[grid](x, y, output, n_elements)
+    # Launch kernel
+    add_kernel[grid](x, y, output, n_elements)
     
     return output
 """
-        return {"code": code.strip()}
+        return {"code": code_str}

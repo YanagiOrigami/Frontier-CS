@@ -11,72 +11,77 @@ def gelu(x):
 
 @triton.autotune(
     configs=[
-        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 64, 'BLOCK_K': 32}),
-        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 64}),
-        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 128, 'BLOCK_K': 64}),
-        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 64, 'BLOCK_K': 64}),
-        triton.Config({'BLOCK_M': 256, 'BLOCK_N': 128, 'BLOCK_K': 128}),
-        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 256, 'BLOCK_K': 128}),
-        triton.Config({'BLOCK_M': 256, 'BLOCK_N': 256, 'BLOCK_K': 128}),
+        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 64}, num_stages=4),
+        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 128, 'BLOCK_K': 128}, num_stages=3),
+        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 64, 'BLOCK_K': 128}, num_stages=3),
+        triton.Config({'BLOCK_M': 256, 'BLOCK_N': 128, 'BLOCK_K': 64}, num_stages=5),
+        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 64, 'BLOCK_K': 64}, num_stages=2),
     ],
-    key=['M', 'N', 'K', 'stride_am', 'stride_ak', 'stride_bk', 'stride_bn', 'stride_cm', 'stride_cn']
+    key=('M', 'N', 'K', 'stride_am', 'stride_ak', 'stride_bk', 'stride_bn', 'stride_cm', 'stride_cn')
 )
 @triton.jit
-def matmul_kernel(
-    A_PTR, B_PTR, C_PTR,
-    M: tl.int32, N: tl.int32, K: tl.int32,
-    stride_am: tl.int32, stride_ak: tl.int32,
-    stride_bk: tl.int32, stride_bn: tl.int32,
-    stride_cm: tl.int32, stride_cn: tl.int32,
-    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr
+def kernel(
+    a_ptr, b_ptr, c_ptr,
+    M, N, K,
+    stride_am, stride_ak, stride_bk, stride_bn, stride_cm, stride_cn,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
 ):
     pid_m = tl.program_id(0)
     pid_n = tl.program_id(1)
-    block_m = pid_m * BLOCK_M
-    block_n = pid_n * BLOCK_N
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    mask_m = offs_m < M
+    mask_n = offs_n < N
     acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
-    for start_k in range(0, K, BLOCK_K):
-        offs_m = block_m + tl.arange(0, BLOCK_M)
-        offs_k = start_k + tl.arange(0, BLOCK_K)
-        a_ptrs = A_PTR + offs_m[:, None] * stride_am + offs_k[None, :] * stride_ak
-        a_mask = (offs_m[:, None] < M) & (offs_k[None, :] < K)
-        Ablock = tl.load(a_ptrs, mask=a_mask, other=0.0).to(tl.float32)
-        offs_k_b = start_k + tl.arange(0, BLOCK_K)
-        offs_n = block_n + tl.arange(0, BLOCK_N)
-        b_ptrs = B_PTR + offs_k_b[:, None] * stride_bk + offs_n[None, :] * stride_bn
-        b_mask = (offs_k_b[:, None] < K) & (offs_n[None, :] < N)
-        Bblock = tl.load(b_ptrs, mask=b_mask, other=0.0).to(tl.float32)
-        partial = tl.dot(Ablock, Bblock)
-        acc += partial
-    acc = gelu(acc)
-    offs_m_c = block_m + tl.arange(0, BLOCK_M)
-    offs_n_c = block_n + tl.arange(0, BLOCK_N)
-    c_ptrs = C_PTR + offs_m_c[:, None] * stride_cm + offs_n_c[None, :] * stride_cn
-    c_mask = (offs_m_c[:, None] < M) & (offs_n_c[None, :] < N)
-    tl.store(c_ptrs, acc, mask=c_mask)
+    for k_start in range(0, K, BLOCK_K):
+        offs_k = k_start + tl.arange(0, BLOCK_K)
+        mask_k = offs_k < K
+        a_ptrs = a_ptr + offs_m[:, None] * stride_am + offs_k[None, :] * stride_ak
+        mask_a = mask_m[:, None] & mask_k[None, :]
+        a = tl.load(a_ptrs, mask=mask_a, other=0.0).to(tl.float32)
+        b_ptrs = b_ptr + offs_k[:, None] * stride_bk + offs_n[None, :] * stride_bn
+        mask_b = mask_k[:, None] & mask_n[None, :]
+        b = tl.load(b_ptrs, mask=mask_b, other=0.0).to(tl.float32)
+        acc += tl.dot(a, b)
+    c = gelu(acc)
+    c_ptrs = c_ptr + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn
+    mask_c = mask_m[:, None] & mask_n[None, :]
+    tl.store(c_ptrs, c, mask=mask_c)
 
 def matmul(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     M, K_a = a.shape
     K_b, N = b.shape
     assert K_a == K_b
-    K = K_a
-    C = torch.empty((M, N), dtype=a.dtype, device=a.device)
+    c = torch.empty((M, N), dtype=a.dtype, device=a.device)
     stride_am = a.stride(0)
     stride_ak = a.stride(1)
     stride_bk = b.stride(0)
     stride_bn = b.stride(1)
-    stride_cm = C.stride(0)
-    stride_cn = C.stride(1)
+    stride_cm = c.stride(0)
+    stride_cn = c.stride(1)
     def grid(meta):
+        BLOCK_M = meta['BLOCK_M']
+        BLOCK_N = meta['BLOCK_N']
         return (
-            triton.cdiv(M, meta['BLOCK_M']),
-            triton.cdiv(N, meta['BLOCK_N'])
+            triton.cdiv(M, BLOCK_M),
+            triton.cdiv(N, BLOCK_N),
         )
-    matmul_kernel[grid](
-        a, b, C,
-        M, N, K,
-        stride_am, stride_ak, stride_bk, stride_bn, stride_cm, stride_cn
+    kernel[grid](
+        a.data_ptr(),
+        b.data_ptr(),
+        c.data_ptr(),
+        M,
+        N,
+        K_a,
+        stride_am,
+        stride_ak,
+        stride_bk,
+        stride_bn,
+        stride_cm,
+        stride_cn,
     )
-    return C
+    return c
 """
         return {"code": code}

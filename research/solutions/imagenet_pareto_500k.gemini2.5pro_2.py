@@ -1,97 +1,73 @@
 import torch
 import torch.nn as nn
 import torch.optim as optim
+import copy
+
+class _Model(nn.Module):
+    def __init__(self, input_dim: int, num_classes: int):
+        super().__init__()
+        # This architecture is a deep MLP with BatchNorm and Dropout, designed to
+        # maximize model capacity under the 500,000 parameter constraint while
+        # providing strong regularization for the small dataset.
+        # Total trainable parameters: 499,428
+        self.layers = nn.Sequential(
+            nn.Linear(input_dim, 600),
+            nn.BatchNorm1d(600),
+            nn.ReLU(inplace=True),
+            nn.Dropout(0.5),
+            
+            nn.Linear(600, 300),
+            nn.BatchNorm1d(300),
+            nn.ReLU(inplace=True),
+            nn.Dropout(0.3),
+
+            nn.Linear(300, 200),
+            nn.BatchNorm1d(200),
+            nn.ReLU(inplace=True),
+            nn.Dropout(0.3),
+
+            nn.Linear(200, num_classes)
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.layers(x)
+
 
 class Solution:
-    """
-    Solution for the ImageNet Pareto Optimization problem (500K variant).
-    This solution uses a Multi-Layer Perceptron (MLP) architecture carefully
-    designed to stay under the 500,000 parameter limit while maximizing capacity.
-    The training strategy employs modern techniques for fast convergence and
-    good generalization, including AdamW optimizer, OneCycleLR scheduler,
-    label smoothing, and early stopping.
-    """
-    
-    class _CustomModel(nn.Module):
+    def solve(self, train_loader: torch.utils.data.DataLoader, 
+              val_loader: torch.utils.data.DataLoader, 
+              metadata: dict = None) -> torch.nn.Module:
         """
-        A custom MLP model with configurable hidden layers, batch normalization,
-        GELU activation, and dropout for regularization.
-        """
-        def __init__(self, input_dim: int, num_classes: int, hidden_dims: list, dropout_p: float):
-            super().__init__()
-            layers = []
-            current_dim = input_dim
-            for h_dim in hidden_dims:
-                layers.append(nn.Linear(current_dim, h_dim))
-                layers.append(nn.BatchNorm1d(h_dim))
-                layers.append(nn.GELU())
-                layers.append(nn.Dropout(dropout_p))
-                current_dim = h_dim
-            
-            layers.append(nn.Linear(current_dim, num_classes))
-            self.net = nn.Sequential(*layers)
-
-        def forward(self, x: torch.Tensor) -> torch.Tensor:
-            return self.net(x)
-
-    def solve(self, train_loader, val_loader, metadata: dict = None) -> torch.nn.Module:
-        """
-        Trains and returns a model for the given task.
+        Train a model and return it.
         
         Args:
-            train_loader: DataLoader for the training set.
-            val_loader: DataLoader for the validation set.
-            metadata: A dictionary containing problem-specific details.
+            train_loader: PyTorch DataLoader with training data
+            val_loader: PyTorch DataLoader with validation data
+            metadata: Dict with problem-specific information
         
         Returns:
-            A trained PyTorch model.
+            Trained torch.nn.Module ready for evaluation
         """
         device = torch.device(metadata.get("device", "cpu"))
         input_dim = metadata["input_dim"]
         num_classes = metadata["num_classes"]
 
-        # --- Hyperparameters ---
-        # Architecture: 3 hidden layers, designed to be close to the 500K param limit.
-        # Calculated params: ~477,608
-        HIDDEN_DIMS = [480, 360, 240] 
-        # Regularization
-        DROPOUT_P = 0.3
-        LABEL_SMOOTHING = 0.1
-        WEIGHT_DECAY = 1e-2
-        # Optimizer & Scheduler
-        LEARNING_RATE = 1.2e-3
-        EPOCHS = 350
-        # Early Stopping
-        PATIENCE = 40
+        model = _Model(input_dim, num_classes).to(device)
 
-        # --- Model Initialization ---
-        model = self._CustomModel(
-            input_dim=input_dim,
-            num_classes=num_classes,
-            hidden_dims=HIDDEN_DIMS,
-            dropout_p=DROPOUT_P,
-        ).to(device)
+        # Hyperparameters chosen for robust training and good generalization.
+        # A longer training schedule with cosine annealing helps find a good minimum.
+        num_epochs = 400
+        learning_rate = 1e-3
+        weight_decay = 5e-4
+        
+        criterion = nn.CrossEntropyLoss()
+        optimizer = optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
+        scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=num_epochs)
 
-        # --- Training Setup ---
-        criterion = nn.CrossEntropyLoss(label_smoothing=LABEL_SMOOTHING)
-        optimizer = optim.AdamW(
-            model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY
-        )
-        # OneCycleLR is highly effective for fast convergence.
-        scheduler = optim.lr_scheduler.OneCycleLR(
-            optimizer,
-            max_lr=LEARNING_RATE,
-            epochs=EPOCHS,
-            steps_per_epoch=len(train_loader),
-            pct_start=0.3  # Spend 30% of time warming up
-        )
-
-        # --- Training Loop with Early Stopping ---
-        best_val_acc = 0.0
+        best_val_accuracy = 0.0
         best_model_state = None
-        epochs_no_improve = 0
 
-        for epoch in range(EPOCHS):
+        for epoch in range(num_epochs):
             # Training phase
             model.train()
             for inputs, targets in train_loader:
@@ -102,36 +78,31 @@ class Solution:
                 loss = criterion(outputs, targets)
                 loss.backward()
                 optimizer.step()
-                scheduler.step()
+            
+            scheduler.step()
 
             # Validation phase
             model.eval()
-            val_correct = 0
-            val_total = 0
+            correct = 0
+            total = 0
             with torch.no_grad():
                 for inputs, targets in val_loader:
                     inputs, targets = inputs.to(device), targets.to(device)
                     outputs = model(inputs)
                     _, predicted = torch.max(outputs.data, 1)
-                    val_total += targets.size(0)
-                    val_correct += (predicted == targets).sum().item()
+                    total += targets.size(0)
+                    correct += (predicted == targets).sum().item()
+            
+            current_val_accuracy = correct / total
+            
+            # Save the model state with the best validation accuracy (early stopping)
+            if current_val_accuracy > best_val_accuracy:
+                best_val_accuracy = current_val_accuracy
+                best_model_state = copy.deepcopy(model.state_dict())
 
-            val_acc = val_correct / val_total
-
-            # Check for improvement and save the best model
-            if val_acc > best_val_acc:
-                best_val_acc = val_acc
-                # Save the model state to CPU memory to be safe
-                best_model_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
-                epochs_no_improve = 0
-            else:
-                epochs_no_improve += 1
-                if epochs_no_improve >= PATIENCE:
-                    break
-        
-        # Load the best performing model state
+        # Load the best performing model state for the final return
         if best_model_state:
             model.load_state_dict(best_model_state)
-            model.to(device)
-        
-        return model
+            
+        # Ensure the model is on CPU for evaluation as per environment spec
+        return model.to(torch.device("cpu"))

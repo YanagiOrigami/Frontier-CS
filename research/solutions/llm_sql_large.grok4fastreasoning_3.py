@@ -1,4 +1,9 @@
 import pandas as pd
+import random
+
+class TrieNode:
+    def __init__(self):
+        self.children = {}
 
 class Solution:
     def solve(
@@ -12,75 +17,80 @@ class Solution:
         distinct_value_threshold: float = 0.7,
         parallel: bool = True,
     ) -> pd.DataFrame:
-        if col_merge is None:
-            col_merge = []
-        
-        # Apply column merges
-        new_df = df.copy()
-        used_cols = set()
-        new_column_order = []
-        for group in col_merge:
-            group = [str(c) for c in group]  # Ensure strings
-            if len(group) == 1:
-                col = group[0]
-                if col in new_df.columns:
-                    new_column_order.append(col)
-                    used_cols.add(col)
-                continue
-            
-            # Merge group
-            merged_name = '_'.join(sorted(group))
-            merged_values = []
-            for idx in range(len(new_df)):
-                vals = [str(new_df.iloc[idx][c]) for c in group if c in new_df.columns]
-                merged_values.append(''.join(vals))
-            new_df[merged_name] = merged_values
-            new_column_order.append(merged_name)
-            used_cols.update(group)
-        
-        # Add remaining columns
-        for col in df.columns:
-            if col not in used_cols:
-                new_column_order.append(col)
-        
-        # Drop original columns that were merged (groups >1)
-        for col in list(new_df.columns):
-            if col in used_cols and col not in new_column_order:
-                new_df = new_df.drop(columns=[col])
-        
-        # Reorder to new_column_order
-        existing_cols = [c for c in new_column_order if c in new_df.columns]
-        new_df = new_df[existing_cols]
-        df = new_df
-        
-        N, M = df.shape
+        df = df.copy()
+        if col_merge is not None:
+            for group in col_merge:
+                if len(group) > 1:
+                    new_name = '_'.join(group)
+                    df[new_name] = df.apply(lambda row: ''.join(str(row[c]) for c in group), axis=1)
+                    df = df.drop(columns=group)
+        all_cols = list(df.columns)
+        M = len(all_cols)
         if M <= 1:
             return df
-        
-        # Precompute string data
-        data = df.astype(str).values
-        
-        # Compute scores for each column
-        col_scores = []
-        for c in range(M):
-            seen = set()
-            num_hits = 0
-            col_len_sum = 0
-            for i in range(N):
-                val = data[i, c]
-                col_len_sum += len(val)
-                if i > 0 and val in seen:
-                    num_hits += 1
-                seen.add(val)
-            avg_len = col_len_sum / N if N > 0 else 0
-            hit_frac = num_hits / max(1, N - 1)
-            score = hit_frac * avg_len
-            col_scores.append(score)
-        
-        # Get permutation: sort by decreasing score
-        sorted_cols = sorted(range(M), key=lambda c: col_scores[c], reverse=True)
-        
-        # Reorder DataFrame
-        df = df.iloc[:, sorted_cols]
-        
-        return df
+        N = len(df)
+        sample_size = row_stop * 250
+        R = min(N, sample_size)
+        if R < 2:
+            return df
+        sample_indices = random.sample(range(N), R)
+        str_values = [[str(df.iloc[si][all_cols[c]]) for c in range(M)] for si in sample_indices]
+        beam_width = max(1, col_stop)
+        current_beam = [(0.0, [])]
+        total_evals = 0
+        for level in range(M):
+            all_possible_perms = []
+            for _, perm in current_beam:
+                used = set(perm)
+                remaining = [j for j in range(M) if j not in used]
+                for j in remaining:
+                    all_possible_perms.append(perm + [j])
+            extensions = []
+            broke_early = False
+            for new_perm in all_possible_perms:
+                total_evals += 1
+                if total_evals > early_stop:
+                    broke_early = True
+                    break
+                strs = [''.join(str_values[r][j] for j in new_perm) for r in range(R)]
+                total_len = sum(len(s) for s in strs)
+                if total_len == 0:
+                    score = 0.0
+                else:
+                    root = TrieNode()
+                    s = strs[0]
+                    node = root
+                    for char in s:
+                        if char not in node.children:
+                            node.children[char] = TrieNode()
+                        node = node.children[char]
+                    sum_lcp = 0.0
+                    for ii in range(1, R):
+                        s = strs[ii]
+                        node = root
+                        depth = 0
+                        for char in s:
+                            if char in node.children:
+                                node = node.children[char]
+                                depth += 1
+                            else:
+                                break
+                        sum_lcp += depth
+                        node = root
+                        for char in s:
+                            if char not in node.children:
+                                node.children[char] = TrieNode()
+                            node = node.children[char]
+                    score = sum_lcp / total_len
+                extensions.append((score, new_perm))
+            if broke_early:
+                break
+            extensions.sort(key=lambda x: x[0], reverse=True)
+            current_beam = extensions[:beam_width]
+        best_score, best_perm = max(current_beam, key=lambda x: x[0])
+        used = set(best_perm)
+        remaining = [j for j in range(M) if j not in used]
+        full_perm = best_perm + remaining
+        reordered_cols = [all_cols[i] for i in full_perm]
+        result_df = df[reordered_cols]
+        return result_df

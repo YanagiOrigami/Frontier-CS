@@ -1,131 +1,251 @@
-import os
 import math
-import copy
 import random
-from typing import Dict, Tuple, Optional, List
+from typing import List, Tuple, Optional, Dict
 
-import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 
-class _Standardize(nn.Module):
-    def __init__(self, input_dim: int, eps: float = 1e-6):
-        super().__init__()
-        self.eps = eps
-        self.register_buffer("mean", torch.zeros(input_dim, dtype=torch.float32))
-        self.register_buffer("invstd", torch.ones(input_dim, dtype=torch.float32))
-
-    def set_stats(self, mean: torch.Tensor, std: torch.Tensor):
-        mean = mean.detach().to(dtype=torch.float32)
-        std = std.detach().to(dtype=torch.float32)
-        invstd = 1.0 / torch.clamp(std, min=self.eps)
-        self.mean.copy_(mean)
-        self.invstd.copy_(invstd)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return (x - self.mean) * self.invstd
+def _flatten_inputs(x: torch.Tensor) -> torch.Tensor:
+    if x.dim() > 2:
+        return x.view(x.size(0), -1)
+    return x
 
 
-class _ResidualMLPBlock(nn.Module):
-    def __init__(self, dim: int, hidden: int, dropout: float = 0.05):
-        super().__init__()
-        self.ln = nn.LayerNorm(dim)
-        self.fc1 = nn.Linear(dim, hidden)
-        self.fc2 = nn.Linear(hidden, dim)
-        self.drop = nn.Dropout(dropout)
-        self.act = nn.GELU(approximate="tanh")
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        h = self.ln(x)
-        h = self.fc1(h)
-        h = self.act(h)
-        h = self.fc2(h)
-        h = self.drop(h)
-        return x + h
-
-
-class _MLPNet(nn.Module):
-    def __init__(self, input_dim: int, num_classes: int, dim: int, hidden: int, blocks: int, dropout: float = 0.05):
-        super().__init__()
-        self.standardize = _Standardize(input_dim)
-        self.stem = nn.Sequential(
-            nn.Linear(input_dim, dim),
-            nn.GELU(approximate="tanh"),
-        )
-        self.blocks = nn.Sequential(*[_ResidualMLPBlock(dim, hidden, dropout=dropout) for _ in range(blocks)])
-        self.final_ln = nn.LayerNorm(dim)
-        self.head = nn.Linear(dim, num_classes)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if not torch.is_tensor(x):
-            x = torch.as_tensor(x)
-        x = x.to(dtype=torch.float32)
-        if x.dim() > 2:
-            x = x.view(x.size(0), -1)
-        x = self.standardize(x)
-        x = self.stem(x)
-        x = self.blocks(x)
-        x = self.final_ln(x)
-        return self.head(x)
-
-
-def _count_trainable_params(model: nn.Module) -> int:
-    return sum(p.numel() for p in model.parameters() if p.requires_grad)
-
-
-def _loader_to_tensors(loader, device: torch.device) -> Tuple[torch.Tensor, torch.Tensor]:
+@torch.no_grad()
+def _collect_loader(loader, input_dim: int, device: str = "cpu") -> Tuple[torch.Tensor, torch.Tensor]:
     xs = []
     ys = []
-    for batch in loader:
-        if isinstance(batch, (tuple, list)) and len(batch) >= 2:
-            x, y = batch[0], batch[1]
-        else:
-            raise ValueError("DataLoader must yield (inputs, targets)")
-        x = torch.as_tensor(x)
-        y = torch.as_tensor(y)
-        if x.dim() > 2:
-            x = x.view(x.size(0), -1)
-        xs.append(x.to(device=device, dtype=torch.float32))
-        ys.append(y.to(device=device, dtype=torch.long))
-    x_all = torch.cat(xs, dim=0) if len(xs) else torch.empty((0,), device=device)
-    y_all = torch.cat(ys, dim=0) if len(ys) else torch.empty((0,), device=device, dtype=torch.long)
-    return x_all, y_all
+    for xb, yb in loader:
+        xb = _flatten_inputs(xb).to(device=device, dtype=torch.float32)
+        if xb.size(1) != input_dim:
+            xb = xb[:, :input_dim].contiguous()
+        yb = yb.to(device=device, dtype=torch.long)
+        xs.append(xb.cpu())
+        ys.append(yb.cpu())
+    x = torch.cat(xs, dim=0)
+    y = torch.cat(ys, dim=0)
+    return x, y
 
 
-@torch.inference_mode()
-def _accuracy(model: nn.Module, x: torch.Tensor, y: torch.Tensor, batch_size: int = 1024) -> float:
-    model.eval()
-    n = int(y.numel())
-    if n == 0:
-        return 0.0
-    correct = 0
-    for i in range(0, n, batch_size):
-        xb = x[i:i + batch_size]
-        yb = y[i:i + batch_size]
-        logits = model(xb)
-        pred = logits.argmax(dim=1)
-        correct += int((pred == yb).sum().item())
-    return correct / n
+def _standardize_fit(x: torch.Tensor, eps: float = 1e-6) -> Tuple[torch.Tensor, torch.Tensor]:
+    mean = x.mean(dim=0)
+    var = x.var(dim=0, unbiased=False)
+    inv_std = torch.rsqrt(var + eps)
+    return mean, inv_std
 
 
-def _make_param_groups(model: nn.Module, weight_decay: float) -> List[Dict]:
-    decay = []
-    no_decay = []
-    for name, p in model.named_parameters():
-        if not p.requires_grad:
-            continue
-        if p.ndim == 1 or name.endswith(".bias") or ".ln." in name or "layernorm" in name.lower() or "final_ln" in name.lower():
-            no_decay.append(p)
-        else:
-            decay.append(p)
-    groups = []
-    if decay:
-        groups.append({"params": decay, "weight_decay": weight_decay})
-    if no_decay:
-        groups.append({"params": no_decay, "weight_decay": 0.0})
-    return groups
+def _standardize_apply(x: torch.Tensor, mean: torch.Tensor, inv_std: torch.Tensor) -> torch.Tensor:
+    return (x - mean) * inv_std
+
+
+def _class_means(x: torch.Tensor, y: torch.Tensor, num_classes: int) -> Tuple[torch.Tensor, torch.Tensor]:
+    d = x.size(1)
+    sums = torch.zeros(num_classes, d, dtype=x.dtype, device=x.device)
+    sums.index_add_(0, y, x)
+    counts = torch.bincount(y, minlength=num_classes).to(dtype=x.dtype, device=x.device).clamp_min(1.0)
+    means = sums / counts.unsqueeze(1)
+    return means, counts
+
+
+def _accuracy_from_logits(logits: torch.Tensor, y: torch.Tensor) -> float:
+    pred = logits.argmax(dim=1)
+    return (pred == y).to(torch.float32).mean().item()
+
+
+class FixedLinearModel(nn.Module):
+    def __init__(self, mean: torch.Tensor, inv_std: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor):
+        super().__init__()
+        self.register_buffer("mean", mean.clone().detach().to(torch.float32))
+        self.register_buffer("inv_std", inv_std.clone().detach().to(torch.float32))
+        self.register_buffer("weight", weight.clone().detach().to(torch.float32))
+        self.register_buffer("bias", bias.clone().detach().to(torch.float32))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = _flatten_inputs(x).to(dtype=torch.float32)
+        x = (x - self.mean) * self.inv_std
+        return F.linear(x, self.weight, self.bias)
+
+
+class RandomFeatureLinearModel(nn.Module):
+    def __init__(
+        self,
+        mean: torch.Tensor,
+        inv_std: torch.Tensor,
+        rf_weight: torch.Tensor,
+        rf_bias: torch.Tensor,
+        act: str,
+        out_weight: torch.Tensor,
+        out_bias: torch.Tensor,
+        l2_normalize_features: bool = False,
+        logit_scale: float = 1.0,
+    ):
+        super().__init__()
+        self.register_buffer("mean", mean.clone().detach().to(torch.float32))
+        self.register_buffer("inv_std", inv_std.clone().detach().to(torch.float32))
+        self.register_buffer("rf_weight", rf_weight.clone().detach().to(torch.float32))  # (m, d)
+        self.register_buffer("rf_bias", rf_bias.clone().detach().to(torch.float32))      # (m,)
+        self.register_buffer("out_weight", out_weight.clone().detach().to(torch.float32))  # (C, m)
+        self.register_buffer("out_bias", out_bias.clone().detach().to(torch.float32))      # (C,)
+        self.act = act
+        self.l2_normalize_features = l2_normalize_features
+        self.register_buffer("logit_scale", torch.tensor(float(logit_scale), dtype=torch.float32))
+
+    def _activate(self, z: torch.Tensor) -> torch.Tensor:
+        if self.act == "relu":
+            return F.relu(z)
+        if self.act == "gelu":
+            return F.gelu(z)
+        if self.act == "tanh":
+            return torch.tanh(z)
+        if self.act == "cos":
+            return torch.cos(z)
+        return z
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = _flatten_inputs(x).to(dtype=torch.float32)
+        x = (x - self.mean) * self.inv_std
+        z = F.linear(x, self.rf_weight, self.rf_bias)
+        z = self._activate(z)
+        if self.l2_normalize_features:
+            z = z / (z.norm(dim=1, keepdim=True) + 1e-6)
+        logits = F.linear(z, self.out_weight, self.out_bias)
+        return logits * self.logit_scale
+
+
+class WeightedEnsemble(nn.Module):
+    def __init__(self, models: List[nn.Module], weights: List[float]):
+        super().__init__()
+        self.models = nn.ModuleList(models)
+        w = torch.tensor(weights, dtype=torch.float32)
+        self.register_buffer("weights", w)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        out = None
+        for i, m in enumerate(self.models):
+            y = m(x) * self.weights[i]
+            out = y if out is None else (out + y)
+        return out
+
+
+def _fit_lda_full(
+    x: torch.Tensor,
+    y: torch.Tensor,
+    num_classes: int,
+    shrink_rel: float,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    x64 = x.to(torch.float64)
+    y64 = y.to(torch.long)
+
+    means, counts = _class_means(x64, y64, num_classes)  # (C, d)
+    x_centered = x64 - means[y64]
+    n = x64.size(0)
+    cov = (x_centered.t() @ x_centered) / max(1, (n - 1))
+    scale = cov.diag().mean().clamp_min(1e-12)
+    alpha = float(shrink_rel) * float(scale.item())
+    cov_reg = cov + torch.eye(cov.size(0), dtype=torch.float64, device=cov.device) * alpha
+
+    chol = torch.linalg.cholesky(cov_reg)
+    inv_cov_mu = torch.cholesky_solve(means.t(), chol)  # (d, C)
+    w = inv_cov_mu.t().to(torch.float32)  # (C, d)
+    b = (-0.5 * (means * inv_cov_mu.t()).sum(dim=1)).to(torch.float32)  # (C,)
+    return w, b
+
+
+def _fit_diag_shared(
+    x: torch.Tensor,
+    y: torch.Tensor,
+    num_classes: int,
+    shrink_rel: float,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    x64 = x.to(torch.float64)
+    y64 = y.to(torch.long)
+    means, _ = _class_means(x64, y64, num_classes)
+    x_centered = x64 - means[y64]
+    var = (x_centered * x_centered).mean(dim=0).clamp_min(1e-12)
+    scale = var.mean().clamp_min(1e-12)
+    alpha = float(shrink_rel) * float(scale.item())
+    denom = (var + alpha).to(torch.float32)  # (d,)
+    means32 = means.to(torch.float32)
+    w = means32 / denom.unsqueeze(0)
+    b = (-0.5 * (means32 * means32 / denom.unsqueeze(0)).sum(dim=1))
+    return w, b
+
+
+def _fit_centroid(
+    x: torch.Tensor,
+    y: torch.Tensor,
+    num_classes: int,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    means, _ = _class_means(x, y, num_classes)
+    w = means.to(torch.float32)
+    b = (-0.5 * (w * w).sum(dim=1))
+    return w, b
+
+
+def _make_random_matrix(m: int, d: int, seed: int, kind: str, gamma: float = 1.0) -> Tuple[torch.Tensor, torch.Tensor]:
+    g = torch.Generator(device="cpu")
+    g.manual_seed(seed)
+    if kind == "cos":
+        w = torch.randn(m, d, generator=g, dtype=torch.float32) * (gamma / math.sqrt(d))
+        b = torch.rand(m, generator=g, dtype=torch.float32) * (2.0 * math.pi)
+        return w, b
+    w = torch.randn(m, d, generator=g, dtype=torch.float32) * (gamma / math.sqrt(d))
+    b = torch.randn(m, generator=g, dtype=torch.float32) * 0.1
+    return w, b
+
+
+def _rf_transform(
+    x: torch.Tensor,
+    rf_w: torch.Tensor,
+    rf_b: torch.Tensor,
+    act: str,
+    l2_normalize_features: bool = False,
+) -> torch.Tensor:
+    z = F.linear(x, rf_w, rf_b)
+    if act == "relu":
+        z = F.relu(z)
+    elif act == "gelu":
+        z = F.gelu(z)
+    elif act == "tanh":
+        z = torch.tanh(z)
+    elif act == "cos":
+        z = torch.cos(z)
+    if l2_normalize_features:
+        z = z / (z.norm(dim=1, keepdim=True) + 1e-6)
+    return z
+
+
+def _fit_rf_centroid(
+    z: torch.Tensor,
+    y: torch.Tensor,
+    num_classes: int,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    means, _ = _class_means(z, y, num_classes)
+    w = means.to(torch.float32)
+    b = (-0.5 * (w * w).sum(dim=1))
+    return w, b
+
+
+def _fit_rf_diag_shared(
+    z: torch.Tensor,
+    y: torch.Tensor,
+    num_classes: int,
+    shrink_rel: float,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    z64 = z.to(torch.float64)
+    y64 = y.to(torch.long)
+    means, _ = _class_means(z64, y64, num_classes)
+    z_centered = z64 - means[y64]
+    var = (z_centered * z_centered).mean(dim=0).clamp_min(1e-12)
+    scale = var.mean().clamp_min(1e-12)
+    alpha = float(shrink_rel) * float(scale.item())
+    denom = (var + alpha).to(torch.float32)
+    means32 = means.to(torch.float32)
+    w = means32 / denom.unsqueeze(0)
+    b = (-0.5 * (means32 * means32 / denom.unsqueeze(0)).sum(dim=1))
+    return w, b
 
 
 class Solution:
@@ -134,166 +254,173 @@ class Solution:
             metadata = {}
         input_dim = int(metadata.get("input_dim", 384))
         num_classes = int(metadata.get("num_classes", 128))
-        param_limit = int(metadata.get("param_limit", 1_000_000))
-        device_str = str(metadata.get("device", "cpu"))
-        device = torch.device(device_str)
+        device = str(metadata.get("device", "cpu"))
+
+        torch.set_num_threads(max(1, int(torch.get_num_threads())))
+        torch.manual_seed(0)
+        random.seed(0)
+
+        x_train, y_train = _collect_loader(train_loader, input_dim=input_dim, device=device)
+        x_val, y_val = _collect_loader(val_loader, input_dim=input_dim, device=device)
+
+        mean_std, inv_std_std = _standardize_fit(x_train)
+        mean_raw = torch.zeros_like(mean_std)
+        inv_std_raw = torch.ones_like(inv_std_std)
+
+        candidates: List[Tuple[str, nn.Module, float, torch.Tensor]] = []
+
+        def eval_and_add(name: str, model: nn.Module):
+            model.eval()
+            with torch.no_grad():
+                logits = model(x_val)
+                acc = _accuracy_from_logits(logits, y_val)
+            candidates.append((name, model, acc, logits))
+
+        # Input-space candidates (raw)
+        for shrink in [0.0, 1e-4, 3e-4, 1e-3, 3e-3, 1e-2, 3e-2, 1e-1, 3e-1, 1.0]:
+            try:
+                w, b = _fit_lda_full(x_train, y_train, num_classes=num_classes, shrink_rel=shrink)
+                m = FixedLinearModel(mean_raw, inv_std_raw, w, b)
+                eval_and_add(f"lda_raw_{shrink:g}", m)
+            except Exception:
+                pass
+
+        for shrink in [0.0, 1e-4, 1e-3, 1e-2, 1e-1, 1.0]:
+            try:
+                w, b = _fit_diag_shared(x_train, y_train, num_classes=num_classes, shrink_rel=shrink)
+                m = FixedLinearModel(mean_raw, inv_std_raw, w, b)
+                eval_and_add(f"diag_raw_{shrink:g}", m)
+            except Exception:
+                pass
 
         try:
-            torch.set_num_interop_threads(1)
+            w, b = _fit_centroid(x_train, y_train, num_classes=num_classes)
+            m = FixedLinearModel(mean_raw, inv_std_raw, w, b)
+            eval_and_add("centroid_raw", m)
         except Exception:
             pass
+
+        # Input-space candidates (standardized)
+        x_train_s = _standardize_apply(x_train, mean_std, inv_std_std)
+        for shrink in [0.0, 1e-4, 3e-4, 1e-3, 3e-3, 1e-2, 3e-2, 1e-1, 3e-1, 1.0]:
+            try:
+                w, b = _fit_lda_full(x_train_s, y_train, num_classes=num_classes, shrink_rel=shrink)
+                m = FixedLinearModel(mean_std, inv_std_std, w, b)
+                eval_and_add(f"lda_std_{shrink:g}", m)
+            except Exception:
+                pass
+
+        for shrink in [0.0, 1e-4, 1e-3, 1e-2, 1e-1, 1.0]:
+            try:
+                w, b = _fit_diag_shared(x_train_s, y_train, num_classes=num_classes, shrink_rel=shrink)
+                m = FixedLinearModel(mean_std, inv_std_std, w, b)
+                eval_and_add(f"diag_std_{shrink:g}", m)
+            except Exception:
+                pass
+
         try:
-            torch.set_num_threads(min(8, os.cpu_count() or 1))
+            w, b = _fit_centroid(x_train_s, y_train, num_classes=num_classes)
+            m = FixedLinearModel(mean_std, inv_std_std, w, b)
+            eval_and_add("centroid_std", m)
         except Exception:
             pass
 
-        seed = 0
-        random.seed(seed)
-        np.random.seed(seed)
-        torch.manual_seed(seed)
-
-        x_train, y_train = _loader_to_tensors(train_loader, device)
-        x_val, y_val = _loader_to_tensors(val_loader, device)
-
-        if x_train.dim() != 2 or x_train.size(1) != input_dim:
-            x_train = x_train.view(x_train.size(0), -1)
-        if x_val.numel() and (x_val.dim() != 2 or x_val.size(1) != input_dim):
-            x_val = x_val.view(x_val.size(0), -1)
-
-        train_mean = x_train.mean(dim=0)
-        train_std = x_train.std(dim=0, unbiased=False)
-
-        candidates = [
-            (576, 144, 4, 0.05),
-            (640, 160, 3, 0.05),
-            (560, 140, 4, 0.05),
-            (512, 128, 5, 0.05),
-            (512, 128, 4, 0.05),
-            (448, 112, 5, 0.05),
-            (384, 96, 6, 0.05),
-            (384, 96, 4, 0.05),
+        # Random feature candidates (standardized input in-model)
+        rf_specs = [
+            ("relu", 1024, 11, 1.0, False),
+            ("relu", 2048, 12, 1.0, False),
+            ("gelu", 2048, 13, 1.0, False),
+            ("cos", 2048, 14, 1.0, False),
         ]
 
-        model = None
-        for dim, hidden, blocks, dropout in candidates:
-            m = _MLPNet(input_dim, num_classes, dim=dim, hidden=hidden, blocks=blocks, dropout=dropout).to(device)
-            m.standardize.set_stats(train_mean, train_std)
-            if _count_trainable_params(m) <= param_limit:
-                model = m
-                break
-        if model is None:
-            model = _MLPNet(input_dim, num_classes, dim=256, hidden=64, blocks=3, dropout=0.05).to(device)
-            model.standardize.set_stats(train_mean, train_std)
+        for act, mdim, seed, gamma, l2norm in rf_specs:
+            try:
+                rf_w, rf_b = _make_random_matrix(mdim, input_dim, seed=seed, kind=act, gamma=gamma)
+                z_train = _rf_transform(x_train_s, rf_w, rf_b, act=act, l2_normalize_features=l2norm)
+                w_cent, b_cent = _fit_rf_centroid(z_train, y_train, num_classes=num_classes)
+                model_cent = RandomFeatureLinearModel(
+                    mean=mean_std,
+                    inv_std=inv_std_std,
+                    rf_weight=rf_w,
+                    rf_bias=rf_b,
+                    act=act,
+                    out_weight=w_cent,
+                    out_bias=b_cent,
+                    l2_normalize_features=l2norm,
+                    logit_scale=1.0,
+                )
+                eval_and_add(f"rf_cent_{act}_{mdim}", model_cent)
 
-        if _count_trainable_params(model) > param_limit:
-            for p in model.parameters():
-                p.requires_grad_(False)
+                for shrink in [0.0, 1e-4, 1e-3, 1e-2, 1e-1]:
+                    w_d, b_d = _fit_rf_diag_shared(z_train, y_train, num_classes=num_classes, shrink_rel=shrink)
+                    model_d = RandomFeatureLinearModel(
+                        mean=mean_std,
+                        inv_std=inv_std_std,
+                        rf_weight=rf_w,
+                        rf_bias=rf_b,
+                        act=act,
+                        out_weight=w_d,
+                        out_bias=b_d,
+                        l2_normalize_features=l2norm,
+                        logit_scale=1.0,
+                    )
+                    eval_and_add(f"rf_diag_{act}_{mdim}_{shrink:g}", model_d)
+            except Exception:
+                pass
+
+        # Ensemble among best few
+        if not candidates:
+            # As a last resort, return a simple centroid classifier in standardized space
+            w, b = _fit_centroid(x_train_s, y_train, num_classes=num_classes)
+            model = FixedLinearModel(mean_std, inv_std_std, w, b).to(device)
             model.eval()
             return model
 
-        batch_size = 256
-        n_train = int(y_train.numel())
-        steps_per_epoch = max(1, (n_train + batch_size - 1) // batch_size)
+        candidates.sort(key=lambda t: t[2], reverse=True)
+        best_name, best_model, best_acc, best_logits = candidates[0]
 
-        max_epochs = 220
-        min_epochs = 30
-        eval_every = 1
+        top_k = min(5, len(candidates))
+        top = candidates[:top_k]
 
-        weight_decay = 2e-4
-        base_lr = 2.8e-3
-        label_smoothing = 0.06
-        grad_clip = 1.0
+        best_ens_model = None
+        best_ens_acc = best_acc
 
-        param_groups = _make_param_groups(model, weight_decay=weight_decay)
-        optimizer = torch.optim.AdamW(param_groups, lr=base_lr, betas=(0.9, 0.95), eps=1e-8)
+        # Prepare per-model scaling based on val logits std to stabilize logit magnitudes
+        scales = []
+        for _, _, _, lg in top:
+            s = float(lg.std().item())
+            scales.append(1.0 / (s + 1e-6))
 
-        total_steps = max_epochs * steps_per_epoch
-        warmup_steps = max(20, int(0.08 * total_steps))
+        # Pair ensembles
+        for i in range(top_k):
+            for j in range(i + 1, top_k):
+                li = top[i][3]
+                lj = top[j][3]
+                wi = scales[i]
+                wj = scales[j]
+                logits_sum = li * wi + lj * wj
+                acc = _accuracy_from_logits(logits_sum, y_val)
+                if acc > best_ens_acc:
+                    best_ens_acc = acc
+                    best_ens_model = WeightedEnsemble([top[i][1], top[j][1]], [wi, wj])
 
-        def lr_for_step(t: int) -> float:
-            if t < warmup_steps:
-                return base_lr * (t + 1) / warmup_steps
-            tt = (t - warmup_steps) / max(1, (total_steps - warmup_steps))
-            return base_lr * (0.5 * (1.0 + math.cos(math.pi * tt)))
+        # Triple ensembles
+        for i in range(top_k):
+            for j in range(i + 1, top_k):
+                for k in range(j + 1, top_k):
+                    li = top[i][3]
+                    lj = top[j][3]
+                    lk = top[k][3]
+                    wi = scales[i]
+                    wj = scales[j]
+                    wk = scales[k]
+                    logits_sum = li * wi + lj * wj + lk * wk
+                    acc = _accuracy_from_logits(logits_sum, y_val)
+                    if acc > best_ens_acc:
+                        best_ens_acc = acc
+                        best_ens_model = WeightedEnsemble([top[i][1], top[j][1], top[k][1]], [wi, wj, wk])
 
-        global_step = 0
-
-        use_ema = True
-        ema_decay = 0.9985
-        ema_state = None
-        if use_ema:
-            ema_state = {k: v.detach().clone() for k, v in model.state_dict().items()}
-
-        def ema_update():
-            if ema_state is None:
-                return
-            msd = model.state_dict()
-            for k, v in msd.items():
-                ev = ema_state[k]
-                if ev.dtype.is_floating_point:
-                    ev.mul_(ema_decay).add_(v.detach(), alpha=(1.0 - ema_decay))
-                else:
-                    ev.copy_(v)
-
-        best_val_acc = -1.0
-        best_state = None
-        best_epoch = -1
-        patience = 35
-        bad = 0
-
-        for epoch in range(max_epochs):
-            model.train()
-            perm = torch.randperm(n_train, device=device)
-            for i in range(0, n_train, batch_size):
-                idx = perm[i:i + batch_size]
-                xb = x_train.index_select(0, idx)
-                yb = y_train.index_select(0, idx)
-
-                lr = lr_for_step(global_step)
-                for pg in optimizer.param_groups:
-                    pg["lr"] = lr
-
-                optimizer.zero_grad(set_to_none=True)
-                logits = model(xb)
-                loss = F.cross_entropy(logits, yb, label_smoothing=label_smoothing)
-                loss.backward()
-                if grad_clip is not None and grad_clip > 0:
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
-                optimizer.step()
-                if use_ema:
-                    with torch.no_grad():
-                        ema_update()
-                global_step += 1
-
-            if (epoch + 1) % eval_every == 0:
-                val_acc = _accuracy(model, x_val, y_val) if y_val.numel() else _accuracy(model, x_train, y_train)
-                if val_acc > best_val_acc + 1e-6:
-                    best_val_acc = val_acc
-                    best_state = {k: v.detach().clone() for k, v in model.state_dict().items()}
-                    best_epoch = epoch
-                    bad = 0
-                else:
-                    bad += 1
-
-                if epoch + 1 >= min_epochs and bad >= patience:
-                    break
-
-        if best_state is not None:
-            model.load_state_dict(best_state)
-
-        if use_ema and ema_state is not None and y_val.numel():
-            cur_acc = _accuracy(model, x_val, y_val)
-            cur_state = {k: v.detach().clone() for k, v in model.state_dict().items()}
-            model.load_state_dict(ema_state)
-            ema_acc = _accuracy(model, x_val, y_val)
-            if ema_acc + 1e-6 < cur_acc:
-                model.load_state_dict(cur_state)
-
-        model.eval()
-
-        if _count_trainable_params(model) > param_limit:
-            for p in model.parameters():
-                p.requires_grad_(False)
-            model.eval()
-
-        return model
+        final_model = best_model if best_ens_model is None else best_ens_model
+        final_model = final_model.to(device)
+        final_model.eval()
+        return final_model

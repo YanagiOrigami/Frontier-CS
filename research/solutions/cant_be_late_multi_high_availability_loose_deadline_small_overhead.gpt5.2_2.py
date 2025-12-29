@@ -1,17 +1,22 @@
 import json
-import math
 from argparse import Namespace
-from typing import List, Optional
 
 from sky_spot.strategies.multi_strategy import MultiRegionStrategy
 from sky_spot.utils import ClusterType
 
 
+_CT_SPOT = getattr(ClusterType, "SPOT")
+_CT_ONDEMAND = getattr(ClusterType, "ON_DEMAND")
+_CT_NONE = getattr(ClusterType, "NONE", None)
+if _CT_NONE is None:
+    _CT_NONE = getattr(ClusterType, "None")
+
+
 class Solution(MultiRegionStrategy):
-    NAME = "cant_be_late_bandit_v1"
+    NAME = "cant_be_late_v1"
 
     def solve(self, spec_path: str) -> "Solution":
-        with open(spec_path) as f:
+        with open(spec_path, "r") as f:
             config = json.load(f)
 
         args = Namespace(
@@ -21,146 +26,138 @@ class Solution(MultiRegionStrategy):
             inter_task_overhead=[0.0],
         )
         super().__init__(args)
-        self._reset_internal_state()
+
+        self._commit_on_demand = False
+        self._no_spot_streak = 0
+        self._last_switch_elapsed = -1e30
+        self._region_seen = None
+        self._region_avail = None
         return self
 
-    def _reset_internal_state(self) -> None:
-        self._inited: bool = False
-        self._num_regions: int = 0
-        self._alpha: List[float] = []
-        self._beta: List[float] = []
-        self._step_count: int = 0
-        self._no_spot_streak: int = 0
-        self._switch_cooldown: int = 0
-
-        self._last_done_len: int = 0
-        self._work_done: float = 0.0
-
-        self._committed_on_demand: bool = False
-
-        self._CT_NONE: Optional[ClusterType] = None
-        self._CT_SPOT: ClusterType = ClusterType.SPOT
-        self._CT_OD: ClusterType = ClusterType.ON_DEMAND
-
-    def _lazy_init(self) -> None:
-        if self._inited:
-            return
-        self._CT_NONE = getattr(ClusterType, "NONE", getattr(ClusterType, "None"))
-        self._num_regions = int(self.env.get_num_regions())
-        self._alpha = [1.0] * self._num_regions
-        self._beta = [1.0] * self._num_regions
-        self._step_count = 0
+    def reset(self, *args, **kwargs):
+        if hasattr(super(), "reset"):
+            super().reset(*args, **kwargs)
+        self._commit_on_demand = False
         self._no_spot_streak = 0
-        self._switch_cooldown = 0
-        self._last_done_len = 0
-        self._work_done = 0.0
-        self._committed_on_demand = False
-        self._inited = True
+        self._last_switch_elapsed = -1e30
+        self._region_seen = None
+        self._region_avail = None
 
-    def _update_work_done(self) -> None:
-        lst = self.task_done_time
-        n = len(lst)
-        if n == self._last_done_len:
+    def _ensure_region_stats(self):
+        if self._region_seen is not None and self._region_avail is not None:
             return
-        if n < self._last_done_len:
-            self._work_done = float(sum(lst))
-            self._last_done_len = n
+        try:
+            n = int(self.env.get_num_regions())
+        except Exception:
+            n = 1
+        self._region_seen = [0] * n
+        self._region_avail = [0] * n
+
+    def _progress_done(self) -> float:
+        tdt = getattr(self, "task_done_time", None)
+        if not tdt:
+            return 0.0
+        return float(sum(tdt))
+
+    def _buffer_seconds(self) -> float:
+        gap = float(getattr(self.env, "gap_seconds", 0.0) or 0.0)
+        oh = float(getattr(self, "restart_overhead", 0.0) or 0.0)
+        return 2.0 * oh + 0.2 * gap
+
+    def _on_demand_overhead_if_start_now(self, last_cluster_type) -> float:
+        if last_cluster_type == _CT_ONDEMAND:
+            return float(getattr(self, "remaining_restart_overhead", 0.0) or 0.0)
+        return float(getattr(self, "restart_overhead", 0.0) or 0.0)
+
+    def _maybe_switch_region_while_waiting(self, slack: float) -> None:
+        self._ensure_region_stats()
+        n = len(self._region_seen)
+        if n <= 1:
             return
-        self._work_done += float(sum(lst[self._last_done_len : n]))
-        self._last_done_len = n
 
-    def _spot_mean(self, i: int) -> float:
-        a = self._alpha[i]
-        b = self._beta[i]
-        return a / (a + b)
+        gap = float(getattr(self.env, "gap_seconds", 0.0) or 0.0)
+        now = float(getattr(self.env, "elapsed_seconds", 0.0) or 0.0)
+        if now - self._last_switch_elapsed < 2.0 * gap:
+            return
+        if slack <= 4.0 * gap:
+            return
+        if self._no_spot_streak < 2:
+            return
 
-    def _select_region_ucb(self, exclude: int) -> int:
-        t = self._step_count + 1
-        logt = math.log(t + 1.0)
-        best_i = exclude
-        best_score = -1e18
-        c = 0.35
-        for i in range(self._num_regions):
-            if i == exclude:
-                continue
-            a = self._alpha[i]
-            b = self._beta[i]
-            n = max(1.0, (a + b - 2.0))
-            mean = a / (a + b)
-            score = mean + c * math.sqrt(logt / n)
+        cur = int(self.env.get_current_region())
+        # Round-robin switch, but slightly prefer regions with better observed availability.
+        best = cur
+        best_score = -1.0
+        for i in range(n):
+            seen = self._region_seen[i]
+            avail = self._region_avail[i]
+            score = (avail + 1.0) / (seen + 2.0)  # Beta(1,1) prior
             if score > best_score:
                 best_score = score
-                best_i = i
-        return best_i
+                best = i
 
-    def _required_time_if_commit_od(self, last_cluster_type: ClusterType, remaining_work: float, gap: float) -> float:
-        if last_cluster_type == self._CT_OD:
-            overhead = float(self.remaining_restart_overhead or 0.0)
-        else:
-            overhead = float(self.restart_overhead or 0.0)
-        total = max(0.0, overhead) + max(0.0, remaining_work)
-        if total <= 0.0:
-            return 0.0
-        steps = int(math.ceil(total / gap))
-        return float(steps) * gap
+        nxt = best
+        if nxt == cur:
+            nxt = (cur + 1) % n
+
+        if nxt != cur:
+            try:
+                self.env.switch_region(nxt)
+                self._last_switch_elapsed = now
+                self._no_spot_streak = 0
+            except Exception:
+                pass
 
     def _step(self, last_cluster_type: ClusterType, has_spot: bool) -> ClusterType:
-        self._lazy_init()
-        self._step_count += 1
-
-        gap = float(self.env.gap_seconds)
-        if gap <= 0.0:
-            gap = 1.0
-
-        self._update_work_done()
-        remaining_work = float(self.task_duration) - float(self._work_done)
-        if remaining_work <= 0.0:
-            return self._CT_NONE  # type: ignore[return-value]
-
-        now = float(self.env.elapsed_seconds)
-        time_left = float(self.deadline) - now
-        if time_left <= 0.0:
-            return self._CT_NONE  # type: ignore[return-value]
+        self._ensure_region_stats()
 
         cur_region = int(self.env.get_current_region())
-        if 0 <= cur_region < self._num_regions:
+        if 0 <= cur_region < len(self._region_seen):
+            self._region_seen[cur_region] += 1
             if has_spot:
-                self._alpha[cur_region] += 1.0
-                self._no_spot_streak = 0
-            else:
-                self._beta[cur_region] += 1.0
-                self._no_spot_streak += 1
+                self._region_avail[cur_region] += 1
 
-        if self._switch_cooldown > 0:
-            self._switch_cooldown -= 1
+        elapsed = float(getattr(self.env, "elapsed_seconds", 0.0) or 0.0)
+        task_duration = float(getattr(self, "task_duration", 0.0) or 0.0)
+        deadline = float(getattr(self, "deadline", 0.0) or 0.0)
+        gap = float(getattr(self.env, "gap_seconds", 0.0) or 0.0)
 
-        if self._committed_on_demand:
-            return self._CT_OD
+        done = self._progress_done()
+        rem_work = task_duration - done
+        if rem_work <= 0.0:
+            self._commit_on_demand = False
+            return _CT_NONE
 
-        if not has_spot:
-            required_od_time = self._required_time_if_commit_od(last_cluster_type, remaining_work, gap)
-            buffer_steps = 2.0
-            if required_od_time + buffer_steps * gap >= time_left:
-                self._committed_on_demand = True
-                return self._CT_OD
+        time_left = deadline - elapsed
+        if time_left <= 0.0:
+            self._commit_on_demand = True
+            return _CT_ONDEMAND
 
-            if self._num_regions > 1 and self._switch_cooldown == 0:
-                if self._no_spot_streak >= 3:
-                    best = self._select_region_ucb(exclude=cur_region)
-                    if best != cur_region:
-                        self.env.switch_region(best)
-                        self._switch_cooldown = max(2, int(round(float(self.restart_overhead) / gap)) + 1)
-                        self._no_spot_streak = 0
+        slack = time_left - rem_work
+        buf = self._buffer_seconds()
+        od_oh = self._on_demand_overhead_if_start_now(last_cluster_type)
 
-            return self._CT_NONE  # type: ignore[return-value]
+        if self._commit_on_demand:
+            return _CT_ONDEMAND
 
-        if last_cluster_type == self._CT_OD:
-            slack = time_left - remaining_work
-            if slack <= 0.0:
-                self._committed_on_demand = True
-                return self._CT_OD
-            if slack <= (float(self.restart_overhead) + 2.0 * gap):
-                return self._CT_OD
-            return self._CT_SPOT
+        if time_left <= rem_work + od_oh + buf:
+            self._commit_on_demand = True
+            return _CT_ONDEMAND
 
-        return self._CT_SPOT
+        if has_spot:
+            self._no_spot_streak = 0
+            return _CT_SPOT
+
+        self._no_spot_streak += 1
+
+        # Consider switching region while we wait (no cost step) to increase chance of spot next step.
+        self._maybe_switch_region_while_waiting(slack)
+
+        # Wait if it's still safe to finish with on-demand even if spot never returns.
+        # Conservative: if we wait this whole step, then later we may need restart_overhead again.
+        restart_oh = float(getattr(self, "restart_overhead", 0.0) or 0.0)
+        if (time_left - gap) > (rem_work + restart_oh + buf):
+            return _CT_NONE
+
+        self._commit_on_demand = True
+        return _CT_ONDEMAND

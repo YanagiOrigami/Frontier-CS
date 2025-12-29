@@ -1,279 +1,339 @@
 import json
 import os
+import random
+import math
 import networkx as nx
 
 class Solution:
     def solve(self, spec_path: str = None) -> dict:
-        num_vms = 2
-        ingress_limit_default = {"aws": 10, "gcp": 16, "azure": 16}
-        egress_limit_default = {"aws": 5, "gcp": 7, "azure": 16}
-        ingress_limits = ingress_limit_default.copy()
-        egress_limits = egress_limit_default.copy()
-
-        if spec_path and os.path.exists(spec_path):
-            try:
-                with open(spec_path, "r") as f:
-                    spec = json.load(f)
-                if isinstance(spec, dict):
-                    if "num_vms" in spec and isinstance(spec["num_vms"], int) and spec["num_vms"] > 0:
-                        num_vms = spec["num_vms"]
-                    cfg_files = spec.get("config_files", [])
-                    if cfg_files and isinstance(cfg_files, list):
-                        first_cfg = cfg_files[0]
-                        if os.path.exists(first_cfg):
-                            with open(first_cfg, "r") as cf:
-                                cfg = json.load(cf)
-                            if isinstance(cfg, dict):
-                                ing = cfg.get("ingress_limit", {})
-                                egr = cfg.get("egress_limit", {})
-                                for k in ingress_limit_default:
-                                    if isinstance(ing.get(k), (int, float)) and ing[k] > 0:
-                                        ingress_limits[k] = float(ing[k])
-                                    if isinstance(egr.get(k), (int, float)) and egr[k] > 0:
-                                        egress_limits[k] = float(egr[k])
-            except Exception:
-                pass
-
-        code = f'''
+        code = r'''
+import math
+import random
 import networkx as nx
 
-N_VMS = {num_vms}
-INGRESS_LIMITS = {{"aws": {ingress_limits["aws"]} * N_VMS, "gcp": {ingress_limits["gcp"]} * N_VMS, "azure": {ingress_limits["azure"]} * N_VMS}}
-EGRESS_LIMITS = {{"aws": {egress_limits["aws"]} * N_VMS, "gcp": {egress_limits["gcp"]} * N_VMS, "azure": {egress_limits["azure"]} * N_VMS}}
+# Helper constants for bandwidth limits (Gbps) per region per provider
+DEFAULT_NUM_VMS = 2
+INGRESS_PER_VM = {"aws": 10.0, "gcp": 16.0, "azure": 16.0}
+EGRESS_PER_VM = {"aws": 5.0, "gcp": 7.0, "azure": 16.0}
 
-def _provider_of(node: str) -> str:
-    try:
-        if ":" in node:
-            return node.split(":", 1)[0].strip().lower()
-        return node.split("-", 1)[0].strip().lower()
-    except Exception:
+
+def _get_provider(node: str) -> str:
+    if not isinstance(node, str):
         return "aws"
+    parts = node.split(":", 1)
+    if len(parts) == 0:
+        return "aws"
+    provider = parts[0].lower()
+    if provider in ("aws", "gcp", "azure"):
+        return provider
+    return "aws"
 
-def _edge_key(u, v):
-    return (u, v)
 
-def _safe_cost(val):
+def _ingress_limit(node: str, num_vms: int = DEFAULT_NUM_VMS) -> float:
+    prov = _get_provider(node)
+    base = INGRESS_PER_VM.get(prov, 10.0)
+    return base * float(num_vms)
+
+
+def _egress_limit(node: str, num_vms: int = DEFAULT_NUM_VMS) -> float:
+    prov = _get_provider(node)
+    base = EGRESS_PER_VM.get(prov, 5.0)
+    return base * float(num_vms)
+
+
+def _edge_cost(G: nx.DiGraph, u, v):
+    d = G[u][v]
+    return float(d.get("cost", 0.0))
+
+
+def _edge_throughput(G: nx.DiGraph, u, v):
+    d = G[u][v]
+    thr = d.get("throughput", None)
+    if thr is None:
+        return 1e9  # effectively infinite if not specified
     try:
-        x = float(val)
-        if x >= 0:
-            return x
-        return 0.0
+        return float(thr)
     except Exception:
-        return 0.0
+        return 1e9
 
-def _safe_thr(val):
-    try:
-        x = float(val)
-        if x > 0:
-            return x
-        return 1e-6
-    except Exception:
-        return 1e-6
 
-def _edge_cost(G, u, v):
-    data = G[u][v]
-    return _safe_cost(data.get("cost", 0.0))
-
-def _edge_thr(G, u, v):
-    data = G[u][v]
-    return _safe_thr(data.get("throughput", 1e6))
-
-def _compute_path_cost(G, path_nodes):
-    if len(path_nodes) < 2:
-        return 0.0
-    c = 0.0
-    for i in range(len(path_nodes) - 1):
-        u = path_nodes[i]
-        v = path_nodes[i+1]
-        if G.has_edge(u, v):
-            c += _edge_cost(G, u, v)
-        else:
-            c += 0.0
-    return c
-
-def _path_to_edges(G, path_nodes):
+def _path_edges_from_nodes(path_nodes):
     edges = []
     for i in range(len(path_nodes) - 1):
-        u = path_nodes[i]
-        v = path_nodes[i+1]
-        edges.append([u, v, G[u][v]])
+        edges.append((path_nodes[i], path_nodes[i + 1]))
     return edges
 
-def _get_k_shortest_paths(G, src, dst, K):
-    # Create or update a lightweight weight attribute for K-shortest computation.
-    # cost dominates; small penalty for low throughput to avoid very slow links.
-    gamma = 1e-4
-    for u, v in G.edges():
-        d = G[u][v]
-        c = _safe_cost(d.get("cost", 0.0))
-        t = _safe_thr(d.get("throughput", 1e6))
-        d["__w"] = c + gamma * (1.0 / max(t, 1e-9))
 
+def _path_cost(G: nx.DiGraph, nodes_path):
+    total = 0.0
+    for i in range(len(nodes_path) - 1):
+        u, v = nodes_path[i], nodes_path[i + 1]
+        total += _edge_cost(G, u, v)
+    return total
+
+
+def _k_shortest_paths_by_cost(G: nx.DiGraph, src, dst, k: int = 5):
     paths = []
     try:
-        gen = nx.shortest_simple_paths(G, src, dst, weight="__w")
+        gen = nx.shortest_simple_paths(G, src, dst, weight="cost")
         for idx, p in enumerate(gen):
-            if idx >= K:
-                break
             paths.append(p)
+            if len(paths) >= k:
+                break
     except Exception:
         try:
-            p = nx.dijkstra_path(G, src, dst, weight="__w")
+            p = nx.dijkstra_path(G, src, dst, weight="cost")
             paths.append(p)
         except Exception:
             try:
                 p = nx.shortest_path(G, src, dst)
                 paths.append(p)
             except Exception:
-                pass
-    # Clean temporary weight if desired (not necessary)
+                return []
     return paths
 
-def _predicted_max_ratio_after_add(G, edge_counts, active_edges, out_active_counts, in_active_counts, path_nodes):
-    # Approximate per-edge actual throughput considering node ingress/egress equal split among active edges.
-    # Build predicted node active counts after adding edges from path.
-    pred_out_counts = dict(out_active_counts)
-    pred_in_counts = dict(in_active_counts)
 
-    # Determine provider node mapping for limits
-    # Precomputed via _provider_of when needed
+def _throughput_weighted_path(G: nx.DiGraph, src, dst, alpha: float = 0.05):
+    # Find a path minimizing: sum(cost + alpha/throughput)
+    def w(u, v, d):
+        thr = d.get("throughput", None)
+        thr = float(thr) if thr is not None else 1e9
+        return float(d.get("cost", 0.0)) + alpha / max(thr, 1e-9)
+    try:
+        return nx.dijkstra_path(G, src, dst, weight=w)
+    except Exception:
+        return []
 
-    # Edges on the path
-    path_edges = []
-    for i in range(len(path_nodes) - 1):
-        u = path_nodes[i]
-        v = path_nodes[i+1]
-        path_edges.append((u, v))
-        ek = (u, v)
-        if ek not in active_edges:
-            pred_out_counts[u] = pred_out_counts.get(u, 0) + 1
-            pred_in_counts[v] = pred_in_counts.get(v, 0) + 1
 
-    # Candidate edges to evaluate: existing active edges union new path edges
-    candidate_edges = set(active_edges)
-    candidate_edges.update(path_edges)
+def _dedup_paths(paths):
+    seen = set()
+    uniq = []
+    for p in paths:
+        t = tuple(p)
+        if t not in seen:
+            seen.add(t)
+            uniq.append(p)
+    return uniq
 
-    max_ratio = 0.0
-    for (u, v) in candidate_edges:
-        prov_u = _provider_of(u)
-        prov_v = _provider_of(v)
-        outn = max(1, pred_out_counts.get(u, 0))
-        inn = max(1, pred_in_counts.get(v, 0))
-        base_thr = _edge_thr(G, u, v)
-        out_share = EGRESS_LIMITS.get(prov_u, EGRESS_LIMITS.get("aws", 10.0)) / outn
-        in_share = INGRESS_LIMITS.get(prov_v, INGRESS_LIMITS.get("aws", 10.0)) / inn
-        fe = min(base_thr, out_share, in_share)
-        cnt = edge_counts.get((u, v), 0)
-        if (u, v) in path_edges:
-            cnt += 1
-        ratio = cnt / max(fe, 1e-9)
-        if ratio > max_ratio:
-            max_ratio = ratio
-    return max_ratio
 
-def search_algorithm(src: str, dsts: list[str], G: nx.DiGraph, num_partitions: int) -> "BroadCastTopology":
+def _compute_global_T(G: nx.DiGraph, loads, used_out_edges, used_in_edges, num_vms: int = DEFAULT_NUM_VMS):
+    # T = max_over_used_edges(load / f_e)
+    T = 0.0
+    tiny = 1e-9
+    for (u, v), load in loads.items():
+        if load <= 0:
+            continue
+        edge_thr = _edge_throughput(G, u, v)
+        out_deg = len(used_out_edges.get(u, ()))
+        in_deg = len(used_in_edges.get(v, ()))
+        egress_share = _egress_limit(u, num_vms=num_vms) / max(1, out_deg)
+        ingress_share = _ingress_limit(v, num_vms=num_vms) / max(1, in_deg)
+        f_e = min(edge_thr, egress_share, ingress_share)
+        T = max(T, float(load) / max(f_e, tiny))
+    return T
+
+
+def _evaluate_candidate_T_after(G: nx.DiGraph, path_nodes, used_edges, loads, used_out_edges, used_in_edges, T_current, num_vms: int = DEFAULT_NUM_VMS):
+    # Approximate T_after considering:
+    # - load increases on edges in the candidate path
+    # - degree increases on nodes where we add new unique out/in edges
+    # - recompute times for edges affected by those deg changes
+    if not path_nodes or len(path_nodes) == 1:
+        return T_current
+
+    path_edges = _path_edges_from_nodes(path_nodes)
+    path_edge_set = set(path_edges)
+
+    new_edges = set()
+    affected_out_nodes = set()
+    affected_in_nodes = set()
+
+    # Determine new unique edges added by this path
+    for (u, v) in path_edges:
+        if (u, v) not in used_edges:
+            new_edges.add((u, v))
+            affected_out_nodes.add(u)
+            affected_in_nodes.add(v)
+
+    # Collect affected existing edges (due to degree increase)
+    affected_used_edges = set()
+    for u in affected_out_nodes:
+        for v2 in used_out_edges.get(u, ()):
+            affected_used_edges.add((u, v2))
+    for v in affected_in_nodes:
+        for u2 in used_in_edges.get(v, ()):
+            affected_used_edges.add((u2, v))
+
+    # Add path edges themselves (existing or new) for recomputation (load change)
+    affected_used_edges.update([e for e in path_edges if e in used_edges])
+
+    # We'll compute predicted times on:
+    #  - all 'affected_used_edges' with updated deg (if applicable) and updated load (if in path)
+    #  - all 'new_edges' (load=1)
+    tiny = 1e-9
+    local_max = 0.0
+
+    # Precompute predicted degrees for affected nodes
+    pred_out_deg = {}
+    pred_in_deg = {}
+
+    for u in affected_out_nodes:
+        pred_out_deg[u] = len(used_out_edges.get(u, ())) + 1
+    for v in affected_in_nodes:
+        pred_in_deg[v] = len(used_in_edges.get(v, ())) + 1
+
+    def get_pred_out_deg(u):
+        if u in pred_out_deg:
+            return pred_out_deg[u]
+        return len(used_out_edges.get(u, ()))
+
+    def get_pred_in_deg(v):
+        if v in pred_in_deg:
+            return pred_in_deg[v]
+        return len(used_in_edges.get(v, ()))
+
+    # Existing used edges affected by deg increases or path load additions
+    for (u, v) in affected_used_edges:
+        edge_thr = _edge_throughput(G, u, v)
+        egress_share = _egress_limit(u, num_vms=num_vms) / max(1, get_pred_out_deg(u))
+        ingress_share = _ingress_limit(v, num_vms=num_vms) / max(1, get_pred_in_deg(v))
+        f_e = min(edge_thr, egress_share, ingress_share)
+        load = loads.get((u, v), 0)
+        if (u, v) in path_edge_set:
+            load += 1
+        local_max = max(local_max, float(load) / max(f_e, tiny))
+
+    # New edges added
+    for (u, v) in new_edges:
+        edge_thr = _edge_throughput(G, u, v)
+        egress_share = _egress_limit(u, num_vms=num_vms) / max(1, get_pred_out_deg(u))
+        ingress_share = _ingress_limit(v, num_vms=num_vms) / max(1, get_pred_in_deg(v))
+        f_e = min(edge_thr, egress_share, ingress_share)
+        load = 1  # first partition on this edge
+        local_max = max(local_max, float(load) / max(f_e, tiny))
+
+    # T_after is the max of current T and any changed edges
+    return max(T_current, local_max)
+
+
+def search_algorithm(src: str, dsts: list[str], G: nx.DiGraph, num_partitions: int) -> 'BroadCastTopology':
+    # Initialize broadcast topology
     bc_topology = BroadCastTopology(src, dsts, num_partitions)
-    if not isinstance(num_partitions, int):
-        num_parts = int(num_partitions)
-    else:
-        num_parts = num_partitions
-    if num_parts <= 0:
+
+    # Handle trivial case
+    if num_partitions <= 0:
+        bc_topology.set_num_partitions(0)
         return bc_topology
 
-    # Prepare candidate paths for each destination
-    K_base = max(6, min(20, num_parts * 2))
+    # Prepare candidate paths per destination
+    K_COST = 5
+    ALPHA_THR = 0.05  # throughput penalty factor for alternative path
     candidates = {}
-    costs = {}
+
     for dst in dsts:
-        cands = _get_k_shortest_paths(G, src, dst, K_base)
-        if not cands:
-            # Fallback: attempt single dijkstra with pure cost
+        if dst == src:
+            candidates[dst] = [[src]]
+            continue
+        cost_paths = _k_shortest_paths_by_cost(G, src, dst, k=K_COST)
+        thr_path = _throughput_weighted_path(G, src, dst, alpha=ALPHA_THR)
+        comb = []
+        comb.extend(cost_paths)
+        if thr_path:
+            comb.append(thr_path)
+        comb = _dedup_paths(comb)
+        if not comb:
+            # Fallback to any path (ensure at least one)
             try:
-                p = nx.dijkstra_path(G, src, dst, weight="cost")
-                cands = [p]
+                p = nx.shortest_path(G, src, dst)
+                comb = [p]
             except Exception:
-                # As last resort, simple unweighted shortest path
+                comb = []
+        candidates[dst] = comb
+
+    # Global structures for load and degree counting
+    used_edges = set()                # set of (u, v)
+    loads = {}                        # (u, v) -> number of partitions using it
+    used_out_edges = {}               # u -> set of v
+    used_in_edges = {}                # v -> set of u
+
+    # Current approximate max time metric (load/f_e)
+    T_current = 0.0
+
+    # Determine ordering of destination processing to spread decision impact
+    dsts_order = list(dsts)
+    random.shuffle(dsts_order)
+
+    # Assign paths partition-by-partition in rounds to balance load
+    COST_TOL_REL = 0.10  # allow up to +10% cost for better time
+
+    for p in range(num_partitions):
+        # randomize per-round order for fairness
+        random.shuffle(dsts_order)
+        for dst in dsts_order:
+            if dst == src:
+                # source equals destination: empty path
+                bc_topology.set_dst_partition_paths(dst, p, [])
+                continue
+
+            cand_paths = candidates.get(dst, [])
+            if not cand_paths:
+                # Attempt to find at least one path now
                 try:
-                    p = nx.shortest_path(G, src, dst)
-                    cands = [p]
+                    path_nodes = nx.dijkstra_path(G, src, dst, weight="cost")
                 except Exception:
-                    cands = []
-        candidates[dst] = cands
-        pcosts = []
-        for p in cands:
-            pcosts.append(_compute_path_cost(G, p))
-        costs[dst] = pcosts
+                    try:
+                        path_nodes = nx.shortest_path(G, src, dst)
+                    except Exception:
+                        path_nodes = [src, dst] if G.has_edge(src, dst) else [src]
+                cand_paths = [path_nodes]
 
-    # Global state for approximate time estimation
-    edge_counts = {}           # (u,v) -> number of partitions that use this edge
-    active_edges = set()       # set of (u,v)
-    out_active_counts = {}     # node -> number of active outgoing edges
-    in_active_counts = {}      # node -> number of active incoming edges
+            # Compute costs for candidates
+            cand_infos = []
+            min_cost = None
+            for path_nodes in cand_paths:
+                c = _path_cost(G, path_nodes)
+                if min_cost is None or c < min_cost:
+                    min_cost = c
+                cand_infos.append((path_nodes, c))
 
-    # Round-robin assignment of partitions to destinations
-    EPS_REL = 0.20
-    EPS_ABS = 0.0
+            # Filter by cost tolerance
+            allowed = []
+            tol = (min_cost if min_cost is not None else 0.0) * (1.0 + COST_TOL_REL)
+            for path_nodes, c in cand_infos:
+                if c <= tol:
+                    allowed.append((path_nodes, c))
+            if not allowed:
+                allowed = cand_infos
 
-    for pid in range(num_parts):
-        for dst in dsts:
-            cands = candidates.get(dst, [])
-            if not cands:
-                # Attempt to compute a path now if missing
-                try:
-                    p = nx.dijkstra_path(G, src, dst, weight="cost")
-                    cands = [p]
-                    candidates[dst] = cands
-                    costs[dst] = [_compute_path_cost(G, p)]
-                except Exception:
-                    continue
+            # Choose candidate that minimizes T_after among allowed; tiebreaker: cost then path length
+            best = None
+            best_T_after = None
+            for path_nodes, c in allowed:
+                T_after = _evaluate_candidate_T_after(G, path_nodes, used_edges, loads, used_out_edges, used_in_edges, T_current, num_vms=DEFAULT_NUM_VMS)
+                score_tuple = (T_after, c, len(path_nodes))
+                if best is None or score_tuple < best:
+                    best = score_tuple
+                    best_choice = (path_nodes, c)
 
-            path_costs = costs.get(dst, [0.0] * len(cands))
-            if not path_costs:
-                path_costs = [_compute_path_cost(G, p) for p in cands]
-                costs[dst] = path_costs
+            chosen_path_nodes, chosen_cost = best_choice
 
-            min_cost = min(path_costs) if path_costs else 0.0
-            allowed_idx = []
-            for idx, pc in enumerate(path_costs):
-                if pc <= min_cost * (1.0 + EPS_REL) + EPS_ABS:
-                    allowed_idx.append(idx)
-            if not allowed_idx:
-                allowed_idx = list(range(len(cands)))
+            # Commit chosen path: update loads, used edges, degrees
+            path_edges = _path_edges_from_nodes(chosen_path_nodes)
+            for (u, v) in path_edges:
+                if (u, v) not in used_edges:
+                    used_edges.add((u, v))
+                    used_out_edges.setdefault(u, set()).add(v)
+                    used_in_edges.setdefault(v, set()).add(u)
+                loads[(u, v)] = loads.get((u, v), 0) + 1
 
-            best_idx = allowed_idx[0]
-            best_score = None
-            best_time = None
-            best_cost = None
+            # Recompute exact T_current to keep accurate
+            T_current = _compute_global_T(G, loads, used_out_edges, used_in_edges, num_vms=DEFAULT_NUM_VMS)
 
-            # Evaluate allowed candidates using predicted max ratio
-            for idx in allowed_idx:
-                p_nodes = cands[idx]
-                pred_max_ratio = _predicted_max_ratio_after_add(
-                    G, edge_counts, active_edges, out_active_counts, in_active_counts, p_nodes
-                )
-                pc = path_costs[idx]
-                score_tuple = (pred_max_ratio, pc, len(p_nodes))
-                if best_score is None or score_tuple < best_score:
-                    best_score = score_tuple
-                    best_idx = idx
-                    best_time = pred_max_ratio
-                    best_cost = pc
-
-            chosen_path_nodes = cands[best_idx]
-            # Update global state
-            for i in range(len(chosen_path_nodes) - 1):
-                u = chosen_path_nodes[i]
-                v = chosen_path_nodes[i + 1]
-                ek = (u, v)
-                if ek not in active_edges:
-                    active_edges.add(ek)
-                    out_active_counts[u] = out_active_counts.get(u, 0) + 1
-                    in_active_counts[v] = in_active_counts.get(v, 0) + 1
-                edge_counts[ek] = edge_counts.get(ek, 0) + 1
-
-            # Write to topology
-            edges = _path_to_edges(G, chosen_path_nodes)
-            bc_topology.set_dst_partition_paths(dst, pid, edges)
+            # Store path into topology
+            edge_list = []
+            for (u, v) in path_edges:
+                edge_list.append([u, v, G[u][v]])
+            bc_topology.set_dst_partition_paths(dst, p, edge_list)
 
     return bc_topology
 
@@ -283,7 +343,9 @@ class BroadCastTopology:
         self.src = src
         self.dsts = dsts
         self.num_partitions = int(num_partitions)
-        self.paths = {dst: {{str(i): None for i in range(self.num_partitions)}} for dst in dsts}
+        # Structure: {dst: {partition_id: [edges]}}
+        # Each edge is [src_node, dst_node, edge_data_dict]
+        self.paths = {dst: {str(i): None for i in range(self.num_partitions)} for dst in dsts}
 
     def append_dst_partition_path(self, dst: str, partition: int, path: list):
         partition = str(partition)

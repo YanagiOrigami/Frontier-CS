@@ -8,12 +8,9 @@ from sky_spot.utils import ClusterType
 class Solution(MultiRegionStrategy):
     """Your multi-region scheduling strategy."""
 
-    NAME = "my_strategy"  # REQUIRED: unique identifier
+    NAME = "my_strategy"
 
     def solve(self, spec_path: str) -> "Solution":
-        """
-        Initialize the solution from spec_path config.
-        """
         with open(spec_path) as f:
             config = json.load(f)
 
@@ -24,56 +21,73 @@ class Solution(MultiRegionStrategy):
             inter_task_overhead=[0.0],
         )
         super().__init__(args)
+
+        self.initialized = False
+        self.ema_alpha = 0.3
+        self.panic_buffer_factor = 1.5
+        self.switch_slack_buffer_factor = 3.0
+        self.initial_optimism = 0.8
+        self.switch_rate_floor = 0.5
         
-        self.num_regions = len(config.get("trace_files", []))
-        self.last_spot_seen = [-1.0] * self.num_regions
+        self.num_regions = 0
+        self.region_availability_rate = []
+        self.region_observations = []
         
         return self
 
+    def _initialize_state(self):
+        if not self.initialized:
+            self.num_regions = self.env.get_num_regions()
+            self.region_availability_rate = [self.initial_optimism] * self.num_regions
+            self.region_observations = [0] * self.num_regions
+            self.initialized = True
+
     def _step(self, last_cluster_type: ClusterType, has_spot: bool) -> ClusterType:
-        """
-        Decide next action based on current state.
-        """
-        work_done = sum(self.task_done_time)
-        work_rem = self.task_duration - work_done
-        
-        if work_rem <= 0:
-            return ClusterType.NONE
+        self._initialize_state()
 
         current_region = self.env.get_current_region()
-        num_regions = self.env.get_num_regions()
+        current_observation = 1.0 if has_spot else 0.0
+        self.region_availability_rate[current_region] = (
+            self.ema_alpha * current_observation +
+            (1 - self.ema_alpha) * self.region_availability_rate[current_region]
+        )
 
-        if has_spot:
-            self.last_spot_seen[current_region] = self.env.elapsed_seconds
+        remaining_work = self.task_duration - sum(self.task_done_time)
+        if remaining_work <= 0:
+            return ClusterType.NONE
 
-        # Safety Net: Force On-Demand if the deadline is critical
-        on_demand_finish_time = self.env.elapsed_seconds + self.restart_overhead + work_rem
+        time_needed_guaranteed = remaining_work + self.remaining_restart_overhead
+        time_left_to_deadline = self.deadline - self.env.elapsed_seconds
         
-        if on_demand_finish_time >= self.deadline:
+        panic_buffer = self.panic_buffer_factor * self.restart_overhead
+        
+        if time_left_to_deadline <= time_needed_guaranteed + panic_buffer:
             return ClusterType.ON_DEMAND
 
-        # Primary Strategy: Prioritize Spot for cost savings
         if has_spot:
             return ClusterType.SPOT
-        
-        # Spot not available: Wait and switch to a better region
         else:
-            if num_regions > 1:
-                best_region_to_switch = -1
-                max_seen_time = -1.0
-                
-                for r in range(num_regions):
-                    if r == current_region:
-                        continue
-                    if self.last_spot_seen[r] > max_seen_time:
-                        max_seen_time = self.last_spot_seen[r]
-                        best_region_to_switch = r
+            best_alt_region_idx = -1
+            max_availability_rate = -1.0
+            for i in range(self.num_regions):
+                if i == current_region:
+                    continue
+                if self.region_availability_rate[i] > max_availability_rate:
+                    max_availability_rate = self.region_availability_rate[i]
+                    best_alt_region_idx = i
 
-                # If no other region has a known spot history, explore.
-                if best_region_to_switch == -1:
-                    best_region_to_switch = (current_region + 1) % num_regions
-            
-                self.env.switch_region(best_region_to_switch)
+            current_slack = time_left_to_deadline - time_needed_guaranteed
+            switch_overhead_buffer = self.switch_slack_buffer_factor * self.restart_overhead
 
-            # Wait (NONE) to save costs. The safety net will catch us if needed.
-            return ClusterType.NONE
+            should_switch = (
+                best_alt_region_idx != -1 and
+                max_availability_rate > self.switch_rate_floor and
+                max_availability_rate > self.region_availability_rate[current_region] and
+                current_slack > switch_overhead_buffer
+            )
+
+            if should_switch:
+                self.env.switch_region(best_alt_region_idx)
+                return ClusterType.NONE
+            else:
+                return ClusterType.ON_DEMAND

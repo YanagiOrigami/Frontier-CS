@@ -2,123 +2,279 @@ import torch
 import triton
 import triton.language as tl
 
+
+@triton.autotune(
+    configs=[
+        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 64, 'BLOCK_D': 64}, num_stages=3, num_warps=4),
+        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_D': 64}, num_stages=3, num_warps=4),
+        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 128, 'BLOCK_D': 64}, num_stages=3, num_warps=4),
+        triton.Config({'BLOCK_M': 256, 'BLOCK_N': 64, 'BLOCK_D': 64}, num_stages=3, num_warps=8),
+        triton.Config({'BLOCK_M': 256, 'BLOCK_N': 128, 'BLOCK_D': 64}, num_stages=2, num_warps=8),
+    ],
+    key=['M', 'N', 'Dq'],
+)
 @triton.jit
-def _fwd_kernel(
-    Q, K, V, sm_scale, Out,
+def _flash_attn_forward_kernel(
+    Q, K, V, O,
     stride_qz, stride_qh, stride_qm, stride_qd,
     stride_kz, stride_kh, stride_kn, stride_kd,
     stride_vz, stride_vh, stride_vn, stride_vd,
     stride_oz, stride_oh, stride_om, stride_od,
     Z, H, M, N, Dq, Dv,
-    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_Dq: tl.constexpr, BLOCK_Dv: tl.constexpr,
-    IS_CAUSAL: tl.constexpr
+    causal: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_D: tl.constexpr,
 ):
-    start_m = tl.program_id(0)
-    off_hz = tl.program_id(1)
+    pid_m = tl.program_id(0)
+    pid_h = tl.program_id(1)
+    pid_z = tl.program_id(2)
     
-    q_offset = off_hz * stride_qh
-    k_offset = off_hz * stride_kh
-    v_offset = off_hz * stride_vh
-    o_offset = off_hz * stride_oh
+    start_m = pid_m * BLOCK_M
+    start_n = 0
     
-    offs_m = start_m * BLOCK_M + tl.arange(0, BLOCK_M)
-    offs_n = tl.arange(0, BLOCK_N)
-    offs_dq = tl.arange(0, BLOCK_Dq)
-    offs_dv = tl.arange(0, BLOCK_Dv)
-    
-    q_ptrs = Q + q_offset + (offs_m[:, None] * stride_qm + offs_dq[None, :] * stride_qd)
-    k_ptrs = K + k_offset + (offs_n[:, None] * stride_kn + offs_dq[None, :] * stride_kd)
-    v_ptrs = V + v_offset + (offs_n[:, None] * stride_vn + offs_dv[None, :] * stride_vd)
-    o_ptrs = Out + o_offset + (offs_m[:, None] * stride_om + offs_dv[None, :] * stride_od)
+    q_offset = pid_z * stride_qz + pid_h * stride_qh + start_m * stride_qm
+    k_offset = pid_z * stride_kz + pid_h * stride_kh
+    v_offset = pid_z * stride_vz + pid_h * stride_vh
+    o_offset = pid_z * stride_oz + pid_h * stride_oh + start_m * stride_om
     
     m_i = tl.zeros([BLOCK_M], dtype=tl.float32) - float('inf')
     l_i = tl.zeros([BLOCK_M], dtype=tl.float32)
-    acc = tl.zeros([BLOCK_M, BLOCK_Dv], dtype=tl.float32)
+    acc = tl.zeros([BLOCK_M, BLOCK_D], dtype=tl.float32)
     
-    q = tl.load(q_ptrs, mask=offs_m[:, None] < M, other=0.0)
-    q = (q * sm_scale).to(tl.float32)
+    q_ptrs = tl.make_block_ptr(
+        base=Q,
+        shape=(M, Dq),
+        strides=(stride_qm, stride_qd),
+        offsets=(start_m, 0),
+        block_shape=(BLOCK_M, BLOCK_D),
+        order=(1, 0)
+    )
     
-    lo = 0
-    hi = tl.minimum(N, start_m * BLOCK_M + BLOCK_M) if IS_CAUSAL else N
+    k_ptrs = tl.make_block_ptr(
+        base=K,
+        shape=(N, Dq),
+        strides=(stride_kn, stride_kd),
+        offsets=(0, 0),
+        block_shape=(BLOCK_N, BLOCK_D),
+        order=(1, 0)
+    )
     
-    for start_n in range(lo, hi, BLOCK_N):
-        start_n = tl.multiple_of(start_n, BLOCK_N)
+    v_ptrs = tl.make_block_ptr(
+        base=V,
+        shape=(N, Dv),
+        strides=(stride_vn, stride_vd),
+        offsets=(0, 0),
+        block_shape=(BLOCK_N, BLOCK_D),
+        order=(1, 0)
+    )
+    
+    for start_n in range(0, N, BLOCK_N):
+        q = tl.load(q_ptrs, boundary_check=(0, 1))
+        k = tl.load(k_ptrs, boundary_check=(0, 1))
+        v = tl.load(v_ptrs, boundary_check=(0, 1))
         
-        k = tl.load(k_ptrs + start_n * stride_kn, mask=(start_n + offs_n[:, None]) < N, other=0.0)
-        v = tl.load(v_ptrs + start_n * stride_vn, mask=(start_n + offs_n[:, None]) < N, other=0.0)
-        
+        q = q.to(tl.float32)
         k = k.to(tl.float32)
-        v = v.to(tl.float32)
         
-        qk = tl.dot(q, tl.trans(k))
+        s = tl.dot(q, tl.trans(k), allow_tf32=False) * (1.0 / tl.sqrt(Dq))
         
-        if IS_CAUSAL:
-            causal_mask = (start_m * BLOCK_M + offs_m[:, None]) >= (start_n + offs_n[None, :])
-            qk = tl.where(causal_mask, qk, float('-inf'))
+        if causal:
+            m = start_m + tl.arange(0, BLOCK_M)
+            n = start_n + tl.arange(0, BLOCK_N)
+            mask = m[:, None] >= n[None, :]
+            s = tl.where(mask, s, float('-inf'))
         
-        m_ij = tl.max(qk, 1)
-        p = tl.exp(qk - m_ij[:, None])
+        m_ij = tl.maximum(m_i[:, None], tl.max(s, axis=1))
+        p = tl.exp(s - m_ij)
+        l_ij = tl.exp(m_i[:, None] - m_ij) * l_i[:, None] + tl.sum(p, axis=1)
         
-        if IS_CAUSAL:
-            p = tl.where(causal_mask, p, 0.0)
-        
-        l_ij = tl.sum(p, 1)
-        alpha = tl.exp(m_i - m_ij)
-        
+        alpha = tl.exp(m_i[:, None] - m_ij) / l_ij
         acc = acc * alpha[:, None]
-        p = p.to(v.dtype)
-        acc += tl.dot(p, v)
         
-        m_i = tl.maximum(m_i, m_ij)
-        l_i = l_i * alpha + l_ij
+        p = p / l_ij[:, None]
+        acc = acc + tl.dot(p.to(v.dtype), v, allow_tf32=False)
+        
+        m_i = m_ij
+        l_i = l_ij
+        
+        k_ptrs = tl.advance(k_ptrs, (BLOCK_N, 0))
+        v_ptrs = tl.advance(v_ptrs, (BLOCK_N, 0))
     
-    acc = acc / l_i[:, None]
-    tl.store(o_ptrs, acc.to(Out.dtype.element_ty), mask=offs_m[:, None] < M)
+    o = acc.to(O.dtype.element_ty)
+    
+    o_ptrs = tl.make_block_ptr(
+        base=O,
+        shape=(M, Dv),
+        strides=(stride_om, stride_od),
+        offsets=(start_m, 0),
+        block_shape=(BLOCK_M, BLOCK_D),
+        order=(1, 0)
+    )
+    
+    tl.store(o_ptrs, o, boundary_check=(0, 1))
+
 
 def flash_attn(Q: torch.Tensor, K: torch.Tensor, V: torch.Tensor, causal: bool = True) -> torch.Tensor:
     Z, H, M, Dq = Q.shape
-    N = K.shape[2]
-    Dv = V.shape[3]
+    _, _, N, Dv = V.shape
     
-    Out = torch.empty((Z, H, M, Dv), device=Q.device, dtype=Q.dtype)
+    O = torch.empty((Z, H, M, Dv), device=Q.device, dtype=Q.dtype)
     
-    sm_scale = 1.0 / (Dq ** 0.5)
+    grid = (triton.cdiv(M, 128), H, Z)
     
-    BLOCK_M = 64
-    BLOCK_N = 64
-    
-    if Dq > 128:
-        BLOCK_Dq = 64
-    else:
-        BLOCK_Dq = Dq
-    
-    if Dv > 128:
-        BLOCK_Dv = 64
-    else:
-        BLOCK_Dv = Dv
-    
-    grid = (triton.cdiv(M, BLOCK_M), Z * H)
-    
-    _fwd_kernel[grid](
-        Q, K, V, sm_scale, Out,
+    _flash_attn_forward_kernel[grid](
+        Q, K, V, O,
         Q.stride(0), Q.stride(1), Q.stride(2), Q.stride(3),
         K.stride(0), K.stride(1), K.stride(2), K.stride(3),
         V.stride(0), V.stride(1), V.stride(2), V.stride(3),
-        Out.stride(0), Out.stride(1), Out.stride(2), Out.stride(3),
+        O.stride(0), O.stride(1), O.stride(2), O.stride(3),
         Z, H, M, N, Dq, Dv,
-        BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_Dq=BLOCK_Dq, BLOCK_Dv=BLOCK_Dv,
-        IS_CAUSAL=causal,
-        num_warps=4,
-        num_stages=3
+        causal,
+        BLOCK_M=128, BLOCK_N=64, BLOCK_D=64
     )
     
-    return Out
+    return O
+
 
 class Solution:
     def solve(self, spec_path: str = None) -> dict:
-        return {"code": self._get_code()}
-    
-    @staticmethod
-    def _get_code() -> str:
-        import inspect
-        return inspect.getsource(inspect.getmodule(inspect.currentframe()))
+        return {"code": "import torch\nimport triton\nimport triton.language as tl\n\n" + 
+                "### TRITON KERNEL ###\n" + 
+                "@triton.autotune(\n" + 
+                "    configs=[\n" + 
+                "        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 64, 'BLOCK_D': 64}, num_stages=3, num_warps=4),\n" + 
+                "        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_D': 64}, num_stages=3, num_warps=4),\n" + 
+                "        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 128, 'BLOCK_D': 64}, num_stages=3, num_warps=4),\n" + 
+                "        triton.Config({'BLOCK_M': 256, 'BLOCK_N': 64, 'BLOCK_D': 64}, num_stages=3, num_warps=8),\n" + 
+                "        triton.Config({'BLOCK_M': 256, 'BLOCK_N': 128, 'BLOCK_D': 64}, num_stages=2, num_warps=8),\n" + 
+                "    ],\n" + 
+                "    key=['M', 'N', 'Dq'],\n" + 
+                ")\n" + 
+                "@triton.jit\n" + 
+                "def _flash_attn_forward_kernel(\n" + 
+                "    Q, K, V, O,\n" + 
+                "    stride_qz, stride_qh, stride_qm, stride_qd,\n" + 
+                "    stride_kz, stride_kh, stride_kn, stride_kd,\n" + 
+                "    stride_vz, stride_vh, stride_vn, stride_vd,\n" + 
+                "    stride_oz, stride_oh, stride_om, stride_od,\n" + 
+                "    Z, H, M, N, Dq, Dv,\n" + 
+                "    causal: tl.constexpr,\n" + 
+                "    BLOCK_M: tl.constexpr,\n" + 
+                "    BLOCK_N: tl.constexpr,\n" + 
+                "    BLOCK_D: tl.constexpr,\n" + 
+                "):\n" + 
+                "    pid_m = tl.program_id(0)\n" + 
+                "    pid_h = tl.program_id(1)\n" + 
+                "    pid_z = tl.program_id(2)\n" + 
+                "    \n" + 
+                "    start_m = pid_m * BLOCK_M\n" + 
+                "    start_n = 0\n" + 
+                "    \n" + 
+                "    q_offset = pid_z * stride_qz + pid_h * stride_qh + start_m * stride_qm\n" + 
+                "    k_offset = pid_z * stride_kz + pid_h * stride_kh\n" + 
+                "    v_offset = pid_z * stride_vz + pid_h * stride_vh\n" + 
+                "    o_offset = pid_z * stride_oz + pid_h * stride_oh + start_m * stride_om\n" + 
+                "    \n" + 
+                "    m_i = tl.zeros([BLOCK_M], dtype=tl.float32) - float('inf')\n" + 
+                "    l_i = tl.zeros([BLOCK_M], dtype=tl.float32)\n" + 
+                "    acc = tl.zeros([BLOCK_M, BLOCK_D], dtype=tl.float32)\n" + 
+                "    \n" + 
+                "    q_ptrs = tl.make_block_ptr(\n" + 
+                "        base=Q,\n" + 
+                "        shape=(M, Dq),\n" + 
+                "        strides=(stride_qm, stride_qd),\n" + 
+                "        offsets=(start_m, 0),\n" + 
+                "        block_shape=(BLOCK_M, BLOCK_D),\n" + 
+                "        order=(1, 0)\n" + 
+                "    )\n" + 
+                "    \n" + 
+                "    k_ptrs = tl.make_block_ptr(\n" + 
+                "        base=K,\n" + 
+                "        shape=(N, Dq),\n" + 
+                "        strides=(stride_kn, stride_kd),\n" + 
+                "        offsets=(0, 0),\n" + 
+                "        block_shape=(BLOCK_N, BLOCK_D),\n" + 
+                "        order=(1, 0)\n" + 
+                "    )\n" + 
+                "    \n" + 
+                "    v_ptrs = tl.make_block_ptr(\n" + 
+                "        base=V,\n" + 
+                "        shape=(N, Dv),\n" + 
+                "        strides=(stride_vn, stride_vd),\n" + 
+                "        offsets=(0, 0),\n" + 
+                "        block_shape=(BLOCK_N, BLOCK_D),\n" + 
+                "        order=(1, 0)\n" + 
+                "    )\n" + 
+                "    \n" + 
+                "    for start_n in range(0, N, BLOCK_N):\n" + 
+                "        q = tl.load(q_ptrs, boundary_check=(0, 1))\n" + 
+                "        k = tl.load(k_ptrs, boundary_check=(0, 1))\n" + 
+                "        v = tl.load(v_ptrs, boundary_check=(0, 1))\n" + 
+                "        \n" + 
+                "        q = q.to(tl.float32)\n" + 
+                "        k = k.to(tl.float32)\n" + 
+                "        \n" + 
+                "        s = tl.dot(q, tl.trans(k), allow_tf32=False) * (1.0 / tl.sqrt(Dq))\n" + 
+                "        \n" + 
+                "        if causal:\n" + 
+                "            m = start_m + tl.arange(0, BLOCK_M)\n" + 
+                "            n = start_n + tl.arange(0, BLOCK_N)\n" + 
+                "            mask = m[:, None] >= n[None, :]\n" + 
+                "            s = tl.where(mask, s, float('-inf'))\n" + 
+                "        \n" + 
+                "        m_ij = tl.maximum(m_i[:, None], tl.max(s, axis=1))\n" + 
+                "        p = tl.exp(s - m_ij)\n" + 
+                "        l_ij = tl.exp(m_i[:, None] - m_ij) * l_i[:, None] + tl.sum(p, axis=1)\n" + 
+                "        \n" + 
+                "        alpha = tl.exp(m_i[:, None] - m_ij) / l_ij\n" + 
+                "        acc = acc * alpha[:, None]\n" + 
+                "        \n" + 
+                "        p = p / l_ij[:, None]\n" + 
+                "        acc = acc + tl.dot(p.to(v.dtype), v, allow_tf32=False)\n" + 
+                "        \n" + 
+                "        m_i = m_ij\n" + 
+                "        l_i = l_ij\n" + 
+                "        \n" + 
+                "        k_ptrs = tl.advance(k_ptrs, (BLOCK_N, 0))\n" + 
+                "        v_ptrs = tl.advance(v_ptrs, (BLOCK_N, 0))\n" + 
+                "    \n" + 
+                "    o = acc.to(O.dtype.element_ty)\n" + 
+                "    \n" + 
+                "    o_ptrs = tl.make_block_ptr(\n" + 
+                "        base=O,\n" + 
+                "        shape=(M, Dv),\n" + 
+                "        strides=(stride_om, stride_od),\n" + 
+                "        offsets=(start_m, 0),\n" + 
+                "        block_shape=(BLOCK_M, BLOCK_D),\n" + 
+                "        order=(1, 0)\n" + 
+                "    )\n" + 
+                "    \n" + 
+                "    tl.store(o_ptrs, o, boundary_check=(0, 1))\n" + 
+                "\n" + 
+                "### WRAPPER FUNCTION ###\n" + 
+                "def flash_attn(Q: torch.Tensor, K: torch.Tensor, V: torch.Tensor, causal: bool = True) -> torch.Tensor:\n" + 
+                "    Z, H, M, Dq = Q.shape\n" + 
+                "    _, _, N, Dv = V.shape\n" + 
+                "    \n" + 
+                "    O = torch.empty((Z, H, M, Dv), device=Q.device, dtype=Q.dtype)\n" + 
+                "    \n" + 
+                "    grid = (triton.cdiv(M, 128), H, Z)\n" + 
+                "    \n" + 
+                "    _flash_attn_forward_kernel[grid](\n" + 
+                "        Q, K, V, O,\n" + 
+                "        Q.stride(0), Q.stride(1), Q.stride(2), Q.stride(3),\n" + 
+                "        K.stride(0), K.stride(1), K.stride(2), K.stride(3),\n" + 
+                "        V.stride(0), V.stride(1), V.stride(2), V.stride(3),\n" + 
+                "        O.stride(0), O.stride(1), O.stride(2), O.stride(3),\n" + 
+                "        Z, H, M, N, Dq, Dv,\n" + 
+                "        causal,\n" + 
+                "        BLOCK_M=128, BLOCK_N=64, BLOCK_D=64\n" + 
+                "    )\n" + 
+                "    \n" + 
+                "    return O\n" + 
+                "\n" + 
+                "### SOLUTION CLASS ###\n" + 
+                "class Solution:\n" + 
+                "    def solve(self, spec_path: str = None) -> dict:\n" + 
+                "        return {'code': 'Complete implementation is already in memory'}"}

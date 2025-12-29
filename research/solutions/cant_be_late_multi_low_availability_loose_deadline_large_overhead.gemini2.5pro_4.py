@@ -25,31 +25,18 @@ class Solution(MultiRegionStrategy):
         )
         super().__init__(args)
 
-        # Custom initialization
-        self.num_regions = self.env.get_num_regions()
+        # Custom initialization for the strategy's state and hyperparameters
+        self.initialized = False
+        self.num_regions = -1
+        self.consecutive_failures = []
         
-        # EMA of spot availability for each region. Start with a neutral 0.5.
-        self.ema_spot = [0.5] * self.num_regions
-        self.alpha = 0.1
-
-        # State tracking
-        self.last_history_update_time = -1.0
-        self.last_switch_time = -1.0
+        # Hyperparameters
+        self.patience = 3
+        self.safety_preemptions = 2
         
-        # Slack management: defines a "glide path" for the schedule
-        self.initial_slack = self.deadline - self.task_duration
-        if self.initial_slack < 0:
-            self.initial_slack = 0
-
-        # Tuned Hyperparameters
-        # Safety factor for entering absolute critical mode
-        self.SAFETY_FACTOR = 1.15
-        # Required EMA improvement to justify a region switch
-        self.SWITCH_IMPROVEMENT_THRESHOLD = 0.2
-        # Cooldown period after a switch to prevent thrashing
-        self.switch_cooldown = 5 * self.restart_overhead
-        # Minimum slack required to consider switching regions
-        self.SWITCH_SLACK_FACTOR = 2.0
+        # State for efficient work tracking
+        self.work_done = 0.0
+        self.last_task_done_len = 0
 
         return self
 
@@ -57,88 +44,49 @@ class Solution(MultiRegionStrategy):
         """
         Decide next action based on current state.
         """
-        # 1. GATHER STATE
+        if not self.initialized:
+            self.num_regions = self.env.get_num_regions()
+            self.consecutive_failures = [0] * self.num_regions
+            self.safety_buffer = self.safety_preemptions * (self.env.gap_seconds + self.restart_overhead)
+            self.initialized = True
+
         current_region = self.env.get_current_region()
-        elapsed_time = self.env.elapsed_seconds
+        if has_spot:
+            self.consecutive_failures[current_region] = 0
+        else:
+            self.consecutive_failures[current_region] += 1
         
-        remaining_work = self.task_duration - sum(self.task_done_time)
+        # Efficiently update the total work done
+        if len(self.task_done_time) > self.last_task_done_len:
+            # sum() is only called on the new segments, keeping this step fast.
+            new_segments = self.task_done_time[self.last_task_done_len:]
+            self.work_done += sum(new_segments)
+            self.last_task_done_len = len(self.task_done_time)
+            
+        remaining_work = self.task_duration - self.work_done
+
         if remaining_work <= 0:
             return ClusterType.NONE
 
-        # 2. UPDATE HISTORY (Exponential Moving Average)
-        if elapsed_time > self.last_history_update_time:
-            spot_observation = 1.0 if has_spot else 0.0
-            self.ema_spot[current_region] = (self.alpha * spot_observation) + \
-                                            ((1 - self.alpha) * self.ema_spot[current_region])
-            self.last_history_update_time = elapsed_time
-
-        # 3. CALCULATE TIME PRESSURE AND SLACK
-        remaining_time = self.deadline - elapsed_time
-        time_needed_od = remaining_work
-
-        # The "glide path": how much buffer we should ideally have at this point.
-        if self.task_duration > 0:
-            desired_slack = self.initial_slack * (remaining_work / self.task_duration)
-        else:
-            desired_slack = self.initial_slack
-        current_slack = remaining_time - time_needed_od
+        time_left = self.deadline - self.env.elapsed_seconds
         
-        # Determine if we are in an absolute critical situation.
-        is_critical_abs = (remaining_time <= time_needed_od * self.SAFETY_FACTOR)
-        
-        # 4. DECISION LOGIC
-        
-        # 4.1. CRITICAL MODE: Prioritize guaranteed progress above all else.
-        if is_critical_abs:
-            if has_spot:
-                # Switching to Spot from OD incurs an overhead, which is too risky in critical mode.
-                if last_cluster_type == ClusterType.ON_DEMAND:
-                    return ClusterType.ON_DEMAND
-                return ClusterType.SPOT
-            else:
-                return ClusterType.ON_DEMAND
+        time_needed_on_demand = remaining_work + self.remaining_restart_overhead
 
-        # 4.2. NORMAL MODE: Balance cost and progress.
-        if has_spot:
-            if last_cluster_type == ClusterType.ON_DEMAND:
-                # Switching from OD to Spot incurs an overhead.
-                # Only do it if we have enough slack to absorb the time loss.
-                if current_slack > desired_slack + self.restart_overhead:
-                    return ClusterType.SPOT
-                else:
-                    return ClusterType.ON_DEMAND # Not enough buffer, stay safe.
-            else:
-                return ClusterType.SPOT
-        
-        # --- Normal Mode, Spot NOT available ---
-        # Options: Switch Region, use On-Demand, or Wait (None).
-
-        # 4.2.1. CONSIDER SWITCHING REGION
-        best_other_region = -1
-        max_ema = -1.0
-        for i in range(self.num_regions):
-            if i == current_region:
-                continue
-            if self.ema_spot[i] > max_ema:
-                max_ema = self.ema_spot[i]
-                best_other_region = i
-        
-        can_switch = (elapsed_time - self.last_switch_time) >= self.switch_cooldown
-        should_switch = (best_other_region != -1 and 
-                         max_ema > self.ema_spot[current_region] + self.SWITCH_IMPROVEMENT_THRESHOLD)
-        is_affordable = current_slack > self.restart_overhead * self.SWITCH_SLACK_FACTOR
-
-        if can_switch and should_switch and is_affordable:
-            self.env.switch_region(best_other_region)
-            self.last_switch_time = elapsed_time
-            # After a switch, wait one step to observe the new region's spot status
-            # without committing to an expensive OD instance blindly.
-            return ClusterType.NONE
-
-        # 4.2.2. ON-DEMAND vs. NONE (if not switching)
-        if current_slack < desired_slack:
-            # We are falling behind our schedule. Use On-Demand to catch up.
+        # Urgency check: If slack is below the safety buffer, force On-Demand.
+        if time_needed_on_demand >= time_left - self.safety_buffer:
             return ClusterType.ON_DEMAND
+
+        # Standard operation: Prioritize cost-saving if not in danger.
+        if has_spot:
+            return ClusterType.SPOT
         else:
-            # We have enough slack. We can afford to wait for a Spot instance.
-            return ClusterType.NONE
+            # Spot unavailable: decide whether to use On-Demand or switch regions.
+            if self.num_regions > 1 and self.consecutive_failures[current_region] >= self.patience:
+                # Switch region if current one is persistently unavailable.
+                next_region = (current_region + 1) % self.num_regions
+                self.env.switch_region(next_region)
+                # Use On-Demand after switching to guarantee progress.
+                return ClusterType.ON_DEMAND
+            else:
+                # Wait for spot in the current region, using On-Demand to make progress.
+                return ClusterType.ON_DEMAND

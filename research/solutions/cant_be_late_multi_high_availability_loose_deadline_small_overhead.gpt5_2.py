@@ -1,12 +1,11 @@
 import json
 from argparse import Namespace
-
 from sky_spot.strategies.multi_strategy import MultiRegionStrategy
 from sky_spot.utils import ClusterType
 
 
 class Solution(MultiRegionStrategy):
-    NAME = "cbl_multi_v1"
+    NAME = "jit_guard_od_lock_v1"
 
     def solve(self, spec_path: str) -> "Solution":
         with open(spec_path) as f:
@@ -21,88 +20,61 @@ class Solution(MultiRegionStrategy):
         super().__init__(args)
 
         # Internal state
-        self._initialized = False
-        self._od_lock = False  # Once ON_DEMAND is chosen to guarantee deadline, keep it.
-        self._work_done_sum = 0.0
-        self._prev_done_len = 0
-        self._num_regions = None
-        self._rr_next_region = None  # for round-robin region switching when spot unavailable
-
+        self._od_locked = False
+        self._last_reset_marker = -1.0
         return self
 
-    def _init_if_needed(self):
-        if not self._initialized:
-            try:
-                self._num_regions = self.env.get_num_regions()
-            except Exception:
-                self._num_regions = 1
-            cur = 0
-            try:
-                cur = self.env.get_current_region()
-            except Exception:
-                cur = 0
-            self._rr_next_region = (cur + 1) % max(1, self._num_regions)
-            self._initialized = True
+    def _maybe_reset_internal_state(self):
+        # Reset lock at the start of each new scenario/run
+        cur = getattr(self.env, "elapsed_seconds", 0.0)
+        if cur < self._last_reset_marker or cur == 0.0:
+            self._od_locked = False
+        self._last_reset_marker = cur
 
-    def _update_work_done_sum(self):
-        n = len(self.task_done_time)
-        if n > self._prev_done_len:
-            # Only sum the newly added segments to avoid O(n) each step
-            add = 0.0
-            for i in range(self._prev_done_len, n):
-                add += self.task_done_time[i]
-            self._work_done_sum += add
-            self._prev_done_len = n
-
-    def _remaining_work(self) -> float:
-        self._update_work_done_sum()
-        rem = self.task_duration - self._work_done_sum
-        if rem < 0.0:
-            rem = 0.0
-        return rem
-
-    def _need_on_demand_now(self) -> bool:
-        # Decide if we must switch to ON_DEMAND now to finish by deadline
-        now = self.env.elapsed_seconds
-        available_time = self.deadline - now
-        if available_time <= 0:
-            return True
-        remaining_work = self._remaining_work()
-        if remaining_work <= 0:
-            return False
-        # If we start ON_DEMAND now, we will pay a restart overhead before accruing work
-        # Use a tiny epsilon to handle float inaccuracies.
-        epsilon = 1e-9
-        return (self.restart_overhead + remaining_work) >= (available_time - epsilon)
+    def _get_remaining_compute(self) -> float:
+        done = sum(self.task_done_time) if hasattr(self, "task_done_time") else 0.0
+        remaining = self.task_duration - done
+        if remaining < 0.0:
+            remaining = 0.0
+        return remaining
 
     def _step(self, last_cluster_type: ClusterType, has_spot: bool) -> ClusterType:
-        self._init_if_needed()
+        self._maybe_reset_internal_state()
 
-        # If already chose ON_DEMAND to guarantee finish, keep using it
-        if self._od_lock:
-            return ClusterType.ON_DEMAND
+        # Basic stats
+        t_elapsed = self.env.elapsed_seconds
+        slack = self.deadline - t_elapsed
+        gap = self.env.gap_seconds
+        R = self._get_remaining_compute()
 
-        # If task is done, don't run more
-        if self._remaining_work() <= 0.0:
+        if R <= 0.0:
             return ClusterType.NONE
 
-        # If we must run ON_DEMAND now to guarantee deadline
-        if self._need_on_demand_now():
-            self._od_lock = True
+        # If we are already locked to OD, keep using OD to ensure deadline feasibility.
+        if self._od_locked:
             return ClusterType.ON_DEMAND
 
-        # Prefer SPOT whenever available
+        # Compute time needed if we start OD now
+        if last_cluster_type == ClusterType.ON_DEMAND:
+            od_overhead_now = max(0.0, self.remaining_restart_overhead)
+        else:
+            od_overhead_now = self.restart_overhead
+
+        # If we cannot guarantee completion unless we start OD now, lock and go OD.
+        if slack <= od_overhead_now + R:
+            self._od_locked = True
+            return ClusterType.ON_DEMAND
+
+        # Prefer SPOT when available
         if has_spot:
             return ClusterType.SPOT
 
-        # Spot unavailable in current region: if there are multiple regions, switch to another region
-        if self._num_regions and self._num_regions > 1:
-            cur_region = self.env.get_current_region()
-            next_region = (cur_region + 1) % self._num_regions
-            # prepare for next step; we still cannot use SPOT this step due to has_spot==False
-            if next_region != cur_region:
-                self.env.switch_region(next_region)
-                self._rr_next_region = (next_region + 1) % self._num_regions
+        # Spot not available: decide wait vs OD
+        # If we can afford to wait one full step and still complete by switching to OD next step, then wait.
+        extra_slack_if_commit_next_step = slack - gap - (self.restart_overhead + R)
+        if extra_slack_if_commit_next_step > 0.0:
+            return ClusterType.NONE
 
-        # Wait this step (cost-free) and try again next step
-        return ClusterType.NONE
+        # Otherwise, we must commit to OD now
+        self._od_locked = True
+        return ClusterType.ON_DEMAND

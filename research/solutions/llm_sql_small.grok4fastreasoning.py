@@ -1,6 +1,44 @@
 import pandas as pd
-import numpy as np
-from typing import List, Optional
+import itertools
+import concurrent.futures
+from typing import List, Dict, Any
+
+class TrieNode:
+    def __init__(self):
+        self.children: Dict[str, 'TrieNode'] = {}
+
+class Trie:
+    def __init__(self):
+        self.root = TrieNode()
+
+    def insert(self, word: str) -> None:
+        node = self.root
+        for char in word:
+            if char not in node.children:
+                node.children[char] = TrieNode()
+            node = node.children[char]
+
+    def max_prefix_len(self, word: str) -> int:
+        node = self.root
+        length = 0
+        for char in word:
+            if char in node.children:
+                node = node.children[char]
+                length += 1
+            else:
+                return length
+        return length
+
+def compute_sum_lcp(order: List[str], values: Dict[str, List[str]], N: int) -> int:
+    total_lcp = 0
+    trie = Trie()
+    for i in range(N):
+        s = ''.join(values[col][i] for col in order)
+        if i > 0:
+            max_l = trie.max_prefix_len(s)
+            total_lcp += max_l
+        trie.insert(s)
+    return total_lcp
 
 class Solution:
     def solve(
@@ -9,127 +47,79 @@ class Solution:
         early_stop: int = 100000,
         row_stop: int = 4,
         col_stop: int = 2,
-        col_merge: Optional[List[List[str]]] = None,
-        one_way_dep: Optional[List] = None,
+        col_merge: list = None,
+        one_way_dep: list = None,
         distinct_value_threshold: float = 0.7,
         parallel: bool = True,
     ) -> pd.DataFrame:
-        if one_way_dep is not None:
-            pass  # Not used in this variant
-
-        N, _ = df.shape
         df = df.copy()
-
-        # Apply column merges
+        N = len(df)
         if col_merge is not None:
+            to_drop = set()
             for group in col_merge:
-                if not group:
-                    continue
-                merged_name = 'merged_' + '_'.join(group)
-                merged = df[group].astype(str).apply(lambda x: ''.join(x), axis=1)
-                df[merged_name] = merged
-                df = df.drop(columns=group)
-
-        columns = list(df.columns)
-        M = len(columns)
-        if M == 0:
+                if len(group) > 1:
+                    merged_name = '_'.join(group)
+                    df[merged_name] = df[group].apply(lambda row: ''.join(map(str, row)), axis=1)
+                    to_drop.update(group)
+            if to_drop:
+                df = df.drop(columns=list(to_drop))
+        cols = list(df.columns)
+        K = len(cols)
+        if K == 0:
             return df
-
-        # Precompute string array
-        str_df = df[columns].astype(str)
-        str_array = str_df.values  # N x M numpy array of strings
-
-        # Greedy selection of permutation
-        remaining = set(range(M))
-        current_perm = []
-
-        for step in range(M):
-            best_score = -1.0
-            best_cand = None
-            candidates = list(remaining)
-
-            # Compute scores for each candidate
-            cand_scores = {}
-            for cand in candidates:
-                partial_perm = current_perm + [cand]
-                score = self._compute_partial_hit_rate(str_array, partial_perm, N)
-                cand_scores[cand] = score
-                if score > best_score:
-                    best_score = score
-                    best_cand = cand
-
-            if best_cand is None:
+        str_df = df.astype(str)
+        values = {col: str_df[col].tolist() for col in cols}
+        low_div = []
+        high_div = []
+        for col in cols:
+            num_distinct = str_df[col].nunique()
+            div = num_distinct / N if N > 0 else 0
+            if div <= distinct_value_threshold:
+                low_div.append(col)
+            else:
+                high_div.append(col)
+        best_order = []
+        remaining = set(low_div)
+        num_evals = 0
+        while remaining and num_evals < early_stop:
+            look = min(col_stop, len(remaining))
+            candidates = list(itertools.permutations(remaining, look))
+            candidate_orders = [best_order + list(seq) for seq in candidates]
+            best_score = -1
+            best_full_order = None
+            if parallel and len(candidate_orders) > 1:
+                with concurrent.futures.ProcessPoolExecutor() as executor:
+                    future_to_order = {executor.submit(compute_sum_lcp, order, values, N): order for order in candidate_orders}
+                    for future in concurrent.futures.as_completed(future_to_order):
+                        if num_evals >= early_stop:
+                            break
+                        try:
+                            score = future.result()
+                            num_evals += 1
+                            if score > best_score:
+                                best_score = score
+                                best_full_order = future_to_order[future]
+                        except Exception:
+                            pass
+            else:
+                for order in candidate_orders:
+                    if num_evals >= early_stop:
+                        break
+                    score = compute_sum_lcp(order, values, N)
+                    num_evals += 1
+                    if score > best_score:
+                        best_score = score
+                        best_full_order = order
+            if best_full_order is None:
                 break
-
-            current_perm.append(best_cand)
-            remaining.remove(best_cand)
-
-            # Early stop check (simplified, based on steps or something)
-            if len(current_perm) >= early_stop:
-                break
-
-        # If not full, append remaining in original order
-        for i in remaining:
-            current_perm.append(i)
-
-        # Reorder dataframe
-        ordered_columns = [columns[i] for i in current_perm]
-        result_df = df[ordered_columns]
-
-        return result_df
-
-    def _compute_partial_hit_rate(self, str_array, perm: List[int], N: int) -> float:
-        if N == 0:
-            return 0.0
-
-        d = len(perm)
-
-        class TrieNode:
-            def __init__(self):
-                self.children = {}
-
-        root = TrieNode()
-
-        total_len = 0
-        sum_lcp = 0
-
-        def get_lcp_and_insert(row_idx: int) -> int:
-            nonlocal total_len, sum_lcp
-            s = ''.join(str_array[row_idx, p] for p in perm)
-            total_len += len(s)
-
-            # Traverse for LCP
-            node = root
-            lcp_len = 0
-            i = 0
-            slen = len(s)
-            while i < slen:
-                char = s[i]
-                if char in node.children:
-                    node = node.children[char]
-                    i += 1
-                    lcp_len += 1
-                else:
-                    break
-
-            # Insert remaining
-            for j in range(i, slen):
-                char = s[j]
-                new_node = TrieNode()
-                node.children[char] = new_node
-                node = new_node
-
-            return lcp_len
-
-        # Insert first row
-        get_lcp_and_insert(0)
-
-        # Insert remaining rows
-        for i in range(1, N):
-            lcp = get_lcp_and_insert(i)
-            sum_lcp += lcp
-
-        if total_len == 0:
-            return 0.0
-
-        return sum_lcp / total_len
+            new_added = best_full_order[len(best_order):]
+            best_order = best_full_order
+            for c in new_added:
+                remaining.discard(c)
+        if remaining:
+            # append any leftover low div in arbitrary order
+            best_order += list(remaining)
+        # append high div sorted by increasing nunique
+        high_sorted = sorted(high_div, key=lambda c: str_df[c].nunique())
+        best_order += high_sorted
+        return df[best_order]

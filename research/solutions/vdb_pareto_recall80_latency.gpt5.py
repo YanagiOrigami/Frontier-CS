@@ -1,169 +1,144 @@
 import numpy as np
-from typing import Tuple, Optional
+from typing import Tuple
 
 try:
     import faiss
-except Exception:
+except ImportError:  # pragma: no cover
     faiss = None
 
 
 class YourIndexClass:
-    def __init__(self, dim: int, **kwargs):
+    def __init__(
+        self,
+        dim: int,
+        **kwargs
+    ):
+        if faiss is None:
+            raise ImportError("faiss is required for this solution.")
         self.dim = int(dim)
-        # Parameters with sensible defaults for Recall80 Latency tier
-        self.nlist: int = int(kwargs.get("nlist", 4096))
-        self.m_pq: int = int(kwargs.get("m", 16))  # number of PQ subvectors
-        self.nbits: int = int(kwargs.get("nbits", 8))  # bits per PQ codebook
-        self.nprobe: int = int(kwargs.get("nprobe", 16))
-        self.use_opq: bool = bool(kwargs.get("use_opq", True))
-        self.train_size: int = int(kwargs.get("train_size", 200000))
-        self.refine_factor: int = int(kwargs.get("refine_factor", 8))  # refine k_factor
-        self.random_seed: int = int(kwargs.get("seed", 123))
-        self.num_threads: Optional[int] = kwargs.get("num_threads", None)
 
-        self.index = None  # final index (possibly IndexRefineFlat)
-        self._base_index = None  # inner base index (IVFPQ possibly inside PreTransform)
+        # Parameters with sensible defaults for recall >= 0.8 and low latency
+        self.nlist = int(kwargs.get("nlist", 8192))            # number of IVF clusters
+        self.nprobe = int(kwargs.get("nprobe", 10))            # probes at search time
+        self.pq_m = int(kwargs.get("M", 16))                   # PQ subquantizers
+        self.pq_nbits = int(kwargs.get("pq_nbits", 8))         # bits per subquantizer
+        self.use_opq = bool(kwargs.get("use_opq", True))       # OPQ transform before IVF-PQ
+        self.use_refine = bool(kwargs.get("use_refine", True)) # refine with exact L2 on small shortlist
+        self.refine_factor = int(kwargs.get("refine_factor", 4))
+        self.train_size = int(kwargs.get("train_size", 200000))
+        self.random_seed = int(kwargs.get("seed", 123))
+        self.num_threads = int(kwargs.get("threads", 0))       # 0 -> use faiss default
+
+        # Internal handles
+        self._index = None                   # top-level index used for add/search (may be refine wrapper)
+        self._base = None                    # base index (possibly with pretransform), before refine
+        self._ivf = None                     # extracted IVF pointer for parameter tuning
         self._is_trained = False
-        self._ntotal = 0
 
-        # Validate divisibility for PQ/OPQ
-        if self.dim % self.m_pq != 0:
-            # Adjust m_pq to a divisor of dim if necessary
-            # Find largest divisor of dim <= requested m_pq
-            div = None
-            for m in range(self.m_pq, 0, -1):
-                if self.dim % m == 0:
-                    div = m
-                    break
-            if div is None:
-                div = 1
-            self.m_pq = div
+        # Configure threads if specified
+        try:
+            if self.num_threads and hasattr(faiss, "omp_set_num_threads"):
+                faiss.omp_set_num_threads(self.num_threads)
+        except Exception:
+            pass
 
-        if faiss is not None:
+    def _build_base_index(self) -> None:
+        # Build index via index_factory for simplicity and speed
+        if self.use_opq:
+            desc = f"OPQ{self.pq_m},IVF{self.nlist},PQ{self.pq_m}x{self.pq_nbits}"
+        else:
+            desc = f"IVF{self.nlist},PQ{self.pq_m}x{self.pq_nbits}"
+        self._base = faiss.index_factory(self.dim, desc, faiss.METRIC_L2)
+
+        # Extract IVF to tune training/search parameters
+        self._ivf = faiss.extract_index_ivf(self._base)
+        if self._ivf is None:
+            # In unlikely cases, fall back to searching directly on _base
+            self._ivf = None
+        else:
+            # Training parameters: reduce iterations to save time, ensure feasibility with fewer train pts
             try:
-                if self.num_threads is None:
-                    th = faiss.omp_get_max_threads()
-                else:
-                    th = int(self.num_threads)
-                if th > 0:
-                    faiss.omp_set_num_threads(th)
+                self._ivf.cp.min_points_per_centroid = 5
+                self._ivf.cp.max_points_per_centroid = 1000000000
+                self._ivf.cp.niter = 15
             except Exception:
                 pass
 
-    def _build_index(self, train_x: np.ndarray):
-        if faiss is None:
-            raise RuntimeError("FAISS library is required for this index.")
+            # Precompute tables for faster scanning, if available
+            try:
+                self._ivf.use_precomputed_table = 1
+            except Exception:
+                pass
 
-        d = self.dim
-        # Coarse quantizer
-        quantizer = faiss.IndexFlatL2(d)
+        # Optional refine (exact L2 re-ranking of a very small shortlist, improves recall with minimal cost)
+        if self.use_refine and hasattr(faiss, "IndexRefineFlat"):
+            refine = faiss.IndexRefineFlat(self._base)
+            refine.k_factor = max(1, self.refine_factor)
+            self._index = refine
+        else:
+            self._index = self._base
 
-        # Base IVF-PQ index
-        ivfpq = faiss.IndexIVFPQ(quantizer, d, self.nlist, self.m_pq, self.nbits, faiss.METRIC_L2)
-        ivfpq.by_residual = True
-
-        base_index = ivfpq
-        # Optional OPQ transform to improve recall for same code size
-        if self.use_opq:
-            opq = faiss.OPQMatrix(d, self.m_pq)
-            base_index = faiss.IndexPreTransform(opq, ivfpq)
-
-        # Training
-        # Ensure contiguous float32
-        train_x = np.ascontiguousarray(train_x, dtype=np.float32)
-        base_index.train(train_x)
-
-        # Use refine flat to re-rank a small candidate set for better recall
-        refine = faiss.IndexRefineFlat(base_index)
-        refine.k_factor = max(1, int(self.refine_factor))
-
-        # Set nprobe on the inner IVF
+        # Set search parameters (nprobe) on the appropriate layer
         try:
-            ivf = faiss.extract_index_ivf(refine)
-            if ivf is not None:
-                ivf.nprobe = int(self.nprobe)
+            if self._ivf is not None:
+                self._ivf.nprobe = self.nprobe
+            else:
+                # Try parameter space as a generic fallback
+                ps = faiss.ParameterSpace()
+                ps.set_index_parameter(self._index, "nprobe", self.nprobe)
         except Exception:
             pass
-
-        # Try to enable precomputed tables on IVFPQ for speed
-        try:
-            inner_ivf = faiss.extract_index_ivf(refine)
-            pq = faiss.downcast_index(inner_ivf)
-            if hasattr(pq, "use_precomputed_table"):
-                pq.use_precomputed_table = 1
-        except Exception:
-            pass
-
-        self.index = refine
-        self._base_index = base_index
-        self._is_trained = True
 
     def add(self, xb: np.ndarray) -> None:
-        if xb is None:
+        if xb is None or xb.size == 0:
             return
-        xb = np.asarray(xb, dtype=np.float32, order="C")
-        if xb.ndim != 2 or xb.shape[1] != self.dim:
-            raise ValueError("xb must have shape (N, dim) with dim matching initialization")
+        if xb.dtype != np.float32:
+            xb = xb.astype(np.float32, copy=False)
+        xb = np.ascontiguousarray(xb)
 
-        if self.index is None:
-            # Train on a random subset of the first add batch
-            N = xb.shape[0]
-            rs = np.random.RandomState(self.random_seed)
-            if N > self.train_size:
-                idx = rs.choice(N, self.train_size, replace=False)
-                train_x = xb[idx]
-            else:
+        if self._index is None:
+            self._build_base_index()
+
+        # Train if needed
+        if not self._index.is_trained:
+            n = xb.shape[0]
+            rng = np.random.default_rng(self.random_seed)
+            if n <= self.train_size:
                 train_x = xb
-            self._build_index(train_x)
-
-        # Ensure FAISS uses desired threads
-        if faiss is not None:
-            try:
-                if self.num_threads is None:
-                    th = faiss.omp_get_max_threads()
-                else:
-                    th = int(self.num_threads)
-                if th > 0:
-                    faiss.omp_set_num_threads(th)
-            except Exception:
-                pass
+            else:
+                # Sample without replacement for training
+                idx = rng.choice(n, size=self.train_size, replace=False)
+                idx.sort()
+                train_x = xb[idx]
+            self._index.train(train_x)
+            self._is_trained = True
 
         # Add vectors
-        self.index.add(xb)
-        self._ntotal += xb.shape[0]
+        self._index.add(xb)
 
     def search(self, xq: np.ndarray, k: int) -> Tuple[np.ndarray, np.ndarray]:
-        if self.index is None or not self._is_trained:
-            raise RuntimeError("Index not built/trained. Call add() before search().")
-        if k <= 0:
-            raise ValueError("k must be positive")
+        if xq is None or xq.size == 0:
+            return (np.empty((0, k), dtype=np.float32), np.empty((0, k), dtype=np.int64))
+        if self._index is None:
+            # Build minimal flat index if add() wasn't called (shouldn't happen in evaluator)
+            flat = faiss.IndexFlatL2(self.dim)
+            self._index = flat
+        if xq.dtype != np.float32:
+            xq = xq.astype(np.float32, copy=False)
+        xq = np.ascontiguousarray(xq)
 
-        xq = np.asarray(xq, dtype=np.float32, order="C")
-        if xq.ndim != 2 or xq.shape[1] != self.dim:
-            raise ValueError("xq must have shape (nq, dim) with dim matching initialization")
-
-        # Ensure FAISS uses desired threads
-        if faiss is not None:
-            try:
-                if self.num_threads is None:
-                    th = faiss.omp_get_max_threads()
-                else:
-                    th = int(self.num_threads)
-                if th > 0:
-                    faiss.omp_set_num_threads(th)
-            except Exception:
-                pass
-
-        # Set nprobe on each search call (in case user changed it)
+        # Ensure nprobe is correctly set
         try:
-            ivf = faiss.extract_index_ivf(self.index)
-            if ivf is not None:
-                ivf.nprobe = int(self.nprobe)
+            if self._ivf is not None:
+                self._ivf.nprobe = self.nprobe
+            else:
+                ps = faiss.ParameterSpace()
+                ps.set_index_parameter(self._index, "nprobe", self.nprobe)
         except Exception:
             pass
 
-        D, I = self.index.search(xq, k)
-        # Ensure correct dtypes and shapes
+        D, I = self._index.search(xq, int(k))
+        # Ensure output dtypes
         if D.dtype != np.float32:
             D = D.astype(np.float32, copy=False)
         if I.dtype != np.int64:

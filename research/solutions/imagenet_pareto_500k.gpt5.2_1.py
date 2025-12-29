@@ -1,427 +1,296 @@
-import math
 import os
-import random
-from dataclasses import dataclass
-from typing import Dict, Optional, Tuple
+import math
+import copy
+from typing import Optional, Dict, Tuple
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-from torch.utils.data import DataLoader, TensorDataset
 
 
-def _set_torch_threads():
-    try:
-        n = os.cpu_count() or 8
-        torch.set_num_threads(min(8, max(1, n)))
-        torch.set_num_interop_threads(min(8, max(1, n)))
-    except Exception:
-        pass
-
-
-def _to_tensor(x, dtype=None, device=None):
-    if torch.is_tensor(x):
-        t = x
-        if dtype is not None and t.dtype != dtype:
-            t = t.to(dtype=dtype)
-        if device is not None and t.device != torch.device(device):
-            t = t.to(device=device)
-        return t
-    t = torch.as_tensor(x, dtype=dtype)
-    if device is not None:
-        t = t.to(device=device)
-    return t
-
-
-def _gather_from_loader(loader: DataLoader, device: str = "cpu") -> Tuple[torch.Tensor, torch.Tensor]:
-    xs = []
-    ys = []
-    for batch in loader:
-        if isinstance(batch, (list, tuple)) and len(batch) >= 2:
-            x, y = batch[0], batch[1]
-        else:
-            raise ValueError("Expected loader to yield (inputs, targets).")
-        x = _to_tensor(x, dtype=torch.float32, device=device)
-        y = _to_tensor(y, dtype=torch.long, device=device)
-        xs.append(x)
-        ys.append(y)
-    x_all = torch.cat(xs, dim=0) if xs else torch.empty((0,), dtype=torch.float32, device=device)
-    y_all = torch.cat(ys, dim=0) if ys else torch.empty((0,), dtype=torch.long, device=device)
-    return x_all, y_all
-
-
-def _param_count_trainable(model: nn.Module) -> int:
+def _count_trainable_params(model: nn.Module) -> int:
     return sum(p.numel() for p in model.parameters() if p.requires_grad)
 
 
-def _choose_hidden_dims(input_dim: int, num_classes: int, param_limit: int) -> Tuple[int, int]:
-    best = None
-    best_params = -1
-
-    h_min = 128
-    h_max = 1024
-    step = 16
-
-    def count_params(h1: int, h2: int) -> int:
-        # Linear params
-        p = (input_dim * h1 + h1) + (h1 * h2 + h2) + (h2 * num_classes + num_classes)
-        # LayerNorm params (weight+bias)
-        p += 2 * h1 + 2 * h2
-        return p
-
-    # Prefer reasonable shapes for CPU GEMM
-    for h1 in range(h_max, h_min - 1, -step):
-        for h2 in range(h_max, h_min - 1, -step):
-            p = count_params(h1, h2)
-            if p <= param_limit and p > best_params:
-                best_params = p
-                best = (h1, h2)
-
-    if best is None:
-        # Fallback: tiny dims
-        best = (h_min, h_min)
-    return best
-
-
-class _NormalizedMLP(nn.Module):
-    def __init__(self, input_dim: int, num_classes: int, h1: int, h2: int, dropout: float):
+class _BottleneckResidualBlock(nn.Module):
+    def __init__(self, dim: int, bottleneck_dim: int, dropout: float = 0.0, layerscale_init: float = 0.1):
         super().__init__()
-        self.input_dim = input_dim
-        self.num_classes = num_classes
-        self.h1 = h1
-        self.h2 = h2
-
-        self.register_buffer("mean", torch.zeros(input_dim, dtype=torch.float32))
-        self.register_buffer("inv_std", torch.ones(input_dim, dtype=torch.float32))
-
-        self.fc1 = nn.Linear(input_dim, h1, bias=True)
-        self.ln1 = nn.LayerNorm(h1, elementwise_affine=True)
-        self.fc2 = nn.Linear(h1, h2, bias=True)
-        self.ln2 = nn.LayerNorm(h2, elementwise_affine=True)
-        self.fc3 = nn.Linear(h2, num_classes, bias=True)
-
-        self.drop = nn.Dropout(p=float(dropout))
+        self.ln = nn.LayerNorm(dim)
+        self.fc1 = nn.Linear(dim, bottleneck_dim)
         self.act = nn.GELU()
-
-        self._init_weights()
-
-    def _init_weights(self):
-        for m in self.modules():
-            if isinstance(m, nn.Linear):
-                nn.init.kaiming_normal_(m.weight, nonlinearity="relu")
-                if m.bias is not None:
-                    nn.init.zeros_(m.bias)
-            elif isinstance(m, nn.LayerNorm):
-                nn.init.ones_(m.weight)
-                nn.init.zeros_(m.bias)
-
-    def set_normalization(self, mean: torch.Tensor, std: torch.Tensor, eps: float = 1e-6):
-        mean = mean.detach().to(dtype=torch.float32, device=self.mean.device)
-        std = std.detach().to(dtype=torch.float32, device=self.mean.device)
-        inv_std = 1.0 / torch.clamp(std, min=eps)
-        if mean.numel() != self.mean.numel():
-            raise ValueError("Mean has wrong shape.")
-        self.mean.copy_(mean)
-        self.inv_std.copy_(inv_std)
-
-    def normalize(self, x: torch.Tensor) -> torch.Tensor:
-        return (x - self.mean) * self.inv_std
-
-    def embed(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.normalize(x)
-        x = self.fc1(x)
-        x = self.ln1(x)
-        x = self.act(x)
-        x = self.drop(x)
-        x = self.fc2(x)
-        x = self.ln2(x)
-        x = self.act(x)
-        x = self.drop(x)
-        return x
-
-    def forward_with_embed(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        e = self.embed(x)
-        logits = self.fc3(e)
-        return logits, e
+        self.drop1 = nn.Dropout(dropout)
+        self.fc2 = nn.Linear(bottleneck_dim, dim)
+        self.drop2 = nn.Dropout(dropout)
+        self.gamma = nn.Parameter(torch.full((dim,), float(layerscale_init), dtype=torch.float32))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        e = self.embed(x)
-        return self.fc3(e)
+        y = self.ln(x)
+        y = self.fc1(y)
+        y = self.act(y)
+        y = self.drop1(y)
+        y = self.fc2(y)
+        y = self.drop2(y)
+        return x + y * self.gamma
 
 
-class _HybridProtoModel(nn.Module):
+class _ResidualMLPNet(nn.Module):
     def __init__(
         self,
-        base: _NormalizedMLP,
-        centroids: torch.Tensor,
-        centroids_norm: torch.Tensor,
-        centroids_sq: torch.Tensor,
-        metric: str,
-        beta: float,
-        scale: float,
-        gamma: float,
+        input_dim: int,
+        num_classes: int,
+        depth: int,
+        bottleneck_dim: int,
+        dropout: float = 0.05,
+        layerscale_init: float = 0.1,
     ):
         super().__init__()
-        self.base = base
+        self.input_dim = int(input_dim)
+        self.num_classes = int(num_classes)
 
-        self.register_buffer("centroids", centroids)
-        self.register_buffer("centroids_norm", centroids_norm)
-        self.register_buffer("centroids_sq", centroids_sq)
+        self.in_ln = nn.LayerNorm(self.input_dim)
+        self.blocks = nn.ModuleList(
+            [
+                _BottleneckResidualBlock(
+                    dim=self.input_dim,
+                    bottleneck_dim=bottleneck_dim,
+                    dropout=dropout,
+                    layerscale_init=layerscale_init,
+                )
+                for _ in range(int(depth))
+            ]
+        )
+        self.out_ln = nn.LayerNorm(self.input_dim)
+        self.head = nn.Linear(self.input_dim, self.num_classes)
 
-        self.metric = metric
-        self.register_buffer("beta", torch.tensor(float(beta), dtype=torch.float32))
-        self.register_buffer("scale", torch.tensor(float(scale), dtype=torch.float32))
-        self.register_buffer("gamma", torch.tensor(float(gamma), dtype=torch.float32))
+        self.register_buffer("x_mean", torch.zeros(self.input_dim, dtype=torch.float32), persistent=True)
+        self.register_buffer("x_invstd", torch.ones(self.input_dim, dtype=torch.float32), persistent=True)
+
+    def set_normalization(self, mean: torch.Tensor, std: torch.Tensor):
+        mean = mean.detach().to(dtype=torch.float32, device=self.x_mean.device)
+        std = std.detach().to(dtype=torch.float32, device=self.x_mean.device)
+        std = torch.clamp(std, min=1e-6)
+        self.x_mean.copy_(mean)
+        self.x_invstd.copy_(1.0 / std)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        logits, emb = self.base.forward_with_embed(x)
-        logits = logits * self.gamma
-
-        if float(self.beta.item()) == 0.0:
-            return logits
-
-        if self.metric == "cosine":
-            emb_n = F.normalize(emb, dim=1)
-            proto = (emb_n @ self.centroids_norm.t()) * self.scale
-        elif self.metric == "sqdist":
-            # -||e-c||^2 = 2 e·c - ||c||^2 - ||e||^2 ; drop ||e||^2 (constant across classes)
-            proto = (2.0 * (emb @ self.centroids.t()) - self.centroids_sq.unsqueeze(0)) / torch.clamp(self.scale, min=1e-6)
-        else:  # "dot"
-            proto = (emb @ self.centroids.t()) / torch.clamp(self.scale, min=1e-6)
-
-        return logits + self.beta * proto
+        if x.dtype != torch.float32:
+            x = x.float()
+        x = (x - self.x_mean) * self.x_invstd
+        x = self.in_ln(x)
+        for b in self.blocks:
+            x = b(x)
+        x = self.out_ln(x)
+        return self.head(x)
 
 
-@dataclass
-class _TrainConfig:
-    batch_size: int = 128
-    max_epochs: int = 160
-    patience: int = 25
-    lr: float = 2.5e-3
-    weight_decay: float = 1.5e-2
-    label_smoothing: float = 0.05
-    dropout: float = 0.08
-    mixup_alpha: float = 0.2
-    mixup_prob: float = 0.65
-    grad_clip: float = 1.0
-    warmup_frac: float = 0.08
+def _compute_mean_std_from_loader(loader, input_dim: int, device: str) -> Tuple[torch.Tensor, torch.Tensor]:
+    s1 = torch.zeros(input_dim, dtype=torch.float64)
+    s2 = torch.zeros(input_dim, dtype=torch.float64)
+    n = 0
+    with torch.no_grad():
+        for xb, _ in loader:
+            xb = xb.detach().to("cpu")
+            if xb.ndim != 2 or xb.shape[1] != input_dim:
+                xb = xb.view(xb.shape[0], -1)
+            xb = xb.to(dtype=torch.float64)
+            s1 += xb.sum(dim=0)
+            s2 += (xb * xb).sum(dim=0)
+            n += xb.shape[0]
+    if n <= 0:
+        mean = torch.zeros(input_dim, dtype=torch.float32, device=device)
+        std = torch.ones(input_dim, dtype=torch.float32, device=device)
+        return mean, std
+    mean64 = s1 / float(n)
+    var64 = s2 / float(n) - mean64 * mean64
+    var64 = torch.clamp(var64, min=1e-8)
+    std64 = torch.sqrt(var64)
+    mean = mean64.to(dtype=torch.float32, device=device)
+    std = std64.to(dtype=torch.float32, device=device)
+    return mean, std
+
+
+def _accuracy(model: nn.Module, loader, device: str) -> float:
+    model.eval()
+    correct = 0
+    total = 0
+    with torch.inference_mode():
+        for xb, yb in loader:
+            xb = xb.to(device=device)
+            yb = yb.to(device=device)
+            logits = model(xb)
+            pred = logits.argmax(dim=1)
+            correct += (pred == yb).sum().item()
+            total += int(yb.numel())
+    return float(correct) / float(total) if total > 0 else 0.0
 
 
 class Solution:
     def solve(self, train_loader, val_loader, metadata: dict = None) -> torch.nn.Module:
-        _set_torch_threads()
-
-        metadata = metadata or {}
-        device = metadata.get("device", "cpu")
+        if metadata is None:
+            metadata = {}
         input_dim = int(metadata.get("input_dim", 384))
         num_classes = int(metadata.get("num_classes", 128))
         param_limit = int(metadata.get("param_limit", 500000))
+        device = str(metadata.get("device", "cpu"))
 
-        train_x, train_y = _gather_from_loader(train_loader, device=device)
-        if train_x.ndim != 2:
-            train_x = train_x.view(train_x.shape[0], -1)
-        train_x = train_x.to(dtype=torch.float32)
-        train_y = train_y.to(dtype=torch.long)
+        try:
+            torch.set_num_threads(min(8, os.cpu_count() or 8))
+        except Exception:
+            pass
 
-        if val_loader is not None:
-            val_x, val_y = _gather_from_loader(val_loader, device=device)
-            if val_x.ndim != 2:
-                val_x = val_x.view(val_x.shape[0], -1)
-            val_x = val_x.to(dtype=torch.float32)
-            val_y = val_y.to(dtype=torch.long)
+        torch.manual_seed(0)
+
+        # Build model close to the limit but safe
+        # Primary candidate: depth=4, bottleneck=144, with layerscale.
+        candidates = [
+            (4, 144, 0.05, 0.1),
+            (3, 192, 0.05, 0.1),
+            (4, 128, 0.05, 0.1),
+            (3, 160, 0.05, 0.1),
+            (2, 192, 0.05, 0.1),
+        ]
+
+        model = None
+        for depth, bottleneck, dropout, ls_init in candidates:
+            m = _ResidualMLPNet(
+                input_dim=input_dim,
+                num_classes=num_classes,
+                depth=depth,
+                bottleneck_dim=bottleneck,
+                dropout=dropout,
+                layerscale_init=ls_init,
+            )
+            if _count_trainable_params(m) <= param_limit:
+                model = m
+                break
+
+        if model is None:
+            # Minimal fallback
+            hidden = min(input_dim, 256)
+            model = nn.Sequential(
+                nn.Linear(input_dim, hidden),
+                nn.GELU(),
+                nn.Linear(hidden, num_classes),
+            )
+
+        model.to(device)
+
+        # Set normalization from training data
+        mean, std = _compute_mean_std_from_loader(train_loader, input_dim=input_dim, device=device)
+        if isinstance(model, _ResidualMLPNet):
+            model.set_normalization(mean, std)
+
+        # Training
+        train_steps_per_epoch = max(1, len(train_loader))
+        train_samples = int(metadata.get("train_samples", 2048))
+        base_epochs = 160
+        if train_samples <= 1024:
+            epochs = 220
+        elif train_samples <= 2048:
+            epochs = base_epochs
         else:
-            val_x, val_y = train_x, train_y
+            epochs = 120
 
-        if metadata.get("input_dim") is None:
-            input_dim = int(train_x.shape[1])
+        max_lr = 4e-3
+        if _count_trainable_params(model) < 250000:
+            max_lr = 5e-3
 
-        # Normalization stats
-        mean = train_x.mean(dim=0)
-        std = train_x.std(dim=0, unbiased=False)
+        wd = 0.02
+        optimizer = torch.optim.AdamW(model.parameters(), lr=max_lr, weight_decay=wd, betas=(0.9, 0.99), eps=1e-8)
 
-        cfg = _TrainConfig()
-        cfg.batch_size = int(min(max(32, cfg.batch_size), max(32, train_x.shape[0])))
+        total_steps = epochs * train_steps_per_epoch
+        if total_steps < 10:
+            total_steps = 10
+        scheduler = torch.optim.lr_scheduler.OneCycleLR(
+            optimizer,
+            max_lr=max_lr,
+            total_steps=total_steps,
+            pct_start=0.12,
+            anneal_strategy="cos",
+            div_factor=15.0,
+            final_div_factor=30.0,
+        )
 
-        h1, h2 = _choose_hidden_dims(input_dim, num_classes, param_limit)
-        base = _NormalizedMLP(input_dim=input_dim, num_classes=num_classes, h1=h1, h2=h2, dropout=cfg.dropout).to(device)
-        base.set_normalization(mean, std)
+        try:
+            criterion = nn.CrossEntropyLoss(label_smoothing=0.05)
+        except TypeError:
+            criterion = nn.CrossEntropyLoss()
 
-        # Verify parameter budget
-        pc = _param_count_trainable(base)
-        if pc > param_limit:
-            # Fallback to smaller dims
-            h1, h2 = 256, 256
-            base = _NormalizedMLP(input_dim=input_dim, num_classes=num_classes, h1=h1, h2=h2, dropout=cfg.dropout).to(device)
-            base.set_normalization(mean, std)
-            pc = _param_count_trainable(base)
-            if pc > param_limit:
-                # Extreme fallback: linear classifier
-                base = _NormalizedMLP(input_dim=input_dim, num_classes=num_classes, h1=128, h2=128, dropout=0.0).to(device)
-                base.set_normalization(mean, std)
-
-        train_ds = TensorDataset(train_x, train_y)
-        train_dl = DataLoader(train_ds, batch_size=cfg.batch_size, shuffle=True, num_workers=0, drop_last=False)
-
-        val_ds = TensorDataset(val_x, val_y)
-        val_dl = DataLoader(val_ds, batch_size=512, shuffle=False, num_workers=0, drop_last=False)
-
-        optimizer = torch.optim.AdamW(base.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay, betas=(0.9, 0.95))
-
-        total_steps = cfg.max_epochs * max(1, len(train_dl))
-        warmup_steps = max(1, int(cfg.warmup_frac * total_steps))
-
-        def lr_at(step: int) -> float:
-            if step < warmup_steps:
-                return cfg.lr * float(step + 1) / float(warmup_steps)
-            t = float(step - warmup_steps) / float(max(1, total_steps - warmup_steps))
-            return cfg.lr * 0.5 * (1.0 + math.cos(math.pi * min(1.0, max(0.0, t))))
-
-        def eval_acc(model: nn.Module) -> float:
-            model.eval()
-            correct = 0
-            total = 0
-            with torch.inference_mode():
-                for xb, yb in val_dl:
-                    logits = model(xb)
-                    pred = logits.argmax(dim=1)
-                    correct += (pred == yb).sum().item()
-                    total += yb.numel()
-            return float(correct) / float(max(1, total))
-
-        def mixup_batch(xb: torch.Tensor, yb: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, float]:
-            if cfg.mixup_alpha <= 0:
-                return xb, yb, yb, 1.0
-            lam = float(torch.distributions.Beta(cfg.mixup_alpha, cfg.mixup_alpha).sample().item())
-            idx = torch.randperm(xb.shape[0], device=xb.device)
-            mixed = lam * xb + (1.0 - lam) * xb[idx]
-            return mixed, yb, yb[idx], lam
-
-        best_acc = -1.0
-        best_state = None
+        best_state = copy.deepcopy(model.state_dict())
+        best_val = -1.0
+        patience = 30
         bad_epochs = 0
-        step = 0
 
-        for epoch in range(cfg.max_epochs):
-            base.train()
-            for xb, yb in train_dl:
-                xb = xb.to(dtype=torch.float32)
-                yb = yb.to(dtype=torch.long)
+        use_val = val_loader is not None
+        ema_state = {k: v.detach().clone() for k, v in model.state_dict().items()}
+        ema_decay = 0.995
 
-                lr = lr_at(step)
-                for pg in optimizer.param_groups:
-                    pg["lr"] = lr
+        noise_std = 0.02 if isinstance(model, _ResidualMLPNet) else 0.0
 
-                do_mix = (cfg.mixup_prob > 0.0) and (random.random() < cfg.mixup_prob) and (xb.shape[0] >= 2)
+        step_idx = 0
+        for epoch in range(epochs):
+            model.train()
+            for xb, yb in train_loader:
+                xb = xb.to(device=device)
+                yb = yb.to(device=device)
+
+                if noise_std > 0.0:
+                    xb = xb + torch.randn_like(xb) * noise_std
+
                 optimizer.zero_grad(set_to_none=True)
-
-                if do_mix:
-                    xm, ya, yb2, lam = mixup_batch(xb, yb)
-                    logits = base(xm)
-                    loss = lam * F.cross_entropy(logits, ya, label_smoothing=cfg.label_smoothing) + (1.0 - lam) * F.cross_entropy(
-                        logits, yb2, label_smoothing=cfg.label_smoothing
-                    )
-                else:
-                    logits = base(xb)
-                    loss = F.cross_entropy(logits, yb, label_smoothing=cfg.label_smoothing)
-
+                logits = model(xb)
+                loss = criterion(logits, yb)
                 loss.backward()
-                if cfg.grad_clip is not None and cfg.grad_clip > 0:
-                    torch.nn.utils.clip_grad_norm_(base.parameters(), max_norm=cfg.grad_clip)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                 optimizer.step()
 
-                step += 1
+                step_idx += 1
+                if step_idx <= total_steps:
+                    scheduler.step()
 
-            acc = eval_acc(base)
-            if acc > best_acc + 1e-5:
-                best_acc = acc
-                best_state = {k: v.detach().clone() for k, v in base.state_dict().items()}
-                bad_epochs = 0
-            else:
-                bad_epochs += 1
+                with torch.no_grad():
+                    sd = model.state_dict()
+                    for k, v in sd.items():
+                        ema_state[k].mul_(ema_decay).add_(v, alpha=1.0 - ema_decay)
 
-            if best_acc >= 0.995:
-                break
-            if bad_epochs >= cfg.patience:
-                break
+            if use_val:
+                # Evaluate current
+                val_acc = _accuracy(model, val_loader, device)
+                if val_acc > best_val + 1e-4:
+                    best_val = val_acc
+                    best_state = copy.deepcopy(model.state_dict())
+                    bad_epochs = 0
+                else:
+                    bad_epochs += 1
+                    if bad_epochs >= patience and epoch >= 40:
+                        break
 
-        if best_state is not None:
-            base.load_state_dict(best_state)
+        # Load best or EMA if it looks better
+        if use_val:
+            model.load_state_dict(best_state)
+            acc_best = _accuracy(model, val_loader, device)
 
-        # Build prototypical centroids from embedding space using train set
-        base.eval()
-        with torch.inference_mode():
-            _, emb_train = base.forward_with_embed(train_x)
-        centroids = torch.zeros((num_classes, emb_train.shape[1]), device=device, dtype=torch.float32)
-        counts = torch.zeros((num_classes,), device=device, dtype=torch.float32)
-        centroids.index_add_(0, train_y, emb_train)
-        ones = torch.ones((train_y.shape[0],), device=device, dtype=torch.float32)
-        counts.index_add_(0, train_y, ones)
-        centroids = centroids / torch.clamp(counts.unsqueeze(1), min=1.0)
+            # Try EMA
+            model_ema = copy.deepcopy(model)
+            model_ema.load_state_dict(ema_state)
+            acc_ema = _accuracy(model_ema, val_loader, device)
+            if acc_ema >= acc_best - 1e-4:
+                model = model_ema
+        else:
+            model.load_state_dict(ema_state)
 
-        centroids_norm = F.normalize(centroids, dim=1)
-        centroids_sq = (centroids * centroids).sum(dim=1)
-
-        # Tune blending on validation (fast grid with reuse)
-        base.eval()
-        with torch.inference_mode():
-            logits_val, emb_val = base.forward_with_embed(val_x)
-            emb_val_n = F.normalize(emb_val, dim=1)
-            sim_cos = emb_val_n @ centroids_norm.t()
-            sim_dot = emb_val @ centroids.t()
-            sim_sq = 2.0 * sim_dot - centroids_sq.unsqueeze(0)
-
-        betas = [0.0, 0.25, 0.5, 1.0, 2.0, 4.0]
-        gammas = [1.0, 0.85, 1.15]
-        scales_cos = [1.0, 2.0, 4.0, 8.0, 16.0]
-        scales_other = [0.5, 1.0, 2.0, 4.0, 8.0]
-
-        best = ("cosine", 0.0, 1.0, 1.0, best_acc)
-        yv = val_y
-
-        def acc_from_logits(lg: torch.Tensor) -> float:
-            pred = lg.argmax(dim=1)
-            return float((pred == yv).float().mean().item())
-
-        # cosine metric
-        for gamma in gammas:
-            lg0 = logits_val * gamma
-            for scale in scales_cos:
-                proto = sim_cos * scale
-                for beta in betas:
-                    lg = lg0 if beta == 0.0 else (lg0 + beta * proto)
-                    a = acc_from_logits(lg)
-                    if a > best[4] + 1e-6:
-                        best = ("cosine", beta, scale, gamma, a)
-
-        # sqdist metric
-        for gamma in gammas:
-            lg0 = logits_val * gamma
-            for scale in scales_other:
-                proto = sim_sq / max(1e-6, scale)
-                for beta in betas:
-                    lg = lg0 if beta == 0.0 else (lg0 + beta * proto)
-                    a = acc_from_logits(lg)
-                    if a > best[4] + 1e-6:
-                        best = ("sqdist", beta, scale, gamma, a)
-
-        metric, beta, scale, gamma, _ = best
-
-        model = _HybridProtoModel(
-            base=base,
-            centroids=centroids,
-            centroids_norm=centroids_norm,
-            centroids_sq=centroids_sq,
-            metric=metric,
-            beta=float(beta),
-            scale=float(scale),
-            gamma=float(gamma),
-        ).to(device)
-
-        # Final safety: ensure trainable params within limit
-        if _param_count_trainable(model) > param_limit:
-            # Return base only (should never happen)
-            base.eval()
-            return base
-
+        model.to(device)
         model.eval()
+
+        # Safety check
+        if _count_trainable_params(model) > param_limit:
+            # Fallback to a safe small model if something went wrong.
+            safe_hidden = min(256, input_dim)
+            safe_model = nn.Sequential(
+                nn.Linear(input_dim, safe_hidden),
+                nn.ReLU(),
+                nn.Linear(safe_hidden, num_classes),
+            ).to(device)
+            safe_model.eval()
+            return safe_model
+
         return model

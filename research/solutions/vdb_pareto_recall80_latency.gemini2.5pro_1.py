@@ -1,84 +1,81 @@
 import numpy as np
-import faiss
 from typing import Tuple
+import faiss
 
-class YourIndexClass:
+class Recall80LatencyIndex:
+    """
+    An optimized Faiss-based index for the Recall80 Latency Tier.
+
+    This index uses an Inverted File with Product Quantization (IVFPQ),
+    a highly efficient method for approximate nearest neighbor search on CPUs.
+    The hyperparameters (nlist, m, nprobe) are aggressively tuned to meet
+    the strict < 0.6ms average query latency requirement while ensuring the
+    recall@1 stays above the 80% gate.
+
+    Key tuning choices:
+    - nlist=4096: A large number of clusters (Voronoi cells) partitions the
+      dataset finely. This allows for a very small search scope.
+    - m=16: Product Quantization with 16 sub-quantizers compresses 128-dim
+      vectors to just 16 bytes, enabling extremely fast distance calculations.
+    - nprobe=5: At search time, only 5 cells are visited. This is the most
+      critical parameter for balancing the speed/recall trade-off. This value
+      is chosen as a safe but aggressive setting estimated to achieve
+      just over 80% recall for the SIFT1M dataset.
+    """
     def __init__(self, dim: int, **kwargs):
         """
         Initialize the index for vectors of dimension `dim`.
 
-        This index uses FAISS's IndexIVFPQ, a highly efficient approximate nearest
-        neighbor search structure based on an inverted file system with product
-        quantization. The parameters are specifically tuned for the SIFT1M
-        dataset to meet the Recall@1 >= 0.80 constraint while minimizing query
-        latency, as required by the Recall80 Latency Tier problem.
-
-        The configuration is based on established FAISS benchmarks which show
-        that an 'IVF4096,PQ16' index with nprobe=16 achieves R@1 > 0.80 with
-        very low latency.
-
         Args:
             dim: Vector dimensionality (e.g., 128 for SIFT1M)
-            **kwargs: Optional parameters (not used in this specialized implementation)
+            **kwargs: Optional parameters (e.g., M, ef_construction for HNSW)
         """
         self.dim = dim
         self.is_trained = False
 
-        # --- Index Parameters ---
-        # These values are tuned for the SIFT1M dataset and the specific
-        # recall/latency trade-off of this problem.
-        
-        # Number of Voronoi cells for the IVF part.
-        nlist = 4096
-        
-        # Number of sub-quantizers for the PQ part.
-        # The 128-dimensional vector is split into 16 sub-vectors of 8 dimensions.
-        m = 16
-        
-        # Number of bits per sub-quantizer code. 8 bits = 256 centroids per subspace.
-        bits = 8
+        # Set Faiss to use a number of threads appropriate for the environment.
+        # The evaluation environment has 8 vCPUs.
+        num_threads = 8
+        faiss.omp_set_num_threads(num_threads)
 
-        # --- Index Construction ---
-        
-        # The coarse quantizer is a flat L2 index used to partition the space.
-        # It finds the nearest cell centroid for a given query vector.
-        quantizer = faiss.IndexFlatL2(self.dim)
-        
-        # The main index object.
-        self.index = faiss.IndexIVFPQ(quantizer, self.dim, nlist, m, bits)
+        # Hyperparameters for IVFPQ, tuned for the SIFT1M dataset
+        nlist = kwargs.get('nlist', 4096)
+        m = kwargs.get('m', 16)
+        nbits = kwargs.get('nbits', 8)
 
-        # --- Search-time Parameters ---
+        if dim % m != 0:
+            # Fallback for dimensions not divisible by m
+            # A simple approach is to find a new m that is a divisor
+            # This is not critical for SIFT1M (128 % 16 == 0) but good practice
+            for i in range(m, 0, -1):
+                if dim % i == 0:
+                    m = i
+                    break
         
-        # nprobe is the number of Voronoi cells to visit during search.
-        # This is the most critical parameter for the speed vs. accuracy trade-off.
-        # A value of 16 is chosen to reliably exceed the 80% recall gate.
-        self.nprobe = 16
-
-        # --- Environment Optimization ---
+        # The quantizer is a flat index used to find the nearest centroids
+        quantizer = faiss.IndexFlatL2(dim)
         
-        # Configure FAISS to use multiple threads for parallel execution.
-        # The evaluation environment specifies 8 vCPUs.
-        faiss.omp_set_num_threads(8)
+        # The main index using IVFPQ. It uses L2 distance.
+        self.index = faiss.IndexIVFPQ(quantizer, dim, nlist, m, nbits, faiss.METRIC_L2)
+        
+        # nprobe is the key parameter for the speed/recall tradeoff.
+        self.nprobe = kwargs.get('nprobe', 5)
 
     def add(self, xb: np.ndarray) -> None:
         """
         Add vectors to the index.
 
-        If the index has not been trained yet, it will be trained on the first
-        batch of vectors passed to this method. The evaluation script calls `add`
-        once with the entire 1M SIFT1M dataset, so this approach is suitable.
-
         Args:
             xb: Base vectors, shape (N, dim), dtype float32
         """
         if not self.is_trained:
-            # Training learns the data distribution to create the IVF cell structure.
-            # We train on the entire dataset to get the best possible partitioning.
+            # Training is required for IVF and PQ.
+            # It learns the centroids and codebooks from the data.
+            # For SIFT1M, training on the full 1M dataset is feasible and
+            # gives the best quality.
             self.index.train(xb)
             self.is_trained = True
-        
-        # Add the vectors to the index. They will be PQ-encoded and stored
-        # in the appropriate inverted lists.
+
         self.index.add(xb)
 
     def search(self, xq: np.ndarray, k: int) -> Tuple[np.ndarray, np.ndarray]:
@@ -90,15 +87,14 @@ class YourIndexClass:
             k: Number of nearest neighbors to return
 
         Returns:
-            A tuple (distances, indices):
-                - distances: shape (nq, k), float32, L2-squared distances
-                - indices: shape (nq, k), int64, indices into base vectors
+            (distances, indices):
+                - distances: shape (nq, k), dtype float32, L2-squared distances
+                - indices: shape (nq, k), dtype int64, indices into base vectors
         """
-        # Set the number of cells to probe for this specific search.
+        # Set the number of probes for this search. This is crucial for performance.
         self.index.nprobe = self.nprobe
 
-        # Execute the search. FAISS automatically handles batching and
-        # parallelization across the available threads.
+        # Perform the search. Faiss is highly optimized for batch searches.
         distances, indices = self.index.search(xq, k)
-
+        
         return distances, indices

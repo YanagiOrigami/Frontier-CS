@@ -1,20 +1,22 @@
 import numpy as np
-import faiss
 from typing import Tuple
+import faiss
 
-class VDBIndex:
+class HNSWIndex:
     def __init__(self, dim: int, **kwargs):
         self.dim = dim
-        M = kwargs.get('M', 32)
-        ef_construction = kwargs.get('ef_construction', 100)
-        self.ef_search = kwargs.get('ef_search', 100)
-        self.index = faiss.IndexHNSWFlat(dim, M)
-        self.index.hnsw.efConstruction = ef_construction
+        self.M = kwargs.get('M', 32)
+        self.ef_construction = kwargs.get('ef_construction', 200)
+        self.ef_search = kwargs.get('ef_search', 50)
+        self.index = faiss.IndexHNSWFlat(dim, int(self.M))
+        self.index.hnsw.efConstruction = int(self.ef_construction)
 
     def add(self, xb: np.ndarray) -> None:
-        self.index.add(xb)
+        self.index.add(xb.astype(np.float32))
 
     def search(self, xq: np.ndarray, k: int) -> Tuple[np.ndarray, np.ndarray]:
-        self.index.hnsw.efSearch = self.ef_search
-        distances, indices = self.index.search(xq, k)
-        return distances.astype(np.float32), indices.astype(np.int64)
+        self.index.hnsw.efSearch = int(self.ef_search)
+        Dsq, I = self.index.search(xq.astype(np.float32), k)
+        D = np.sqrt(Dsq).astype(np.float32)
+        I = I.astype(np.int64)
+        return D, I

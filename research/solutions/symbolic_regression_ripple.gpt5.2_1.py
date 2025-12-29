@@ -1,267 +1,362 @@
 import numpy as np
+import sympy as sp
+
+
+def _fmt(x: float) -> str:
+    if not np.isfinite(x):
+        return "0"
+    if abs(x) < 1e-15:
+        return "0"
+    s = f"{x:.12g}"
+    if s == "-0":
+        s = "0"
+    return s
+
+
+def _sum_parts(parts):
+    if not parts:
+        return "0"
+    out = parts[0]
+    for p in parts[1:]:
+        if p.startswith("-"):
+            out += " - " + p[1:]
+        else:
+            out += " + " + p
+    return out
+
+
+def _poly_expr(coefs, z_str, tol=0.0):
+    parts = []
+    for k, c in enumerate(coefs):
+        if not np.isfinite(c) or abs(c) <= tol:
+            continue
+        cs = _fmt(float(c))
+        if cs == "0":
+            continue
+        if k == 0:
+            part = cs
+        elif k == 1:
+            part = f"{cs}*({z_str})"
+        else:
+            part = f"{cs}*(({z_str})**{k})"
+        parts.append(part)
+    return _sum_parts(parts) if parts else "0"
+
+
+def _build_design(z, w, d_trig, d_const, include_cos):
+    n = z.shape[0]
+    s = np.sin(w * z)
+    m = (d_trig + 1) + (d_trig + 1 if include_cos else 0) + (d_const + 1)
+    A = np.empty((n, m), dtype=np.float64)
+
+    col = 0
+    zpow = np.ones(n, dtype=np.float64)
+    for k in range(d_trig + 1):
+        if k > 0:
+            zpow = zpow * z
+        A[:, col] = zpow * s
+        col += 1
+
+    if include_cos:
+        c = np.cos(w * z)
+        zpow = np.ones(n, dtype=np.float64)
+        for k in range(d_trig + 1):
+            if k > 0:
+                zpow = zpow * z
+            A[:, col] = zpow * c
+            col += 1
+
+    zpow = np.ones(n, dtype=np.float64)
+    for k in range(d_const + 1):
+        if k > 0:
+            zpow = zpow * z
+        A[:, col] = zpow
+        col += 1
+
+    return A
+
+
+def _ridge_solve(A, y, lam=1e-10):
+    m = A.shape[1]
+    AtA = A.T @ A
+    scale = float(np.trace(AtA)) / max(m, 1)
+    reg = lam * max(scale, 1e-12)
+    AtA.flat[:: m + 1] += reg
+    Aty = A.T @ y
+    try:
+        coef = np.linalg.solve(AtA, Aty)
+    except np.linalg.LinAlgError:
+        coef, _, _, _ = np.linalg.lstsq(A, y, rcond=None)
+    return coef
+
+
+def _prune_refit(A, y, coef, term_kinds, y_rms, keep_const_idx, min_keep=1):
+    pred = A @ coef
+    resid = pred - y
+    mse = float(np.mean(resid * resid))
+
+    col_rms = np.sqrt(np.mean(A * A, axis=0))
+    contrib = np.abs(coef) * col_rms
+    thresh = max(1e-4 * y_rms, 1e-12)
+
+    keep = contrib > thresh
+    if keep_const_idx is not None:
+        keep[keep_const_idx] = True
+
+    # Ensure at least one trig term
+    trig_mask = np.array([k in ("sin", "cos") for k, _ in term_kinds], dtype=bool)
+    if trig_mask.any() and not np.any(keep & trig_mask):
+        j = int(np.argmax(contrib * trig_mask))
+        keep[j] = True
+
+    if np.sum(keep) < min_keep:
+        j = int(np.argmax(contrib))
+        keep[:] = False
+        keep[j] = True
+        if keep_const_idx is not None:
+            keep[keep_const_idx] = True
+
+    if np.all(keep):
+        return coef, mse
+
+    A2 = A[:, keep]
+    coef2 = _ridge_solve(A2, y, lam=1e-10)
+    coef_full = np.zeros_like(coef)
+    coef_full[keep] = coef2
+    pred2 = A @ coef_full
+    resid2 = pred2 - y
+    mse2 = float(np.mean(resid2 * resid2))
+    return coef_full, mse2 if np.isfinite(mse2) else mse
+
+
+def _coef_to_groups(coef, d_trig, d_const, include_cos):
+    idx = 0
+    ps = coef[idx : idx + (d_trig + 1)]
+    idx += (d_trig + 1)
+    pc = None
+    if include_cos:
+        pc = coef[idx : idx + (d_trig + 1)]
+        idx += (d_trig + 1)
+    p0 = coef[idx : idx + (d_const + 1)]
+    return ps, pc, p0
+
+
+def _build_expression(z_str, w, d_trig, d_const, include_cos, coef, tol=0.0):
+    ps, pc, p0 = _coef_to_groups(coef, d_trig, d_const, include_cos)
+    w_str = _fmt(float(w))
+
+    sin_arg = f"(({w_str})*({z_str}))"
+    parts = []
+
+    ps_str = _poly_expr(ps, z_str, tol=tol)
+    if ps_str != "0":
+        parts.append(f"({ps_str})*sin({sin_arg})")
+
+    if include_cos and pc is not None:
+        pc_str = _poly_expr(pc, z_str, tol=tol)
+        if pc_str != "0":
+            parts.append(f"({pc_str})*cos({sin_arg})")
+
+    p0_str = _poly_expr(p0, z_str, tol=tol)
+    if p0_str != "0":
+        parts.append(f"({p0_str})")
+
+    return _sum_parts(parts) if parts else "0"
+
+
+def _sympy_complexity(expr_str: str):
+    try:
+        x1, x2 = sp.Symbol("x1"), sp.Symbol("x2")
+        expr = sp.sympify(expr_str, locals={"sin": sp.sin, "cos": sp.cos, "exp": sp.exp, "log": sp.log, "x1": x1, "x2": x2})
+    except Exception:
+        return None
+
+    bin_ops = 0
+    un_ops = 0
+    for node in sp.preorder_traversal(expr):
+        f = getattr(node, "func", None)
+        if f in (sp.sin, sp.cos, sp.exp, sp.log):
+            un_ops += 1
+        elif f is sp.Add or f is sp.Mul:
+            try:
+                bin_ops += max(len(node.args) - 1, 0)
+            except Exception:
+                pass
+        elif f is sp.Pow:
+            bin_ops += 1
+    return int(2 * bin_ops + un_ops)
+
 
 class Solution:
     def __init__(self, **kwargs):
-        self.random_state = kwargs.get("random_state", 42)
-
-    @staticmethod
-    def _fmt_num(a: float) -> str:
-        if not np.isfinite(a):
-            return "0.0"
-        if abs(a) < 1e-15:
-            return "0.0"
-        ar = float(a)
-        ir = int(round(ar))
-        if abs(ar - ir) < 1e-12 and abs(ir) < 10**12:
-            return str(ir)
-        s = f"{ar:.12g}"
-        if s == "-0":
-            s = "0"
-        return s
-
-    @staticmethod
-    def _poly_horner_str(coeffs, var_str: str) -> str:
-        # coeffs: [c0, c1, c2] for c0 + c1*var + c2*var**2
-        c0, c1, c2 = coeffs
-        def is_zero(v):
-            return (not np.isfinite(v)) or abs(v) < 1e-15
-
-        expr = None
-        if not is_zero(c2):
-            expr = Solution._fmt_num(c2)
-        if expr is not None:
-            expr = f"({expr})*({var_str})"
-            if not is_zero(c1):
-                expr = f"({expr} + {Solution._fmt_num(c1)})"
-        else:
-            if not is_zero(c1):
-                expr = Solution._fmt_num(c1)
-
-        if expr is not None:
-            expr = f"({expr})*({var_str})"
-            if not is_zero(c0):
-                expr = f"({expr} + {Solution._fmt_num(c0)})"
-        else:
-            if not is_zero(c0):
-                expr = Solution._fmt_num(c0)
-            else:
-                expr = "0.0"
-
-        return expr
-
-    @staticmethod
-    def _eval_poly(coeffs, r2):
-        c0, c1, c2 = coeffs
-        return (c2 * r2 + c1) * r2 + c0
-
-    @staticmethod
-    def _fit_normal_eq(columns, y, yTy, reg_scale=1e-12):
-        # columns: list of 1D arrays length n
-        n = y.shape[0]
-        m = len(columns)
-        A = np.column_stack(columns).astype(np.float64, copy=False)
-        ATA = A.T @ A
-        ATy = A.T @ y
-        tr = float(np.trace(ATA))
-        lam = reg_scale * (tr / m + 1.0)
-        if lam > 0:
-            ATA = ATA + lam * np.eye(m, dtype=np.float64)
-        try:
-            coef = np.linalg.solve(ATA, ATy)
-        except np.linalg.LinAlgError:
-            coef, _, _, _ = np.linalg.lstsq(A, y, rcond=None)
-        sse = float(yTy - 2.0 * float(np.dot(coef, ATy)) + float(coef @ (ATA @ coef)))
-        mse = sse / n
-        return coef, mse
-
-    def _build_columns(self, r2, arg, k):
-        ones = np.ones_like(r2)
-        r2_1 = r2
-        r2_2 = r2 * r2
-        ka = k * arg
-        s = np.sin(ka)
-        c = np.cos(ka)
-        cols = [
-            ones, r2_1, r2_2,
-            ones * s, r2_1 * s, r2_2 * s,
-            ones * c, r2_1 * c, r2_2 * c,
-        ]
-        return cols
-
-    def _search_best_k(self, r2, arg, y):
-        y = y.astype(np.float64, copy=False)
-        yTy = float(np.dot(y, y))
-        n = y.shape[0]
-
-        # Determine sensible k ranges
-        arg_min = float(np.min(arg))
-        arg_max = float(np.max(arg))
-        arg_range = max(arg_max - arg_min, 1e-12)
-
-        # Heuristic: allow up to ~25 oscillations across range
-        # If arg is r2 (0..~2), k might need to be larger; clamp.
-        kmax = int(min(250, max(40, round(50.0 * np.pi / arg_range))))
-        kmin = 1
-
-        best = None  # (mse, k, coef)
-        for k in range(kmin, kmax + 1):
-            cols = self._build_columns(r2, arg, float(k))
-            coef, mse = self._fit_normal_eq(cols, y, yTy, reg_scale=1e-12)
-            if not np.isfinite(mse):
-                continue
-            if best is None or mse < best[0]:
-                best = (mse, float(k), coef)
-
-        if best is None:
-            return None
-
-        def refine(center_k, step, half_width_steps):
-            nonlocal best
-            ks = center_k + step * (np.arange(-half_width_steps, half_width_steps + 1, dtype=np.float64))
-            for k in ks:
-                if k <= 0:
-                    continue
-                cols = self._build_columns(r2, arg, float(k))
-                coef, mse = self._fit_normal_eq(cols, y, yTy, reg_scale=1e-12)
-                if np.isfinite(mse) and mse < best[0]:
-                    best = (mse, float(k), coef)
-
-        # Refinement stages
-        refine(best[1], 0.1, 15)   # +/-1.5
-        refine(best[1], 0.01, 20)  # +/-0.2
-
-        return best  # mse, k, coef
-
-    def _prune_terms(self, cols, y, yTy, coef_full, mse_full, rel_tol=1e-4):
-        # Greedy backward elimination
-        idx = list(range(len(cols)))
-        best_mse = float(mse_full)
-        best_idx = idx
-        best_coef = coef_full
-
-        def fit_subset(sub_idx):
-            sub_cols = [cols[i] for i in sub_idx]
-            coef, mse = self._fit_normal_eq(sub_cols, y, yTy, reg_scale=1e-12)
-            return coef, mse
-
-        changed = True
-        while changed and len(best_idx) > 1:
-            changed = False
-            # Sort candidates by smallest absolute coefficient magnitude first
-            abscoefs = [(abs(best_coef[j]), j) for j in range(len(best_idx))]
-            abscoefs.sort(key=lambda t: t[0])
-            for _, local_j in abscoefs:
-                trial_idx = best_idx[:local_j] + best_idx[local_j + 1:]
-                if len(trial_idx) == 0:
-                    continue
-                tcoef, tmse = fit_subset(trial_idx)
-                if np.isfinite(tmse) and tmse <= best_mse * (1.0 + rel_tol):
-                    best_mse = float(tmse)
-                    best_idx = trial_idx
-                    best_coef = tcoef
-                    changed = True
-                    break
-
-        # Map back to full 9 coefficients
-        coef9 = np.zeros(9, dtype=np.float64)
-        for j, col_i in enumerate(best_idx):
-            coef9[col_i] = best_coef[j]
-        return coef9, best_mse
+        self.kwargs = kwargs
 
     def solve(self, X: np.ndarray, y: np.ndarray) -> dict:
         X = np.asarray(X, dtype=np.float64)
         y = np.asarray(y, dtype=np.float64).reshape(-1)
-        n = y.shape[0]
-        if n == 0:
-            return {"expression": "0.0", "predictions": [], "details": {}}
-
+        n = X.shape[0]
         x1 = X[:, 0]
         x2 = X[:, 1]
-        r2 = x1 * x1 + x2 * x2
-        r = np.sqrt(r2)
+        y_rms = float(np.sqrt(np.mean(y * y))) + 1e-12
+        y_var = float(np.var(y)) + 1e-12
 
-        # Handle near-constant targets
-        y_mean = float(np.mean(y))
-        y_var = float(np.var(y))
-        if not np.isfinite(y_var) or y_var < 1e-24:
-            expr = self._fmt_num(y_mean)
-            preds = np.full(n, y_mean, dtype=np.float64)
-            return {"expression": expr, "predictions": preds.tolist(), "details": {"complexity": 0}}
+        # Linear baseline (fallback)
+        A_lin = np.column_stack([x1, x2, np.ones_like(x1)])
+        try:
+            coef_lin, _, _, _ = np.linalg.lstsq(A_lin, y, rcond=None)
+            pred_lin = A_lin @ coef_lin
+            mse_lin = float(np.mean((pred_lin - y) ** 2))
+        except Exception:
+            coef_lin = np.array([0.0, 0.0, float(np.mean(y))], dtype=np.float64)
+            pred_lin = A_lin @ coef_lin
+            mse_lin = float(np.mean((pred_lin - y) ** 2))
 
-        # Try two radial arguments: r2 and r
-        candidates = []
-        for arg_name, arg in (("r2", r2), ("r", r)):
-            best = self._search_best_k(r2, arg, y)
-            if best is None:
-                continue
-            mse, k, coef = best
-            candidates.append((mse, k, coef, arg_name))
-
-        if not candidates:
-            # Fallback: quadratic in r2
-            A = np.column_stack([np.ones_like(r2), r2, r2 * r2])
-            coef, _, _, _ = np.linalg.lstsq(A, y, rcond=None)
-            c0, c1, c2 = coef.tolist()
-            r2s = "(x1**2 + x2**2)"
-            expr = self._poly_horner_str([c0, c1, c2], r2s)
-            preds = (c2 * r2 + c1) * r2 + c0
-            return {"expression": expr, "predictions": preds.tolist(), "details": {}}
-
-        # Choose best by MSE
-        candidates.sort(key=lambda t: t[0])
-        best_mse, best_k, best_coef, best_arg_name = candidates[0]
-
-        # Prune terms
-        yTy = float(np.dot(y, y))
-        best_arg = r2 if best_arg_name == "r2" else r
-        cols_full = self._build_columns(r2, best_arg, best_k)
-        coef9, pruned_mse = self._prune_terms(cols_full, y, yTy, best_coef, best_mse, rel_tol=1e-4)
-
-        c_off = [float(coef9[0]), float(coef9[1]), float(coef9[2])]
-        c_sin = [float(coef9[3]), float(coef9[4]), float(coef9[5])]
-        c_cos = [float(coef9[6]), float(coef9[7]), float(coef9[8])]
-
-        # Predictions
-        arg_np = best_arg
-        ka = best_k * arg_np
-        off_np = self._eval_poly(c_off, r2)
-        sin_amp_np = self._eval_poly(c_sin, r2)
-        cos_amp_np = self._eval_poly(c_cos, r2)
-        preds = off_np + sin_amp_np * np.sin(ka) + cos_amp_np * np.cos(ka)
-
-        # Build expression
-        r2_str = "(x1**2 + x2**2)"
-        arg_str = r2_str if best_arg_name == "r2" else f"({r2_str})**0.5"
-        k_str = self._fmt_num(best_k)
-
-        off_str = self._poly_horner_str(c_off, r2_str)
-        sin_poly_str = self._poly_horner_str(c_sin, r2_str)
-        cos_poly_str = self._poly_horner_str(c_cos, r2_str)
-
-        s_str = f"sin({k_str}*({arg_str}))"
-        c_str = f"cos({k_str}*({arg_str}))"
-
-        terms = []
-        if off_str != "0.0":
-            terms.append(off_str)
-        if sin_poly_str != "0.0":
-            terms.append(f"({sin_poly_str})*({s_str})")
-        if cos_poly_str != "0.0":
-            terms.append(f"({cos_poly_str})*({c_str})")
-
-        if not terms:
-            expression = "0.0"
+        rng = np.random.RandomState(0)
+        m_search = min(n, 2500)
+        if m_search < n:
+            idx = rng.choice(n, size=m_search, replace=False)
         else:
-            expression = " + ".join(terms)
-            expression = expression.replace("+ -", "- ")
+            idx = np.arange(n)
 
-        details = {
-            "mse": float(np.mean((y - preds) ** 2)),
-            "arg": best_arg_name,
-            "k": float(best_k),
-        }
+        candidates = [
+            {"z": "r2", "d_trig": 2, "d_const": 2, "cos": True},
+            {"z": "r2", "d_trig": 1, "d_const": 1, "cos": True},
+            {"z": "r2", "d_trig": 1, "d_const": 1, "cos": False},
+            {"z": "r2", "d_trig": 0, "d_const": 0, "cos": True},
+            {"z": "r2", "d_trig": 0, "d_const": 0, "cos": False},
+            {"z": "r", "d_trig": 1, "d_const": 1, "cos": True},
+            {"z": "r", "d_trig": 1, "d_const": 1, "cos": False},
+            {"z": "r", "d_trig": 0, "d_const": 0, "cos": True},
+            {"z": "r", "d_trig": 0, "d_const": 0, "cos": False},
+        ]
+
+        best = None
+
+        for cand in candidates:
+            ztype = cand["z"]
+            d_trig = int(cand["d_trig"])
+            d_const = int(cand["d_const"])
+            include_cos = bool(cand["cos"])
+
+            if ztype == "r2":
+                z = x1 * x1 + x2 * x2
+                z_str = "(x1**2 + x2**2)"
+            else:
+                z = np.sqrt(x1 * x1 + x2 * x2)
+                z_str = "((x1**2 + x2**2)**0.5)"
+
+            z_s = z[idx]
+            y_s = y[idx]
+
+            zmin, zmax = np.percentile(z_s, [1.0, 99.0])
+            zrange = float(max(zmax - zmin, 1e-6))
+            w_min = 0.1
+            w_max = min(300.0, 220.0 / zrange)
+            if not np.isfinite(w_max) or w_max <= w_min:
+                continue
+
+            grid_n = 80
+            w_grid = np.linspace(w_min, w_max, grid_n, dtype=np.float64)
+            best_ws = []
+
+            # coarse
+            for w in w_grid:
+                A = _build_design(z_s, float(w), d_trig, d_const, include_cos)
+                coef = _ridge_solve(A, y_s, lam=1e-10)
+                pred = A @ coef
+                mse = float(np.mean((pred - y_s) ** 2))
+                if np.isfinite(mse):
+                    best_ws.append((mse, float(w)))
+
+            if not best_ws:
+                continue
+
+            best_ws.sort(key=lambda t: t[0])
+            top = best_ws[:2]
+            step = (w_max - w_min) / max(grid_n - 1, 1)
+
+            # refine
+            refine_list = []
+            for _, w0 in top:
+                a = max(w_min, w0 - 6.0 * step)
+                b = min(w_max, w0 + 6.0 * step)
+                if b <= a:
+                    continue
+                ww = np.linspace(a, b, 40, dtype=np.float64)
+                for w in ww:
+                    A = _build_design(z_s, float(w), d_trig, d_const, include_cos)
+                    coef = _ridge_solve(A, y_s, lam=1e-10)
+                    pred = A @ coef
+                    mse = float(np.mean((pred - y_s) ** 2))
+                    if np.isfinite(mse):
+                        refine_list.append((mse, float(w)))
+
+            if refine_list:
+                refine_list.sort(key=lambda t: t[0])
+                w_best = refine_list[0][1]
+            else:
+                w_best = best_ws[0][1]
+
+            # full fit on all data
+            A_full = _build_design(z, w_best, d_trig, d_const, include_cos)
+            coef_full = _ridge_solve(A_full, y, lam=1e-10)
+
+            # term kinds for pruning and constant index
+            term_kinds = []
+            for k in range(d_trig + 1):
+                term_kinds.append(("sin", k))
+            if include_cos:
+                for k in range(d_trig + 1):
+                    term_kinds.append(("cos", k))
+            for k in range(d_const + 1):
+                term_kinds.append(("poly", k))
+
+            keep_const_idx = (d_trig + 1) + (d_trig + 1 if include_cos else 0) + 0  # poly k=0
+            coef_pruned, mse_full = _prune_refit(
+                A_full, y, coef_full, term_kinds, y_rms=y_rms, keep_const_idx=keep_const_idx
+            )
+
+            # build expression with stronger threshold to keep it compact
+            expr = _build_expression(z_str, w_best, d_trig, d_const, include_cos, coef_pruned, tol=1e-10 * y_rms)
+            if expr == "0":
+                continue
+
+            comp = _sympy_complexity(expr)
+            if comp is None:
+                comp = 10_000
+
+            # objective trades off MSE and complexity mildly
+            obj = mse_full + (1e-4 * y_var) * float(comp)
+
+            pred_full = A_full @ coef_pruned
+            if not np.all(np.isfinite(pred_full)):
+                continue
+
+            candidate = {
+                "expression": expr,
+                "predictions": pred_full,
+                "mse": float(mse_full),
+                "complexity": int(comp),
+                "objective": float(obj),
+            }
+
+            if best is None or candidate["objective"] < best["objective"]:
+                best = candidate
+
+        if best is None:
+            a, b, c = coef_lin
+            expr = _sum_parts([f"{_fmt(float(a))}*x1", f"{_fmt(float(b))}*x2", f"{_fmt(float(c))}"])
+            comp = _sympy_complexity(expr)
+            if comp is None:
+                comp = 0
+            return {
+                "expression": expr,
+                "predictions": pred_lin.tolist(),
+                "details": {"mse": mse_lin, "complexity": int(comp)},
+            }
+
         return {
-            "expression": expression,
-            "predictions": preds.tolist(),
-            "details": details,
+            "expression": best["expression"],
+            "predictions": best["predictions"].tolist(),
+            "details": {"mse": best["mse"], "complexity": best["complexity"], "baseline_mse": mse_lin},
         }

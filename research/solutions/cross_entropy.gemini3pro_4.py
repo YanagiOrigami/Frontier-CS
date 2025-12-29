@@ -4,8 +4,7 @@ import triton.language as tl
 
 class Solution:
     def solve(self, spec_path: str = None) -> dict:
-        return {
-            "code": """
+        code = r"""
 import torch
 import triton
 import triton.language as tl
@@ -15,90 +14,91 @@ import triton.language as tl
         triton.Config({'BLOCK_SIZE': 1024}, num_warps=4),
         triton.Config({'BLOCK_SIZE': 2048}, num_warps=8),
         triton.Config({'BLOCK_SIZE': 4096}, num_warps=8),
-        triton.Config({'BLOCK_SIZE': 8192}, num_warps=8),
+        triton.Config({'BLOCK_SIZE': 8192}, num_warps=16),
+        triton.Config({'BLOCK_SIZE': 1024}, num_warps=4, num_stages=3),
+        triton.Config({'BLOCK_SIZE': 2048}, num_warps=8, num_stages=3),
     ],
-    key=['N']
+    key=['n_cols'],
 )
 @triton.jit
 def cross_entropy_kernel(
-    logits_ptr, targets_ptr, out_ptr,
+    logits_ptr, targets_ptr, output_ptr,
     stride_logits_m, stride_logits_n,
-    stride_targets_m, stride_out_m,
-    N,
+    stride_targets_m,
+    n_cols,
     BLOCK_SIZE: tl.constexpr
 ):
-    # One program instance per row
+    # Map program ID to row index
     row_idx = tl.program_id(0)
     
-    # Calculate pointers for the current row
-    logits_row_ptr = logits_ptr + row_idx * stride_logits_m
-    target_idx_ptr = targets_ptr + row_idx * stride_targets_m
-    out_row_ptr = out_ptr + row_idx * stride_out_m
+    # Pointers to the current row
+    logits_row_start = logits_ptr + row_idx * stride_logits_m
+    target_idx = tl.load(targets_ptr + row_idx * stride_targets_m)
     
-    # Load target class index for this row
-    target_idx = tl.load(target_idx_ptr)
-    
-    # Fetch the specific logit corresponding to the target class
-    # This avoids iterating to find it, improving performance
-    target_logit_ptr = logits_row_ptr + target_idx * stride_logits_n
-    target_val = tl.load(target_logit_ptr).to(tl.float32)
-    
-    # Online Softmax / LogSumExp Computation
-    # Uses the numerically stable online update to compute:
-    # log(sum(exp(x_i))) = m_final + log(sum(exp(x_i - m_final)))
-    
+    # Accumulators for Online Softmax (Welford's algorithm adaptation)
+    # m_prev: Current maximum value
+    # d_prev: Current sum of exponentials (scaled by m_prev)
     m_prev = -float('inf')
     d_prev = 0.0
     
-    # Loop over the row in chunks defined by BLOCK_SIZE
-    for off in range(0, N, BLOCK_SIZE):
-        cols = off + tl.arange(0, BLOCK_SIZE)
-        mask = cols < N
-        
-        # Load chunk of logits
-        # Cast to float32 is crucial for accumulation precision and stability
-        a_ptr = logits_row_ptr + cols * stride_logits_n
-        val = tl.load(a_ptr, mask=mask, other=-float('inf')).to(tl.float32)
-        
-        # Compute max in current chunk
-        m_curr = tl.max(val, 0)
-        
-        # Update global max
-        m_new = tl.maximum(m_prev, m_curr)
-        
-        # Update running sum of exponentials
-        # d_prev is rescaled by exp(m_prev - m_new) to align with new max
-        d_prev = d_prev * tl.exp(m_prev - m_new) + tl.sum(tl.exp(val - m_new), 0)
-        
-        # Update previous max
-        m_prev = m_new
+    # Accumulator for the specific target logit value
+    target_val = 0.0
 
-    # Calculate final loss
-    # Loss = LogSumExp - TargetLogit
+    # Iterate over the row in blocks
+    for off in range(0, n_cols, BLOCK_SIZE):
+        cols = off + tl.arange(0, BLOCK_SIZE)
+        mask = cols < n_cols
+        
+        # Load logits chunk
+        # Casting to float32 ensures higher precision for the exponential sum
+        a = tl.load(logits_row_start + cols * stride_logits_n, mask=mask, other=-float('inf')).to(tl.float32)
+        
+        # Online Softmax Update
+        m_curr = tl.max(a, 0)
+        m_new = tl.max(m_curr, m_prev)
+        
+        # Update sum of exps: d_new = d_prev * exp(m_prev - m_new) + sum(exp(a - m_new))
+        d_prev = d_prev * tl.exp(m_prev - m_new) + tl.sum(tl.exp(a - m_new), 0)
+        m_prev = m_new
+        
+        # Extract the target logit if it exists in the current block
+        # mask is implicitly handled because 'a' has -inf where invalid, 
+        # and target_idx < n_cols ensures we select a valid value.
+        target_val += tl.sum(tl.where(cols == target_idx, a, 0.0))
+
+    # Final Loss Calculation
+    # Loss = -log(softmax(x_target)) = -x_target + log(sum(exp(x)))
     # LogSumExp = m_prev + log(d_prev)
     lse = m_prev + tl.log(d_prev)
     loss = lse - target_val
     
-    # Store result
-    tl.store(out_row_ptr, loss)
+    tl.store(output_ptr + row_idx, loss)
 
 def cross_entropy(logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+    """
+    Computes Cross Entropy Loss using Triton.
+    Args:
+        logits: (M, N) tensor
+        targets: (M,) tensor of indices
+    Returns:
+        (M,) tensor of losses
+    """
     M, N = logits.shape
     
-    # Ensure outputs are contiguous float32 for best performance
-    out = torch.empty(M, device=logits.device, dtype=torch.float32)
+    # Allocate output tensor
+    losses = torch.empty(M, device=logits.device, dtype=torch.float32)
     
-    # Grid creates one kernel instance per row (batch element)
+    # Grid configuration: One kernel instance per row (sample)
     grid = (M,)
     
     # Launch kernel
     cross_entropy_kernel[grid](
-        logits, targets, out,
+        logits, targets, losses,
         logits.stride(0), logits.stride(1),
-        targets.stride(0), out.stride(0),
+        targets.stride(0),
         N
     )
     
-    return out
+    return losses
 """
-        }
+        return {"code": code}

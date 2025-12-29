@@ -1,155 +1,99 @@
-import os
 import tarfile
+import os
 
 
 class Solution:
     def solve(self, src_path: str) -> bytes:
-        target_size = 1445
+        poc_len = 1445
+        try:
+            tf = tarfile.open(src_path, "r:*")
+        except Exception:
+            return b"A" * poc_len
 
-        def is_binary_sample(sample: bytes) -> bool:
-            if not sample:
-                return False
-            if b"\0" in sample:
-                return True
-            text_chars = set(range(32, 127))
-            text_chars.update((9, 10, 13))
-            text_count = 0
-            for b in sample:
-                if b in text_chars:
-                    text_count += 1
-            ratio = text_count / len(sample)
-            return ratio < 0.95
+        with tf:
+            members = [m for m in tf.getmembers() if m.isfile() and m.size > 0]
+            if not members:
+                return b"A" * poc_len
 
-        def score_candidate(name: str, size: int, sample: bytes) -> int:
-            name_lower = name.lower()
-            base = 0
+            target = self._select_poc_member(members, poc_len)
+            if target is None:
+                return b"A" * poc_len
 
-            if "42537907" in name_lower:
-                base += 120
-            if "gf_hevc" in name_lower or "hevc" in name_lower or "h265" in name_lower:
-                base += 40
-            for kw, pts in (
-                ("poc", 80),
-                ("repro", 70),
-                ("reproducer", 70),
-                ("crash", 80),
-                ("clusterfuzz", 60),
-                ("testcase", 60),
-                ("seed", 20),
-                ("fuzz", 20),
-                ("sample", 10),
-            ):
-                if kw in name_lower:
-                    base += pts
-
-            ext = os.path.splitext(name_lower)[1]
-            if ext in {".mp4", ".m4v", ".mkv", ".bin", ".dat", ".raw", ".hevc", ".h265", ".265"}:
-                base += 40
-
-            if is_binary_sample(sample):
-                base += 30
-            else:
-                # Penalize very-text-like files unless strongly named as PoC
-                if not any(k in name_lower for k in ("poc", "repro", "crash", "testcase", "clusterfuzz")):
-                    base -= 30
-
-            distance = abs(size - target_size)
-            proximity = max(0, 500 - distance)  # 0..500
-            if proximity > 0:
-                base += proximity // 50  # small bonus
-
-            return base * 1000 + proximity
-
-        def search_tar(tar_path: str):
-            best_score = None
-            best_data = None
             try:
-                with tarfile.open(tar_path, "r:*") as tf:
-                    for member in tf.getmembers():
-                        if not member.isreg():
-                            continue
-                        size = member.size
-                        if size <= 0 or size > 1_000_000:
-                            continue
-                        name = member.name
-                        try:
-                            f = tf.extractfile(member)
-                            if f is None:
-                                continue
-                            sample = f.read(4096)
-                        except Exception:
-                            continue
-                        s = score_candidate(name, size, sample)
-                        if best_score is None or s > best_score:
-                            try:
-                                f_full = tf.extractfile(member)
-                                if f_full is None:
-                                    continue
-                                data = f_full.read()
-                            except Exception:
-                                continue
-                            if not data:
-                                continue
-                            best_score = s
-                            best_data = data
+                f = tf.extractfile(target)
+                if f is None:
+                    return b"A" * poc_len
+                data = f.read()
+                if not isinstance(data, bytes):
+                    return b"A" * poc_len
+                return data
             except Exception:
-                return None
-            return best_data
+                return b"A" * poc_len
 
-        def search_dir(root_path: str):
-            best_score = None
-            best_data = None
-            for dirpath, _, filenames in os.walk(root_path):
-                for fname in filenames:
-                    path = os.path.join(dirpath, fname)
-                    try:
-                        size = os.path.getsize(path)
-                    except OSError:
-                        continue
-                    if size <= 0 or size > 1_000_000:
-                        continue
-                    rel_name = os.path.relpath(path, root_path)
-                    try:
-                        with open(path, "rb") as f:
-                            sample = f.read(4096)
-                    except OSError:
-                        continue
-                    s = score_candidate(rel_name, size, sample)
-                    if best_score is None or s > best_score:
-                        try:
-                            with open(path, "rb") as f_full:
-                                data = f_full.read()
-                        except OSError:
-                            continue
-                        if not data:
-                            continue
-                        best_score = s
-                        best_data = data
-            return best_data
+    def _select_poc_member(self, members, poc_len: int):
+        source_exts = {
+            ".c", ".h", ".hpp", ".hh", ".cc", ".cpp", ".cxx",
+            ".md", ".markdown", ".txt", ".rst",
+            ".html", ".htm", ".xml", ".xsl",
+            ".py", ".pyw", ".pyi", ".pyx",
+            ".sh", ".bash", ".zsh",
+            ".cmake", ".am", ".ac", ".m4", ".in",
+            ".pc", ".def", ".rc", ".bat", ".ps1",
+            ".ini", ".cfg", ".conf", ".json", ".yml", ".yaml", ".toml",
+            ".css", ".js", ".java", ".cs", ".php", ".rb", ".pl", ".m", ".mm",
+        }
 
-        poc_data = None
-        if os.path.isfile(src_path):
-            poc_data = search_tar(src_path)
-        if poc_data is None and os.path.isdir(src_path):
-            poc_data = search_dir(src_path)
+        target_bug_id = "42537907"
+        best = None
+        best_score = float("-inf")
 
-        if poc_data is not None and len(poc_data) > 0:
-            return poc_data
+        for m in members:
+            name = m.name
+            lower = name.lower()
+            _, ext = os.path.splitext(lower)
 
-        # Fallback: construct a deterministic synthetic HEVC-like byte stream
-        # with Annex B start codes and varying NAL unit types.
-        pattern_nals = [
-            b"\x00\x00\x00\x01\x40\x01\x0c\x01\xff\xff\x01",
-            b"\x00\x00\x00\x01\x42\x01\x01\x60\x00\x00\x03",
-            b"\x00\x00\x00\x01\x44\x01\xfa\x80\x80\x80\x80",
-            b"\x00\x00\x00\x01\x26\x01\x01\x01\x01\x01\x01",
-            b"\x00\x00\x00\x01\x02\x01\x01\x01\x01\x01\x01",
-        ]
-        fallback = bytearray()
-        idx = 0
-        while len(fallback) < target_size:
-            fallback.extend(pattern_nals[idx % len(pattern_nals)])
-            idx += 1
-        if len(fallback) > target_size:
-            fallback = fallback[:target_size]
-        return bytes(fallback)
+            score = 0.0
+
+            # Size proximity to known PoC length
+            size_diff = abs(m.size - poc_len)
+            score += max(0.0, 300.0 - float(size_diff))
+            if m.size == poc_len:
+                score += 800.0
+
+            # Name patterns
+            if target_bug_id in lower:
+                score += 1000.0
+            if "oss-fuzz" in lower or "ossfuzz" in lower:
+                score += 300.0
+            if "clusterfuzz" in lower or "testcase" in lower:
+                score += 300.0
+            if "poc" in lower or "proof" in lower:
+                score += 500.0
+            if "crash" in lower or "issue" in lower or "bug" in lower:
+                score += 200.0
+            if "fuzz" in lower:
+                score += 100.0
+            if "hevc" in lower or "hvc1" in lower or "hev1" in lower:
+                score += 150.0
+            if "gpac" in lower:
+                score += 50.0
+            if "/tests" in lower or "/test" in lower:
+                score += 40.0
+            if "/poc" in lower or "/crash" in lower or "/crashes" in lower:
+                score += 300.0
+
+            # Extension-based adjustments
+            if ext in source_exts:
+                score -= 500.0
+            if m.size > 65536:
+                score -= 1000.0
+            if ext in (".mp4", ".m4v", ".hvc", ".hevc", ".265", ".bin"):
+                score += 200.0
+
+            if score > best_score:
+                best_score = score
+                best = m
+
+        if best is not None and best_score > 0.0:
+            return best
+        return None

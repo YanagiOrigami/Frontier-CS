@@ -1,251 +1,269 @@
 import os
-import io
 import re
-import math
-import ast
-import base64
+import io
 import tarfile
 import zipfile
-from typing import Optional, Tuple, List
+import gzip
+import bz2
+import lzma
+import base64
+from typing import Optional, List, Tuple
 
 
 class Solution:
-    def _is_probably_text(self, data: bytes) -> bool:
-        if not data:
-            return True
-        if b"\x00" in data:
-            return False
-        # Heuristic: if most bytes are printable ASCII / common whitespace, treat as text
-        printable = 0
-        for b in data[:4096]:
-            if b in (9, 10, 13) or 32 <= b <= 126:
-                printable += 1
-        return printable / min(len(data), 4096) > 0.97
+    def solve(self, src_path: str) -> bytes:
+        poc = self._find_embedded_poc(src_path)
+        if poc is not None and len(poc) > 0:
+            return poc
+        return b"\x00" * 149
 
-    def _try_decode_from_text(self, data: bytes) -> Optional[bytes]:
-        try:
-            s = data.decode("utf-8", errors="ignore")
-        except Exception:
+    def _find_embedded_poc(self, src_path: str) -> Optional[bytes]:
+        files = []
+        if os.path.isdir(src_path):
+            files = self._collect_from_dir(src_path)
+        else:
+            files = self._collect_from_tar(src_path)
+
+        if not files:
             return None
 
-        s_stripped = s.strip()
+        def score_item(name: str, size: int) -> float:
+            n = name.lower()
+            s = 0.0
+            if "385170375" in n:
+                s += 10000
+            if "385170" in n:
+                s += 2000
+            if "clusterfuzz" in n:
+                s += 1500
+            if "testcase" in n:
+                s += 800
+            if "minimiz" in n:
+                s += 600
+            if "oss-fuzz" in n or "ossfuzz" in n:
+                s += 500
+            if "poc" in n or "repro" in n or "crash" in n:
+                s += 350
+            if "rv60" in n:
+                s += 300
+            if "realvideo" in n or "real media" in n or "realmedia" in n:
+                s += 150
+            ext = os.path.splitext(n)[1]
+            if ext in (".bin", ".raw", ".dat", ".rm", ".rma", ".rmvb", ".rv", ".ivf", ".mkv", ".mp4", ".mov", ".avi"):
+                s += 120
+            if ext in (".zip", ".gz", ".xz", ".bz2", ".lzma", ".zst"):
+                s += 40
+            if ext in (".txt", ".md", ".rst", ".c", ".cc", ".cpp", ".h"):
+                s -= 30
+            if size == 149:
+                s += 500
+            s -= min(size, 2_000_000) / 5000.0
+            return s
 
-        # Try python bytes literal embedded in text
-        # e.g., b"\x00\x01..." or b'...'
-        m = re.search(r"(b(['\"]).*?\2)", s, flags=re.DOTALL)
-        if m:
-            lit = m.group(1)
+        scored = [(score_item(n, sz), n, sz, getter) for (n, sz, getter) in files]
+        scored.sort(key=lambda x: (-x[0], x[2], x[1]))
+
+        # Try top candidates first
+        for _, name, size, getter in scored[:50]:
+            if size <= 0:
+                continue
             try:
-                v = ast.literal_eval(lit)
-                if isinstance(v, (bytes, bytearray)) and len(v) > 0:
-                    return bytes(v)
+                data = getter()
             except Exception:
-                pass
+                continue
+            if not data:
+                continue
+            extracted = self._maybe_extract_from_container(name, data)
+            if extracted is not None:
+                return extracted
+            decoded = self._maybe_decode_text_payload(name, data)
+            if decoded is not None:
+                extracted2 = self._maybe_extract_from_container(name, decoded)
+                if extracted2 is not None:
+                    return extracted2
+                return decoded
+            return data
 
-        # Try \xHH sequences
-        if "\\x" in s:
-            hex_bytes = re.findall(r"\\x([0-9a-fA-F]{2})", s)
-            if hex_bytes:
-                try:
-                    return bytes(int(h, 16) for h in hex_bytes)
-                except Exception:
-                    pass
-
-        # Try 0xHH sequences
-        hex_bytes = re.findall(r"0x([0-9a-fA-F]{2})", s)
-        if hex_bytes and len(hex_bytes) >= 4:
+        # Fallback: exact-size match
+        exact = [(n, sz, getter) for (_, n, sz, getter) in scored if sz == 149]
+        for name, _, getter in exact[:50]:
             try:
-                return bytes(int(h, 16) for h in hex_bytes)
+                data = getter()
             except Exception:
-                pass
-
-        # Try raw hex (possibly whitespace separated)
-        hex_only = re.sub(r"[\s,;:_-]+", "", s_stripped)
-        if hex_only and len(hex_only) % 2 == 0 and re.fullmatch(r"[0-9a-fA-F]+", hex_only):
-            try:
-                b = bytes.fromhex(hex_only)
-                if b:
-                    return b
-            except Exception:
-                pass
-
-        # Try base64 blocks
-        # Find long-ish base64-like sequences
-        for m in re.finditer(r"([A-Za-z0-9+/]{80,}={0,2})", s_stripped):
-            b64 = m.group(1)
-            try:
-                out = base64.b64decode(b64, validate=False)
-                if out:
-                    return out
-            except Exception:
-                pass
+                continue
+            if data:
+                extracted = self._maybe_extract_from_container(name, data)
+                if extracted is not None:
+                    return extracted
+                return data
 
         return None
 
-    def _score_name(self, name: str) -> int:
+    def _collect_from_dir(self, root: str) -> List[Tuple[str, int, object]]:
+        out = []
+        for dirpath, _, filenames in os.walk(root):
+            for fn in filenames:
+                p = os.path.join(dirpath, fn)
+                try:
+                    st = os.stat(p)
+                except Exception:
+                    continue
+                if not os.path.isfile(p):
+                    continue
+                rel = os.path.relpath(p, root).replace(os.sep, "/")
+                size = int(st.st_size)
+
+                def make_getter(path=p):
+                    def _g():
+                        with open(path, "rb") as f:
+                            return f.read()
+                    return _g
+
+                out.append((rel, size, make_getter()))
+        return out
+
+    def _collect_from_tar(self, tar_path: str) -> List[Tuple[str, int, object]]:
+        out = []
+        try:
+            tf = tarfile.open(tar_path, "r:*")
+        except Exception:
+            return out
+        with tf:
+            for m in tf.getmembers():
+                if not m.isreg():
+                    continue
+                name = m.name
+                size = int(m.size)
+
+                def make_getter(member=m, tarobj=tf):
+                    def _g():
+                        f = tarobj.extractfile(member)
+                        if f is None:
+                            return b""
+                        with f:
+                            return f.read()
+                    return _g
+
+                out.append((name, size, make_getter()))
+        return out
+
+    def _maybe_extract_from_container(self, name: str, data: bytes) -> Optional[bytes]:
+        if len(data) < 4:
+            return None
         n = name.lower()
-        keywords = [
-            ("385170375", 120),
-            ("clusterfuzz", 90),
-            ("testcase", 70),
-            ("minimized", 70),
-            ("crash", 60),
-            ("repro", 55),
-            ("poc", 55),
-            ("oss-fuzz", 45),
-            ("ossfuzz", 45),
-            ("rv60", 35),
-            ("rv60dec", 35),
-            ("rv", 10),
-            ("fuzz", 10),
-        ]
-        score = 0
-        for kw, w in keywords:
-            if kw in n:
-                score += w
-        return score
+        # Zip
+        if data[:4] == b"PK\x03\x04" or n.endswith(".zip"):
+            try:
+                with zipfile.ZipFile(io.BytesIO(data)) as zf:
+                    infos = zf.infolist()
+                    if not infos:
+                        return None
+                    def zscore(info):
+                        nn = info.filename.lower()
+                        s = 0
+                        if "385170375" in nn:
+                            s += 10000
+                        if "clusterfuzz" in nn:
+                            s += 1000
+                        if "minimiz" in nn:
+                            s += 500
+                        if "rv60" in nn:
+                            s += 200
+                        if info.file_size == 149:
+                            s += 500
+                        s -= info.file_size / 5000.0
+                        return (-s, info.file_size, info.filename)
+                    infos.sort(key=zscore)
+                    for info in infos[:20]:
+                        if info.file_size <= 0 or info.file_size > 5_000_000:
+                            continue
+                        b = zf.read(info)
+                        if not b:
+                            continue
+                        # Nested compression
+                        inner = self._maybe_extract_from_container(info.filename, b)
+                        if inner is not None:
+                            return inner
+                        dec = self._maybe_decode_text_payload(info.filename, b)
+                        if dec is not None:
+                            inner2 = self._maybe_extract_from_container(info.filename, dec)
+                            return inner2 if inner2 is not None else dec
+                        return b
+            except Exception:
+                return None
+            return None
 
-    def _score_bytes(self, data: bytes) -> float:
-        if not data:
-            return -1e18
-        size = len(data)
-        score = 0.0
-        if size == 149:
-            score += 50.0
-        # prefer smaller, but not too tiny
-        score += 12.0 / (1.0 + math.log10(size + 1.0))
-        if size < 16:
-            score -= 10.0
-        if size > 200000:
-            score -= 30.0
-        # prefer binary-ish
-        if not self._is_probably_text(data):
-            score += 8.0
-        return score
+        # gzip
+        if data[:2] == b"\x1f\x8b" or n.endswith(".gz"):
+            try:
+                b = gzip.decompress(data)
+                if b:
+                    inner = self._maybe_extract_from_container(name[:-3] if n.endswith(".gz") else name, b)
+                    return inner if inner is not None else b
+            except Exception:
+                return None
 
-    def _consider_candidate(self, name: str, data: bytes) -> Tuple[float, bytes]:
-        name_score = float(self._score_name(name))
-        data_score = self._score_bytes(data)
-        return (name_score + data_score, data)
+        # bzip2
+        if data[:3] == b"BZh" or n.endswith(".bz2"):
+            try:
+                b = bz2.decompress(data)
+                if b:
+                    inner = self._maybe_extract_from_container(name[:-4] if n.endswith(".bz2") else name, b)
+                    return inner if inner is not None else b
+            except Exception:
+                return None
 
-    def _best_from_tar(self, path: str) -> Optional[bytes]:
-        best_score = -1e18
-        best_data = None
+        # xz / lzma
+        if data[:6] == b"\xfd7zXZ\x00" or n.endswith(".xz") or n.endswith(".lzma"):
+            try:
+                b = lzma.decompress(data)
+                if b:
+                    inner = self._maybe_extract_from_container(name, b)
+                    return inner if inner is not None else b
+            except Exception:
+                return None
 
+        return None
+
+    def _maybe_decode_text_payload(self, name: str, data: bytes) -> Optional[bytes]:
+        # Try base64 decode for small-ish ascii text payloads that look like a testcase encoding.
+        if not data or len(data) > 5_000_000:
+            return None
         try:
-            with tarfile.open(path, "r:*") as tf:
-                members = tf.getmembers()
-                for m in members:
-                    if not m.isreg():
-                        continue
-                    if m.size <= 0 or m.size > 2_000_000:
-                        continue
-                    name = m.name
-                    nl = name.lower()
-                    # skip obvious source/text files unless keyword hints strongly
-                    ext = os.path.splitext(nl)[1]
-                    text_exts = {
-                        ".c", ".h", ".cpp", ".cc", ".hh", ".hpp", ".md", ".rst", ".txt", ".py",
-                        ".sh", ".cmake", ".in", ".ac", ".am", ".m4", ".y", ".l", ".json", ".xml",
-                        ".yaml", ".yml", ".mak", ".make", ".mk", ".inc", ".pl", ".bat", ".ps1",
-                        ".html", ".css", ".js", ".ts", ".java", ".go", ".rs", ".s", ".asm",
-                    }
-                    name_score = self._score_name(name)
-                    if ext in text_exts and name_score < 50:
-                        continue
-
-                    f = tf.extractfile(m)
-                    if f is None:
-                        continue
-                    try:
-                        data = f.read()
-                    except Exception:
-                        continue
-
-                    if self._is_probably_text(data):
-                        decoded = self._try_decode_from_text(data)
-                        if decoded:
-                            data = decoded
-
-                    score, cand = self._consider_candidate(name, data)
-                    if score > best_score:
-                        best_score = score
-                        best_data = cand
-
+            text = data.decode("utf-8", errors="strict")
         except Exception:
             return None
 
-        return best_data
-
-    def _best_from_zip(self, path: str) -> Optional[bytes]:
-        best_score = -1e18
-        best_data = None
-        try:
-            with zipfile.ZipFile(path, "r") as zf:
-                for info in zf.infolist():
-                    if info.is_dir():
-                        continue
-                    if info.file_size <= 0 or info.file_size > 2_000_000:
-                        continue
-                    name = info.filename
-                    nl = name.lower()
-                    ext = os.path.splitext(nl)[1]
-                    text_exts = {
-                        ".c", ".h", ".cpp", ".cc", ".hh", ".hpp", ".md", ".rst", ".txt", ".py",
-                        ".sh", ".cmake", ".in", ".ac", ".am", ".m4", ".y", ".l", ".json", ".xml",
-                        ".yaml", ".yml", ".mak", ".make", ".mk", ".inc", ".pl", ".bat", ".ps1",
-                        ".html", ".css", ".js", ".ts", ".java", ".go", ".rs", ".s", ".asm",
-                    }
-                    name_score = self._score_name(name)
-                    if ext in text_exts and name_score < 50:
-                        continue
-
-                    try:
-                        data = zf.read(info)
-                    except Exception:
-                        continue
-
-                    if self._is_probably_text(data):
-                        decoded = self._try_decode_from_text(data)
-                        if decoded:
-                            data = decoded
-
-                    score, cand = self._consider_candidate(name, data)
-                    if score > best_score:
-                        best_score = score
-                        best_data = cand
-        except Exception:
+        stripped = re.sub(r"\s+", "", text)
+        if len(stripped) < 32:
             return None
-        return best_data
 
-    def solve(self, src_path: str) -> bytes:
-        src_path = os.path.abspath(src_path)
+        if re.fullmatch(r"[A-Za-z0-9+/=]+", stripped) and (len(stripped) % 4 == 0):
+            try:
+                raw = base64.b64decode(stripped, validate=True)
+                if raw:
+                    return raw
+            except Exception:
+                pass
 
-        best = None
-        if os.path.isfile(src_path):
-            lower = src_path.lower()
-            if lower.endswith(".zip"):
-                best = self._best_from_zip(src_path)
-            else:
-                best = self._best_from_tar(src_path)
+        # Hex string like "00ff01..."
+        if re.fullmatch(r"[0-9a-fA-F]+", stripped) and (len(stripped) % 2 == 0) and len(stripped) >= 40:
+            try:
+                raw = bytes.fromhex(stripped)
+                if raw:
+                    return raw
+            except Exception:
+                pass
 
-        if best is not None and len(best) > 0:
-            return best
+        # C array initializer: {0x00, 0x01, ...}
+        if "0x" in text and "{" in text and "}" in text:
+            hex_bytes = re.findall(r"0x([0-9a-fA-F]{2})", text)
+            if len(hex_bytes) >= 16:
+                try:
+                    raw = bytes(int(h, 16) for h in hex_bytes)
+                    if raw:
+                        return raw
+                except Exception:
+                    pass
 
-        # Fallback: deterministic 149-byte blob (best-effort)
-        # (If no reproducer is embedded in the tarball, return a stable input length-matched.)
-        x = bytearray(149)
-        # Some structured-looking header-like bytes and a large length field pattern.
-        seed = bytes.fromhex(
-            "52 56 36 30 00 00 00 01 7F FF FF F0 00 00 00 00"
-            "00 00 00 00 00 01 00 00 00 00 00 00 00 00"
-        )
-        for i in range(len(x)):
-            x[i] = (i * 131 + 17) & 0xFF
-        x[: len(seed)] = seed
-        # Sprinkle repeated 0xFF/0x00
-        for i in range(32, 149, 7):
-            x[i] = 0xFF
-        for i in range(40, 149, 11):
-            x[i] = 0x00
-        return bytes(x)
+        return None

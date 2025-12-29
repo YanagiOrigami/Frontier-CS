@@ -2,57 +2,66 @@ import numpy as np
 import faiss
 from typing import Tuple
 
-class Recall95LatencyIndex:
+class YourIndexClass:
     def __init__(self, dim: int, **kwargs):
         """
-        Initialize the index for SIFT1M with HNSW.
+        Initialize the index for vectors of dimension `dim`.
         
-        Design choices:
-        - Algorithm: HNSW (Hierarchical Navigable Small World) with Flat storage.
-          HNSW provides superior latency-recall tradeoffs for in-memory datasets.
-        - Memory: SIFT1M (1M x 128 float32) requires ~512MB for vectors + graph overhead.
-          This easily fits within the 16GB RAM limit, allowing us to avoid compression (PQ)
-          which would hurt recall.
-        - Parameters:
-          - M=32: Standard connectivity for SIFT-scale data.
-          - efConstruction=200: Builds a high-quality graph (time permit allows this).
-          - efSearch=96: Chosen to strictly guarantee >95% recall (typically >98%)
-            while keeping latency < 1ms (well within 7.7ms budget).
+        Strategy:
+        - Use HNSW (Hierarchical Navigable Small World) graph for efficient approximate search.
+        - Use Flat storage (IndexHNSWFlat) to store exact vectors. This avoids quantization 
+          loss, ensuring we can meet the strict 95% recall requirement more easily than PQ.
+        - Optimization focuses on tuning M and efSearch to balance recall and latency.
         """
         self.dim = dim
-        self.M = 32
-        self.ef_construction = 200
-        self.ef_search = 96
         
-        # Initialize Faiss HNSW index
-        # MetricType is L2 by default for IndexHNSWFlat
-        self.index = faiss.IndexHNSWFlat(dim, self.M)
-        self.index.hnsw.efConstruction = self.ef_construction
+        # Configuration for SIFT1M (1M vectors, 128 dim)
+        # M=32: Number of connections per node. Higher M improves recall at cost of speed/memory.
+        # 32 is a robust sweet spot for 1M vectors to maintain high recall.
+        self.M = kwargs.get('M', 32)
         
-        # Configure threading to utilize all 8 vCPUs
-        faiss.omp_set_num_threads(8)
+        # Initialize the Faiss index
+        # IndexHNSWFlat wraps a flat index (exact distances) with an HNSW graph
+        self.index = faiss.IndexHNSWFlat(dim, self.M, faiss.METRIC_L2)
+        
+        # efConstruction: Controls graph quality during build time.
+        # Build time is not part of the score (only query latency is).
+        # We use a high value (128) to build a high-quality graph.
+        self.index.hnsw.efConstruction = kwargs.get('ef_construction', 128)
+        
+        # efSearch: Controls the size of the candidate list during search.
+        # This is the primary knob for the Recall vs Latency trade-off.
+        # For SIFT1M:
+        # - efSearch=64 with M=32 typically yields ~98-99% recall.
+        # - We set it to 80 to have a safety buffer above the 95% gate.
+        # - Latency with efSearch=80 is typically < 1ms for batch queries on modern CPUs,
+        #   well within the 7.7ms budget for max score.
+        self.index.hnsw.efSearch = kwargs.get('ef_search', 80)
+        
+        # Note: Faiss automatically utilizes OpenMP for batch queries.
+        # The environment's 8 vCPUs will be used effectively for the 10k query batch.
 
     def add(self, xb: np.ndarray) -> None:
         """
         Add vectors to the index.
         """
-        # Faiss expects float32
-        if xb.dtype != np.float32:
-            xb = xb.astype(np.float32)
+        # Ensure array is C-contiguous for Faiss
+        if not xb.flags['C_CONTIGUOUS']:
+            xb = np.ascontiguousarray(xb)
+        
         self.index.add(xb)
 
     def search(self, xq: np.ndarray, k: int) -> Tuple[np.ndarray, np.ndarray]:
         """
         Search for k nearest neighbors.
         """
-        if xq.dtype != np.float32:
-            xq = xq.astype(np.float32)
-            
-        # Set search-time parameter for recall/latency trade-off
-        self.index.hnsw.efSearch = self.ef_search
+        # Ensure array is C-contiguous
+        if not xq.flags['C_CONTIGUOUS']:
+            xq = np.ascontiguousarray(xq)
         
-        # Perform search
-        # Faiss handles batching and threading automatically
+        # Perform batch search
+        # Returns (distances, indices)
+        # Distances are squared L2 because metric is METRIC_L2
         distances, indices = self.index.search(xq, k)
         
         return distances, indices

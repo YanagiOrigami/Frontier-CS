@@ -1,110 +1,109 @@
 import numpy as np
-import sympy as sp
-
-
-def _format_float(x: float) -> str:
-    if not np.isfinite(x):
-        return "0.0"
-    xr = float(x)
-    if abs(xr) < 1e-14:
-        return "0"
-    xi = round(xr)
-    if abs(xr - xi) < 1e-12 and abs(xi) < 1e12:
-        return str(int(xi))
-    return format(xr, ".12g")
-
-
-def _sympy_complexity(expr_str: str) -> int:
-    try:
-        expr = sp.sympify(expr_str, locals={"sin": sp.sin, "cos": sp.cos, "exp": sp.exp, "log": sp.log})
-    except Exception:
-        return 0
-
-    def rec(e) -> int:
-        if e.is_Atom:
-            return 0
-        if isinstance(e, sp.Function):
-            name = e.func.__name__
-            unary = 1 if name in ("sin", "cos", "exp", "log") else 0
-            return unary + sum(rec(a) for a in e.args)
-        if isinstance(e, sp.Add):
-            args = e.args
-            return (len(args) - 1) + sum(rec(a) for a in args)
-        if isinstance(e, sp.Mul):
-            args = e.args
-            return (len(args) - 1) + sum(rec(a) for a in args)
-        if isinstance(e, sp.Pow):
-            return 1 + sum(rec(a) for a in e.args)
-        return sum(rec(a) for a in e.args)
-
-    binary_ops = rec(expr)  # counts all ops; will be split below approximately
-    # Convert to requested measure: 2*(#binary ops)+(#unary ops).
-    # Our rec currently counts unary ops too; adjust by counting unary separately.
-    def unary_count(e) -> int:
-        if e.is_Atom:
-            return 0
-        if isinstance(e, sp.Function):
-            name = e.func.__name__
-            u = 1 if name in ("sin", "cos", "exp", "log") else 0
-            return u + sum(unary_count(a) for a in e.args)
-        return sum(unary_count(a) for a in e.args)
-
-    u = unary_count(expr)
-    b = max(binary_ops - u, 0)
-    return int(2 * b + u)
-
 
 class Solution:
     def __init__(self, **kwargs):
         self.kwargs = kwargs
 
+    def _snap(self, v: float, tol: float = 1e-10) -> float:
+        if not np.isfinite(v):
+            return float(v)
+        r = round(v)
+        if abs(v - r) <= tol:
+            return float(int(r))
+        for denom in (2, 3, 4, 5, 6, 8, 10, 12):
+            num = round(v * denom)
+            if abs(v - (num / denom)) <= tol:
+                return float(num / denom)
+        for tgt in (0.5, -0.5, 1.5, -1.5, 2.5, -2.5):
+            if abs(v - tgt) <= tol:
+                return float(tgt)
+        return float(v)
+
+    def _fmt(self, v: float) -> str:
+        if isinstance(v, (int, np.integer)):
+            return str(int(v))
+        if not np.isfinite(v):
+            if np.isnan(v):
+                return "0.0"
+            return "0.0"
+        v = float(v)
+        if v == 0.0:
+            return "0"
+        s = format(v, ".12g")
+        if "e" in s or "E" in s:
+            s = format(v, ".15g")
+        return s
+
+    def _append_term(self, parts, term: str, sign: int):
+        if not term:
+            return
+        if not parts:
+            parts.append(term if sign >= 0 else f"-({term})")
+        else:
+            parts.append(("+ " if sign >= 0 else "- ") + f"({term})")
+
     def solve(self, X: np.ndarray, y: np.ndarray) -> dict:
         X = np.asarray(X)
-        y = np.asarray(y).ravel()
+        y = np.asarray(y).reshape(-1)
+        if X.ndim != 2 or X.shape[1] != 2:
+            raise ValueError("X must have shape (n, 2)")
+        n = X.shape[0]
+        if y.shape[0] != n:
+            raise ValueError("y must have shape (n,)")
 
-        if X.ndim != 2 or X.shape[1] != 2 or y.shape[0] != X.shape[0]:
-            expression = "0"
-            return {"expression": expression, "predictions": np.zeros_like(y).tolist(), "details": {"complexity": 0}}
+        x1 = X[:, 0]
+        x2 = X[:, 1]
 
-        x1 = X[:, 0].astype(np.float64, copy=False)
-        x2 = X[:, 1].astype(np.float64, copy=False)
+        s = np.sin(x1 + x2)
+        q = (x1 - x2) ** 2
+        A = np.column_stack([s, q, x1, x2, np.ones_like(x1)])
+        coeffs, _, _, _ = np.linalg.lstsq(A, y, rcond=None)
 
-        # Basis for McCormick-like function: sin(x1+x2), (x1-x2)^2, x1, x2, 1
-        t1 = np.sin(x1 + x2)
-        t2 = (x1 - x2) ** 2
-        ones = np.ones_like(x1)
-        A = np.column_stack([t1, t2, x1, x2, ones])
+        coeffs = np.array([self._snap(float(v)) for v in coeffs], dtype=float)
+        a_sin, a_quad, a_x1, a_x2, a_c = coeffs.tolist()
 
-        try:
-            coeffs, _, _, _ = np.linalg.lstsq(A, y, rcond=None)
-            coeffs = coeffs.astype(np.float64, copy=False)
-        except Exception:
-            coeffs = np.array([1.0, 1.0, -1.5, 2.5, 1.0], dtype=np.float64)
+        parts = []
 
-        # Snap to canonical McCormick coefficients if extremely close
-        canonical = np.array([1.0, 1.0, -1.5, 2.5, 1.0], dtype=np.float64)
-        if np.all(np.isfinite(coeffs)) and np.max(np.abs(coeffs - canonical)) < 1e-10:
-            coeffs = canonical.copy()
+        def add_scaled(coeff, base_expr):
+            coeff = float(coeff)
+            if not np.isfinite(coeff) or abs(coeff) < 1e-14:
+                return
+            if abs(coeff - 1.0) < 1e-12:
+                self._append_term(parts, base_expr, +1)
+            elif abs(coeff + 1.0) < 1e-12:
+                self._append_term(parts, base_expr, -1)
+            else:
+                sign = +1 if coeff >= 0 else -1
+                term = f"{self._fmt(abs(coeff))}*{base_expr}"
+                self._append_term(parts, term, sign)
 
-        c1, c2, c3, c4, c5 = (float(coeffs[0]), float(coeffs[1]), float(coeffs[2]), float(coeffs[3]), float(coeffs[4]))
+        add_scaled(a_sin, "sin(x1 + x2)")
+        add_scaled(a_quad, "(x1 - x2)**2")
+        add_scaled(a_x1, "x1")
+        add_scaled(a_x2, "x2")
 
-        # Build expression, omitting near-zero terms
-        terms = []
-        if abs(c1) > 1e-14:
-            terms.append(f"{_format_float(c1)}*sin(x1 + x2)")
-        if abs(c2) > 1e-14:
-            terms.append(f"{_format_float(c2)}*(x1 - x2)**2")
-        if abs(c3) > 1e-14:
-            terms.append(f"{_format_float(c3)}*x1")
-        if abs(c4) > 1e-14:
-            terms.append(f"{_format_float(c4)}*x2")
-        if abs(c5) > 1e-14 or not terms:
-            terms.append(f"{_format_float(c5)}")
+        if np.isfinite(a_c) and abs(a_c) >= 1e-14:
+            sign = +1 if a_c >= 0 else -1
+            self._append_term(parts, self._fmt(abs(a_c)), sign)
 
-        expression = " + ".join(terms).replace("+ -", "- ")
+        expression = "0"
+        if parts:
+            expression = " ".join(parts)
 
-        # Predictions
-        preds = c1 * t1 + c2 * t2 + c3 * x1 + c4 * x2 + c5
+        predictions = a_sin * s + a_quad * q + a_x1 * x1 + a_x2 * x2 + a_c
 
-        details = {"complexity": _sympy_complexity(expression)}
-        return {"expression": expression, "predictions": preds.tolist(), "details": details}
+        details = {
+            "coefficients": {
+                "sin": float(a_sin),
+                "quad": float(a_quad),
+                "x1": float(a_x1),
+                "x2": float(a_x2),
+                "const": float(a_c),
+            }
+        }
+
+        return {
+            "expression": expression,
+            "predictions": predictions.tolist(),
+            "details": details,
+        }

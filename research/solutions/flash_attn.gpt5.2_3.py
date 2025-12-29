@@ -1,141 +1,149 @@
 import textwrap
 
-_KERNEL_CODE = textwrap.dedent(r"""
+class Solution:
+    def solve(self, spec_path: str = None) -> dict:
+        code = r'''
 import math
 import torch
 import triton
 import triton.language as tl
 
-_LOG2E = 1.4426950408889634
 
-
+@triton.autotune(
+    configs=[
+        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 64}, num_warps=8, num_stages=4),
+        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 64}, num_warps=4, num_stages=4),
+        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128}, num_warps=8, num_stages=3),
+        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 128}, num_warps=8, num_stages=3),
+    ],
+    key=['M_CTX', 'N_CTX', 'CAUSAL'],
+)
 @triton.jit
 def _flash_attn_fwd(
     Q_ptr, K_ptr, V_ptr, O_ptr,
-    stride_qb, stride_qm, stride_qd,
-    stride_kb, stride_kn, stride_kd,
-    stride_vb, stride_vn, stride_vd,
-    stride_ob, stride_om, stride_od,
-    M: tl.constexpr, N: tl.constexpr,
+    stride_qz: tl.constexpr, stride_qh: tl.constexpr, stride_qm: tl.constexpr, stride_qd: tl.constexpr,
+    stride_kz: tl.constexpr, stride_kh: tl.constexpr, stride_kn: tl.constexpr, stride_kd: tl.constexpr,
+    stride_vz: tl.constexpr, stride_vh: tl.constexpr, stride_vn: tl.constexpr, stride_vd: tl.constexpr,
+    stride_oz: tl.constexpr, stride_oh: tl.constexpr, stride_om: tl.constexpr, stride_od: tl.constexpr,
+    Z: tl.constexpr, H: tl.constexpr,
+    M_CTX: tl.constexpr, N_CTX: tl.constexpr,
     D_HEAD: tl.constexpr, D_V: tl.constexpr,
-    SM_SCALE_LOG2E: tl.constexpr,
+    SM_SCALE: tl.constexpr,
     CAUSAL: tl.constexpr,
     BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
 ):
-    pid_m = tl.program_id(0)
-    pid_b = tl.program_id(1)
+    pid = tl.program_id(0)
+    num_m_blocks = tl.cdiv(M_CTX, BLOCK_M)
+    bh = pid // num_m_blocks
+    pid_m = pid - bh * num_m_blocks
+    z = bh // H
+    h = bh - z * H
 
-    start_m = pid_m * BLOCK_M
-    offs_m = start_m + tl.arange(0, BLOCK_M)
-    mask_m = offs_m < M
-
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
     offs_d = tl.arange(0, D_HEAD)
-    tl.multiple_of(offs_d, 16)
-    tl.max_contiguous(offs_d, 16)
 
-    q_ptrs = Q_ptr + pid_b * stride_qb + offs_m[:, None] * stride_qm + offs_d[None, :] * stride_qd
-    q = tl.load(q_ptrs, mask=mask_m[:, None], other=0.0).to(tl.float16)
+    q_base = Q_ptr + z * stride_qz + h * stride_qh
+    k_base = K_ptr + z * stride_kz + h * stride_kh
+    v_base = V_ptr + z * stride_vz + h * stride_vh
+    o_base = O_ptr + z * stride_oz + h * stride_oh
+
+    q_ptrs = q_base + offs_m[:, None] * stride_qm + offs_d[None, :] * stride_qd
+    q_mask = offs_m < M_CTX
+    q = tl.load(q_ptrs, mask=q_mask[:, None], other=0.0).to(tl.float16)
+
+    m_i = tl.full([BLOCK_M], -float("inf"), tl.float32)
+    l_i = tl.zeros([BLOCK_M], tl.float32)
+    acc = tl.zeros([BLOCK_M, D_V], tl.float32)
+
+    # hints (best-effort)
+    tl.multiple_of(stride_qm, 16)
+    tl.multiple_of(stride_kn, 16)
+    tl.multiple_of(stride_vn, 16)
+    tl.multiple_of(stride_om, 16)
 
     offs_dv = tl.arange(0, D_V)
-    tl.multiple_of(offs_dv, 16)
-    tl.max_contiguous(offs_dv, 16)
 
-    m_i = tl.where(mask_m, -float("inf"), 0.0).to(tl.float32)
-    l_i = tl.where(mask_m, 0.0, 1.0).to(tl.float32)
-    acc = tl.zeros([BLOCK_M, D_V], dtype=tl.float32)
-
-    for start_n in tl.static_range(0, N, BLOCK_N):
+    for start_n in tl.static_range(0, N_CTX, BLOCK_N):
         offs_n = start_n + tl.arange(0, BLOCK_N)
-        mask_n = offs_n < N
+        n_mask = offs_n < N_CTX
 
-        k_ptrs = K_ptr + pid_b * stride_kb + offs_n[None, :] * stride_kn + offs_d[:, None] * stride_kd
-        k = tl.load(k_ptrs, mask=mask_n[None, :], other=0.0).to(tl.float16)
+        k_ptrs = k_base + offs_n[:, None] * stride_kn + offs_d[None, :] * stride_kd
+        k = tl.load(k_ptrs, mask=n_mask[:, None], other=0.0).to(tl.float16)
 
-        v_ptrs = V_ptr + pid_b * stride_vb + offs_n[:, None] * stride_vn + offs_dv[None, :] * stride_vd
-        v = tl.load(v_ptrs, mask=mask_n[:, None], other=0.0).to(tl.float16)
+        qk = tl.dot(q, tl.trans(k))
+        qk = qk.to(tl.float32) * SM_SCALE
 
-        qk = tl.dot(q, k).to(tl.float32)
-        qk = qk * SM_SCALE_LOG2E
-
-        attn_mask = mask_m[:, None] & mask_n[None, :]
         if CAUSAL:
-            attn_mask = attn_mask & (offs_m[:, None] >= offs_n[None, :])
+            causal_mask = offs_n[None, :] <= offs_m[:, None]
+            qk = tl.where(causal_mask, qk, -float("inf"))
 
-        qk = tl.where(attn_mask, qk, -float("inf"))
+        qk = tl.where(n_mask[None, :], qk, -float("inf"))
 
-        m_ij = tl.maximum(m_i, tl.max(qk, axis=1))
-        p = tl.exp2(qk - m_ij[:, None])
+        m_ij = tl.max(qk, axis=1)
+        m_new = tl.maximum(m_i, m_ij)
 
-        alpha = tl.exp2(m_i - m_ij)
-        l_ij = l_i * alpha + tl.sum(p, axis=1)
+        exp_m = tl.exp(m_i - m_new)
+        p = tl.exp(qk - m_new[:, None])
 
-        acc = acc * alpha[:, None] + tl.dot(p.to(tl.float16), v)
+        l_new = l_i * exp_m + tl.sum(p, axis=1)
 
-        m_i = m_ij
-        l_i = l_ij
+        v_ptrs = v_base + offs_n[:, None] * stride_vn + offs_dv[None, :] * stride_vd
+        v = tl.load(v_ptrs, mask=n_mask[:, None], other=0.0).to(tl.float16)
 
-    o = acc / l_i[:, None]
-    o_ptrs = O_ptr + pid_b * stride_ob + offs_m[:, None] * stride_om + offs_dv[None, :] * stride_od
-    tl.store(o_ptrs, o.to(tl.float16), mask=mask_m[:, None])
+        acc = acc * exp_m[:, None] + tl.dot(p.to(tl.float16), v)
+
+        m_i = m_new
+        l_i = l_new
+
+    inv_l = 1.0 / l_i
+    out = acc * inv_l[:, None]
+    out = out.to(tl.float16)
+
+    o_ptrs = o_base + offs_m[:, None] * stride_om + offs_dv[None, :] * stride_od
+    tl.store(o_ptrs, out, mask=q_mask[:, None])
 
 
 def flash_attn(Q: torch.Tensor, K: torch.Tensor, V: torch.Tensor, causal: bool = True) -> torch.Tensor:
     assert Q.is_cuda and K.is_cuda and V.is_cuda
     assert Q.dtype == torch.float16 and K.dtype == torch.float16 and V.dtype == torch.float16
     assert Q.ndim == 4 and K.ndim == 4 and V.ndim == 4
-    Z, H, M, D_HEAD = Q.shape
+    Z, H, M, D = Q.shape
     Zk, Hk, N, Dk = K.shape
-    Zv, Hv, Nv, D_V = V.shape
-    assert Z == Zk == Zv and H == Hk == Hv and N == Nv and D_HEAD == Dk
-    assert K.shape[2] == V.shape[2]
+    Zv, Hv, Nv, Dv = V.shape
+    assert Z == Zk == Zv and H == Hk == Hv and D == Dk and N == Nv
 
-    if not Q.is_contiguous():
-        Q = Q.contiguous()
-    if not K.is_contiguous():
-        K = K.contiguous()
-    if not V.is_contiguous():
-        V = V.contiguous()
+    # optimized path for typical dims; otherwise fallback
+    if D % 16 != 0 or Dv % 16 != 0:
+        q = Q.to(torch.float32)
+        k = K.to(torch.float32)
+        v = V.to(torch.float32)
+        scale = 1.0 / math.sqrt(D)
+        attn = torch.matmul(q, k.transpose(-1, -2)) * scale
+        if causal:
+            i = torch.arange(M, device=Q.device)
+            j = torch.arange(N, device=Q.device)
+            mask = j[None, :] <= i[:, None]
+            attn = attn.masked_fill(~mask, float('-inf'))
+        p = torch.softmax(attn, dim=-1)
+        out = torch.matmul(p, v).to(torch.float16)
+        return out
 
-    B = Z * H
-    Q3 = Q.view(B, M, D_HEAD)
-    K3 = K.view(B, N, D_HEAD)
-    V3 = V.view(B, N, D_V)
+    O = torch.empty((Z, H, M, Dv), device=Q.device, dtype=torch.float16)
 
-    O = torch.empty((B, M, D_V), device=Q.device, dtype=torch.float16)
+    grid = lambda meta: (Z * H * triton.cdiv(M, meta['BLOCK_M']),)
 
-    if M <= 1024:
-        BLOCK_M = 64
-        BLOCK_N = 128
-        num_warps = 4
-        num_stages = 4
-    else:
-        BLOCK_M = 128
-        BLOCK_N = 128
-        num_warps = 8
-        num_stages = 3
-
-    sm_scale_log2e = (1.0 / math.sqrt(D_HEAD)) * _LOG2E
-
-    grid = (triton.cdiv(M, BLOCK_M), B)
     _flash_attn_fwd[grid](
-        Q3, K3, V3, O,
-        Q3.stride(0), Q3.stride(1), Q3.stride(2),
-        K3.stride(0), K3.stride(1), K3.stride(2),
-        V3.stride(0), V3.stride(1), V3.stride(2),
-        O.stride(0), O.stride(1), O.stride(2),
-        M=M, N=N,
-        D_HEAD=D_HEAD, D_V=D_V,
-        SM_SCALE_LOG2E=sm_scale_log2e,
+        Q, K, V, O,
+        Q.stride(0), Q.stride(1), Q.stride(2), Q.stride(3),
+        K.stride(0), K.stride(1), K.stride(2), K.stride(3),
+        V.stride(0), V.stride(1), V.stride(2), V.stride(3),
+        O.stride(0), O.stride(1), O.stride(2), O.stride(3),
+        Z=Z, H=H,
+        M_CTX=M, N_CTX=N,
+        D_HEAD=D, D_V=Dv,
+        SM_SCALE=(1.0 / math.sqrt(D)),
         CAUSAL=causal,
-        BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N,
-        num_warps=num_warps,
-        num_stages=num_stages,
     )
-
-    return O.view(Z, H, M, D_V)
-""").strip() + "\n"
-
-
-class Solution:
-    def solve(self, spec_path: str = None) -> dict:
-        return {"code": _KERNEL_CODE}
+    return O
+'''
+        return {"code": textwrap.dedent(code)}

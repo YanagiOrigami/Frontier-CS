@@ -1,7 +1,5 @@
-import torch
-import triton
-import triton.language as tl
 import math
+from triton import cdiv
 
 class Solution:
     def solve(self, spec_path: str = None) -> dict:
@@ -10,96 +8,106 @@ import torch
 import triton
 import triton.language as tl
 import math
+from triton import cdiv
 
 def flash_attn(Q: torch.Tensor, K: torch.Tensor, V: torch.Tensor, causal: bool = True) -> torch.Tensor:
     Z, H, M, Dq = Q.shape
     _, _, N, Dv = V.shape
-    assert N == M
-    assert Q.dtype == torch.float16
-    assert K.dtype == torch.float16
-    assert V.dtype == torch.float16
-    scale = 1.0 / math.sqrt(Dq)
-    output = torch.empty((Z, H, M, Dv), dtype=torch.float16, device=Q.device)
+    assert K.shape == (Z, H, N, Dq)
+    out = torch.empty((Z, H, M, Dv), dtype=Q.dtype, device=Q.device)
+    scale = 1 / math.sqrt(Dq)
+    BLOCK_M = 128
+    BLOCK_N = 64
+
+    stride_q = Q.stride()
+    stride_k = K.stride()
+    stride_v = V.stride()
+    stride_o = out.stride()
 
     @triton.jit
     def kernel(
         Q_ptr, K_ptr, V_ptr, O_ptr,
         stride_qz, stride_qh, stride_qm, stride_qd,
-        stride_kz, stride_kh, stride_km, stride_kd,
-        stride_vz, stride_vh, stride_vm, stride_vd,
+        stride_kz, stride_kh, stride_kn, stride_kd,
+        stride_vz, stride_vh, stride_vn, stride_vd,
         stride_oz, stride_oh, stride_om, stride_od,
-        Z, H, M, N, Dq, Dv, scale,
-        causal: tl.constexpr,
-        BLOCK_M: tl.constexpr,
-        BLOCK_N: tl.constexpr,
+        Z, H, M, N, Dq, Dv,
+        scale,
+        causal: tl.constexpr
     ):
-        block_m = tl.program_id(0)
-        batch = tl.program_id(1)
-        head = tl.program_id(2)
+        pid_z = tl.program_id(0)
+        pid_h = tl.program_id(1)
+        pid_m = tl.program_id(2)
 
-        q_start = block_m * BLOCK_M
-        q_base = Q_ptr + batch * stride_qz + head * stride_qh
-        k_base = K_ptr + batch * stride_kz + head * stride_kh
-        v_base = V_ptr + batch * stride_vz + head * stride_vh
-        o_base = O_ptr + batch * stride_oz + head * stride_oh
+        block_start_m = pid_m * BLOCK_M
+        offs_m = tl.arange(0, BLOCK_M)
+        row_idx = block_start_m + offs_m
+        mask_m = row_idx < M
+        offs_d = tl.arange(0, Dq)
+        offs_n = tl.arange(0, BLOCK_N)
+        offs_dv = tl.arange(0, Dv)
 
-        arange_m = tl.arange(0, BLOCK_M)
-        arange_d = tl.arange(0, Dq)
-        q_ptrs = q_base + (q_start + arange_m)[:, None] * stride_qm + arange_d[None, :] * stride_qd
-        q = tl.load(q_ptrs).to(tl.float32)
+        q_base = pid_z * stride_qz + pid_h * stride_qh + block_start_m * stride_qm
+        q_ptrs = Q_ptr + q_base + offs_m[:, None] * stride_qm + offs_d[None, :] * stride_qd
+        Q = tl.load(q_ptrs, mask=mask_m[:, None], other=0.0).to(tl.float32)
 
-        m = tl.full((BLOCK_M,), -float("inf"), dtype=tl.float32)
-        l = tl.zeros((BLOCK_M,), dtype=tl.float32)
-        o = tl.zeros((BLOCK_M, Dv), dtype=tl.float32)
+        row_max = tl.full((BLOCK_M,), -1e4, dtype=tl.float32)
+        row_l = tl.zeros((BLOCK_M,), dtype=tl.float32)
+        local_O = tl.zeros((BLOCK_M, Dv), dtype=tl.float32)
 
-        arange_kn = tl.arange(0, BLOCK_N)
-        arange_vd = tl.arange(0, Dv)
+        bn = 0
+        while bn * BLOCK_N < N:
+            block_start_n = bn * BLOCK_N
+            col_idx = block_start_n + offs_n
+            mask_n = col_idx < N
 
-        num_k_blocks = (N + BLOCK_N - 1) // BLOCK_N
-        for k_block in range(num_k_blocks):
-            k_start = k_block * BLOCK_N
-            if causal and k_start >= q_start + BLOCK_M:
-                break
-            k_ptrs = k_base + (k_start + arange_kn)[:, None] * stride_km + arange_d[None, :] * stride_kd
-            k = tl.load(k_ptrs).to(tl.float32)
+            k_base = pid_z * stride_kz + pid_h * stride_kh + block_start_n * stride_kn
+            k_ptrs = K_ptr + k_base + offs_n[:, None] * stride_kn + offs_d[None, :] * stride_kd
+            K_block = tl.load(k_ptrs, mask=mask_n[:, None], other=0.0).to(tl.float32)
 
-            s = tl.matmul(q, tl.trans(k)) * scale
+            v_base = pid_z * stride_vz + pid_h * stride_vh + block_start_n * stride_vn
+            v_ptrs = V_ptr + v_base + offs_n[:, None] * stride_vn + offs_dv[None, :] * stride_vd
+            V_block = tl.load(v_ptrs, mask=mask_n[:, None], other=0.0).to(tl.float32)
+
+            S = tl.dot(Q, tl.trans(K_block)) * scale
 
             if causal:
-                delta = q_start - k_start
-                i_indices = tl.arange(0, BLOCK_M)[:, None]
-                j_indices = tl.arange(0, BLOCK_N)[None, :]
-                mask_causal = j_indices <= (i_indices + delta)
-                s = tl.where(mask_causal, s, -1e9)
+                mask_causal = col_idx[None, :] <= row_idx[:, None]
+                S = tl.where(mask_causal, S, -1e4)
 
-            m_new = tl.maximum(m, tl.max(s, axis=1))
-            p = tl.exp(s - m_new[:, None])
-            l_temp = tl.sum(p, axis=1)
-            exp_diff = tl.exp(m - m_new)
-            l = l * exp_diff + l_temp
+            m_curr = tl.max(S, axis=1)
+            new_m = tl.maximum(row_max, m_curr)
+            scale_fct = tl.exp(row_max - new_m)
+            P = tl.exp(S - new_m[:, None])
+            l_update = tl.sum(P, axis=1)
+            new_l = row_l * scale_fct + l_update
 
-            v_ptrs = v_base + (k_start + arange_kn)[:, None] * stride_vm + arange_vd[None, :] * stride_vd
-            v = tl.load(v_ptrs).to(tl.float32)
+            O_update = tl.dot(P, V_block)
+            local_O = (local_O * row_l[:, None] * scale_fct[:, None] + O_update) / new_l[:, None]
 
-            pv = tl.matmul(p, v)
-            o = o * exp_diff[:, None] + pv
+            row_max = new_m
+            row_l = new_l
 
-            m = m_new
+            bn += 1
 
-        o = o / l[:, None]
-        o_ptrs = o_base + (q_start + arange_m)[:, None] * stride_om + arange_vd[None, :] * stride_od
-        tl.store(o_ptrs, o.to(tl.float16))
+        o_base = pid_z * stride_oz + pid_h * stride_oh + block_start_m * stride_om
+        o_ptrs = O_ptr + o_base + offs_m[:, None] * stride_om + offs_dv[None, :] * stride_od
+        tl.store(o_ptrs, local_O.to(tl.float16), mask=mask_m[:, None])
 
-    grid = (triton.cdiv(M, 64), Z, H)
+    kernel = triton.jit(kernel, constants={"BLOCK_M": BLOCK_M, "BLOCK_N": BLOCK_N})
+
+    grid = (Z, H, cdiv(M, BLOCK_M))
     kernel[grid](
-        Q, K, V, output,
-        stride_qz=Q.stride(0), stride_qh=Q.stride(1), stride_qm=Q.stride(2), stride_qd=Q.stride(3),
-        stride_kz=K.stride(0), stride_kh=K.stride(1), stride_km=K.stride(2), stride_kd=K.stride(3),
-        stride_vz=V.stride(0), stride_vh=V.stride(1), stride_vm=V.stride(2), stride_vd=V.stride(3),
-        stride_oz=output.stride(0), stride_oh=output.stride(1), stride_om=output.stride(2), stride_od=output.stride(3),
-        Z=Z, H=H, M=M, N=N, Dq=Dq, Dv=Dv, scale=scale, causal=causal,
-        BLOCK_M=64, BLOCK_N=64,
+        Q, K, V, out,
+        *stride_q,
+        *stride_k,
+        *stride_v,
+        *stride_o,
+        Z=Z, H=H, M=M, N=N, Dq=Dq, Dv=Dv,
+        scale=float(scale),
+        causal=causal
     )
-    return output
+
+    return out
 """
         return {"code": code}

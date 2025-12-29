@@ -1,6 +1,5 @@
 import json
 from argparse import Namespace
-from typing import Optional
 
 from sky_spot.strategies.multi_strategy import MultiRegionStrategy
 from sky_spot.utils import ClusterType
@@ -20,111 +19,118 @@ class Solution(MultiRegionStrategy):
             inter_task_overhead=[0.0],
         )
         super().__init__(args)
-        self._commit_to_on_demand = False
+
+        # Internal state initialization
+        self._work_done_cached = 0.0
+        self._work_done_len = 0
+        self._committed_od = False
+
+        # Region stats for heuristic switching (EWMA)
+        try:
+            n_regions = self.env.get_num_regions()
+        except Exception:
+            n_regions = 1
+        self._p_est = [0.5 for _ in range(n_regions)]
+        self._ewma_alpha = 0.08
+
+        # Waiting cycle counter (for optional behavior)
+        self._wait_counter = 0
+
         return self
 
-    def _remaining_work(self) -> float:
-        done = sum(self.task_done_time)
-        return max(self.task_duration - done, 0.0)
+    def _update_work_done_cache(self):
+        if hasattr(self, "task_done_time"):
+            curr_len = len(self.task_done_time)
+            if curr_len > self._work_done_len:
+                # Sum only the new segments
+                new_sum = 0.0
+                for v in self.task_done_time[self._work_done_len:]:
+                    new_sum += float(v)
+                self._work_done_cached += new_sum
+                self._work_done_len = curr_len
 
-    def _overhead_if_choose(self, choice: ClusterType, last_cluster_type: ClusterType) -> float:
-        # If we keep the same cluster type, we only need to pay the remaining overhead (if any).
-        # If we switch, we pay full restart_overhead.
-        if choice == last_cluster_type:
-            # Continuing on the same cluster consumes remaining overhead.
-            return max(self.remaining_restart_overhead, 0.0)
-        else:
-            return self.restart_overhead
+    def _safe_margin(self, time_left: float, rem_work: float, last_cluster_type: ClusterType) -> float:
+        # Time needed on OD to finish if we commit now
+        # Include one-time overhead if switching from non-OD to OD
+        overhead_commit = 0.0 if last_cluster_type == ClusterType.ON_DEMAND else float(self.restart_overhead)
+        return time_left - (rem_work + overhead_commit)
 
-    def _finish_time_if_choose_now(self, choice: ClusterType, last_cluster_type: ClusterType, has_spot: bool) -> Optional[float]:
-        # Returns the time the job would finish if we pick `choice` now and stick with it hereafter.
-        # For SPOT, this assumes no future preemptions (optimistic); we only use OD for guarantees.
-        # For OD, this is exact since OD is not interrupted.
-        if choice == ClusterType.NONE:
-            return None
-        if choice == ClusterType.SPOT and not has_spot:
-            return None
-        t = self.env.elapsed_seconds
-        gap = self.env.gap_seconds
-        rem = self._remaining_work()
-        if rem <= 0:
-            return t  # already finished
-        overhead_now = self._overhead_if_choose(choice, last_cluster_type)
-        # Work in this step:
-        step_work = max(gap - overhead_now, 0.0)
-        step_work = min(step_work, rem)
-        rem_after_step = rem - step_work
-        t_after_step = t + gap
-        # If choosing OD, no interruptions in future:
-        if choice == ClusterType.ON_DEMAND:
-            return t_after_step + rem_after_step
-        # If choosing SPOT and assuming no preemptions, finishing time optimistic:
-        return t_after_step + rem_after_step
-
-    def _safe_to_use_spot_one_step(self, last_cluster_type: ClusterType, has_spot: bool) -> bool:
-        if not has_spot:
-            return False
-        # Ensure that even if SPOT disappears next step, switching to OD then still meets deadline.
-        t = self.env.elapsed_seconds
-        gap = self.env.gap_seconds
-        rem = self._remaining_work()
-        if rem <= 0:
-            return True
-        # Effective work if we pick SPOT now for one step:
-        overhead_now = self._overhead_if_choose(ClusterType.SPOT, last_cluster_type)
-        work_now = max(gap - overhead_now, 0.0)
-        work_now = min(work_now, rem)
-        rem_after = rem - work_now
-        t_after = t + gap
-        # Worst-case: next step we start OD (pay full overhead then) and finish the remaining work.
-        # Overhead is restart_overhead at that switch (regardless of remaining).
-        finish_time_worst = t_after + self.restart_overhead + rem_after
-        return finish_time_worst <= self.deadline + 1e-6
-
-    def _safe_to_wait_none_one_step(self) -> bool:
-        # Safe to pause this step if, even after waiting one gap and then switching to OD (with overhead), we can finish.
-        t = self.env.elapsed_seconds
-        gap = self.env.gap_seconds
-        rem = self._remaining_work()
-        if rem <= 0:
-            return True
-        finish_time_wait_then_od = t + gap + self.restart_overhead + rem
-        return finish_time_wait_then_od <= self.deadline + 1e-6
-
-    def _must_choose_od_now(self, last_cluster_type: ClusterType) -> bool:
-        # If starting OD at next step would violate deadline, we must start OD now.
-        t = self.env.elapsed_seconds
-        gap = self.env.gap_seconds
-        rem = self._remaining_work()
-        if rem <= 0:
-            return False
-        # If we delay OD by one step (do NONE or SPOT), then start OD next step:
-        finish_next_step_od = t + gap + self.restart_overhead + rem
-        return finish_next_step_od > self.deadline + 1e-6
+    def _choose_region_when_waiting(self):
+        # Simple round-robin to explore regions while waiting
+        try:
+            n = self.env.get_num_regions()
+        except Exception:
+            n = 1
+        if n <= 1:
+            return
+        cur = self.env.get_current_region()
+        next_idx = (cur + 1) % n
+        if next_idx != cur:
+            self.env.switch_region(next_idx)
 
     def _step(self, last_cluster_type: ClusterType, has_spot: bool) -> ClusterType:
-        # If we've already committed to OD, stick with it.
-        if self._commit_to_on_demand:
-            return ClusterType.ON_DEMAND
+        # Update EWMA spot availability for current region
+        try:
+            cur_region = self.env.get_current_region()
+            n_regions = self.env.get_num_regions()
+            if len(self._p_est) != n_regions:
+                # In case the environment changed number of regions unexpectedly
+                self._p_est = [0.5 for _ in range(n_regions)]
+            # EWMA update
+            p_old = self._p_est[cur_region]
+            self._p_est[cur_region] = p_old + self._ewma_alpha * ((1.0 if has_spot else 0.0) - p_old)
+        except Exception:
+            pass
 
-        # If task already completed, no need to run further.
-        if self._remaining_work() <= 0:
+        # Update cached sum of completed work
+        self._update_work_done_cache()
+
+        # Remaining work and time left
+        rem_work = max(0.0, float(self.task_duration) - self._work_done_cached)
+        time_left = float(self.deadline) - float(self.env.elapsed_seconds)
+        gap = float(self.env.gap_seconds)
+        overhead = float(self.restart_overhead)
+
+        # If task finished, do nothing
+        if rem_work <= 0.0:
             return ClusterType.NONE
 
-        # Decide action based on safety to meet deadline.
-        # Prefer Spot when safe; otherwise use OD. If Spot unavailable and safe to wait, pause.
+        # If already committed to on-demand, stick to it
+        if self._committed_od:
+            return ClusterType.ON_DEMAND
+
+        # If no time left or negative, still try ON_DEMAND
+        if time_left <= 0.0:
+            self._committed_od = True
+            return ClusterType.ON_DEMAND
+
+        # Compute safety margin relative to committing to OD now
+        safe_margin = self._safe_margin(time_left, rem_work, last_cluster_type)
+
+        # Define guard thresholds
+        # If we try one more SPOT step and it fails, we still want to be able to finish on OD.
+        guard_spot = gap + overhead  # conservative single-step guard
+        # For waiting (NONE) when spot is not available, allow at most one step of waiting slack
+        wait_guard = gap + overhead
+
+        # Decision logic
         if has_spot:
-            if self._safe_to_use_spot_one_step(last_cluster_type, has_spot):
-                # Use Spot; continue exploiting cheap capacity.
-                return ClusterType.SPOT
-            else:
-                # Not safe to use Spot; commit to OD to guarantee deadline.
-                self._commit_to_on_demand = True
+            # If margin is too thin, commit to OD to avoid risk near deadline
+            if safe_margin <= guard_spot:
+                self._committed_od = True
                 return ClusterType.ON_DEMAND
+            # Otherwise, use spot
+            self._wait_counter = 0
+            return ClusterType.SPOT
         else:
-            # Spot not available. If we must choose OD now to guarantee deadline, do so; else wait.
-            if self._must_choose_od_now(last_cluster_type) or not self._safe_to_wait_none_one_step():
-                self._commit_to_on_demand = True
-                return ClusterType.ON_DEMAND
-            else:
+            # Spot not available here: wait if we have slack, otherwise commit to OD
+            if safe_margin > wait_guard:
+                # We can safely wait and try other regions
+                self._wait_counter += 1
+                self._choose_region_when_waiting()
                 return ClusterType.NONE
+            else:
+                # Not enough slack to wait, commit to OD
+                self._committed_od = True
+                self._wait_counter = 0
+                return ClusterType.ON_DEMAND

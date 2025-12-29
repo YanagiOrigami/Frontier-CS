@@ -2,227 +2,263 @@ import os
 import tarfile
 import tempfile
 import subprocess
-import stat
-import random
 import shutil
+import stat
+import time
 
 
 class Solution:
     def solve(self, src_path: str) -> bytes:
-        root_dir = None
         try:
-            root_dir = tempfile.mkdtemp(prefix="pocgen_")
-            if not self._extract_tarball(src_path, root_dir):
-                return self._fallback_poc()
-            build_sh = self._find_build_sh(root_dir)
-            if build_sh is not None:
-                binary = self._build_and_find_binary(build_sh, root_dir)
-                if binary is not None:
-                    poc = self._fuzz_for_crash(binary)
-                    if poc is not None:
-                        return poc
-        finally:
-            if root_dir is not None and os.path.isdir(root_dir):
-                shutil.rmtree(root_dir, ignore_errors=True)
+            poc = self._generate_poc(src_path)
+            if poc:
+                return poc
+        except Exception:
+            pass
         return self._fallback_poc()
 
-    def _fallback_poc(self) -> bytes:
-        # 16-byte input with leading '-' and "infinity" to match bug description
-        return b"-infinity1234567"
+    def _generate_poc(self, src_path: str) -> bytes | None:
+        start_time = time.time()
+        time_budget = 20.0  # seconds for dynamic work
 
-    def _extract_tarball(self, src_path: str, dst_dir: str) -> bool:
+        tmpdir = tempfile.mkdtemp(prefix="pocgen_")
         try:
-            with tarfile.open(src_path, "r:*") as tf:
-                def is_within_directory(directory, target):
-                    abs_directory = os.path.abspath(directory)
-                    abs_target = os.path.abspath(target)
-                    prefix = os.path.commonprefix([abs_directory, abs_target])
-                    return prefix == abs_directory
+            # Extract the tarball
+            try:
+                with tarfile.open(src_path, "r:*") as tf:
+                    tf.extractall(tmpdir)
+            except Exception:
+                return None
 
-                for member in tf.getmembers():
-                    member_path = os.path.join(dst_dir, member.name)
-                    if not is_within_directory(dst_dir, member_path):
-                        continue
-                tf.extractall(dst_dir)
-            return True
-        except Exception:
-            return False
+            if time.time() - start_time > time_budget:
+                return None
 
-    def _find_build_sh(self, root_dir: str):
-        for dirpath, dirnames, filenames in os.walk(root_dir):
-            if "build.sh" in filenames:
-                return os.path.join(dirpath, "build.sh")
-        return None
+            out_dir = os.path.join(tmpdir, "out")
+            os.makedirs(out_dir, exist_ok=True)
 
-    def _build_and_find_binary(self, build_sh: str, root_dir: str):
-        cwd = os.path.dirname(build_sh)
-        try:
-            st = os.stat(build_sh)
-            os.chmod(build_sh, st.st_mode | stat.S_IXUSR)
-        except OSError:
-            pass
+            # Locate build.sh scripts
+            build_scripts = []
+            for root, dirs, files in os.walk(tmpdir):
+                if "build.sh" in files:
+                    build_scripts.append(os.path.join(root, "build.sh"))
 
-        shell_exe = "bash"
-        if shutil.which(shell_exe) is None:
-            shell_exe = "sh"
+            if not build_scripts:
+                return None
 
-        try:
-            subprocess.run(
-                [shell_exe, build_sh],
-                cwd=cwd,
-                env=os.environ.copy(),
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                timeout=60.0,
-                check=False,
-            )
-        except Exception:
+            env_base = os.environ.copy()
+            env_base.setdefault("OUT", out_dir)
+
+            built = False
+            for bs in build_scripts:
+                if time.time() - start_time > time_budget:
+                    return None
+                try:
+                    r = subprocess.run(
+                        ["bash", bs],
+                        cwd=os.path.dirname(bs),
+                        env=env_base,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                        timeout=60,
+                    )
+                except subprocess.TimeoutExpired:
+                    continue
+                except Exception:
+                    continue
+                if r.returncode == 0:
+                    built = True
+                    break
+
+            if not built:
+                return None
+
+            if time.time() - start_time > time_budget:
+                return None
+
+            binaries = self._find_binaries(out_dir)
+            if not binaries:
+                binaries = self._find_binaries(tmpdir)
+            if not binaries:
+                return None
+
+            payloads = self._candidate_payloads()
+            # Try only a few binaries to keep runtime manageable
+            max_binaries = 3
+            per_run_timeout = 0.1
+
+            for bin_path in binaries[:max_binaries]:
+                for payload in payloads:
+                    if time.time() - start_time > time_budget:
+                        return None
+                    if self._run_and_check(bin_path, payload, per_run_timeout):
+                        return payload
+
             return None
+        finally:
+            try:
+                shutil.rmtree(tmpdir)
+            except Exception:
+                pass
 
-        candidates = []
-        for dirpath, dirnames, filenames in os.walk(root_dir):
-            for name in filenames:
-                path = os.path.join(dirpath, name)
+    def _find_binaries(self, root: str) -> list:
+        bins = []
+        for dirpath, dirnames, filenames in os.walk(root):
+            for fname in filenames:
+                path = os.path.join(dirpath, fname)
                 try:
                     st = os.stat(path)
-                except OSError:
+                except Exception:
                     continue
                 if not stat.S_ISREG(st.st_mode):
                     continue
-                if not (st.st_mode & (stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)):
+                if not (st.st_mode & stat.S_IXUSR):
                     continue
-                lower_name = name.lower()
-                if lower_name.endswith((".sh", ".bash", ".py", ".pl", ".rb", ".js", ".php", ".lua")):
+                try:
+                    with open(path, "rb") as f:
+                        magic = f.read(4)
+                except Exception:
                     continue
-                if lower_name.endswith((".so", ".a", ".o", ".lo", ".la", ".dll")):
-                    continue
-                candidates.append((path, st))
+                if magic == b"\x7fELF":
+                    bins.append(path)
+        return bins
 
-        if not candidates:
-            return None
+    def _candidate_payloads(self) -> list[bytes]:
+        base_strings = [
+            "-inf",
+            "-Inf",
+            "-INF",
+            "-infinity",
+            "-Infinity",
+            "-INFINITY",
+            "-infi",
+            "-infa",
+            "-inf0",
+            "-inf1",
+            "-inf.",
+            "-inf..",
+            "-infinity0",
+            "-infinity1",
+            "-infinity.",
+            "-infinityx",
+            "-inn",
+            "-ni",
+            "-nan",
+            "-NaN",
+            "-foo",
+            "-bar",
+            "-1",
+            "-1.",
+            "-1e",
+            "-1e+",
+            "-1e309",
+            "--inf",
+            "+-inf",
+            "-+inf",
+            "- inf",
+        ]
+        extras = [
+            "",
+            "\n",
+            " ",
+            "0",
+            "00",
+            "0000",
+            "xxxx",
+            "1234",
+        ]
 
-        def rank(item):
-            path, st = item
-            name = os.path.basename(path).lower()
-            score = 0
-            if "fuzz" in name:
-                score += 4
-            if "poc" in name:
-                score += 3
-            if "test" in name or "target" in name:
-                score += 2
-            if "example" in name or "demo" in name or "main" in name:
-                score += 1
-            return (score, st.st_size)
+        payloads_set: set[bytes] = set()
+        for s in base_strings:
+            for e in extras:
+                p = (s + e).encode("ascii", "ignore")
+                if 1 <= len(p) <= 16:
+                    payloads_set.add(p)
 
-        candidates.sort(key=rank, reverse=True)
-        return candidates[0][0]
+        # Some explicit 16-byte candidates closely tied to minus/infinity theme
+        payloads_set.add(b"-infinity-000000")  # 16 bytes
+        payloads_set.add(b"-inf-1234567890")   # 16 bytes
+        payloads_set.add(b"-INF1234567890")    # 16 bytes
 
-    def _fuzz_for_crash(self, binary_path: str):
-        max_tests = 250
-        timeout = 0.08
-        tested = 0
-        visited = set()
+        payloads_list = sorted(payloads_set, key=lambda x: (len(x), x))
+        return payloads_list
 
-        def run_one(data: bytes) -> bool:
-            nonlocal tested
-            if data in visited:
-                return False
-            if tested >= max_tests:
-                return False
-            visited.add(data)
-            tested += 1
+    def _run_and_check(self, bin_path: str, payload: bytes, timeout: float) -> bool:
+        # First: try feeding via stdin
+        try:
+            r = subprocess.run(
+                [bin_path],
+                input=payload,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=timeout,
+            )
+            if self._is_crash(r):
+                return True
+        except subprocess.TimeoutExpired:
+            pass
+        except Exception:
+            return False
+
+        # Second: try via file argument
+        tmp_file = None
+        try:
+            fd, tmp_file = tempfile.mkstemp(prefix="pocinput_", suffix=".bin")
+            with os.fdopen(fd, "wb") as f:
+                f.write(payload)
             try:
-                proc = subprocess.run(
-                    [binary_path],
-                    input=data,
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
+                r = subprocess.run(
+                    [bin_path, tmp_file],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
                     timeout=timeout,
                 )
             except subprocess.TimeoutExpired:
                 return False
-            rc = proc.returncode
-            if rc < 0:
-                return True
+            except Exception:
+                return False
+            return self._is_crash(r)
+        finally:
+            if tmp_file is not None:
+                try:
+                    os.unlink(tmp_file)
+                except Exception:
+                    pass
+
+    def _is_crash(self, result: subprocess.CompletedProcess) -> bool:
+        rc = result.returncode
+        if rc is None:
             return False
+        # Crashed via signal
+        if rc < 0:
+            return True
 
-        bases = [
-            b"-inf",
-            b"-infi",
-            b"-infin",
-            b"-infinity",
-            b"-Infinity",
-            b"-INF",
-            b"-INFINITY",
-            b"-nan",
-            b"-NaN",
-            b"-1e309",
-            b"-1e1000",
-            b"-0",
-            b"-1",
-            b"-x",
-            b"-a",
-            b"-z",
-            b"-i",
-            b"-ii",
-            b"-iiiiiiii",
+        out = b""
+        try:
+            out = (result.stdout or b"") + (result.stderr or b"")
+        except Exception:
+            pass
+        text = ""
+        try:
+            text = out.decode("latin1", errors="ignore")
+        except Exception:
+            pass
+
+        crash_keywords = [
+            "AddressSanitizer",
+            "UndefinedBehaviorSanitizer",
+            "runtime error",
+            "stack-buffer-overflow",
+            "heap-buffer-overflow",
+            "stack smashing detected",
+            "==ERROR:",
+            "Sanitizer:",
+            "Segmentation fault",
         ]
-        tails = [b"", b"\n", b"0", b"1", b"f", b"n", b" "]
-        pad_chars = [b"A", b"0", b"f", b"n"]
-        target_lengths = [4, 8, 16, 24, 32, 48, 64]
+        for kw in crash_keywords:
+            if kw in text:
+                return True
+        return False
 
-        for base in bases:
-            for tail in tails:
-                s = base + tail
-                if 1 <= len(s) <= 64:
-                    if run_one(s):
-                        return s
-                for pad in pad_chars:
-                    for tlen in target_lengths:
-                        if len(s) < tlen:
-                            s2 = s + pad * (tlen - len(s))
-                            if run_one(s2):
-                                return s2
-
-        explicit_seeds = [
-            b"-infinity1234567",
-            b"-Infinity1234567",
-            b"-inf1234567890123",
-        ]
-        for s in explicit_seeds:
-            if run_one(s):
-                return s
-
-        if tested >= max_tests:
-            return None
-
-        remaining = max_tests - tested
-        alphabet = b"infINFaety0123456789+-.eE \n"
-        random.seed(0)
-
-        for _ in range(remaining):
-            length = random.randint(1, 64)
-            if length <= 0:
-                continue
-            if length == 1:
-                s = b"-"
-            else:
-                rest_len = length - 1
-                if random.random() < 0.7:
-                    base = random.choice([b"inf", b"INF", b"infinity", b"Infinity"])
-                    if rest_len <= len(base):
-                        s = b"-" + base[:rest_len]
-                    else:
-                        prefix_len = random.randint(0, rest_len - len(base))
-                        suffix_len = rest_len - len(base) - prefix_len
-                        prefix = bytes(random.choice(alphabet) for _ in range(prefix_len))
-                        suffix = bytes(random.choice(alphabet) for _ in range(suffix_len))
-                        s = b"-" + prefix + base + suffix
-                else:
-                    rest = bytes(random.choice(alphabet) for _ in range(rest_len))
-                    s = b"-" + rest
-            if run_one(s):
-                return s
-
-        return None
+    def _fallback_poc(self) -> bytes:
+        # 16-byte payload themed around the described bug (minus + infinity)
+        return b"-infinity-000000"

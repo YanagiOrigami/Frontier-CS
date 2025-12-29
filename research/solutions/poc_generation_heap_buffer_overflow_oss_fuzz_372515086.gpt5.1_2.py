@@ -1,512 +1,464 @@
 import os
 import tarfile
 import tempfile
-import subprocess
 import shutil
-import time
-import random
+import subprocess
 import struct
+import random
+import time
+import select
+
+
+FUZZED_DATA_PROVIDER_CODE = r'''
+#include <cstddef>
+#include <cstdint>
+#include <cstring>
+#include <vector>
+#include <string>
+
+namespace fuzzing {
+
+class FuzzedDataProvider {
+ public:
+  FuzzedDataProvider(const uint8_t *data, size_t size)
+      : data_(data), size_(size), offset_(0) {}
+
+  size_t remaining_bytes() const {
+    return size_ - offset_;
+  }
+
+  template <typename T>
+  T ConsumeIntegral() {
+    T result = 0;
+    size_t need = sizeof(T);
+    size_t rem = remaining_bytes();
+    if (need > rem) need = rem;
+    if (need > 0) {
+      std::memcpy(&result, data_ + offset_, need);
+      offset_ += need;
+    }
+    return result;
+  }
+
+  template <typename T>
+  T ConsumeIntegralInRange(T min, T max) {
+    if (min > max) {
+      T tmp = min;
+      min = max;
+      max = tmp;
+    }
+    unsigned long long range =
+        static_cast<unsigned long long>(max) -
+        static_cast<unsigned long long>(min);
+    unsigned long long range_plus_one = range + 1ULL;
+    T value = ConsumeIntegral<T>();
+    if (range_plus_one == 0) {
+      return static_cast<T>(min + value);
+    }
+    return static_cast<T>(
+        min + static_cast<T>(
+                  static_cast<unsigned long long>(value) %
+                  range_plus_one));
+  }
+
+  template <typename T>
+  T ConsumeFloatingPoint() {
+    T result = 0;
+    size_t need = sizeof(T);
+    size_t rem = remaining_bytes();
+    if (need > rem) need = rem;
+    if (need > 0) {
+      std::memcpy(&result, data_ + offset_, need);
+      offset_ += need;
+    }
+    return result;
+  }
+
+  bool ConsumeBool() {
+    return (ConsumeIntegral<uint8_t>() & 1) != 0;
+  }
+
+  template <typename T>
+  std::vector<T> ConsumeBytes(size_t count) {
+    size_t rem = remaining_bytes();
+    if (count > rem) count = rem;
+    std::vector<T> out(count);
+    if (count > 0) {
+      std::memcpy(out.data(), data_ + offset_, count);
+      offset_ += count;
+    }
+    return out;
+  }
+
+  template <typename T>
+  std::vector<T> ConsumeRemainingBytes() {
+    return ConsumeBytes<T>(remaining_bytes());
+  }
+
+  std::string ConsumeRandomLengthString(size_t max_length) {
+    size_t n = ConsumeIntegralInRange<size_t>(0, max_length);
+    std::vector<char> bytes = ConsumeBytes<char>(n);
+    return std::string(bytes.begin(), bytes.end());
+  }
+
+ private:
+  const uint8_t *data_;
+  size_t size_;
+  size_t offset_;
+};
+
+}  // namespace fuzzing
+
+using fuzzing::FuzzedDataProvider;
+
+'''
+
+HARNESS_MAIN_CODE = r'''
+#include <cstdint>
+#include <cstddef>
+#include <vector>
+#include <unistd.h>
+#include <cstdio>
+
+extern "C" int FuzzHarnessEntry(const uint8_t *data, size_t size);
+
+static bool read_n(int fd, void *buf, size_t n) {
+  uint8_t *p = reinterpret_cast<uint8_t *>(buf);
+  while (n > 0) {
+    ssize_t r = read(fd, p, n);
+    if (r <= 0) return false;
+    p += r;
+    n -= static_cast<size_t>(r);
+  }
+  return true;
+}
+
+static bool write_n(int fd, const void *buf, size_t n) {
+  const uint8_t *p = reinterpret_cast<const uint8_t *>(buf);
+  while (n > 0) {
+    ssize_t w = write(fd, p, n);
+    if (w <= 0) return false;
+    p += w;
+    n -= static_cast<size_t>(w);
+  }
+  return true;
+}
+
+int main() {
+  while (true) {
+    uint32_t sz = 0;
+    if (!read_n(0, &sz, sizeof(sz))) {
+      return 0;
+    }
+    if (sz == 0xFFFFFFFFu) {
+      return 0;
+    }
+    std::vector<uint8_t> data;
+    data.resize(sz);
+    if (!read_n(0, data.data(), sz)) {
+      return 0;
+    }
+    FuzzHarnessEntry(data.data(), data.size());
+    uint8_t ack = 0;
+    if (!write_n(1, &ack, 1)) {
+      return 0;
+    }
+    fflush(stdout);
+  }
+}
+
+'''
+
+
+def _find_compiler(candidates):
+    for c in candidates:
+        path = shutil.which(c)
+        if path:
+            return path
+    return None
+
+
+def _collect_include_dirs(src_root):
+    inc_dirs = {src_root}
+    for root, dirs, files in os.walk(src_root):
+        for f in files:
+            if f.endswith(('.h', '.hpp', '.hh')):
+                inc_dirs.add(root)
+                break
+    return sorted(inc_dirs)
+
+
+def _collect_c_files(src_root):
+    c_files = []
+    skip_dir_names = {
+        'test', 'tests', 'example', 'examples', 'doc', 'docs',
+        'benchmark', 'benchmarks', 'fuzz', 'oss-fuzz', 'cmake-build'
+    }
+    for root, dirs, files in os.walk(src_root):
+        parts = set(root.split(os.sep))
+        if parts & skip_dir_names:
+            continue
+        for f in files:
+            if not f.endswith('.c'):
+                continue
+            path = os.path.join(root, f)
+            try:
+                with open(path, 'r', errors='ignore') as fh:
+                    head = fh.read(4096)
+            except OSError:
+                continue
+            if 'LLVMFuzzerTestOneInput' in head:
+                continue
+            if ' main(' in head or '\nmain(' in head or 'int main(' in head or 'int\nmain(' in head:
+                continue
+            c_files.append(path)
+    return c_files
+
+
+def _find_harness_file(src_root):
+    target_substrings = ['polygonToCellsExperimental', 'experimentalPolygonToCells']
+    for root, dirs, files in os.walk(src_root):
+        for f in files:
+            if not f.endswith(('.cc', '.cpp', '.cxx', '.C')):
+                continue
+            path = os.path.join(root, f)
+            try:
+                with open(path, 'r', errors='ignore') as fh:
+                    txt = fh.read()
+            except OSError:
+                continue
+            if 'LLVMFuzzerTestOneInput' not in txt:
+                continue
+            if any(s in txt for s in target_substrings):
+                return path
+    return None
+
+
+def _build_harness(src_root, harness_path, build_dir):
+    os.makedirs(build_dir, exist_ok=True)
+    try:
+        with open(harness_path, 'r', encoding='latin-1', errors='ignore') as f:
+            original = f.read()
+    except OSError:
+        return None
+
+    # Remove FuzzedDataProvider include lines if present
+    body_lines = []
+    for line in original.splitlines():
+        if 'FuzzedDataProvider.h' in line:
+            continue
+        body_lines.append(line)
+    body = '\n'.join(body_lines)
+
+    # Rename LLVMFuzzerTestOneInput to FuzzHarnessEntry
+    if 'LLVMFuzzerTestOneInput' not in body:
+        return None
+    body = body.replace('LLVMFuzzerTestOneInput', 'FuzzHarnessEntry')
+
+    modified_code = FUZZED_DATA_PROVIDER_CODE + '\n' + body
+
+    harness_mod_path = os.path.join(build_dir, 'harness_mod.cpp')
+    try:
+        with open(harness_mod_path, 'w') as f:
+            f.write(modified_code)
+    except OSError:
+        return None
+
+    main_cpp_path = os.path.join(build_dir, 'harness_main.cpp')
+    try:
+        with open(main_cpp_path, 'w') as f:
+            f.write(HARNESS_MAIN_CODE)
+    except OSError:
+        return None
+
+    cc = _find_compiler(['clang', 'gcc', 'cc'])
+    cxx = _find_compiler(['clang++', 'g++', 'c++'])
+    if not cc or not cxx:
+        return None
+
+    inc_dirs = _collect_include_dirs(src_root)
+    c_files = _collect_c_files(src_root)
+    if not c_files:
+        return None
+
+    san_flags = ['-fsanitize=address']
+    common_cflags = ['-std=c99', '-O1', '-g', '-fno-omit-frame-pointer']
+    common_cxxflags = ['-std=c++14', '-O1', '-g', '-fno-omit-frame-pointer']
+
+    def compile_with_flags(use_san):
+        objs = []
+        cflags = common_cflags + (san_flags if use_san else [])
+        cxxflags = common_cxxflags + (san_flags if use_san else [])
+        inc_args = [f'-I{d}' for d in inc_dirs]
+
+        # Compile C files
+        for cfile in c_files:
+            rel = os.path.relpath(cfile, src_root).replace(os.sep, '_')
+            obj = os.path.join(build_dir, rel + '.o')
+            cmd = [cc] + cflags + inc_args + ['-c', cfile, '-o', obj]
+            try:
+                subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            except Exception:
+                return None
+            objs.append(obj)
+
+        # Compile modified harness
+        harness_obj = os.path.join(build_dir, 'harness_mod.o')
+        cmd = [cxx] + cxxflags + inc_args + ['-c', harness_mod_path, '-o', harness_obj]
+        try:
+            subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except Exception:
+            return None
+        objs.append(harness_obj)
+
+        # Compile main
+        main_obj = os.path.join(build_dir, 'harness_main.o')
+        cmd = [cxx] + cxxflags + ['-c', main_cpp_path, '-o', main_obj]
+        try:
+            subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except Exception:
+            return None
+        objs.append(main_obj)
+
+        # Link
+        bin_path = os.path.join(build_dir, 'poc_harness')
+        link_cmd = [cxx] + (san_flags if use_san else []) + ['-O1', '-g', '-fno-omit-frame-pointer', '-o', bin_path] + objs + ['-lm']
+        try:
+            subprocess.run(link_cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except Exception:
+            return None
+        return bin_path
+
+    # First try with ASAN, then without as fallback
+    bin_path = compile_with_flags(use_san=True)
+    if bin_path is None:
+        bin_path = compile_with_flags(use_san=False)
+    return bin_path
+
+
+def _fuzz_for_poc(bin_path, max_time=20.0, max_iters=100000, poc_size=1032):
+    rnd = random.Random(123456)
+    end_time = time.time() + max_time
+    proc = None
+
+    def start_proc():
+        return subprocess.Popen(
+            [bin_path],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+        )
+
+    def test_input(data):
+        nonlocal proc
+        if proc is None or proc.poll() is not None:
+            try:
+                proc = start_proc()
+            except Exception:
+                proc = None
+                return False
+        try:
+            proc.stdin.write(struct.pack('<I', len(data)))
+            proc.stdin.write(data)
+            proc.stdin.flush()
+        except Exception:
+            try:
+                if proc is not None:
+                    proc.kill()
+            except Exception:
+                pass
+            proc = None
+            return True  # treat as crash
+
+        try:
+            fd = proc.stdout.fileno()
+            rlist, _, _ = select.select([fd], [], [], 0.5)
+            if not rlist:
+                try:
+                    proc.kill()
+                    proc.wait(timeout=1)
+                except Exception:
+                    pass
+                proc = None
+                return True  # treat timeout as crash/hang
+            ack = proc.stdout.read(1)
+        except Exception:
+            try:
+                if proc is not None:
+                    proc.kill()
+            except Exception:
+                pass
+            proc = None
+            return True
+        if ack == b'':
+            proc = None
+            return True
+        return False
+
+    last = os.urandom(poc_size)
+    i = 0
+    while i < max_iters and time.time() < end_time:
+        i += 1
+        if i == 1:
+            data = last
+        else:
+            if rnd.random() < 0.3:
+                data = os.urandom(poc_size)
+            else:
+                ba = bytearray(last)
+                n_mut = 1 + rnd.randint(0, 7)
+                for _ in range(n_mut):
+                    pos = rnd.randrange(poc_size)
+                    if rnd.random() < 0.5:
+                        ba[pos] ^= 1 << rnd.randint(0, 7)
+                    else:
+                        ba[pos] = rnd.getrandbits(8)
+                data = bytes(ba)
+        crashed = test_input(data)
+        if crashed:
+            try:
+                if proc is not None:
+                    proc.stdin.write(struct.pack('<I', 0xFFFFFFFF))
+                    proc.stdin.flush()
+                    proc.terminate()
+            except Exception:
+                pass
+            return data
+        last = data
+
+    try:
+        if proc is not None:
+            proc.stdin.write(struct.pack('<I', 0xFFFFFFFF))
+            proc.stdin.flush()
+            proc.terminate()
+    except Exception:
+        pass
+    return last
 
 
 class Solution:
     def solve(self, src_path: str) -> bytes:
-        tmp_root = tempfile.mkdtemp(prefix="pocgen_")
+        base_dir = tempfile.mkdtemp(prefix='pocgen_')
         try:
-            # 1. Extract tarball
+            src_dir = os.path.join(base_dir, 'src')
+            os.makedirs(src_dir, exist_ok=True)
             try:
-                with tarfile.open(src_path, "r:*") as tf:
-                    tf.extractall(tmp_root)
+                with tarfile.open(src_path, 'r:*') as tar:
+                    tar.extractall(src_dir)
             except Exception:
+                # Fallback: return random bytes if extraction fails
                 return os.urandom(1032)
 
-            # 2. Determine project root (handle single top-level dir)
-            root_dir = tmp_root
-            try:
-                entries = [e for e in os.listdir(tmp_root) if not e.startswith(".")]
-                if len(entries) == 1:
-                    single = os.path.join(tmp_root, entries[0])
-                    if os.path.isdir(single):
-                        root_dir = single
-            except Exception:
-                pass
-
-            # 3. Try to find fuzz harness
-            harness_path = self._find_harness(root_dir)
-            if harness_path is None:
+            harness_path = _find_harness_file(src_dir)
+            if not harness_path:
                 return os.urandom(1032)
 
-            # 4. Check if harness uses FuzzedDataProvider
-            uses_fdp = False
-            try:
-                with open(harness_path, "r", errors="ignore") as f:
-                    code = f.read()
-                if "FuzzedDataProvider" in code:
-                    uses_fdp = True
-            except Exception:
-                pass
-
-            # 5. Optional: create stub FuzzedDataProvider header if needed
-            fdp_include_dir = None
-            if uses_fdp:
-                try:
-                    fdp_include_dir = self._create_fdp_stub(root_dir)
-                except Exception:
-                    # If stub creation fails, fall back to random PoC
-                    return os.urandom(1032)
-
-            # 6. Build instrumented binary with harness
-            try:
-                binary_path = self._build_instrumented_binary(
-                    root_dir, harness_path, uses_fdp, fdp_include_dir
-                )
-            except Exception:
-                binary_path = None
-
-            if not binary_path or not os.path.isfile(binary_path):
+            build_dir = os.path.join(base_dir, 'build')
+            bin_path = _build_harness(src_dir, harness_path, build_dir)
+            if not bin_path or not os.path.exists(bin_path):
                 return os.urandom(1032)
 
-            # 7. Run a small guided random search to find crashing input
-            try:
-                poc = self._search_for_crash(binary_path, approx_len=1032, time_budget=25.0)
-                if poc is not None:
-                    return poc
-            except Exception:
-                pass
-
-            # Fallback: random bytes of ground-truth length
-            return os.urandom(1032)
+            poc = _fuzz_for_poc(bin_path, max_time=20.0, max_iters=100000, poc_size=1032)
+            return poc
         finally:
-            # Best-effort cleanup; ignore errors
-            try:
-                shutil.rmtree(tmp_root)
-            except Exception:
-                pass
-
-    # ----------------------------------------
-    # Helper functions
-    # ----------------------------------------
-
-    def _find_harness(self, root_dir: str) -> str | None:
-        candidates_specific = []
-        candidates_any = []
-        for dirpath, _, filenames in os.walk(root_dir):
-            for fname in filenames:
-                if not fname.endswith((".c", ".cc", ".cpp", ".cxx")):
-                    continue
-                fpath = os.path.join(dirpath, fname)
-                try:
-                    with open(fpath, "r", errors="ignore") as f:
-                        text = f.read()
-                except Exception:
-                    continue
-                if "LLVMFuzzerTestOneInput" in text:
-                    if "polygonToCellsExperimental" in text or "polygonToCells" in text:
-                        candidates_specific.append(fpath)
-                    else:
-                        candidates_any.append(fpath)
-        if candidates_specific:
-            return candidates_specific[0]
-        if candidates_any:
-            return candidates_any[0]
-        return None
-
-    def _create_fdp_stub(self, root_dir: str) -> str:
-        """
-        Create a minimal but reasonably accurate implementation of
-        <fuzzer/FuzzedDataProvider.h>. Returns the include directory that
-        contains 'fuzzer/FuzzedDataProvider.h'.
-        """
-        include_root = os.path.join(root_dir, "_fdp_stub_include")
-        fuzzer_dir = os.path.join(include_root, "fuzzer")
-        os.makedirs(fuzzer_dir, exist_ok=True)
-        header_path = os.path.join(fuzzer_dir, "FuzzedDataProvider.h")
-
-        fdp_code = r"""
-#ifndef LLVM_FUZZER_FUZZED_DATA_PROVIDER_H_
-#define LLVM_FUZZER_FUZZED_DATA_PROVIDER_H_
-
-#include <algorithm>
-#include <cassert>
-#include <cstddef>
-#include <cstdint>
-#include <cstring>
-#include <limits>
-#include <string>
-#include <type_traits>
-#include <vector>
-#include <cmath>
-
-class FuzzedDataProvider {
-public:
-  FuzzedDataProvider(const uint8_t *data, size_t size)
-      : data_ptr_(data), remaining_bytes_(size) {}
-
-  size_t remaining_bytes() const { return remaining_bytes_; }
-
-  template <typename T>
-  typename std::enable_if<std::is_integral<T>::value, T>::type
-  ConsumeIntegral() {
-    T result = 0;
-    size_t bytes = std::min(sizeof(T), remaining_bytes_);
-    if (bytes) {
-      std::memcpy(&result, data_ptr_, bytes);
-      data_ptr_ += bytes;
-      remaining_bytes_ -= bytes;
-    }
-    return result;
-  }
-
-  template <typename T>
-  typename std::enable_if<std::is_integral<T>::value, T>::type
-  ConsumeIntegralInRange(T min, T max) {
-    assert(min <= max);
-    if (min == max)
-      return min;
-    T range = max - min;
-    T val = ConsumeIntegral<T>();
-    if (range == std::numeric_limits<T>::max()) {
-      return min + (val & range);
-    }
-    return static_cast<T>(min + (val % (range + 1)));
-  }
-
-  template <typename T>
-  typename std::enable_if<std::is_floating_point<T>::value, T>::type
-  ConsumeFloatingPoint() {
-    T result = 0;
-    size_t bytes = std::min(sizeof(T), remaining_bytes_);
-    if (bytes) {
-      std::memcpy(&result, data_ptr_, bytes);
-      data_ptr_ += bytes;
-      remaining_bytes_ -= bytes;
-    }
-    return result;
-  }
-
-  template <typename T>
-  typename std::enable_if<std::is_floating_point<T>::value, T>::type
-  ConsumeFloatingPointInRange(T min, T max) {
-    assert(min <= max);
-    if (min == max)
-      return min;
-    T val = ConsumeFloatingPoint<T>();
-    if (std::isnan(val) || std::isinf(val))
-      val = min;
-    T range = max - min;
-    T scaled = std::fmod(std::fabs(val), static_cast<T>(1.0));
-    return static_cast<T>(min + scaled * range);
-  }
-
-  std::string ConsumeBytesAsString(size_t num_bytes) {
-    num_bytes = std::min(num_bytes, remaining_bytes_);
-    std::string s(reinterpret_cast<const char *>(data_ptr_), num_bytes);
-    data_ptr_ += num_bytes;
-    remaining_bytes_ -= num_bytes;
-    return s;
-  }
-
-  std::string ConsumeRandomLengthString(size_t max_length) {
-    size_t len = ConsumeIntegralInRange<size_t>(0,
-        std::min(max_length, remaining_bytes_));
-    return ConsumeBytesAsString(len);
-  }
-
-  template <typename T>
-  std::vector<T> ConsumeBytes(size_t num_bytes) {
-    num_bytes = std::min(num_bytes, remaining_bytes_);
-    std::vector<T> v(num_bytes);
-    if (num_bytes) {
-      std::memcpy(v.data(), data_ptr_, num_bytes);
-      data_ptr_ += num_bytes;
-      remaining_bytes_ -= num_bytes;
-    }
-    return v;
-  }
-
-  void ConsumeBytes(uint8_t *dest, size_t num_bytes) {
-    num_bytes = std::min(num_bytes, remaining_bytes_);
-    if (num_bytes) {
-      std::memcpy(dest, data_ptr_, num_bytes);
-      data_ptr_ += num_bytes;
-      remaining_bytes_ -= num_bytes;
-    }
-  }
-
-  std::vector<uint8_t> ConsumeRemainingBytes() {
-    std::vector<uint8_t> v(data_ptr_, data_ptr_ + remaining_bytes_);
-    data_ptr_ += remaining_bytes_;
-    remaining_bytes_ = 0;
-    return v;
-  }
-
-  std::string ConsumeRemainingBytesAsString() {
-    std::string s(reinterpret_cast<const char *>(data_ptr_), remaining_bytes_);
-    data_ptr_ += remaining_bytes_;
-    remaining_bytes_ = 0;
-    return s;
-  }
-
-private:
-  const uint8_t *data_ptr_;
-  size_t remaining_bytes_;
-};
-
-#endif  // LLVM_FUZZER_FUZZED_DATA_PROVIDER_H_
-"""
-        with open(header_path, "w") as hf:
-            hf.write(fdp_code)
-        return include_root
-
-    def _build_instrumented_binary(
-        self, root_dir: str, harness_path: str, uses_fdp: bool, fdp_include_dir: str | None
-    ) -> str | None:
-        """
-        Build an AddressSanitizer-instrumented binary that:
-        - Links the project library sources
-        - Includes the fuzz harness with LLVMFuzzerTestOneInput
-        - Adds a main() that reads a file and calls LLVMFuzzerTestOneInput
-
-        Compilation is done via direct gcc/clang invocation over .c/.cpp files,
-        focusing primarily on H3's src/h3lib/lib if present.
-        """
-        cc = shutil.which("clang")
-        if not cc:
-            cc = shutil.which("gcc")
-        cxx = shutil.which("clang++")
-        if not cxx:
-            cxx = shutil.which("g++")
-        if not cc and not cxx:
-            return None
-        if not cc:
-            cc = cxx
-        if not cxx:
-            cxx = cc
-
-        harness_ext = os.path.splitext(harness_path)[1].lower()
-        harness_is_cpp = harness_ext in (".cc", ".cpp", ".cxx")
-
-        build_dir = os.path.join(root_dir, "_poc_build")
-        os.makedirs(build_dir, exist_ok=True)
-
-        # Create main() wrapper source
-        main_ext = ".cc" if harness_is_cpp else ".c"
-        main_src = os.path.join(build_dir, "poc_main" + main_ext)
-        main_code_c = r"""
-#include <stdint.h>
-#include <stdlib.h>
-#include <stdio.h>
-
-int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size);
-
-int main(int argc, char **argv) {
-    if (argc < 2) {
-        return 1;
-    }
-    const char *path = argv[1];
-    FILE *f = fopen(path, "rb");
-    if (!f) {
-        return 1;
-    }
-    if (fseek(f, 0, SEEK_END) != 0) {
-        fclose(f);
-        return 1;
-    }
-    long sz = ftell(f);
-    if (sz < 0) {
-        fclose(f);
-        return 1;
-    }
-    if (fseek(f, 0, SEEK_SET) != 0) {
-        fclose(f);
-        return 1;
-    }
-    if (sz == 0) {
-        fclose(f);
-        return 0;
-    }
-    uint8_t *data = (uint8_t *)malloc((size_t)sz);
-    if (!data) {
-        fclose(f);
-        return 1;
-    }
-    size_t r = fread(data, 1, (size_t)sz, f);
-    fclose(f);
-    if (r != (size_t)sz) {
-        free(data);
-        return 1;
-    }
-    LLVMFuzzerTestOneInput(data, (size_t)sz);
-    free(data);
-    return 0;
-}
-"""
-        main_code_cpp = main_code_c  # identical C/C++ main
-        with open(main_src, "w") as mf:
-            mf.write(main_code_cpp if harness_is_cpp else main_code_c)
-
-        # Determine source roots: prefer H3 layout if present
-        src_roots = []
-        h3_lib_root = os.path.join(root_dir, "src", "h3lib", "lib")
-        if os.path.isdir(h3_lib_root):
-            src_roots.append(h3_lib_root)
-        else:
-            src_roots.append(root_dir)
-
-        # Collect library source files
-        lib_c_files = []
-        lib_cpp_files = []
-        skip_dir_names = {"test", "tests", "testing", "benchmark", "benchmarks",
-                          "examples", "example", "docs", "doc", "fuzz", "fuzzers", "_poc_build"}
-        for src_root in src_roots:
-            for dirpath, dirnames, filenames in os.walk(src_root):
-                # Skip unwanted directories
-                parts = set(os.path.relpath(dirpath, root_dir).split(os.sep))
-                if parts & skip_dir_names:
-                    continue
-                for fname in filenames:
-                    full = os.path.join(dirpath, fname)
-                    if full == harness_path or full == main_src:
-                        continue
-                    ext = os.path.splitext(fname)[1].lower()
-                    if ext == ".c":
-                        lib_c_files.append(full)
-                    elif ext in (".cc", ".cpp", ".cxx"):
-                        lib_cpp_files.append(full)
-
-        # Include directories: all dirs that contain headers, plus optional FDP stub dir
-        include_dirs = set()
-        for dirpath, _, filenames in os.walk(root_dir):
-            if any(fn.endswith(".h") for fn in filenames):
-                rel = os.path.relpath(dirpath, root_dir)
-                # Avoid including build artifacts excessively
-                if "_poc_build" in rel:
-                    continue
-                include_dirs.add(dirpath)
-        if uses_fdp and fdp_include_dir:
-            include_dirs.add(fdp_include_dir)
-
-        include_flags = []
-        for d in include_dirs:
-            include_flags.extend(["-I", d])
-
-        # Compile all sources to .o
-        obj_files: list[str] = []
-        have_cpp = harness_is_cpp or bool(lib_cpp_files)
-
-        def compile_one(src: str, is_cpp: bool) -> str:
-            compiler = cxx if is_cpp else cc
-            if compiler is None:
-                raise RuntimeError("No suitable compiler found")
-            rel = os.path.relpath(src, root_dir)
-            obj_name = rel.replace(os.sep, "_") + ".o"
-            obj_path = os.path.join(build_dir, obj_name)
-            cmd = [compiler]
-            if is_cpp:
-                cmd += ["-std=c++11"]
-            else:
-                cmd += ["-std=c99"]
-            cmd += [
-                "-fsanitize=address",
-                "-g",
-                "-O1",
-            ]
-            cmd += include_flags
-            cmd += ["-c", src, "-o", obj_path]
-            try:
-                subprocess.run(cmd, cwd=root_dir, check=True,
-                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            except subprocess.CalledProcessError:
-                raise
-            obj_files.append(obj_path)
-            return obj_path
-
-        # Compile library sources
-        for src in lib_c_files:
-            compile_one(src, is_cpp=False)
-        for src in lib_cpp_files:
-            compile_one(src, is_cpp=True)
-
-        # Compile harness and main
-        compile_one(harness_path, is_cpp=harness_is_cpp)
-        compile_one(main_src, is_cpp=harness_is_cpp)
-
-        # Link all objects
-        linker = cxx if have_cpp else cc
-        binary_path = os.path.join(build_dir, "poc_driver")
-        link_cmd = [linker,
-                    "-fsanitize=address",
-                    "-g",
-                    "-O1"] + obj_files + ["-lm", "-o", binary_path]
-        subprocess.run(link_cmd, cwd=root_dir, check=True,
-                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        return binary_path
-
-    def _search_for_crash(self, binary_path: str, approx_len: int, time_budget: float) -> bytes | None:
-        """
-        Run the built binary repeatedly with randomized inputs to try to trigger
-        an ASan-detected crash (heap-buffer-overflow).
-        """
-        end_time = time.time() + max(1.0, time_budget)
-        random.seed(0xC0FFEE)
-        best_input = None
-
-        def gen_candidate() -> bytes:
-            r = random.random()
-            if r < 0.6:
-                length = approx_len
-            elif r < 0.85:
-                length = random.randint(max(1, approx_len // 2), approx_len * 2)
-            else:
-                length = random.randint(1, 4096)
-
-            # Bias first few bytes towards small integers and structured patterns
-            data = bytearray(os.urandom(length))
-            if length >= 4:
-                # possible resolution in [0, 15]
-                data[0] = random.randint(0, 15)
-                # maybe number of verts/holes
-                data[1] = random.randint(3, 64)
-                # sometimes large values
-                if random.random() < 0.3:
-                    data[2] = 0xFF
-                    data[3] = 0xFF
-            return bytes(data)
-
-        while time.time() < end_time:
-            candidate = gen_candidate()
-            # Write to temp file
-            with tempfile.NamedTemporaryFile(delete=False) as tf:
-                tf.write(candidate)
-                tmp_input_path = tf.name
-            try:
-                try:
-                    proc = subprocess.run(
-                        [binary_path, tmp_input_path],
-                        stdout=subprocess.PIPE,
-                        stderr=subprocess.PIPE,
-                        timeout=2.0,
-                    )
-                    crashed = proc.returncode != 0
-                except subprocess.TimeoutExpired:
-                    crashed = True
-                    proc = None
-                if crashed:
-                    stderr = b""
-                    if proc is not None:
-                        stderr = proc.stderr or b""
-                    # Prefer ASan / heap-buffer-overflow crashes
-                    if (b"heap-buffer-overflow" in stderr or
-                            b"AddressSanitizer" in stderr or
-                            b"polygonToCellsExperimental" in stderr or
-                            b"maxPolygonToCellsSizeExperimental" in stderr):
-                        return candidate
-                    # Store first generic crash as fallback
-                    if best_input is None:
-                        best_input = candidate
-            finally:
-                try:
-                    os.unlink(tmp_input_path)
-                except Exception:
-                    pass
-
-        return best_input
+            shutil.rmtree(base_dir, ignore_errors=True)

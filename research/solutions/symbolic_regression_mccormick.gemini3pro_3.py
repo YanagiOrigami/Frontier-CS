@@ -1,7 +1,8 @@
 import numpy as np
-import pandas as pd
 import sympy
 from pysr import PySRRegressor
+import tempfile
+import os
 
 class Solution:
     def __init__(self, **kwargs):
@@ -9,63 +10,58 @@ class Solution:
 
     def solve(self, X: np.ndarray, y: np.ndarray) -> dict:
         """
-        Solves the Symbolic Regression problem for the McCormick dataset.
+        Solves the symbolic regression problem using PySR.
+        Targeting the McCormick function structure.
         """
-        variable_names = ["x1", "x2"]
-        
-        # Subsample dataset if too large to ensure efficient processing
-        n_samples = X.shape[0]
-        if n_samples > 2000:
-            rng = np.random.RandomState(42)
-            indices = rng.choice(n_samples, 2000, replace=False)
-            X_train = X[indices]
-            y_train = y[indices]
-        else:
-            X_train = X
-            y_train = y
-
-        # Configure PySRRegressor
-        # The McCormick function is f(x1, x2) = sin(x1 + x2) + (x1 - x2)^2 - 1.5*x1 + 2.5*x2 + 1
-        # We enable specific operators to find this form efficiently.
-        model = PySRRegressor(
-            niterations=60,
-            binary_operators=["+", "-", "*", "^"],
-            unary_operators=["sin", "cos"],
-            populations=20,
-            population_size=40,
-            maxsize=45,
-            verbosity=0,
-            progress=False,
-            random_state=42,
-            multiprocessing=True,
-            temp_equation_file=True,
-            delete_tempfiles=True,
-            timeout_in_seconds=500
-        )
-
-        # Fit the model
-        model.fit(X_train, y_train, variable_names=variable_names)
-
-        # Select the best equation based on lowest loss (MSE)
-        if hasattr(model, 'equations_') and model.equations_ is not None and not model.equations_.empty:
-            # Identify the index of the equation with the minimum loss
-            best_idx = model.equations_['loss'].idxmin()
+        # Create a temporary directory to store PySR's intermediate files
+        with tempfile.TemporaryDirectory() as tmpdir:
+            equation_file = os.path.join(tmpdir, "hall_of_fame.csv")
             
-            # Retrieve the sympy expression object
-            best_expr_sympy = model.equations_.loc[best_idx, 'sympy_format']
+            # Initialize PySRRegressor with parameters optimized for the environment and problem
+            # Using 8 processes to match the 8 vCPUs
+            # Restricting operators to those likely needed for McCormick (Trig + Poly)
+            model = PySRRegressor(
+                niterations=40,
+                binary_operators=["+", "-", "*"],
+                unary_operators=["sin", "cos"],
+                populations=16,
+                population_size=40,
+                maxsize=45,
+                verbosity=0,
+                progress=False,
+                random_state=42,
+                tempdir=tmpdir,
+                equation_file=equation_file,
+                procs=8,
+                model_selection="best",
+            )
             
-            # Convert to string (PySR/SymPy outputs standard Python operators like **)
-            expression = str(best_expr_sympy)
+            # Subsample training data if dataset is large to ensure completion within time limits
+            n_samples = X.shape[0]
+            if n_samples > 2000:
+                rng = np.random.RandomState(42)
+                indices = rng.choice(n_samples, 2000, replace=False)
+                X_train = X[indices]
+                y_train = y[indices]
+            else:
+                X_train = X
+                y_train = y
             
-            # Compute predictions on the full dataset using the selected equation
-            predictions = model.predict(X, index=best_idx)
-        else:
-            # Fallback linear baseline if symbolic regression fails
-            expression = "0.0"
-            predictions = np.zeros(n_samples)
-
-        return {
-            "expression": expression,
-            "predictions": predictions.tolist(),
-            "details": {}
-        }
+            # Fit the symbolic regression model
+            # Ensure variable names match the required output format
+            model.fit(X_train, y_train, variable_names=["x1", "x2"])
+            
+            # Retrieve the best expression found as a sympy object
+            best_expr = model.sympy()
+            
+            # Convert sympy expression to a Python-evaluable string
+            expression = str(best_expr)
+            
+            # Generate predictions for the full dataset using the fitted model
+            predictions = model.predict(X)
+            
+            return {
+                "expression": expression,
+                "predictions": predictions.tolist(),
+                "details": {}
+            }

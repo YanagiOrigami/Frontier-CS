@@ -1,4 +1,5 @@
 import pandas as pd
+from joblib import Parallel, delayed
 
 class Solution:
     def solve(
@@ -28,88 +29,97 @@ class Solution:
         Returns:
             DataFrame with reordered columns (same rows, different column order)
         """
+        if df.empty:
+            return df
+
+        # 1. Handle col_merge
         if col_merge:
-            current_df = df.copy()
-            for merge_group in col_merge:
-                if len(merge_group) > 1 and all(c in current_df.columns for c in merge_group):
-                    new_col_name = "_".join(merge_group)
-                    
-                    i = 0
-                    base_name = new_col_name
-                    while new_col_name in current_df.columns:
-                        i += 1
-                        new_col_name = f"{base_name}_{i}"
-
-                    current_df[new_col_name] = current_df[merge_group[0]].astype(str)
-                    for i in range(1, len(merge_group)):
-                        current_df[new_col_name] += current_df[merge_group[i]].astype(str)
-                    current_df = current_df.drop(columns=merge_group)
-            df = current_df
-
-        if df.shape[1] <= 1:
-            return df
-
-        df_str = df.astype(str)
-        num_rows = len(df_str)
-
-        if num_rows == 0:
-            return df
-
-        cardinalities = {col: df_str[col].nunique() for col in df_str.columns}
-        
-        high_card_cols = set()
-        low_card_cols = []
-        
-        # Sort for deterministic behavior
-        for col in sorted(df_str.columns):
-            if num_rows > 0 and cardinalities[col] / num_rows > distinct_value_threshold:
-                high_card_cols.add(col)
-            else:
-                low_card_cols.append(col)
-        
-        low_card_cols.sort(key=lambda c: (cardinalities[c], c))
-
-        perm_optimized = []
-        candidates = list(low_card_cols)
-        groups = None
-        
-        k_limit = min(col_stop, len(candidates))
-
-        for i in range(k_limit):
-            best_next_col = None
-            max_score = -1.0
-
-            for next_col in candidates:
-                current_score = 0.0
-                if groups is None:
-                    counts = df_str[next_col].value_counts()
-                    current_score = (counts**2).sum()
-                else:
-                    for group_indices in groups.values():
-                        # This operation is the core of the greedy selection
-                        counts = df_str.iloc[group_indices][next_col].value_counts()
-                        current_score += (counts**2).sum()
-
-                if current_score > max_score:
-                    max_score = current_score
-                    best_next_col = next_col
+            merged_df_cols = {}
+            merged_cols_set = set()
+            for group in col_merge:
+                if not group: continue
+                merged_cols_set.update(group)
+                new_col_name = '_'.join(map(str, group))
+                merged_df_cols[new_col_name] = df[group].astype(str).agg(''.join, axis=1)
             
-            if best_next_col is not None:
-                perm_optimized.append(best_next_col)
-                candidates.remove(best_next_col)
-                
-                if i < k_limit - 1:
-                    if len(perm_optimized) == 1:
-                        groups = df_str.groupby(perm_optimized[0]).indices
-                    else:
-                        groups = df_str.groupby(perm_optimized).indices
-            else:
-                break
+            df_processed = pd.DataFrame(merged_df_cols, index=df.index)
 
-        remaining_low_card_cols = candidates
+            # Add non-merged columns
+            for col in df.columns:
+                if col not in merged_cols_set:
+                    df_processed[col] = df[col]
+        else:
+            df_processed = df.copy()
+
+        # 2. Convert all to string for internal processing
+        df_str = df_processed.astype(str)
+
+        all_cols = df_str.columns.tolist()
+        if len(all_cols) <= 1:
+            return df_processed
+
+        # 3. Separate high-cardinality columns
+        num_rows = len(df_str)
+        threshold = distinct_value_threshold * num_rows
         
-        sorted_high_card_cols = sorted(list(high_card_cols), key=lambda c: (cardinalities[c], c))
+        n_distincts = df_str.nunique().to_dict()
+
+        high_card_cols = []
+        low_card_cols = []
+
+        for c in all_cols:
+            if n_distincts.get(c, num_rows) > threshold and n_distincts.get(c, num_rows) > 1:
+                high_card_cols.append(c)
+            else:
+                low_card_cols.append(c)
         
-        final_perm = perm_optimized + remaining_low_card_cols + sorted_high_card_cols
+        high_card_cols.sort(key=lambda c: n_distincts.get(c, num_rows))
         
-        return df[final_perm]
+        # 4. Greedy search on low-cardinality columns
+        P = []
+        U = low_card_cols
+        
+        if not U: # All columns are high cardinality
+            P.extend(high_card_cols)
+            return df_processed[P]
+
+        # 4.1. Choose p_1 based on fewest distinct values
+        low_card_n_distincts = {c: n_distincts.get(c, num_rows) for c in U}
+        p_1 = min(U, key=lambda c: low_card_n_distincts[c])
+        P.append(p_1)
+        U.remove(p_1)
+
+        # 4.2. Greedy search for p_2 ... p_col_stop
+        M_low = len(low_card_cols)
+        
+        def calculate_score(c, current_P, df_to_use):
+            return c, df_to_use[current_P + [c]].drop_duplicates().shape[0]
+
+        search_depth = min(col_stop, M_low)
+
+        for k in range(2, search_depth + 1):
+            if not U:
+                break
+            
+            if parallel and len(U) > 1:
+                n_jobs = -1 
+                results = Parallel(n_jobs=n_jobs, prefer="threads")(
+                    delayed(calculate_score)(c, P, df_str) for c in U
+                )
+                scores = dict(results)
+            else:
+                scores = {c: calculate_score(c, P, df_str)[1] for c in U}
+
+            p_k = min(scores, key=scores.get)
+            P.append(p_k)
+            U.remove(p_k)
+
+        # 4.3. Sort the rest of low-cardinality columns by their global nunique
+        if U:
+            U.sort(key=lambda c: low_card_n_distincts[c])
+            P.extend(U)
+            
+        # 5. Append high-cardinality columns at the end
+        P.extend(high_card_cols)
+        
+        return df_processed[P]

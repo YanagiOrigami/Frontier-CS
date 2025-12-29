@@ -3,114 +3,105 @@ import triton
 import triton.language as tl
 import math
 
+class Solution:
+    def solve(self, spec_path: str = None) -> dict:
+        code = r'''
+import torch
+import triton
+import triton.language as tl
+import math
+
 @triton.jit
-def _ragged_attn_kernel(
-    Q, K, V, row_lens, O,
-    scale, D, Dv, M,
-    BLOCK_DV: tl.constexpr,
-    BLOCK_K: tl.constexpr
+def kernel(
+    Q_PTR, K_PTR, V_PTR, ROW_LENS_PTR, O_PTR,
+    M: tl.int32,
+    N: tl.int32,
+    D: tl.int32,
+    Dv: tl.int32,
+    scale: tl.float32,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
 ):
-    i = tl.program_id(0)
-    if i >= M:
-        return
+    pid = tl.program_id(0)
+    block_start = pid * BLOCK_M
+    offsets = block_start + tl.arange(0, BLOCK_M)
+    mask = offsets < M
 
-    l_i = tl.load(row_lens + i)
+    # Load Q block
+    q_offsets = offsets[:, None] * D + tl.arange(0, D)[None, :]
+    Q_block = tl.load(Q_PTR + q_offsets, dtype=tl.float16, mask=mask[:, None], other=0.0).to(tl.float32)
 
-    local_idx = tl.arange(0, BLOCK_DV)
+    # Load row_lens
+    rl_offsets = offsets
+    row_lens_block = tl.load(ROW_LENS_PTR + rl_offsets, dtype=tl.int32, mask=mask, other=0)
 
-    # Load Q_i
-    q_base = Q + i * D
-    q_ptrs = q_base + local_idx
-    q_mask = local_idx < D
-    q = tl.load(q_ptrs, mask=q_mask, other=0.0).to(tl.float32)
+    # Initialize online softmax stats
+    m = tl.full((BLOCK_M,), -float("inf"), dtype=tl.float32)
+    l = tl.zeros((BLOCK_M,), dtype=tl.float32)
+    o = tl.zeros((BLOCK_M, Dv), dtype=tl.float32)
 
-    # Initialize streaming softmax
-    m = -float('inf')
-    l = 0.0
-    o_local = 0.0
+    # Loop over key tiles
+    for start_n in range(0, N, BLOCK_N):
+        end_n = tl.minimum(N, start_n + BLOCK_N)
+        offsets_n = tl.arange(0, end_n - start_n)
+        block_n = end_n - start_n
 
-    j = 0
-    N = K.shape[0]  # Assuming K.shape accessible, but pass N if needed; here assume
+        # Load K tile
+        k_offsets = (start_n + offsets_n)[:, None] * D + tl.arange(0, D)[None, :]
+        K_tile = tl.load(K_PTR + k_offsets, dtype=tl.float16, other=0.0).to(tl.float32)
 
-    # Full blocks
-    while j + BLOCK_K <= l_i:
-        for jj in range(0, BLOCK_K):
-            j_this = j + jj
-            # Load K row
-            k_base = K + j_this * D
-            k_ptrs = k_base + local_idx
-            k = tl.load(k_ptrs, mask=local_idx < D, other=0.0).to(tl.float32)
-            partial = q * k
-            score = tl.sum(partial) * scale
+        # Load V tile
+        v_offsets = (start_n + offsets_n)[:, None] * Dv + tl.arange(0, Dv)[None, :]
+        V_tile = tl.load(V_PTR + v_offsets, dtype=tl.float16, other=0.0).to(tl.float32)
 
-            # Load V row
-            v_base = V + j_this * Dv
-            v_ptrs = v_base + local_idx
-            v = tl.load(v_ptrs, mask=local_idx < Dv, other=0.0).to(tl.float32)
+        # Compute attention scores
+        scores = tl.sum(Q_block[:, None, :] * K_tile[None, :, :], axis=2) * scale
 
-            # Streaming update
-            m_new = tl.maximum(m, score)
-            exp_old = tl.exp(m - m_new)
-            exp_score = tl.exp(score - m_new)
-            l_new = l * exp_old + exp_score
-            o_local = o_local * exp_old + exp_score * v
-            m = m_new
-            l = l_new
-        j += BLOCK_K
+        # Apply masking
+        j_offsets = start_n + offsets_n
+        mask_j = j_offsets[None, :] >= row_lens_block[:, None]
+        scores = tl.where(mask_j, -10000.0, scores)
 
-    # Remaining
-    if j < l_i:
-        bk = l_i - j
-        for jj in range(0, bk):
-            j_this = j + jj
-            # Load K row
-            k_base = K + j_this * D
-            k_ptrs = k_base + local_idx
-            k = tl.load(k_ptrs, mask=local_idx < D, other=0.0).to(tl.float32)
-            partial = q * k
-            score = tl.sum(partial) * scale
+        # Online softmax update
+        m_tile = tl.max(scores, axis=1)
+        m_new = tl.maximum(m, m_tile)
+        alpha = tl.exp(m - m_new)
+        p = tl.exp(scores - m_new[:, None])
+        l_new = alpha * l + tl.sum(p, axis=1)
 
-            # Load V row
-            v_base = V + j_this * Dv
-            v_ptrs = v_base + local_idx
-            v = tl.load(v_ptrs, mask=local_idx < Dv, other=0.0).to(tl.float32)
+        # Compute partial output
+        partial_o = tl.sum(p[:, :, None] * V_tile[None, :, :], axis=1)
 
-            # Streaming update
-            m_new = tl.maximum(m, score)
-            exp_old = tl.exp(m - m_new)
-            exp_score = tl.exp(score - m_new)
-            l_new = l * exp_old + exp_score
-            o_local = o_local * exp_old + exp_score * v
-            m = m_new
-            l = l_new
+        # Update output accumulator
+        o_scale = l * alpha
+        o = (o * o_scale[:, None] + partial_o) / l_new[:, None]
 
-    # Finalize
-    o_final = tl.where(l == 0.0, 0.0, o_local / l)
-    # Store
-    o_base = O + i * Dv
-    o_ptrs = o_base + local_idx
-    tl.store(o_ptrs, o_final.to(tl.float16), mask=local_idx < Dv)
+        # Update stats
+        l = l_new
+        m = m_new
+
+    # Store output
+    o_offsets = offsets[:, None] * Dv + tl.arange(0, Dv)[None, :]
+    tl.store(O_PTR + o_offsets, o.to(tl.float16), mask=mask[:, None])
+
 
 def ragged_attn(Q: torch.Tensor, K: torch.Tensor, V: torch.Tensor, row_lens: torch.Tensor) -> torch.Tensor:
-    assert Q.is_cuda and K.is_cuda and V.is_cuda and row_lens.is_cuda
     M, D = Q.shape
     N, _ = K.shape
     _, Dv = V.shape
-    scale = 1 / math.sqrt(D)
-    O = torch.empty((M, Dv), dtype=torch.float16, device=Q.device)
-
-    BLOCK_DV = 64
-    BLOCK_K = 64
-
-    grid = (M,)
-    _ragged_attn_kernel[grid](
+    scale = 1.0 / math.sqrt(D)
+    O = torch.empty((M, Dv), dtype=Q.dtype, device=Q.device)
+    BLOCK_M = 64
+    BLOCK_N = 64
+    grid = (triton.cdiv(M, BLOCK_M),)
+    row_lens = row_lens.to(torch.int32)
+    kernel[grid](
         Q, K, V, row_lens, O,
-        scale, D, Dv, M,
-        BLOCK_DV=BLOCK_DV,
-        BLOCK_K=BLOCK_K
+        M, N, D, Dv,
+        scale,
+        BLOCK_M=BLOCK_M,
+        BLOCK_N=BLOCK_N,
     )
     return O
-
-class Solution:
-    def solve(self, spec_path: str = None) -> dict:
-        return {"code": "Implemented in the module above; use ragged_attn directly."}
+'''
+        return {"code": code}

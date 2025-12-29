@@ -1,114 +1,172 @@
-import textwrap
-
-KERNEL_CODE = textwrap.dedent(r'''
+import os
 import math
+import inspect
+import sys
+from typing import Optional, Dict
+
 import torch
-import triton
-import triton.language as tl
+
+try:
+    import triton
+    import triton.language as tl
+except Exception:  # pragma: no cover
+    triton = None
+    tl = None
 
 
-@triton.autotune(
-    configs=[
-        triton.Config({"BLOCK_M": 128, "BLOCK_N": 64}, num_warps=4, num_stages=3),
-        triton.Config({"BLOCK_M": 64, "BLOCK_N": 64}, num_warps=4, num_stages=4),
-        triton.Config({"BLOCK_M": 128, "BLOCK_N": 32}, num_warps=4, num_stages=4),
-        triton.Config({"BLOCK_M": 128, "BLOCK_N": 64}, num_warps=8, num_stages=3),
-    ],
-    key=["M_CTX", "N_CTX"],
-)
-@triton.jit
-def _gdpa_fwd_kernel(
-    Q_ptr, K_ptr, V_ptr, GQ_ptr, GK_ptr, O_ptr,
-    stride_qb: tl.constexpr, stride_qm: tl.constexpr, stride_qd: tl.constexpr,
-    stride_kb: tl.constexpr, stride_kn: tl.constexpr, stride_kd: tl.constexpr,
-    stride_vb: tl.constexpr, stride_vn: tl.constexpr, stride_vd: tl.constexpr,
-    stride_ob: tl.constexpr, stride_om: tl.constexpr, stride_od: tl.constexpr,
-    sm_scale,
-    M_CTX: tl.constexpr, N_CTX: tl.constexpr,
-    D_HEAD: tl.constexpr, D_VALUE: tl.constexpr,
-    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
-):
-    tl.multiple_of(stride_qm, 16)
-    tl.multiple_of(stride_kn, 16)
-    tl.multiple_of(stride_vn, 16)
-    tl.multiple_of(stride_om, 16)
+if triton is not None:
 
-    pid_m = tl.program_id(0)
-    pid_bh = tl.program_id(1)
+    @triton.autotune(
+        configs=[
+            triton.Config({"BM": 64, "BN": 64}, num_warps=4, num_stages=4),
+            triton.Config({"BM": 128, "BN": 64}, num_warps=8, num_stages=3),
+            triton.Config({"BM": 64, "BN": 128}, num_warps=8, num_stages=3),
+            triton.Config({"BM": 128, "BN": 128}, num_warps=8, num_stages=2),
+        ],
+        key=["N_CTX"],
+    )
+    @triton.jit
+    def _gdpa_attn_fwd(
+        Q_ptr,
+        K_ptr,
+        V_ptr,
+        GQ_ptr,
+        GK_ptr,
+        O_ptr,
+        stride_qh: tl.constexpr,
+        stride_qm: tl.constexpr,
+        stride_qk: tl.constexpr,
+        stride_kh: tl.constexpr,
+        stride_kn: tl.constexpr,
+        stride_kk: tl.constexpr,
+        stride_vh: tl.constexpr,
+        stride_vn: tl.constexpr,
+        stride_vk: tl.constexpr,
+        stride_oh: tl.constexpr,
+        stride_om: tl.constexpr,
+        stride_ok: tl.constexpr,
+        M_CTX: tl.constexpr,
+        N_CTX: tl.constexpr,
+        D: tl.constexpr,
+        DV: tl.constexpr,
+        SM_SCALE: tl.constexpr,
+        BM: tl.constexpr,
+        BN: tl.constexpr,
+    ):
+        pid_m = tl.program_id(0)
+        pid_b = tl.program_id(1)
 
-    start_m = pid_m * BLOCK_M
-    offs_m = start_m + tl.arange(0, BLOCK_M)
-    mask_m = offs_m < M_CTX
+        start_m = pid_m * BM
+        offs_m = start_m + tl.arange(0, BM)
+        offs_d = tl.arange(0, D)
+        offs_dv = tl.arange(0, DV)
 
-    offs_d = tl.arange(0, D_HEAD)
-    q_ptrs = Q_ptr + pid_bh * stride_qb + offs_m[:, None] * stride_qm + offs_d[None, :] * stride_qd
-    gq_ptrs = GQ_ptr + pid_bh * stride_qb + offs_m[:, None] * stride_qm + offs_d[None, :] * stride_qd
+        q_base = Q_ptr + pid_b * stride_qh
+        k_base = K_ptr + pid_b * stride_kh
+        v_base = V_ptr + pid_b * stride_vh
+        gq_base = GQ_ptr + pid_b * stride_qh
+        gk_base = GK_ptr + pid_b * stride_kh
+        o_base = O_ptr + pid_b * stride_oh
 
-    q = tl.load(q_ptrs, mask=mask_m[:, None], other=0.0).to(tl.float32)
-    gq = tl.load(gq_ptrs, mask=mask_m[:, None], other=0.0).to(tl.float32)
-    q = q * tl.sigmoid(gq)
-    q = q * sm_scale
-    q = q.to(tl.float16)
+        q = tl.load(
+            q_base + offs_m[:, None] * stride_qm + offs_d[None, :] * stride_qk,
+            mask=(offs_m[:, None] < M_CTX),
+            other=0.0,
+        ).to(tl.float32)
+        gq = tl.load(
+            gq_base + offs_m[:, None] * stride_qm + offs_d[None, :] * stride_qk,
+            mask=(offs_m[:, None] < M_CTX),
+            other=0.0,
+        ).to(tl.float32)
+        q = (q * tl.sigmoid(gq)).to(tl.float16)
 
-    offs_dv = tl.arange(0, D_VALUE)
+        m_i = tl.full([BM], float("-inf"), tl.float32)
+        l_i = tl.zeros([BM], tl.float32)
+        acc = tl.zeros([BM, DV], tl.float32)
 
-    m_i = tl.where(mask_m, -float("inf"), 0.0).to(tl.float32)
-    l_i = tl.where(mask_m, 0.0, 1.0).to(tl.float32)
-    acc = tl.zeros((BLOCK_M, D_VALUE), dtype=tl.float32)
+        for start_n in tl.static_range(0, N_CTX, BN):
+            offs_n = start_n + tl.arange(0, BN)
+            mask_n = offs_n < N_CTX
 
-    log2e = 1.4426950408889634
+            k = tl.load(
+                k_base + offs_n[None, :] * stride_kn + offs_d[:, None] * stride_kk,
+                mask=(mask_n[None, :]),
+                other=0.0,
+            ).to(tl.float32)
+            gk = tl.load(
+                gk_base + offs_n[None, :] * stride_kn + offs_d[:, None] * stride_kk,
+                mask=(mask_n[None, :]),
+                other=0.0,
+            ).to(tl.float32)
+            k = (k * tl.sigmoid(gk)).to(tl.float16)
 
-    for start_n in tl.static_range(0, N_CTX, BLOCK_N):
-        offs_n = start_n + tl.arange(0, BLOCK_N)
-        mask_n = offs_n < N_CTX
+            scores = tl.dot(q, k) * SM_SCALE
+            scores = tl.where(mask_n[None, :], scores, float("-inf"))
 
-        k_ptrs = K_ptr + pid_bh * stride_kb + offs_n[:, None] * stride_kn + offs_d[None, :] * stride_kd
-        gk_ptrs = GK_ptr + pid_bh * stride_kb + offs_n[:, None] * stride_kn + offs_d[None, :] * stride_kd
+            m_ij = tl.maximum(m_i, tl.max(scores, axis=1))
+            alpha = tl.exp(m_i - m_ij)
 
-        k = tl.load(k_ptrs, mask=mask_n[:, None], other=0.0).to(tl.float32)
-        gk = tl.load(gk_ptrs, mask=mask_n[:, None], other=0.0).to(tl.float32)
-        k = k * tl.sigmoid(gk)
-        k = k.to(tl.float16)
+            p = tl.exp(scores - m_ij[:, None]).to(tl.float16)
 
-        v_ptrs = V_ptr + pid_bh * stride_vb + offs_n[:, None] * stride_vn + offs_dv[None, :] * stride_vd
-        v = tl.load(v_ptrs, mask=mask_n[:, None], other=0.0).to(tl.float16)
+            l_i = l_i * alpha + tl.sum(p.to(tl.float32), axis=1)
 
-        scores = tl.dot(q, tl.trans(k))
-        mask_mn = mask_m[:, None] & mask_n[None, :]
-        scores = tl.where(mask_mn, scores, -float("inf"))
+            v = tl.load(
+                v_base + offs_n[:, None] * stride_vn + offs_dv[None, :] * stride_vk,
+                mask=(mask_n[:, None]),
+                other=0.0,
+            ).to(tl.float16)
 
-        m_ij = tl.max(scores, axis=1)
-        m_ij = tl.where(mask_m, m_ij, 0.0)
-        m_new = tl.maximum(m_i, m_ij)
+            acc = acc * alpha[:, None] + tl.dot(p, v, out_dtype=tl.float32)
 
-        alpha = tl.exp2((m_i - m_new) * log2e)
-        p = tl.exp2((scores - m_new[:, None]) * log2e)
-        p = tl.where(mask_mn, p, 0.0)
-        l_new = l_i * alpha + tl.sum(p, axis=1)
-        l_new = tl.where(mask_m, l_new, 1.0)
+            m_i = m_ij
 
-        acc = acc * alpha[:, None] + tl.dot(p.to(tl.float16), v)
-        m_i = m_new
-        l_i = l_new
+        l_safe = tl.where(offs_m < M_CTX, l_i, 1.0)
+        out = (acc / l_safe[:, None]).to(tl.float16)
 
-    out = acc / l_i[:, None]
-    out = out.to(tl.float16)
-
-    out_ptrs = O_ptr + pid_bh * stride_ob + offs_m[:, None] * stride_om + offs_dv[None, :] * stride_od
-    tl.store(out_ptrs, out, mask=mask_m[:, None])
+        tl.store(
+            o_base + offs_m[:, None] * stride_om + offs_dv[None, :] * stride_ok,
+            out,
+            mask=(offs_m[:, None] < M_CTX),
+        )
 
 
 def gdpa_attn(Q: torch.Tensor, K: torch.Tensor, V: torch.Tensor, GQ: torch.Tensor, GK: torch.Tensor) -> torch.Tensor:
-    assert Q.is_cuda and K.is_cuda and V.is_cuda and GQ.is_cuda and GK.is_cuda
-    assert Q.dtype == torch.float16 and K.dtype == torch.float16 and V.dtype == torch.float16 and GQ.dtype == torch.float16 and GK.dtype == torch.float16
-    assert Q.ndim == 4 and K.ndim == 4 and V.ndim == 4 and GQ.ndim == 4 and GK.ndim == 4
-    Z, H, M, Dq = Q.shape
-    Zk, Hk, N, Dk = K.shape
-    Zv, Hv, Nv, Dv = V.shape
-    assert Zk == Z and Hk == H and Dk == Dq
-    assert Zv == Z and Hv == H and Nv == N
-    assert GQ.shape == Q.shape
-    assert GK.shape == K.shape
+    if triton is None:
+        qg = Q * torch.sigmoid(GQ)
+        kg = K * torch.sigmoid(GK)
+        attn = torch.matmul(qg, kg.transpose(-1, -2)) * (1.0 / math.sqrt(Q.shape[-1]))
+        attn = torch.softmax(attn, dim=-1)
+        out = torch.matmul(attn, V)
+        return out.to(torch.float16)
+
+    if not (Q.is_cuda and K.is_cuda and V.is_cuda and GQ.is_cuda and GK.is_cuda):
+        raise ValueError("All inputs must be CUDA tensors.")
+    if Q.dtype != torch.float16 or K.dtype != torch.float16 or V.dtype != torch.float16 or GQ.dtype != torch.float16 or GK.dtype != torch.float16:
+        raise ValueError("All inputs must be torch.float16.")
+    if Q.ndim != 4 or K.ndim != 4 or V.ndim != 4 or GQ.ndim != 4 or GK.ndim != 4:
+        raise ValueError("All inputs must be rank-4 tensors.")
+    if Q.shape[0] != K.shape[0] or Q.shape[0] != V.shape[0] or Q.shape[0] != GQ.shape[0] or Q.shape[0] != GK.shape[0]:
+        raise ValueError("Batch dimension mismatch.")
+    if Q.shape[1] != K.shape[1] or Q.shape[1] != V.shape[1] or Q.shape[1] != GQ.shape[1] or Q.shape[1] != GK.shape[1]:
+        raise ValueError("Head dimension mismatch.")
+    if Q.shape[2] != GQ.shape[2]:
+        raise ValueError("Q and GQ sequence length mismatch.")
+    if K.shape[2] != GK.shape[2]:
+        raise ValueError("K and GK sequence length mismatch.")
+    if Q.shape[2] != K.shape[2]:
+        raise ValueError("This implementation assumes N == M.")
+    if Q.shape[3] != K.shape[3] or Q.shape[3] != GQ.shape[3] or K.shape[3] != GK.shape[3]:
+        raise ValueError("Dq dimension mismatch.")
+    if Q.shape[3] != 64:
+        raise ValueError("This implementation supports Dq=64 only.")
+    if V.shape[3] != 64:
+        raise ValueError("This implementation supports Dv=64 only.")
+
+    Z, H, M, D = Q.shape
+    N = K.shape[2]
+    DV = V.shape[3]
+    B = Z * H
+    sm_scale = 1.0 / math.sqrt(D)
 
     if not Q.is_contiguous():
         Q = Q.contiguous()
@@ -121,34 +179,53 @@ def gdpa_attn(Q: torch.Tensor, K: torch.Tensor, V: torch.Tensor, GQ: torch.Tenso
     if not GK.is_contiguous():
         GK = GK.contiguous()
 
-    BH = Z * H
-    Q3 = Q.reshape(BH, M, Dq)
-    K3 = K.reshape(BH, N, Dq)
-    V3 = V.reshape(BH, N, Dv)
-    GQ3 = GQ.reshape(BH, M, Dq)
-    GK3 = GK.reshape(BH, N, Dq)
+    Q2 = Q.reshape(B, M, D)
+    K2 = K.reshape(B, N, D)
+    V2 = V.reshape(B, N, DV)
+    GQ2 = GQ.reshape(B, M, D)
+    GK2 = GK.reshape(B, N, D)
+    O2 = torch.empty((B, M, DV), device=Q.device, dtype=torch.float16)
 
-    O3 = torch.empty((BH, M, Dv), device=Q.device, dtype=torch.float16)
+    stride_qh, stride_qm, stride_qk = Q2.stride()
+    stride_kh, stride_kn, stride_kk = K2.stride()
+    stride_vh, stride_vn, stride_vk = V2.stride()
+    stride_oh, stride_om, stride_ok = O2.stride()
 
-    sm_scale = 1.0 / math.sqrt(Dq)
+    grid = lambda meta: (triton.cdiv(M, meta["BM"]), B)
 
-    grid = (triton.cdiv(M, 128), BH)
-
-    _gdpa_fwd_kernel[grid](
-        Q3, K3, V3, GQ3, GK3, O3,
-        Q3.stride(0), Q3.stride(1), Q3.stride(2),
-        K3.stride(0), K3.stride(1), K3.stride(2),
-        V3.stride(0), V3.stride(1), V3.stride(2),
-        O3.stride(0), O3.stride(1), O3.stride(2),
-        sm_scale,
-        M_CTX=M, N_CTX=N,
-        D_HEAD=Dq, D_VALUE=Dv,
+    _gdpa_attn_fwd[grid](
+        Q2,
+        K2,
+        V2,
+        GQ2,
+        GK2,
+        O2,
+        stride_qh=stride_qh,
+        stride_qm=stride_qm,
+        stride_qk=stride_qk,
+        stride_kh=stride_kh,
+        stride_kn=stride_kn,
+        stride_kk=stride_kk,
+        stride_vh=stride_vh,
+        stride_vn=stride_vn,
+        stride_vk=stride_vk,
+        stride_oh=stride_oh,
+        stride_om=stride_om,
+        stride_ok=stride_ok,
+        M_CTX=M,
+        N_CTX=N,
+        D=D,
+        DV=DV,
+        SM_SCALE=sm_scale,
     )
-
-    return O3.reshape(Z, H, M, Dv)
-''')
+    return O2.reshape(Z, H, M, DV)
 
 
 class Solution:
-    def solve(self, spec_path: str = None) -> dict:
-        return {"code": KERNEL_CODE}
+    def solve(self, spec_path: str = None) -> Dict[str, str]:
+        try:
+            path = os.path.abspath(__file__)
+            return {"program_path": path}
+        except Exception:
+            code = inspect.getsource(sys.modules[__name__])
+            return {"code": code}

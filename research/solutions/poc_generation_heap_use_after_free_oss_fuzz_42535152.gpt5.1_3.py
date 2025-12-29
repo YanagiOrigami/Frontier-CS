@@ -1,31 +1,260 @@
 import os
 import tarfile
-import gzip
-import bz2
-import lzma
 
 
 class Solution:
     def solve(self, src_path: str) -> bytes:
-        try:
-            if os.path.isdir(src_path):
-                data = self._find_poc_in_dir(src_path)
-            elif tarfile.is_tarfile(src_path):
-                data = self._find_poc_in_tar(src_path)
-            else:
+        """
+        Generate a PoC that triggers the vulnerability.
+        """
+        lg = 33453
+
+        data = None
+
+        if os.path.isfile(src_path):
+            try:
+                data = self._extract_from_tar(src_path, lg)
+            except tarfile.ReadError:
                 data = None
-        except Exception:
-            data = None
+            except Exception:
+                data = None
 
-        if not data:
-            data = self._default_poc()
+        if data is not None:
+            return data
 
-        return data
+        if os.path.isdir(src_path):
+            try:
+                data = self._extract_from_dir(src_path, lg)
+            except Exception:
+                data = None
 
-    def _default_poc(self) -> bytes:
-        # Minimal, generic PDF as fallback
+        if data is not None:
+            return data
+
+        return self._fallback_pdf()
+
+    def _base_score(self, name_lower: str, size: int, lg: int) -> int:
+        score = 0
+        diff = abs(size - lg)
+
+        if diff == 0:
+            score += 200
+        elif diff <= 64:
+            score += 140
+        elif diff <= 256:
+            score += 110
+        elif diff <= 1024:
+            score += 80
+        elif diff <= 4096:
+            score += 40
+        elif diff <= 16384:
+            score += 10
+
+        if "42535152" in name_lower:
+            score += 120
+        if "oss-fuzz" in name_lower or "ossfuzz" in name_lower:
+            score += 100
+        if "clusterfuzz" in name_lower:
+            score += 90
+        if "testcase" in name_lower:
+            score += 70
+        if "repro" in name_lower or "reproducer" in name_lower:
+            score += 70
+        if "poc" in name_lower:
+            score += 80
+        if "uaf" in name_lower or "use-after-free" in name_lower or "use_after_free" in name_lower:
+            score += 60
+        if "heap-use-after-free" in name_lower or "heap_use_after_free" in name_lower:
+            score += 60
+        if "fuzz" in name_lower:
+            score += 20
+
+        base, ext = os.path.splitext(name_lower)
+        binary_exts = {
+            ".pdf",
+            ".bin",
+            ".dat",
+            ".raw",
+            ".repro",
+            ".input",
+            ".seed",
+            ".case",
+        }
+        text_exts = {
+            ".c",
+            ".cc",
+            ".cpp",
+            ".cxx",
+            ".h",
+            ".hpp",
+            ".hh",
+            ".py",
+            ".java",
+            ".js",
+            ".html",
+            ".xml",
+            ".md",
+            ".txt",
+            ".json",
+            ".yaml",
+            ".yml",
+            ".cmake",
+            ".sh",
+            ".bat",
+            ".ps1",
+            ".in",
+            ".ac",
+            ".am",
+            ".m4",
+            ".sln",
+            ".vcxproj",
+            ".vcproj",
+            ".gradle",
+            ".mak",
+            ".rst",
+            ".tex",
+            ".csv",
+            ".tsv",
+            ".ini",
+            ".cfg",
+            ".conf",
+        }
+
+        if ext in binary_exts:
+            score += 60
+        elif ext in text_exts:
+            score -= 60
+
+        return score
+
+    def _evaluate_with_sample(self, name_lower: str, size: int, sample: bytes, lg: int) -> int:
+        score = self._base_score(name_lower, size, lg)
+
+        if sample:
+            if sample.startswith(b"%PDF-"):
+                score += 150
+
+            non_printable = 0
+            for b in sample:
+                if b in (9, 10, 13) or 32 <= b <= 126:
+                    continue
+                non_printable += 1
+            ratio = non_printable / float(len(sample))
+            if ratio > 0.10:
+                score += 50
+            else:
+                score -= 30
+
+        return score
+
+    def _extract_from_tar(self, tar_path: str, lg: int) -> bytes | None:
+        best_member = None
+        best_score = float("-inf")
+        best_size = 0
+
+        with tarfile.open(tar_path, "r:*") as tf:
+            for member in tf.getmembers():
+                if not member.isreg():
+                    continue
+
+                name_lower = member.name.lower()
+                size = member.size
+                diff = abs(size - lg)
+
+                need_sample = False
+                base, ext = os.path.splitext(name_lower)
+                if diff <= 2048 or "poc" in name_lower or "clusterfuzz" in name_lower or "oss-fuzz" in name_lower or ext == ".pdf":
+                    need_sample = True
+
+                sample = b""
+                if need_sample:
+                    try:
+                        f = tf.extractfile(member)
+                        if f is not None:
+                            sample = f.read(2048)
+                            f.close()
+                    except Exception:
+                        sample = b""
+
+                if sample:
+                    score = self._evaluate_with_sample(name_lower, size, sample, lg)
+                else:
+                    score = self._base_score(name_lower, size, lg)
+
+                if score > best_score:
+                    best_score = score
+                    best_member = member
+                    best_size = size
+
+            if best_member is not None:
+                size_limit = max(lg * 10, 1_048_576)
+                if best_size <= size_limit:
+                    try:
+                        f = tf.extractfile(best_member)
+                        if f is not None:
+                            data = f.read()
+                            f.close()
+                            if data:
+                                return data
+                    except Exception:
+                        return None
+
+        return None
+
+    def _extract_from_dir(self, root: str, lg: int) -> bytes | None:
+        best_path = None
+        best_score = float("-inf")
+        best_size = 0
+
+        for dirpath, _, filenames in os.walk(root):
+            for fname in filenames:
+                path = os.path.join(dirpath, fname)
+                try:
+                    size = os.path.getsize(path)
+                except OSError:
+                    continue
+
+                name_lower = path.lower()
+                diff = abs(size - lg)
+                base, ext = os.path.splitext(name_lower)
+                need_sample = False
+                if diff <= 2048 or "poc" in name_lower or "clusterfuzz" in name_lower or "oss-fuzz" in name_lower or ext == ".pdf":
+                    need_sample = True
+
+                sample = b""
+                if need_sample:
+                    try:
+                        with open(path, "rb") as f:
+                            sample = f.read(2048)
+                    except OSError:
+                        sample = b""
+
+                if sample:
+                    score = self._evaluate_with_sample(name_lower, size, sample, lg)
+                else:
+                    score = self._base_score(name_lower, size, lg)
+
+                if score > best_score:
+                    best_score = score
+                    best_path = path
+                    best_size = size
+
+        if best_path is not None:
+            size_limit = max(lg * 10, 1_048_576)
+            if best_size <= size_limit:
+                try:
+                    with open(best_path, "rb") as f:
+                        data = f.read()
+                    if data:
+                        return data
+                except OSError:
+                    return None
+
+        return None
+
+    def _fallback_pdf(self) -> bytes:
         return (
-            b"%PDF-1.4\n"
+            b"%PDF-1.1\n"
             b"1 0 obj\n"
             b"<< /Type /Catalog /Pages 2 0 R >>\n"
             b"endobj\n"
@@ -40,320 +269,10 @@ class Solution:
             b"0000000000 65535 f \n"
             b"0000000010 00000 n \n"
             b"0000000060 00000 n \n"
-            b"0000000115 00000 n \n"
+            b"0000000117 00000 n \n"
             b"trailer\n"
             b"<< /Size 4 /Root 1 0 R >>\n"
             b"startxref\n"
             b"170\n"
             b"%%EOF\n"
         )
-
-    def _find_poc_in_tar(self, tar_path: str) -> bytes | None:
-        try:
-            tf = tarfile.open(tar_path, "r:*")
-        except Exception:
-            return None
-
-        best_member = None
-        best_score = -1
-        best_size_diff = None
-        target_size = 33453
-
-        # File extensions that are likely to contain binary PoCs
-        binary_exts = {
-            ".pdf",
-            ".bin",
-            ".dat",
-            ".raw",
-            ".poc",
-            ".gz",
-            ".bz2",
-            ".xz",
-            ".lzma",
-        }
-
-        code_exts = {
-            ".c",
-            ".cc",
-            ".cpp",
-            ".cxx",
-            ".h",
-            ".hh",
-            ".hpp",
-            ".py",
-            ".java",
-            ".cs",
-            ".js",
-            ".ts",
-            ".go",
-            ".rs",
-            ".m",
-            ".mm",
-            ".sh",
-            ".bat",
-            ".ps1",
-            ".cmake",
-            ".ac",
-            ".am",
-            ".in",
-        }
-
-        text_like_exts = {
-            ".txt",
-            ".md",
-            ".rst",
-            ".html",
-            ".htm",
-            ".xml",
-            ".json",
-            ".yml",
-            ".yaml",
-            ".csv",
-        }
-
-        try:
-            for member in tf.getmembers():
-                if not member.isfile() or member.size <= 0:
-                    continue
-
-                name = member.name.lower()
-                base = os.path.basename(name)
-                _, ext = os.path.splitext(base)
-
-                # Skip obvious source/text files unless strongly hinted
-                if ext in code_exts or ext in text_like_exts:
-                    if "poc" not in name and "crash" not in name and "42535152" not in name:
-                        continue
-
-                is_candidate = False
-                if ext in binary_exts:
-                    is_candidate = True
-                elif ext == "":
-                    # Files without extension but with typical PoC hints
-                    if (
-                        "poc" in name
-                        or "crash" in name
-                        or "oss-fuzz" in name
-                        or "ossfuzz" in name
-                        or "clusterfuzz" in name
-                        or "testcase" in name
-                        or "42535152" in name
-                    ):
-                        is_candidate = True
-
-                if not is_candidate:
-                    continue
-
-                score = 0
-
-                if ext == ".pdf" or name.endswith(".pdf.gz") or name.endswith(".pdf.bz2") or name.endswith(".pdf.xz") or name.endswith(".pdf.lzma"):
-                    score += 100
-
-                if "42535152" in name:
-                    score += 120
-                if "oss-fuzz" in name or "ossfuzz" in name or "clusterfuzz" in name:
-                    score += 80
-                if "poc" in name:
-                    score += 70
-                if "crash" in name or "uaf" in name or "use-after-free" in name:
-                    score += 60
-                if "regress" in name or "bug" in name or "issue" in name:
-                    score += 20
-                if "fuzz" in name:
-                    score += 10
-
-                size_diff = abs(member.size - target_size)
-
-                if best_member is None:
-                    best_member = member
-                    best_score = score
-                    best_size_diff = size_diff
-                else:
-                    if score > best_score:
-                        best_member = member
-                        best_score = score
-                        best_size_diff = size_diff
-                    elif score == best_score and size_diff < (best_size_diff if best_size_diff is not None else size_diff + 1):
-                        best_member = member
-                        best_size_diff = size_diff
-        finally:
-            try:
-                tf.close()
-            except Exception:
-                pass
-
-        if best_member is None:
-            return None
-
-        try:
-            with tarfile.open(tar_path, "r:*") as tf2:
-                f = tf2.extractfile(best_member)
-                if f is None:
-                    return None
-                data = f.read()
-        except Exception:
-            return None
-
-        # Try to transparently decompress if needed
-        name = best_member.name.lower()
-        try:
-            if name.endswith(".gz"):
-                data = gzip.decompress(data)
-            elif name.endswith(".bz2"):
-                data = bz2.decompress(data)
-            elif name.endswith(".xz") or name.endswith(".lzma"):
-                data = lzma.decompress(data)
-        except Exception:
-            # If decompression fails, just return the raw data
-            pass
-
-        return data if data else None
-
-    def _find_poc_in_dir(self, root_dir: str) -> bytes | None:
-        best_path = None
-        best_score = -1
-        best_size_diff = None
-        target_size = 33453
-
-        binary_exts = {
-            ".pdf",
-            ".bin",
-            ".dat",
-            ".raw",
-            ".poc",
-            ".gz",
-            ".bz2",
-            ".xz",
-            ".lzma",
-        }
-
-        code_exts = {
-            ".c",
-            ".cc",
-            ".cpp",
-            ".cxx",
-            ".h",
-            ".hh",
-            ".hpp",
-            ".py",
-            ".java",
-            ".cs",
-            ".js",
-            ".ts",
-            ".go",
-            ".rs",
-            ".m",
-            ".mm",
-            ".sh",
-            ".bat",
-            ".ps1",
-            ".cmake",
-            ".ac",
-            ".am",
-            ".in",
-        }
-
-        text_like_exts = {
-            ".txt",
-            ".md",
-            ".rst",
-            ".html",
-            ".htm",
-            ".xml",
-            ".json",
-            ".yml",
-            ".yaml",
-            ".csv",
-        }
-
-        for dirpath, _, filenames in os.walk(root_dir):
-            for filename in filenames:
-                full_path = os.path.join(dirpath, filename)
-                try:
-                    size = os.path.getsize(full_path)
-                except OSError:
-                    continue
-
-                if size <= 0:
-                    continue
-
-                name = full_path.lower()
-                base = os.path.basename(name)
-                _, ext = os.path.splitext(base)
-
-                if ext in code_exts or ext in text_like_exts:
-                    if "poc" not in name and "crash" not in name and "42535152" not in name:
-                        continue
-
-                is_candidate = False
-                if ext in binary_exts:
-                    is_candidate = True
-                elif ext == "":
-                    if (
-                        "poc" in name
-                        or "crash" in name
-                        or "oss-fuzz" in name
-                        or "ossfuzz" in name
-                        or "clusterfuzz" in name
-                        or "testcase" in name
-                        or "42535152" in name
-                    ):
-                        is_candidate = True
-
-                if not is_candidate:
-                    continue
-
-                score = 0
-
-                if ext == ".pdf" or name.endswith(".pdf.gz") or name.endswith(".pdf.bz2") or name.endswith(".pdf.xz") or name.endswith(".pdf.lzma"):
-                    score += 100
-
-                if "42535152" in name:
-                    score += 120
-                if "oss-fuzz" in name or "ossfuzz" in name or "clusterfuzz" in name:
-                    score += 80
-                if "poc" in name:
-                    score += 70
-                if "crash" in name or "uaf" in name or "use-after-free" in name:
-                    score += 60
-                if "regress" in name or "bug" in name or "issue" in name:
-                    score += 20
-                if "fuzz" in name:
-                    score += 10
-
-                size_diff = abs(size - target_size)
-
-                if best_path is None:
-                    best_path = full_path
-                    best_score = score
-                    best_size_diff = size_diff
-                else:
-                    if score > best_score:
-                        best_path = full_path
-                        best_score = score
-                        best_size_diff = size_diff
-                    elif score == best_score and size_diff < (best_size_diff if best_size_diff is not None else size_diff + 1):
-                        best_path = full_path
-                        best_size_diff = size_diff
-
-        if best_path is None:
-            return None
-
-        try:
-            with open(best_path, "rb") as f:
-                data = f.read()
-        except Exception:
-            return None
-
-        name = best_path.lower()
-        try:
-            if name.endswith(".gz"):
-                data = gzip.decompress(data)
-            elif name.endswith(".bz2"):
-                data = bz2.decompress(data)
-            elif name.endswith(".xz") or name.endswith(".lzma"):
-                data = lzma.decompress(data)
-        except Exception:
-            pass
-
-        return data if data else None

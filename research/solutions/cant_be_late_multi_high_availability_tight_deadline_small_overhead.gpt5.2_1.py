@@ -1,16 +1,13 @@
 import json
 from argparse import Namespace
-from typing import Optional, List
+from typing import List, Optional
 
 from sky_spot.strategies.multi_strategy import MultiRegionStrategy
 from sky_spot.utils import ClusterType
 
 
-_CT_NONE = getattr(ClusterType, "NONE", getattr(ClusterType, "None", None))
-
-
 class Solution(MultiRegionStrategy):
-    NAME = "cant_be_late_multiregion_v1"
+    NAME = "cant_be_late_multi_region"
 
     def solve(self, spec_path: str) -> "Solution":
         with open(spec_path) as f:
@@ -23,193 +20,142 @@ class Solution(MultiRegionStrategy):
             inter_task_overhead=[0.0],
         )
         super().__init__(args)
-
-        self._inited = False
-        self._gap = None
-        self._num_regions = None
-
-        self._work_done = 0.0
-        self._last_task_done_len = 0
-
-        self._last_elapsed = None
-        self._last_work_done_for_ema = 0.0
-        self._ema_prod = 0.95
-        self._ema_alpha = 0.02
-
-        self._last_region = None
-        self._consec_spot = 0
-        self._consec_no_spot = 0
-
-        self._commit_on_demand = False
-
-        self._search_active = False
-        self._search_order = []
-        self._search_pos = 0
-        self._next_probe_time = 0.0
-        self._probe_interval = 30.0
-
-        self._spot_seen = []
-        self._seen_total = []
-        self._perm_regions = []
-
-        self._config = config
         return self
 
-    def _lazy_init(self) -> None:
-        if self._inited:
-            return
-        self._gap = float(getattr(self.env, "gap_seconds", 1.0))
-        self._num_regions = int(self.env.get_num_regions())
-        self._probe_interval = max(5.0 * self._gap, 30.0)
+    def _get_scalar(self, x):
+        if isinstance(x, (list, tuple)):
+            return float(x[0]) if x else 0.0
+        return float(x)
 
-        self._spot_seen = [0] * self._num_regions
-        self._seen_total = [0] * self._num_regions
-        self._perm_regions = list(range(self._num_regions))
+    def _lazy_init(self):
+        if getattr(self, "_inited", False):
+            return
         self._inited = True
 
-    def _update_work_done(self) -> None:
-        l = len(self.task_done_time)
-        if l > self._last_task_done_len:
-            self._work_done += sum(self.task_done_time[self._last_task_done_len:l])
-            self._last_task_done_len = l
+        n = int(self.env.get_num_regions())
+        self._num_regions = n
+        self._avail: List[int] = [0] * n
+        self._seen: List[int] = [0] * n
+        self._last_visit: List[float] = [-1.0] * n
 
-    def _update_ema_prod(self, elapsed: float) -> None:
-        if self._last_elapsed is None:
-            self._last_elapsed = elapsed
-            self._last_work_done_for_ema = self._work_done
+        self._last_task_done_len = 0
+        self._work_done = 0.0
+
+        self._forced_on_demand = False
+
+        self._consec_no_spot = 0.0
+        self._last_switch_time = -1e30
+
+        self._deadline_s = self._get_scalar(self.deadline)
+        self._task_duration_s = self._get_scalar(self.task_duration)
+        self._restart_overhead_s = self._get_scalar(self.restart_overhead)
+
+        gap = float(self.env.gap_seconds)
+        self._switch_cooldown_s = max(5.0 * gap, min(30.0, 30.0 * gap))
+        self._switch_after_no_spot_s = max(3.0 * gap, 15.0)
+
+        self._safety_slack_s = max(1800.0, 20.0 * self._restart_overhead_s)
+
+    def _update_work_done(self):
+        td = self.task_done_time
+        l = len(td)
+        if l <= self._last_task_done_len:
             return
-        dt = elapsed - self._last_elapsed
-        if dt <= 0:
-            return
-        dw = self._work_done - self._last_work_done_for_ema
-        inst = max(0.0, min(1.0, dw / dt))
-        self._ema_prod = (1.0 - self._ema_alpha) * self._ema_prod + self._ema_alpha * inst
-        self._last_elapsed = elapsed
-        self._last_work_done_for_ema = self._work_done
+        s = 0.0
+        for i in range(self._last_task_done_len, l):
+            s += float(td[i])
+        self._work_done += s
+        self._last_task_done_len = l
 
-    def _start_search(self, cur_region: int, elapsed: float) -> None:
-        self._search_active = True
-        if self._num_regions <= 1:
-            self._search_order = []
-            self._search_pos = 0
-            self._next_probe_time = elapsed + self._probe_interval
-            return
-        self._search_order = [r for r in self._perm_regions if r != cur_region]
-        self._search_pos = 0
-        self._next_probe_time = elapsed
+    def _region_score(self, idx: int, now: float) -> float:
+        seen = self._seen[idx]
+        avail = self._avail[idx]
+        p = (avail + 1.0) / (seen + 2.0)
+        explore = 0.25 if seen == 0 else 0.0
+        lv = self._last_visit[idx]
+        if lv < 0.0:
+            rec = 1.0
+        else:
+            rec = min(1.0, (now - lv) / 3600.0)
+        return p + explore + 0.05 * rec
 
-    def _best_region_by_history(self) -> int:
-        best_r = 0
-        best_score = -1.0
-        for r in range(self._num_regions):
-            total = self._seen_total[r]
-            hits = self._spot_seen[r]
-            score = (hits + 1.0) / (total + 2.0)
-            if score > best_score:
-                best_score = score
-                best_r = r
-        return best_r
-
-    def _maybe_switch_to_next_search_region(self) -> None:
-        if self._search_pos < len(self._search_order):
-            nxt = self._search_order[self._search_pos]
-            self._search_pos += 1
-            self.env.switch_region(nxt)
+    def _choose_best_region(self, now: float, exclude: Optional[int] = None) -> int:
+        best_idx = 0
+        best_score = -1e100
+        for i in range(self._num_regions):
+            if exclude is not None and i == exclude:
+                continue
+            sc = self._region_score(i, now)
+            if sc > best_score:
+                best_score = sc
+                best_idx = i
+        return best_idx
 
     def _step(self, last_cluster_type: ClusterType, has_spot: bool) -> ClusterType:
         self._lazy_init()
 
-        elapsed = float(getattr(self.env, "elapsed_seconds", 0.0))
-        cur_region = int(self.env.get_current_region())
-        if self._last_region is None or cur_region != self._last_region:
-            self._consec_spot = 0
-            self._consec_no_spot = 0
-            self._last_region = cur_region
-
-        self._seen_total[cur_region] += 1
-        if has_spot:
-            self._spot_seen[cur_region] += 1
+        now = float(self.env.elapsed_seconds)
+        gap = float(self.env.gap_seconds)
 
         self._update_work_done()
-        self._update_ema_prod(elapsed)
 
-        remaining_work = float(self.task_duration) - float(self._work_done)
+        remaining_work = self._task_duration_s - self._work_done
         if remaining_work <= 0.0:
-            return _CT_NONE
+            return ClusterType.NONE
 
-        time_left = float(self.deadline) - elapsed
+        time_left = self._deadline_s - now
         if time_left <= 0.0:
-            return _CT_NONE
+            return ClusterType.NONE
 
+        cur_region = int(self.env.get_current_region())
+        self._seen[cur_region] += 1
         if has_spot:
-            self._consec_spot += 1
-            self._consec_no_spot = 0
+            self._avail[cur_region] += 1
+            self._consec_no_spot = 0.0
         else:
-            self._consec_no_spot += 1
-            self._consec_spot = 0
+            self._consec_no_spot += gap
+        self._last_visit[cur_region] = now
 
-        full_overhead = float(self.restart_overhead)
-        rem_overhead = float(getattr(self, "remaining_restart_overhead", 0.0))
-
-        if last_cluster_type == ClusterType.ON_DEMAND:
-            need_if_od_now = remaining_work + max(0.0, rem_overhead)
+        # If we are so close that switching to on-demand (incurring a restart overhead)
+        # could make it impossible to finish, prefer continuing current cluster if it can run.
+        keep_overhead = 0.0
+        if last_cluster_type == ClusterType.NONE:
+            keep_overhead = self._restart_overhead_s
         else:
-            need_if_od_now = remaining_work + full_overhead
+            keep_overhead = float(getattr(self, "remaining_restart_overhead", 0.0) or 0.0)
 
-        critical_margin = 5.0 * self._gap
-        if need_if_od_now >= time_left - critical_margin:
-            self._commit_on_demand = True
+        t_needed_keep = remaining_work + keep_overhead
+        t_needed_od = remaining_work + (keep_overhead if last_cluster_type == ClusterType.ON_DEMAND else self._restart_overhead_s)
 
-        if self._commit_on_demand:
-            self._search_active = False
+        # Critical: no time to restart; keep current if possible.
+        if time_left <= t_needed_od and time_left >= t_needed_keep:
+            if last_cluster_type == ClusterType.SPOT and has_spot:
+                return ClusterType.SPOT
+            if last_cluster_type == ClusterType.ON_DEMAND:
+                return ClusterType.ON_DEMAND
+
+        # Decide when to force on-demand to guarantee completion.
+        if not self._forced_on_demand:
+            if time_left <= (t_needed_od + self._safety_slack_s):
+                self._forced_on_demand = True
+
+        if self._forced_on_demand:
             return ClusterType.ON_DEMAND
 
-        if rem_overhead > 0.0:
-            if last_cluster_type == ClusterType.ON_DEMAND:
-                self._search_active = False
-                return ClusterType.ON_DEMAND
-            if last_cluster_type == ClusterType.SPOT and has_spot:
-                self._search_active = False
-                return ClusterType.SPOT
-
-        slack = time_left - remaining_work
-
         if has_spot:
-            self._search_active = False
-            if last_cluster_type == ClusterType.ON_DEMAND:
-                if slack > full_overhead + 600.0 and self._consec_spot >= 5:
-                    return ClusterType.SPOT
-                return ClusterType.ON_DEMAND
             return ClusterType.SPOT
 
-        if last_cluster_type == ClusterType.ON_DEMAND:
-            if slack > full_overhead + 1800.0:
-                self._start_search(cur_region, elapsed)
-                self._maybe_switch_to_next_search_region()
-                return _CT_NONE
-            return ClusterType.ON_DEMAND
+        # No spot and not forced on-demand: pause to save cost, and opportunistically switch regions.
+        # Avoid switching if we're mid-overhead (switching would reset overhead back to full).
+        rem_ov = float(getattr(self, "remaining_restart_overhead", 0.0) or 0.0)
+        avoid_switch = (rem_ov > 0.0) and (rem_ov < max(0.0, self._restart_overhead_s - gap))
 
-        if not self._search_active:
-            if slack > full_overhead + 600.0:
-                self._start_search(cur_region, elapsed)
-                self._maybe_switch_to_next_search_region()
-                return _CT_NONE
-            return ClusterType.ON_DEMAND if slack < full_overhead + 300.0 else _CT_NONE
+        if (self._num_regions > 1) and (not avoid_switch):
+            if (now - self._last_switch_time) >= self._switch_cooldown_s and self._consec_no_spot >= self._switch_after_no_spot_s:
+                target = self._choose_best_region(now, exclude=cur_region)
+                if target != cur_region:
+                    self.env.switch_region(target)
+                    self._last_switch_time = now
+                    self._consec_no_spot = 0.0
 
-        if elapsed < self._next_probe_time:
-            return _CT_NONE
-
-        if self._num_regions <= 1:
-            self._next_probe_time = elapsed + self._probe_interval
-            return _CT_NONE
-
-        if self._search_pos < len(self._search_order):
-            self._maybe_switch_to_next_search_region()
-            return _CT_NONE
-
-        self._search_active = False
-        self._next_probe_time = elapsed + self._probe_interval
-        best_r = self._best_region_by_history()
-        if best_r != cur_region:
-            self.env.switch_region(best_r)
-        return _CT_NONE
+        return ClusterType.NONE

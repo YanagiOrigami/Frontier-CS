@@ -1,97 +1,81 @@
 import numpy as np
 from pysr import PySRRegressor
+from typing import Dict, Any
 import warnings
 
 class Solution:
     def __init__(self, **kwargs):
         pass
 
-    def solve(self, X: np.ndarray, y: np.ndarray) -> dict:
+    def solve(self, X: np.ndarray, y: np.ndarray) -> Dict[str, Any]:
         with warnings.catch_warnings():
-            warnings.filterwarnings("ignore", category=UserWarning)
+            warnings.simplefilter("ignore")
             
             model = PySRRegressor(
-                niterations=50,
+                niterations=30,
                 binary_operators=["+", "-", "*", "/", "**"],
-                unary_operators=["sin", "cos", "exp", "log"],
+                unary_operators=["exp", "sin", "cos", "log"],
                 populations=8,
-                population_size=40,
-                maxsize=30,
+                population_size=30,
+                maxsize=20,
+                early_stop_condition=(
+                    "stop_if(loss, complexity) = loss < 1e-6 && complexity < 10"
+                ),
+                temp_equation_file=True,
+                delete_tempfiles=True,
                 verbosity=0,
                 progress=False,
                 random_state=42,
-                early_stop_condition="stop_if(loss, complexity) = loss < 1e-9 && complexity < 20",
                 deterministic=True,
-                loss="loss(prediction, target) = (prediction - target)^2",
-                constraints={
-                    "exp": 4,
-                    "log": 4,
-                    "sin": 4,
-                    "cos": 4,
-                    "**": 4
-                },
-                nested_constraints={
-                    "sin": {"sin": 0, "cos": 0, "exp": 1, "log": 1},
-                    "cos": {"sin": 0, "cos": 0, "exp": 1, "log": 1},
-                    "exp": {"exp": 1, "log": 1, "sin": 1, "cos": 1},
-                    "log": {"exp": 1, "log": 1, "sin": 1, "cos": 1},
-                    "**": {"**": 1}
-                },
-                complexity_of_operators={
-                    "**": 3,
-                    "exp": 3,
-                    "log": 3,
-                    "sin": 2,
-                    "cos": 2
-                },
-                weight_optimize=0.02,
-                weight_simplify=0.02,
-                turbo=True,
+                warm_start=True,
+                tempdir="/tmp",
                 multithreading=True,
-                model_selection="best",
-                extra_sympy_mappings={
-                    "exp": lambda x: np.exp(x),
-                    "log": lambda x: np.log(np.abs(x) + 1e-12)
+                nested_constraints={
+                    "exp": {"exp": 0, "log": 0},
+                    "log": {"exp": 0, "log": 0}
                 }
             )
             
-            model.fit(X, y, variable_names=["x1", "x2"])
-            
             try:
-                best_expr = model.sympy()
-                if best_expr is None:
-                    best_expr = model.equations_.iloc[0]["sympy_format"]
-                expression = str(best_expr)
-                expression = expression.replace("Abs", "")
-                expression = expression.replace("abs", "")
-                expression = expression.replace("log", "np.log")
-                expression = expression.replace("exp", "np.exp")
-                expression = expression.replace("sin", "np.sin")
-                expression = expression.replace("cos", "np.cos")
+                model.fit(X, y, variable_names=["x1", "x2"])
                 
+                if hasattr(model, "sympy") and callable(model.sympy):
+                    try:
+                        expression = str(model.sympy())
+                    except:
+                        if len(model.equations_) > 0:
+                            best_eq = model.equations_.iloc[0]
+                            expression = best_eq["equation"]
+                        else:
+                            expression = self._linear_fallback(X, y)
+                else:
+                    expression = self._linear_fallback(X, y)
+                    
                 predictions = model.predict(X)
                 
-                complexity = len(model.equations_)
-                
                 return {
                     "expression": expression,
                     "predictions": predictions.tolist(),
-                    "details": {"complexity": int(complexity)}
+                    "details": {}
                 }
-            except Exception as e:
-                x1 = X[:, 0]
-                x2 = X[:, 1]
-                A = np.column_stack([x1, x2, x1**2, x2**2, x1*x2, 
-                                    np.exp(-x1**2), np.exp(-x2**2),
-                                    np.sin(x1), np.cos(x2), np.ones_like(x1)])
-                coeffs, _, _, _ = np.linalg.lstsq(A, y, rcond=None)
                 
-                a, b, c, d, e, f, g, h, i, j = coeffs
-                expression = f"{a:.6f}*x1 + {b:.6f}*x2 + {c:.6f}*x1**2 + {d:.6f}*x2**2 + {e:.6f}*x1*x2 + {f:.6f}*np.exp(-x1**2) + {g:.6f}*np.exp(-x2**2) + {h:.6f}*np.sin(x1) + {i:.6f}*np.cos(x2) + {j:.6f}"
-                predictions = A @ coeffs
-                
-                return {
-                    "expression": expression,
-                    "predictions": predictions.tolist(),
-                    "details": {"complexity": 10}
-                }
+            except Exception:
+                return self._linear_fallback_result(X, y)
+    
+    def _linear_fallback(self, X: np.ndarray, y: np.ndarray) -> str:
+        x1, x2 = X[:, 0], X[:, 1]
+        A = np.column_stack([x1, x2, np.ones_like(x1)])
+        coeffs, *_ = np.linalg.lstsq(A, y, rcond=None)
+        a, b, c = coeffs
+        return f"{a:.8f}*x1 + {b:.8f}*x2 + {c:.8f}"
+    
+    def _linear_fallback_result(self, X: np.ndarray, y: np.ndarray) -> Dict[str, Any]:
+        expr = self._linear_fallback(X, y)
+        x1, x2 = X[:, 0], X[:, 1]
+        a, b, c = map(float, expr.replace('*x1', '').replace('*x2', '').replace('+', '').split())
+        predictions = a * x1 + b * x2 + c
+        return {
+            "expression": expr,
+            "predictions": predictions.tolist(),
+            "details": {}
+        }

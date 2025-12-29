@@ -2,99 +2,108 @@ import torch
 import triton
 import triton.language as tl
 import math
-from typing import Optional
 
 class Solution:
     def solve(self, spec_path: str = None) -> dict:
-        code = r'''
+        code = """
 import torch
 import triton
 import triton.language as tl
 import math
 
+@triton.jit
+def ragged_kernel(
+    Q, K, V, O, ROW_LENS, M, D, Dv, scale: tl.f32,
+    BLOCK_N: tl.constexpr
+):
+    pid = tl.program_id(0)
+    q_offset = pid * D * 2
+    q = tl.load(Q + q_offset).to(tl.float32)
+
+    l_offset = pid * 4
+    L = tl.load(ROW_LENS + l_offset).to(tl.int32)
+
+    if L == 0:
+        o_offset = pid * Dv * 2
+        zero_vec = tl.zeros((Dv,), dtype=tl.float16)
+        tl.store(O + o_offset, zero_vec)
+        return
+
+    # First pass: compute m and s
+    m = tl.float32('-inf')
+    s = tl.float32(0.0)
+    start = tl.int32(0)
+    while start < L:
+        end = tl.minimum(start + BLOCK_N, L)
+        bn = end - start
+
+        # Load k_block
+        row_offsets_k = (start + tl.arange(0, BLOCK_N)) * D * 2
+        col_offsets_k = tl.arange(0, D) * 2
+        k_offsets = row_offsets_k[:, None] + col_offsets_k[None, :]
+        mask_k = (tl.arange(0, BLOCK_N)[:, None] < bn) & (tl.arange(0, D)[None, :] < D)
+        k_block_f16 = tl.load(K + k_offsets, mask=mask_k, other=tl.float16(0.0))
+        k_block = k_block_f16.to(tl.float32)
+
+        scores = tl.sum(k_block * q[None, :], axis=1) * scale
+        scores = tl.where(tl.arange(0, BLOCK_N) < bn, scores, tl.float32('-1e9'))
+
+        m_block = tl.max(scores)
+        m_new = tl.maximum(m, m_block)
+        exp_old = tl.exp(m - m_new)
+        exp_scores = tl.exp(scores - m_new)
+        s_new = s * exp_old + tl.sum(exp_scores)
+        m = m_new
+        s = s_new
+
+        start += BLOCK_N
+
+    # Second pass: compute output
+    o_acc = tl.zeros((Dv,), dtype=tl.float32)
+    denom = s
+    start = tl.int32(0)
+    while start < L:
+        end = tl.minimum(start + BLOCK_N, L)
+        bn = end - start
+
+        # Load k_block again
+        row_offsets_k = (start + tl.arange(0, BLOCK_N)) * D * 2
+        col_offsets_k = tl.arange(0, D) * 2
+        k_offsets = row_offsets_k[:, None] + col_offsets_k[None, :]
+        mask_k = (tl.arange(0, BLOCK_N)[:, None] < bn) & (tl.arange(0, D)[None, :] < D)
+        k_block_f16 = tl.load(K + k_offsets, mask=mask_k, other=tl.float16(0.0))
+        k_block = k_block_f16.to(tl.float32)
+
+        scores = tl.sum(k_block * q[None, :], axis=1) * scale
+        scores = tl.where(tl.arange(0, BLOCK_N) < bn, scores, tl.float32('-1e9'))
+
+        # Load v_block
+        row_offsets_v = (start + tl.arange(0, BLOCK_N)) * Dv * 2
+        col_offsets_v = tl.arange(0, Dv) * 2
+        v_offsets = row_offsets_v[:, None] + col_offsets_v[None, :]
+        mask_v = (tl.arange(0, BLOCK_N)[:, None] < bn) & (tl.arange(0, Dv)[None, :] < Dv)
+        v_block_f16 = tl.load(V + v_offsets, mask=mask_v, other=tl.float16(0.0))
+        v_block = v_block_f16.to(tl.float32)
+
+        probs = tl.exp(scores - m) / denom
+        contrib = probs[:, None] * v_block
+        o_acc += tl.sum(contrib, axis=0)
+
+        start += BLOCK_N
+
+    o_offset = pid * Dv * 2
+    tl.store(O + o_offset, o_acc.to(tl.float16))
+
+
 def ragged_attn(Q: torch.Tensor, K: torch.Tensor, V: torch.Tensor, row_lens: torch.Tensor) -> torch.Tensor:
-    assert Q.is_cuda and K.is_cuda and V.is_cuda and row_lens.is_cuda
-    scale = 1 / math.sqrt(Q.shape[-1])
     M, D = Q.shape
-    N, Dv = V.shape
-    O = torch.empty((M, Dv), dtype=Q.dtype, device=Q.device)
-    row_lens_cpu = row_lens.to(torch.int32)
-    BLOCK_M = 64
-    BLOCK_N = 64
-    MAX_K_BLOCKS = 16
-    grid = lambda meta: (triton.cdiv(M, meta['BLOCK_M']),)
-    @triton.jit
-    def kernel(
-        Q, K, V, row_lens, O,
-        scale: tl.constexpr,
-        BLOCK_M: tl.constexpr,
-        BLOCK_N: tl.constexpr,
-        MAX_K_BLOCKS: tl.constexpr
-    ):
-        pid = tl.program_id(0)
-        block_start_q = pid * BLOCK_M
-        offs_q = block_start_q + tl.arange(0, BLOCK_M)
-        q_mask = offs_q < Q.shape[0]
-        q = tl.load(Q[offs_q, :], mask=q_mask[:, None], other=0.0)
-        row_lens_local = tl.load(row_lens[offs_q], mask=q_mask, other=0, dtype=tl.int32)
-        INITIAL_M = -1e5
-        m = tl.full((BLOCK_M,), INITIAL_M, dtype=tl.float32)
-        l = tl.zeros((BLOCK_M,), dtype=tl.float32)
-        o = tl.zeros((BLOCK_M, Dv), dtype=tl.float32)
-        for bk in range(MAX_K_BLOCKS):
-            start_k = bk * BLOCK_N
-            if start_k >= V.shape[0]:
-                break
-            offs_k = start_k + tl.arange(0, BLOCK_N)
-            k_mask = offs_k < V.shape[0]
-            k = tl.load(K[offs_k, :], mask=k_mask[:, None], other=0.0)
-            scores = tl.sum(q[:, None, :] * k[None, :, :], axis=-1) * scale
-            v = tl.load(V[offs_k, :], mask=k_mask[:, None], other=0.0)
-            for local_q in range(BLOCK_M):
-                if not q_mask[local_q]:
-                    continue
-                row_len = row_lens_local[local_q]
-                num_valid = tl.where(
-                    row_len > start_k,
-                    tl.minimum(tl.constexpr(BLOCK_N), row_len - start_k),
-                    tl.constexpr(0)
-                )
-                local_max = INITIAL_M
-                for local_k in range(BLOCK_N):
-                    if local_k < num_valid and k_mask[local_k]:
-                        local_max = tl.maximum(local_max, scores[local_q, local_k])
-                if local_max == INITIAL_M:
-                    continue
-                m_new = tl.maximum(m[local_q], local_max)
-                exp_old_scale = l[local_q] * tl.exp(m[local_q] - m_new)
-                sum_exp_new = 0.0
-                for local_k in range(BLOCK_N):
-                    if local_k < num_valid and k_mask[local_k]:
-                        sum_exp_new += tl.exp(scores[local_q, local_k] - m_new)
-                l_new = exp_old_scale + sum_exp_new
-                if l_new == 0.0:
-                    continue
-                scaling = exp_old_scale / l_new
-                o[local_q] *= scaling
-                contrib = tl.zeros((Dv,), dtype=tl.float32)
-                for local_k in range(BLOCK_N):
-                    if local_k < num_valid and k_mask[local_k]:
-                        e = tl.exp(scores[local_q, local_k] - m_new)
-                        contrib += e * v[local_k]
-                o[local_q] += contrib / l_new
-                m[local_q] = m_new
-                l[local_q] = l_new
-        o_mask = offs_q < O.shape[0]
-        tl.store(O[offs_q, :], o.to(tl.float16), mask=o_mask[:, None])
-    kernel[grid](
-        Q, K, V, row_lens_cpu, O,
-        scale=scale,
-        BLOCK_M=BLOCK_M,
-        BLOCK_N=BLOCK_N,
-        MAX_K_BLOCKS=MAX_K_BLOCKS,
-        num_stages=4,
-        num_warps=4
-    )
-    return O
-'''
+    N, _ = K.shape
+    _, Dv = V.shape
+    output = torch.empty((M, Dv), dtype=Q.dtype, device=Q.device)
+    scale = 1 / math.sqrt(D)
+    row_lens_i32 = row_lens.to(torch.int32)
+    BLOCK_N = 128
+    ragged_kernel[grid=(M,)](Q, K, V, output, row_lens_i32, M, N, D, Dv, scale, BLOCK_N=BLOCK_N)
+    return output
+"""
         return {"code": code}

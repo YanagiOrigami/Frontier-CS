@@ -1,96 +1,58 @@
 import pandas as pd
-import numpy as np
 
 
 class Solution:
-    def _apply_col_merge(self, df: pd.DataFrame, col_merge) -> pd.DataFrame:
-        if col_merge is None:
+    def _apply_col_merge(self, df: pd.DataFrame, col_merge):
+        if not col_merge:
             return df
 
-        df_merged = df.copy()
+        df = df.copy()
         for group in col_merge:
-            if group is None:
+            if not group:
                 continue
 
-            # Normalize group to list
-            if isinstance(group, (str, int)):
-                raw_list = [group]
-            else:
-                try:
-                    raw_list = list(group)
-                except TypeError:
-                    raw_list = [group]
-
-            group_cols = []
-            for x in raw_list:
-                # Prefer explicit string column names
-                if isinstance(x, str) and x in df_merged.columns:
-                    if x not in group_cols:
-                        group_cols.append(x)
-                elif isinstance(x, int):
-                    # Try 0-based index
-                    if 0 <= x < len(df_merged.columns):
-                        name = df_merged.columns[x]
-                        if name not in group_cols:
-                            group_cols.append(name)
-                    # Fallback: 1-based index
-                    elif 1 <= x <= len(df_merged.columns):
-                        name = df_merged.columns[x - 1]
-                        if name not in group_cols:
-                            group_cols.append(name)
+            # Resolve group items to column names that currently exist in df
+            names = []
+            for item in group:
+                if isinstance(item, int):
+                    # Treat as column index
+                    if 0 <= item < len(df.columns):
+                        names.append(df.columns[item])
                 else:
-                    sx = str(x)
-                    if sx in df_merged.columns and sx not in group_cols:
-                        group_cols.append(sx)
+                    # Treat as column name
+                    if item in df.columns:
+                        names.append(item)
 
-            # Only merge if at least two existing columns are in the group
-            if len(group_cols) <= 1:
+            # Remove duplicates while preserving order
+            if not names:
+                continue
+            names = list(dict.fromkeys(names))
+
+            # Ensure at least two distinct columns and all still exist
+            if len(names) <= 1:
+                continue
+            if not all(name in df.columns for name in names):
                 continue
 
-            base_name = "MERGED_" + "_".join(map(str, group_cols))
+            # Determine insertion position (position of first column in group)
+            first_idx = min(df.columns.get_loc(name) for name in names)
+
+            # Create a unique merged column name
+            base_name = "_MERGED_".join(map(str, names))
             new_name = base_name
             suffix = 1
-            while new_name in df_merged.columns:
-                new_name = f"{base_name}_{suffix}"
+            while new_name in df.columns:
                 suffix += 1
+                new_name = f"{base_name}_{suffix}"
 
-            merged_series = df_merged[group_cols].astype(str).agg("".join, axis=1)
-            df_merged = df_merged.drop(columns=group_cols)
-            df_merged[new_name] = merged_series
+            # Concatenate string representations of the group columns
+            merged_series = df[names].astype(str).agg("".join, axis=1)
 
-        return df_merged
+            # Drop original columns and insert merged column
+            df = df.drop(columns=names)
+            df.insert(first_idx, new_name, merged_series)
 
-    @staticmethod
-    def _lcp_len_strings(a: str, b: str) -> int:
-        limit = min(len(a), len(b))
-        i = 0
-        while i < limit and a[i] == b[i]:
-            i += 1
-        return i
-
-    def _approx_order_score(self, order, col_sample_vals) -> float:
-        if not order or not col_sample_vals:
-            return 0.0
-
-        # All value lists have same length
-        any_col = next(iter(col_sample_vals))
-        sample_size = len(col_sample_vals[any_col])
-        if sample_size <= 1:
-            return 0.0
-
-        # Build concatenated strings for each sampled row
-        S = [
-            "".join(col_sample_vals[col][r] for col in order)
-            for r in range(sample_size)
-        ]
-
-        S.sort()
-        total_lcp = 0
-        prev = S[0]
-        for s in S[1:]:
-            total_lcp += self._lcp_len_strings(prev, s)
-            prev = s
-        return float(total_lcp)
+        return df
 
     def solve(
         self,
@@ -103,131 +65,217 @@ class Solution:
         distinct_value_threshold: float = 0.7,
         parallel: bool = True,
     ) -> pd.DataFrame:
-        # Step 1: apply column merges
-        df_work = df.copy()
-        if col_merge is not None and len(col_merge) > 0:
-            df_work = self._apply_col_merge(df_work, col_merge)
+        # Work on a copy to avoid mutating the input DataFrame
+        if col_merge:
+            df_work = self._apply_col_merge(df, col_merge)
+        else:
+            df_work = df.copy()
 
-        num_cols = df_work.shape[1]
-        num_rows = df_work.shape[0]
-
-        if num_cols <= 1 or num_rows <= 1:
+        n_rows = len(df_work)
+        if n_rows == 0:
             return df_work
 
-        # String view for statistics and scoring
-        df_str = df_work.astype(str)
-        columns = list(df_str.columns)
-        N = num_rows
-        denom_pairs = N * (N - 1) if N > 1 else 1
+        col_names = list(df_work.columns)
+        m_cols = len(col_names)
+        if m_cols <= 1:
+            return df_work
 
-        # Sampling for per-column adjacency LCP statistics
-        max_sample_stats = 3000
-        sample_n_stats = min(N, max_sample_stats)
-        if sample_n_stats <= 1:
-            sample_idx_stats = np.arange(sample_n_stats)
+        # Determine number of rows to sample for optimization
+        if early_stop is not None and early_stop > 0:
+            sample_n = min(n_rows, int(early_stop))
         else:
-            sample_idx_stats = np.linspace(0, N - 1, sample_n_stats, dtype=int)
+            sample_n = n_rows
 
-        col_stats = []
+        if sample_n < 2:
+            # Not enough rows to estimate prefix sharing; return as is
+            return df_work
 
-        for col in columns:
-            s_col = df_str[col]
+        # Use first sample_n rows for statistics
+        df_sample = df_work.iloc[:sample_n]
+
+        # Precompute per-column string data, average lengths, distinct ratios, and pair counts
+        data_cols = []          # list of list-of-str per column
+        weights = []            # average string length per column
+        P1 = []                 # sum_{values} C(count, 2) for single column
+        distinct_ratio = []     # distinct values / sample_n
+
+        for col in col_names:
+            series_str = df_sample[col].astype(str)
+            col_list = series_str.tolist()
+            data_cols.append(col_list)
 
             # Average string length
-            lengths = s_col.str.len()
-            avg_len = float(lengths.mean()) if N > 0 else 0.0
+            total_len = 0
+            for s in col_list:
+                total_len += len(s)
+            avg_len = total_len / sample_n if sample_n > 0 else 0.0
+            weights.append(avg_len)
 
-            # Equality probability via value counts
-            vc = s_col.value_counts(dropna=False, sort=False)
-            counts = vc.values.astype("int64")
-            num_unique = len(vc)
+            # Value counts for distinct ratio and P1
+            counts = {}
+            for v in col_list:
+                counts[v] = counts.get(v, 0) + 1
 
-            if N > 1:
-                same_pairs = int((counts * (counts - 1)).sum())
-                same_prob = same_pairs / denom_pairs
-            else:
-                same_prob = 1.0
+            p1 = 0
+            for cnt in counts.values():
+                if cnt > 1:
+                    p1 += cnt * (cnt - 1) // 2
+            P1.append(p1)
+            distinct_ratio.append(len(counts) / sample_n)
 
-            if same_prob < 0.0:
-                same_prob = 0.0
-            elif same_prob > 1.0:
-                same_prob = 1.0
+        indices = list(range(m_cols))
 
-            distinct_ratio = num_unique / N if N > 0 else 0.0
+        # Base score: average length * pair count for equality in that column
+        base_score = [weights[i] * P1[i] for i in indices]
 
-            # Approximate mean adjacent LCP on a sample of this column
-            if sample_n_stats > 1 and avg_len > 0.0:
-                sample_vals = s_col.iloc[sample_idx_stats].tolist()
-                sample_vals.sort()
-                total_lcp = 0
-                prev = sample_vals[0]
-                for v in sample_vals[1:]:
-                    total_lcp += self._lcp_len_strings(prev, v)
-                    prev = v
-                adj_lcp_mean = total_lcp / (sample_n_stats - 1)
-            else:
-                adj_lcp_mean = 0.0
+        # Base orderings: by descending base_score, and by distinct ratio
+        order_score_desc = sorted(
+            indices,
+            key=lambda j: (-base_score[j], weights[j], j),
+        )
 
-            eq_score = same_prob * avg_len
-            base = eq_score + 0.1 * adj_lcp_mean
+        order_distinct = sorted(
+            indices,
+            key=lambda j: (
+                distinct_ratio[j] >= distinct_value_threshold,
+                distinct_ratio[j],
+                -weights[j],
+                j,
+            ),
+        )
 
-            # Penalize very high-cardinality columns
-            if distinct_ratio > distinct_value_threshold:
-                base *= 0.5
+        original_order = list(range(m_cols))
 
-            if same_prob >= 1.0 - 1e-9:
-                priority = float("inf")
-            else:
-                priority = base / (1.0 - same_prob + 1e-9)
+        # Evaluation function for a permutation using the pair-based surrogate objective
+        def evaluate_perm(perm):
+            n = sample_n
+            pre_keys = [None] * n
+            total = 0.0
+            data_cols_local = data_cols
+            weights_local = weights
 
-            col_stats.append((col, priority, same_prob, avg_len))
+            for col_idx in perm:
+                col_data = data_cols_local[col_idx]
+                mapping = {}
+                get_mapping = mapping.get
 
-        # Initial heuristic ordering
-        col_stats.sort(key=lambda x: (x[1], x[2], x[3]), reverse=True)
-        order = [c[0] for c in col_stats]
+                # Build groups for current prefix
+                for i in range(n):
+                    prev_key = pre_keys[i]
+                    v = col_data[i]
+                    if prev_key is None:
+                        key = v
+                    else:
+                        key = (prev_key, v)
+                    pre_keys[i] = key
 
-        # Prepare shared samples for approximate permutation scoring
-        max_sample_order = 2000
-        sample_n_order = min(N, max_sample_order)
-        if sample_n_order <= 1:
-            # Not enough rows to benefit from reordering
-            return df_work.loc[:, order]
+                    cnt = get_mapping(key)
+                    if cnt is None:
+                        mapping[key] = 1
+                    else:
+                        mapping[key] = cnt + 1
 
-        if sample_n_order == N:
-            sample_idx_order = np.arange(N)
-        else:
-            sample_idx_order = np.linspace(0, N - 1, sample_n_order, dtype=int)
+                # Compute number of equal-prefix pairs at this depth
+                pairs = 0
+                for cnt in mapping.values():
+                    if cnt > 1:
+                        pairs += cnt * (cnt - 1) // 2
 
-        col_sample_vals = {
-            col: df_str[col].iloc[sample_idx_order].tolist() for col in columns
-        }
+                total += weights_local[col_idx] * pairs
 
-        # Local search (pairwise swap hill-climbing) on approximate score
-        best_order = order[:]
-        best_score = self._approx_order_score(best_order, col_sample_vals)
-        eval_count = 1
-        max_iterations = max(1, col_stop * num_cols)
+            return total
 
-        for _ in range(max_iterations):
-            improved = False
-            m = len(best_order)
-            current_order = best_order
+        # Search for a good permutation
+        max_evals = 200  # hard cap on the number of full evaluations
 
-            for i in range(m):
-                for j in range(i + 1, m):
-                    if eval_count >= early_stop:
-                        break
-                    candidate = current_order[:]
-                    candidate[i], candidate[j] = candidate[j], candidate[i]
-                    score = self._approx_order_score(candidate, col_sample_vals)
+        best_perm = None
+        best_score = None
+        eval_count = 0
+        visited = set()
+
+        def eval_and_update(perm):
+            nonlocal best_perm, best_score, eval_count
+            t = tuple(perm)
+            if t in visited:
+                return
+            visited.add(t)
+            score = evaluate_perm(perm)
+            eval_count += 1
+            if best_score is None or score > best_score:
+                best_score = score
+                best_perm = perm
+
+        # Evaluate baseline permutations
+        eval_and_update(original_order)
+        eval_and_update(order_score_desc)
+        eval_and_update(list(reversed(order_score_desc)))
+        eval_and_update(order_distinct)
+        eval_and_update(list(reversed(order_distinct)))
+
+        # Greedy construction guided by full-evaluation surrogate
+        def greedy_build(reverse_tail=False):
+            nonlocal best_perm, best_score, eval_count
+            prefix = []
+            remaining = list(range(m_cols))
+
+            while remaining and eval_count < max_evals:
+                best_local_c = None
+                best_local_score = None
+
+                for c in remaining:
+                    # Tail order for remaining columns (after choosing c next)
+                    tail = [x for x in remaining if x != c]
+                    if tail:
+                        if not reverse_tail:
+                            tail_sorted = sorted(
+                                tail,
+                                key=lambda j: (-base_score[j], weights[j], j),
+                            )
+                        else:
+                            tail_sorted = sorted(
+                                tail,
+                                key=lambda j: (base_score[j], -weights[j], j),
+                            )
+                    else:
+                        tail_sorted = []
+
+                    perm = prefix + [c] + tail_sorted
+                    t_perm = tuple(perm)
+                    if t_perm in visited:
+                        continue
+
+                    score = evaluate_perm(perm)
+                    visited.add(t_perm)
                     eval_count += 1
-                    if score > best_score:
-                        best_score = score
-                        best_order = candidate
-                        improved = True
-                if eval_count >= early_stop:
-                    break
-            if not improved or eval_count >= early_stop:
-                break
 
-        return df_work.loc[:, best_order]
+                    if best_score is None or score > best_score:
+                        best_score = score
+                        best_perm = perm
+
+                    if best_local_score is None or score > best_local_score:
+                        best_local_score = score
+                        best_local_c = c
+
+                    if eval_count >= max_evals:
+                        break
+
+                if best_local_c is None:
+                    # No new permutations evaluated (all visited or eval cap reached)
+                    break
+
+                prefix.append(best_local_c)
+                remaining.remove(best_local_c)
+
+        greedy_build(False)
+        if eval_count < max_evals:
+            greedy_build(True)
+
+        # Fallback in case something went wrong
+        if best_perm is None:
+            best_perm = order_score_desc
+
+        # Reorder columns of the working DataFrame according to best_perm
+        reordered_cols = [col_names[i] for i in best_perm]
+        df_out = df_work[reordered_cols]
+
+        return df_out

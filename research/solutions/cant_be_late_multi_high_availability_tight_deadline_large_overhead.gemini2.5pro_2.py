@@ -1,20 +1,26 @@
 import json
-from argparse import Namespace
 import collections
+from argparse import Namespace
 
 from sky_spot.strategies.multi_strategy import MultiRegionStrategy
 from sky_spot.utils import ClusterType
 
 
 class Solution(MultiRegionStrategy):
-    NAME = "adaptive_ema_v1"
+    """Your multi-region scheduling strategy."""
 
-    SAFETY_BUFFER = 1.20
-    MAX_WAIT_STEPS = 1
-    EMA_ALPHA = 0.1
-    SWITCH_THRESHOLD = 0.2
+    NAME = "my_strategy"  # REQUIRED: unique identifier
 
     def solve(self, spec_path: str) -> "Solution":
+        """
+        Initialize the solution from spec_path config.
+
+        The spec file contains:
+        - deadline: deadline in hours
+        - duration: task duration in hours
+        - overhead: restart overhead in hours
+        - trace_files: list of trace file paths (one per region)
+        """
         with open(spec_path) as f:
             config = json.load(f)
 
@@ -26,72 +32,108 @@ class Solution(MultiRegionStrategy):
         )
         super().__init__(args)
 
-        self.num_regions = len(config["trace_files"])
-        initial_availability = 0.5
-        self.ema_spot_availability = [initial_availability] * self.num_regions
-        self.consecutive_outages = [0] * self.num_regions
+        self.num_regions = self.env.get_num_regions()
+
+        # Hyperparameters
+        self.HISTORY_WINDOW = 24
+        self.CRITICAL_BUFFER_SECONDS = self.restart_overhead
+        self.SWITCH_SCORE_THRESHOLD = 0.80
+        self.EXPLORE_HISTORY_THRESHOLD = 6
+
+        # State tracking
+        self.region_stats = {
+            i: {'history': collections.deque(maxlen=self.HISTORY_WINDOW)}
+            for i in range(self.num_regions)
+        }
+        self.unexplored_regions = set(range(self.num_regions))
+        
+        # Optimization to avoid re-calculating sum() over a long list.
+        self.cached_work_done = 0.0
+        self.last_task_done_time_len = 0
 
         return self
 
-    def _step(self, last_cluster_type: ClusterType, has_spot: bool) -> ClusterType:
-        current_region = self.env.get_current_region()
-        self._update_region_stats(current_region, has_spot)
+    def _get_score(self, region_idx: int) -> float:
+        """Calculate the recent spot availability score for a region."""
+        if region_idx in self.unexplored_regions:
+            return 1.0
 
-        remaining_work = self.task_duration - sum(self.task_done_time)
-        if remaining_work <= 0:
+        history = self.region_stats[region_idx]['history']
+        if not history:
+            return 1.0
+
+        return sum(history) / len(history)
+
+    def _step(self, last_cluster_type: ClusterType, has_spot: bool) -> ClusterType:
+        """
+        Decide next action based on current state.
+
+        Available attributes:
+        - self.env.get_current_region(): Get current region index
+        - self.env.get_num_regions(): Get total number of regions
+        - self.env.switch_region(idx): Switch to region by index
+        - self.env.elapsed_seconds: Current time elapsed
+        - self.task_duration: Total task duration needed (seconds)
+        - self.deadline: Deadline time (seconds)
+        - self.restart_overhead: Restart overhead (seconds)
+        - self.task_done_time: List of completed work segments
+        - self.remaining_restart_overhead: Current pending overhead
+
+        Returns: ClusterType.SPOT, ClusterType.ON_DEMAND, or ClusterType.NONE
+        """
+        current_region = self.env.get_current_region()
+
+        self.region_stats[current_region]['history'].append(1 if has_spot else 0)
+        if current_region in self.unexplored_regions:
+            if len(self.region_stats[current_region]['history']) >= self.EXPLORE_HISTORY_THRESHOLD:
+                self.unexplored_regions.discard(current_region)
+
+        if len(self.task_done_time) > self.last_task_done_time_len:
+            self.cached_work_done += sum(self.task_done_time[self.last_task_done_time_len:])
+            self.last_task_done_time_len = len(self.task_done_time)
+        
+        work_remaining = self.task_duration - self.cached_work_done
+        if work_remaining <= 0:
             return ClusterType.NONE
 
-        if self._is_urgent(remaining_work):
+        time_left = self.deadline - self.env.elapsed_seconds
+        time_needed_for_od = work_remaining + self.restart_overhead
+        
+        if time_needed_for_od >= time_left - self.CRITICAL_BUFFER_SECONDS:
             return ClusterType.ON_DEMAND
 
         if has_spot:
             return ClusterType.SPOT
+        
+        target_region = -1
+        
+        unexplored_targets = self.unexplored_regions - {current_region}
+        if unexplored_targets:
+            target_region = sorted(list(unexplored_targets))[0]
         else:
-            return self._handle_spot_outage(current_region)
+            best_alt_score = -1.0
+            best_alt_region = -1
+            for r in range(self.num_regions):
+                if r == current_region:
+                    continue
+                score = self._get_score(r)
+                if score > best_alt_score:
+                    best_alt_score = score
+                    best_alt_region = r
+            
+            if best_alt_score > self.SWITCH_SCORE_THRESHOLD:
+                target_region = best_alt_region
 
-    def _update_region_stats(self, current_region: int, has_spot: bool):
-        spot_now = 1.0 if has_spot else 0.0
-        current_ema = self.ema_spot_availability[current_region]
-        self.ema_spot_availability[current_region] = (
-            self.EMA_ALPHA * spot_now + (1 - self.EMA_ALPHA) * current_ema
-        )
+        if target_region != -1:
+            is_switch_safe = (self.env.elapsed_seconds + self.restart_overhead + work_remaining) < self.deadline - self.CRITICAL_BUFFER_SECONDS
+            if is_switch_safe:
+                self.env.switch_region(target_region)
+                return ClusterType.ON_DEMAND
 
-        if has_spot:
-            self.consecutive_outages[current_region] = 0
-        else:
-            self.consecutive_outages[current_region] += 1
-
-    def _is_urgent(self, remaining_work: float) -> bool:
-        remaining_time = self.deadline - self.env.elapsed_seconds
-        effective_remaining_time = remaining_time - self.remaining_restart_overhead
-        on_demand_finish_time = remaining_work
-        return effective_remaining_time < on_demand_finish_time * self.SAFETY_BUFFER
-
-    def _handle_spot_outage(self, current_region: int) -> ClusterType:
-        if self.consecutive_outages[current_region] <= self.MAX_WAIT_STEPS:
+        slack = time_left - work_remaining
+        wait_threshold = self.restart_overhead + self.env.gap_seconds
+        
+        if slack > wait_threshold:
             return ClusterType.NONE
-
-        best_alt_region, best_alt_ema = self._find_best_alternative_region(
-            current_region
-        )
-
-        current_ema = self.ema_spot_availability[current_region]
-
-        if best_alt_region != -1 and best_alt_ema > current_ema + self.SWITCH_THRESHOLD:
-            self.env.switch_region(best_alt_region)
-            return ClusterType.ON_DEMAND
         else:
             return ClusterType.ON_DEMAND
-
-    def _find_best_alternative_region(self, current_region: int) -> tuple[int, float]:
-        best_region = -1
-        best_ema = -1.0
-
-        for i in range(self.num_regions):
-            if i == current_region:
-                continue
-            if self.ema_spot_availability[i] > best_ema:
-                best_ema = self.ema_spot_availability[i]
-                best_region = i
-
-        return best_region, best_ema

@@ -6,7 +6,7 @@ from sky_spot.utils import ClusterType
 
 
 class Solution(MultiRegionStrategy):
-    NAME = "spot_hunter"
+    NAME = "my_strategy"
 
     def solve(self, spec_path: str) -> "Solution":
         with open(spec_path) as f:
@@ -20,57 +20,68 @@ class Solution(MultiRegionStrategy):
         )
         super().__init__(args)
 
-        trace_files = config.get("trace_files", [])
-        num_regions = self.env.get_num_regions()
-        self.availability = []
-        for i in range(num_regions):
-            path = trace_files[i]
+        # Load traces
+        self.traces = []
+        for path in config["trace_files"]:
             with open(path, 'r') as f:
                 trace = json.load(f)
-            self.availability.append([bool(x) for x in trace])
-        self.num_steps = len(self.availability[0]) if self.availability else 0
-
-        self.streaks = [[0] * self.num_steps for _ in range(num_regions)]
-        for r in range(num_regions):
-            streak = 0
-            for s in range(self.num_steps - 1, -1, -1):
-                if self.availability[r][s]:
-                    streak += 1
-                else:
-                    streak = 0
-                self.streaks[r][s] = streak
+                self.traces.append([bool(x) for x in trace])
+        self.num_regions = len(self.traces)
+        if self.num_regions > 0:
+            self.T = len(self.traces[0])
+        else:
+            self.T = 0
 
         return self
 
     def _step(self, last_cluster_type: ClusterType, has_spot: bool) -> ClusterType:
-        progress = sum(self.task_done_time)
-        if progress >= self.task_duration:
+        current_region = self.env.get_current_region()
+        elapsed = self.env.elapsed_seconds
+        gap = self.env.gap_seconds
+        current_step = int(elapsed // gap)
+
+        total_progress = sum(self.task_done_time)
+        if total_progress >= self.task_duration:
             return ClusterType.NONE
 
-        current_region = self.env.get_current_region()
-        num_regions = self.env.get_num_regions()
-        current_step = int(self.env.elapsed_seconds // self.env.gap_seconds)
-        if current_step >= self.num_steps:
+        remaining_time = self.deadline - elapsed
+        if remaining_time <= 0:
+            return ClusterType.NONE
+
+        if current_step >= self.T:
             return ClusterType.ON_DEMAND
 
-        max_streak = 0
-        best_r = current_region
-        if self.availability[current_region][current_step]:
-            max_streak = self.streaks[current_region][current_step]
-            best_r = current_region
+        # Compute remaining steps approx
+        remaining_steps_approx = int(remaining_time // gap) + 1
 
-        for r in range(num_regions):
-            if r == current_region:
-                continue
-            if self.availability[r][current_step]:
-                s = self.streaks[r][current_step]
-                if s > max_streak:
-                    max_streak = s
-                    best_r = r
+        # Find best region
+        best_region = current_region
+        best_score = -float('inf')
+        switch_penalty = 1.0
 
-        if max_streak > 0:
-            if best_r != current_region:
-                self.env.switch_region(best_r)
+        for r in range(self.num_regions):
+            max_t = min(self.T, current_step + remaining_steps_approx)
+            if max_t <= current_step:
+                total_spot = 0
+            else:
+                total_spot = sum(1 for t in range(current_step, max_t) if self.traces[r][t])
+            is_switch = 1 if r != current_region else 0
+            score = total_spot - is_switch * switch_penalty
+            if score > best_score:
+                best_score = score
+                best_region = r
+
+        # Switch if better
+        if best_region != current_region:
+            self.env.switch_region(best_region)
+
+        # Now check has_spot in new region
+        new_region = self.env.get_current_region()  # should be best_region
+        new_has_spot = False
+        if current_step < self.T and new_region < self.num_regions and current_step < len(self.traces[new_region]):
+            new_has_spot = self.traces[new_region][current_step]
+
+        if new_has_spot:
             return ClusterType.SPOT
         else:
             return ClusterType.ON_DEMAND

@@ -1,512 +1,469 @@
-import math
 import torch
 import triton
 import triton.language as tl
 
 
 @triton.jit
-def _pass1_logsumexp_kernel(
-    X_ptr, W1_ptr, B1_ptr, W2_ptr, B2_ptr,
-    S1_ptr, S2_ptr,
+def _pass1_lse_kernel(
+    X_ptr, W1_ptr, W2_ptr, B1_ptr, B2_ptr,
+    LSE1_ptr, LSE2_ptr,
     M, N, K,
-    stride_xm, stride_xk,
-    stride_w1k, stride_w1n,
-    stride_w2k, stride_w2n,
-    stride_b1, stride_b2,
-    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr
+    stride_x_m, stride_x_k,
+    stride_w_k, stride_w_n,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
 ):
     pid_m = tl.program_id(0)
-    rm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
-    mask_rm = rm < M
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    mask_m = offs_m < M
 
-    # initialize running max and sumexp for both branches
-    neg_inf = tl.full([BLOCK_M], -float("inf"), dtype=tl.float32)
-    max1 = neg_inf
-    max2 = neg_inf
-    sumexp1 = tl.zeros([BLOCK_M], dtype=tl.float32)
-    sumexp2 = tl.zeros([BLOCK_M], dtype=tl.float32)
+    # Running log-sum-exp accumulators per row
+    neg_inf = -1e9
+    m1 = tl.full((BLOCK_M,), neg_inf, dtype=tl.float32)
+    s1 = tl.zeros((BLOCK_M,), dtype=tl.float32)
+    m2 = tl.full((BLOCK_M,), neg_inf, dtype=tl.float32)
+    s2 = tl.zeros((BLOCK_M,), dtype=tl.float32)
 
-    rn = tl.arange(0, BLOCK_N)
+    offs_k_inner = tl.arange(0, BLOCK_K)
 
-    # iterate over N in tiles
-    col_start = 0
-    while col_start < N:
-        cn = col_start + rn
-        mask_cn = cn < N
+    for n0 in range(0, N, BLOCK_N):
+        offs_n = n0 + tl.arange(0, BLOCK_N)
+        mask_n = offs_n < N
 
-        # compute logits tiles for both branches: Y = X @ W + B
         acc1 = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
         acc2 = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
 
-        rk = tl.arange(0, BLOCK_K)
-        k_start = 0
-        while k_start < K:
-            kk = k_start + rk
-            mask_kk = kk < K
+        for k0 in range(0, K, BLOCK_K):
+            offs_k = k0 + offs_k_inner
 
-            x_ptrs = X_ptr + (rm[:, None] * stride_xm + kk[None, :] * stride_xk)
-            x_tile = tl.load(x_ptrs, mask=mask_rm[:, None] & mask_kk[None, :], other=0.0).to(tl.float16)
+            # Load tiles
+            x_ptrs = X_ptr + offs_m[:, None] * stride_x_m + offs_k[None, :] * stride_x_k
+            x = tl.load(x_ptrs, mask=(mask_m[:, None] & (offs_k[None, :] < K)), other=0.0)
 
-            w1_ptrs = W1_ptr + (kk[:, None] * stride_w1k + cn[None, :] * stride_w1n)
-            w2_ptrs = W2_ptr + (kk[:, None] * stride_w2k + cn[None, :] * stride_w2n)
-            w_mask = mask_kk[:, None] & mask_cn[None, :]
+            w1_ptrs = W1_ptr + offs_k[:, None] * stride_w_k + offs_n[None, :] * stride_w_n
+            w2_ptrs = W2_ptr + offs_k[:, None] * stride_w_k + offs_n[None, :] * stride_w_n
+            w1 = tl.load(w1_ptrs, mask=((offs_k[:, None] < K) & (offs_n[None, :] < N)), other=0.0)
+            w2 = tl.load(w2_ptrs, mask=((offs_k[:, None] < K) & (offs_n[None, :] < N)), other=0.0)
 
-            w1_tile = tl.load(w1_ptrs, mask=w_mask, other=0.0)
-            w2_tile = tl.load(w2_ptrs, mask=w_mask, other=0.0)
+            acc1 += tl.dot(x, w1)
+            acc2 += tl.dot(x, w2)
 
-            acc1 += tl.dot(x_tile, w1_tile)
-            acc2 += tl.dot(x_tile, w2_tile)
-
-            k_start += BLOCK_K
-
-        # add bias
-        b1 = tl.load(B1_ptr + cn * stride_b1, mask=mask_cn, other=0.0).to(tl.float32)
-        b2 = tl.load(B2_ptr + cn * stride_b2, mask=mask_cn, other=0.0).to(tl.float32)
+        # Add bias
+        b1 = tl.load(B1_ptr + offs_n, mask=mask_n, other=0.0)
+        b2 = tl.load(B2_ptr + offs_n, mask=mask_n, other=0.0)
         acc1 += b1[None, :]
         acc2 += b2[None, :]
 
-        # mask out-of-range columns with -inf to not affect max/sumexp
-        acc1 = tl.where(mask_cn[None, :], acc1, -float("inf"))
-        acc2 = tl.where(mask_cn[None, :], acc2, -float("inf"))
+        valid = mask_n[None, :]
+        acc1_masked = tl.where(valid, acc1, neg_inf)
+        acc2_masked = tl.where(valid, acc2, neg_inf)
 
-        # update running logsumexp for branch 1
-        tile_max1 = tl.max(acc1, axis=1)
-        new_max1 = tl.maximum(max1, tile_max1)
-        # exp(max1 - new_max1) may be 0 when max1 is -inf; that's fine
-        sumexp1 = sumexp1 * tl.exp(max1 - new_max1) + tl.sum(tl.exp(acc1 - new_max1[:, None]), axis=1)
-        max1 = new_max1
+        tile_max1 = tl.max(acc1_masked, axis=1)
+        tile_max2 = tl.max(acc2_masked, axis=1)
 
-        # update running logsumexp for branch 2
-        tile_max2 = tl.max(acc2, axis=1)
-        new_max2 = tl.maximum(max2, tile_max2)
-        sumexp2 = sumexp2 * tl.exp(max2 - new_max2) + tl.sum(tl.exp(acc2 - new_max2[:, None]), axis=1)
-        max2 = new_max2
+        # sumexp within tile relative to tile_max
+        exp1 = tl.exp(acc1_masked - tile_max1[:, None])
+        exp2 = tl.exp(acc2_masked - tile_max2[:, None])
+        tile_sum1 = tl.sum(exp1, axis=1)
+        tile_sum2 = tl.sum(exp2, axis=1)
 
-        col_start += BLOCK_N
+        # Merge with running
+        new_m1 = tl.maximum(m1, tile_max1)
+        new_m2 = tl.maximum(m2, tile_max2)
+        s1 = s1 * tl.exp(m1 - new_m1) + tile_sum1 * tl.exp(tile_max1 - new_m1)
+        s2 = s2 * tl.exp(m2 - new_m2) + tile_sum2 * tl.exp(tile_max2 - new_m2)
+        m1 = new_m1
+        m2 = new_m2
 
-    # compute final S = log(sumexp) + max
-    S1 = tl.log(sumexp1) + max1
-    S2 = tl.log(sumexp2) + max2
+    # Finalize LSE
+    eps = 1e-20
+    s1 = tl.maximum(s1, eps)
+    s2 = tl.maximum(s2, eps)
+    lse1 = tl.log(s1) + m1
+    lse2 = tl.log(s2) + m2
 
-    # store results
-    tl.store(S1_ptr + rm, S1, mask=mask_rm)
-    tl.store(S2_ptr + rm, S2, mask=mask_rm)
+    tl.store(LSE1_ptr + offs_m, lse1, mask=mask_m)
+    tl.store(LSE2_ptr + offs_m, lse2, mask=mask_m)
 
 
 @triton.jit
 def _pass2_jsd_kernel(
-    X_ptr, W1_ptr, B1_ptr, W2_ptr, B2_ptr,
-    S1_ptr, S2_ptr, Out_ptr,
+    X_ptr, W1_ptr, W2_ptr, B1_ptr, B2_ptr,
+    LSE1_ptr, LSE2_ptr,
+    OUT_ptr,
     M, N, K,
-    stride_xm, stride_xk,
-    stride_w1k, stride_w1n,
-    stride_w2k, stride_w2n,
-    stride_b1, stride_b2,
-    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr
+    stride_x_m, stride_x_k,
+    stride_w_k, stride_w_n,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
 ):
     pid_m = tl.program_id(0)
-    rm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
-    mask_rm = rm < M
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    mask_m = offs_m < M
 
-    # load S1, S2 for these rows
-    S1 = tl.load(S1_ptr + rm, mask=mask_rm, other=0.0)
-    S2 = tl.load(S2_ptr + rm, mask=mask_rm, other=0.0)
-    S1 = S1[:, None]  # shape (BM, 1)
-    S2 = S2[:, None]
+    lse1 = tl.load(LSE1_ptr + offs_m, mask=mask_m, other=0.0)
+    lse2 = tl.load(LSE2_ptr + offs_m, mask=mask_m, other=0.0)
 
-    rn = tl.arange(0, BLOCK_N)
+    sum_plogp = tl.zeros((BLOCK_M,), dtype=tl.float32)
+    sum_qlogq = tl.zeros((BLOCK_M,), dtype=tl.float32)
+    sum_mlogm = tl.zeros((BLOCK_M,), dtype=tl.float32)
 
-    ln2 = 0.6931471805599453
-    accum = tl.zeros([BLOCK_M], dtype=tl.float32)
+    offs_k_inner = tl.arange(0, BLOCK_K)
+    eps = 1e-20
 
-    col_start = 0
-    while col_start < N:
-        cn = col_start + rn
-        mask_cn = cn < N
+    for n0 in range(0, N, BLOCK_N):
+        offs_n = n0 + tl.arange(0, BLOCK_N)
+        mask_n = offs_n < N
 
-        # compute logits tiles for both branches
         acc1 = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
         acc2 = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
 
-        rk = tl.arange(0, BLOCK_K)
-        k_start = 0
-        while k_start < K:
-            kk = k_start + rk
-            mask_kk = kk < K
+        for k0 in range(0, K, BLOCK_K):
+            offs_k = k0 + offs_k_inner
 
-            x_ptrs = X_ptr + (rm[:, None] * stride_xm + kk[None, :] * stride_xk)
-            x_tile = tl.load(x_ptrs, mask=mask_rm[:, None] & mask_kk[None, :], other=0.0).to(tl.float16)
+            x_ptrs = X_ptr + offs_m[:, None] * stride_x_m + offs_k[None, :] * stride_x_k
+            x = tl.load(x_ptrs, mask=(mask_m[:, None] & (offs_k[None, :] < K)), other=0.0)
 
-            w1_ptrs = W1_ptr + (kk[:, None] * stride_w1k + cn[None, :] * stride_w1n)
-            w2_ptrs = W2_ptr + (kk[:, None] * stride_w2k + cn[None, :] * stride_w2n)
-            w_mask = mask_kk[:, None] & mask_cn[None, :]
+            w1_ptrs = W1_ptr + offs_k[:, None] * stride_w_k + offs_n[None, :] * stride_w_n
+            w2_ptrs = W2_ptr + offs_k[:, None] * stride_w_k + offs_n[None, :] * stride_w_n
+            w1 = tl.load(w1_ptrs, mask=((offs_k[:, None] < K) & (offs_n[None, :] < N)), other=0.0)
+            w2 = tl.load(w2_ptrs, mask=((offs_k[:, None] < K) & (offs_n[None, :] < N)), other=0.0)
 
-            w1_tile = tl.load(w1_ptrs, mask=w_mask, other=0.0)
-            w2_tile = tl.load(w2_ptrs, mask=w_mask, other=0.0)
+            acc1 += tl.dot(x, w1)
+            acc2 += tl.dot(x, w2)
 
-            acc1 += tl.dot(x_tile, w1_tile)
-            acc2 += tl.dot(x_tile, w2_tile)
-
-            k_start += BLOCK_K
-
-        # add bias
-        b1 = tl.load(B1_ptr + cn * stride_b1, mask=mask_cn, other=0.0).to(tl.float32)
-        b2 = tl.load(B2_ptr + cn * stride_b2, mask=mask_cn, other=0.0).to(tl.float32)
+        b1 = tl.load(B1_ptr + offs_n, mask=(offs_n < N), other=0.0)
+        b2 = tl.load(B2_ptr + offs_n, mask=(offs_n < N), other=0.0)
         acc1 += b1[None, :]
         acc2 += b2[None, :]
 
-        # mask columns outside N
-        acc1 = tl.where(mask_cn[None, :], acc1, -float("inf"))
-        acc2 = tl.where(mask_cn[None, :], acc2, -float("inf"))
+        # Compute probabilities
+        shift1 = acc1 - lse1[:, None]
+        shift2 = acc2 - lse2[:, None]
 
-        # compute logP, logQ
-        logP = acc1 - S1  # broadcasting across columns
-        logQ = acc2 - S2
+        valid = (offs_n < N)[None, :]
+        # Zero out invalid columns
+        shift1 = tl.where(valid, shift1, -1e9)
+        shift2 = tl.where(valid, shift2, -1e9)
 
-        # exp(logP), exp(logQ) for P and Q
-        eP = tl.exp(logP)
-        eQ = tl.exp(logQ)
+        p = tl.exp(shift1)
+        q = tl.exp(shift2)
 
-        # logM = logsumexp(logP, logQ) - ln2
-        mx = tl.maximum(logP, logQ)
-        sum_exp = tl.exp(logP - mx) + tl.exp(logQ - mx)
-        logsum = mx + tl.log(sum_exp)
-        logM = logsum - ln2
+        # p*log p and q*log q
+        plogp = p * shift1
+        qlogq = q * shift2
 
-        # contributions; zero-out masked columns by ensuring eP/eQ are zero
-        contrib = 0.5 * (eP * (logP - logM) + eQ * (logQ - logM))
-        contrib = tl.where(mask_cn[None, :], contrib, 0.0)
-        accum += tl.sum(contrib, axis=1)
+        sum_plogp += tl.sum(plogp, axis=1)
+        sum_qlogq += tl.sum(qlogq, axis=1)
 
-        col_start += BLOCK_N
+        # m*log m for M = 0.5*(p+q)
+        m = 0.5 * (p + q)
+        m = tl.where(valid, m, 0.0)
+        m_log_m = m * tl.log(tl.maximum(m, eps))
+        sum_mlogm += tl.sum(m_log_m, axis=1)
 
-    tl.store(Out_ptr + rm, accum, mask=mask_rm)
+    jsd = 0.5 * sum_plogp + 0.5 * sum_qlogq - sum_mlogm
+    tl.store(OUT_ptr + offs_m, jsd, mask=mask_m)
 
 
 def fused_linear_jsd(X: torch.Tensor, W1: torch.Tensor, B1: torch.Tensor, W2: torch.Tensor, B2: torch.Tensor) -> torch.Tensor:
     """
     Fused linear layers with Jensen-Shannon Divergence computation.
+    
     Args:
-        X: (M, K) float16
-        W1: (K, N) float16
-        B1: (N,) float32
-        W2: (K, N) float16
-        B2: (N,) float32
+        X: (M, K), float16
+        W1: (K, N), float16
+        B1: (N,), float32
+        W2: (K, N), float16
+        B2: (N,), float32
+    
     Returns:
-        (M,) float32
+        (M,), float32
     """
-    assert X.is_cuda and W1.is_cuda and W2.is_cuda and B1.is_cuda and B2.is_cuda, "All tensors must be on CUDA"
-    assert X.dtype == torch.float16 and W1.dtype == torch.float16 and W2.dtype == torch.float16, "X, W1, W2 must be float16"
-    assert B1.dtype == torch.float32 and B2.dtype == torch.float32, "Biases must be float32"
+    assert X.is_cuda and W1.is_cuda and W2.is_cuda and B1.is_cuda and B2.is_cuda
+    assert X.dtype == torch.float16 and W1.dtype == torch.float16 and W2.dtype == torch.float16
+    assert B1.dtype == torch.float32 and B2.dtype == torch.float32
     M, K = X.shape
-    K1, N = W1.shape
-    K2, N2 = W2.shape
-    assert K == K1 == K2 and N == N2, "Shapes must align"
-    assert B1.shape[0] == N and B2.shape[0] == N, "Bias shapes must match N"
+    K_w1, N = W1.shape
+    K_w2, N2 = W2.shape
+    assert K_w1 == K and K_w2 == K and N2 == N
+    assert B1.shape[0] == N and B2.shape[0] == N
 
-    # choose block sizes
+    device = X.device
+    lse1 = torch.empty((M,), dtype=torch.float32, device=device)
+    lse2 = torch.empty((M,), dtype=torch.float32, device=device)
+    out = torch.empty((M,), dtype=torch.float32, device=device)
+
+    # Strides in elements
+    stride_x_m, stride_x_k = X.stride()
+    stride_w1_k, stride_w1_n = W1.stride()
+    # For W2, assume same layout
+    stride_w2_k, stride_w2_n = W2.stride()
+    assert stride_w1_k == stride_w2_k and stride_w1_n == stride_w2_n, "W1 and W2 must have same strides"
+
+    # Choose tile sizes heuristically
     BLOCK_M = 32
-    BLOCK_N = 128
-    BLOCK_K = 32
-
-    # allocate buffers for log-sum-exp results
-    S1 = torch.empty((M,), device=X.device, dtype=torch.float32)
-    S2 = torch.empty((M,), device=X.device, dtype=torch.float32)
-    Out = torch.empty((M,), device=X.device, dtype=torch.float32)
+    BLOCK_N = 128 if N >= 512 else 64
+    BLOCK_K = 64 if (K % 64 == 0) else 32
+    num_warps = 4 if BLOCK_N <= 128 else 8
+    num_stages = 3
 
     grid = (triton.cdiv(M, BLOCK_M),)
 
-    _pass1_logsumexp_kernel[grid](
-        X, W1, B1, W2, B2,
-        S1, S2,
+    _pass1_lse_kernel[grid](
+        X, W1, W2, B1, B2,
+        lse1, lse2,
         M, N, K,
-        X.stride(0), X.stride(1),
-        W1.stride(0), W1.stride(1),
-        W2.stride(0), W2.stride(1),
-        B1.stride(0), B2.stride(0),
+        stride_x_m, stride_x_k,
+        stride_w1_k, stride_w1_n,
         BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K,
-        num_warps=8, num_stages=3,
+        num_warps=num_warps, num_stages=num_stages
     )
 
     _pass2_jsd_kernel[grid](
-        X, W1, B1, W2, B2,
-        S1, S2, Out,
+        X, W1, W2, B1, B2,
+        lse1, lse2,
+        out,
         M, N, K,
-        X.stride(0), X.stride(1),
-        W1.stride(0), W1.stride(1),
-        W2.stride(0), W2.stride(1),
-        B1.stride(0), B2.stride(0),
+        stride_x_m, stride_x_k,
+        stride_w1_k, stride_w1_n,
         BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K,
-        num_warps=8, num_stages=3,
+        num_warps=num_warps, num_stages=num_stages
     )
-    return Out
+
+    return out
 
 
 class Solution:
     def solve(self, spec_path: str = None) -> dict:
-        return {"code": (
-            "import math\n"
-            "import torch\n"
-            "import triton\n"
-            "import triton.language as tl\n"
-            "\n"
-            + _pass1_logsumexp_kernel.__code__.co_consts[0] if False else ""
-        )} if False else {
-            "code": (
-                "import math\n"
-                "import torch\n"
-                "import triton\n"
-                "import triton.language as tl\n"
-                "\n"
-                + _get_source(_pass1_logsumexp_kernel)
-                + "\n\n"
-                + _get_source(_pass2_jsd_kernel)
-                + "\n\n"
-                + fused_linear_jsd.__code__.co_consts[0] if False else
-                "import math\n"
-                "import torch\n"
-                "import triton\n"
-                "import triton.language as tl\n"
-                "\n"
-                + _kernel_source_pass1()
-                + "\n"
-                + _kernel_source_pass2()
-                + "\n"
-                + _function_source_fused_linear_jsd()
-                + "\n"
-                + _solution_reemitter()
-            )
-        }
+        code = '''
+import torch
+import triton
+import triton.language as tl
 
 
-def _kernel_source_pass1():
-    return (
-        "@triton.jit\n"
-        "def _pass1_logsumexp_kernel(\n"
-        "    X_ptr, W1_ptr, B1_ptr, W2_ptr, B2_ptr,\n"
-        "    S1_ptr, S2_ptr,\n"
-        "    M, N, K,\n"
-        "    stride_xm, stride_xk,\n"
-        "    stride_w1k, stride_w1n,\n"
-        "    stride_w2k, stride_w2n,\n"
-        "    stride_b1, stride_b2,\n"
-        "    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr\n"
-        "):\n"
-        "    pid_m = tl.program_id(0)\n"
-        "    rm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)\n"
-        "    mask_rm = rm < M\n"
-        "\n"
-        "    neg_inf = tl.full([BLOCK_M], -float('inf'), dtype=tl.float32)\n"
-        "    max1 = neg_inf\n"
-        "    max2 = neg_inf\n"
-        "    sumexp1 = tl.zeros([BLOCK_M], dtype=tl.float32)\n"
-        "    sumexp2 = tl.zeros([BLOCK_M], dtype=tl.float32)\n"
-        "\n"
-        "    rn = tl.arange(0, BLOCK_N)\n"
-        "\n"
-        "    col_start = 0\n"
-        "    while col_start < N:\n"
-        "        cn = col_start + rn\n"
-        "        mask_cn = cn < N\n"
-        "\n"
-        "        acc1 = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)\n"
-        "        acc2 = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)\n"
-        "\n"
-        "        rk = tl.arange(0, BLOCK_K)\n"
-        "        k_start = 0\n"
-        "        while k_start < K:\n"
-        "            kk = k_start + rk\n"
-        "            mask_kk = kk < K\n"
-        "\n"
-        "            x_ptrs = X_ptr + (rm[:, None] * stride_xm + kk[None, :] * stride_xk)\n"
-        "            x_tile = tl.load(x_ptrs, mask=mask_rm[:, None] & mask_kk[None, :], other=0.0).to(tl.float16)\n"
-        "\n"
-        "            w1_ptrs = W1_ptr + (kk[:, None] * stride_w1k + cn[None, :] * stride_w1n)\n"
-        "            w2_ptrs = W2_ptr + (kk[:, None] * stride_w2k + cn[None, :] * stride_w2n)\n"
-        "            w_mask = mask_kk[:, None] & mask_cn[None, :]\n"
-        "\n"
-        "            w1_tile = tl.load(w1_ptrs, mask=w_mask, other=0.0)\n"
-        "            w2_tile = tl.load(w2_ptrs, mask=w_mask, other=0.0)\n"
-        "\n"
-        "            acc1 += tl.dot(x_tile, w1_tile)\n"
-        "            acc2 += tl.dot(x_tile, w2_tile)\n"
-        "\n"
-        "            k_start += BLOCK_K\n"
-        "\n"
-        "        b1 = tl.load(B1_ptr + cn * stride_b1, mask=mask_cn, other=0.0).to(tl.float32)\n"
-        "        b2 = tl.load(B2_ptr + cn * stride_b2, mask=mask_cn, other=0.0).to(tl.float32)\n"
-        "        acc1 += b1[None, :]\n"
-        "        acc2 += b2[None, :]\n"
-        "\n"
-        "        acc1 = tl.where(mask_cn[None, :], acc1, -float('inf'))\n"
-        "        acc2 = tl.where(mask_cn[None, :], acc2, -float('inf'))\n"
-        "\n"
-        "        tile_max1 = tl.max(acc1, axis=1)\n"
-        "        new_max1 = tl.maximum(max1, tile_max1)\n"
-        "        sumexp1 = sumexp1 * tl.exp(max1 - new_max1) + tl.sum(tl.exp(acc1 - new_max1[:, None]), axis=1)\n"
-        "        max1 = new_max1\n"
-        "\n"
-        "        tile_max2 = tl.max(acc2, axis=1)\n"
-        "        new_max2 = tl.maximum(max2, tile_max2)\n"
-        "        sumexp2 = sumexp2 * tl.exp(max2 - new_max2) + tl.sum(tl.exp(acc2 - new_max2[:, None]), axis=1)\n"
-        "        max2 = new_max2\n"
-        "\n"
-        "        col_start += BLOCK_N\n"
-        "\n"
-        "    S1 = tl.log(sumexp1) + max1\n"
-        "    S2 = tl.log(sumexp2) + max2\n"
-        "    tl.store(S1_ptr + rm, S1, mask=mask_rm)\n"
-        "    tl.store(S2_ptr + rm, S2, mask=mask_rm)\n"
+@triton.jit
+def _pass1_lse_kernel(
+    X_ptr, W1_ptr, W2_ptr, B1_ptr, B2_ptr,
+    LSE1_ptr, LSE2_ptr,
+    M, N, K,
+    stride_x_m, stride_x_k,
+    stride_w_k, stride_w_n,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+):
+    pid_m = tl.program_id(0)
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    mask_m = offs_m < M
+
+    # Running log-sum-exp accumulators per row
+    neg_inf = -1e9
+    m1 = tl.full((BLOCK_M,), neg_inf, dtype=tl.float32)
+    s1 = tl.zeros((BLOCK_M,), dtype=tl.float32)
+    m2 = tl.full((BLOCK_M,), neg_inf, dtype=tl.float32)
+    s2 = tl.zeros((BLOCK_M,), dtype=tl.float32)
+
+    offs_k_inner = tl.arange(0, BLOCK_K)
+
+    for n0 in range(0, N, BLOCK_N):
+        offs_n = n0 + tl.arange(0, BLOCK_N)
+        mask_n = offs_n < N
+
+        acc1 = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+        acc2 = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+        for k0 in range(0, K, BLOCK_K):
+            offs_k = k0 + offs_k_inner
+
+            # Load tiles
+            x_ptrs = X_ptr + offs_m[:, None] * stride_x_m + offs_k[None, :] * stride_x_k
+            x = tl.load(x_ptrs, mask=(mask_m[:, None] & (offs_k[None, :] < K)), other=0.0)
+
+            w1_ptrs = W1_ptr + offs_k[:, None] * stride_w_k + offs_n[None, :] * stride_w_n
+            w2_ptrs = W2_ptr + offs_k[:, None] * stride_w_k + offs_n[None, :] * stride_w_n
+            w1 = tl.load(w1_ptrs, mask=((offs_k[:, None] < K) & (offs_n[None, :] < N)), other=0.0)
+            w2 = tl.load(w2_ptrs, mask=((offs_k[:, None] < K) & (offs_n[None, :] < N)), other=0.0)
+
+            acc1 += tl.dot(x, w1)
+            acc2 += tl.dot(x, w2)
+
+        # Add bias
+        b1 = tl.load(B1_ptr + offs_n, mask=mask_n, other=0.0)
+        b2 = tl.load(B2_ptr + offs_n, mask=mask_n, other=0.0)
+        acc1 += b1[None, :]
+        acc2 += b2[None, :]
+
+        valid = mask_n[None, :]
+        acc1_masked = tl.where(valid, acc1, neg_inf)
+        acc2_masked = tl.where(valid, acc2, neg_inf)
+
+        tile_max1 = tl.max(acc1_masked, axis=1)
+        tile_max2 = tl.max(acc2_masked, axis=1)
+
+        # sumexp within tile relative to tile_max
+        exp1 = tl.exp(acc1_masked - tile_max1[:, None])
+        exp2 = tl.exp(acc2_masked - tile_max2[:, None])
+        tile_sum1 = tl.sum(exp1, axis=1)
+        tile_sum2 = tl.sum(exp2, axis=1)
+
+        # Merge with running
+        new_m1 = tl.maximum(m1, tile_max1)
+        new_m2 = tl.maximum(m2, tile_max2)
+        s1 = s1 * tl.exp(m1 - new_m1) + tile_sum1 * tl.exp(tile_max1 - new_m1)
+        s2 = s2 * tl.exp(m2 - new_m2) + tile_sum2 * tl.exp(tile_max2 - new_m2)
+        m1 = new_m1
+        m2 = new_m2
+
+    # Finalize LSE
+    eps = 1e-20
+    s1 = tl.maximum(s1, eps)
+    s2 = tl.maximum(s2, eps)
+    lse1 = tl.log(s1) + m1
+    lse2 = tl.log(s2) + m2
+
+    tl.store(LSE1_ptr + offs_m, lse1, mask=mask_m)
+    tl.store(LSE2_ptr + offs_m, lse2, mask=mask_m)
+
+
+@triton.jit
+def _pass2_jsd_kernel(
+    X_ptr, W1_ptr, W2_ptr, B1_ptr, B2_ptr,
+    LSE1_ptr, LSE2_ptr,
+    OUT_ptr,
+    M, N, K,
+    stride_x_m, stride_x_k,
+    stride_w_k, stride_w_n,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+):
+    pid_m = tl.program_id(0)
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    mask_m = offs_m < M
+
+    lse1 = tl.load(LSE1_ptr + offs_m, mask=mask_m, other=0.0)
+    lse2 = tl.load(LSE2_ptr + offs_m, mask=mask_m, other=0.0)
+
+    sum_plogp = tl.zeros((BLOCK_M,), dtype=tl.float32)
+    sum_qlogq = tl.zeros((BLOCK_M,), dtype=tl.float32)
+    sum_mlogm = tl.zeros((BLOCK_M,), dtype=tl.float32)
+
+    offs_k_inner = tl.arange(0, BLOCK_K)
+    eps = 1e-20
+
+    for n0 in range(0, N, BLOCK_N):
+        offs_n = n0 + tl.arange(0, BLOCK_N)
+        mask_n = offs_n < N
+
+        acc1 = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+        acc2 = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+        for k0 in range(0, K, BLOCK_K):
+            offs_k = k0 + offs_k_inner
+
+            x_ptrs = X_ptr + offs_m[:, None] * stride_x_m + offs_k[None, :] * stride_x_k
+            x = tl.load(x_ptrs, mask=(mask_m[:, None] & (offs_k[None, :] < K)), other=0.0)
+
+            w1_ptrs = W1_ptr + offs_k[:, None] * stride_w_k + offs_n[None, :] * stride_w_n
+            w2_ptrs = W2_ptr + offs_k[:, None] * stride_w_k + offs_n[None, :] * stride_w_n
+            w1 = tl.load(w1_ptrs, mask=((offs_k[:, None] < K) & (offs_n[None, :] < N)), other=0.0)
+            w2 = tl.load(w2_ptrs, mask=((offs_k[:, None] < K) & (offs_n[None, :] < N)), other=0.0)
+
+            acc1 += tl.dot(x, w1)
+            acc2 += tl.dot(x, w2)
+
+        b1 = tl.load(B1_ptr + offs_n, mask=(offs_n < N), other=0.0)
+        b2 = tl.load(B2_ptr + offs_n, mask=(offs_n < N), other=0.0)
+        acc1 += b1[None, :]
+        acc2 += b2[None, :]
+
+        # Compute probabilities
+        shift1 = acc1 - lse1[:, None]
+        shift2 = acc2 - lse2[:, None]
+
+        valid = (offs_n < N)[None, :]
+        shift1 = tl.where(valid, shift1, -1e9)
+        shift2 = tl.where(valid, shift2, -1e9)
+
+        p = tl.exp(shift1)
+        q = tl.exp(shift2)
+
+        # p*log p and q*log q
+        plogp = p * shift1
+        qlogq = q * shift2
+
+        sum_plogp += tl.sum(plogp, axis=1)
+        sum_qlogq += tl.sum(qlogq, axis=1)
+
+        # m*log m for M = 0.5*(p+q)
+        m = 0.5 * (p + q)
+        m = tl.where(valid, m, 0.0)
+        m_log_m = m * tl.log(tl.maximum(m, eps))
+        sum_mlogm += tl.sum(m_log_m, axis=1)
+
+    jsd = 0.5 * sum_plogp + 0.5 * sum_qlogq - sum_mlogm
+    tl.store(OUT_ptr + offs_m, jsd, mask=mask_m)
+
+
+def fused_linear_jsd(X: torch.Tensor, W1: torch.Tensor, B1: torch.Tensor, W2: torch.Tensor, B2: torch.Tensor) -> torch.Tensor:
+    """
+    Fused linear layers with Jensen-Shannon Divergence computation.
+    
+    Args:
+        X: (M, K), float16
+        W1: (K, N), float16
+        B1: (N,), float32
+        W2: (K, N), float16
+        B2: (N,), float32
+    
+    Returns:
+        (M,), float32
+    """
+    assert X.is_cuda and W1.is_cuda and W2.is_cuda and B1.is_cuda and B2.is_cuda
+    assert X.dtype == torch.float16 and W1.dtype == torch.float16 and W2.dtype == torch.float16
+    assert B1.dtype == torch.float32 and B2.dtype == torch.float32
+    M, K = X.shape
+    K_w1, N = W1.shape
+    K_w2, N2 = W2.shape
+    assert K_w1 == K and K_w2 == K and N2 == N
+    assert B1.shape[0] == N and B2.shape[0] == N
+
+    device = X.device
+    lse1 = torch.empty((M,), dtype=torch.float32, device=device)
+    lse2 = torch.empty((M,), dtype=torch.float32, device=device)
+    out = torch.empty((M,), dtype=torch.float32, device=device)
+
+    # Strides in elements
+    stride_x_m, stride_x_k = X.stride()
+    stride_w1_k, stride_w1_n = W1.stride()
+    stride_w2_k, stride_w2_n = W2.stride()
+    assert stride_w1_k == stride_w2_k and stride_w1_n == stride_w2_n, "W1 and W2 must have same strides"
+
+    # Choose tile sizes heuristically
+    BLOCK_M = 32
+    BLOCK_N = 128 if N >= 512 else 64
+    BLOCK_K = 64 if (K % 64 == 0) else 32
+    num_warps = 4 if BLOCK_N <= 128 else 8
+    num_stages = 3
+
+    grid = (triton.cdiv(M, BLOCK_M),)
+
+    _pass1_lse_kernel[grid](
+        X, W1, W2, B1, B2,
+        lse1, lse2,
+        M, N, K,
+        stride_x_m, stride_x_k,
+        stride_w1_k, stride_w1_n,
+        BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K,
+        num_warps=num_warps, num_stages=num_stages
     )
 
-
-def _kernel_source_pass2():
-    return (
-        "@triton.jit\n"
-        "def _pass2_jsd_kernel(\n"
-        "    X_ptr, W1_ptr, B1_ptr, W2_ptr, B2_ptr,\n"
-        "    S1_ptr, S2_ptr, Out_ptr,\n"
-        "    M, N, K,\n"
-        "    stride_xm, stride_xk,\n"
-        "    stride_w1k, stride_w1n,\n"
-        "    stride_w2k, stride_w2n,\n"
-        "    stride_b1, stride_b2,\n"
-        "    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr\n"
-        "):\n"
-        "    pid_m = tl.program_id(0)\n"
-        "    rm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)\n"
-        "    mask_rm = rm < M\n"
-        "\n"
-        "    S1 = tl.load(S1_ptr + rm, mask=mask_rm, other=0.0)\n"
-        "    S2 = tl.load(S2_ptr + rm, mask=mask_rm, other=0.0)\n"
-        "    S1 = S1[:, None]\n"
-        "    S2 = S2[:, None]\n"
-        "\n"
-        "    rn = tl.arange(0, BLOCK_N)\n"
-        "    ln2 = 0.6931471805599453\n"
-        "    accum = tl.zeros([BLOCK_M], dtype=tl.float32)\n"
-        "\n"
-        "    col_start = 0\n"
-        "    while col_start < N:\n"
-        "        cn = col_start + rn\n"
-        "        mask_cn = cn < N\n"
-        "\n"
-        "        acc1 = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)\n"
-        "        acc2 = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)\n"
-        "\n"
-        "        rk = tl.arange(0, BLOCK_K)\n"
-        "        k_start = 0\n"
-        "        while k_start < K:\n"
-        "            kk = k_start + rk\n"
-        "            mask_kk = kk < K\n"
-        "\n"
-        "            x_ptrs = X_ptr + (rm[:, None] * stride_xm + kk[None, :] * stride_xk)\n"
-        "            x_tile = tl.load(x_ptrs, mask=mask_rm[:, None] & mask_kk[None, :], other=0.0).to(tl.float16)\n"
-        "\n"
-        "            w1_ptrs = W1_ptr + (kk[:, None] * stride_w1k + cn[None, :] * stride_w1n)\n"
-        "            w2_ptrs = W2_ptr + (kk[:, None] * stride_w2k + cn[None, :] * stride_w2n)\n"
-        "            w_mask = mask_kk[:, None] & mask_cn[None, :]\n"
-        "\n"
-        "            w1_tile = tl.load(w1_ptrs, mask=w_mask, other=0.0)\n"
-        "            w2_tile = tl.load(w2_ptrs, mask=w_mask, other=0.0)\n"
-        "\n"
-        "            acc1 += tl.dot(x_tile, w1_tile)\n"
-        "            acc2 += tl.dot(x_tile, w2_tile)\n"
-        "\n"
-        "            k_start += BLOCK_K\n"
-        "\n"
-        "        b1 = tl.load(B1_ptr + cn * stride_b1, mask=mask_cn, other=0.0).to(tl.float32)\n"
-        "        b2 = tl.load(B2_ptr + cn * stride_b2, mask=mask_cn, other=0.0).to(tl.float32)\n"
-        "        acc1 += b1[None, :]\n"
-        "        acc2 += b2[None, :]\n"
-        "\n"
-        "        acc1 = tl.where(mask_cn[None, :], acc1, -float('inf'))\n"
-        "        acc2 = tl.where(mask_cn[None, :], acc2, -float('inf'))\n"
-        "\n"
-        "        logP = acc1 - S1\n"
-        "        logQ = acc2 - S2\n"
-        "\n"
-        "        eP = tl.exp(logP)\n"
-        "        eQ = tl.exp(logQ)\n"
-        "\n"
-        "        mx = tl.maximum(logP, logQ)\n"
-        "        sum_exp = tl.exp(logP - mx) + tl.exp(logQ - mx)\n"
-        "        logsum = mx + tl.log(sum_exp)\n"
-        "        logM = logsum - ln2\n"
-        "\n"
-        "        contrib = 0.5 * (eP * (logP - logM) + eQ * (logQ - logM))\n"
-        "        contrib = tl.where(mask_cn[None, :], contrib, 0.0)\n"
-        "        accum += tl.sum(contrib, axis=1)\n"
-        "\n"
-        "        col_start += BLOCK_N\n"
-        "\n"
-        "    tl.store(Out_ptr + rm, accum, mask=mask_rm)\n"
+    _pass2_jsd_kernel[grid](
+        X, W1, W2, B1, B2,
+        lse1, lse2,
+        out,
+        M, N, K,
+        stride_x_m, stride_x_k,
+        stride_w1_k, stride_w1_n,
+        BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K,
+        num_warps=num_warps, num_stages=num_stages
     )
 
-
-def _function_source_fused_linear_jsd():
-    return (
-        "def fused_linear_jsd(X: torch.Tensor, W1: torch.Tensor, B1: torch.Tensor, W2: torch.Tensor, B2: torch.Tensor) -> torch.Tensor:\n"
-        "    assert X.is_cuda and W1.is_cuda and W2.is_cuda and B1.is_cuda and B2.is_cuda, 'All tensors must be on CUDA'\n"
-        "    assert X.dtype == torch.float16 and W1.dtype == torch.float16 and W2.dtype == torch.float16, 'X, W1, W2 must be float16'\n"
-        "    assert B1.dtype == torch.float32 and B2.dtype == torch.float32, 'Biases must be float32'\n"
-        "    M, K = X.shape\n"
-        "    K1, N = W1.shape\n"
-        "    K2, N2 = W2.shape\n"
-        "    assert K == K1 == K2 and N == N2, 'Shapes must align'\n"
-        "    assert B1.shape[0] == N and B2.shape[0] == N, 'Bias shapes must match N'\n"
-        "\n"
-        "    BLOCK_M = 32\n"
-        "    BLOCK_N = 128\n"
-        "    BLOCK_K = 32\n"
-        "\n"
-        "    S1 = torch.empty((M,), device=X.device, dtype=torch.float32)\n"
-        "    S2 = torch.empty((M,), device=X.device, dtype=torch.float32)\n"
-        "    Out = torch.empty((M,), device=X.device, dtype=torch.float32)\n"
-        "\n"
-        "    grid = (triton.cdiv(M, BLOCK_M),)\n"
-        "\n"
-        "    _pass1_logsumexp_kernel[grid](\n"
-        "        X, W1, B1, W2, B2,\n"
-        "        S1, S2,\n"
-        "        M, N, K,\n"
-        "        X.stride(0), X.stride(1),\n"
-        "        W1.stride(0), W1.stride(1),\n"
-        "        W2.stride(0), W2.stride(1),\n"
-        "        B1.stride(0), B2.stride(0),\n"
-        "        BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K,\n"
-        "        num_warps=8, num_stages=3,\n"
-        "    )\n"
-        "\n"
-        "    _pass2_jsd_kernel[grid](\n"
-        "        X, W1, B1, W2, B2,\n"
-        "        S1, S2, Out,\n"
-        "        M, N, K,\n"
-        "        X.stride(0), X.stride(1),\n"
-        "        W1.stride(0), W1.stride(1),\n"
-        "        W2.stride(0), W2.stride(1),\n"
-        "        B1.stride(0), B2.stride(0),\n"
-        "        BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K,\n"
-        "        num_warps=8, num_stages=3,\n"
-        "    )\n"
-        "    return Out\n"
-    )
-
-
-def _solution_reemitter():
-    return (
-        "class Solution:\n"
-        "    def solve(self, spec_path: str = None) -> dict:\n"
-        "        return {'code': '\\n'.join([\n"
-        "            'import math',\n"
-        "            'import torch',\n"
-        "            'import triton',\n"
-        "            'import triton.language as tl',\n"
-        "            '',\n"
-        "            " + repr(_kernel_source_pass1().rstrip()) + ",\n"
-        "            '',\n"
-        "            " + repr(_kernel_source_pass2().rstrip()) + ",\n"
-        "            '',\n"
-        "            " + repr(_function_source_fused_linear_jsd().rstrip()) + "\n"
-        "        ])}\n"
-    )
+    return out
+'''
+        return {"code": code}

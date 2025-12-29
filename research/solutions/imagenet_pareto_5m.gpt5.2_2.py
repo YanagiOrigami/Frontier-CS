@@ -1,238 +1,331 @@
-import os
 import math
+import copy
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
 
-def _unpack_batch(batch):
-    if isinstance(batch, (list, tuple)):
-        if len(batch) >= 2:
-            return batch[0], batch[1]
-        return batch[0], None
-    return batch, None
+class _EMA:
+    def __init__(self, model: nn.Module, decay: float = 0.999):
+        self.decay = float(decay)
+        self.params = [p for p in model.parameters() if p.requires_grad]
+        self.shadow = [p.detach().clone() for p in self.params]
+        self._backup = None
+
+    @torch.no_grad()
+    def update(self):
+        d = self.decay
+        for s, p in zip(self.shadow, self.params):
+            s.mul_(d).add_(p.detach(), alpha=1.0 - d)
+
+    @torch.no_grad()
+    def apply_shadow(self):
+        self._backup = [p.detach().clone() for p in self.params]
+        for p, s in zip(self.params, self.shadow):
+            p.copy_(s)
+
+    @torch.no_grad()
+    def restore(self):
+        if self._backup is None:
+            return
+        for p, b in zip(self.params, self._backup):
+            p.copy_(b)
+        self._backup = None
 
 
-def _collect_loader(loader, device="cpu"):
+class _NormalizedLinear(nn.Module):
+    def __init__(self, input_dim: int, num_classes: int, mean: torch.Tensor, std: torch.Tensor):
+        super().__init__()
+        self.register_buffer("mean", mean.detach().clone().view(1, -1))
+        self.register_buffer("std", std.detach().clone().view(1, -1))
+        self.linear = nn.Linear(input_dim, num_classes)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = x.float()
+        x = (x - self.mean) / self.std
+        return self.linear(x)
+
+
+class _MLPBlock(nn.Module):
+    def __init__(self, width: int, dropout: float):
+        super().__init__()
+        self.norm = nn.LayerNorm(width)
+        self.fc1 = nn.Linear(width, width, bias=True)
+        self.act = nn.GELU()
+        self.drop = nn.Dropout(dropout) if dropout and dropout > 0 else nn.Identity()
+        self.fc2 = nn.Linear(width, width, bias=True)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        h = self.norm(x)
+        h = self.fc1(h)
+        h = self.act(h)
+        h = self.drop(h)
+        h = self.fc2(h)
+        h = self.drop(h)
+        return x + h
+
+
+class _ResMLPClassifier(nn.Module):
+    def __init__(self, input_dim: int, num_classes: int, mean: torch.Tensor, std: torch.Tensor, width: int, blocks: int, dropout: float):
+        super().__init__()
+        self.register_buffer("mean", mean.detach().clone().view(1, -1))
+        self.register_buffer("std", std.detach().clone().view(1, -1))
+        self.norm_in = nn.LayerNorm(input_dim)
+        self.fc_in = nn.Linear(input_dim, width, bias=True)
+        self.blocks = nn.ModuleList([_MLPBlock(width, dropout) for _ in range(blocks)])
+        self.norm_out = nn.LayerNorm(width)
+        self.fc_out = nn.Linear(width, num_classes, bias=True)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = x.float()
+        x = (x - self.mean) / self.std
+        x = self.norm_in(x)
+        x = self.fc_in(x)
+        for b in self.blocks:
+            x = b(x)
+        x = self.norm_out(x)
+        x = self.fc_out(x)
+        return x
+
+
+def _gather_from_loader(loader, device: str):
     xs = []
     ys = []
-    for batch in loader:
-        x, y = _unpack_batch(batch)
-        if not torch.is_tensor(x):
-            x = torch.as_tensor(x)
-        x = x.detach().to(device=device)
-        x = x.view(x.shape[0], -1).contiguous()
-        if y is not None:
-            if not torch.is_tensor(y):
-                y = torch.as_tensor(y)
-            y = y.detach().to(device=device).long().view(-1).contiguous()
-            ys.append(y)
-        xs.append(x)
-    x_all = torch.cat(xs, dim=0) if xs else torch.empty(0, device=device)
-    y_all = torch.cat(ys, dim=0) if ys else None
-    return x_all, y_all
+    for xb, yb in loader:
+        xs.append(xb.to(device=device, dtype=torch.float32))
+        ys.append(yb.to(device=device, dtype=torch.long))
+    X = torch.cat(xs, dim=0) if xs else torch.empty(0, device=device)
+    y = torch.cat(ys, dim=0) if ys else torch.empty(0, device=device, dtype=torch.long)
+    return X, y
 
 
-def _make_standardizer(x, mode: str):
-    if mode == "none":
-        mean = torch.zeros(x.shape[1], dtype=torch.float32, device=x.device)
-        inv_std = torch.ones(x.shape[1], dtype=torch.float32, device=x.device)
-        return mean, inv_std
-    mean = x.mean(dim=0).to(dtype=torch.float32)
-    var = x.var(dim=0, unbiased=False).to(dtype=torch.float32)
-    std = torch.sqrt(var.clamp_min(1e-8))
-    inv_std = (1.0 / std).to(dtype=torch.float32)
-    return mean, inv_std
+def _accuracy_from_tensors(model: nn.Module, X: torch.Tensor, y: torch.Tensor, batch: int = 1024) -> float:
+    model.eval()
+    correct = 0
+    total = int(y.numel())
+    if total == 0:
+        return 0.0
+    with torch.inference_mode():
+        for i in range(0, X.shape[0], batch):
+            xb = X[i:i + batch]
+            logits = model(xb)
+            pred = logits.argmax(dim=1)
+            correct += int((pred == y[i:i + batch]).sum().item())
+    return float(correct) / float(total)
 
 
-def _standardize(x, mean, inv_std):
-    return (x.to(dtype=torch.float32) - mean) * inv_std
+def _param_count(model: nn.Module) -> int:
+    return sum(p.numel() for p in model.parameters() if p.requires_grad)
 
 
-def _accuracy_from_logits(logits, y):
-    preds = logits.argmax(dim=1)
-    return (preds == y).float().mean().item()
+def _compute_mean_std(X: torch.Tensor):
+    mean = X.mean(dim=0)
+    var = X.var(dim=0, unbiased=False)
+    std = torch.sqrt(var + 1e-6)
+    std = std.clamp_min(1e-3)
+    return mean, std
 
 
-def _class_means(x, y, num_classes):
-    d = x.shape[1]
-    sums = torch.zeros(num_classes, d, dtype=torch.float32, device=x.device)
-    counts = torch.zeros(num_classes, dtype=torch.float32, device=x.device)
-    sums.index_add_(0, y, x.to(dtype=torch.float32))
-    counts.index_add_(0, y, torch.ones_like(y, dtype=torch.float32))
-    means = sums / counts.clamp_min(1.0).unsqueeze(1)
-    return means, counts
+def _lda_weights_bias(Xn: torch.Tensor, y: torch.Tensor, num_classes: int, shrinkage: float = 0.08):
+    # Xn already normalized (mean/std)
+    device = Xn.device
+    n, d = Xn.shape
+    y = y.long()
+    counts = torch.bincount(y, minlength=num_classes).clamp_min(1).to(device=device, dtype=torch.float64)
+    mu = torch.zeros((num_classes, d), device=device, dtype=torch.float64)
+    X64 = Xn.to(dtype=torch.float64)
+
+    for k in range(num_classes):
+        mask = (y == k)
+        if mask.any():
+            mu[k] = X64[mask].mean(dim=0)
+        else:
+            mu[k].zero_()
+
+    mu_y = mu[y]
+    resid = X64 - mu_y
+    denom = max(1, n - num_classes)
+    cov = (resid.transpose(0, 1) @ resid) / float(denom)
+    cov = (cov + cov.transpose(0, 1)) * 0.5
+    tr = cov.diag().sum()
+    if float(tr.item()) <= 0.0:
+        tr = torch.tensor(1.0, device=device, dtype=torch.float64)
+    iso = (tr / float(d)) * torch.eye(d, device=device, dtype=torch.float64)
+    cov = (1.0 - shrinkage) * cov + shrinkage * iso
+    cov = cov + 1e-5 * torch.eye(d, device=device, dtype=torch.float64)
+
+    L = torch.linalg.cholesky(cov)
+    W = torch.cholesky_solve(mu.transpose(0, 1), L).transpose(0, 1)  # K x D
+    b = -0.5 * (mu * W).sum(dim=1)
+
+    priors = counts / counts.sum()
+    logp = torch.log(priors)
+    b = b + logp
+
+    return W.to(dtype=torch.float32), b.to(dtype=torch.float32)
 
 
-def _ridge_fit_weights(x_std, y, num_classes, lam):
-    # x_std: (N,D), float32
-    # returns W_aug: (D+1,C), float32 where last row is bias
-    n, d = x_std.shape
-    xa = torch.cat([x_std, torch.ones(n, 1, dtype=torch.float32, device=x_std.device)], dim=1)
-    xa64 = xa.to(dtype=torch.float64)
-    y_onehot = torch.zeros(n, num_classes, dtype=torch.float64, device=x_std.device)
-    y_onehot.scatter_(1, y.view(-1, 1), 1.0)
-    xtx = xa64.T @ xa64
-    eye = torch.eye(d + 1, dtype=torch.float64, device=x_std.device)
-    reg = float(lam)
-    a = xtx + (reg + 1e-10) * eye
-    xty = xa64.T @ y_onehot
-    try:
-        l = torch.linalg.cholesky(a)
-        w = torch.cholesky_solve(xty, l)
-    except Exception:
-        w = torch.linalg.solve(a, xty)
-    return w.to(dtype=torch.float32)
+def _train_linear_lbfgs(model: _NormalizedLinear, X: torch.Tensor, y: torch.Tensor, max_iter: int = 120, wd: float = 2e-4):
+    model.train()
+    ce = nn.CrossEntropyLoss()
+    opt = torch.optim.LBFGS(model.parameters(), lr=1.0, max_iter=max_iter, history_size=20, line_search_fn="strong_wolfe")
+
+    def closure():
+        opt.zero_grad(set_to_none=True)
+        logits = model(X)
+        loss = ce(logits, y)
+        if wd and wd > 0:
+            l2 = 0.0
+            for p in model.parameters():
+                if p.requires_grad:
+                    l2 = l2 + (p.float() ** 2).sum()
+            loss = loss + 0.5 * wd * l2
+        loss.backward()
+        return loss
+
+    opt.step(closure)
 
 
-def _lda_fit(x_std, y, num_classes, lam):
-    # Shared covariance LDA with shrinkage lam*I
-    n, d = x_std.shape
-    means, counts = _class_means(x_std, y, num_classes)
-    x_centered = x_std - means[y]
-    xc64 = x_centered.to(dtype=torch.float64)
-    cov = (xc64.T @ xc64) / max(1, n)
-    eye = torch.eye(d, dtype=torch.float64, device=x_std.device)
-    a = cov + (float(lam) + 1e-10) * eye
-    mu64 = means.to(dtype=torch.float64)  # (C,D)
-    try:
-        l = torch.linalg.cholesky(a)
-        inv_mu_t = torch.cholesky_solve(mu64.T, l)  # (D,C) = inv(A) @ mu.T
-    except Exception:
-        inv_mu_t = torch.linalg.solve(a, mu64.T)
-    w = inv_mu_t.to(dtype=torch.float32)  # (D,C)
-    # bias b_c = -0.5 * mu_c^T invS mu_c
-    quad = (mu64 * inv_mu_t.T).sum(dim=1)  # (C,)
-    b = (-0.5 * quad).to(dtype=torch.float32)
-    return w, b
+def _mlp_param_estimate(input_dim: int, num_classes: int, width: int, blocks: int) -> int:
+    # LayerNorm: 2*dim
+    total = 0
+    total += 2 * input_dim  # norm_in
+    total += input_dim * width + width  # fc_in
+    for _ in range(blocks):
+        total += 2 * width  # block norm
+        total += width * width + width  # fc1
+        total += width * width + width  # fc2
+    total += 2 * width  # norm_out
+    total += width * num_classes + num_classes  # fc_out
+    return int(total)
 
 
-def _diag_nb_fit(x_std, y, num_classes, var_smooth):
-    # Gaussian Naive Bayes with diagonal cov per class
-    n, d = x_std.shape
-    means, counts = _class_means(x_std, y, num_classes)  # (C,D)
-    x_centered = x_std - means[y]
-    # compute per-class variance
-    sums2 = torch.zeros(num_classes, d, dtype=torch.float32, device=x_std.device)
-    sums2.index_add_(0, y, (x_centered * x_centered).to(dtype=torch.float32))
-    counts_f = counts.clamp_min(1.0).unsqueeze(1)
-    var = sums2 / counts_f
-    var = var + float(var_smooth)
-    inv_var = 1.0 / var
-    # Precompute matrices for efficient scoring:
-    # score = -0.5 * [ x^2 @ inv_var.T - 2 x @ (mu*inv_var).T + sum(mu^2*inv_var + log(var)) ]
-    a = inv_var  # (C,D)
-    b = means * inv_var  # (C,D)
-    const = (means * means * inv_var + torch.log(var)).sum(dim=1)  # (C,)
-    return a, b, const
+def _choose_width_under_limit(input_dim: int, num_classes: int, blocks: int, limit: int, margin: int = 8192):
+    lo, hi = 64, 4096
+    best = lo
+    target = max(1, limit - margin)
+    while lo <= hi:
+        mid = (lo + hi) // 2
+        p = _mlp_param_estimate(input_dim, num_classes, mid, blocks)
+        if p <= target:
+            best = mid
+            lo = mid + 1
+        else:
+            hi = mid - 1
+    return best
 
 
-class _PrototypeCosine(nn.Module):
-    def __init__(self, mean, inv_std, prototypes, normalize_input=True):
-        super().__init__()
-        self.register_buffer("mean", mean.clone())
-        self.register_buffer("inv_std", inv_std.clone())
-        proto = prototypes.to(dtype=torch.float32)
-        proto = F.normalize(proto, dim=1, eps=1e-8)
-        self.register_buffer("proto", proto)
-        self.normalize_input = bool(normalize_input)
+def _train_resmlp(
+    model: _ResMLPClassifier,
+    X_train: torch.Tensor,
+    y_train: torch.Tensor,
+    X_val: torch.Tensor,
+    y_val: torch.Tensor,
+    max_epochs: int = 260,
+    batch_size: int = 256,
+    lr: float = 2.5e-3,
+    weight_decay: float = 1.5e-4,
+    label_smoothing: float = 0.04,
+    grad_clip: float = 1.0,
+    patience: int = 40,
+    dropout_noise_std: float = 0.00,
+):
+    device = X_train.device
+    criterion = nn.CrossEntropyLoss(label_smoothing=label_smoothing)
+    opt = torch.optim.AdamW(model.parameters(), lr=lr, betas=(0.9, 0.99), eps=1e-8, weight_decay=weight_decay)
 
-    def forward(self, x):
-        x = x.view(x.shape[0], -1)
-        x = _standardize(x, self.mean, self.inv_std)
-        if self.normalize_input:
-            x = F.normalize(x, dim=1, eps=1e-8)
-        return x @ self.proto.t()
+    warmup = min(10, max(2, max_epochs // 20))
 
+    def lr_factor(epoch: int):
+        if epoch < warmup:
+            return float(epoch + 1) / float(warmup)
+        t = (epoch - warmup) / float(max(1, max_epochs - warmup))
+        return 0.5 * (1.0 + math.cos(math.pi * t))
 
-class _RidgeLinear(nn.Module):
-    def __init__(self, mean, inv_std, w_aug):
-        super().__init__()
-        self.register_buffer("mean", mean.clone())
-        self.register_buffer("inv_std", inv_std.clone())
-        self.register_buffer("w_aug", w_aug.clone())  # (D+1,C)
+    sched = torch.optim.lr_scheduler.LambdaLR(opt, lr_lambda=lr_factor)
 
-    def forward(self, x):
-        x = x.view(x.shape[0], -1)
-        x = _standardize(x, self.mean, self.inv_std)
-        xa = torch.cat([x, torch.ones(x.shape[0], 1, dtype=torch.float32, device=x.device)], dim=1)
-        return xa @ self.w_aug
+    ema = _EMA(model, decay=0.999)
+    best_state = None
+    best_acc = -1.0
+    best_epoch = 0
+    no_improve = 0
 
+    n = X_train.shape[0]
+    for epoch in range(max_epochs):
+        model.train()
+        perm = torch.randperm(n, device=device)
+        total_loss = 0.0
+        steps = 0
 
-class _LDA(nn.Module):
-    def __init__(self, mean, inv_std, w, b):
-        super().__init__()
-        self.register_buffer("mean", mean.clone())
-        self.register_buffer("inv_std", inv_std.clone())
-        self.register_buffer("w", w.clone())  # (D,C)
-        self.register_buffer("b", b.clone())  # (C,)
+        for i in range(0, n, batch_size):
+            idx = perm[i:i + batch_size]
+            xb = X_train[idx]
+            yb = y_train[idx]
+            if dropout_noise_std and dropout_noise_std > 0:
+                xb = xb + torch.randn_like(xb) * dropout_noise_std
 
-    def forward(self, x):
-        x = x.view(x.shape[0], -1)
-        x = _standardize(x, self.mean, self.inv_std)
-        return x @ self.w + self.b
+            opt.zero_grad(set_to_none=True)
+            logits = model(xb)
+            loss = criterion(logits, yb)
+            loss.backward()
+            if grad_clip and grad_clip > 0:
+                nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+            opt.step()
+            ema.update()
 
+            total_loss += float(loss.detach().item())
+            steps += 1
 
-class _DiagNB(nn.Module):
-    def __init__(self, mean, inv_std, a, b, const):
-        super().__init__()
-        self.register_buffer("mean", mean.clone())
-        self.register_buffer("inv_std", inv_std.clone())
-        self.register_buffer("a", a.clone())  # (C,D)
-        self.register_buffer("b", b.clone())  # (C,D)
-        self.register_buffer("const", const.clone())  # (C,)
+        sched.step()
 
-    def forward(self, x):
-        x = x.view(x.shape[0], -1)
-        x = _standardize(x, self.mean, self.inv_std)
-        x2 = x * x
-        t1 = x2 @ self.a.t()
-        t2 = x @ self.b.t()
-        return -0.5 * (t1 - 2.0 * t2 + self.const)
+        # Validation with EMA weights
+        ema.apply_shadow()
+        val_acc = _accuracy_from_tensors(model, X_val, y_val, batch=1024)
+        ema.restore()
 
+        if val_acc > best_acc + 1e-5:
+            best_acc = val_acc
+            best_epoch = epoch
+            best_state = copy.deepcopy(model.state_dict())
+            no_improve = 0
+        else:
+            no_improve += 1
+            if no_improve >= patience:
+                break
 
-class _KNN(nn.Module):
-    def __init__(self, mean, inv_std, train_x, train_y, num_classes, k=5, temp=20.0):
-        super().__init__()
-        self.register_buffer("mean", mean.clone())
-        self.register_buffer("inv_std", inv_std.clone())
-        tx = train_x.to(dtype=torch.float32)
-        tx = F.normalize(tx, dim=1, eps=1e-8)
-        self.register_buffer("train_x", tx)
-        self.register_buffer("train_y", train_y.to(dtype=torch.long))
-        self.num_classes = int(num_classes)
-        self.k = int(k)
-        self.temp = float(temp)
-
-    def forward(self, x):
-        x = x.view(x.shape[0], -1)
-        x = _standardize(x, self.mean, self.inv_std)
-        x = F.normalize(x, dim=1, eps=1e-8)
-        sim = x @ self.train_x.t()
-        k = min(self.k, self.train_x.shape[0])
-        vals, idx = torch.topk(sim, k=k, dim=1, largest=True, sorted=True)
-        weights = torch.softmax(vals * self.temp, dim=1)
-        labs = self.train_y[idx]
-        out = torch.zeros(x.shape[0], self.num_classes, dtype=torch.float32, device=x.device)
-        out.scatter_add_(1, labs, weights)
-        return out
+    if best_state is not None:
+        model.load_state_dict(best_state)
+    return model, float(best_acc), int(best_epoch)
 
 
-class _Ensemble(nn.Module):
-    def __init__(self, models, weights):
-        super().__init__()
-        self.models = nn.ModuleList(models)
-        w = torch.tensor(weights, dtype=torch.float32)
-        w = w / w.sum().clamp_min(1e-12)
-        self.register_buffer("weights", w)
-
-    def forward(self, x):
-        logits = None
-        for i, m in enumerate(self.models):
-            li = m(x)
-            wi = self.weights[i]
-            logits = li.mul(wi) if logits is None else logits.add(li.mul(wi))
-        return logits
+def _finetune_on_combined(
+    model: nn.Module,
+    X_all: torch.Tensor,
+    y_all: torch.Tensor,
+    epochs: int = 20,
+    batch_size: int = 256,
+    lr: float = 2e-4,
+    weight_decay: float = 1e-4,
+    label_smoothing: float = 0.02,
+    grad_clip: float = 1.0,
+):
+    model.train()
+    criterion = nn.CrossEntropyLoss(label_smoothing=label_smoothing)
+    opt = torch.optim.AdamW(model.parameters(), lr=lr, betas=(0.9, 0.99), eps=1e-8, weight_decay=weight_decay)
+    n = X_all.shape[0]
+    for _ in range(max(1, epochs)):
+        perm = torch.randperm(n, device=X_all.device)
+        for i in range(0, n, batch_size):
+            idx = perm[i:i + batch_size]
+            xb = X_all[idx]
+            yb = y_all[idx]
+            opt.zero_grad(set_to_none=True)
+            logits = model(xb)
+            loss = criterion(logits, yb)
+            loss.backward()
+            if grad_clip and grad_clip > 0:
+                nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+            opt.step()
+    return model
 
 
 class Solution:
@@ -240,210 +333,149 @@ class Solution:
         if metadata is None:
             metadata = {}
         device = metadata.get("device", "cpu")
-        if device is None:
-            device = "cpu"
-        device = str(device)
-
-        try:
-            torch.set_num_threads(min(8, os.cpu_count() or 8))
-        except Exception:
-            pass
-
         num_classes = int(metadata.get("num_classes", 128))
         input_dim = int(metadata.get("input_dim", 384))
         param_limit = int(metadata.get("param_limit", 5_000_000))
 
-        x_train, y_train = _collect_loader(train_loader, device="cpu")
-        if y_train is None:
-            raise ValueError("Training loader must provide labels.")
-        x_train = x_train.to(dtype=torch.float32).view(x_train.shape[0], -1).contiguous()
-        y_train = y_train.to(dtype=torch.long).contiguous()
-        if x_train.shape[1] != input_dim:
-            input_dim = x_train.shape[1]
+        torch.manual_seed(0)
 
-        if val_loader is not None:
-            x_val, y_val = _collect_loader(val_loader, device="cpu")
-            x_val = x_val.to(dtype=torch.float32).view(x_val.shape[0], -1).contiguous()
-            y_val = y_val.to(dtype=torch.long).contiguous() if y_val is not None else None
-        else:
-            x_val, y_val = None, None
+        X_train, y_train = _gather_from_loader(train_loader, device=device)
+        X_val, y_val = _gather_from_loader(val_loader, device=device)
 
-        preproc_modes = ["standardize", "none"]
-
-        ridge_lams = [1e-6, 1e-5, 1e-4, 5e-4, 1e-3, 5e-3, 1e-2, 5e-2, 1e-1]
-        lda_lams = [1e-5, 1e-4, 5e-4, 1e-3, 5e-3, 1e-2, 5e-2]
-        nb_smooth = [1e-6, 1e-5, 1e-4, 5e-4, 1e-3, 5e-3, 1e-2]
-        k_list = [1, 3, 5, 7, 9, 15]
-        temp_list = [5.0, 10.0, 20.0, 40.0]
-        k_max = max(k_list)
-
-        candidates = []
-
-        def _eval_model(model):
-            if x_val is None or y_val is None:
-                return -1.0
-            with torch.no_grad():
-                logits = model(x_val)
-                return _accuracy_from_logits(logits, y_val)
-
-        with torch.no_grad():
-            for mode in preproc_modes:
-                mean, inv_std = _make_standardizer(x_train, mode)
-                xtr = _standardize(x_train, mean, inv_std)
-                xva = _standardize(x_val, mean, inv_std) if x_val is not None else None
-
-                # Prototype cosine variants (mean of raw standardized vs mean of normalized)
-                means_c_raw, _ = _class_means(xtr, y_train, num_classes)
-                proto_raw = means_c_raw
-                model_proto_raw = _PrototypeCosine(mean, inv_std, proto_raw, normalize_input=True)
-                acc = _eval_model(model_proto_raw)
-                candidates.append(("proto_cos_rawmean", mode, {"variant": "rawmean"}, acc, model_proto_raw))
-
-                xtr_n = F.normalize(xtr, dim=1, eps=1e-8)
-                means_c_norm, _ = _class_means(xtr_n, y_train, num_classes)
-                model_proto_norm = _PrototypeCosine(mean, inv_std, means_c_norm, normalize_input=True)
-                acc = _eval_model(model_proto_norm)
-                candidates.append(("proto_cos_normmean", mode, {"variant": "normmean"}, acc, model_proto_norm))
-
-                # kNN cosine via precomputed sim/topk (only if val available)
-                if x_val is not None and y_val is not None:
-                    xva_n = F.normalize(xva, dim=1, eps=1e-8)
-                    sim = xva_n @ xtr_n.t()
-                    vals_max, idx_max = torch.topk(sim, k=min(k_max, sim.shape[1]), dim=1, largest=True, sorted=True)
-                    labs_max = y_train[idx_max]
-
-                    for k in k_list:
-                        vals_k = vals_max[:, :k]
-                        labs_k = labs_max[:, :k]
-                        for temp in temp_list:
-                            weights = torch.softmax(vals_k * temp, dim=1)
-                            out = torch.zeros(xva.shape[0], num_classes, dtype=torch.float32)
-                            out.scatter_add_(1, labs_k, weights)
-                            acc = _accuracy_from_logits(out, y_val)
-                            candidates.append(("knn_cos", mode, {"k": k, "temp": temp}, acc, None))
-
-                # Ridge regression
-                for lam in ridge_lams:
-                    w_aug = _ridge_fit_weights(xtr, y_train, num_classes, lam)
-                    model = _RidgeLinear(mean, inv_std, w_aug)
-                    acc = _eval_model(model)
-                    candidates.append(("ridge", mode, {"lam": lam}, acc, model))
-
-                # LDA
-                for lam in lda_lams:
-                    w, b = _lda_fit(xtr, y_train, num_classes, lam)
-                    model = _LDA(mean, inv_std, w, b)
-                    acc = _eval_model(model)
-                    candidates.append(("lda", mode, {"lam": lam}, acc, model))
-
-                # Diagonal Gaussian NB
-                for vs in nb_smooth:
-                    a, b, const = _diag_nb_fit(xtr, y_train, num_classes, vs)
-                    model = _DiagNB(mean, inv_std, a, b, const)
-                    acc = _eval_model(model)
-                    candidates.append(("diag_nb", mode, {"var_smooth": vs}, acc, model))
-
-        # Choose best (with fallback when no val)
-        if x_val is None or y_val is None:
-            # Default to ridge with moderate regularization
-            mode = "standardize"
-            mean, inv_std = _make_standardizer(x_train, mode)
-            xtr = _standardize(x_train, mean, inv_std)
-            w_aug = _ridge_fit_weights(xtr, y_train, num_classes, 1e-3)
-            model = _RidgeLinear(mean, inv_std, w_aug).to(device)
+        if X_train.numel() == 0:
+            mean = torch.zeros((input_dim,), device=device, dtype=torch.float32)
+            std = torch.ones((input_dim,), device=device, dtype=torch.float32)
+            model = _NormalizedLinear(input_dim, num_classes, mean, std).to(device)
             model.eval()
             return model
 
-        candidates_sorted = sorted(candidates, key=lambda t: (t[3] if t[3] is not None else -1.0), reverse=True)
-        top = candidates_sorted[:8]
+        mean_tr, std_tr = _compute_mean_std(X_train)
+        Xtr_n = (X_train - mean_tr) / std_tr
+        Xval_n = (X_val - mean_tr) / std_tr if X_val.numel() else X_val
 
-        # Build ensemble candidates from top fixed-logit models (excluding knn placeholder)
-        fixed_models = []
-        for name, mode, hp, acc, model in top:
-            if model is not None and acc is not None and acc >= 0.0:
-                fixed_models.append((name, mode, hp, acc, model))
-        ensemble_best = None
-        ensemble_best_acc = -1.0
-        if len(fixed_models) >= 2:
-            weights_grid = [(0.5, 0.5), (0.7, 0.3), (0.3, 0.7), (0.6, 0.4), (0.4, 0.6)]
-            for i in range(min(4, len(fixed_models))):
-                for j in range(i + 1, min(4, len(fixed_models))):
-                    m1 = fixed_models[i][4]
-                    m2 = fixed_models[j][4]
-                    for w1, w2 in weights_grid:
-                        ens = _Ensemble([m1, m2], [w1, w2])
-                        acc = _eval_model(ens)
-                        if acc > ensemble_best_acc:
-                            ensemble_best_acc = acc
-                            ensemble_best = ("ensemble2", None, {"pair": (fixed_models[i], fixed_models[j]), "weights": (w1, w2)}, acc, ens)
+        # Linear (LDA init -> LBFGS fine-tune)
+        W, b = _lda_weights_bias(Xtr_n, y_train, num_classes=num_classes, shrinkage=0.08)
+        lin_model = _NormalizedLinear(input_dim, num_classes, mean_tr, std_tr).to(device)
+        with torch.no_grad():
+            lin_model.linear.weight.copy_(W)
+            lin_model.linear.bias.copy_(b)
 
-        best = candidates_sorted[0]
-        if ensemble_best is not None and ensemble_best[3] is not None and ensemble_best[3] > best[3] + 1e-4:
-            best = ensemble_best
+        try:
+            _train_linear_lbfgs(lin_model, X_train, y_train, max_iter=120, wd=2e-4)
+        except Exception:
+            pass
 
-        # Retrain/rebuild best using combined train+val for final
-        x_all = torch.cat([x_train, x_val], dim=0)
-        y_all = torch.cat([y_train, y_val], dim=0)
+        lin_val_acc = _accuracy_from_tensors(lin_model, X_val, y_val, batch=1024) if X_val.numel() else 0.0
 
-        def _build_model_from_spec(spec):
-            name, mode, hp, acc, model_obj = spec
-            if name == "ensemble2":
-                (spec1, spec2) = hp["pair"]
-                w1, w2 = hp["weights"]
-                m1 = _build_model_from_spec((spec1[0], spec1[1], spec1[2], spec1[3], spec1[4]))
-                m2 = _build_model_from_spec((spec2[0], spec2[1], spec2[2], spec2[3], spec2[4]))
-                return _Ensemble([m1, m2], [w1, w2])
+        # If linear already excellent, train final linear on combined train+val and return
+        if lin_val_acc >= 0.95 or X_val.numel() == 0:
+            if X_val.numel():
+                X_all = torch.cat([X_train, X_val], dim=0)
+                y_all = torch.cat([y_train, y_val], dim=0)
+            else:
+                X_all, y_all = X_train, y_train
 
-            if mode is None:
-                mode = "standardize"
+            mean_all, std_all = _compute_mean_std(X_all)
+            Xall_n = (X_all - mean_all) / std_all
+            W2, b2 = _lda_weights_bias(Xall_n, y_all, num_classes=num_classes, shrinkage=0.08)
+            final_lin = _NormalizedLinear(input_dim, num_classes, mean_all, std_all).to(device)
+            with torch.no_grad():
+                final_lin.linear.weight.copy_(W2)
+                final_lin.linear.bias.copy_(b2)
+            try:
+                _train_linear_lbfgs(final_lin, X_all, y_all, max_iter=160, wd=2e-4)
+            except Exception:
+                pass
 
-            mean, inv_std = _make_standardizer(x_all, mode)
-            xa = _standardize(x_all, mean, inv_std)
+            if _param_count(final_lin) > param_limit:
+                final_lin = lin_model
+            final_lin.eval()
+            return final_lin
 
-            if name.startswith("proto_cos"):
-                variant = hp.get("variant", "rawmean")
-                if variant == "normmean":
-                    xa_n = F.normalize(xa, dim=1, eps=1e-8)
-                    means_c, _ = _class_means(xa_n, y_all, num_classes)
-                    return _PrototypeCosine(mean, inv_std, means_c, normalize_input=True)
-                means_c, _ = _class_means(xa, y_all, num_classes)
-                return _PrototypeCosine(mean, inv_std, means_c, normalize_input=True)
+        # Train one ResMLP candidate (near limit)
+        # Choose blocks by a simple heuristic; deeper often helps but keep compute sane.
+        candidate_blocks = [2, 3, 4, 5]
+        best_cfg = None
+        for blocks in candidate_blocks:
+            width = _choose_width_under_limit(input_dim, num_classes, blocks, param_limit, margin=12288)
+            if width < 128:
+                continue
+            est = _mlp_param_estimate(input_dim, num_classes, width, blocks)
+            if est <= param_limit:
+                best_cfg = (blocks, width, est)
+        if best_cfg is None:
+            lin_model.eval()
+            return lin_model
 
-            if name == "knn_cos":
-                k = int(hp["k"])
-                temp = float(hp["temp"])
-                return _KNN(mean, inv_std, xa, y_all, num_classes, k=k, temp=temp)
+        blocks, width, _ = best_cfg
+        mlp = _ResMLPClassifier(
+            input_dim=input_dim,
+            num_classes=num_classes,
+            mean=mean_tr,
+            std=std_tr,
+            width=width,
+            blocks=blocks,
+            dropout=0.02,
+        ).to(device)
 
-            if name == "ridge":
-                lam = float(hp["lam"])
-                w_aug = _ridge_fit_weights(xa, y_all, num_classes, lam)
-                return _RidgeLinear(mean, inv_std, w_aug)
+        if _param_count(mlp) > param_limit:
+            lin_model.eval()
+            return lin_model
 
-            if name == "lda":
-                lam = float(hp["lam"])
-                w, b = _lda_fit(xa, y_all, num_classes, lam)
-                return _LDA(mean, inv_std, w, b)
+        mlp, mlp_val_acc, best_epoch = _train_resmlp(
+            mlp,
+            X_train=X_train,
+            y_train=y_train,
+            X_val=X_val,
+            y_val=y_val,
+            max_epochs=280,
+            batch_size=256,
+            lr=2.3e-3,
+            weight_decay=1.5e-4,
+            label_smoothing=0.04,
+            grad_clip=1.0,
+            patience=45,
+            dropout_noise_std=0.0,
+        )
 
-            if name == "diag_nb":
-                vs = float(hp["var_smooth"])
-                a, b, const = _diag_nb_fit(xa, y_all, num_classes, vs)
-                return _DiagNB(mean, inv_std, a, b, const)
-
-            # fallback
-            w_aug = _ridge_fit_weights(xa, y_all, num_classes, 1e-3)
-            return _RidgeLinear(mean, inv_std, w_aug)
-
-        final_model = _build_model_from_spec(best).to(device)
-        final_model.eval()
-
-        # Hard constraint check (trainable params only)
-        trainable_params = sum(p.numel() for p in final_model.parameters() if p.requires_grad)
-        if trainable_params > param_limit:
-            # Fallback to parameter-free prototype
-            mean, inv_std = _make_standardizer(x_all, "standardize")
-            xa = _standardize(x_all, mean, inv_std)
-            means_c, _ = _class_means(xa, y_all, num_classes)
-            final_model = _PrototypeCosine(mean, inv_std, means_c, normalize_input=True).to(device)
-            final_model.eval()
-
-        return final_model
+        # Compare and pick best
+        if mlp_val_acc + 1e-6 >= lin_val_acc:
+            # light fine-tune on combined train+val
+            if X_val.numel():
+                X_all = torch.cat([X_train, X_val], dim=0)
+                y_all = torch.cat([y_train, y_val], dim=0)
+                mlp = _finetune_on_combined(
+                    mlp,
+                    X_all,
+                    y_all,
+                    epochs=18,
+                    batch_size=256,
+                    lr=1.8e-4,
+                    weight_decay=1.2e-4,
+                    label_smoothing=0.02,
+                    grad_clip=1.0,
+                )
+            if _param_count(mlp) > param_limit:
+                lin_model.eval()
+                return lin_model
+            mlp.eval()
+            return mlp
+        else:
+            # train final linear on combined
+            X_all = torch.cat([X_train, X_val], dim=0)
+            y_all = torch.cat([y_train, y_val], dim=0)
+            mean_all, std_all = _compute_mean_std(X_all)
+            Xall_n = (X_all - mean_all) / std_all
+            W2, b2 = _lda_weights_bias(Xall_n, y_all, num_classes=num_classes, shrinkage=0.08)
+            final_lin = _NormalizedLinear(input_dim, num_classes, mean_all, std_all).to(device)
+            with torch.no_grad():
+                final_lin.linear.weight.copy_(W2)
+                final_lin.linear.bias.copy_(b2)
+            try:
+                _train_linear_lbfgs(final_lin, X_all, y_all, max_iter=160, wd=2e-4)
+            except Exception:
+                pass
+            if _param_count(final_lin) > param_limit:
+                final_lin = lin_model
+            final_lin.eval()
+            return final_lin

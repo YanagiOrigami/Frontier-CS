@@ -1,8 +1,3 @@
-import torch
-import triton
-import triton.language as tl
-import math
-
 class Solution:
     def solve(self, spec_path: str = None) -> dict:
         code = """
@@ -12,192 +7,100 @@ import triton.language as tl
 import math
 
 @triton.jit
-def attn_kernel(
-    Q_PTR,
-    K_PTR,
-    V_PTR,
-    O_PTR,
-    stride_qz: tl.int32,
-    stride_qh: tl.int32,
-    stride_qm: tl.int32,
-    stride_qd: tl.int32,
-    stride_kz: tl.int32,
-    stride_kh: tl.int32,
-    stride_kn: tl.int32,
-    stride_kd: tl.int32,
-    stride_vz: tl.int32,
-    stride_vh: tl.int32,
-    stride_vn: tl.int32,
-    stride_vd: tl.int32,
-    stride_oz: tl.int32,
-    stride_oh: tl.int32,
-    stride_om: tl.int32,
-    stride_od: tl.int32,
-    Z: tl.int32,
-    H: tl.int32,
-    M: tl.int32,
-    N: tl.int32,
-    D: tl.int32,
-    Dv: tl.int32,
-    scale: tl.float32,
-    causal: tl.int32,
-    num_blocks: tl.int32,
-    BLOCK_M: tl.constexpr,
-    BLOCK_N: tl.constexpr,
+def flash_attn_kernel(
+    Q_PTR, K_PTR, V_PTR, O_PTR,
+    M: tl.constexpr, N: tl.constexpr, D: tl.constexpr,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_D: tl.constexpr,
+    CAUSAL: tl.constexpr,
+    STRIDE_QM, STRIDE_QD,
+    STRIDE_KN, STRIDE_KD,
+    STRIDE_VN, STRIDE_VD,
+    STRIDE_OM, STRIDE_OD,
+    scale: tl.float32
 ):
-    pid_z = tl.program_id(0)
-    pid_h = tl.program_id(1)
-    pid_i = tl.program_id(2)
-
-    # Q block
-    q_offset = pid_z * stride_qz + pid_h * stride_qh + pid_i * BLOCK_M * stride_qm
-    q_ptr = tl.make_block_ptr(
-        Q_PTR,
-        (M, D),
-        (stride_qm, stride_qd),
-        q_offset,
-        (BLOCK_M, D),
-        order=(0, 1),
-    )
-    q_block = tl.load(q_ptr).to(tl.float32)
-
-    # O block ptr
-    o_offset = pid_z * stride_oz + pid_h * stride_oh + pid_i * BLOCK_M * stride_om
-    o_ptr = tl.make_block_ptr(
-        O_PTR,
-        (M, Dv),
-        (stride_om, stride_od),
-        o_offset,
-        (BLOCK_M, Dv),
-        order=(0, 1),
-    )
-
-    # Initialize
-    m = tl.full((BLOCK_M,), -1e9, tl.float32)
-    l = tl.zeros((BLOCK_M,), tl.float32)
-    o = tl.zeros((BLOCK_M, Dv), tl.float32)
-
-    for j in tl.range(0, num_blocks):
-        if causal == 1 and j > pid_i:
-            continue
-
-        # K block
-        k_offset = pid_z * stride_kz + pid_h * stride_kh + j * BLOCK_N * stride_kn
-        k_ptr = tl.make_block_ptr(
-            K_PTR,
-            (N, D),
-            (stride_kn, stride_kd),
-            k_offset,
-            (BLOCK_N, D),
-            order=(0, 1),
-        )
-        k_block = tl.load(k_ptr).to(tl.float32)
-
-        # V block
-        v_offset = pid_z * stride_vz + pid_h * stride_vh + j * BLOCK_N * stride_vn
-        v_ptr = tl.make_block_ptr(
-            V_PTR,
-            (N, Dv),
-            (stride_vn, stride_vd),
-            v_offset,
-            (BLOCK_N, Dv),
-            order=(0, 1),
-        )
-        v_block = tl.load(v_ptr).to(tl.float32)
-
-        # Compute S
-        s = tl.dot(q_block, tl.trans(k_block)) * scale
-
-        # Causal mask on diagonal block
-        do_mask = (causal == 1) and (j == pid_i)
-        if do_mask:
-            row_idx = tl.arange(0, BLOCK_M)[:, None]
-            col_idx = tl.arange(0, BLOCK_N)[None, :]
-            mask = col_idx > row_idx
-            s = tl.where(mask, -1e9, s)
-
-        # Online softmax
-        local_m = tl.max(s, 1)
-        p = tl.exp(s - local_m[:, None])
-        local_l = tl.sum(p, 1)
-
-        m_new = tl.maximum(m, local_m)
-        alpha = tl.exp(m - m_new)
-        beta = tl.exp(local_m - m_new)
-
-        # Update l
-        l = alpha * l + beta * local_l
-
-        # Update o
-        p_scaled = p * beta[:, None]
-        o_new = tl.dot(p_scaled, v_block)
-        o = alpha[:, None] * o + o_new
-
-        # Update m
-        m = m_new
-
-    # Finalize
-    o_final = o / l[:, None]
-    tl.store(o_ptr, o_final.to(O_PTR.dtype.element_ty))
-
+    pid_m = tl.program_id(0)
+    lo = pid_m * BLOCK_M
+    m_end = (pid_m + 1) * BLOCK_M
+    if m_end > M:
+        m_end = M
+    offs_m = lo + tl.arange(0, BLOCK_M)
+    offs_n_base = tl.arange(0, BLOCK_N)
+    offs_d = tl.arange(0, BLOCK_D)
+    q_ptr = Q_PTR + offs_m[:, None] * STRIDE_QM + offs_d[None, :] * STRIDE_QD
+    q_mask = (offs_m[:, None] < M) & (offs_d[None, :] < D)
+    q = tl.load(q_ptr, mask=q_mask, other=0.0).to(tl.float32) * scale
+    m_i = tl.full([BLOCK_M], -1e9, dtype=tl.float32)
+    l_i = tl.zeros([BLOCK_M], dtype=tl.float32)
+    o = tl.zeros([BLOCK_M, BLOCK_D], dtype=tl.float32)
+    num_blks_n = (N + BLOCK_N - 1) // BLOCK_N
+    for blk_n in range(num_blks_n):
+        start_n = blk_n * BLOCK_N
+        if CAUSAL and start_n >= m_end:
+            break
+        offs_n = start_n + offs_n_base
+        k_ptr = K_PTR + offs_n[None, :] * STRIDE_KN + offs_d[:, None] * STRIDE_KD
+        k_mask = (offs_n[None, :] < N) & (offs_d[:, None] < D)
+        k = tl.load(k_ptr, mask=k_mask, other=0.0).to(tl.float32)
+        v_ptr = V_PTR + offs_n[:, None] * STRIDE_VN + offs_d[None, :] * STRIDE_VD
+        v_mask = (offs_n[:, None] < N) & (offs_d[None, :] < D)
+        v = tl.load(v_ptr, mask=v_mask, other=0.0).to(tl.float32)
+        s = tl.dot(q, k)
+        if CAUSAL:
+            i_idx = lo + tl.arange(0, BLOCK_M)[:, None]
+            j_idx = start_n + tl.arange(0, BLOCK_N)[None, :]
+            causal_mask = i_idx >= j_idx
+            s = tl.where(causal_mask, s, -1e9)
+        m_new = tl.maximum(m_i, tl.max(s, 1))
+        exp_scale = tl.exp(m_i - m_new)
+        p = tl.exp(s - m_new[:, None])
+        l_new = l_i * exp_scale + tl.sum(p, 1)
+        p_v = tl.dot(p, v)
+        o = (o * (l_i * exp_scale)[:, None] + p_v) / l_new[:, None]
+        m_i = m_new
+        l_i = l_new
+    o_ptr = O_PTR + offs_m[:, None] * STRIDE_OM + offs_d[None, :] * STRIDE_OD
+    o_mask = (offs_m[:, None] < M) & (offs_d[None, :] < D)
+    tl.store(o_ptr, o.to(tl.float16), mask=o_mask)
 
 def flash_attn(Q: torch.Tensor, K: torch.Tensor, V: torch.Tensor, causal: bool = True) -> torch.Tensor:
-    Z, H, M, D = Q.shape
-    _, _, N, Dv = V.shape
+    Z, H, M, Dq = Q.shape
+    N = K.shape[2]
+    Dv = V.shape[3]
     assert N == M
-    assert K.shape == (Z, H, N, D)
-
-    scale = 1.0 / math.sqrt(D)
-    O = torch.empty((Z, H, M, Dv), dtype=Q.dtype, device=Q.device)
-
-    if M == 0:
-        return O
-
+    assert K.shape[3] == Dq
+    assert V.shape == (Z, H, N, Dv)
+    out = torch.empty(Z, H, M, Dv, dtype=Q.dtype, device=Q.device)
     BLOCK_M = 64
     BLOCK_N = 64
-    num_blocks = M // BLOCK_M
-    grid = lambda z, h, nb: (z, h, nb)
-
-    q_strides = Q.stride()
-    k_strides = K.stride()
-    v_strides = V.stride()
-    o_strides = O.stride()
-
-    attn_kernel[grid](  # type: ignore
-        Q,
-        K,
-        V,
-        O,
-        tl.int32(q_strides[0]),
-        tl.int32(q_strides[1]),
-        tl.int32(q_strides[2]),
-        tl.int32(q_strides[3]),
-        tl.int32(k_strides[0]),
-        tl.int32(k_strides[1]),
-        tl.int32(k_strides[2]),
-        tl.int32(k_strides[3]),
-        tl.int32(v_strides[0]),
-        tl.int32(v_strides[1]),
-        tl.int32(v_strides[2]),
-        tl.int32(v_strides[3]),
-        tl.int32(o_strides[0]),
-        tl.int32(o_strides[1]),
-        tl.int32(o_strides[2]),
-        tl.int32(o_strides[3]),
-        Z,
-        H,
-        M,
-        N,
-        D,
-        Dv,
-        tl.float32(scale),
-        tl.int32(1 if causal else 0),
-        num_blocks,
-        BLOCK_M=BLOCK_M,
-        BLOCK_N=BLOCK_N,
-        num_stages=1,
-    )
-
-    return O
+    BLOCK_D = 64
+    scale = 1.0 / math.sqrt(Dq)
+    for z in range(Z):
+        for h in range(H):
+            q = Q[z, h]
+            k = K[z, h]
+            v = V[z, h]
+            o = out[z, h]
+            es = q.element_size()
+            stride_qm = q.stride(0) // es
+            stride_qd = q.stride(1) // es
+            stride_kn = k.stride(0) // es
+            stride_kd = k.stride(1) // es
+            stride_vn = v.stride(0) // es
+            stride_vd = v.stride(1) // es
+            stride_om = o.stride(0) // es
+            stride_od = o.stride(1) // es
+            grid = (triton.cdiv(M, BLOCK_M),)
+            flash_attn_kernel[grid](
+                q, k, v, o,
+                M=M, N=N, D=BLOCK_D,
+                BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_D=BLOCK_D,
+                CAUSAL=causal,
+                STRIDE_QM=stride_qm, STRIDE_QD=stride_qd,
+                STRIDE_KN=stride_kn, STRIDE_KD=stride_kd,
+                STRIDE_VN=stride_vn, STRIDE_VD=stride_vd,
+                STRIDE_OM=stride_om, STRIDE_OD=stride_od,
+                scale=scale
+            )
+    return out
 """
         return {"code": code}

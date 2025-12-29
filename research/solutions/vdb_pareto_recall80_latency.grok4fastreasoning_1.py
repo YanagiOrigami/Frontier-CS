@@ -2,15 +2,13 @@ import faiss
 import numpy as np
 from typing import Tuple
 
-class VDBLatencyIndex:
+class VDBIndex:
     def __init__(self, dim: int, **kwargs):
         self.dim = dim
         nlist = 1000
-        m = 8
-        bits = 8
         self.nprobe = 10
         self.quantizer = faiss.IndexFlatL2(dim)
-        self.index = faiss.IndexIVFPQ(self.quantizer, dim, nlist, m, bits)
+        self.index = faiss.IndexIVFFlat(self.quantizer, dim, nlist, faiss.METRIC_L2)
         self.trained = False
 
     def add(self, xb: np.ndarray) -> None:
@@ -21,5 +19,5 @@ class VDBLatencyIndex:
 
     def search(self, xq: np.ndarray, k: int) -> Tuple[np.ndarray, np.ndarray]:
         self.index.nprobe = self.nprobe
-        D, I = self.index.search(xq, k)
-        return D, I
+        distances, indices = self.index.search(xq, k)
+        return distances.astype(np.float32), indices.astype(np.int64)

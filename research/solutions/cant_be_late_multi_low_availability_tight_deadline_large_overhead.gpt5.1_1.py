@@ -6,20 +6,11 @@ from sky_spot.utils import ClusterType
 
 
 class Solution(MultiRegionStrategy):
-    """Your multi-region scheduling strategy."""
+    """Multi-region scheduling strategy with deadline safety."""
 
-    NAME = "my_strategy"  # REQUIRED: unique identifier
+    NAME = "my_strategy"
 
     def solve(self, spec_path: str) -> "Solution":
-        """
-        Initialize the solution from spec_path config.
-
-        The spec file contains:
-        - deadline: deadline in hours
-        - duration: task duration in hours
-        - overhead: restart overhead in hours
-        - trace_files: list of trace file paths (one per region)
-        """
         with open(spec_path) as f:
             config = json.load(f)
 
@@ -31,91 +22,102 @@ class Solution(MultiRegionStrategy):
         )
         super().__init__(args)
 
-        # Internal state initialization
-        # Determine the "NONE" enum value robustly
-        if hasattr(ClusterType, "NONE"):
-            self.CLUSTER_NONE = ClusterType.NONE
-        else:
-            self.CLUSTER_NONE = ClusterType.None  # type: ignore[attr-defined]
-
-        # Convert to seconds (MultiRegionStrategy should already do this,
-        # but we store local aliases for clarity and speed).
-        self.total_task = float(self.task_duration)
-        self.overhead = float(self.restart_overhead)
-        self.deadline_time = float(self.deadline)
-        self.gap = float(self.env.gap_seconds)
-
-        # Initial slack (seconds)
-        self.initial_slack = self.deadline_time - self.total_task
-
-        # Running sum for task_done_time to avoid O(n) per step
-        self._work_done_sum = 0.0
+        # Internal state (initialized later when env is available)
+        self._initialized = False
+        self._total_done = 0.0
         self._last_task_done_len = 0
-
-        # Once we commit to on-demand, never go back to spot
-        self._commit_to_on_demand = False
-
-        # Slack threshold (in seconds) beyond remaining work at which we
-        # must commit to ON_DEMAND to still safely finish.
-        # Derivation: We can afford at most one full gap of zero progress
-        # (idle or failed spot) and still switch to ON_DEMAND and finish.
-        # Condition: time_left - gap >= remaining_work + overhead
-        # => slack >= gap + overhead
-        self._slack_commit_threshold = self.overhead + self.gap
+        self._lock_to_ond = False
+        self._preferred_region = None
+        self._commit_threshold = 0.0
+        self._initial_slack = 0.0
+        self._task_duration_s = None
+        self._restart_overhead_s = None
+        self._deadline_s = None
 
         return self
 
-    def _update_work_done_sum(self) -> None:
-        """Incrementally maintain the sum of task_done_time."""
+    def _initialize_if_needed(self):
+        if self._initialized:
+            return
+        self._initialized = True
+
+        # Normalize possible list-valued attributes into scalars
+        td = getattr(self, "task_duration", 0.0)
+        if isinstance(td, (list, tuple)):
+            td = float(td[0])
+        self._task_duration_s = float(td)
+
+        ro = getattr(self, "restart_overhead", 0.0)
+        if isinstance(ro, (list, tuple)):
+            ro = float(ro[0])
+        self._restart_overhead_s = float(ro)
+
+        dl = getattr(self, "deadline", 0.0)
+        if isinstance(dl, (list, tuple)):
+            dl = float(dl[0])
+        self._deadline_s = float(dl)
+
+        self._preferred_region = self.env.get_current_region()
+
+        remaining_time = self._deadline_s - self.env.elapsed_seconds
+        time_needed = self._task_duration_s + self._restart_overhead_s
+        initial_slack = max(remaining_time - time_needed, 0.0)
+        self._initial_slack = initial_slack
+
+        gap = getattr(self.env, "gap_seconds", 0.0)
+        base_thresh = 2.0 * (gap + self._restart_overhead_s)
+
+        if initial_slack > 0.0:
+            max_thresh = initial_slack * 0.8
+            self._commit_threshold = min(base_thresh, max_thresh)
+        else:
+            self._commit_threshold = 0.0
+
+    def _update_progress(self):
         td_list = self.task_done_time
-        length = len(td_list)
-        if length > self._last_task_done_len:
-            s = self._work_done_sum
-            for i in range(self._last_task_done_len, length):
-                s += td_list[i]
-            self._work_done_sum = s
-            self._last_task_done_len = length
+        n = len(td_list)
+        if n > self._last_task_done_len:
+            self._total_done += sum(td_list[self._last_task_done_len:n])
+            self._last_task_done_len = n
 
     def _step(self, last_cluster_type: ClusterType, has_spot: bool) -> ClusterType:
-        """
-        Decide next action based on current state.
+        self._initialize_if_needed()
+        self._update_progress()
 
-        Returns: ClusterType.SPOT, ClusterType.ON_DEMAND, or ClusterType.NONE
-        """
-        # Keep running sum of work done
-        self._update_work_done_sum()
+        remaining_work = self._task_duration_s - self._total_done
+        if remaining_work <= 0.0:
+            # Task already completed.
+            return ClusterType.NONE
 
-        remaining_work = self.total_task - self._work_done_sum
-        if remaining_work <= 0:
-            # Task complete: no need to spend more money.
-            return self.CLUSTER_NONE
-
-        current_time = float(self.env.elapsed_seconds)
-        time_left = self.deadline_time - current_time
-
-        if time_left <= 0:
-            # Already at / past deadline; nothing sensible to do but avoid cost.
-            return self.CLUSTER_NONE
-
-        # Slack = extra time beyond remaining work
-        slack = time_left - remaining_work
-
-        # If we've already committed to on-demand, always stay on it
-        if self._commit_to_on_demand:
+        # Once locked into on-demand, never leave it until completion.
+        if self._lock_to_ond:
             return ClusterType.ON_DEMAND
 
-        # If slack is small enough that we cannot afford even one more
-        # zero-progress step, commit to ON_DEMAND now.
-        # Also, if slack is already less than overhead, even immediate
-        # ON_DEMAND cannot guarantee success, but we still do our best.
-        if slack <= self._slack_commit_threshold or slack <= self.overhead:
-            self._commit_to_on_demand = True
+        remaining_time = self._deadline_s - self.env.elapsed_seconds
+        if remaining_time <= 0.0:
+            # Past deadline; nothing to do but run on-demand.
+            self._lock_to_ond = True
             return ClusterType.ON_DEMAND
 
-        # We still have enough slack to risk one more step of no progress.
-        # Prefer SPOT when available; otherwise, idle (NONE) to save cost.
+        # Conservative estimate of time needed if we switch to on-demand now.
+        time_needed_ond = remaining_work + self._restart_overhead_s
+        slack = remaining_time - time_needed_ond
+
+        # If slack is small, commit to on-demand for safety.
+        if slack <= self._commit_threshold:
+            self._lock_to_ond = True
+            return ClusterType.ON_DEMAND
+
+        # Slack is large: we are in the "spot-preferred" phase.
+        # Stay in our initial preferred region.
+        if self._preferred_region is not None:
+            current_region = self.env.get_current_region()
+            if current_region != self._preferred_region:
+                # Region switching is modeled as free in the provided API.
+                self.env.switch_region(self._preferred_region)
+
+        # Use Spot when available; otherwise, wait to save cost.
         if has_spot:
             return ClusterType.SPOT
-
-        # Spot unavailable, but plenty of slack: wait for cheaper resources.
-        return self.CLUSTER_NONE
+        else:
+            return ClusterType.NONE

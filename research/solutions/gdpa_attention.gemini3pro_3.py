@@ -1,178 +1,175 @@
 import torch
 import triton
 import triton.language as tl
+import math
+import sys
+import inspect
 
-class Solution:
-    def solve(self, spec_path: str = None) -> dict:
-        return {
-            "code": r"""
-import torch
-import triton
-import triton.language as tl
-
+@triton.autotune(
+    configs=[
+        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 64, 'num_warps': 4, 'num_stages': 4}, num_stages=4),
+        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 64, 'num_warps': 4, 'num_stages': 4}, num_stages=4),
+        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 32, 'num_warps': 4, 'num_stages': 4}, num_stages=4),
+        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 32, 'num_warps': 4, 'num_stages': 2}, num_stages=2),
+    ],
+    key=['N_CTX']
+)
 @triton.jit
-def _gdpa_fwd_kernel(
+def _gdpa_kernel(
     Q, K, V, GQ, GK, Out,
     stride_qz, stride_qh, stride_qm, stride_qk,
     stride_kz, stride_kh, stride_kn, stride_kk,
     stride_vz, stride_vh, stride_vn, stride_vk,
-    stride_gqz, stride_gqh, stride_gqm, stride_gqk,
-    stride_gkz, stride_gkh, stride_gkn, stride_gkk,
     stride_oz, stride_oh, stride_om, stride_on,
     sm_scale,
-    Z, H, M, N, D_Q, D_V,
-    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
-    BLOCK_DQ: tl.constexpr, BLOCK_DV: tl.constexpr
+    Z, H, N_CTX,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_D: tl.constexpr
 ):
+    # IDs
     start_m = tl.program_id(0)
     off_hz = tl.program_id(1)
     
     off_z = off_hz // H
     off_h = off_hz % H
-    
-    # -----------------------------------------------------------
-    # Q and GQ Loading
-    # -----------------------------------------------------------
-    # Offsets for Q/GQ: [BLOCK_M, BLOCK_DQ]
-    offs_m = start_m * BLOCK_M + tl.arange(0, BLOCK_M)
-    offs_dq = tl.arange(0, BLOCK_DQ)
-    
-    # Check bounds
-    mask_m = offs_m < M
-    mask_dq = offs_dq < D_Q
-    mask_q = mask_m[:, None] & mask_dq[None, :]
-    
-    # Pointers
-    q_ptrs = Q + (off_z * stride_qz + off_h * stride_qh) + \
-             (offs_m[:, None] * stride_qm + offs_dq[None, :] * stride_qk)
-    gq_ptrs = GQ + (off_z * stride_gqz + off_h * stride_gqh) + \
-              (offs_m[:, None] * stride_gqm + offs_dq[None, :] * stride_gqk)
-              
-    # Load and Gate
-    q = tl.load(q_ptrs, mask=mask_q, other=0.0)
-    gq = tl.load(gq_ptrs, mask=mask_q, other=0.0)
-    
-    q = q * tl.sigmoid(gq)
-    q = q * sm_scale
-    q = q.to(tl.float16)
 
-    # -----------------------------------------------------------
-    # Accumulators
-    # -----------------------------------------------------------
+    # Pointer offsets
+    # Base pointers for the sequence/head
+    q_base = Q + off_z * stride_qz + off_h * stride_qh
+    gq_base = GQ + off_z * stride_qz + off_h * stride_qh
+    k_base = K + off_z * stride_kz + off_h * stride_kh
+    gk_base = GK + off_z * stride_kz + off_h * stride_kh
+    v_base = V + off_z * stride_vz + off_h * stride_vh
+    out_base = Out + off_z * stride_oz + off_h * stride_oh
+
+    # Offsets initialization
+    offs_m = start_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_d = tl.arange(0, BLOCK_D)
+    offs_n = tl.arange(0, BLOCK_N)
+    
+    # Q Block Pointers
+    q_ptrs = q_base + (offs_m[:, None] * stride_qm + offs_d[None, :] * stride_qk)
+    gq_ptrs = gq_base + (offs_m[:, None] * stride_qm + offs_d[None, :] * stride_qk)
+    
+    # Mask for Q bounds (M dimension)
+    m_mask = offs_m[:, None] < N_CTX
+    
+    # Load Q and GQ
+    q = tl.load(q_ptrs, mask=m_mask, other=0.0)
+    gq = tl.load(gq_ptrs, mask=m_mask, other=0.0)
+    
+    # Apply Gating to Q
+    q_gated = q * tl.sigmoid(gq)
+    
+    # Fuse scaling into Q
+    q_gated = q_gated * sm_scale
+    
+    # Initialize accumulators for streaming softmax
     m_i = tl.zeros([BLOCK_M], dtype=tl.float32) - float("inf")
     l_i = tl.zeros([BLOCK_M], dtype=tl.float32)
-    acc = tl.zeros([BLOCK_M, BLOCK_DV], dtype=tl.float32)
+    acc = tl.zeros([BLOCK_M, BLOCK_D], dtype=tl.float32)
     
-    # -----------------------------------------------------------
-    # K/V Base Pointers & Offsets
-    # -----------------------------------------------------------
-    k_base = K + (off_z * stride_kz + off_h * stride_kh)
-    gk_base = GK + (off_z * stride_gkz + off_h * stride_gkh)
-    v_base = V + (off_z * stride_vz + off_h * stride_vh)
+    # Inner loop over K/V blocks
+    # Note: K, GK, V have shape (Z, H, N, D). N matches M in this problem (self-attn).
+    # Iterate through all N blocks.
     
-    offs_n = tl.arange(0, BLOCK_N)
-    offs_dv = tl.arange(0, BLOCK_DV)
-    mask_dv = offs_dv < D_V
+    # Pre-calculate stride offsets for N step
+    # k_base + (offs_n + step) * stride_kn
     
-    # -----------------------------------------------------------
-    # Loop over N
-    # -----------------------------------------------------------
-    for start_n in range(0, N, BLOCK_N):
-        cols = start_n + offs_n
-        mask_n = cols < N
+    for start_n in range(0, N_CTX, BLOCK_N):
+        offs_n_curr = start_n + offs_n
         
-        # --- Load K, GK ---
-        # Shape: [BLOCK_N, BLOCK_DQ]
-        mask_k = mask_n[:, None] & mask_dq[None, :]
+        # Mask for K/V bounds
+        n_mask = offs_n_curr[None, :] < N_CTX
         
-        k_ptrs = k_base + (cols[:, None] * stride_kn + offs_dq[None, :] * stride_kk)
-        gk_ptrs = gk_base + (cols[:, None] * stride_gkn + offs_dq[None, :] * stride_gkk)
+        # Load K, GK
+        # Transpose logic: we load K as (BLOCK_N, D) then transpose in dot
+        k_ptrs = k_base + (offs_n_curr[:, None] * stride_kn + offs_d[None, :] * stride_kk)
+        gk_ptrs = gk_base + (offs_n_curr[:, None] * stride_kn + offs_d[None, :] * stride_kk)
         
-        k = tl.load(k_ptrs, mask=mask_k, other=0.0)
-        gk = tl.load(gk_ptrs, mask=mask_k, other=0.0)
+        k = tl.load(k_ptrs, mask=offs_n_curr[:, None] < N_CTX, other=0.0)
+        gk = tl.load(gk_ptrs, mask=offs_n_curr[:, None] < N_CTX, other=0.0)
         
-        # Gate K
-        k = k * tl.sigmoid(gk)
-        k = k.to(tl.float16)
+        # Apply Gating to K
+        k_gated = k * tl.sigmoid(gk)
         
-        # --- Attention Score ---
-        # q: [M, D], k: [N, D] -> qk: [M, N]
-        # We compute q @ k.T
-        qk = tl.dot(q, tl.trans(k))
+        # Compute Attention Scores: Q @ K.T
+        # Shape: (BLOCK_M, D) @ (D, BLOCK_N) -> (BLOCK_M, BLOCK_N)
+        qk = tl.dot(q_gated, tl.trans(k_gated))
         
-        # Mask padded parts of N
-        qk = tl.where(mask_n[None, :], qk, float("-inf"))
+        # Mask padded parts of N with -inf
+        if start_n + BLOCK_N > N_CTX:
+            qk = tl.where(n_mask, qk, float("-inf"))
+            
+        # --- Online Softmax Update ---
         
-        # --- Softmax Stats ---
-        m_ij = tl.max(qk, 1)
-        p = tl.exp(qk - m_ij[:, None])
-        l_ij = tl.sum(p, 1)
+        # 1. Update max (m_i)
+        m_i_new = tl.max(qk, 1)
+        m_next = tl.maximum(m_i, m_i_new)
         
-        # --- Update Global Stats ---
-        m_new = tl.maximum(m_i, m_ij)
-        alpha = tl.exp(m_i - m_new)
-        beta = tl.exp(m_ij - m_new)
+        # 2. Compute scaling factors
+        # alpha = exp(m_prev - m_next)
+        alpha = tl.exp(m_i - m_next)
+        # p = exp(qk - m_next)
+        p = tl.exp(qk - m_next[:, None])
         
-        l_i = l_i * alpha + l_ij * beta
+        # 3. Update sum (l_i)
+        l_i = l_i * alpha + tl.sum(p, 1)
         
-        # --- Load V ---
-        # Shape: [BLOCK_N, BLOCK_DV]
-        mask_v = mask_n[:, None] & mask_dv[None, :]
-        v_ptrs = v_base + (cols[:, None] * stride_vn + offs_dv[None, :] * stride_vk)
-        v = tl.load(v_ptrs, mask=mask_v, other=0.0)
+        # 4. Load V
+        v_ptrs = v_base + (offs_n_curr[:, None] * stride_vn + offs_d[None, :] * stride_vk)
+        v = tl.load(v_ptrs, mask=offs_n_curr[:, None] < N_CTX, other=0.0)
         
-        # --- Update Accumulator ---
-        p = p.to(tl.float16)
-        # p: [M, N], v: [N, DV] -> pv: [M, DV]
-        pv = tl.dot(p, v)
-        acc = acc * alpha[:, None] + pv * beta[:, None]
+        # 5. Update accumulator
+        # acc = acc * alpha + p @ V
+        acc = acc * alpha[:, None]
+        # p is fp32, v is fp16. Convert p to fp16 for speed if needed, but keeping p fp16 and acc fp32 is standard
+        acc = tl.dot(p.to(tl.float16), v, acc)
         
-        m_i = m_new
+        # Update running max
+        m_i = m_next
 
-    # -----------------------------------------------------------
+    # Finalize Output
+    # out = acc / l_i
+    acc = acc / l_i[:, None]
+    
     # Store Output
-    # -----------------------------------------------------------
-    out = acc / l_i[:, None]
-    out = out.to(tl.float16)
-    
-    out_ptrs = Out + (off_z * stride_oz + off_h * stride_oh) + \
-               (offs_m[:, None] * stride_om + offs_dv[None, :] * stride_on)
-    
-    mask_out = mask_m[:, None] & mask_dv[None, :]
-    tl.store(out_ptrs, out, mask=mask_out)
+    out_ptrs = out_base + (offs_m[:, None] * stride_om + offs_d[None, :] * stride_on)
+    tl.store(out_ptrs, acc.to(tl.float16), mask=m_mask)
 
-def gdpa_attn(Q, K, V, GQ, GK):
-    Z, H, M, Dq = Q.shape
+def gdpa_attn(Q: torch.Tensor, K: torch.Tensor, V: torch.Tensor, GQ: torch.Tensor, GK: torch.Tensor) -> torch.Tensor:
+    """
+    GDPA attention computation with gated Q and K tensors.
+    """
+    # Dimensions
+    Z, H, M, D = Q.shape
     _, _, N, _ = K.shape
-    _, _, _, Dv = V.shape
     
-    Out = torch.empty((Z, H, M, Dv), device=Q.device, dtype=torch.float16)
+    # Scale factor
+    sm_scale = 1.0 / (D ** 0.5)
     
-    BLOCK_M = 128
-    BLOCK_N = 64
-    BLOCK_DQ = triton.next_power_of_2(Dq)
-    BLOCK_DV = triton.next_power_of_2(Dv)
+    # Output tensor
+    Out = torch.empty_like(Q)
     
-    num_warps = 4 if Dq <= 64 else 8
-    num_stages = 3
+    # Grid configuration
+    grid = lambda META: (triton.cdiv(M, META['BLOCK_M']), Z * H)
     
-    grid = (triton.cdiv(M, BLOCK_M), Z * H)
-    
-    _gdpa_fwd_kernel[grid](
+    # Launch Kernel
+    _gdpa_kernel[grid](
         Q, K, V, GQ, GK, Out,
         Q.stride(0), Q.stride(1), Q.stride(2), Q.stride(3),
         K.stride(0), K.stride(1), K.stride(2), K.stride(3),
         V.stride(0), V.stride(1), V.stride(2), V.stride(3),
-        GQ.stride(0), GQ.stride(1), GQ.stride(2), GQ.stride(3),
-        GK.stride(0), GK.stride(1), GK.stride(2), GK.stride(3),
         Out.stride(0), Out.stride(1), Out.stride(2), Out.stride(3),
-        sm_scale=1.0 / (Dq ** 0.5),
-        Z=Z, H=H, M=M, N=N, D_Q=Dq, D_V=Dv,
-        BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N,
-        BLOCK_DQ=BLOCK_DQ, BLOCK_DV=BLOCK_DV,
-        num_warps=num_warps, num_stages=num_stages
+        sm_scale,
+        Z, H, M,
+        BLOCK_D=D
     )
     
     return Out
-"""
-        }
+
+class Solution:
+    def solve(self, spec_path: str = None) -> dict:
+        """
+        Returns the source code of the current solution.
+        """
+        return {"code": inspect.getsource(sys.modules[__name__])}

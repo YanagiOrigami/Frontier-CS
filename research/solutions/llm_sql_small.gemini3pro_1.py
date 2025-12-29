@@ -13,115 +13,111 @@ class Solution:
         distinct_value_threshold: float = 0.7,
         parallel: bool = True,
     ) -> pd.DataFrame:
-        """
-        Reorder columns in the DataFrame to maximize prefix hit rate.
-        Implements a greedy tree-minimization strategy.
-        """
-        # Work on a copy to preserve input integrity
-        df_work = df.copy()
         
-        # Convert all columns to string string representation is required for the objective
-        # and for concatenation. This also handles mixed types or NaNs (becoming "nan").
-        for col in df_work.columns:
-            df_work[col] = df_work[col].astype(str)
-            
+        # Convert all data to string type for processing and concatenation
+        df_work = df.astype(str)
+        
         # 1. Apply Column Merges
+        # Merged columns are concatenated and replace the original columns.
         if col_merge:
             for group in col_merge:
-                # Identify valid columns that exist in the current dataframe
-                valid_cols = [c for c in group if c in df_work.columns]
-                
-                # Need at least 2 columns to perform a merge
-                if len(valid_cols) < 2:
+                if not group:
+                    continue
+                # Identify columns from the group that are present in the dataframe
+                valid_group = [c for c in group if c in df_work.columns]
+                # Need at least 2 columns to merge
+                if len(valid_group) < 2:
                     continue
                 
-                # Name of the new column
-                new_col_name = "".join(valid_cols)
+                # Merge into the first column of the group
+                base_col = valid_group[0]
+                # Efficiently concatenate strings
+                combined = df_work[base_col].copy()
+                for c in valid_group[1:]:
+                    combined = combined + df_work[c]
                 
-                # Concatenate values of the columns in the group
-                merged_series = df_work[valid_cols[0]]
-                for c in valid_cols[1:]:
-                    merged_series = merged_series + df_work[c]
+                df_work[base_col] = combined
+                # Drop the merged-in columns
+                df_work.drop(columns=valid_group[1:], inplace=True)
+        
+        # 2. Prepare Data for Greedy Search
+        # Use numpy array for faster iteration
+        # Limit to first 30k rows to satisfy runtime constraint if dataset is huge,
+        # as the prefix hit rate is heavily determined by the structure of the beginning of the data.
+        limit = 30000
+        if len(df_work) > limit:
+            data_sample = df_work.iloc[:limit].to_numpy()
+        else:
+            data_sample = df_work.to_numpy()
+            
+        columns = df_work.columns.tolist()
+        M = len(columns)
+        
+        # 3. Greedy Permutation Search
+        # We iteratively select the column that maximizes the prefix LCP score (numerator of the target metric).
+        # Since the total length (denominator) is constant regardless of permutation, maximizing the sum of LCPs is sufficient.
+        
+        current_perm_indices = []
+        remaining_indices = set(range(M))
+        
+        # Function to evaluate the total LCP score of a given column prefix
+        # We approximate the LCP by summing the lengths of matching tokens (column values).
+        def get_score(perm_idx):
+            subset = data_sample[:, perm_idx]
+            
+            # Use a Trie (represented by nested dicts) to track prefixes seen so far.
+            # We insert rows one by one. The depth we can traverse in the Trie
+            # represents the Longest Common Prefix with some previous row.
+            root = {}
+            total_score = 0
+            
+            for row in subset:
+                node = root
+                match_len = 0
+                diverged = False
                 
-                # Drop original columns
-                df_work.drop(columns=valid_cols, inplace=True)
+                for token in row:
+                    if not diverged:
+                        if token in node:
+                            # Match found with a previous row's path
+                            match_len += len(token)
+                            node = node[token]
+                        else:
+                            # Diverged from existing paths
+                            diverged = True
+                            new_node = {}
+                            node[token] = new_node
+                            node = new_node
+                    else:
+                        # Continue inserting the rest of the row to update the Trie
+                        new_node = {}
+                        node[token] = new_node
+                        node = new_node
                 
-                # Add the new merged column
-                df_work[new_col_name] = merged_series
+                total_score += match_len
+            return total_score
 
-        # 2. Greedy Column Ordering
-        # Objective: Order columns to maximize shared prefixes (hit rate).
-        # Strategy: At each step, select the column that results in the minimum
-        # number of unique row prefixes formed by the sequence of selected columns so far.
-        # This keeps the "prefix tree" as narrow as possible near the root.
-        # Tie-breaker: Choose columns with longer string representation to maximize bytes shared.
-        
-        cols = list(df_work.columns)
-        
-        # Precompute integer codes for each column to speed up cardinality checks
-        # and precompute average lengths for tie-breaking.
-        col_codes = {}
-        col_lens = {}
-        for c in cols:
-            # pd.factorize returns (codes, uniques). We only need codes.
-            codes, _ = pd.factorize(df_work[c])
-            col_codes[c] = codes
-            col_lens[c] = df_work[c].str.len().mean()
+        # Greedy Loop: At each step, pick the column that yields the highest prefix score
+        while remaining_indices:
+            best_idx = -1
+            best_score = -1
             
-        selected = []
-        remaining = set(cols)
-        
-        # current_groups tracks the unique group ID for the prefix formed by selected columns.
-        # Initially, all rows belong to the same group (0).
-        num_rows = len(df_work)
-        current_groups = np.zeros(num_rows, dtype=np.int64)
-        
-        # Greedy selection loop
-        for _ in range(len(cols)):
-            best_col = None
-            best_cardinality = float('inf')
-            best_len = -1.0
-            
-            # Evaluate each remaining column as the next candidate
-            for c in remaining:
-                codes = col_codes[c]
-                max_code = codes.max()
+            # Try appending each remaining column to the current permutation
+            for idx in remaining_indices:
+                candidate = current_perm_indices + [idx]
+                score = get_score(candidate)
                 
-                # Calculate the "combined" identifier for (current_prefix, new_column)
-                # packing two ints into one int64 for fast unique counting.
-                stride = max_code + 1
-                combined = current_groups * stride + codes
+                if score > best_score:
+                    best_score = score
+                    best_idx = idx
+            
+            # Fallback safety (should rare occur unless all scores are 0)
+            if best_idx == -1:
+                best_idx = list(remaining_indices)[0]
                 
-                # Count unique prefixes that would result from picking this column
-                # pd.unique is efficient
-                cardinality = len(pd.unique(combined))
-                
-                # Selection logic:
-                # 1. Minimize cardinality (primary)
-                # 2. Maximize average string length (secondary)
-                if cardinality < best_cardinality:
-                    best_cardinality = cardinality
-                    best_col = c
-                    best_len = col_lens[c]
-                elif cardinality == best_cardinality:
-                    if col_lens[c] > best_len:
-                        best_col = c
-                        best_len = col_lens[c]
+            current_perm_indices.append(best_idx)
+            remaining_indices.remove(best_idx)
             
-            # Append best column to the permutation
-            selected.append(best_col)
-            remaining.remove(best_col)
-            
-            # Update current_groups for the next iteration
-            # The new groups are the unique IDs of the prefixes we just accepted
-            best_codes = col_codes[best_col]
-            stride = best_codes.max() + 1
-            combined = current_groups * stride + best_codes
-            
-            # Re-normalize combined IDs to a dense range [0, k-1]
-            current_groups, _ = pd.factorize(combined)
-            # Ensure type is int64 to prevent overflow in packing
-            current_groups = current_groups.astype(np.int64)
-            
-        # Return the DataFrame with columns in the optimized order
-        return df_work[selected]
+        # 4. Return result
+        final_cols = [columns[i] for i in current_perm_indices]
+        return df_work[final_cols]

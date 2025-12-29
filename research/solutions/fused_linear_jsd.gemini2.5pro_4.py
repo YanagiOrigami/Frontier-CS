@@ -1,185 +1,159 @@
 import torch
 import triton
 import triton.language as tl
-import inspect
 
-# This string contains the full implementation that will be passed to the evaluator.
-_triton_kernel_code = """
+class Solution:
+    def solve(self, spec_path: str = None) -> dict:
+        code = """
 import torch
 import triton
 import triton.language as tl
 
+
 @triton.autotune(
     configs=[
-        # Basic configurations with varying block sizes and warp counts
-        triton.Config({'BLOCK_K': 32, 'num_stages': 2, 'num_warps': 4}),
-        triton.Config({'BLOCK_K': 64, 'num_stages': 2, 'num_warps': 4}),
-        triton.Config({'BLOCK_K': 32, 'num_stages': 3, 'num_warps': 8}),
-        triton.Config({'BLOCK_K': 64, 'num_stages': 3, 'num_warps': 8}),
-        # Configurations with more warps for higher occupancy and parallelism
-        triton.Config({'BLOCK_K': 32, 'num_stages': 4, 'num_warps': 16}),
-        triton.Config({'BLOCK_K': 64, 'num_stages': 4, 'num_warps': 16}),
-        # Configurations with larger K blocks for more work per thread
-        triton.Config({'BLOCK_K': 128, 'num_stages': 3, 'num_warps': 8}),
-        triton.Config({'BLOCK_K': 128, 'num_stages': 3, 'num_warps': 16}),
+        triton.Config({'BLOCK_SIZE_N': 64, 'BLOCK_SIZE_K': 64, 'num_stages': 2, 'num_warps': 4}),
+        triton.Config({'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 32, 'num_stages': 2, 'num_warps': 4}),
+        triton.Config({'BLOCK_SIZE_N': 256, 'BLOCK_SIZE_K': 32, 'num_stages': 2, 'num_warps': 8}),
+        triton.Config({'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 64, 'num_stages': 2, 'num_warps': 4}),
+        triton.Config({'BLOCK_SIZE_N': 256, 'BLOCK_SIZE_K': 64, 'num_stages': 3, 'num_warps': 8}),
+        triton.Config({'BLOCK_SIZE_N': 512, 'BLOCK_SIZE_K': 32, 'num_stages': 3, 'num_warps': 8}),
+        triton.Config({'BLOCK_SIZE_N': 64, 'BLOCK_SIZE_K': 128, 'num_stages': 3, 'num_warps': 4}),
+        triton.Config({'BLOCK_SIZE_N': 1024, 'BLOCK_SIZE_K': 32, 'num_stages': 4, 'num_warps': 8}),
+        triton.Config({'BLOCK_SIZE_N': 2048, 'BLOCK_SIZE_K': 16, 'num_stages': 4, 'num_warps': 8}),
+        triton.Config({'BLOCK_SIZE_N': 4096, 'BLOCK_SIZE_K': 16, 'num_stages': 4, 'num_warps': 16}, pre_hook=lambda args: args['N'] == 4096),
     ],
-    key=['N', 'K'],
+    key=['M', 'N', 'K'],
 )
 @triton.jit
-def _fused_linear_jsd_kernel(
+def _fused_jsd_kernel(
     X_ptr, W1_ptr, B1_ptr, W2_ptr, B2_ptr, Out_ptr,
     M, N, K,
-    stride_xm, stride_xk,
-    stride_w1k, stride_w1n,
-    stride_w2k, stride_w2n,
-    stride_b1n, stride_b2n,
-    stride_outm,
-    BLOCK_N: tl.constexpr,
-    BLOCK_K: tl.constexpr,
+    stride_x_m, stride_x_k,
+    stride_w1_k, stride_w1_n,
+    stride_w2_k, stride_w2_n,
+    stride_out_m,
+    BLOCK_SIZE_N: tl.constexpr,
+    BLOCK_SIZE_K: tl.constexpr
 ):
-    '''
-    Triton kernel for fused linear layers and Jensen-Shannon Divergence.
-    Each program in the grid computes the JSD for a single row of the input tensor X.
-    The kernel is structured as follows:
-    1. Compute two full logit vectors (size N) by performing two matrix-vector multiplications.
-       This is done by tiling over the K dimension.
-    2. Compute softmax probabilities P and Q using a stable log-sum-exp approach.
-       This involves block-level reductions (tl.max, tl.sum) over the N dimension.
-    3. Compute the JSD using the formula: JSD = H(M) - 0.5 * (H(P) + H(Q)),
-       where M = 0.5 * (P + Q) and H is the Shannon entropy.
-    4. Handle numerical stability for log(0) by adding a small epsilon.
-    '''
-    # Each program instance computes one JSD value for one row of X.
     pid_m = tl.program_id(axis=0)
+    x_row_ptr = X_ptr + pid_m * stride_x_m
 
-    # --- Step 1: Compute logits1 and logits2 for the current row ---
-    n_offsets = tl.arange(0, BLOCK_N)
-    
-    # Accumulators for the two matmuls, initialized to zero.
-    acc1 = tl.zeros((BLOCK_N,), dtype=tl.float32)
-    acc2 = tl.zeros((BLOCK_N,), dtype=tl.float32)
-    
-    # Loop over the K dimension in blocks to compute the matrix-vector products.
-    for k_start in range(0, K, BLOCK_K):
-        k_offsets = k_start + tl.arange(0, BLOCK_K)
-        k_mask = k_offsets < K
+    # --- PASS 1: Compute log-sum-exp ---
+    max1 = -float('inf')
+    max2 = -float('inf')
+    sum_exp1 = 0.0
+    sum_exp2 = 0.0
+
+    for n_start in range(0, tl.cdiv(N, BLOCK_SIZE_N)):
+        offs_n = n_start * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+        mask_n = offs_n < N
+
+        acc1 = tl.zeros((1, BLOCK_SIZE_N), dtype=tl.float32)
+        acc2 = tl.zeros((1, BLOCK_SIZE_N), dtype=tl.float32)
+        for k_start in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
+            offs_k = k_start * BLOCK_SIZE_K + tl.arange(0, BLOCK_SIZE_K)
+            
+            x_ptr = x_row_ptr + offs_k * stride_x_k
+            x = tl.load(x_ptr, mask=offs_k < K, other=0.0)
+            x_mat = tl.reshape(x, (1, BLOCK_SIZE_K))
+
+            w1_ptr = W1_ptr + (offs_k[:, None] * stride_w1_k + offs_n[None, :] * stride_w1_n)
+            w1 = tl.load(w1_ptr, mask=(offs_k[:, None] < K) & (offs_n[None, :] < N), other=0.0)
+
+            w2_ptr = W2_ptr + (offs_k[:, None] * stride_w2_k + offs_n[None, :] * stride_w2_n)
+            w2 = tl.load(w2_ptr, mask=(offs_k[:, None] < K) & (offs_n[None, :] < N), other=0.0)
+
+            acc1 += tl.dot(x_mat.to(w1.dtype), w1, out_dtype=tl.float32)
+            acc2 += tl.dot(x_mat.to(w2.dtype), w2, out_dtype=tl.float32)
+
+        b1 = tl.load(B1_ptr + offs_n, mask=mask_n, other=0.0)
+        b2 = tl.load(B2_ptr + offs_n, mask=mask_n, other=0.0)
         
-        # Load a tile of X for the current row. Shape: (BLOCK_K,)
-        x_ptrs = X_ptr + pid_m * stride_xm + k_offsets * stride_xk
-        # Cast input to float32 for high-precision accumulation
-        x = tl.load(x_ptrs, mask=k_mask, other=0.0).to(tl.float32)
+        logits1_block = tl.squeeze(acc1, axis=0) + b1
+        logits2_block = tl.squeeze(acc2, axis=0) + b2
 
-        # Load tiles of W1 and W2. Shape: (BLOCK_K, BLOCK_N)
-        w1_ptrs = W1_ptr + (k_offsets[:, None] * stride_w1k + n_offsets[None, :] * stride_w1n)
-        w1 = tl.load(w1_ptrs, mask=k_mask[:, None], other=0.0)
+        block_max1 = tl.max(tl.where(mask_n, logits1_block, -float('inf')), axis=0)
+        new_max1 = tl.maximum(max1, block_max1)
+        sum_exp1 = sum_exp1 * tl.exp(max1 - new_max1) + tl.sum(tl.exp(tl.where(mask_n, logits1_block, -float('inf')) - new_max1))
+        max1 = new_max1
         
-        w2_ptrs = W2_ptr + (k_offsets[:, None] * stride_w2k + n_offsets[None, :] * stride_w2n)
-        w2 = tl.load(w2_ptrs, mask=k_mask[:, None], other=0.0)
+        block_max2 = tl.max(tl.where(mask_n, logits2_block, -float('inf')), axis=0)
+        new_max2 = tl.maximum(max2, block_max2)
+        sum_exp2 = sum_exp2 * tl.exp(max2 - new_max2) + tl.sum(tl.exp(tl.where(mask_n, logits2_block, -float('inf')) - new_max2))
+        max2 = new_max2
+
+    lse1 = max1 + tl.log(sum_exp1)
+    lse2 = max2 + tl.log(sum_exp2)
+
+    # --- PASS 2: Compute JSD ---
+    jsd_sum = 0.0
+    for n_start in range(0, tl.cdiv(N, BLOCK_SIZE_N)):
+        offs_n = n_start * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+        mask_n = offs_n < N
+
+        acc1 = tl.zeros((1, BLOCK_SIZE_N), dtype=tl.float32)
+        acc2 = tl.zeros((1, BLOCK_SIZE_N), dtype=tl.float32)
+        for k_start in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
+            offs_k = k_start * BLOCK_SIZE_K + tl.arange(0, BLOCK_SIZE_K)
+            
+            x_ptr = x_row_ptr + offs_k * stride_x_k
+            x = tl.load(x_ptr, mask=offs_k < K, other=0.0)
+            x_mat = tl.reshape(x, (1, BLOCK_SIZE_K))
+
+            w1_ptr = W1_ptr + (offs_k[:, None] * stride_w1_k + offs_n[None, :] * stride_w1_n)
+            w1 = tl.load(w1_ptr, mask=(offs_k[:, None] < K) & (offs_n[None, :] < N), other=0.0)
+
+            w2_ptr = W2_ptr + (offs_k[:, None] * stride_w2_k + offs_n[None, :] * stride_w2_n)
+            w2 = tl.load(w2_ptr, mask=(offs_k[:, None] < K) & (offs_n[None, :] < N), other=0.0)
+
+            acc1 += tl.dot(x_mat.to(w1.dtype), w1, out_dtype=tl.float32)
+            acc2 += tl.dot(x_mat.to(w2.dtype), w2, out_dtype=tl.float32)
+
+        b1 = tl.load(B1_ptr + offs_n, mask=mask_n, other=0.0)
+        b2 = tl.load(B2_ptr + offs_n, mask=mask_n, other=0.0)
+
+        logits1_block = tl.squeeze(acc1, axis=0) + b1
+        logits2_block = tl.squeeze(acc2, axis=0) + b2
+
+        logp_block = logits1_block - lse1
+        logq_block = logits2_block - lse2
+        p_block = tl.exp(logp_block)
+        q_block = tl.exp(logq_block)
         
-        # Accumulate dot product. Triton handles upcasting of W1/W2 to float32.
-        acc1 += tl.dot(x, w1)
-        acc2 += tl.dot(x, w2)
+        m_block = 0.5 * (p_block + q_block)
+        logm_block = tl.log(m_block)
+        
+        kl_p_term = p_block * (logp_block - logm_block)
+        kl_q_term = q_block * (logq_block - logm_block)
+        
+        kl_p_term = tl.where(p_block > 0, kl_p_term, 0.0)
+        kl_q_term = tl.where(q_block > 0, kl_q_term, 0.0)
+        
+        jsd_sum += tl.sum(tl.where(mask_n, kl_p_term + kl_q_term, 0.0))
+        
+    jsd = 0.5 * jsd_sum
     
-    # Add biases to the accumulated values to get the final logits.
-    b1_ptrs = B1_ptr + n_offsets * stride_b1n
-    b1 = tl.load(b1_ptrs, mask=n_offsets < N, other=0.0)
-    logits1 = acc1 + b1
-    
-    b2_ptrs = B2_ptr + n_offsets * stride_b2n
-    b2 = tl.load(b2_ptrs, mask=n_offsets < N, other=0.0)
-    logits2 = acc2 + b2
+    out_ptr_row = Out_ptr + pid_m * stride_out_m
+    tl.store(out_ptr_row, jsd)
 
-    # --- Step 2: Compute P = softmax(logits1) and Q = softmax(logits2) stablely ---
-    # Use the log-sum-exp trick for numerical stability.
-    # `log_softmax(x) = x - logsumexp(x)`
-    # `logsumexp(x) = max(x) + log(sum(exp(x - max(x))))`
-    
-    # For P
-    max1 = tl.max(logits1, axis=0)
-    lse1 = max1 + tl.log(tl.sum(tl.exp(logits1 - max1), axis=0))
-    log_p = logits1 - lse1
-    p = tl.exp(log_p)
-
-    # For Q
-    max2 = tl.max(logits2, axis=0)
-    lse2 = max2 + tl.log(tl.sum(tl.exp(logits2 - max2), axis=0))
-    log_q = logits2 - lse2
-    q = tl.exp(log_q)
-
-    # --- Step 3: Compute M and JSD ---
-    # JSD = H(M) - 0.5 * (H(P) + H(Q))
-    # H(X) = -sum(X * log(X))
-    
-    m = 0.5 * (p + q)
-
-    # Entropy terms: H(P) and H(Q). p*log(p) is numerically stable since p is from exp.
-    h_p_term = p * log_p
-    h_q_term = q * log_q
-    
-    # For H(M), we need log(m). Add a small epsilon to avoid log(0) -> -inf,
-    # which would cause `m * log(m)` -> `0 * -inf = nan`.
-    log_m = tl.log(m + 1e-20)
-    h_m_term = m * log_m
-    
-    # Reduce over the N dimension to get the scalar entropy values.
-    h_p = -tl.sum(h_p_term, axis=0)
-    h_q = -tl.sum(h_q_term, axis=0)
-    h_m = -tl.sum(h_m_term, axis=0)
-
-    # Final JSD calculation.
-    jsd = h_m - 0.5 * (h_p + h_q)
-
-    # Store the final result for the current row.
-    out_ptrs = Out_ptr + pid_m * stride_outm
-    tl.store(out_ptrs, jsd)
 
 def fused_linear_jsd(X: torch.Tensor, W1: torch.Tensor, B1: torch.Tensor, W2: torch.Tensor, B2: torch.Tensor) -> torch.Tensor:
-    """
-    Fused linear layers with Jensen-Shannon Divergence computation.
-    
-    Args:
-        X: Input tensor of shape (M, K) - input features (float16)
-        W1: Weight tensor of shape (K, N) - first weight matrix (float16)
-        B1: Bias tensor of shape (N,) - first bias vector (float32)
-        W2: Weight tensor of shape (K, N) - second weight matrix (float16)
-        B2: Bias tensor of shape (N,) - second bias vector (float32)
-    
-    Returns:
-        Output tensor of shape (M,) - Jensen-Shannon Divergence per sample (float32)
-    """
     M, K = X.shape
-    _K1, N = W1.shape
-    
-    # Create the output tensor.
+    _ , N = W1.shape
+
     output = torch.empty(M, device=X.device, dtype=torch.float32)
+
+    grid = lambda meta: (M,)
     
-    # The grid is 1D, with one program per row of X.
-    grid = (M,)
-    
-    # This implementation fixes BLOCK_N = N. This is efficient when N is a power of 2
-    # and the entire logits vector (size N) fits into the SM's shared memory / registers.
-    # Given the problem constraints (N=4096), this is a feasible approach.
-    
-    # Launch the Triton kernel.
-    _fused_linear_jsd_kernel[grid](
+    _fused_jsd_kernel[grid](
         X, W1, B1, W2, B2, output,
         M, N, K,
         X.stride(0), X.stride(1),
         W1.stride(0), W1.stride(1),
         W2.stride(0), W2.stride(1),
-        B1.stride(0),
-        B2.stride(0),
         output.stride(0),
-        BLOCK_N=N,
-        # BLOCK_K, num_stages, and num_warps are determined by the autotuner.
     )
-    
     return output
 """
-
-class Solution:
-    def solve(self, spec_path: str = None) -> dict:
-        """
-        Returns a dict with the Triton kernel code.
-        """
-        return {"code": _triton_kernel_code}
+        return {"code": code}

@@ -1,103 +1,120 @@
 import os
+import sys
+import math
 import textwrap
 import torch
 import triton
 import triton.language as tl
 
+_DEFAULT_BLOCK = 4096
+_DEFAULT_NUM_WARPS = 8
+_DEFAULT_NUM_STAGES = 4
+
 
 @triton.jit
-def _add_kernel(x_ptr, y_ptr, out_ptr, BLOCK: tl.constexpr):
+def _add_nomask_kernel(X_ptr, Y_ptr, Z_ptr, BLOCK: tl.constexpr):
     pid = tl.program_id(0)
-    offs = pid * BLOCK + tl.arange(0, BLOCK)
+    block_start = pid * BLOCK
+    offs = block_start + tl.arange(0, BLOCK)
+    x = tl.load(X_ptr + offs, cache_modifier=".cg", eviction_policy="evict_last")
+    y = tl.load(Y_ptr + offs, cache_modifier=".cg", eviction_policy="evict_last")
+    tl.store(Z_ptr + offs, x + y, cache_modifier=".cg", eviction_policy="evict_last")
 
-    tl.multiple_of(x_ptr, 16)
-    tl.multiple_of(y_ptr, 16)
-    tl.multiple_of(out_ptr, 16)
 
-    x = tl.load(x_ptr + offs, eviction_policy="evict_first")
-    y = tl.load(y_ptr + offs, eviction_policy="evict_first")
-    tl.store(out_ptr + offs, x + y)
+@triton.jit
+def _add_mask_kernel(X_ptr, Y_ptr, Z_ptr, N, BLOCK: tl.constexpr):
+    pid = tl.program_id(0)
+    block_start = pid * BLOCK
+    offs = block_start + tl.arange(0, BLOCK)
+    mask = offs < N
+    x = tl.load(X_ptr + offs, mask=mask, other=0, cache_modifier=".cg", eviction_policy="evict_last")
+    y = tl.load(Y_ptr + offs, mask=mask, other=0, cache_modifier=".cg", eviction_policy="evict_last")
+    tl.store(Z_ptr + offs, x + y, mask=mask, cache_modifier=".cg", eviction_policy="evict_last")
 
 
 def add(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
-    if not (isinstance(x, torch.Tensor) and isinstance(y, torch.Tensor)):
-        raise TypeError("x and y must be torch.Tensor")
-    if x.shape != y.shape:
-        raise ValueError("x and y must have the same shape")
-    if x.numel() != y.numel():
-        raise ValueError("x and y must have the same number of elements")
-
-    if not (x.is_cuda and y.is_cuda):
+    if not x.is_cuda or not y.is_cuda:
         return x + y
-
-    if not (x.is_contiguous() and y.is_contiguous()):
+    if x.dtype != y.dtype:
+        raise TypeError(f"dtype mismatch: {x.dtype} vs {y.dtype}")
+    if x.numel() != y.numel():
+        raise ValueError("size mismatch")
+    if not x.is_contiguous() or not y.is_contiguous():
         x = x.contiguous()
         y = y.contiguous()
 
     n = x.numel()
-    if n != 268435456:
-        return x + y
+    z = torch.empty_like(x)
 
-    if x.dtype != y.dtype:
-        y = y.to(dtype=x.dtype)
+    block = _DEFAULT_BLOCK
+    num_warps = _DEFAULT_NUM_WARPS
+    num_stages = _DEFAULT_NUM_STAGES
 
-    out = torch.empty_like(x)
+    if n % block == 0:
+        grid = (n // block,)
+        _add_nomask_kernel[grid](x, y, z, BLOCK=block, num_warps=num_warps, num_stages=num_stages)
+    else:
+        grid = (triton.cdiv(n, block),)
+        _add_mask_kernel[grid](x, y, z, n, BLOCK=block, num_warps=num_warps, num_stages=num_stages)
 
-    BLOCK = 4096
-    grid = (n // BLOCK,)
-
-    _add_kernel[grid](x, y, out, BLOCK=BLOCK, num_warps=8, num_stages=2)
-    return out
+    return z
 
 
 _KERNEL_CODE = textwrap.dedent(
-    r"""
+    """
     import torch
     import triton
     import triton.language as tl
 
+    _DEFAULT_BLOCK = 4096
+    _DEFAULT_NUM_WARPS = 8
+    _DEFAULT_NUM_STAGES = 4
+
     @triton.jit
-    def _add_kernel(x_ptr, y_ptr, out_ptr, BLOCK: tl.constexpr):
+    def _add_nomask_kernel(X_ptr, Y_ptr, Z_ptr, BLOCK: tl.constexpr):
         pid = tl.program_id(0)
-        offs = pid * BLOCK + tl.arange(0, BLOCK)
+        block_start = pid * BLOCK
+        offs = block_start + tl.arange(0, BLOCK)
+        x = tl.load(X_ptr + offs, cache_modifier=".cg", eviction_policy="evict_last")
+        y = tl.load(Y_ptr + offs, cache_modifier=".cg", eviction_policy="evict_last")
+        tl.store(Z_ptr + offs, x + y, cache_modifier=".cg", eviction_policy="evict_last")
 
-        tl.multiple_of(x_ptr, 16)
-        tl.multiple_of(y_ptr, 16)
-        tl.multiple_of(out_ptr, 16)
-
-        x = tl.load(x_ptr + offs, eviction_policy="evict_first")
-        y = tl.load(y_ptr + offs, eviction_policy="evict_first")
-        tl.store(out_ptr + offs, x + y)
+    @triton.jit
+    def _add_mask_kernel(X_ptr, Y_ptr, Z_ptr, N, BLOCK: tl.constexpr):
+        pid = tl.program_id(0)
+        block_start = pid * BLOCK
+        offs = block_start + tl.arange(0, BLOCK)
+        mask = offs < N
+        x = tl.load(X_ptr + offs, mask=mask, other=0, cache_modifier=".cg", eviction_policy="evict_last")
+        y = tl.load(Y_ptr + offs, mask=mask, other=0, cache_modifier=".cg", eviction_policy="evict_last")
+        tl.store(Z_ptr + offs, x + y, mask=mask, cache_modifier=".cg", eviction_policy="evict_last")
 
     def add(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
-        if not (isinstance(x, torch.Tensor) and isinstance(y, torch.Tensor)):
-            raise TypeError("x and y must be torch.Tensor")
-        if x.shape != y.shape:
-            raise ValueError("x and y must have the same shape")
-        if x.numel() != y.numel():
-            raise ValueError("x and y must have the same number of elements")
-
-        if not (x.is_cuda and y.is_cuda):
+        if not x.is_cuda or not y.is_cuda:
             return x + y
-
-        if not (x.is_contiguous() and y.is_contiguous()):
+        if x.dtype != y.dtype:
+            raise TypeError(f"dtype mismatch: {x.dtype} vs {y.dtype}")
+        if x.numel() != y.numel():
+            raise ValueError("size mismatch")
+        if not x.is_contiguous() or not y.is_contiguous():
             x = x.contiguous()
             y = y.contiguous()
 
         n = x.numel()
-        if n != 268435456:
-            return x + y
+        z = torch.empty_like(x)
 
-        if x.dtype != y.dtype:
-            y = y.to(dtype=x.dtype)
+        block = _DEFAULT_BLOCK
+        num_warps = _DEFAULT_NUM_WARPS
+        num_stages = _DEFAULT_NUM_STAGES
 
-        out = torch.empty_like(x)
+        if n % block == 0:
+            grid = (n // block,)
+            _add_nomask_kernel[grid](x, y, z, BLOCK=block, num_warps=num_warps, num_stages=num_stages)
+        else:
+            grid = (triton.cdiv(n, block),)
+            _add_mask_kernel[grid](x, y, z, n, BLOCK=block, num_warps=num_warps, num_stages=num_stages)
 
-        BLOCK = 4096
-        grid = (n // BLOCK,)
-
-        _add_kernel[grid](x, y, out, BLOCK=BLOCK, num_warps=8, num_stages=2)
-        return out
+        return z
     """
 ).lstrip()
 

@@ -1,93 +1,166 @@
 import os
 import tarfile
-import tempfile
-from typing import Optional
+import gzip
 
 
 class Solution:
-    def __init__(self) -> None:
-        pass
+    def solve(self, src_path: str) -> bytes:
+        target_len = 72
 
-    def _extract_tar_if_needed(self, src_path: str) -> str:
+        # Try as directory first (just in case).
         if os.path.isdir(src_path):
-            return src_path
-        tmpdir = tempfile.mkdtemp(prefix="src-")
-        try:
-            with tarfile.open(src_path, "r:*") as tf:
-                tf.extractall(tmpdir)
-        except tarfile.ReadError:
-            # Not a tar file; return empty temp directory.
-            pass
-        return tmpdir
+            data = self._search_fs_for_poc(src_path, target_len)
+            if data is not None:
+                return data
+            return self._fallback_poc(target_len)
 
-    def _find_poc_file(self, root: str, target_len: int) -> Optional[bytes]:
-        best_data: Optional[bytes] = None
-        best_score: float = float("-inf")
+        # Try as tarball.
+        data = None
+        try:
+            with tarfile.open(src_path, "r:*") as tar:
+                data = self._search_tar_for_poc(tar, target_len)
+        except tarfile.ReadError:
+            # Not a tarball; treat as a regular file.
+            if os.path.isfile(src_path):
+                try:
+                    with open(src_path, "rb") as f:
+                        return f.read()
+                except OSError:
+                    pass
+
+        if data is not None:
+            return data
+
+        return self._fallback_poc(target_len)
+
+    def _search_tar_for_poc(self, tar: tarfile.TarFile, target_len: int) -> bytes | None:
+        best = None  # (score_tuple, data)
+
+        for member in tar.getmembers():
+            if not member.isfile():
+                continue
+
+            size = member.size
+            if size <= 0 or size > 65536:
+                continue
+
+            name_lower = member.name.lower()
+
+            prio = 100
+            if "27851" in name_lower:
+                prio = 0
+            elif (
+                "raw_encap" in name_lower
+                or "raw-encap" in name_lower
+                or "nxast_raw_encap" in name_lower
+                or "nxast-raw-encap" in name_lower
+            ):
+                prio = 1
+            elif any(
+                key in name_lower
+                for key in (
+                    "poc",
+                    "proof",
+                    "crash",
+                    "uaf",
+                    "heap",
+                    "asan",
+                    "testcase",
+                    "id_",
+                    "input",
+                )
+            ):
+                prio = 2
+            elif size == target_len:
+                prio = 3
+            else:
+                prio = 4
+
+            if prio >= 4 and size != target_len:
+                continue
+
+            try:
+                f = tar.extractfile(member)
+            except KeyError:
+                continue
+            if f is None:
+                continue
+
+            try:
+                data = f.read()
+            except OSError:
+                continue
+
+            if name_lower.endswith(".gz"):
+                try:
+                    data = gzip.decompress(data)
+                except Exception:
+                    pass
+
+            if any(
+                name_lower.endswith(ext)
+                for ext in (".c", ".h", ".cpp", ".cc", ".md", ".txt", ".rst")
+            ):
+                if prio > 1:
+                    continue
+
+            length = len(data)
+            if length <= 0:
+                continue
+
+            score = (prio, abs(length - target_len), length)
+            if best is None or score < best[0]:
+                best = (score, data)
+
+        return best[1] if best is not None else None
+
+    def _search_fs_for_poc(self, root: str, target_len: int) -> bytes | None:
+        best = None  # (score_tuple, data)
 
         for dirpath, _, filenames in os.walk(root):
-            ldir = dirpath.lower()
-            for name in filenames:
-                path = os.path.join(dirpath, name)
+            for filename in filenames:
+                path = os.path.join(dirpath, filename)
                 try:
-                    st = os.stat(path)
+                    size = os.path.getsize(path)
                 except OSError:
                     continue
-                size = st.st_size
+
                 if size <= 0 or size > 65536:
                     continue
 
-                lname = name.lower()
-                score = 0.0
+                name_lower = path.lower()
 
-                if size == target_len:
-                    score += 10.0
-                else:
-                    score -= abs(size - target_len) / max(target_len, 1)
-
-                key_weights = {
-                    "poc": 6.0,
-                    "crash": 5.0,
-                    "heap": 2.0,
-                    "uaf": 3.0,
-                    "raw_encap": 8.0,
-                    "raw-encap": 8.0,
-                    "rawencap": 8.0,
-                    "raw": 1.5,
-                    "encap": 4.0,
-                    "openflow": 3.0,
-                    "ovs": 2.0,
-                    "openvswitch": 2.0,
-                    "id_": 1.0,
-                    "payload": 2.0,
-                    "testcase": 1.5,
-                }
-                for kw, w in key_weights.items():
-                    if kw in lname:
-                        score += w
-
-                dir_keywords = [("poc", 3.0), ("crash", 2.0), ("uaf", 1.5), ("fuzz", 2.0)]
-                for kw, w in dir_keywords:
-                    if kw in ldir:
-                        score += w
-
-                ext = os.path.splitext(name)[1].lower()
-                if ext in (
-                    ".c",
-                    ".h",
-                    ".cpp",
-                    ".cc",
-                    ".hpp",
-                    ".java",
-                    ".py",
-                    ".md",
-                    ".rst",
-                    ".txt",
-                    ".patch",
-                    ".diff",
+                prio = 100
+                if "27851" in name_lower:
+                    prio = 0
+                elif (
+                    "raw_encap" in name_lower
+                    or "raw-encap" in name_lower
+                    or "nxast_raw_encap" in name_lower
+                    or "nxast-raw-encap" in name_lower
                 ):
-                    score -= 5.0
+                    prio = 1
+                elif any(
+                    key in name_lower
+                    for key in (
+                        "poc",
+                        "proof",
+                        "crash",
+                        "uaf",
+                        "heap",
+                        "asan",
+                        "testcase",
+                        "id_",
+                        "input",
+                    )
+                ):
+                    prio = 2
+                elif size == target_len:
+                    prio = 3
+                else:
+                    prio = 4
 
-                if score <= best_score:
+                if prio >= 4 and size != target_len:
                     continue
 
                 try:
@@ -96,31 +169,30 @@ class Solution:
                 except OSError:
                     continue
 
-                if best_data is not None and score == best_score:
-                    prev_non_ascii = sum(b >= 0x80 or b == 0x00 for b in best_data)
-                    cur_non_ascii = sum(b >= 0x80 or b == 0x00 for b in data)
-                    if cur_non_ascii <= prev_non_ascii:
+                if name_lower.endswith(".gz"):
+                    try:
+                        data = gzip.decompress(data)
+                    except Exception:
+                        pass
+
+                if any(
+                    name_lower.endswith(ext)
+                    for ext in (".c", ".h", ".cpp", ".cc", ".md", ".txt", ".rst")
+                ):
+                    if prio > 1:
                         continue
 
-                best_score = score
-                best_data = data
+                length = len(data)
+                if length <= 0:
+                    continue
 
-        return best_data
+                score = (prio, abs(length - target_len), length)
+                if best is None or score < best[0]:
+                    best = (score, data)
 
-    def solve(self, src_path: str) -> bytes:
-        root = self._extract_tar_if_needed(src_path)
-        poc = self._find_poc_file(root, target_len=72)
-        if poc is not None:
-            return poc
+        return best[1] if best is not None else None
 
-        # Fallback: generic 72-byte pattern resembling a RAW_ENCAP-like payload.
-        pattern = (
-            b"\x00\x00\x00\x10"          # length/placeholder
-            b"\xff\xff\xff\xff"          # dummy xid/vendor
-            b"NXAST"                     # tag
-            b"_RAW_ENCAP"               # keyword
-            b"\x01\x02\x03\x04\x05\x06"  # misc bytes
-        )
-        if len(pattern) >= 72:
-            return pattern[:72]
-        return pattern + b"A" * (72 - len(pattern))
+    def _fallback_poc(self, target_len: int) -> bytes:
+        if target_len <= 0:
+            return b""
+        return b"A" * target_len

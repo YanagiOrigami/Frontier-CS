@@ -7,29 +7,29 @@ class Solution:
 
     def solve(self, X: np.ndarray, y: np.ndarray) -> dict:
         model = PySRRegressor(
-            niterations=100,
-            binary_operators=["+", "-", "*", "/"],
-            unary_operators=["sin", "cos", "exp", "log"],
-            populations=30,
-            population_size=50,
-            maxsize=30,
+            niterations=40,
+            binary_operators=[
+                "+", "-", "*", "/", "(x, y) -> x ** y"
+            ],
+            unary_operators=[
+                "sin", "cos", "exp", "log"
+            ],
+            populations=15,
+            population_size=33,
+            maxsize=25,
             verbosity=0,
             progress=False,
             random_state=42,
-            loss="loss(sum of squares)",
-            model_selection="best"
         )
         model.fit(X, y, variable_names=["x1", "x2"])
 
         best_expr = model.sympy()
-        expression = str(best_expr).replace('**', '^') if '^' in str(best_expr) else str(best_expr)
+        expression = str(best_expr)
 
-        predictions = model.predict(X).tolist()
-
-        complexity = int(model.equations_['complexity'].iloc[0]) if not model.equations_.empty else 0
+        predictions = model.predict(X)
 
         return {
             "expression": expression,
-            "predictions": predictions,
-            "details": {"complexity": complexity}
+            "predictions": predictions.tolist(),
+            "details": {}
         }

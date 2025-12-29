@@ -1,49 +1,45 @@
 import numpy as np
 import faiss
-import time
-from typing import Tuple
 
 class BalancedTierIndex:
     def __init__(self, dim: int, **kwargs):
         """
-        Initialize HNSW index optimized for recall while meeting latency constraint.
-        Parameters tuned for SIFT1M (1M vectors, 128 dim) on 8 vCPU CPU-only environment.
+        Initialize HNSW index for SIFT1M with optimized parameters for recall.
+        Default parameters tuned to achieve high recall while meeting latency constraint.
         """
         self.dim = dim
         
-        # HNSW parameters optimized for recall@1 > 0.9914 while meeting 5.775ms latency
-        # Using conservative settings to maximize recall
-        M = kwargs.get('M', 32)  # Higher M for better recall (16 is baseline, 32 for better connectivity)
-        ef_construction = kwargs.get('ef_construction', 400)  # High for maximum recall
-        ef_search = kwargs.get('ef_search', 256)  # High for maximum recall
+        # Extract parameters or use optimized defaults for SIFT1M
+        M = kwargs.get('M', 24)  # Increased from 16 for better recall
+        ef_construction = kwargs.get('ef_construction', 400)  # High for better graph
+        ef_search = kwargs.get('ef_search', 128)  # High for better recall
         
-        # Create HNSW index
+        # Create HNSW index with flat storage (exact distance calculation)
         self.index = faiss.IndexHNSWFlat(dim, M, faiss.METRIC_L2)
         self.index.hnsw.efConstruction = ef_construction
         self.index.hnsw.efSearch = ef_search
         
-        # Store for batch optimization
-        self.xb = None
+        # Optimize search parameters
+        self.index.hnsw.search_bounded_queue = False
+        
+        # Set number of threads for batch queries (8 vCPUs)
+        self.threads = kwargs.get('threads', 8)
+        faiss.omp_set_num_threads(self.threads)
         
     def add(self, xb: np.ndarray) -> None:
         """
         Add vectors to the index.
-        Optimized for SIFT1M scale (1M vectors).
         """
-        self.xb = xb if self.xb is None else np.vstack([self.xb, xb])
         self.index.add(xb)
-        
-    def search(self, xq: np.ndarray, k: int) -> Tuple[np.ndarray, np.ndarray]:
+    
+    def search(self, xq: np.ndarray, k: int):
         """
-        Search for k nearest neighbors.
-        Optimized for batch queries (10K queries) with focus on recall.
+        Search for k nearest neighbors using HNSW with optimized settings.
         """
-        # Set efSearch for this query batch
-        # Conservative value to maximize recall
-        self.index.hnsw.efSearch = 256
+        # Set efSearch for this search operation
+        self.index.hnsw.efSearch = 128
         
-        # Perform search
-        D, I = self.index.search(xq, k)
+        # Perform the search
+        distances, indices = self.index.search(xq, k)
         
-        # Convert to required dtypes
-        return D.astype(np.float32), I.astype(np.int64)
+        return distances.astype(np.float32), indices.astype(np.int64)

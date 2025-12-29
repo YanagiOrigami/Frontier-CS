@@ -2,131 +2,150 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 import numpy as np
+import copy
+import random
 
-class ResidualBlock(nn.Module):
-    def __init__(self, dim, dropout=0.2):
+class ResBlock(nn.Module):
+    def __init__(self, dim, dropout=0.0):
         super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(dim, dim),
-            nn.BatchNorm1d(dim),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(dim, dim),
-            nn.BatchNorm1d(dim),
-            nn.GELU(),
-            nn.Dropout(dropout)
-        )
+        self.norm = nn.LayerNorm(dim)
+        self.fc1 = nn.Linear(dim, dim)
+        self.act = nn.GELU()
+        self.drop1 = nn.Dropout(dropout)
+        self.fc2 = nn.Linear(dim, dim)
+        self.drop2 = nn.Dropout(dropout)
 
     def forward(self, x):
-        return x + self.net(x)
+        input = x
+        x = self.norm(x)
+        x = self.fc1(x)
+        x = self.act(x)
+        x = self.drop1(x)
+        x = self.fc2(x)
+        x = self.drop2(x)
+        return input + x
 
-class SubModel(nn.Module):
-    def __init__(self, input_dim, num_classes, hidden_dim=512, dropout=0.2):
+class Model(nn.Module):
+    def __init__(self, input_dim, num_classes, width, dropout=0.0):
         super().__init__()
         self.stem = nn.Sequential(
-            nn.Linear(input_dim, hidden_dim),
-            nn.BatchNorm1d(hidden_dim),
+            nn.LayerNorm(input_dim),
+            nn.Linear(input_dim, width),
             nn.GELU(),
             nn.Dropout(dropout)
         )
-        self.blocks = nn.Sequential(
-            ResidualBlock(hidden_dim, dropout),
-            ResidualBlock(hidden_dim, dropout)
+        self.layer1 = ResBlock(width, dropout)
+        self.layer2 = ResBlock(width, dropout)
+        self.head = nn.Sequential(
+            nn.LayerNorm(width),
+            nn.Linear(width, num_classes)
         )
-        self.head_pre = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.BatchNorm1d(hidden_dim),
-            nn.GELU(),
-            nn.Dropout(dropout)
-        )
-        self.head = nn.Linear(hidden_dim, num_classes)
 
     def forward(self, x):
         x = self.stem(x)
-        x = self.blocks(x)
-        x = self.head_pre(x)
+        x = self.layer1(x)
+        x = self.layer2(x)
         return self.head(x)
-
-class Ensemble(nn.Module):
-    def __init__(self, models):
-        super().__init__()
-        self.models = nn.ModuleList(models)
-    
-    def forward(self, x):
-        outputs = [m(x) for m in self.models]
-        return torch.stack(outputs).mean(dim=0)
 
 class Solution:
     def solve(self, train_loader, val_loader, metadata: dict = None) -> torch.nn.Module:
-        input_dim = metadata["input_dim"]
-        num_classes = metadata["num_classes"]
+        metadata = metadata or {}
+        
+        # Set seeds for reproducibility
+        seed = 42
+        random.seed(seed)
+        np.random.seed(seed)
+        torch.manual_seed(seed)
+        
+        input_dim = metadata.get("input_dim", 384)
+        num_classes = metadata.get("num_classes", 128)
+        param_limit = metadata.get("param_limit", 5000000)
         device = metadata.get("device", "cpu")
         
-        # Architecture parameters
-        hidden_dim = 512
-        dropout = 0.2
-        
-        # Calculate parameter count for a single sub-model to determine ensemble size
-        dummy_model = SubModel(input_dim, num_classes, hidden_dim, dropout)
-        param_count_per_model = sum(p.numel() for p in dummy_model.parameters() if p.requires_grad)
-        
-        # Param budget is 5,000,000. Leave a small safety margin.
-        max_params = 4990000 
-        num_models = int(max_params // param_count_per_model)
-        
-        # Ensure at least one model if specs are weird, though budget violation would occur
-        if num_models < 1:
-            num_models = 1
+        # Dynamically determine the maximum width that fits within the parameter budget
+        # We start with a good estimate and decrease if necessary
+        width = 1056 
+        while True:
+            # Check parameter count with dummy model
+            m = Model(input_dim, num_classes, width, dropout=0.0)
+            p_count = sum(p.numel() for p in m.parameters() if p.requires_grad)
             
-        trained_models = []
+            # Leave a small buffer to be safe
+            if p_count <= param_limit - 5000:
+                break
+            width -= 8  # Decrease width in steps
+            
+        # Instantiate the final model with regularization
+        # High dropout is used because the dataset is small (2048 samples) relative to params (~5M)
+        model = Model(input_dim, num_classes, width, dropout=0.5).to(device)
         
-        # Training Hyperparameters
-        epochs = 85
-        lr = 1e-3
-        weight_decay = 2e-2
-        mixup_prob = 0.6
-        mixup_alpha = 0.4
+        # Optimization setup
+        # AdamW with weight decay for regularization
+        optimizer = optim.AdamW(model.parameters(), lr=1e-3, weight_decay=0.05)
         
-        for i in range(num_models):
-            model = SubModel(input_dim, num_classes, hidden_dim, dropout).to(device)
+        # Training configuration
+        epochs = 120
+        steps_per_epoch = len(train_loader)
+        
+        # OneCycleLR for efficient convergence
+        scheduler = optim.lr_scheduler.OneCycleLR(
+            optimizer, 
+            max_lr=1e-3, 
+            epochs=epochs, 
+            steps_per_epoch=steps_per_epoch,
+            pct_start=0.3
+        )
+        
+        # Label smoothing helps with generalization on small datasets
+        criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
+        
+        best_acc = 0.0
+        best_model_state = copy.deepcopy(model.state_dict())
+        
+        # Training loop
+        for epoch in range(epochs):
             model.train()
+            for inputs, targets in train_loader:
+                inputs, targets = inputs.to(device), targets.to(device)
+                
+                # Mixup augmentation
+                alpha = 0.4
+                lam = np.random.beta(alpha, alpha) if alpha > 0 else 1.0
+                
+                batch_size = inputs.size(0)
+                index = torch.randperm(batch_size).to(device)
+                
+                mixed_inputs = lam * inputs + (1 - lam) * inputs[index, :]
+                y_a, y_b = targets, targets[index]
+                
+                optimizer.zero_grad()
+                outputs = model(mixed_inputs)
+                loss = lam * criterion(outputs, y_a) + (1 - lam) * criterion(outputs, y_b)
+                
+                loss.backward()
+                nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                optimizer.step()
+                scheduler.step()
             
-            optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
-            
-            total_steps = epochs * len(train_loader)
-            scheduler = optim.lr_scheduler.OneCycleLR(
-                optimizer,
-                max_lr=lr,
-                total_steps=total_steps,
-                pct_start=0.3
-            )
-            
-            criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
-            
-            for epoch in range(epochs):
-                for inputs, targets in train_loader:
-                    inputs, targets = inputs.to(device), targets.to(device)
-                    
-                    # Mixup Augmentation
-                    if np.random.random() < mixup_prob:
-                        lam = np.random.beta(mixup_alpha, mixup_alpha)
-                        index = torch.randperm(inputs.size(0)).to(device)
-                        
-                        mixed_inputs = lam * inputs + (1 - lam) * inputs[index]
-                        target_a, target_b = targets, targets[index]
-                        
-                        outputs = model(mixed_inputs)
-                        loss = lam * criterion(outputs, target_a) + (1 - lam) * criterion(outputs, target_b)
-                    else:
-                        outputs = model(inputs)
-                        loss = criterion(outputs, targets)
-                    
-                    optimizer.zero_grad()
-                    loss.backward()
-                    optimizer.step()
-                    scheduler.step()
-            
+            # Validation loop
             model.eval()
-            trained_models.append(model)
+            correct = 0
+            total = 0
+            with torch.no_grad():
+                for inputs, targets in val_loader:
+                    inputs, targets = inputs.to(device), targets.to(device)
+                    outputs = model(inputs)
+                    _, predicted = outputs.max(1)
+                    total += targets.size(0)
+                    correct += predicted.eq(targets).sum().item()
             
-        return Ensemble(trained_models)
+            acc = correct / total if total > 0 else 0
+            
+            # Save best model
+            if acc >= best_acc:
+                best_acc = acc
+                best_model_state = copy.deepcopy(model.state_dict())
+        
+        # Return the best performing model
+        model.load_state_dict(best_model_state)
+        return model

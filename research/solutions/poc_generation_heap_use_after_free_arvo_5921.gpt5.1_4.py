@@ -1,179 +1,268 @@
 import os
 import tarfile
-import struct
+import tempfile
+import shutil
+import subprocess
+import glob
+import stat
+import random
 
 
 class Solution:
     def solve(self, src_path: str) -> bytes:
-        poc = None
-        try:
-            poc = self._extract_poc_from_tar(src_path)
-        except Exception:
-            poc = None
-        if poc is not None and isinstance(poc, (bytes, bytearray)) and len(poc) > 0:
-            return bytes(poc)
-        return self._build_default_poc()
+        def extract_tarball(tar_path: str, target_dir: str) -> None:
+            with tarfile.open(tar_path, 'r:*') as tar:
+                def is_within_directory(directory: str, target: str) -> bool:
+                    abs_directory = os.path.abspath(directory)
+                    abs_target = os.path.abspath(target)
+                    return os.path.commonprefix([abs_directory, abs_target]) == abs_directory
 
-    def _extract_poc_from_tar(self, src_path: str) -> bytes | None:
-        if not os.path.exists(src_path):
-            return None
-
-        best_member = None
-        best_score = float("-inf")
-
-        try:
-            with tarfile.open(src_path, "r:*") as tf:
-                for m in tf.getmembers():
-                    if not m.isfile():
+                for member in tar.getmembers():
+                    member_path = os.path.join(target_dir, member.name)
+                    if not is_within_directory(target_dir, member_path):
                         continue
-                    size = m.size
-                    # Ignore empty or very large files
-                    if size <= 0 or size > 65536:
-                        continue
+                    tar.extract(member, target_dir)
 
-                    lname = m.name.lower()
-                    score = 0
+        def find_root(base_dir: str) -> str:
+            try:
+                entries = [e for e in os.listdir(base_dir) if not e.startswith('.') and not e.endswith('.log')]
+            except FileNotFoundError:
+                return base_dir
+            if len(entries) == 1:
+                only = os.path.join(base_dir, entries[0])
+                if os.path.isdir(only):
+                    return only
+            return base_dir
 
-                    # Prefer sizes close to 73 bytes
-                    if size == 73:
-                        score += 1000
-                    score += max(0, 200 - abs(size - 73))
+        def build_project(root: str):
+            env = os.environ.copy()
+            cc = shutil.which('clang') or shutil.which('gcc') or 'gcc'
+            cxx = shutil.which('clang++') or shutil.which('g++') or 'g++'
+            env.setdefault('CC', cc)
+            env.setdefault('CXX', cxx)
 
-                    root, ext = os.path.splitext(lname)
+            def add_flag(var: str, flag: str) -> None:
+                val = env.get(var, '')
+                if flag not in val:
+                    val = (val + ' ' + flag).strip()
+                env[var] = val
 
-                    text_exts = {
-                        ".c", ".h", ".hpp", ".hh", ".cpp", ".cc", ".cxx",
-                        ".py", ".sh", ".bash", ".zsh",
-                        ".txt", ".md", ".rst",
-                        ".html", ".htm", ".xml", ".json", ".yml", ".yaml",
-                        ".ini", ".cfg", ".conf",
-                        ".in", ".ac", ".am", ".m4",
-                        ".cmake", ".java", ".php", ".rb", ".pl", ".go",
-                        ".ts", ".js", ".css", ".scss", ".lua",
-                    }
-                    if ext in text_exts:
-                        score -= 300
+            # Add reasonable ASan/debug flags
+            for v in ('CFLAGS', 'CXXFLAGS'):
+                add_flag(v, '-g')
+                add_flag(v, '-O1')
+                add_flag(v, '-fno-omit-frame-pointer')
+                add_flag(v, '-fsanitize=address')
 
-                    binary_bonus_exts = {
-                        ".pcap": 150,
-                        ".pcapng": 140,
-                        ".cap": 130,
-                        ".bin": 120,
-                        ".raw": 110,
-                        ".dat": 100,
-                        ".dump": 90,
-                        ".pkt": 90,
-                        ".frame": 80,
-                        ".out": 60,
-                    }
-                    score += binary_bonus_exts.get(ext, 0)
+            env.setdefault('FUZZING_ENGINE', 'libfuzzer')
+            env.setdefault('SANITIZER', 'address')
+            env.setdefault('ARCHITECTURE', 'x86_64')
 
-                    kw_poc = [
-                        "poc", "crash", "id_", "id:", "uaf",
-                        "use-after-free", "use_after_free", "heap-uaf",
-                        "heap-use-after-free", "heap_use_after_free",
-                        "testcase", "repro", "reproducer",
-                        "clusterfuzz", "minimized", "crashes",
-                    ]
-                    for kw in kw_poc:
-                        if kw in lname:
-                            score += 150
+            if 'clang' in os.path.basename(cc):
+                env['LIB_FUZZING_ENGINE'] = '-fsanitize=fuzzer,address'
+            else:
+                env.setdefault('LIB_FUZZING_ENGINE', '')
 
-                    kw_proto = ["h225", "h.225", "ras"]
-                    for kw in kw_proto:
-                        if kw in lname:
-                            score += 120
+            out_dir = os.path.join(root, 'out')
+            os.makedirs(out_dir, exist_ok=True)
+            env.setdefault('OUT', out_dir)
 
-                    kw_test_dirs = [
-                        "test", "tests", "regress", "regression",
-                        "fuzz", "corpus", "inputs", "input",
-                        "seed", "seeds", "cases", "examples", "example",
-                        "sample", "samples",
-                    ]
-                    # Check directory components
-                    path_with_slashes = "/" + lname
-                    for kw in kw_test_dirs:
-                        if f"/{kw}/" in path_with_slashes:
-                            score += 60
+            build_ok = False
 
-                    # Slight preference for binary-looking names without extension
-                    if ext == "" and not lname.endswith("/"):
-                        if any(k in lname for k in ("id_", "id:", "packet", "pcap", "bin", "h225", "ras")):
-                            score += 40
+            # Try build.sh-style script
+            for name in ('build.sh', 'build.bash', 'Build.sh'):
+                script = os.path.join(root, name)
+                if os.path.isfile(script):
+                    try:
+                        res = subprocess.run(
+                            ['bash', script],
+                            cwd=root,
+                            env=env,
+                            stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL,
+                            timeout=300,
+                        )
+                        if res.returncode == 0:
+                            build_ok = True
+                            break
+                    except Exception:
+                        pass
 
-                    if score > best_score:
-                        best_score = score
-                        best_member = m
+            # Try CMake-based build
+            if not build_ok and os.path.exists(os.path.join(root, 'CMakeLists.txt')):
+                bdir = os.path.join(root, 'build')
+                os.makedirs(bdir, exist_ok=True)
+                try:
+                    res = subprocess.run(
+                        ['cmake', '..'],
+                        cwd=bdir,
+                        env=env,
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                        timeout=120,
+                    )
+                    if res.returncode == 0:
+                        res = subprocess.run(
+                            ['make', '-j4'],
+                            cwd=bdir,
+                            env=env,
+                            stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL,
+                            timeout=300,
+                        )
+                        if res.returncode == 0:
+                            build_ok = True
+                except Exception:
+                    pass
 
-                if best_member is not None:
-                    f = tf.extractfile(best_member)
-                    if f is not None:
-                        data = f.read()
-                        if isinstance(data, (bytes, bytearray)) and len(data) > 0:
-                            return bytes(data)
-        except tarfile.ReadError:
-            return None
-        except Exception:
-            return None
+            # Try plain make
+            if not build_ok and os.path.exists(os.path.join(root, 'Makefile')):
+                try:
+                    res = subprocess.run(
+                        ['make', '-j4'],
+                        cwd=root,
+                        env=env,
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                        timeout=300,
+                    )
+                    if res.returncode == 0:
+                        build_ok = True
+                except Exception:
+                    pass
 
-        return None
+            return build_ok, env
 
-    def _build_default_poc(self) -> bytes:
-        # Construct a minimal PCAP with a single IPv4/UDP packet to port 1719 (H.225 RAS)
-        # Global header (pcap, little-endian, LINKTYPE_RAW)
-        pcap_global = struct.pack(
-            "<IHHIIII",
-            0xA1B2C3D4,  # magic number (little-endian)
-            2,           # version major
-            4,           # version minor
-            0,           # thiszone
-            0,           # sigfigs
-            65535,       # snaplen
-            101,         # network: LINKTYPE_RAW (IPv4)
-        )
+        def is_elf_executable(path: str) -> bool:
+            try:
+                st = os.stat(path)
+            except OSError:
+                return False
+            if not stat.S_ISREG(st.st_mode):
+                return False
+            if not (st.st_mode & (stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)):
+                return False
+            try:
+                with open(path, 'rb') as f:
+                    magic = f.read(4)
+                return magic == b'\x7fELF'
+            except OSError:
+                return False
 
-        # IPv4 header (20 bytes)
-        # Version/IHL=0x45, TOS=0x00, Total Length=0x0021 (33 bytes)
-        # ID=0x0000, Flags/Frag=0x0000, TTL=64, Protocol=17 (UDP)
-        # Header checksum computed for this header: 0x66CA
-        ip_header = bytes(
-            [
-                0x45, 0x00, 0x00, 0x21,  # v4, ihl, tos, total length (33)
-                0x00, 0x00,              # identification
-                0x00, 0x00,              # flags, fragment offset
-                0x40,                    # TTL
-                0x11,                    # protocol (UDP)
-                0x66, 0xCA,              # header checksum
-                0x0A, 0x00, 0x00, 0x01,  # src IP 10.0.0.1
-                0x0A, 0x00, 0x00, 0x02,  # dst IP 10.0.0.2
+        def find_executables(root: str):
+            exes = []
+            for dirpath, _, filenames in os.walk(root):
+                for name in filenames:
+                    full = os.path.join(dirpath, name)
+                    if is_elf_executable(full):
+                        if '.so' in name or name.endswith('.a'):
+                            continue
+                        exes.append(full)
+            return exes
+
+        def is_libfuzzer_exe(path: str) -> bool:
+            try:
+                with open(path, 'rb') as f:
+                    data = f.read()
+                if b'LLVMFuzzerTestOneInput' in data:
+                    return True
+                if b'libFuzzer' in data or b'LibFuzzer' in data:
+                    return True
+            except Exception:
+                pass
+            return False
+
+        def run_libfuzzer_for_crash(exe: str, env) -> bytes | None:
+            exe_dir = os.path.dirname(exe) or '.'
+            artifact_dir = os.path.join(exe_dir, 'artifacts_' + os.path.basename(exe))
+            os.makedirs(artifact_dir, exist_ok=True)
+            cmd = [
+                exe,
+                '-max_total_time=60',
+                '-timeout=10',
+                '-rss_limit_mb=12000',
+                '-detect_leaks=0',
+                f'-artifact_prefix={artifact_dir}/',
             ]
-        )
+            try:
+                subprocess.run(
+                    cmd,
+                    cwd=exe_dir,
+                    env=env,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    timeout=75,
+                )
+            except subprocess.TimeoutExpired:
+                pass
+            except Exception:
+                return None
 
-        # UDP header (8 bytes)
-        # src port 1234, dst port 1719 (H.225 RAS), length 13, checksum 0
-        udp_header = bytes(
-            [
-                0x04, 0xD2,  # source port 1234
-                0x06, 0xB7,  # dest port 1719
-                0x00, 0x0D,  # length = 13 (8 UDP + 5 payload)
-                0x00, 0x00,  # checksum
-            ]
-        )
+            crash_files = []
+            for pattern in ('crash-*', 'leak-*', 'timeout-*', 'oom-*'):
+                crash_files.extend(glob.glob(os.path.join(artifact_dir, pattern)))
+            if not crash_files:
+                return None
+            crash_files.sort(key=lambda p: os.path.getsize(p))
+            try:
+                with open(crash_files[0], 'rb') as f:
+                    return f.read()
+            except Exception:
+                return None
 
-        # Minimal payload (5 bytes) - arbitrary; crafted size to hit total length 33
-        payload = b"\x01\x00\x00\x00\x00"
+        def random_stdin_fuzz(exe: str, env, trials: int = 128) -> bytes | None:
+            exe_dir = os.path.dirname(exe) or '.'
+            for _ in range(trials):
+                length = random.randint(1, 256)
+                data = os.urandom(length)
+                try:
+                    res = subprocess.run(
+                        [exe],
+                        cwd=exe_dir,
+                        env=env,
+                        input=data,
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                        timeout=2,
+                    )
+                    if res.returncode != 0:
+                        return data
+                except Exception:
+                    continue
+            return None
 
-        frame = ip_header + udp_header + payload
-        frame_len = len(frame)  # should be 33
+        with tempfile.TemporaryDirectory() as tmpdir:
+            extract_tarball(src_path, tmpdir)
+            root = find_root(tmpdir)
+            build_project(root)  # even if build fails, there may be prebuilt binaries
+            _, env = build_project(root)
 
-        # Packet header
-        pcap_packet_header = struct.pack(
-            "<IIII",
-            0,          # ts_sec
-            0,          # ts_usec
-            frame_len,  # incl_len
-            frame_len,  # orig_len
-        )
+            exes = find_executables(root)
+            if not exes:
+                return b'A'
 
-        poc = pcap_global + pcap_packet_header + frame
-        return poc
+            def exe_key(path: str):
+                name = os.path.basename(path).lower()
+                score = 0
+                if 'fuzz' not in name:
+                    score += 2
+                if 'h225' not in name and 'ras' not in name:
+                    score += 1
+                if os.sep + 'out' + os.sep not in path:
+                    score += 1
+                return score, len(path)
+
+            exes.sort(key=exe_key)
+
+            for exe in exes:
+                if is_libfuzzer_exe(exe):
+                    data = run_libfuzzer_for_crash(exe, env)
+                    if data:
+                        return data
+
+            for exe in exes[:3]:
+                data = random_stdin_fuzz(exe, env)
+                if data:
+                    return data
+
+            return b'A'

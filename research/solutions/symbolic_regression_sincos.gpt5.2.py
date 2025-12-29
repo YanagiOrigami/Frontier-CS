@@ -5,227 +5,319 @@ import sympy as sp
 
 class Solution:
     def __init__(self, **kwargs):
-        self.max_terms = int(kwargs.get("max_terms", 4))
-        self.max_harmonic = int(kwargs.get("max_harmonic", 3))
-        self.include_cross = bool(kwargs.get("include_cross", True))
-        self.include_sumdiff = bool(kwargs.get("include_sumdiff", True))
+        self.random_state = int(kwargs.get("random_state", 0))
+        self.max_nonconst_terms = int(kwargs.get("max_nonconst_terms", 5))
+        self.search_sample_size = int(kwargs.get("search_sample_size", 5000))
+        self.coef_prune_rel = float(kwargs.get("coef_prune_rel", 1e-10))
+        self.coef_snap_rtol = float(kwargs.get("coef_snap_rtol", 1e-6))
+        self.coef_snap_max_den = int(kwargs.get("coef_snap_max_den", 12))
+        self.use_simplify = bool(kwargs.get("use_simplify", True))
 
     @staticmethod
-    def _sympy_complexity(expr: sp.Expr) -> int:
-        sin, cos, exp, log = sp.sin, sp.cos, sp.exp, sp.log
-        unary_funcs = (sin, cos, exp, log)
-
-        binary_ops = 0
-        unary_ops = 0
-
-        stack = [expr]
-        while stack:
-            e = stack.pop()
-            if isinstance(e, sp.Function):
-                if e.func in unary_funcs:
-                    unary_ops += 1
-                stack.extend(e.args)
-            elif isinstance(e, sp.Add) or isinstance(e, sp.Mul):
-                args = e.args
-                if len(args) >= 2:
-                    binary_ops += (len(args) - 1)
-                stack.extend(args)
-            elif isinstance(e, sp.Pow):
-                binary_ops += 1
-                stack.extend(e.args)
-            else:
-                if hasattr(e, "args"):
-                    stack.extend(e.args)
-
-        return int(2 * binary_ops + unary_ops)
+    def _safe_sin(x):
+        return np.sin(x)
 
     @staticmethod
-    def _safe_lstsq(A: np.ndarray, y: np.ndarray) -> np.ndarray:
-        # If ill-conditioned or underdetermined, fall back to ridge
-        n, p = A.shape
-        if n >= p:
-            try:
-                coeffs, _, _, _ = np.linalg.lstsq(A, y, rcond=None)
-                if np.all(np.isfinite(coeffs)):
-                    return coeffs
-            except Exception:
-                pass
-        # ridge fallback
-        lam = 1e-8
-        ATA = A.T @ A
-        ATy = A.T @ y
-        ATA.flat[:: ATA.shape[0] + 1] += lam
+    def _safe_cos(x):
+        return np.cos(x)
+
+    def _build_library(self, X):
+        x1 = X[:, 0]
+        x2 = X[:, 1]
+
+        s1 = self._safe_sin(x1)
+        c1 = self._safe_cos(x1)
+        s2 = self._safe_sin(x2)
+        c2 = self._safe_cos(x2)
+
+        two_x1 = 2.0 * x1
+        two_x2 = 2.0 * x2
+
+        s1_2 = self._safe_sin(two_x1)
+        c1_2 = self._safe_cos(two_x1)
+        s2_2 = self._safe_sin(two_x2)
+        c2_2 = self._safe_cos(two_x2)
+
+        x1px2 = x1 + x2
+        x1mx2 = x1 - x2
+        sp12 = self._safe_sin(x1px2)
+        cp12 = self._safe_cos(x1px2)
+        sm12 = self._safe_sin(x1mx2)
+        cm12 = self._safe_cos(x1mx2)
+
+        Phi = np.column_stack(
+            [
+                np.ones_like(x1),  # 0
+                x1,  # 1
+                x2,  # 2
+                s1,  # 3
+                c1,  # 4
+                s2,  # 5
+                c2,  # 6
+                s1_2,  # 7
+                c1_2,  # 8
+                s2_2,  # 9
+                c2_2,  # 10
+                sp12,  # 11
+                cp12,  # 12
+                sm12,  # 13
+                cm12,  # 14
+                s1 * s2,  # 15
+                s1 * c2,  # 16
+                c1 * s2,  # 17
+                c1 * c2,  # 18
+            ]
+        ).astype(np.float64, copy=False)
+
+        basis = [
+            {"expr": "1", "unary": 0, "binary": 0},
+            {"expr": "x1", "unary": 0, "binary": 0},
+            {"expr": "x2", "unary": 0, "binary": 0},
+            {"expr": "sin(x1)", "unary": 1, "binary": 0},
+            {"expr": "cos(x1)", "unary": 1, "binary": 0},
+            {"expr": "sin(x2)", "unary": 1, "binary": 0},
+            {"expr": "cos(x2)", "unary": 1, "binary": 0},
+            {"expr": "sin(2*x1)", "unary": 1, "binary": 1},
+            {"expr": "cos(2*x1)", "unary": 1, "binary": 1},
+            {"expr": "sin(2*x2)", "unary": 1, "binary": 1},
+            {"expr": "cos(2*x2)", "unary": 1, "binary": 1},
+            {"expr": "sin(x1 + x2)", "unary": 1, "binary": 1},
+            {"expr": "cos(x1 + x2)", "unary": 1, "binary": 1},
+            {"expr": "sin(x1 - x2)", "unary": 1, "binary": 1},
+            {"expr": "cos(x1 - x2)", "unary": 1, "binary": 1},
+            {"expr": "sin(x1)*sin(x2)", "unary": 2, "binary": 1},
+            {"expr": "sin(x1)*cos(x2)", "unary": 2, "binary": 1},
+            {"expr": "cos(x1)*sin(x2)", "unary": 2, "binary": 1},
+            {"expr": "cos(x1)*cos(x2)", "unary": 2, "binary": 1},
+        ]
+        return Phi, basis
+
+    def _snap_coef(self, a):
+        if not np.isfinite(a):
+            return 0.0
+        if abs(a) < 1e-15:
+            return 0.0
+
+        near_int = np.round(a)
+        if abs(a - near_int) <= self.coef_snap_rtol * max(1.0, abs(a)):
+            return float(near_int)
+
+        best = float(a)
+        best_err = abs(a - best)
+        for den in range(2, max(2, self.coef_snap_max_den) + 1):
+            num = np.round(a * den)
+            cand = float(num / den)
+            err = abs(a - cand)
+            if err < best_err and err <= self.coef_snap_rtol * max(1.0, abs(a)):
+                best = cand
+                best_err = err
+        return float(best)
+
+    def _subset_mse_from_gram(self, G, g, yTy, n, cols):
+        GSS = G[np.ix_(cols, cols)]
+        gS = g[cols]
         try:
-            coeffs = np.linalg.solve(ATA, ATy)
-        except Exception:
-            coeffs, _, _, _ = np.linalg.lstsq(A, y, rcond=None)
-        return coeffs
+            coef = np.linalg.solve(GSS, gS)
+        except np.linalg.LinAlgError:
+            coef, _, _, _ = np.linalg.lstsq(GSS, gS, rcond=None)
+        mse = (yTy - 2.0 * float(coef @ gS) + float(coef @ (GSS @ coef))) / float(n)
+        if mse < 0 and mse > -1e-12:
+            mse = 0.0
+        return float(mse), np.asarray(coef, dtype=np.float64)
 
-    @staticmethod
-    def _format_float(c: float) -> str:
-        if not np.isfinite(c):
-            return "0.0"
-        # Avoid "-0.0"
-        if abs(c) < 1e-15:
-            c = 0.0
-        s = f"{c:.12g}"
-        if s == "-0":
-            s = "0"
-        return s
+    def _estimate_complexity(self, cols, coef, basis):
+        if coef.size == 0:
+            return 0
 
-    @classmethod
-    def _build_expression(cls, intercept: float, coefs: np.ndarray, term_exprs: list, coef_tol: float = 1e-12) -> str:
-        parts = []
-        if np.isfinite(intercept) and abs(intercept) > coef_tol:
-            parts.append(cls._format_float(float(intercept)))
+        max_abs = float(np.max(np.abs(coef))) if coef.size else 0.0
+        thr = self.coef_prune_rel * max(1.0, max_abs)
 
-        for c, texpr in zip(coefs, term_exprs):
-            c = float(c)
-            if not np.isfinite(c) or abs(c) <= coef_tol:
-                continue
+        kept = []
+        snapped = []
+        for j, c in enumerate(coef):
+            cs = self._snap_coef(float(c))
+            if abs(cs) > thr:
+                kept.append(j)
+                snapped.append(cs)
 
-            if abs(c - 1.0) < 1e-6:
-                parts.append(f"({texpr})")
-            elif abs(c + 1.0) < 1e-6:
-                parts.append(f"(-({texpr}))")
-            else:
-                parts.append(f"({cls._format_float(c)})*({texpr})")
+        if not kept:
+            return 0
 
-        if not parts:
-            return "0.0"
-        expr = " + ".join(parts)
-        return expr
+        unary = 0
+        binary = 0
+
+        # additions between kept terms
+        binary += max(0, len(kept) - 1)
+
+        for jj, cs in zip(kept, snapped):
+            idx = cols[jj]
+            unary += int(basis[idx]["unary"])
+            binary += int(basis[idx]["binary"])
+
+            if idx != 0:
+                if not (abs(cs - 1.0) <= self.coef_snap_rtol or abs(cs + 1.0) <= self.coef_snap_rtol):
+                    binary += 1
+
+        C = 2 * binary + unary
+        return int(C)
+
+    def _sympy_complexity(self, sym_expr):
+        unary = 0
+        binary = 0
+        for node in sp.preorder_traversal(sym_expr):
+            if isinstance(node, sp.Function):
+                if node.func in (sp.sin, sp.cos, sp.exp, sp.log):
+                    unary += 1
+            elif isinstance(node, sp.Add) or isinstance(node, sp.Mul):
+                nargs = len(node.args)
+                if nargs >= 2:
+                    binary += (nargs - 1)
+            elif isinstance(node, sp.Pow):
+                binary += 1
+        return int(2 * binary + unary)
 
     def solve(self, X: np.ndarray, y: np.ndarray) -> dict:
-        X = np.asarray(X)
-        y = np.asarray(y).reshape(-1)
+        X = np.asarray(X, dtype=np.float64)
+        y = np.asarray(y, dtype=np.float64).reshape(-1)
         n = X.shape[0]
-        x1 = X[:, 0].astype(np.float64, copy=False)
-        x2 = X[:, 1].astype(np.float64, copy=False)
 
-        # Precompute basis
-        term_exprs = []
-        cols = []
+        Phi, basis = self._build_library(X)
+        m = Phi.shape[1]
 
-        def add_term(expr_str: str, values: np.ndarray):
-            if values is None:
-                return
-            v = np.asarray(values, dtype=np.float64)
-            if v.shape != (n,):
-                return
-            if not np.all(np.isfinite(v)):
-                return
-            # Skip near-constant zero columns
-            if np.std(v) < 1e-14:
-                return
-            term_exprs.append(expr_str)
-            cols.append(v)
+        # Drop near-constant / invalid columns except intercept
+        col_ok = np.ones(m, dtype=bool)
+        col_ok[0] = True
+        for j in range(1, m):
+            col = Phi[:, j]
+            if not np.all(np.isfinite(col)):
+                col_ok[j] = False
+                continue
+            v = float(np.var(col))
+            if v < 1e-16:
+                col_ok[j] = False
 
-        # Linear terms (sometimes helpful)
-        add_term("x1", x1)
-        add_term("x2", x2)
+        keep_indices = np.where(col_ok)[0].tolist()
+        if 0 not in keep_indices:
+            keep_indices = [0] + keep_indices
+        keep_map = {old: new for new, old in enumerate(keep_indices)}
+        Phi_k = Phi[:, keep_indices]
+        basis_k = [basis[i] for i in keep_indices]
+        m_k = Phi_k.shape[1]
 
-        with np.errstate(all="ignore"):
-            # Harmonics
-            for k in range(1, max(1, self.max_harmonic) + 1):
-                if k == 1:
-                    add_term("sin(x1)", np.sin(x1))
-                    add_term("cos(x1)", np.cos(x1))
-                    add_term("sin(x2)", np.sin(x2))
-                    add_term("cos(x2)", np.cos(x2))
-                else:
-                    ks = self._format_float(float(k))
-                    add_term(f"sin(({ks})*x1)", np.sin(k * x1))
-                    add_term(f"cos(({ks})*x1)", np.cos(k * x1))
-                    add_term(f"sin(({ks})*x2)", np.sin(k * x2))
-                    add_term(f"cos(({ks})*x2)", np.cos(k * x2))
+        # Sample for search if large n
+        if n > self.search_sample_size:
+            rng = np.random.default_rng(self.random_state)
+            idx = rng.choice(n, size=self.search_sample_size, replace=False)
+            Phi_s = Phi_k[idx]
+            y_s = y[idx]
+        else:
+            Phi_s = Phi_k
+            y_s = y
 
-            if self.include_sumdiff:
-                add_term("sin(x1 + x2)", np.sin(x1 + x2))
-                add_term("cos(x1 + x2)", np.cos(x1 + x2))
-                add_term("sin(x1 - x2)", np.sin(x1 - x2))
-                add_term("cos(x1 - x2)", np.cos(x1 - x2))
+        ns = Phi_s.shape[0]
+        G = Phi_s.T @ Phi_s
+        g = Phi_s.T @ y_s
+        yTy = float(y_s @ y_s)
 
-            if self.include_cross:
-                s1, c1 = np.sin(x1), np.cos(x1)
-                s2, c2 = np.sin(x2), np.cos(x2)
-                add_term("sin(x1)*sin(x2)", s1 * s2)
-                add_term("sin(x1)*cos(x2)", s1 * c2)
-                add_term("cos(x1)*sin(x2)", c1 * s2)
-                add_term("cos(x1)*cos(x2)", c1 * c2)
+        candidate = list(range(1, m_k))
+        max_k = max(0, min(self.max_nonconst_terms, len(candidate)))
 
-        if not cols:
-            pred = np.full(n, float(np.mean(y)) if n else 0.0)
-            expr = self._format_float(float(pred[0] if n else 0.0))
-            return {"expression": expr, "predictions": pred.tolist(), "details": {"complexity": 0}}
+        best_cols = (0,)
+        best_mse = float("inf")
+        best_C = 10**9
 
-        F = np.column_stack(cols)  # (n, m)
-        m = F.shape[1]
-        ones = np.ones((n, 1), dtype=np.float64)
+        # Always include intercept
+        for k in range(0, max_k + 1):
+            for subset in itertools.combinations(candidate, k):
+                cols = (0,) + subset
+                mse, coef = self._subset_mse_from_gram(G, g, yTy, ns, cols)
+                C = self._estimate_complexity(cols, coef, basis_k)
 
-        # Model selection: minimize MSE, tie-break on estimated complexity later
-        max_terms = min(self.max_terms, m)
-        best = None  # (mse, idxs, coeffs, pred)
-        best_mse = np.inf
-        tol_rel = 1e-12
-        tol_abs = 1e-14
-
-        # Evaluate small subset sizes first to encourage simple models
-        for k in range(0, max_terms + 1):
-            for idxs in itertools.combinations(range(m), k):
-                if k == 0:
-                    A = ones
-                    coeffs = self._safe_lstsq(A, y)
-                    pred = A @ coeffs
-                    mse = float(np.mean((y - pred) ** 2))
-                    if mse + tol_abs < best_mse:
-                        best_mse = mse
-                        best = (mse, idxs, coeffs, pred)
-                    continue
-
-                Fi = F[:, idxs]
-                A = np.concatenate([ones, Fi], axis=1)
-                coeffs = self._safe_lstsq(A, y)
-                pred = A @ coeffs
-                mse = float(np.mean((y - pred) ** 2))
-
-                if mse + tol_abs < best_mse * (1.0 - tol_rel):
+                if mse < best_mse - 1e-12:
                     best_mse = mse
-                    best = (mse, idxs, coeffs, pred)
-                elif abs(mse - best_mse) <= max(tol_abs, tol_rel * max(1.0, best_mse)):
-                    # Keep the simpler one (by rough count: fewer terms, and prefer fewer cross/sumdiff terms)
-                    if best is None or k < len(best[1]):
-                        best_mse = mse
-                        best = (mse, idxs, coeffs, pred)
+                    best_cols = cols
+                    best_C = C
+                elif abs(mse - best_mse) <= 1e-12:
+                    if C < best_C:
+                        best_cols = cols
+                        best_C = C
 
-        if best is None:
-            pred = np.full(n, float(np.mean(y)) if n else 0.0)
-            expr = self._format_float(float(pred[0] if n else 0.0))
-            return {"expression": expr, "predictions": pred.tolist(), "details": {"complexity": 0}}
+        # Refit on full data
+        A = Phi_k[:, best_cols]
+        coef_full, _, _, _ = np.linalg.lstsq(A, y, rcond=None)
+        coef_full = np.asarray(coef_full, dtype=np.float64)
 
-        mse, idxs, coeffs, pred = best
-        intercept = float(coeffs[0]) if coeffs.size else 0.0
-        term_coefs = coeffs[1:] if coeffs.size > 1 else np.array([], dtype=np.float64)
-        selected_exprs = [term_exprs[i] for i in idxs]
+        # Prune/snap
+        max_abs = float(np.max(np.abs(coef_full))) if coef_full.size else 0.0
+        thr = self.coef_prune_rel * max(1.0, max_abs)
 
-        expression = self._build_expression(intercept, term_coefs, selected_exprs)
+        terms = []
+        for j, idx in enumerate(best_cols):
+            c = self._snap_coef(float(coef_full[j]))
+            if abs(c) <= thr:
+                continue
+            expr = basis_k[idx]["expr"]
+            terms.append((c, expr, idx))
 
-        # Compute exact complexity via sympy
+        if not terms:
+            final_expr_str = "0.0"
+            predictions = np.zeros_like(y)
+            details = {"complexity": 0}
+            return {
+                "expression": final_expr_str,
+                "predictions": predictions.tolist(),
+                "details": details,
+            }
+
+        # Build expression string
+        parts = []
+        for c, expr, idx in terms:
+            if idx == 0:
+                parts.append(repr(float(c)))
+                continue
+
+            if abs(c - 1.0) <= self.coef_snap_rtol:
+                parts.append(f"({expr})")
+            elif abs(c + 1.0) <= self.coef_snap_rtol:
+                parts.append(f"(-({expr}))")
+            else:
+                cstr = repr(float(c))
+                if expr in ("x1", "x2"):
+                    parts.append(f"({cstr}*{expr})")
+                else:
+                    parts.append(f"({cstr}*({expr}))")
+
+        expr_str = " + ".join(parts)
+
+        x1s, x2s = sp.symbols("x1 x2")
+        locals_map = {"x1": x1s, "x2": x2s, "sin": sp.sin, "cos": sp.cos, "exp": sp.exp, "log": sp.log}
         try:
-            x1s, x2s = sp.Symbol("x1"), sp.Symbol("x2")
-            expr_sym = sp.sympify(expression, locals={"sin": sp.sin, "cos": sp.cos, "exp": sp.exp, "log": sp.log, "x1": x1s, "x2": x2s})
-            complexity = self._sympy_complexity(expr_sym)
-            # Re-stringify to ensure sympy-parsable canonical form without changing allowed funcs
-            expression = str(expr_sym)
+            sym_expr = sp.sympify(expr_str, locals=locals_map)
+            if self.use_simplify:
+                sym_expr = sp.simplify(sym_expr)
+            final_expr_str = str(sym_expr)
         except Exception:
-            complexity = None
+            sym_expr = None
+            final_expr_str = expr_str
 
-        details = {}
-        if complexity is not None:
-            details["complexity"] = int(complexity)
+        # Predictions from final expression to match exactly
+        if sym_expr is not None:
+            f = sp.lambdify((x1s, x2s), sym_expr, modules={"sin": np.sin, "cos": np.cos, "exp": np.exp, "log": np.log})
+            predictions = np.asarray(f(X[:, 0], X[:, 1]), dtype=np.float64).reshape(-1)
+        else:
+            # Fallback: evaluate linear combo
+            predictions = A @ coef_full
+
+        # Complexity
+        if sym_expr is not None:
+            C_final = self._sympy_complexity(sym_expr)
+        else:
+            # Approx from the selected terms
+            cols = best_cols
+            C_final = self._estimate_complexity(cols, coef_full, basis_k)
 
         return {
-            "expression": expression,
-            "predictions": pred.tolist(),
-            "details": details,
+            "expression": final_expr_str,
+            "predictions": predictions.tolist(),
+            "details": {"complexity": int(C_final)},
         }

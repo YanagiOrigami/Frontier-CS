@@ -1,17 +1,21 @@
 import torch
 import triton
 import triton.language as tl
-from typing import Dict, Optional
 from pathlib import Path
+import sys
+
+class Solution:
+    def solve(self, spec_path: str = None) -> dict:
+        return {"code": Path(__file__).read_text(encoding="utf-8")}
 
 @triton.autotune(
     configs=[
-        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 32, 'GROUP_SIZE_M': 8}, num_warps=8, num_stages=3),
-        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 64, 'BLOCK_K': 32, 'GROUP_SIZE_M': 8}, num_warps=4, num_stages=3),
-        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 128, 'BLOCK_K': 32, 'GROUP_SIZE_M': 8}, num_warps=4, num_stages=3),
-        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 64, 'BLOCK_K': 32, 'GROUP_SIZE_M': 8}, num_warps=4, num_stages=3),
-        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 64, 'BLOCK_K': 64, 'GROUP_SIZE_M': 8}, num_warps=4, num_stages=3),
-        triton.Config({'BLOCK_M': 32, 'BLOCK_N': 32, 'BLOCK_K': 64, 'GROUP_SIZE_M': 8}, num_warps=2, num_stages=2),
+        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 32, 'GROUP_SIZE_M': 8}, num_stages=3, num_warps=8),
+        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 64, 'BLOCK_K': 32, 'GROUP_SIZE_M': 8}, num_stages=3, num_warps=8),
+        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 128, 'BLOCK_K': 32, 'GROUP_SIZE_M': 8}, num_stages=3, num_warps=8),
+        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 64, 'BLOCK_K': 32, 'GROUP_SIZE_M': 8}, num_stages=4, num_warps=4),
+        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 64, 'BLOCK_K': 64, 'GROUP_SIZE_M': 8}, num_stages=3, num_warps=4),
+        triton.Config({'BLOCK_M': 32, 'BLOCK_N': 32, 'BLOCK_K': 32, 'GROUP_SIZE_M': 8}, num_stages=2, num_warps=2),
     ],
     key=['M', 'N', 'K'],
 )
@@ -26,108 +30,106 @@ def _bmm_kernel(
     GROUP_SIZE_M: tl.constexpr
 ):
     # Program IDs
-    pid = tl.program_id(axis=0)
-    batch_id = tl.program_id(axis=1)
+    pid_batch = tl.program_id(2)
+    pid = tl.program_id(0)
 
-    # Number of blocks along M and N
+    # Grid processing (Swizzling)
     num_pid_m = tl.cdiv(M, BLOCK_M)
     num_pid_n = tl.cdiv(N, BLOCK_N)
-    
-    # Swizzling for better L2 cache locality
     num_pid_in_group = GROUP_SIZE_M * num_pid_n
     group_id = pid // num_pid_in_group
     first_pid_m = group_id * GROUP_SIZE_M
     group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
-    pid_m = first_pid_m + (pid % group_size_m)
+    pid_m = first_pid_m + ((pid % num_pid_in_group) % group_size_m)
     pid_n = (pid % num_pid_in_group) // group_size_m
 
-    # Batch offsets
-    A_batch_ptr = A_ptr + batch_id * stride_ab
-    B_batch_ptr = B_ptr + batch_id * stride_bb
-    C_batch_ptr = C_ptr + batch_id * stride_cb
+    # Batch pointers
+    A_batch_ptr = A_ptr + pid_batch * stride_ab
+    B_batch_ptr = B_ptr + pid_batch * stride_bb
+    C_batch_ptr = C_ptr + pid_batch * stride_cb
 
-    # Block offsets
+    # Block pointers
     offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
     offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
     offs_k = tl.arange(0, BLOCK_K)
 
-    # Pointers for the first block
-    A_ptrs = A_batch_ptr + (offs_m[:, None] * stride_am + offs_k[None, :] * stride_ak)
-    B_ptrs = B_batch_ptr + (offs_k[:, None] * stride_bk + offs_n[None, :] * stride_bn)
-
     # Accumulator
     acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
 
-    # Loop over K
-    for k in range(0, tl.cdiv(K, BLOCK_K)):
-        k_val = k * BLOCK_K + offs_k
+    # Pointers to the first block of K
+    # We will advance these pointers or recalculate them in the loop
+    # Using the pattern requested in the problem description for correctness
+    
+    k0 = 0
+    while k0 < K:
+        k_idxs = k0 + offs_k
         
-        # Masking for boundary conditions
-        a_mask = (offs_m[:, None] < M) & (k_val[None, :] < K)
-        b_mask = (offs_n[None, :] < N) & (k_val[:, None] < K)
+        # Calculate pointers for the current K-block
+        # A shape: (M, K), B shape: (K, N)
+        # Using correct strides
+        A_ptrs = A_batch_ptr + (offs_m[:, None] * stride_am) + (k_idxs[None, :] * stride_ak)
+        B_ptrs = B_batch_ptr + (k_idxs[:, None] * stride_bk) + (offs_n[None, :] * stride_bn)
         
-        # Load and cast to fp32 (required by problem spec)
+        # Masks
+        # Check M and N boundaries (constant for the thread block) and K boundary
+        a_mask = (offs_m[:, None] < M) & (k_idxs[None, :] < K)
+        b_mask = (offs_n[None, :] < N) & (k_idxs[:, None] < K)
+        
+        # Load and convert to fp32
         a = tl.load(A_ptrs, mask=a_mask, other=0.0).to(tl.float32)
         b = tl.load(B_ptrs, mask=b_mask, other=0.0).to(tl.float32)
         
         # Accumulate
         acc += tl.dot(a, b)
         
-        # Advance pointers
-        A_ptrs += BLOCK_K * stride_ak
-        B_ptrs += BLOCK_K * stride_bk
+        # Advance
+        k0 += BLOCK_K
 
     # Store result
-    offs_cm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
-    offs_cn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
-    C_ptrs = C_batch_ptr + (offs_cm[:, None] * stride_cm + offs_cn[None, :] * stride_cn)
-    c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
+    # Cast to float16 as required
+    c = acc.to(tl.float16)
     
-    # Cast to fp16 before storing
-    tl.store(C_ptrs, acc.to(tl.float16), mask=c_mask)
+    # Output pointers
+    c_ptrs = C_batch_ptr + (offs_m[:, None] * stride_cm) + (offs_n[None, :] * stride_cn)
+    c_mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
+    
+    tl.store(c_ptrs, c, mask=c_mask)
 
 def bmm(A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
     """
     Batched matrix multiplication.
     
     Args:
-        A: Input tensor of shape (B, M, K)
-        B: Input tensor of shape (B, K, N)
+        A: Input tensor of shape (B, M, K) - batch of M×K matrices
+        B: Input tensor of shape (B, K, N) - batch of K×N matrices
     
     Returns:
-        Output tensor of shape (B, M, N)
+        Output tensor of shape (B, M, N) - batch of M×N result matrices
     """
-    # Validation
-    assert A.ndim == 3 and B.ndim == 3, "A and B must be 3D tensors"
-    assert A.shape[0] == B.shape[0], "Batch dimension must match"
-    assert A.shape[2] == B.shape[1], "K dimension must match"
+    # Check constraints
+    assert A.ndim == 3 and B.ndim == 3, "Inputs must be 3D tensors"
+    assert A.shape[0] == B.shape[0], "Batch dimension mismatch"
+    assert A.shape[2] == B.shape[1], "Inner dimension K mismatch"
     
-    Batches, M, K = A.shape
+    Batch, M, K = A.shape
     _, _, N = B.shape
     
-    # Output tensor
-    C = torch.empty((Batches, M, N), device=A.device, dtype=torch.float16)
+    # Allocate output
+    C = torch.empty((Batch, M, N), device=A.device, dtype=torch.float16)
     
-    # Grid definition: (M blocks * N blocks, Batches)
+    # 1D launch grid for M/N blocks (swizzling handled in kernel), Batch in Z
     grid = lambda META: (
         triton.cdiv(M, META['BLOCK_M']) * triton.cdiv(N, META['BLOCK_N']),
-        Batches
+        1,
+        Batch
     )
     
-    # Launch kernel
     _bmm_kernel[grid](
         A, B, C,
         M, N, K,
         A.stride(0), A.stride(1), A.stride(2),
         B.stride(0), B.stride(1), B.stride(2),
-        C.stride(0), C.stride(1), C.stride(2),
+        C.stride(0), C.stride(1), C.stride(2)
     )
     
     return C
-
-class Solution:
-    def solve(self, spec_path: Optional[str] = None) -> Dict[str, str]:
-        """
-        Returns a dict with the source code of the current file.
-        """
-        return {"code": Path(__file__).resolve().read_text(encoding="utf-8")}

@@ -1,13 +1,102 @@
-import time
-import math
-import random
-from typing import List, Any, Dict, Tuple, Optional
-
-import numpy as np
 import pandas as pd
+import numpy as np
+from itertools import permutations
 
 
 class Solution:
+    def __init__(self):
+        self._hash_base = 911382323
+        self._hash_mask = (1 << 64) - 1
+
+    def _apply_col_merge(self, df: pd.DataFrame, col_merge):
+        if not col_merge:
+            return df
+
+        df2 = df.copy()
+        orig_cols = list(df.columns)
+
+        for group in col_merge:
+            if group is None:
+                continue
+            if not isinstance(group, (list, tuple)):
+                group = [group]
+            if len(group) < 2:
+                continue
+
+            cols = []
+            for g in group:
+                if isinstance(g, (int, np.integer)):
+                    if 0 <= int(g) < len(orig_cols):
+                        name = orig_cols[int(g)]
+                    else:
+                        continue
+                else:
+                    name = str(g)
+                if name in df2.columns and name not in cols:
+                    cols.append(name)
+
+            if len(cols) < 2:
+                continue
+
+            try:
+                positions = [df2.columns.get_loc(c) for c in cols]
+                loc = min(positions)
+            except Exception:
+                loc = 0
+
+            merged = df2[cols[0]].astype(str)
+            for c in cols[1:]:
+                merged = merged + df2[c].astype(str)
+
+            base_name = "_".join(cols)
+            new_name = base_name
+            if new_name in df2.columns and new_name not in cols:
+                k = 2
+                while f"{base_name}_{k}" in df2.columns:
+                    k += 1
+                new_name = f"{base_name}_{k}"
+
+            df2.drop(columns=cols, inplace=True)
+            if loc > len(df2.columns):
+                loc = len(df2.columns)
+            df2.insert(loc=loc, column=new_name, value=merged)
+
+        return df2
+
+    def _score_perm_hash(self, col_lists, perm, n_rows, max_chars):
+        base = self._hash_base
+        mask = self._hash_mask
+        prefix_sets = [set() for _ in range(max_chars + 1)]
+
+        total = 0
+        first = True
+
+        for idx in range(n_rows):
+            h = 0
+            depth = 0
+            best = 0
+
+            for pi in perm:
+                s = col_lists[pi][idx]
+                for ch in s:
+                    depth += 1
+                    if depth > max_chars:
+                        break
+                    h = (h * base + (ord(ch) + 1)) & mask
+                    ps = prefix_sets[depth]
+                    if h in ps:
+                        best = depth
+                    ps.add(h)
+                if depth >= max_chars:
+                    break
+
+            if first:
+                first = False
+            else:
+                total += best
+
+        return total
+
     def solve(
         self,
         df: pd.DataFrame,
@@ -19,340 +108,126 @@ class Solution:
         distinct_value_threshold: float = 0.7,
         parallel: bool = True,
     ) -> pd.DataFrame:
-        t0 = time.perf_counter()
-
-        if df is None or df.shape[1] <= 1:
-            return df
-
-        df2 = df
-
-        def _normalize_col(c):
-            if isinstance(c, (int, np.integer)):
-                if 0 <= int(c) < len(df2.columns):
-                    return df2.columns[int(c)]
-                return c
-            return c
-
-        def _unique_name(base: str) -> str:
-            if base not in df2.columns:
-                return base
-            k = 2
-            while f"{base}__{k}" in df2.columns:
-                k += 1
-            return f"{base}__{k}"
-
-        # Apply column merges (robust to already-merged inputs)
-        if col_merge:
-            for grp in col_merge:
-                if grp is None:
-                    continue
-                if not isinstance(grp, (list, tuple)) or len(grp) <= 1:
-                    continue
-                cols = [_normalize_col(c) for c in grp]
-                cols_present = []
-                seen = set()
-                for c in cols:
-                    if c in df2.columns and c not in seen:
-                        cols_present.append(c)
-                        seen.add(c)
-                if len(cols_present) <= 1:
-                    continue
-
-                try:
-                    pos = min(int(df2.columns.get_loc(c)) for c in cols_present)
-                except Exception:
-                    pos = 0
-
-                merged = df2[cols_present[0]].astype(str)
-                for c in cols_present[1:]:
-                    merged = merged + df2[c].astype(str)
-
-                new_name = _unique_name("+".join(map(str, cols_present)))
-                df2.insert(pos, new_name, merged)
-                df2.drop(columns=cols_present, inplace=True)
-
+        df2 = self._apply_col_merge(df, col_merge)
         cols = list(df2.columns)
         m = len(cols)
         if m <= 1:
             return df2
 
         n = len(df2)
-        # Sample size for scoring
-        sample_size = min(n, int(min(max(2000, n * 0.25), 6000, max(2000, early_stop))))
-        if sample_size < 500:
-            sample_size = min(n, 500)
+        if n == 0:
+            return df2
 
-        df_s = df2.iloc[:sample_size]
+        sample_n = min(n, max(800, int(row_stop) * 1000))
+        max_chars = 96
 
-        # Tokenization: first T characters as 1-char tokens, then remainder as one token
-        T = 3
-        SHIFT = 32
-
-        token_to_id: Dict[str, int] = {}
-        next_tid = 1
-
-        def _tok_id(tok: str) -> int:
-            nonlocal next_tid
-            tid = token_to_id.get(tok)
-            if tid is None:
-                tid = next_tid
-                token_to_id[tok] = tid
-                next_tid += 1
-            return tid
-
-        # Precompute per-column per-row token ids and token lengths
-        tok_ids_by_col: List[List[Tuple[int, ...]]] = []
-        tok_lens_by_col: List[List[Tuple[int, ...]]] = []
-
-        # Heuristic stats
-        nunique_list = []
-        avg_len_list = []
-        pref1_unique = []
-        pref2_unique = []
-        pref3_unique = []
+        col_lists = []
+        distinct_ratios = []
+        avg_lens = []
+        first1_ratios = []
+        first2_ratios = []
 
         for c in cols:
-            arr = df_s[c].astype(str).to_numpy()
-            tok_ids_col: List[Tuple[int, ...]] = [()] * sample_size
-            tok_lens_col: List[Tuple[int, ...]] = [()] * sample_size
+            arr = df2[c].astype(str).tolist()
+            col_lists.append(arr)
+
+            d = len(set(arr)) / n
+            distinct_ratios.append(d)
 
             total_len = 0
-            sset = set()
-            p1 = set()
-            p2 = set()
-            p3 = set()
-
-            for i in range(sample_size):
-                v = arr[i]
-                if v is None:
-                    v = ""
-                if not isinstance(v, str):
-                    v = str(v)
-                sset.add(v)
-                lv = len(v)
-                total_len += lv
-
-                if lv >= 1:
-                    p1.add(v[0])
+            f1 = set()
+            f2 = set()
+            for s in arr[:sample_n]:
+                total_len += len(s)
+                if s:
+                    f1.add(s[0])
+                    f2.add(s[:2] if len(s) >= 2 else s)
                 else:
-                    p1.add("")
-                if lv >= 2:
-                    p2.add(v[:2])
-                else:
-                    p2.add(v)
-                if lv >= 3:
-                    p3.add(v[:3])
-                else:
-                    p3.add(v)
+                    f1.add("")
+                    f2.add("")
+            avg_lens.append(total_len / sample_n if sample_n else 0.0)
+            first1_ratios.append(len(f1) / sample_n if sample_n else 1.0)
+            first2_ratios.append(len(f2) / sample_n if sample_n else 1.0)
 
-                if lv == 0:
-                    tok_ids_col[i] = ()
-                    tok_lens_col[i] = ()
-                    continue
+        def add_perm(p, perms, seen):
+            t = tuple(p)
+            if t not in seen:
+                perms.append(p)
+                seen.add(t)
 
-                # Build tokens
-                ids = []
-                lens = []
-                k = min(T, lv)
-                for j in range(k):
-                    ids.append(_tok_id(v[j]))
-                    lens.append(1)
-                if lv > T:
-                    rest = v[T:]
-                    ids.append(_tok_id(rest))
-                    lens.append(lv - T)
+        perms = []
+        seen = set()
+        base_perm = list(range(m))
+        add_perm(base_perm, perms, seen)
+        add_perm(list(reversed(base_perm)), perms, seen)
 
-                tok_ids_col[i] = tuple(ids)
-                tok_lens_col[i] = tuple(lens)
+        add_perm(sorted(range(m), key=lambda i: (distinct_ratios[i], -avg_lens[i])), perms, seen)
+        add_perm(sorted(range(m), key=lambda i: (-avg_lens[i], distinct_ratios[i])), perms, seen)
+        add_perm(sorted(range(m), key=lambda i: (distinct_ratios[i] / (avg_lens[i] + 1e-6), distinct_ratios[i], -avg_lens[i])), perms, seen)
+        add_perm(sorted(range(m), key=lambda i: (-(avg_lens[i] * (1.0 - distinct_ratios[i])), distinct_ratios[i], -avg_lens[i])), perms, seen)
+        add_perm(sorted(range(m), key=lambda i: (first2_ratios[i], distinct_ratios[i], -avg_lens[i])), perms, seen)
+        add_perm(sorted(range(m), key=lambda i: (first1_ratios[i], distinct_ratios[i], -avg_lens[i])), perms, seen)
 
-            tok_ids_by_col.append(tok_ids_col)
-            tok_lens_by_col.append(tok_lens_col)
+        low = [i for i in range(m) if distinct_ratios[i] <= distinct_value_threshold]
+        high = [i for i in range(m) if distinct_ratios[i] > distinct_value_threshold]
+        low_sorted = sorted(low, key=lambda i: (distinct_ratios[i], -avg_lens[i]))
+        high_sorted = sorted(high, key=lambda i: (distinct_ratios[i], -avg_lens[i]))
+        add_perm(low_sorted + high_sorted, perms, seen)
 
-            nunique_list.append(len(sset))
-            avg_len_list.append(total_len / max(1, sample_size))
-            pref1_unique.append(len(p1))
-            pref2_unique.append(len(p2))
-            pref3_unique.append(len(p3))
+        score_cache = {}
 
-        # Fast scoring using a single dict edge trie keyed by (node<<32)|token_id
-        edges: Dict[int, int] = {}
-
-        def score_perm(perm: List[int], nrows: int) -> int:
-            edges.clear()
-            next_node = 1
-            total = 0
-
-            tok_ids_cols = tok_ids_by_col
-            tok_lens_cols = tok_lens_by_col
-            edges_get = edges.get
-            edges_set = edges.__setitem__
-
-            for r in range(nrows):
-                node = 0
-                lcp = 0
-                matched = True
-                for ci in perm:
-                    tlist = tok_ids_cols[ci][r]
-                    llist = tok_lens_cols[ci][r]
-                    lt = len(tlist)
-                    for k in range(lt):
-                        tok = tlist[k]
-                        ln = llist[k]
-                        key = (node << SHIFT) | tok
-                        nxt = edges_get(key)
-                        if matched and nxt is not None:
-                            node = nxt
-                            lcp += ln
-                        else:
-                            if matched:
-                                matched = False
-                            if nxt is None:
-                                nxt = next_node
-                                next_node += 1
-                                edges_set(key, nxt)
-                            node = nxt
-                total += lcp
-            return total
-
-        # Heuristic initial order
-        nunique_ratio = [nu / sample_size for nu in nunique_list]
-        p1_ratio = [u / sample_size for u in pref1_unique]
-        p2_ratio = [u / sample_size for u in pref2_unique]
-        p3_ratio = [u / sample_size for u in pref3_unique]
-
-        idxs = list(range(m))
-
-        # Put very high-cardinality columns later
-        low = [i for i in idxs if nunique_ratio[i] <= distinct_value_threshold]
-        high = [i for i in idxs if nunique_ratio[i] > distinct_value_threshold]
-
-        def _sort_key(i: int):
-            # Lower diversity earlier, longer strings earlier within similar diversity
-            return (nunique_ratio[i], p1_ratio[i], p2_ratio[i], p3_ratio[i], -avg_len_list[i])
-
-        low.sort(key=_sort_key)
-        high.sort(key=_sort_key)
-
-        # Small tweak: if column name suggests ID and high cardinality, push to end
-        def _is_id_name(name: str) -> bool:
-            s = str(name).lower()
-            return s == "id" or s.endswith("_id") or s.startswith("id_") or "uuid" in s
-
-        ids = [i for i in idxs if _is_id_name(cols[i])]
-        if ids:
-            id_set = set(ids)
-            base = [i for i in low if i not in id_set] + [i for i in high if i not in id_set] + ids
-        else:
-            base = low + high
-
-        # Greedy build using smaller sample
-        greedy_nrows = min(sample_size, 3000)
-        greedy_perm: List[int] = []
-        remaining = set(idxs)
-
-        # Time budget (keep well under 10s average)
-        time_budget = 2.4
-        deadline = t0 + time_budget
-
-        if time.perf_counter() < deadline and m <= 9 and greedy_nrows >= 500:
-            while remaining and time.perf_counter() < deadline:
-                best_c = None
-                best_sc = -1
-                prefix = greedy_perm
-                for c in list(remaining):
-                    sc = score_perm(prefix + [c], greedy_nrows)
-                    if sc > best_sc:
-                        best_sc = sc
-                        best_c = c
-                if best_c is None:
-                    break
-                greedy_perm.append(best_c)
-                remaining.remove(best_c)
-            if remaining:
-                tail = list(remaining)
-                tail.sort(key=_sort_key)
-                greedy_perm.extend(tail)
-        else:
-            greedy_perm = base[:]
-
-        # Candidate generation
-        candidates: List[List[int]] = []
-        candidates.append(base)
-        candidates.append(greedy_perm)
-        candidates.append(list(reversed(base)))
-
-        # Adjacent swaps of base
-        for i in range(m - 1):
-            p = base[:]
-            p[i], p[i + 1] = p[i + 1], p[i]
-            candidates.append(p)
-
-        # Random shuffles (stable seed from column names)
-        seed = 1469598103934665603
-        for name in cols:
-            for ch in str(name):
-                seed ^= ord(ch)
-                seed *= 1099511628211
-                seed &= (1 << 64) - 1
-        rng = random.Random(seed)
-        for _ in range(8):
-            p = base[:]
-            # shuffle mostly in the high-cardinality tail to keep structure
-            split = max(0, m - max(2, min(4, m // 2)))
-            head = p[:split]
-            tail = p[split:]
-            rng.shuffle(tail)
-            candidates.append(head + tail)
-
-        # Deduplicate candidates
-        seen_c = set()
-        uniq_candidates = []
-        for p in candidates:
+        def get_score(p):
             tp = tuple(p)
-            if tp not in seen_c:
-                seen_c.add(tp)
-                uniq_candidates.append(p)
+            sc = score_cache.get(tp)
+            if sc is not None:
+                return sc
+            sc = self._score_perm_hash(col_lists, p, sample_n, max_chars)
+            score_cache[tp] = sc
+            return sc
 
-        # Pick best candidate
-        best_perm = base
+        best_p = perms[0]
         best_score = -1
-        for p in uniq_candidates:
-            if time.perf_counter() > deadline:
+        evals = 0
+        for p in perms:
+            if evals >= early_stop:
                 break
-            sc = score_perm(p, sample_size)
+            sc = get_score(p)
+            evals += 1
             if sc > best_score:
                 best_score = sc
-                best_perm = p
+                best_p = p
 
-        # Local improvement: best pair swap hill-climb
-        improvements = 0
-        while improvements < 4 and time.perf_counter() < deadline:
+        max_iters = min(6, max(1, int(col_stop) * 2))
+        for _ in range(max_iters):
+            if evals >= early_stop:
+                break
+            current = best_p
+            current_score = best_score
             improved = False
-            cur = best_perm
-            cur_score = best_score
-            best_local_perm = cur
-            best_local_score = cur_score
+
+            best_neighbor = current
+            best_neighbor_score = current_score
 
             for i in range(m - 1):
-                for j in range(i + 1, m):
-                    if time.perf_counter() > deadline:
-                        break
-                    p = cur[:]
-                    p[i], p[j] = p[j], p[i]
-                    sc = score_perm(p, sample_size)
-                    if sc > best_local_score:
-                        best_local_score = sc
-                        best_local_perm = p
-                        improved = True
-                if time.perf_counter() > deadline:
+                if evals >= early_stop:
                     break
+                for j in range(i + 1, m):
+                    if evals >= early_stop:
+                        break
+                    nb = current.copy()
+                    nb[i], nb[j] = nb[j], nb[i]
+                    sc = get_score(nb)
+                    evals += 1
+                    if sc > best_neighbor_score:
+                        best_neighbor_score = sc
+                        best_neighbor = nb
+                        improved = True
 
-            if improved:
-                best_perm = best_local_perm
-                best_score = best_local_score
-                improvements += 1
+            if improved and best_neighbor_score > best_score:
+                best_p = best_neighbor
+                best_score = best_neighbor_score
             else:
                 break
 
-        ordered_cols = [cols[i] for i in best_perm]
+        ordered_cols = [cols[i] for i in best_p]
         return df2[ordered_cols]

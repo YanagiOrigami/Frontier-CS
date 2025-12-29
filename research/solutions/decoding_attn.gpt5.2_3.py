@@ -1,304 +1,214 @@
-import math
 import os
-from typing import Dict, Tuple, Optional
+import math
+from typing import Dict, Optional, Tuple
 
 import torch
-
-try:
-    import triton
-    import triton.language as tl
-except Exception:
-    triton = None
-    tl = None
+import triton
+import triton.language as tl
 
 
-if triton is not None:
-
-    @triton.jit
-    def _decoding_attn_stage1(
-        Q_ptr,
-        K_ptr,
-        V_ptr,
-        M_ptr,
-        L_ptr,
-        A_ptr,
-        sm_scale,
-        N,
-        stride_qz: tl.constexpr,
-        stride_qh: tl.constexpr,
-        stride_qm: tl.constexpr,
-        stride_qd: tl.constexpr,
-        stride_kz: tl.constexpr,
-        stride_kh: tl.constexpr,
-        stride_kn: tl.constexpr,
-        stride_kd: tl.constexpr,
-        stride_vz: tl.constexpr,
-        stride_vh: tl.constexpr,
-        stride_vn: tl.constexpr,
-        stride_vd: tl.constexpr,
-        stride_mz: tl.constexpr,
-        stride_mh: tl.constexpr,
-        stride_mm: tl.constexpr,
-        stride_mb: tl.constexpr,
-        stride_lz: tl.constexpr,
-        stride_lh: tl.constexpr,
-        stride_lm: tl.constexpr,
-        stride_lb: tl.constexpr,
-        stride_az: tl.constexpr,
-        stride_ah: tl.constexpr,
-        stride_am: tl.constexpr,
-        stride_ab: tl.constexpr,
-        stride_ad: tl.constexpr,
-        H: tl.constexpr,
-        Mq: tl.constexpr,
-        DQ: tl.constexpr,
-        DV: tl.constexpr,
-        BLOCK_N: tl.constexpr,
-    ):
-        pid_q = tl.program_id(0)
-        pid_b = tl.program_id(1)
-
-        m_idx = pid_q % Mq
-        h_idx = (pid_q // Mq) % H
-        z_idx = pid_q // (H * Mq)
-
-        q_ptr = Q_ptr + z_idx * stride_qz + h_idx * stride_qh + m_idx * stride_qm
-        k_ptr = K_ptr + z_idx * stride_kz + h_idx * stride_kh
-        v_ptr = V_ptr + z_idx * stride_vz + h_idx * stride_vh
-
-        d_off = tl.arange(0, DQ)
-        q = tl.load(q_ptr + d_off * stride_qd).to(tl.float16)
-
-        n0 = pid_b * BLOCK_N
-        n_off = n0 + tl.arange(0, BLOCK_N)
-        n_mask = n_off < N
-
-        k = tl.load(
-            k_ptr + n_off[:, None] * stride_kn + d_off[None, :] * stride_kd,
-            mask=n_mask[:, None],
-            other=0.0,
-        ).to(tl.float16)
-
-        scores = tl.dot(k, q[:, None])[:, 0].to(tl.float32) * sm_scale
-        m_block = tl.max(scores, axis=0)
-        p16 = tl.exp(scores - m_block).to(tl.float16)
-        l_block = tl.sum(p16.to(tl.float32), axis=0)
-
-        dv_off = tl.arange(0, DV)
-        v = tl.load(
-            v_ptr + n_off[:, None] * stride_vn + dv_off[None, :] * stride_vd,
-            mask=n_mask[:, None],
-            other=0.0,
-        ).to(tl.float16)
-
-        acc = tl.dot(p16[None, :], v)[0, :].to(tl.float32)
-
-        tl.store(
-            M_ptr + z_idx * stride_mz + h_idx * stride_mh + m_idx * stride_mm + pid_b * stride_mb,
-            m_block,
-        )
-        tl.store(
-            L_ptr + z_idx * stride_lz + h_idx * stride_lh + m_idx * stride_lm + pid_b * stride_lb,
-            l_block,
-        )
-        tl.store(
-            A_ptr
-            + z_idx * stride_az
-            + h_idx * stride_ah
-            + m_idx * stride_am
-            + pid_b * stride_ab
-            + dv_off * stride_ad,
-            acc,
-        )
-
-    @triton.jit
-    def _decoding_attn_stage2(
-        M_ptr,
-        L_ptr,
-        A_ptr,
-        O_ptr,
-        stride_mz: tl.constexpr,
-        stride_mh: tl.constexpr,
-        stride_mm: tl.constexpr,
-        stride_mb: tl.constexpr,
-        stride_lz: tl.constexpr,
-        stride_lh: tl.constexpr,
-        stride_lm: tl.constexpr,
-        stride_lb: tl.constexpr,
-        stride_az: tl.constexpr,
-        stride_ah: tl.constexpr,
-        stride_am: tl.constexpr,
-        stride_ab: tl.constexpr,
-        stride_ad: tl.constexpr,
-        stride_oz: tl.constexpr,
-        stride_oh: tl.constexpr,
-        stride_om: tl.constexpr,
-        stride_od: tl.constexpr,
-        H: tl.constexpr,
-        Mq: tl.constexpr,
-        DV: tl.constexpr,
-        B: tl.constexpr,
-    ):
-        pid_q = tl.program_id(0)
-
-        m_idx = pid_q % Mq
-        h_idx = (pid_q // Mq) % H
-        z_idx = pid_q // (H * Mq)
-
-        m_ptr = M_ptr + z_idx * stride_mz + h_idx * stride_mh + m_idx * stride_mm
-        l_ptr = L_ptr + z_idx * stride_lz + h_idx * stride_lh + m_idx * stride_lm
-        a_ptr = A_ptr + z_idx * stride_az + h_idx * stride_ah + m_idx * stride_am
-
-        m_g = -float("inf")
-        for b in tl.static_range(0, B):
-            m_b = tl.load(m_ptr + b * stride_mb).to(tl.float32)
-            m_g = tl.maximum(m_g, m_b)
-
-        l_g = 0.0
-        dv_off = tl.arange(0, DV)
-        acc_g = tl.zeros([DV], dtype=tl.float32)
-
-        for b in tl.static_range(0, B):
-            m_b = tl.load(m_ptr + b * stride_mb).to(tl.float32)
-            l_b = tl.load(l_ptr + b * stride_lb).to(tl.float32)
-            w = tl.exp(m_b - m_g)
-            l_g += l_b * w
-            a_b = tl.load(a_ptr + b * stride_ab + dv_off * stride_ad).to(tl.float32)
-            acc_g += a_b * w
-
-        out = acc_g / l_g
-        tl.store(
-            O_ptr + z_idx * stride_oz + h_idx * stride_oh + m_idx * stride_om + dv_off * stride_od,
-            out.to(tl.float16),
-        )
+def _next_pow2(x: int) -> int:
+    if x <= 1:
+        return 1
+    return 1 << (x - 1).bit_length()
 
 
-_tmp_cache: Dict[Tuple[int, int, int, int, int, int], Tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = {}
+@triton.jit
+def _decode_attn_stage1(
+    Q_ptr, K_ptr, V_ptr,
+    M_ptr, L_ptr, ACC_ptr,
+    stride_qz: tl.constexpr, stride_qh: tl.constexpr, stride_qm: tl.constexpr, stride_qd: tl.constexpr,
+    stride_kz: tl.constexpr, stride_kh: tl.constexpr, stride_kn: tl.constexpr, stride_kd: tl.constexpr,
+    stride_vz: tl.constexpr, stride_vh: tl.constexpr, stride_vn: tl.constexpr, stride_vd: tl.constexpr,
+    Z: tl.constexpr, H: tl.constexpr, M: tl.constexpr, N_CTX: tl.constexpr,
+    sm_scale,
+    BLOCK_N: tl.constexpr, D: tl.constexpr, DV: tl.constexpr,
+    SPLIT_K: tl.constexpr,
+):
+    pid_row = tl.program_id(0)
+    pid_split = tl.program_id(1)
+
+    m_idx = pid_row % M
+    tmp = pid_row // M
+    h_idx = tmp % H
+    z_idx = tmp // H
+
+    d_offsets = tl.arange(0, D)
+    q_ptrs = Q_ptr + z_idx * stride_qz + h_idx * stride_qh + m_idx * stride_qm + d_offsets * stride_qd
+    q = tl.load(q_ptrs, mask=d_offsets < D, other=0.0).to(tl.float32)
+
+    split_size = (N_CTX + SPLIT_K - 1) // SPLIT_K
+    start_n = pid_split * split_size
+
+    m_i = tl.full((), -1.0e20, tl.float32)
+    l_i = tl.zeros((), tl.float32)
+    acc = tl.zeros((DV,), tl.float32)
+
+    dv_offsets = tl.arange(0, DV)
+
+    for offs in tl.static_range(0, split_size, BLOCK_N):
+        n_offsets = start_n + offs + tl.arange(0, BLOCK_N)
+        n_mask = (n_offsets < N_CTX) & (n_offsets < start_n + split_size)
+
+        k_ptrs = K_ptr + z_idx * stride_kz + h_idx * stride_kh + n_offsets[:, None] * stride_kn + d_offsets[None, :] * stride_kd
+        k = tl.load(k_ptrs, mask=n_mask[:, None] & (d_offsets[None, :] < D), other=0.0).to(tl.float32)
+
+        scores = tl.sum(k * q[None, :], axis=1) * sm_scale
+        scores = tl.where(n_mask, scores, -1.0e20)
+
+        m_b = tl.max(scores, axis=0)
+        m_new = tl.maximum(m_i, m_b)
+        alpha = tl.exp(m_i - m_new)
+
+        p = tl.exp(scores - m_new)
+        l_new = l_i * alpha + tl.sum(p, axis=0)
+
+        v_ptrs = V_ptr + z_idx * stride_vz + h_idx * stride_vh + n_offsets[:, None] * stride_vn + dv_offsets[None, :] * stride_vd
+        v = tl.load(v_ptrs, mask=n_mask[:, None] & (dv_offsets[None, :] < DV), other=0.0).to(tl.float32)
+
+        acc = acc * alpha + tl.sum(v * p[:, None], axis=0)
+
+        m_i = m_new
+        l_i = l_new
+
+    idx = pid_row * SPLIT_K + pid_split
+    tl.store(M_ptr + idx, m_i)
+    tl.store(L_ptr + idx, l_i)
+    tl.store(ACC_ptr + idx * DV + dv_offsets, acc)
 
 
-def _get_tmp(device: torch.device, Z: int, H: int, M: int, B: int, DV: int):
-    key = (device.index if device.type == "cuda" else -1, Z, H, M, B, DV)
-    buf = _tmp_cache.get(key, None)
-    if buf is not None:
-        m, l, a = buf
-        if m.is_cuda and m.device == device and l.device == device and a.device == device:
-            return m, l, a
-    m = torch.empty((Z, H, M, B), device=device, dtype=torch.float32)
-    l = torch.empty((Z, H, M, B), device=device, dtype=torch.float32)
-    a = torch.empty((Z, H, M, B, DV), device=device, dtype=torch.float32)
-    _tmp_cache[key] = (m, l, a)
-    return m, l, a
+@triton.jit
+def _decode_attn_stage2(
+    M_ptr, L_ptr, ACC_ptr,
+    Out_ptr,
+    stride_oz: tl.constexpr, stride_oh: tl.constexpr, stride_om: tl.constexpr, stride_od: tl.constexpr,
+    Z: tl.constexpr, H: tl.constexpr, M: tl.constexpr,
+    DV: tl.constexpr,
+    SPLIT_K: tl.constexpr,
+):
+    pid_row = tl.program_id(0)
+
+    m_idx = pid_row % M
+    tmp = pid_row // M
+    h_idx = tmp % H
+    z_idx = tmp // H
+
+    s_offsets = tl.arange(0, SPLIT_K)
+    m_vec = tl.load(M_ptr + pid_row * SPLIT_K + s_offsets).to(tl.float32)
+    m = tl.max(m_vec, axis=0)
+
+    w = tl.exp(m_vec - m)
+    l_vec = tl.load(L_ptr + pid_row * SPLIT_K + s_offsets).to(tl.float32)
+    l = tl.sum(l_vec * w, axis=0)
+    l = tl.maximum(l, 1.0e-20)
+
+    dv_offsets = tl.arange(0, DV)
+    acc_ptrs = ACC_ptr + (pid_row * SPLIT_K + s_offsets)[:, None] * DV + dv_offsets[None, :]
+    acc_mat = tl.load(acc_ptrs).to(tl.float32)
+    acc = tl.sum(acc_mat * w[:, None], axis=0)
+
+    out = acc / l
+    out_ptrs = Out_ptr + z_idx * stride_oz + h_idx * stride_oh + m_idx * stride_om + dv_offsets * stride_od
+    tl.store(out_ptrs, out.to(tl.float16), mask=dv_offsets < DV)
+
+
+_TEMP_CACHE: Dict[Tuple[int, int, int, int], Tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = {}
+
+
+def _get_temps(device: torch.device, rows: int, split_k: int, dv: int):
+    key = (device.index if device.type == "cuda" else -1, rows, split_k, dv)
+    t = _TEMP_CACHE.get(key, None)
+    if t is None or any(x is None for x in t):
+        m = torch.empty((rows * split_k,), device=device, dtype=torch.float32)
+        l = torch.empty((rows * split_k,), device=device, dtype=torch.float32)
+        acc = torch.empty((rows * split_k * dv,), device=device, dtype=torch.float32)
+        _TEMP_CACHE[key] = (m, l, acc)
+        return m, l, acc
+    m, l, acc = t
+    if m.numel() != rows * split_k or l.numel() != rows * split_k or acc.numel() != rows * split_k * dv:
+        m = torch.empty((rows * split_k,), device=device, dtype=torch.float32)
+        l = torch.empty((rows * split_k,), device=device, dtype=torch.float32)
+        acc = torch.empty((rows * split_k * dv,), device=device, dtype=torch.float32)
+        _TEMP_CACHE[key] = (m, l, acc)
+    return _TEMP_CACHE[key]
+
+
+def _pick_meta(Z: int, H: int, M: int, N: int) -> Tuple[int, int, int, int]:
+    rows = Z * H * M
+    block_n = 256 if N >= 2048 else 128
+    max_split = max(1, N // block_n)
+    desired_blocks = 256
+    split_needed = (desired_blocks + rows - 1) // rows
+    split = _next_pow2(split_needed)
+    split = min(split, 32)
+    split = min(split, max_split)
+    if split < 1:
+        split = 1
+    num_warps = 8 if block_n == 256 else 4
+    num_stages = 2
+    return block_n, split, num_warps, num_stages
 
 
 def decoding_attn(Q: torch.Tensor, K: torch.Tensor, V: torch.Tensor) -> torch.Tensor:
-    if triton is None or (not Q.is_cuda) or (not K.is_cuda) or (not V.is_cuda):
-        DQ = Q.shape[-1]
-        sm_scale = 1.0 / math.sqrt(DQ)
-        att = torch.matmul(Q.to(torch.float32), K.transpose(-1, -2).to(torch.float32)) * sm_scale
-        p = torch.softmax(att, dim=-1)
-        out = torch.matmul(p, V.to(torch.float32)).to(Q.dtype)
-        return out
+    if not (Q.is_cuda and K.is_cuda and V.is_cuda):
+        # CPU fallback
+        D = Q.shape[-1]
+        sm_scale = 1.0 / math.sqrt(D)
+        att = torch.matmul(Q.float(), K.float().transpose(-2, -1)) * sm_scale
+        att = torch.softmax(att, dim=-1)
+        out = torch.matmul(att, V.float())
+        return out.to(torch.float16)
+
+    if Q.dtype not in (torch.float16, torch.bfloat16):
+        Q = Q.to(torch.float16)
+    if K.dtype not in (torch.float16, torch.bfloat16):
+        K = K.to(torch.float16)
+    if V.dtype not in (torch.float16, torch.bfloat16):
+        V = V.to(torch.float16)
 
     assert Q.ndim == 4 and K.ndim == 4 and V.ndim == 4
-    Z, H, Mq, DQ = Q.shape
-    Zk, Hk, N, DQk = K.shape
+    Z, H, Mq, D = Q.shape
+    Zk, Hk, N, Dk = K.shape
     Zv, Hv, Nv, DV = V.shape
-    assert Zk == Z and Hk == H and DQk == DQ
-    assert Zv == Z and Hv == H and Nv == N
-    assert Q.dtype in (torch.float16, torch.bfloat16) and K.dtype == Q.dtype and V.dtype == Q.dtype
-    assert DQ % 16 == 0 and DV % 16 == 0
+    assert Z == Zk == Zv and H == Hk == Hv and N == Nv and D == Dk and Mq >= 1
 
-    if N <= 2048:
-        BLOCK_N = 64
-        num_warps = 4
-        num_stages = 3
-    else:
-        BLOCK_N = 128
-        num_warps = 4
-        num_stages = 4
+    device = Q.device
+    out = torch.empty((Z, H, Mq, DV), device=device, dtype=torch.float16)
 
-    B = (N + BLOCK_N - 1) // BLOCK_N
-    tmp_m, tmp_l, tmp_a = _get_tmp(Q.device, Z, H, Mq, B, DV)
-    out = torch.empty((Z, H, Mq, DV), device=Q.device, dtype=torch.float16)
+    rows = Z * H * Mq
+    block_n, split_k, num_warps, num_stages = _pick_meta(Z, H, Mq, N)
 
-    sm_scale = 1.0 / math.sqrt(DQ)
+    m_buf, l_buf, acc_buf = _get_temps(device, rows, split_k, DV)
 
-    grid1 = (Z * H * Mq, B)
-    _decoding_attn_stage1[grid1](
-        Q,
-        K,
-        V,
-        tmp_m,
-        tmp_l,
-        tmp_a,
-        sm_scale,
-        N,
-        stride_qz=Q.stride(0),
-        stride_qh=Q.stride(1),
-        stride_qm=Q.stride(2),
-        stride_qd=Q.stride(3),
-        stride_kz=K.stride(0),
-        stride_kh=K.stride(1),
-        stride_kn=K.stride(2),
-        stride_kd=K.stride(3),
-        stride_vz=V.stride(0),
-        stride_vh=V.stride(1),
-        stride_vn=V.stride(2),
-        stride_vd=V.stride(3),
-        stride_mz=tmp_m.stride(0),
-        stride_mh=tmp_m.stride(1),
-        stride_mm=tmp_m.stride(2),
-        stride_mb=tmp_m.stride(3),
-        stride_lz=tmp_l.stride(0),
-        stride_lh=tmp_l.stride(1),
-        stride_lm=tmp_l.stride(2),
-        stride_lb=tmp_l.stride(3),
-        stride_az=tmp_a.stride(0),
-        stride_ah=tmp_a.stride(1),
-        stride_am=tmp_a.stride(2),
-        stride_ab=tmp_a.stride(3),
-        stride_ad=tmp_a.stride(4),
-        H=H,
-        Mq=Mq,
-        DQ=DQ,
-        DV=DV,
-        BLOCK_N=BLOCK_N,
+    sm_scale = 1.0 / math.sqrt(D)
+
+    grid1 = (rows, split_k)
+    _decode_attn_stage1[grid1](
+        Q, K, V,
+        m_buf, l_buf, acc_buf,
+        Q.stride(0), Q.stride(1), Q.stride(2), Q.stride(3),
+        K.stride(0), K.stride(1), K.stride(2), K.stride(3),
+        V.stride(0), V.stride(1), V.stride(2), V.stride(3),
+        Z=Z, H=H, M=Mq, N_CTX=N,
+        sm_scale=sm_scale,
+        BLOCK_N=block_n, D=D, DV=DV, SPLIT_K=split_k,
         num_warps=num_warps,
         num_stages=num_stages,
     )
 
-    grid2 = (Z * H * Mq,)
-    _decoding_attn_stage2[grid2](
-        tmp_m,
-        tmp_l,
-        tmp_a,
+    grid2 = (rows,)
+    _decode_attn_stage2[grid2](
+        m_buf, l_buf, acc_buf,
         out,
-        stride_mz=tmp_m.stride(0),
-        stride_mh=tmp_m.stride(1),
-        stride_mm=tmp_m.stride(2),
-        stride_mb=tmp_m.stride(3),
-        stride_lz=tmp_l.stride(0),
-        stride_lh=tmp_l.stride(1),
-        stride_lm=tmp_l.stride(2),
-        stride_lb=tmp_l.stride(3),
-        stride_az=tmp_a.stride(0),
-        stride_ah=tmp_a.stride(1),
-        stride_am=tmp_a.stride(2),
-        stride_ab=tmp_a.stride(3),
-        stride_ad=tmp_a.stride(4),
-        stride_oz=out.stride(0),
-        stride_oh=out.stride(1),
-        stride_om=out.stride(2),
-        stride_od=out.stride(3),
-        H=H,
-        Mq=Mq,
+        out.stride(0), out.stride(1), out.stride(2), out.stride(3),
+        Z=Z, H=H, M=Mq,
         DV=DV,
-        B=B,
+        SPLIT_K=split_k,
         num_warps=4,
-        num_stages=2,
+        num_stages=1,
     )
 
-    return out.to(Q.dtype)
+    return out
 
 
 class Solution:

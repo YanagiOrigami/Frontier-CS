@@ -1,174 +1,274 @@
-import os
 import json
-import math
-import heapq
-from typing import List, Dict, Tuple, Set
-import networkx as nx
-
-
-class BroadCastTopology:
-    def __init__(self, src: str, dsts: List[str], num_partitions: int):
-        self.src = src
-        self.dsts = dsts
-        self.num_partitions = int(num_partitions)
-        # Structure: {dst: {partition_id: [edges]}}
-        # Each edge is [src_node, dst_node, edge_data_dict]
-        self.paths = {dst: {str(i): None for i in range(self.num_partitions)} for dst in dsts}
-
-    def append_dst_partition_path(self, dst: str, partition: int, path: list):
-        """
-        Append an edge to the path for a specific destination-partition pair.
-
-        Args:
-            dst: Destination node
-            partition: Partition ID (0 to num_partitions-1)
-            path: Edge represented as [src_node, dst_node, edge_data_dict]
-                  where edge_data_dict = G[src_node][dst_node]
-        """
-        partition = str(partition)
-        if self.paths[dst][partition] is None:
-            self.paths[dst][partition] = []
-        self.paths[dst][partition].append(path)
-
-    def set_dst_partition_paths(self, dst: str, partition: int, paths: list):
-        """
-        Set the complete path (list of edges) for a destination-partition pair.
-
-        Args:
-            dst: Destination node
-            partition: Partition ID
-            paths: List of edges, each edge is [src_node, dst_node, edge_data_dict]
-        """
-        partition = str(partition)
-        self.paths[dst][partition] = paths
-
-    def set_num_partitions(self, num_partitions: int):
-        """Update number of partitions"""
-        self.num_partitions = num_partitions
-
-
-def search_algorithm(src: str, dsts: List[str], G: nx.DiGraph, num_partitions: int) -> BroadCastTopology:
-    """
-    Design routing paths for broadcasting data partitions to multiple destinations.
-
-    Args:
-        src: Source node (e.g., "aws:ap-northeast-1")
-        dsts: List of destination nodes (e.g., ["aws:us-east-1", "gcp:us-central1"])
-        G: NetworkX DiGraph with edge attributes:
-           - "cost": float ($/GB) - egress cost for transferring data
-           - "throughput": float (Gbps) - maximum bandwidth capacity
-        num_partitions: Number of data partitions to broadcast
-
-    Returns:
-        BroadCastTopology object with routing paths for all (destination, partition) pairs
-    """
-    bc_topology = BroadCastTopology(src, dsts, num_partitions)
-
-    # Deduplicate destinations while preserving order
-    seen_dsts: Set[str] = set()
-    unique_dsts: List[str] = []
-    for d in dsts:
-        if d not in seen_dsts:
-            seen_dsts.add(d)
-            unique_dsts.append(d)
-
-    # Edge load: number of partitions that use this edge (for P_e)
-    load: Dict[Tuple[str, str], int] = {}
-
-    # Parameters controlling trade-off between egress cost and load/throughput
-    alpha = 0.1   # penalty per existing partition using an edge (multiplicative on cost)
-    gamma = 0.005  # small additive penalty scaled by 1/throughput
-
-    INF = float("inf")
-
-    # Precompute adjacency to speed up Dijkstra
-    # G[u] is already adjacency dict: {v: data}
-    for partition_id in range(num_partitions):
-        # Dijkstra from src with weights depending on current load
-        dist: Dict[str, float] = {src: 0.0}
-        parent: Dict[str, str] = {}
-        heap: List[Tuple[float, str]] = [(0.0, src)]
-
-        while heap:
-            d, u = heapq.heappop(heap)
-            if d != dist.get(u, INF):
-                continue
-            # Explore outgoing edges
-            for v, data in G[u].items():
-                if v == u:
-                    continue  # avoid self-loops
-                base_cost = float(data.get("cost", 0.0))
-                th = float(data.get("throughput", 1.0))
-                if th <= 0.0:
-                    th = 1e-9
-                l = load.get((u, v), 0)
-                w = base_cost * (1.0 + alpha * l) + gamma / th
-                nd = d + w
-                if nd < dist.get(v, INF):
-                    dist[v] = nd
-                    parent[v] = u
-                    heapq.heappush(heap, (nd, v))
-
-        used_edges_in_partition: Set[Tuple[str, str]] = set()
-
-        # For each destination, reconstruct path and update topology and load
-        for dst in unique_dsts:
-            # Handle src == dst: no transfer needed
-            if dst == src:
-                continue
-
-            path_nodes: List[str] = []
-
-            if dst in dist:
-                # Reconstruct using parent pointers
-                cur = dst
-                while True:
-                    path_nodes.append(cur)
-                    if cur == src:
-                        break
-                    cur = parent.get(cur)
-                    if cur is None:
-                        # This should not happen for reachable nodes; break and fallback
-                        path_nodes = []
-                        break
-                if path_nodes:
-                    path_nodes.reverse()
-            # Fallback: use pure cost-based shortest path if needed
-            if not path_nodes or path_nodes[0] != src:
-                try:
-                    path_nodes = nx.shortest_path(
-                        G,
-                        src,
-                        dst,
-                        weight=lambda u, v, d: float(d.get("cost", 0.0)),
-                    )
-                except Exception:
-                    # If still no path, skip (graph likely invalid, but avoid crash)
-                    continue
-
-            if len(path_nodes) < 2:
-                continue
-
-            # Append edges to BroadCastTopology and update load once per edge per partition
-            for i in range(len(path_nodes) - 1):
-                u = path_nodes[i]
-                v = path_nodes[i + 1]
-                edge_data = G[u][v]
-                bc_topology.append_dst_partition_path(dst, partition_id, [u, v, edge_data])
-                ekey = (u, v)
-                if ekey not in used_edges_in_partition:
-                    used_edges_in_partition.add(ekey)
-                    load[ekey] = load.get(ekey, 0) + 1
-
-    return bc_topology
+import os
 
 
 class Solution:
     def solve(self, spec_path: str = None) -> dict:
-        """
-        Returns a dict with either:
-        - {"code": "python_code_string"}
-        - {"program_path": "path/to/algorithm.py"}
-        """
-        # Use this file itself as the program containing search_algorithm
-        return {"program_path": os.path.abspath(__file__)}
+        num_vms = 2
+        ingress_limits = {"aws": 10, "gcp": 16, "azure": 16}
+        egress_limits = {"aws": 5, "gcp": 7, "azure": 16}
+
+        if spec_path:
+            try:
+                with open(spec_path, "r") as f:
+                    spec = json.load(f)
+                if isinstance(spec, dict):
+                    if "num_vms" in spec:
+                        try:
+                            num_vms = int(spec["num_vms"])
+                        except (TypeError, ValueError):
+                            pass
+                    config_files = spec.get("config_files") or []
+                    if config_files:
+                        first_cfg = config_files[0]
+                        if not os.path.isabs(first_cfg):
+                            base_dir = os.path.dirname(spec_path)
+                            cfg_path = os.path.join(base_dir, first_cfg)
+                        else:
+                            cfg_path = first_cfg
+                        try:
+                            with open(cfg_path, "r") as cf:
+                                cfg = json.load(cf)
+                            ing = cfg.get("ingress_limit")
+                            if isinstance(ing, dict):
+                                for k, v in ing.items():
+                                    try:
+                                        ingress_limits[str(k).lower()] = float(v)
+                                    except (TypeError, ValueError):
+                                        continue
+                            egr = cfg.get("egress_limit")
+                            if isinstance(egr, dict):
+                                for k, v in egr.items():
+                                    try:
+                                        egress_limits[str(k).lower()] = float(v)
+                                    except (TypeError, ValueError):
+                                        continue
+                        except Exception:
+                            pass
+            except Exception:
+                pass
+
+        ingress_limits = {str(k).lower(): float(v) for k, v in ingress_limits.items()}
+        egress_limits = {str(k).lower(): float(v) for k, v in egress_limits.items()}
+
+        lines = []
+        lines.append("import networkx as nx")
+        lines.append("from collections import defaultdict")
+        lines.append("")
+        lines.append(f"NUM_VMS = {num_vms}")
+        lines.append(f"INGRESS_LIMITS = {repr(ingress_limits)}")
+        lines.append(f"EGRESS_LIMITS = {repr(egress_limits)}")
+        lines.append("")
+        lines.append("")
+        lines.append("class BroadCastTopology:")
+        lines.append("    def __init__(self, src, dsts, num_partitions):")
+        lines.append("        self.src = src")
+        lines.append("        self.dsts = dsts")
+        lines.append("        self.num_partitions = int(num_partitions)")
+        lines.append("        # Structure: {dst: {partition_id: [edges]}}")
+        lines.append("        self.paths = {dst: {str(i): None for i in range(self.num_partitions)} for dst in dsts}")
+        lines.append("")
+        lines.append("    def append_dst_partition_path(self, dst, partition, path):")
+        lines.append("        partition = str(partition)")
+        lines.append("        if self.paths[dst][partition] is None:")
+        lines.append("            self.paths[dst][partition] = []")
+        lines.append("        self.paths[dst][partition].append(path)")
+        lines.append("")
+        lines.append("    def set_dst_partition_paths(self, dst, partition, paths):")
+        lines.append("        partition = str(partition)")
+        lines.append("        self.paths[dst][partition] = paths")
+        lines.append("")
+        lines.append("    def set_num_partitions(self, num_partitions):")
+        lines.append("        self.num_partitions = num_partitions")
+        lines.append("")
+        lines.append("")
+        lines.append("def _get_provider(node):")
+        lines.append("    if not isinstance(node, str):")
+        lines.append("        return None")
+        lines.append("    return node.split(':', 1)[0].lower()")
+        lines.append("")
+        lines.append("")
+        lines.append("def search_algorithm(src, dsts, G, num_partitions):")
+        lines.append("    bc_topology = BroadCastTopology(src, dsts, num_partitions)")
+        lines.append("")
+        lines.append("    if not isinstance(G, nx.DiGraph):")
+        lines.append("        G = nx.DiGraph(G)")
+        lines.append("")
+        lines.append("    # Precompute effective throughput and static cost per edge")
+        lines.append("    eff_throughput = {}")
+        lines.append("    static_cost = {}")
+        lines.append("    original_throughput = {}")
+        lines.append("")
+        lines.append("    for u, v, data in G.edges(data=True):")
+        lines.append("        cost = float(data.get('cost', 0.0))")
+        lines.append("        throughput = data.get('throughput', 0.0)")
+        lines.append("        try:")
+        lines.append("            throughput = float(throughput)")
+        lines.append("        except (TypeError, ValueError):")
+        lines.append("            throughput = 0.0")
+        lines.append("        if throughput <= 0.0:")
+        lines.append("            throughput = 1e-6")
+        lines.append("")
+        lines.append("        prov_u = _get_provider(u)")
+        lines.append("        prov_v = _get_provider(v)")
+        lines.append("")
+        lines.append("        egress_cap = EGRESS_LIMITS.get(prov_u, float('inf')) * NUM_VMS")
+        lines.append("        ingress_cap = INGRESS_LIMITS.get(prov_v, float('inf')) * NUM_VMS")
+        lines.append("")
+        lines.append("        eff = throughput")
+        lines.append("        if egress_cap > 0:")
+        lines.append("            eff = min(eff, float(egress_cap))")
+        lines.append("        if ingress_cap > 0:")
+        lines.append("            eff = min(eff, float(ingress_cap))")
+        lines.append("        if eff <= 0.0:")
+        lines.append("            eff = 1e-6")
+        lines.append("")
+        lines.append("        eff_throughput[(u, v)] = eff")
+        lines.append("        original_throughput[(u, v)] = throughput")
+        lines.append("        static_cost[(u, v)] = cost")
+        lines.append("")
+        lines.append("    if not static_cost:")
+        lines.append("        return bc_topology")
+        lines.append("")
+        lines.append("    cost_values = list(static_cost.values())")
+        lines.append("    thr_values = list(eff_throughput.values())")
+        lines.append("")
+        lines.append("    cost_min = min(cost_values)")
+        lines.append("    cost_max = max(cost_values)")
+        lines.append("    thr_min = min(thr_values)")
+        lines.append("    thr_max = max(thr_values)")
+        lines.append("")
+        lines.append("    cost_span = cost_max - cost_min")
+        lines.append("    if cost_span <= 0.0:")
+        lines.append("        cost_span = 1.0")
+        lines.append("    thr_span = thr_max - thr_min")
+        lines.append("    if thr_span <= 0.0:")
+        lines.append("        thr_span = 1.0")
+        lines.append("")
+        lines.append("    # Build a static base score per edge balancing cost and throughput")
+        lines.append("    base_edge_score = {}")
+        lines.append("    w_cost = 0.6")
+        lines.append("    w_thr = 0.25")
+        lines.append("    w_limit = 0.15")
+        lines.append("")
+        lines.append("    for (u, v), cost in static_cost.items():")
+        lines.append("        eff = eff_throughput[(u, v)]")
+        lines.append("        thr_norm = (thr_max - eff) / thr_span  # lower eff -> larger value")
+        lines.append("        cost_norm = (cost - cost_min) / cost_span")
+        lines.append("")
+        lines.append("        throughput_orig = original_throughput[(u, v)]")
+        lines.append("        limit_penalty = 0.0")
+        lines.append("        if throughput_orig > 0.0:")
+        lines.append("            limit_factor = eff / throughput_orig")
+        lines.append("            if limit_factor < 1.0:")
+        lines.append("                limit_penalty = 1.0 - limit_factor")
+        lines.append("")
+        lines.append("        base_score = w_cost * cost_norm + w_thr * thr_norm + w_limit * limit_penalty")
+        lines.append("        if base_score <= 0.0:")
+        lines.append("            base_score = 1e-6")
+        lines.append("        base_edge_score[(u, v)] = base_score")
+        lines.append("")
+        lines.append("    # For each destination, precompute a set of candidate paths using k-shortest by cost")
+        lines.append("    candidate_paths_edges = {}")
+        lines.append("")
+        lines.append("    try:")
+        lines.append("        max_paths_per_dst = max(3, min(8, int(num_partitions)))")
+        lines.append("    except (TypeError, ValueError):")
+        lines.append("        max_paths_per_dst = 3")
+        lines.append("")
+        lines.append("    def _cost_weight(u, v, data):")
+        lines.append("        val = data.get('cost', 0.0)")
+        lines.append("        try:")
+        lines.append("            return float(val)")
+        lines.append("        except (TypeError, ValueError):")
+        lines.append("            return 0.0")
+        lines.append("")
+        lines.append("    for dst in dsts:")
+        lines.append("        paths_edges = []")
+        lines.append("        if src == dst:")
+        lines.append("            candidate_paths_edges[dst] = [[]]")
+        lines.append("            continue")
+        lines.append("        try:")
+        lines.append("            gen = nx.shortest_simple_paths(G, src, dst, weight=_cost_weight)")
+        lines.append("            for path in gen:")
+        lines.append("                if not path or len(path) < 2:")
+        lines.append("                    continue")
+        lines.append("                edges = []")
+        lines.append("                valid = True")
+        lines.append("                for i in range(len(path) - 1):")
+        lines.append("                    u = path[i]")
+        lines.append("                    v = path[i + 1]")
+        lines.append("                    if not G.has_edge(u, v):")
+        lines.append("                        valid = False")
+        lines.append("                        break")
+        lines.append("                    edges.append((u, v))")
+        lines.append("                if not valid:")
+        lines.append("                    continue")
+        lines.append("                paths_edges.append(edges)")
+        lines.append("                if len(paths_edges) >= max_paths_per_dst:")
+        lines.append("                    break")
+        lines.append("        except (nx.NetworkXNoPath, nx.NodeNotFound):")
+        lines.append("            paths_edges = []")
+        lines.append("")
+        lines.append("        # Fallback to a single shortest path if no candidate path was found")
+        lines.append("        if not paths_edges:")
+        lines.append("            try:")
+        lines.append("                path = nx.dijkstra_path(G, src, dst, weight=_cost_weight)")
+        lines.append("                if len(path) >= 2:")
+        lines.append("                    edges = [(path[i], path[i + 1]) for i in range(len(path) - 1)]")
+        lines.append("                    paths_edges.append(edges)")
+        lines.append("            except (nx.NetworkXNoPath, nx.NodeNotFound):")
+        lines.append("                paths_edges = []")
+        lines.append("")
+        lines.append("        if not paths_edges:")
+        lines.append("            candidate_paths_edges[dst] = [[]]")
+        lines.append("        else:")
+        lines.append("            candidate_paths_edges[dst] = paths_edges")
+        lines.append("")
+        lines.append("    # Dynamic assignment of partitions to paths to balance edge load")
+        lines.append("    edge_usage = defaultdict(int)")
+        lines.append("    gamma_edge = 1.3")
+        lines.append("")
+        lines.append("    try:")
+        lines.append("        total_parts = int(num_partitions)")
+        lines.append("    except (TypeError, ValueError):")
+        lines.append("        total_parts = 1")
+        lines.append("")
+        lines.append("    for part in range(total_parts):")
+        lines.append("        for dst in dsts:")
+        lines.append("            paths_edges = candidate_paths_edges.get(dst)")
+        lines.append("            if not paths_edges:")
+        lines.append("                continue")
+        lines.append("")
+        lines.append("            best_idx = 0")
+        lines.append("            best_score = None")
+        lines.append("")
+        lines.append("            for idx, edges in enumerate(paths_edges):")
+        lines.append("                if not edges:")
+        lines.append("                    score = 0.0")
+        lines.append("                else:")
+        lines.append("                    score = 0.0")
+        lines.append("                    for (u, v) in edges:")
+        lines.append("                        base = base_edge_score.get((u, v), 1.0)")
+        lines.append("                        usage = edge_usage[(u, v)]")
+        lines.append("                        factor = (1.0 + float(usage)) ** gamma_edge")
+        lines.append("                        score += base * factor")
+        lines.append("")
+        lines.append("                if best_score is None or score < best_score:")
+        lines.append("                    best_score = score")
+        lines.append("                    best_idx = idx")
+        lines.append("")
+        lines.append("            selected_edges = paths_edges[best_idx]")
+        lines.append("")
+        lines.append("            path_records = []")
+        lines.append("            for (u, v) in selected_edges:")
+        lines.append("                path_records.append([u, v, G[u][v]])")
+        lines.append("                edge_usage[(u, v)] += 1")
+        lines.append("")
+        lines.append("            bc_topology.set_dst_partition_paths(dst, part, path_records)")
+        lines.append("")
+        lines.append("    return bc_topology")
+        lines.append("")
+
+        code = "\n".join(lines)
+        return {"code": code}

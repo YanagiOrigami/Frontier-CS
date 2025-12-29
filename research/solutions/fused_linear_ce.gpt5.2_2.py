@@ -1,241 +1,192 @@
-import os
-import sys
-import inspect
-from typing import Dict, Tuple, Optional
+import textwrap
 
+KERNEL_CODE = textwrap.dedent(
+    r"""
 import torch
 import triton
 import triton.language as tl
 
-_TMP_CACHE: Dict[Tuple[int, int, int], Tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = {}
-
-
-def _next_pow2(x: int) -> int:
-    if x <= 1:
-        return 1
-    return 1 << (x - 1).bit_length()
-
-
-def _get_temp_buffers(device: torch.device, M: int, rblocks: int):
-    dev_index = device.index if device.type == "cuda" else -1
-    key = (dev_index, M, rblocks)
-    buf = _TMP_CACHE.get(key, None)
-    if buf is None or buf[0].device != device:
-        max_buf = torch.empty((M, rblocks), device=device, dtype=torch.float32)
-        sum_buf = torch.empty((M, rblocks), device=device, dtype=torch.float32)
-        tlogit_buf = torch.empty((M,), device=device, dtype=torch.float32)
-        _TMP_CACHE[key] = (max_buf, sum_buf, tlogit_buf)
-        return max_buf, sum_buf, tlogit_buf
-    max_buf, sum_buf, tlogit_buf = buf
-    if max_buf.shape[0] != M or max_buf.shape[1] != rblocks:
-        max_buf = torch.empty((M, rblocks), device=device, dtype=torch.float32)
-        sum_buf = torch.empty((M, rblocks), device=device, dtype=torch.float32)
-        tlogit_buf = torch.empty((M,), device=device, dtype=torch.float32)
-        _TMP_CACHE[key] = (max_buf, sum_buf, tlogit_buf)
-        return max_buf, sum_buf, tlogit_buf
-    return max_buf, sum_buf, tlogit_buf
-
+_LOG2E = 1.4426950408889634
+_LN2 = 0.6931471805599453
 
 @triton.jit
-def _linear_ce_partials_kernel(
-    X_ptr,
-    W_ptr,
-    B_ptr,
-    T_ptr,
-    out_max_ptr,
-    out_sum_ptr,
-    out_tlogit_ptr,
+def _ce_partials_kernel(
+    X_ptr, W_ptr, B_ptr, T_ptr,
+    PM_ptr, PS_ptr, TL_ptr,
     M: tl.constexpr,
-    N,
-    K: tl.constexpr,
-    stride_xm: tl.constexpr,
-    stride_xk: tl.constexpr,
-    stride_wk: tl.constexpr,
-    stride_wn: tl.constexpr,
-    stride_om: tl.constexpr,
-    stride_on: tl.constexpr,
-    BLOCK_M: tl.constexpr,
-    BLOCK_N: tl.constexpr,
-    BLOCK_K: tl.constexpr,
+    stride_xm, stride_xk,
+    stride_wk, stride_wn,
+    stride_p,
+    N: tl.constexpr, K: tl.constexpr,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
 ):
     pid_m = tl.program_id(0)
     pid_n = tl.program_id(1)
 
-    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
-    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
-    mask_m = offs_m < M
-    mask_n = offs_n < N
+    row_start = pid_m * BLOCK_M
+    col_start = pid_n * BLOCK_N
+
+    rows = row_start + tl.arange(0, BLOCK_M)
+    cols = col_start + tl.arange(0, BLOCK_N)
+    row_mask = rows < M
+    col_mask = cols < N
+
+    x_blk = tl.make_block_ptr(
+        base=X_ptr,
+        shape=(M, K),
+        strides=(stride_xm, stride_xk),
+        offsets=(row_start, 0),
+        block_shape=(BLOCK_M, BLOCK_K),
+        order=(1, 0),
+    )
+    w_blk = tl.make_block_ptr(
+        base=W_ptr,
+        shape=(K, N),
+        strides=(stride_wk, stride_wn),
+        offsets=(0, col_start),
+        block_shape=(BLOCK_K, BLOCK_N),
+        order=(0, 1),
+    )
 
     acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
 
-    k_it = K // BLOCK_K
-    for i in tl.static_range(0, k_it):
-        offs_k = i * BLOCK_K + tl.arange(0, BLOCK_K)
-        x = tl.load(
-            X_ptr + offs_m[:, None] * stride_xm + offs_k[None, :] * stride_xk,
-            mask=mask_m[:, None],
-            other=0.0,
-        ).to(tl.float16)
-        w = tl.load(
-            W_ptr + offs_k[:, None] * stride_wk + offs_n[None, :] * stride_wn,
-            mask=mask_n[None, :],
-            other=0.0,
-        ).to(tl.float16)
-        acc += tl.dot(x, w)
+    for _ in tl.static_range(0, K, BLOCK_K):
+        a = tl.load(x_blk, boundary_check=(0, 1), padding_option="zero").to(tl.float16)
+        b = tl.load(w_blk, boundary_check=(0, 1), padding_option="zero").to(tl.float16)
+        acc += tl.dot(a, b)
+        x_blk = tl.advance(x_blk, (0, BLOCK_K))
+        w_blk = tl.advance(w_blk, (BLOCK_K, 0))
 
-    b = tl.load(B_ptr + offs_n, mask=mask_n, other=0.0).to(tl.float32)
-    logits = acc + b[None, :]
-    logits = tl.where(mask_n[None, :], logits, -1.0e20)
+    bias = tl.load(B_ptr + cols, mask=col_mask, other=0.0).to(tl.float32)
+    acc = acc + bias[None, :]
 
-    block_max = tl.max(logits, axis=1)
-    exp_logits = tl.exp(logits - block_max[:, None])
-    block_sum = tl.sum(exp_logits, axis=1)
+    neg_inf = -float("inf")
+    acc = tl.where(col_mask[None, :], acc, neg_inf)
 
-    out_idx = offs_m * stride_om + pid_n * stride_on
-    tl.store(out_max_ptr + out_idx, block_max, mask=mask_m)
-    tl.store(out_sum_ptr + out_idx, block_sum, mask=mask_m)
+    row_max = tl.max(acc, axis=1)
+    row_max = tl.where(row_mask, row_max, 0.0)
 
-    targets = tl.load(T_ptr + offs_m, mask=mask_m, other=0).to(tl.int32)
-    col_start = pid_n * BLOCK_N
-    in_tile = (targets >= col_start) & (targets < (col_start + BLOCK_N))
-    idx = targets - col_start
-    cols = tl.arange(0, BLOCK_N)[None, :]
-    mask_t = in_tile[:, None] & (cols == idx[:, None]) & mask_m[:, None] & mask_n[None, :]
-    tlogit = tl.sum(tl.where(mask_t, logits, 0.0), axis=1)
-    tl.store(out_tlogit_ptr + offs_m, tlogit, mask=mask_m & in_tile)
+    exp2v = tl.exp2((acc - row_max[:, None]) * _LOG2E)
+    exp2v = tl.where(row_mask[:, None] & col_mask[None, :], exp2v, 0.0)
+    row_sum = tl.sum(exp2v, axis=1)
+    row_sum = tl.where(row_mask, row_sum, 0.0)
+
+    out_offs = rows * stride_p + pid_n
+    tl.store(PM_ptr + out_offs, row_max, mask=row_mask)
+    tl.store(PS_ptr + out_offs, row_sum, mask=row_mask)
+
+    t = tl.load(T_ptr + rows, mask=row_mask, other=0).to(tl.int32)
+    in_chunk = (t >= col_start) & (t < (col_start + BLOCK_N)) & row_mask
+    mt = (cols[None, :] == t[:, None]) & in_chunk[:, None]
+    tlog = tl.sum(tl.where(mt, acc, 0.0), axis=1)
+    tl.store(TL_ptr + rows, tlog, mask=in_chunk)
 
 
 @triton.jit
-def _linear_ce_reduce_kernel(
-    in_max_ptr,
-    in_sum_ptr,
-    in_tlogit_ptr,
-    out_loss_ptr,
-    M,
-    NB_ACTUAL,
-    stride_im: tl.constexpr,
-    stride_in: tl.constexpr,
-    RBLOCKS: tl.constexpr,
+def _ce_reduce_kernel(
+    PM_ptr, PS_ptr, TL_ptr, Out_ptr,
+    M: tl.constexpr,
+    stride_p,
+    N_CHUNKS: tl.constexpr,
 ):
-    pid = tl.program_id(0)
-    if pid >= M:
-        return
+    row = tl.program_id(0)
+    row_mask = row < M
 
-    offs = tl.arange(0, RBLOCKS)
-    mask = offs < NB_ACTUAL
+    offs = row * stride_p + tl.arange(0, N_CHUNKS)
+    pm = tl.load(PM_ptr + offs, mask=row_mask, other=-float("inf")).to(tl.float32)
+    ps = tl.load(PS_ptr + offs, mask=row_mask, other=0.0).to(tl.float32)
 
-    maxs = tl.load(in_max_ptr + pid * stride_im + offs * stride_in, mask=mask, other=-1.0e20).to(tl.float32)
-    row_max = tl.max(maxs, axis=0)
+    m = tl.max(pm, axis=0)
+    m = tl.where(row_mask, m, 0.0)
 
-    sums = tl.load(in_sum_ptr + pid * stride_im + offs * stride_in, mask=mask, other=0.0).to(tl.float32)
-    total = tl.sum(sums * tl.exp(maxs - row_max), axis=0)
-    total = tl.maximum(total, 1.0e-20)
-    lse = row_max + tl.log(total)
+    scale = tl.exp2((pm - m) * _LOG2E)
+    sumexp = tl.sum(ps * scale, axis=0)
+    sumexp = tl.where(row_mask, sumexp, 1.0)
 
-    tlogit = tl.load(in_tlogit_ptr + pid).to(tl.float32)
-    tl.store(out_loss_ptr + pid, lse - tlogit)
+    logsumexp = tl.log2(sumexp) * _LN2 + m
 
+    tlog = tl.load(TL_ptr + row, mask=row_mask, other=0.0).to(tl.float32)
+    loss = logsumexp - tlog
+    tl.store(Out_ptr + row, loss, mask=row_mask)
+
+
+_buffer_cache = {}
 
 def fused_linear_ce(X: torch.Tensor, W: torch.Tensor, B: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
     if not (X.is_cuda and W.is_cuda and B.is_cuda and targets.is_cuda):
-        logits = X.float() @ W.float() + B.float()
+        logits = X @ W + B
         return torch.nn.functional.cross_entropy(logits, targets, reduction="none")
 
-    assert X.dtype == torch.float16 and W.dtype == torch.float16
-    assert B.dtype == torch.float32
-    assert targets.dtype == torch.int64
-    assert X.ndim == 2 and W.ndim == 2 and B.ndim == 1 and targets.ndim == 1
+    if X.dtype != torch.float16:
+        X = X.to(torch.float16)
+    if W.dtype != torch.float16:
+        W = W.to(torch.float16)
+    if B.dtype != torch.float32:
+        B = B.to(torch.float32)
+    if targets.dtype != torch.int64:
+        targets = targets.to(torch.int64)
+
+    if X.ndim != 2 or W.ndim != 2 or B.ndim != 1 or targets.ndim != 1:
+        logits = X @ W + B
+        return torch.nn.functional.cross_entropy(logits, targets, reduction="none")
 
     M, K = X.shape
     K2, N = W.shape
-    assert K == K2
-    assert B.numel() == N
-    assert targets.numel() == M
+    if K2 != K or B.shape[0] != N or targets.shape[0] != M:
+        logits = X @ W + B
+        return torch.nn.functional.cross_entropy(logits, targets, reduction="none")
 
-    Xc = X
-    Wc = W
-    Bc = B
-    Tc = targets
-
-    if not Xc.is_contiguous():
-        Xc = Xc.contiguous()
-    if not Wc.is_contiguous():
-        Wc = Wc.contiguous()
-    if not Bc.is_contiguous():
-        Bc = Bc.contiguous()
-    if not Tc.is_contiguous():
-        Tc = Tc.contiguous()
-
-    BLOCK_N = 128
-    nblocks_actual = triton.cdiv(N, BLOCK_N)
-    rblocks = _next_pow2(nblocks_actual)
-
-    out_max, out_sum, out_tlogit = _get_temp_buffers(Xc.device, M, rblocks)
-    out_loss = torch.empty((M,), device=Xc.device, dtype=torch.float32)
-
-    stride_xm, stride_xk = Xc.stride()
-    stride_wk, stride_wn = Wc.stride()
-    stride_om, stride_on = out_max.stride()
+    # optimized path assumes K is multiple of 32 for BLOCK_K=32
+    if K % 32 != 0:
+        logits = X @ W + B
+        return torch.nn.functional.cross_entropy(logits, targets, reduction="none")
 
     BLOCK_M = 16
-    BLOCK_K = 64
-    num_warps = 8
-    num_stages = 4
+    BLOCK_N = 128
+    BLOCK_K = 32
 
-    grid = (triton.cdiv(M, BLOCK_M), nblocks_actual)
-    _linear_ce_partials_kernel[grid](
-        Xc,
-        Wc,
-        Bc,
-        Tc,
-        out_max,
-        out_sum,
-        out_tlogit,
-        M=M,
-        N=N,
-        K=K,
-        stride_xm=stride_xm,
-        stride_xk=stride_xk,
-        stride_wk=stride_wk,
-        stride_wn=stride_wn,
-        stride_om=stride_om,
-        stride_on=stride_on,
-        BLOCK_M=BLOCK_M,
-        BLOCK_N=BLOCK_N,
-        BLOCK_K=BLOCK_K,
-        num_warps=num_warps,
-        num_stages=num_stages,
+    n_chunks = triton.cdiv(N, BLOCK_N)
+
+    dev = X.device
+    key = (dev.index, M, n_chunks)
+    buf = _buffer_cache.get(key, None)
+    if buf is None or buf[0].device != dev:
+        PM = torch.empty((M, n_chunks), device=dev, dtype=torch.float32)
+        PS = torch.empty((M, n_chunks), device=dev, dtype=torch.float32)
+        TL = torch.empty((M,), device=dev, dtype=torch.float32)
+        _buffer_cache[key] = (PM, PS, TL)
+    else:
+        PM, PS, TL = buf
+
+    Out = torch.empty((M,), device=dev, dtype=torch.float32)
+
+    grid = (triton.cdiv(M, BLOCK_M), n_chunks)
+    _ce_partials_kernel[grid](
+        X, W, B, targets,
+        PM, PS, TL,
+        M,
+        X.stride(0), X.stride(1),
+        W.stride(0), W.stride(1),
+        PM.stride(0),
+        N=N, K=K,
+        BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K,
+        num_warps=8,
+        num_stages=4,
     )
 
-    _linear_ce_reduce_kernel[(M,)](
-        out_max,
-        out_sum,
-        out_tlogit,
-        out_loss,
-        M=M,
-        NB_ACTUAL=nblocks_actual,
-        stride_im=stride_om,
-        stride_in=stride_on,
-        RBLOCKS=rblocks,
+    _ce_reduce_kernel[(M,)](
+        PM, PS, TL, Out,
+        M,
+        PM.stride(0),
+        N_CHUNKS=n_chunks,
         num_warps=1,
         num_stages=1,
     )
-
-    return out_loss
+    return Out
+"""
+).strip()
 
 
 class Solution:
     def solve(self, spec_path: str = None) -> dict:
-        parts = []
-        parts.append("import torch\nimport triton\nimport triton.language as tl\n\n")
-        parts.append("_TMP_CACHE = {}\n\n")
-        for obj in (
-            _next_pow2,
-            _get_temp_buffers,
-            _linear_ce_partials_kernel,
-            _linear_ce_reduce_kernel,
-            fused_linear_ce,
-        ):
-            parts.append(inspect.getsource(obj))
-            parts.append("\n\n")
-        return {"code": "".join(parts)}
+        return {"code": KERNEL_CODE}

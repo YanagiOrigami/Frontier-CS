@@ -1,8 +1,7 @@
 import math
-import random
 import copy
-from typing import List
-
+import random
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -10,246 +9,229 @@ import torch.optim as optim
 
 def set_seed(seed: int = 42):
     random.seed(seed)
+    np.random.seed(seed)
     torch.manual_seed(seed)
 
 
-def count_parameters(model: nn.Module) -> int:
+class Standardize(nn.Module):
+    def __init__(self, dim: int, eps: float = 1e-8):
+        super().__init__()
+        self.eps = eps
+        self.register_buffer("mean", torch.zeros(dim))
+        self.register_buffer("invstd", torch.ones(dim))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return (x - self.mean) * self.invstd
+
+    @torch.no_grad()
+    def update(self, mean: torch.Tensor, std: torch.Tensor):
+        std = std.clone()
+        std[std < self.eps] = 1.0
+        self.mean.copy_(mean.to(self.mean.dtype))
+        self.invstd.copy_((1.0 / std).to(self.invstd.dtype))
+
+
+class ResBlock(nn.Module):
+    def __init__(self, dim: int, dropout: float = 0.1):
+        super().__init__()
+        self.ln = nn.LayerNorm(dim)
+        self.fc = nn.Linear(dim, dim)
+        self.act = nn.GELU()
+        self.drop = nn.Dropout(dropout)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        z = self.ln(x)
+        z = self.fc(z)
+        z = self.act(z)
+        z = self.drop(z)
+        return x + z
+
+
+class MLPResNet(nn.Module):
+    def __init__(self, in_dim: int, num_classes: int, width: int, nblocks: int, dropout: float = 0.1):
+        super().__init__()
+        self.std = Standardize(in_dim)
+        self.in_proj = nn.Linear(in_dim, width)
+        self.blocks = nn.ModuleList([ResBlock(width, dropout=dropout) for _ in range(nblocks)])
+        self.out_norm = nn.LayerNorm(width)
+        self.out_drop = nn.Dropout(dropout)
+        self.head = nn.Linear(width, num_classes)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.std(x)
+        x = self.in_proj(x)
+        for blk in self.blocks:
+            x = blk(x)
+        x = self.out_norm(x)
+        x = self.out_drop(x)
+        x = self.head(x)
+        return x
+
+
+def count_trainable_params(model: nn.Module) -> int:
     return sum(p.numel() for p in model.parameters() if p.requires_grad)
 
 
-class InputStandardizer(nn.Module):
-    def __init__(self, mean: torch.Tensor, inv_std: torch.Tensor):
-        super().__init__()
-        self.register_buffer("mean", mean.view(1, -1))
-        self.register_buffer("inv_std", inv_std.view(1, -1))
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return (x - self.mean) * self.inv_std
-
-
-class MLPNet(nn.Module):
-    def __init__(self, input_dim: int, num_classes: int, hidden_widths: List[int], dropout: float,
-                 mean: torch.Tensor, inv_std: torch.Tensor):
-        super().__init__()
-        self.pre = InputStandardizer(mean, inv_std)
-        dims = [input_dim] + hidden_widths + [num_classes]
-        layers = []
-        for i in range(len(dims) - 1):
-            layers.append(nn.Linear(dims[i], dims[i + 1]))
-            if i < len(dims) - 2:
-                layers.append(nn.GELU())
-                layers.append(nn.Dropout(dropout))
-        self.net = nn.Sequential(*layers)
-        self._init_weights()
-
-    def _init_weights(self):
-        for m in self.modules():
-            if isinstance(m, nn.Linear):
-                nn.init.kaiming_uniform_(m.weight, a=math.sqrt(5))
-                if m.bias is not None:
-                    nn.init.zeros_(m.bias)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.pre(x)
-        return self.net(x)
+def compute_feature_stats(loader, device: str = "cpu"):
+    # Compute per-feature mean and std across the training set
+    first_batch = True
+    n_total = 0
+    sum_vec = None
+    sum_sq_vec = None
+    for inputs, _ in loader:
+        x = inputs.to("cpu")
+        if first_batch:
+            d = x.shape[1]
+            sum_vec = torch.zeros(d, dtype=torch.float64)
+            sum_sq_vec = torch.zeros(d, dtype=torch.float64)
+            first_batch = False
+        sum_vec += x.to(torch.float64).sum(dim=0)
+        sum_sq_vec += (x.to(torch.float64) ** 2).sum(dim=0)
+        n_total += x.size(0)
+    mean = (sum_vec / max(1, n_total)).to(torch.float32)
+    var = (sum_sq_vec / max(1, n_total) - (mean.to(torch.float64) ** 2)).clamp_min_(1e-8).to(torch.float32)
+    std = torch.sqrt(var)
+    return mean, std
 
 
-class EMA:
-    def __init__(self, model: nn.Module, decay: float = 0.995):
-        self.decay = decay
-        self.shadow = {}
-        self.backup = None
-        for name, param in model.named_parameters():
-            if param.requires_grad:
-                self.shadow[name] = param.data.clone()
-
-    @torch.no_grad()
-    def update(self, model: nn.Module):
-        for name, param in model.named_parameters():
-            if param.requires_grad:
-                self.shadow[name].mul_(self.decay).add_(param.data, alpha=1.0 - self.decay)
-
-    def apply_to(self, model: nn.Module):
-        self.backup = {}
-        for name, param in model.named_parameters():
-            if param.requires_grad:
-                self.backup[name] = param.data.clone()
-                param.data.copy_(self.shadow[name])
-
-    def restore(self, model: nn.Module):
-        if self.backup is None:
-            return
-        for name, param in model.named_parameters():
-            if param.requires_grad and name in self.backup:
-                param.data.copy_(self.backup[name])
-        self.backup = None
-
-
-def compute_input_stats(train_loader, device: torch.device, input_dim: int):
-    total = 0
-    sum_vec = torch.zeros(input_dim, dtype=torch.float64)
-    sq_sum_vec = torch.zeros(input_dim, dtype=torch.float64)
-    for inputs, _ in train_loader:
-        x = inputs.to("cpu", non_blocking=False).to(torch.float64)
-        sum_vec += x.sum(dim=0)
-        sq_sum_vec += (x * x).sum(dim=0)
-        total += x.size(0)
-    mean = (sum_vec / max(1, total))
-    var = (sq_sum_vec / max(1, total)) - (mean * mean)
-    var = torch.clamp(var, min=1e-6)
-    std = torch.sqrt(var).to(torch.float32)
-    mean = mean.to(torch.float32)
-    inv_std = 1.0 / std
-    return mean, inv_std
-
-
-def param_count_for_config(input_dim: int, widths: List[int], out_dim: int) -> int:
-    dims = [input_dim] + widths + [out_dim]
-    params = 0
-    for i in range(len(dims) - 1):
-        params += dims[i] * dims[i + 1] + dims[i + 1]
-    return params
-
-
-def choose_widths(input_dim: int, num_classes: int, param_limit: int) -> List[int]:
-    candidates = [
-        [256, 192, 160],
-        [256, 192, 144],
-        [256, 192, 128],
-        [256, 160],
-        [224, 192, 160],
-        [256, 128],
-        [192, 160],
-        [256],
-        [192],
-        [160],
-        [128],
-        []
+def get_param_groups(model: nn.Module, weight_decay: float):
+    decay_params = []
+    no_decay_params = []
+    for module_name, module in model.named_modules():
+        for param_name, param in module.named_parameters(recurse=False):
+            if not param.requires_grad:
+                continue
+            full_name = f"{module_name}.{param_name}" if module_name else param_name
+            if isinstance(module, (nn.LayerNorm, nn.BatchNorm1d)) or param_name.endswith("bias"):
+                no_decay_params.append(param)
+            else:
+                decay_params.append(param)
+    return [
+        {"params": decay_params, "weight_decay": weight_decay},
+        {"params": no_decay_params, "weight_decay": 0.0},
     ]
-    for widths in candidates:
-        if param_count_for_config(input_dim, widths, num_classes) <= param_limit:
-            return widths
-    # Fallback minimal configuration
-    return []
 
 
-def evaluate(model: nn.Module, loader, device: torch.device, criterion=None):
+class WarmupCosineLR(optim.lr_scheduler._LRScheduler):
+    def __init__(self, optimizer, warmup_steps: int, total_steps: int, last_epoch: int = -1):
+        self.warmup_steps = max(1, warmup_steps)
+        self.total_steps = max(self.warmup_steps + 1, total_steps)
+        super().__init__(optimizer, last_epoch)
+
+    def get_lr(self):
+        step = self.last_epoch + 1
+        lrs = []
+        for base_lr in self.base_lrs:
+            if step <= self.warmup_steps:
+                scale = step / float(self.warmup_steps)
+            else:
+                progress = (step - self.warmup_steps) / float(max(1, self.total_steps - self.warmup_steps))
+                scale = 0.5 * (1.0 + math.cos(math.pi * progress))
+            lrs.append(base_lr * scale)
+        return lrs
+
+
+def evaluate(model: nn.Module, loader, device: str = "cpu"):
     model.eval()
-    total = 0
     correct = 0
-    running_loss = 0.0
+    total = 0
     with torch.no_grad():
         for inputs, targets in loader:
-            inputs = inputs.to(device, non_blocking=False).float()
-            targets = targets.to(device, non_blocking=False).long()
+            inputs = inputs.to(device)
+            targets = targets.to(device)
             outputs = model(inputs)
-            if criterion is not None:
-                running_loss += criterion(outputs, targets).item() * targets.size(0)
             preds = outputs.argmax(dim=1)
             correct += (preds == targets).sum().item()
-            total += targets.size(0)
+            total += targets.numel()
     acc = correct / max(1, total)
-    avg_loss = running_loss / max(1, total) if criterion is not None else 0.0
-    return avg_loss, acc
+    return acc
 
 
 class Solution:
     def solve(self, train_loader, val_loader, metadata: dict = None) -> torch.nn.Module:
         set_seed(42)
-        device = torch.device((metadata or {}).get("device", "cpu"))
-        input_dim = int((metadata or {}).get("input_dim", 384))
-        num_classes = int((metadata or {}).get("num_classes", 128))
-        param_limit = int((metadata or {}).get("param_limit", 200000))
+        device = metadata.get("device", "cpu") if metadata is not None else "cpu"
+        input_dim = int(metadata.get("input_dim", 384)) if metadata is not None else 384
+        num_classes = int(metadata.get("num_classes", 128)) if metadata is not None else 128
+        param_limit = int(metadata.get("param_limit", 200_000)) if metadata is not None else 200_000
 
-        # Compute dataset statistics for input normalization
-        mean, inv_std = compute_input_stats(train_loader, device, input_dim)
+        # Search for a strong architecture under parameter budget
+        best_model = None
+        best_params = -1
+        chosen_width, chosen_blocks = None, None
+        # Prefer wider models (fewer blocks) for this budget
+        candidate_blocks = [2, 3]
+        for blocks in candidate_blocks:
+            for width in range(320, 95, -1):
+                model = MLPResNet(input_dim, num_classes, width, blocks, dropout=0.10)
+                params = count_trainable_params(model)
+                if params <= param_limit and params > best_params:
+                    best_params = params
+                    best_model = model
+                    chosen_width, chosen_blocks = width, blocks
+        if best_model is None:
+            # Fallback safe small model
+            chosen_width, chosen_blocks = 160, 2
+            best_model = MLPResNet(input_dim, num_classes, chosen_width, chosen_blocks, dropout=0.10)
+            best_params = count_trainable_params(best_model)
 
-        # Choose architecture under parameter limit
-        widths = choose_widths(input_dim, num_classes, param_limit)
-        model = MLPNet(input_dim, num_classes, widths, dropout=0.10, mean=mean, inv_std=inv_std).to(device)
+        # Compute and set feature standardization from train set
+        mean, std = compute_feature_stats(train_loader, device="cpu")
+        best_model.std.update(mean, std)
 
-        # Safety check for parameter limit
-        if count_parameters(model) > param_limit:
-            # As a last resort, use a very small network
-            widths = []
-            model = MLPNet(input_dim, num_classes, widths, dropout=0.10, mean=mean, inv_std=inv_std).to(device)
+        model = best_model.to(device)
 
         # Training setup
-        base_lr = 0.0025
+        lr = 0.0025
         weight_decay = 1e-4
-        max_epochs = 180
-        warmup_epochs = 8
-        min_lr_ratio = 0.05
-        patience = 28
-        mixup_alpha = 0.2
-        mixup_prob = 0.35
-
+        max_epochs = 120
+        patience = 20
         criterion = nn.CrossEntropyLoss(label_smoothing=0.05)
-        optimizer = optim.AdamW(model.parameters(), lr=base_lr, weight_decay=weight_decay, betas=(0.9, 0.99))
 
-        def lr_lambda(epoch):
-            if epoch < warmup_epochs:
-                return float(epoch + 1) / float(max(1, warmup_epochs))
-            t = (epoch - warmup_epochs) / float(max(1, max_epochs - warmup_epochs))
-            cosine = 0.5 * (1.0 + math.cos(math.pi * t))
-            return min_lr_ratio + (1.0 - min_lr_ratio) * cosine
+        param_groups = get_param_groups(model, weight_decay)
+        optimizer = optim.AdamW(param_groups, lr=lr, betas=(0.9, 0.999))
 
-        scheduler = optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_lambda)
-        ema = EMA(model, decay=0.995)
+        steps_per_epoch = max(1, len(train_loader))
+        total_steps = max_epochs * steps_per_epoch
+        warmup_steps = max(10, int(0.05 * total_steps))
+        scheduler = WarmupCosineLR(optimizer, warmup_steps=warmup_steps, total_steps=total_steps)
 
-        best_val_acc = -1.0
-        best_state = None
+        best_state = copy.deepcopy(model.state_dict())
+        best_val_acc = 0.0
         epochs_no_improve = 0
+        global_step = 0
 
         for epoch in range(max_epochs):
             model.train()
             for inputs, targets in train_loader:
-                inputs = inputs.to(device, non_blocking=False).float()
-                targets = targets.to(device, non_blocking=False).long()
+                inputs = inputs.to(device)
+                targets = targets.to(device)
 
-                use_mixup = (random.random() < mixup_prob)
-                if use_mixup and inputs.size(0) > 1:
-                    lam = random.betavariate(mixup_alpha, mixup_alpha)
-                    index = torch.randperm(inputs.size(0), device=device)
-                    mixed_x = lam * inputs + (1.0 - lam) * inputs[index, :]
-                    y_a, y_b = targets, targets[index]
-                    outputs = model(mixed_x)
-                    loss = lam * criterion(outputs, y_a) + (1.0 - lam) * criterion(outputs, y_b)
-                else:
-                    outputs = model(inputs)
-                    loss = criterion(outputs, targets)
-
-                optimizer.zero_grad()
+                optimizer.zero_grad(set_to_none=True)
+                outputs = model(inputs)
+                loss = criterion(outputs, targets)
                 loss.backward()
-                nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                 optimizer.step()
-                ema.update(model)
+                scheduler.step()
+                global_step += 1
 
-            scheduler.step()
-
-            # Validation with EMA weights
-            ema.apply_to(model)
-            _, val_acc = evaluate(model, val_loader, device, criterion=None)
-            ema.restore(model)
-
+            # Validation
+            val_acc = evaluate(model, val_loader, device=device)
             if val_acc > best_val_acc + 1e-6:
                 best_val_acc = val_acc
-                # Save EMA weights as best snapshot
-                ema.apply_to(model)
-                best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
-                ema.restore(model)
+                best_state = copy.deepcopy(model.state_dict())
                 epochs_no_improve = 0
             else:
                 epochs_no_improve += 1
+                if epochs_no_improve >= patience:
+                    break
 
-            if epochs_no_improve >= patience:
-                break
+        # Load best weights
+        model.load_state_dict(best_state)
 
-        if best_state is not None:
-            model.load_state_dict(best_state, strict=True)
-        else:
-            ema.apply_to(model)
+        # Final check to ensure we adhere to parameter limit
+        model = model.to("cpu" if device == "cpu" else device)
+        assert count_trainable_params(model) <= param_limit, "Model exceeds parameter limit"
 
-        model.to(device)
-        model.eval()
         return model

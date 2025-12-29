@@ -2,439 +2,234 @@ import torch
 import triton
 import triton.language as tl
 
-@triton.autotune(
-    configs=[
-        triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 256, 'BLOCK_SIZE_K': 64}, num_stages=3, num_warps=8),
-        triton.Config({'BLOCK_SIZE_M': 256, 'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 64}, num_stages=3, num_warps=8),
-        triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 64}, num_stages=4, num_warps=4),
-        triton.Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 256, 'BLOCK_SIZE_K': 32}, num_stages=4, num_warps=4),
-        triton.Config({'BLOCK_SIZE_M': 256, 'BLOCK_SIZE_N': 64, 'BLOCK_SIZE_K': 32}, num_stages=4, num_warps=4),
-    ],
-    key=['M', 'N', 'K'],
-)
+
 @triton.jit
-def _linear_forward_kernel(
-    X, W, B,
-    LOGITS,
-    M, N, K,
+def _fused_linear_ce_phase1(
+    X_ptr, W_ptr, B_ptr,
+    max_ptr, sumexp_ptr,
+    M, K, N,
     stride_xm, stride_xk,
     stride_wk, stride_wn,
-    stride_bn,
-    stride_logits_m, stride_logits_n,
-    BLOCK_SIZE_M: tl.constexpr, BLOCK_SIZE_N: tl.constexpr, BLOCK_SIZE_K: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    USE_FP16_ACC: tl.constexpr,
 ):
-    pid_m = tl.program_id(0)
-    pid_n = tl.program_id(1)
+    pid = tl.program_id(0)
+    pid_m = pid // tl.cdiv(N, BLOCK_N)
+    pid_n = pid % tl.cdiv(N, BLOCK_N)
     
-    offs_m = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
-    offs_n = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
-    offs_k = tl.arange(0, BLOCK_SIZE_K)
+    m_off = pid_m * BLOCK_M
+    n_off = pid_n * BLOCK_N
     
-    x_ptrs = X + (offs_m[:, None] * stride_xm + offs_k[None, :] * stride_xk)
-    w_ptrs = W + (offs_k[:, None] * stride_wk + offs_n[None, :] * stride_wn)
+    m_mask = m_off + tl.arange(0, BLOCK_M) < M
+    n_mask = n_off + tl.arange(0, BLOCK_N) < N
     
-    accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
-    for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
-        mask_x = (offs_m[:, None] < M) & (offs_k[None, :] < K - k * BLOCK_SIZE_K)
-        mask_w = (offs_k[:, None] < K - k * BLOCK_SIZE_K) & (offs_n[None, :] < N)
+    # Initialize accumulator
+    if USE_FP16_ACC:
+        acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float16)
+    else:
+        acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    
+    # Load bias block
+    b_ptrs = B_ptr + (tl.arange(0, BLOCK_N) + n_off)
+    bias = tl.load(b_ptrs, mask=n_mask, other=0.0)
+    
+    # Matrix multiplication with tiling
+    for k_off in range(0, K, BLOCK_K):
+        k_mask = k_off + tl.arange(0, BLOCK_K) < K
         
-        x = tl.load(x_ptrs, mask=mask_x, other=0.0)
-        w = tl.load(w_ptrs, mask=mask_w, other=0.0)
+        # Load X block
+        x_ptrs = X_ptr + (m_off[:, None] * stride_xm + 
+                         (k_off + tl.arange(0, BLOCK_K)[None, :]) * stride_xk)
+        x = tl.load(x_ptrs, mask=m_mask[:, None] & k_mask[None, :], other=0.0)
         
-        accumulator += tl.dot(x, w)
+        # Load W block
+        w_ptrs = W_ptr + ((k_off + tl.arange(0, BLOCK_K)[:, None]) * stride_wk + 
+                         (n_off + tl.arange(0, BLOCK_N)[None, :]) * stride_wn)
+        w = tl.load(w_ptrs, mask=k_mask[:, None] & n_mask[None, :], other=0.0)
         
-        x_ptrs += BLOCK_SIZE_K * stride_xk
-        w_ptrs += BLOCK_SIZE_K * stride_wk
+        # Accumulate
+        acc += tl.dot(x, w, allow_tf32=False)
     
-    offs_b = offs_n
-    b = tl.load(B + offs_b * stride_bn, mask=offs_n < N, other=0.0)
-    accumulator += b[None, :]
+    # Add bias
+    acc += bias[None, :]
     
-    offs_logits_m = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
-    offs_logits_n = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+    # Convert to float32 for stable reduction
+    acc_f32 = acc.to(tl.float32)
     
-    logits_ptrs = LOGITS + (offs_logits_m[:, None] * stride_logits_m + 
-                           offs_logits_n[None, :] * stride_logits_n)
+    # Find row-wise maximum
+    if USE_FP16_ACC:
+        row_max = tl.max(acc_f32, axis=1)
+    else:
+        row_max = tl.max(acc, axis=1)
     
-    mask = (offs_logits_m[:, None] < M) & (offs_logits_n[None, :] < N)
-    tl.store(logits_ptrs, accumulator, mask=mask)
+    # Store max for each row
+    max_ptrs = max_ptr + m_off + tl.arange(0, BLOCK_M)
+    tl.store(max_ptrs, row_max, mask=m_mask)
+    
+    # Compute exp(acc - max) and sum
+    row_max_expanded = tl.expand_dims(row_max, 1)
+    exp_vals = tl.exp(acc_f32 - row_max_expanded)
+    row_sumexp = tl.sum(exp_vals, axis=1)
+    
+    # Store sumexp for each row
+    sumexp_ptrs = sumexp_ptr + m_off + tl.arange(0, BLOCK_M)
+    tl.store(sumexp_ptrs, row_sumexp, mask=m_mask)
 
-@triton.autotune(
-    configs=[
-        triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 256}, num_stages=3, num_warps=8),
-        triton.Config({'BLOCK_SIZE_M': 256, 'BLOCK_SIZE_N': 128}, num_stages=3, num_warps=8),
-        triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 128}, num_stages=4, num_warps=4),
-        triton.Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 256}, num_stages=4, num_warps=4),
-        triton.Config({'BLOCK_SIZE_M': 256, 'BLOCK_SIZE_N': 64}, num_stages=4, num_warps=4),
-    ],
-    key=['M', 'N'],
-)
-@triton.jit
-def _cross_entropy_first_pass_kernel(
-    LOGITS,
-    ROW_MAX,
-    M, N,
-    stride_logits_m, stride_logits_n,
-    stride_row_max,
-    BLOCK_SIZE_M: tl.constexpr, BLOCK_SIZE_N: tl.constexpr,
-):
-    pid_m = tl.program_id(0)
-    
-    offs_m = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
-    offs_n = tl.arange(0, BLOCK_SIZE_N)
-    
-    row_max = tl.full((BLOCK_SIZE_M,), float('-inf'), dtype=tl.float32)
-    
-    for n in range(0, tl.cdiv(N, BLOCK_SIZE_N)):
-        offs_n_curr = n * BLOCK_SIZE_N + offs_n
-        
-        logits_ptrs = LOGITS + (offs_m[:, None] * stride_logits_m + 
-                               offs_n_curr[None, :] * stride_logits_n)
-        mask = (offs_m[:, None] < M) & (offs_n_curr[None, :] < N)
-        
-        logits_chunk = tl.load(logits_ptrs, mask=mask, other=float('-inf'))
-        row_max = tl.maximum(row_max, tl.max(logits_chunk, axis=1))
-    
-    row_max_ptrs = ROW_MAX + offs_m * stride_row_max
-    tl.store(row_max_ptrs, row_max, mask=offs_m < M)
 
-@triton.autotune(
-    configs=[
-        triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 256}, num_stages=3, num_warps=8),
-        triton.Config({'BLOCK_SIZE_M': 256, 'BLOCK_SIZE_N': 128}, num_stages=3, num_warps=8),
-        triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 128}, num_stages=4, num_warps=4),
-        triton.Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 256}, num_stages=4, num_warps=4),
-        triton.Config({'BLOCK_SIZE_M': 256, 'BLOCK_SIZE_N': 64}, num_stages=4, num_warps=4),
-    ],
-    key=['M', 'N'],
-)
 @triton.jit
-def _cross_entropy_second_pass_kernel(
-    LOGITS, TARGETS, ROW_MAX,
-    LOSS,
-    M, N,
-    stride_logits_m, stride_logits_n,
-    stride_targets_m,
-    stride_row_max,
-    stride_loss_m,
-    BLOCK_SIZE_M: tl.constexpr, BLOCK_SIZE_N: tl.constexpr,
+def _fused_linear_ce_phase2(
+    X_ptr, W_ptr, B_ptr, targets_ptr,
+    max_ptr, sumexp_ptr, output_ptr,
+    M, K, N,
+    stride_xm, stride_xk,
+    stride_wk, stride_wn,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    USE_FP16_ACC: tl.constexpr,
 ):
     pid_m = tl.program_id(0)
+    m_off = pid_m * BLOCK_M
+    m_mask = m_off + tl.arange(0, BLOCK_M) < M
     
-    offs_m = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
-    offs_n = tl.arange(0, BLOCK_SIZE_N)
+    # Load targets for this block
+    target_ptrs = targets_ptr + m_off + tl.arange(0, BLOCK_M)
+    targets = tl.load(target_ptrs, mask=m_mask, other=0)
     
-    mask_m = offs_m < M
+    # Load precomputed max and sumexp
+    max_ptrs = max_ptr + m_off + tl.arange(0, BLOCK_M)
+    sumexp_ptrs = sumexp_ptr + m_off + tl.arange(0, BLOCK_M)
+    row_max = tl.load(max_ptrs, mask=m_mask, other=-float('inf'))
+    row_sumexp = tl.load(sumexp_ptrs, mask=m_mask, other=0.0)
     
-    row_max_ptrs = ROW_MAX + offs_m * stride_row_max
-    row_max_vals = tl.load(row_max_ptrs, mask=mask_m, other=0.0)
+    # Initialize target logits
+    target_logits = tl.zeros((BLOCK_M,), dtype=tl.float32)
     
-    sum_exp = tl.zeros((BLOCK_SIZE_M,), dtype=tl.float32)
-    target_logits = tl.zeros((BLOCK_SIZE_M,), dtype=tl.float32)
-    
-    for n in range(0, tl.cdiv(N, BLOCK_SIZE_N)):
-        offs_n_curr = n * BLOCK_SIZE_N + offs_n
+    # Process each target column
+    for pid_n in range(tl.cdiv(N, BLOCK_N)):
+        n_off = pid_n * BLOCK_N
+        n_mask = n_off + tl.arange(0, BLOCK_N) < N
         
-        logits_ptrs = LOGITS + (offs_m[:, None] * stride_logits_m + 
-                               offs_n_curr[None, :] * stride_logits_n)
-        mask = mask_m[:, None] & (offs_n_curr[None, :] < N)
+        # Check if this block contains any of our targets
+        target_in_block = (targets >= n_off) & (targets < n_off + BLOCK_N)
+        any_target = tl.any(target_in_block)
         
-        logits_chunk = tl.load(logits_ptrs, mask=mask, other=float('-inf'))
-        stable_logits = logits_chunk - row_max_vals[:, None]
+        if not any_target:
+            continue
+            
+        # Initialize accumulator for this block
+        if USE_FP16_ACC:
+            acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float16)
+        else:
+            acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
         
-        exp_vals = tl.exp(stable_logits)
-        sum_exp += tl.sum(exp_vals, axis=1)
+        # Load bias block
+        b_ptrs = B_ptr + (tl.arange(0, BLOCK_N) + n_off)
+        bias = tl.load(b_ptrs, mask=n_mask, other=0.0)
         
-        if n == 0:
-            target_ptrs = TARGETS + offs_m * stride_targets_m
-            target_indices = tl.load(target_ptrs, mask=mask_m, other=0)
+        # Matrix multiplication
+        for k_off in range(0, K, BLOCK_K):
+            k_mask = k_off + tl.arange(0, BLOCK_K) < K
+            
+            # Load X block
+            x_ptrs = X_ptr + (m_off[:, None] * stride_xm + 
+                             (k_off + tl.arange(0, BLOCK_K)[None, :]) * stride_xk)
+            x = tl.load(x_ptrs, mask=m_mask[:, None] & k_mask[None, :], other=0.0)
+            
+            # Load W block
+            w_ptrs = W_ptr + ((k_off + tl.arange(0, BLOCK_K)[:, None]) * stride_wk + 
+                             (n_off + tl.arange(0, BLOCK_N)[None, :]) * stride_wn)
+            w = tl.load(w_ptrs, mask=k_mask[:, None] & n_mask[None, :], other=0.0)
+            
+            # Accumulate
+            acc += tl.dot(x, w, allow_tf32=False)
         
-        target_mask = (offs_n_curr[None, :] == target_indices[:, None]) & mask
-        target_logits += tl.sum(logits_chunk * target_mask, axis=1)
+        # Add bias and convert to float32
+        acc += bias[None, :]
+        acc_f32 = acc.to(tl.float32)
+        
+        # Extract target logits
+        for i in range(BLOCK_M):
+            if m_mask[i] and target_in_block[i]:
+                col_idx = targets[i] - n_off
+                if 0 <= col_idx < BLOCK_N:
+                    target_logits = tl.where(
+                        tl.arange(0, BLOCK_M) == i,
+                        acc_f32[i, col_idx],
+                        target_logits
+                    )
     
-    log_sum_exp = tl.log(sum_exp) + row_max_vals
-    loss_vals = log_sum_exp - target_logits
+    # Compute final loss: -log(exp(target_logit - max) / sumexp)
+    # = max + log(sumexp) - target_logit
+    log_sumexp = tl.log(row_sumexp)
+    losses = row_max + log_sumexp - target_logits
     
-    loss_ptrs = LOSS + offs_m * stride_loss_m
-    tl.store(loss_ptrs, loss_vals, mask=mask_m)
+    # Store results
+    out_ptrs = output_ptr + m_off + tl.arange(0, BLOCK_M)
+    tl.store(out_ptrs, losses, mask=m_mask)
+
 
 def fused_linear_ce(X: torch.Tensor, W: torch.Tensor, B: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+    """
+    Fused linear layer with cross entropy loss computation.
+    """
     M, K = X.shape
     N = W.shape[1]
     
-    assert X.dtype == torch.float16
-    assert W.dtype == torch.float16
-    assert B.dtype == torch.float32
-    assert targets.dtype == torch.int64
+    # Output tensor
+    output = torch.empty(M, dtype=torch.float32, device=X.device)
     
-    device = X.device
+    # Intermediate tensors for two-pass algorithm
+    max_vals = torch.empty(M, dtype=torch.float32, device=X.device)
+    sumexp_vals = torch.empty(M, dtype=torch.float32, device=X.device)
     
-    LOGITS = torch.empty((M, N), device=device, dtype=torch.float32)
-    ROW_MAX = torch.empty((M,), device=device, dtype=torch.float32)
-    LOSS = torch.empty((M,), device=device, dtype=torch.float32)
+    # Choose optimal block sizes based on problem dimensions
+    # L4 GPU has 24GB VRAM, these sizes work well for K=4096, N=8192
+    BLOCK_M = 128
+    BLOCK_N = 256
+    BLOCK_K = 64
     
-    grid_linear = lambda META: (
-        triton.cdiv(M, META['BLOCK_SIZE_M']),
-        triton.cdiv(N, META['BLOCK_SIZE_N']),
-    )
+    # Use fp16 accumulation for better performance on Ampere+
+    USE_FP16_ACC = True
     
-    _linear_forward_kernel[grid_linear](
+    # Phase 1: Compute row-wise max and sumexp
+    grid1 = (triton.cdiv(M, BLOCK_M) * triton.cdiv(N, BLOCK_N),)
+    _fused_linear_ce_phase1[grid1](
         X, W, B,
-        LOGITS,
-        M, N, K,
+        max_vals, sumexp_vals,
+        M, K, N,
         X.stride(0), X.stride(1),
         W.stride(0), W.stride(1),
-        B.stride(0),
-        LOGITS.stride(0), LOGITS.stride(1),
+        BLOCK_M=BLOCK_M,
+        BLOCK_N=BLOCK_N,
+        BLOCK_K=BLOCK_K,
+        USE_FP16_ACC=USE_FP16_ACC,
     )
     
-    grid_first_pass = lambda META: (
-        triton.cdiv(M, META['BLOCK_SIZE_M']),
+    # Phase 2: Compute final losses using target indices
+    grid2 = (triton.cdiv(M, BLOCK_M),)
+    _fused_linear_ce_phase2[grid2](
+        X, W, B, targets,
+        max_vals, sumexp_vals, output,
+        M, K, N,
+        X.stride(0), X.stride(1),
+        W.stride(0), W.stride(1),
+        BLOCK_M=BLOCK_M,
+        BLOCK_N=BLOCK_N,
+        BLOCK_K=BLOCK_K,
+        USE_FP16_ACC=USE_FP16_ACC,
     )
     
-    _cross_entropy_first_pass_kernel[grid_first_pass](
-        LOGITS,
-        ROW_MAX,
-        M, N,
-        LOGITS.stride(0), LOGITS.stride(1),
-        ROW_MAX.stride(0),
-    )
-    
-    grid_second_pass = lambda META: (
-        triton.cdiv(M, META['BLOCK_SIZE_M']),
-    )
-    
-    _cross_entropy_second_pass_kernel[grid_second_pass](
-        LOGITS, targets, ROW_MAX,
-        LOSS,
-        M, N,
-        LOGITS.stride(0), LOGITS.stride(1),
-        targets.stride(0),
-        ROW_MAX.stride(0),
-        LOSS.stride(0),
-    )
-    
-    return LOSS
+    return output
+
 
 class Solution:
     def solve(self, spec_path: str = None) -> dict:
-        code = '''
-import torch
-import triton
-import triton.language as tl
-
-@triton.autotune(
-    configs=[
-        triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 256, 'BLOCK_SIZE_K': 64}, num_stages=3, num_warps=8),
-        triton.Config({'BLOCK_SIZE_M': 256, 'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 64}, num_stages=3, num_warps=8),
-        triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 64}, num_stages=4, num_warps=4),
-        triton.Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 256, 'BLOCK_SIZE_K': 32}, num_stages=4, num_warps=4),
-        triton.Config({'BLOCK_SIZE_M': 256, 'BLOCK_SIZE_N': 64, 'BLOCK_SIZE_K': 32}, num_stages=4, num_warps=4),
-    ],
-    key=['M', 'N', 'K'],
-)
-@triton.jit
-def _linear_forward_kernel(
-    X, W, B,
-    LOGITS,
-    M, N, K,
-    stride_xm, stride_xk,
-    stride_wk, stride_wn,
-    stride_bn,
-    stride_logits_m, stride_logits_n,
-    BLOCK_SIZE_M: tl.constexpr, BLOCK_SIZE_N: tl.constexpr, BLOCK_SIZE_K: tl.constexpr,
-):
-    pid_m = tl.program_id(0)
-    pid_n = tl.program_id(1)
+        return {"code": self._get_code()}
     
-    offs_m = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
-    offs_n = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
-    offs_k = tl.arange(0, BLOCK_SIZE_K)
-    
-    x_ptrs = X + (offs_m[:, None] * stride_xm + offs_k[None, :] * stride_xk)
-    w_ptrs = W + (offs_k[:, None] * stride_wk + offs_n[None, :] * stride_wn)
-    
-    accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
-    for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
-        mask_x = (offs_m[:, None] < M) & (offs_k[None, :] < K - k * BLOCK_SIZE_K)
-        mask_w = (offs_k[:, None] < K - k * BLOCK_SIZE_K) & (offs_n[None, :] < N)
-        
-        x = tl.load(x_ptrs, mask=mask_x, other=0.0)
-        w = tl.load(w_ptrs, mask=mask_w, other=0.0)
-        
-        accumulator += tl.dot(x, w)
-        
-        x_ptrs += BLOCK_SIZE_K * stride_xk
-        w_ptrs += BLOCK_SIZE_K * stride_wk
-    
-    offs_b = offs_n
-    b = tl.load(B + offs_b * stride_bn, mask=offs_n < N, other=0.0)
-    accumulator += b[None, :]
-    
-    offs_logits_m = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
-    offs_logits_n = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
-    
-    logits_ptrs = LOGITS + (offs_logits_m[:, None] * stride_logits_m + 
-                           offs_logits_n[None, :] * stride_logits_n)
-    
-    mask = (offs_logits_m[:, None] < M) & (offs_logits_n[None, :] < N)
-    tl.store(logits_ptrs, accumulator, mask=mask)
-
-@triton.autotune(
-    configs=[
-        triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 256}, num_stages=3, num_warps=8),
-        triton.Config({'BLOCK_SIZE_M': 256, 'BLOCK_SIZE_N': 128}, num_stages=3, num_warps=8),
-        triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 128}, num_stages=4, num_warps=4),
-        triton.Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 256}, num_stages=4, num_warps=4),
-        triton.Config({'BLOCK_SIZE_M': 256, 'BLOCK_SIZE_N': 64}, num_stages=4, num_warps=4),
-    ],
-    key=['M', 'N'],
-)
-@triton.jit
-def _cross_entropy_first_pass_kernel(
-    LOGITS,
-    ROW_MAX,
-    M, N,
-    stride_logits_m, stride_logits_n,
-    stride_row_max,
-    BLOCK_SIZE_M: tl.constexpr, BLOCK_SIZE_N: tl.constexpr,
-):
-    pid_m = tl.program_id(0)
-    
-    offs_m = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
-    offs_n = tl.arange(0, BLOCK_SIZE_N)
-    
-    row_max = tl.full((BLOCK_SIZE_M,), float('-inf'), dtype=tl.float32)
-    
-    for n in range(0, tl.cdiv(N, BLOCK_SIZE_N)):
-        offs_n_curr = n * BLOCK_SIZE_N + offs_n
-        
-        logits_ptrs = LOGITS + (offs_m[:, None] * stride_logits_m + 
-                               offs_n_curr[None, :] * stride_logits_n)
-        mask = (offs_m[:, None] < M) & (offs_n_curr[None, :] < N)
-        
-        logits_chunk = tl.load(logits_ptrs, mask=mask, other=float('-inf'))
-        row_max = tl.maximum(row_max, tl.max(logits_chunk, axis=1))
-    
-    row_max_ptrs = ROW_MAX + offs_m * stride_row_max
-    tl.store(row_max_ptrs, row_max, mask=offs_m < M)
-
-@triton.autotune(
-    configs=[
-        triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 256}, num_stages=3, num_warps=8),
-        triton.Config({'BLOCK_SIZE_M': 256, 'BLOCK_SIZE_N': 128}, num_stages=3, num_warps=8),
-        triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 128}, num_stages=4, num_warps=4),
-        triton.Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 256}, num_stages=4, num_warps=4),
-        triton.Config({'BLOCK_SIZE_M': 256, 'BLOCK_SIZE_N': 64}, num_stages=4, num_warps=4),
-    ],
-    key=['M', 'N'],
-)
-@triton.jit
-def _cross_entropy_second_pass_kernel(
-    LOGITS, TARGETS, ROW_MAX,
-    LOSS,
-    M, N,
-    stride_logits_m, stride_logits_n,
-    stride_targets_m,
-    stride_row_max,
-    stride_loss_m,
-    BLOCK_SIZE_M: tl.constexpr, BLOCK_SIZE_N: tl.constexpr,
-):
-    pid_m = tl.program_id(0)
-    
-    offs_m = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
-    offs_n = tl.arange(0, BLOCK_SIZE_N)
-    
-    mask_m = offs_m < M
-    
-    row_max_ptrs = ROW_MAX + offs_m * stride_row_max
-    row_max_vals = tl.load(row_max_ptrs, mask=mask_m, other=0.0)
-    
-    sum_exp = tl.zeros((BLOCK_SIZE_M,), dtype=tl.float32)
-    target_logits = tl.zeros((BLOCK_SIZE_M,), dtype=tl.float32)
-    
-    for n in range(0, tl.cdiv(N, BLOCK_SIZE_N)):
-        offs_n_curr = n * BLOCK_SIZE_N + offs_n
-        
-        logits_ptrs = LOGITS + (offs_m[:, None] * stride_logits_m + 
-                               offs_n_curr[None, :] * stride_logits_n)
-        mask = mask_m[:, None] & (offs_n_curr[None, :] < N)
-        
-        logits_chunk = tl.load(logits_ptrs, mask=mask, other=float('-inf'))
-        stable_logits = logits_chunk - row_max_vals[:, None]
-        
-        exp_vals = tl.exp(stable_logits)
-        sum_exp += tl.sum(exp_vals, axis=1)
-        
-        if n == 0:
-            target_ptrs = TARGETS + offs_m * stride_targets_m
-            target_indices = tl.load(target_ptrs, mask=mask_m, other=0)
-        
-        target_mask = (offs_n_curr[None, :] == target_indices[:, None]) & mask
-        target_logits += tl.sum(logits_chunk * target_mask, axis=1)
-    
-    log_sum_exp = tl.log(sum_exp) + row_max_vals
-    loss_vals = log_sum_exp - target_logits
-    
-    loss_ptrs = LOSS + offs_m * stride_loss_m
-    tl.store(loss_ptrs, loss_vals, mask=mask_m)
-
-def fused_linear_ce(X: torch.Tensor, W: torch.Tensor, B: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
-    M, K = X.shape
-    N = W.shape[1]
-    
-    assert X.dtype == torch.float16
-    assert W.dtype == torch.float16
-    assert B.dtype == torch.float32
-    assert targets.dtype == torch.int64
-    
-    device = X.device
-    
-    LOGITS = torch.empty((M, N), device=device, dtype=torch.float32)
-    ROW_MAX = torch.empty((M,), device=device, dtype=torch.float32)
-    LOSS = torch.empty((M,), device=device, dtype=torch.float32)
-    
-    grid_linear = lambda META: (
-        triton.cdiv(M, META['BLOCK_SIZE_M']),
-        triton.cdiv(N, META['BLOCK_SIZE_N']),
-    )
-    
-    _linear_forward_kernel[grid_linear](
-        X, W, B,
-        LOGITS,
-        M, N, K,
-        X.stride(0), X.stride(1),
-        W.stride(0), W.stride(1),
-        B.stride(0),
-        LOGITS.stride(0), LOGITS.stride(1),
-    )
-    
-    grid_first_pass = lambda META: (
-        triton.cdiv(M, META['BLOCK_SIZE_M']),
-    )
-    
-    _cross_entropy_first_pass_kernel[grid_first_pass](
-        LOGITS,
-        ROW_MAX,
-        M, N,
-        LOGITS.stride(0), LOGITS.stride(1),
-        ROW_MAX.stride(0),
-    )
-    
-    grid_second_pass = lambda META: (
-        triton.cdiv(M, META['BLOCK_SIZE_M']),
-    )
-    
-    _cross_entropy_second_pass_kernel[grid_second_pass](
-        LOGITS, targets, ROW_MAX,
-        LOSS,
-        M, N,
-        LOGITS.stride(0), LOGITS.stride(1),
-        targets.stride(0),
-        ROW_MAX.stride(0),
-        LOSS.stride(0),
-    )
-    
-    return LOSS
-'''
-        return {"code": code}
+    @staticmethod
+    def _get_code() -> str:
+        import inspect
+        return inspect.getsource(fused_linear_ce)

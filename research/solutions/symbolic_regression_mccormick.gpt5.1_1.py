@@ -6,37 +6,36 @@ class Solution:
 
     def solve(self, X: np.ndarray, y: np.ndarray) -> dict:
         X = np.asarray(X, dtype=float)
-        y = np.asarray(y, dtype=float).ravel()
+        y = np.asarray(y, dtype=float).reshape(-1)
 
         x1 = X[:, 0]
         x2 = X[:, 1]
 
-        # Basis functions inspired by the McCormick function structure
         f1 = np.sin(x1 + x2)
         f2 = (x1 - x2) ** 2
-        ones = np.ones_like(x1)
+        f3 = x1
+        f4 = x2
+        f5 = np.ones_like(x1)
 
-        # Design matrix: [sin(x1+x2), (x1-x2)^2, x1, x2, 1]
-        A = np.column_stack([f1, f2, x1, x2, ones])
+        A = np.column_stack((f1, f2, f3, f4, f5))
 
-        coeffs, _, _, _ = np.linalg.lstsq(A, y, rcond=None)
-
-        # Round coefficients for a cleaner expression and use them consistently
-        rounded_coeffs = np.array([float(f"{c:.12g}") for c in coeffs])
-        a, b, c, d, e = rounded_coeffs
-
-        # Compute predictions using the rounded coefficients
-        predictions = a * f1 + b * f2 + c * x1 + d * x2 + e
-
-        # Build the expression string
-        a_str, b_str, c_str, d_str, e_str = [f"{c:.12g}" for c in rounded_coeffs]
-        expression = (
-            f"{a_str}*sin(x1 + x2) + "
-            f"{b_str}*(x1 - x2)**2 + "
-            f"{c_str}*x1 + "
-            f"{d_str}*x2 + "
-            f"{e_str}"
-        )
+        try:
+            coeffs, _, _, _ = np.linalg.lstsq(A, y, rcond=None)
+            a1, a2, a3, a4, a5 = coeffs
+            expression = (
+                f"({repr(a1)})*sin(x1 + x2) + "
+                f"({repr(a2)})*(x1 - x2)**2 + "
+                f"({repr(a3)})*x1 + "
+                f"({repr(a4)})*x2 + "
+                f"({repr(a5)})"
+            )
+            predictions = A.dot(coeffs)
+        except Exception:
+            A_lin = np.column_stack((x1, x2, np.ones_like(x1)))
+            coeffs_lin, _, _, _ = np.linalg.lstsq(A_lin, y, rcond=None)
+            a, b, c = coeffs_lin
+            expression = f"({repr(a)})*x1 + ({repr(b)})*x2 + ({repr(c)})"
+            predictions = A_lin.dot(coeffs_lin)
 
         return {
             "expression": expression,

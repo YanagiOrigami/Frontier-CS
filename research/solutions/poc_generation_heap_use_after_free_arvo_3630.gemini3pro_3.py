@@ -1,13 +1,8 @@
-import sys
-
 class Solution:
     def solve(self, src_path: str) -> bytes:
-        # The vulnerability is a Heap Use-After-Free in PJ_lsat.c.
-        # It is triggered when the 'lsat' parameter is out of range (<=0 or >5).
-        # The vulnerable code detects the error and calls the destructor (freeing P)
-        # but fails to return, continuing execution with a freed pointer.
-        # We must also provide a valid ellipsoid (e.g., WGS84) because the lsat projection
-        # requires an ellipsoid (es > 0) and checks this before the vulnerable parameter check.
-        # Providing a sphere (+a=1) would cause an early return on the ellipsoid check.
-        # We also provide 'path' to ensure other parameter checks don't interfere.
-        return b"+proj=lsat +lsat=6 +path=1 +ellps=WGS84"
+        # The vulnerability is a missing return statement in PJ_lsat.c when the 'lsat' parameter is invalid (> 5).
+        # This causes the code to proceed and use the invalid 'lsat' value as an index for static arrays,
+        # resulting in an out-of-bounds read. By providing a very large integer (INT_MAX),
+        # we ensure the read accesses unmapped memory or causes a sanitizer error (e.g., OOB/SEGV),
+        # satisfying the crash requirement. The 'path' parameter is required to bypass a subsequent check.
+        return b"+proj=lsat +lsat=2147483647 +path=1"

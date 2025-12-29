@@ -1,56 +1,20 @@
 import pandas as pd
-import math
-from multiprocessing import Pool, cpu_count
-from functools import partial
-import sys
+import numpy as np
+from joblib import Parallel, delayed
 
-# It's better to put helper functions outside the class for multiprocessing pickling
-def _calculate_lcp_sum_for_strings(strings: list[str]) -> int:
-    """Calculates the total LCP sum using a Trie."""
-    trie = {}
-    total_lcp = 0
-    if not strings:
-        return 0
-        
-    for s in strings:
-        if not s:
-            continue
-        node = trie
-        lcp = 0
-        i = 0
-        s_len = len(s)
-        while i < s_len:
-            char = s[i]
-            if char in node:
-                node = node[char]
-                lcp += 1
-                i += 1
-            else:
-                break
-        
-        total_lcp += lcp
-        
-        # Insert the rest of the string
-        while i < s_len:
-            char = s[i]
-            node[char] = {}
-            node = node[char]
-            i += 1
-            
-    return total_lcp
-
-def _score_candidate_expansion(args):
+def _calculate_distinct_count(cols, df_str_data):
     """
-    Worker function for parallel scoring.
-    It computes new strings and their LCP sum.
+    Calculates the number of unique rows for a subset of columns.
+    A helper function for parallel processing, defined at the top level.
     """
-    p, c, base_strings, data_c = args
-    new_strings = [base + val for base, val in zip(base_strings, data_c)]
-    score = _calculate_lcp_sum_for_strings(new_strings)
-    return score, p + [c], new_strings
-
+    if not cols:
+        return 1
+    return df_str_data[cols].drop_duplicates().shape[0]
 
 class Solution:
+    """
+    Implements the solution for reordering CSV columns to maximize KV-cache hit rate.
+    """
     def solve(
         self,
         df: pd.DataFrame,
@@ -62,90 +26,118 @@ class Solution:
         distinct_value_threshold: float = 0.7,
         parallel: bool = True,
     ) -> pd.DataFrame:
-        
-        # 1. Handle Column Merges
+        """
+        Reorders columns in the DataFrame to maximize prefix hit rate.
+
+        The strategy is as follows:
+        1.  Handle column merges as specified.
+        2.  Partition columns into low-cardinality and high-cardinality groups. This is
+            because low-cardinality columns are better for creating common prefixes.
+        3.  For low-cardinality columns, use a greedy forward selection algorithm to find
+            an optimal ordering. At each step, add the column that results in the minimum
+            increase in the number of unique prefixes. This process is parallelized for
+            efficiency.
+        4.  For high-cardinality columns, which are likely to break prefixes, place them
+            at the end. They are ordered among themselves by their cardinality.
+        5.  Combine the ordered low and high cardinality columns to get the final order.
+        """
+        # Step 1: Handle column merges
         if col_merge:
-            merged_df = df.copy()
+            work_df = df.copy()
+            
+            all_merged_cols = set()
+            for group in col_merge:
+                for col in group:
+                    if col in work_df.columns:
+                        all_merged_cols.add(col)
+
+            unmerged_cols_df = work_df.drop(columns=list(all_merged_cols), errors='ignore')
+            
+            merged_components = [unmerged_cols_df]
             for i, group in enumerate(col_merge):
-                if not isinstance(group, list) or not group:
-                    continue
-                # Ensure all columns in group exist in the dataframe
-                group = [c for c in group if c in merged_df.columns]
-                if not group:
+                valid_group = [c for c in group if c in work_df.columns]
+                if not valid_group:
                     continue
                 
-                new_col_name = f"_merged_{'_'.join(group)}"
-                merged_df[new_col_name] = merged_df[group].astype(str).agg(''.join, axis=1)
-                merged_df = merged_df.drop(columns=group)
+                new_col_name = f"__merged_{'_'.join(sorted(valid_group))}"
+                merged_col = work_df[valid_group].astype(str).agg(''.join, axis=1).rename(new_col_name)
+                merged_components.append(merged_col)
+                
+            work_df = pd.concat(merged_components, axis=1)
         else:
-            merged_df = df
-        
-        all_cols = list(merged_df.columns)
-        if len(all_cols) <= 1:
-            return merged_df
+            work_df = df
 
-        # 2. Data Preparation
-        # Cap early_stop to a reasonable value to manage runtime
-        sample_size = min(len(merged_df), early_stop, 5000)
-        if sample_size == 0:
-            return merged_df
+        candidate_cols = list(work_df.columns)
+        num_cols = len(candidate_cols)
+        
+        if num_cols <= 1:
+            return work_df
+
+        df_str = work_df.astype(str)
+        n_rows = len(df_str)
+
+        # Step 2: Partition columns into low and high cardinality
+        high_card_cols = []
+        low_card_cols = []
+        
+        if n_rows > 0:
+            sample_size = min(n_rows, 5000)
+            df_sample = df_str.head(sample_size)
             
-        sampled_df = merged_df.head(sample_size)
+            for col in candidate_cols:
+                distinct_ratio = df_sample[col].nunique() / sample_size
+                if distinct_ratio > distinct_value_threshold:
+                    high_card_cols.append(col)
+                else:
+                    low_card_cols.append(col)
+        else:
+            low_card_cols = candidate_cols
+
+        # Step 3: Find optimal order for low-cardinality columns via greedy search
+        best_order_low = []
+        remaining_cols = low_card_cols.copy()
         
-        # 3. Column Classification
-        id_cols = []
-        candidate_cols = []
-        
-        for col in all_cols:
-            try:
-                # Use dropna() to handle potential NaNs that break nunique() in some pandas versions
-                distinct_count = sampled_df[col].dropna().nunique()
-            except TypeError: # For unhashable types
-                distinct_count = len(set(map(str, sampled_df[col].dropna())))
-
-            distinct_ratio = distinct_count / sample_size
-            if distinct_ratio > distinct_value_threshold and len(all_cols) > col_stop:
-                id_cols.append(col)
-            else:
-                candidate_cols.append(col)
-        
-        if id_cols:
-            id_col_cardinalities = {c: sampled_df[c].nunique() for c in id_cols}
-            id_cols.sort(key=lambda c: id_col_cardinalities.get(c, 0), reverse=True)
-
-        if not candidate_cols:
-            return merged_df[id_cols]
-
-        # Convert sampled data to a more accessible format for the search
-        data_dict = {col: sampled_df[col].astype(str).tolist() for col in candidate_cols}
-
-        # 4. Beam Search for `candidate_cols`
-        beam = [([], [""] * sample_size)]  # (permutation, current_strings)
-        num_cand_cols = len(candidate_cols)
-
-        for k in range(num_cand_cols):
-            expansion_args = []
-            for p, p_strings in beam:
-                remaining_cols = [c for c in candidate_cols if c not in p]
-                for c in remaining_cols:
-                    expansion_args.append((p, c, p_strings, data_dict[c]))
-
-            if not expansion_args:
+        for _ in range(len(low_card_cols)):
+            if not remaining_cols:
                 break
-                
-            if parallel and len(expansion_args) > 1:
-                num_processes = min(cpu_count(), len(expansion_args))
-                with Pool(processes=num_processes) as pool:
-                    scored_candidates = pool.map(_score_candidate_expansion, expansion_args)
+
+            if len(remaining_cols) == 1:
+                best_col = remaining_cols[0]
+            elif parallel and len(remaining_cols) > 1:
+                candidate_col_lists = [best_order_low + [col] for col in remaining_cols]
+                scores = Parallel(n_jobs=-1, prefer="threads")(
+                    delayed(_calculate_distinct_count)(cols, df_str) for cols in candidate_col_lists
+                )
+                min_idx = np.argmin(scores)
+                best_col = remaining_cols[min_idx]
             else:
-                scored_candidates = [_score_candidate_expansion(args) for args in expansion_args]
-            
-            scored_candidates.sort(key=lambda x: x[0], reverse=True)
-            
-            beam_width = col_stop if k < num_cand_cols - 1 else 1
-            beam = [(p, strings) for score, p, strings in scored_candidates[:beam_width]]
+                min_distinct_count = float('inf')
+                best_col_candidate = None
+                for col in remaining_cols:
+                    current_cols = best_order_low + [col]
+                    distinct_count = _calculate_distinct_count(current_cols, df_str)
+                    if distinct_count < min_distinct_count:
+                        min_distinct_count = distinct_count
+                        best_col_candidate = col
+                best_col = best_col_candidate
 
-        best_p = beam[0][0] if beam and beam[0] else []
-        final_permutation = best_p + id_cols
+            if best_col is not None:
+                best_order_low.append(best_col)
+                remaining_cols.remove(best_col)
+        
+        # Step 4: Order high-cardinality columns by their own cardinality
+        best_order_high = []
+        if high_card_cols:
+            if n_rows > 0:
+                cardinalities = df_str[high_card_cols].nunique()
+                best_order_high = cardinalities.sort_values().index.tolist()
+            else:
+                best_order_high = sorted(high_card_cols)
+            
+        # Step 5: Combine orders and return the reordered DataFrame
+        final_order = best_order_low + best_order_high
+        
+        if len(final_order) != num_cols or len(set(final_order)) != num_cols:
+            return work_df # Fallback to original order
 
-        return merged_df[final_permutation]
+        return work_df[final_order]

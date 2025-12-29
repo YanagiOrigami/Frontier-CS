@@ -3,8 +3,9 @@ import zipfile
 
 class Solution:
     def solve(self, src_path: str) -> bytes:
-        buf = io.BytesIO()
-        with zipfile.ZipFile(buf, 'w', zipfile.ZIP_STORED) as z:
-            long_name = 'A' * 300
-            z.writestr(long_name, b'')
-        return buf.getvalue()
+        buffer = io.BytesIO()
+        with zipfile.ZipFile(buffer, "w", compression=zipfile.ZIP_STORED) as zf:
+            long_filename = "A" * 257
+            zf.writestr(long_filename, b"")
+        buffer.seek(0)
+        return buffer.getvalue()

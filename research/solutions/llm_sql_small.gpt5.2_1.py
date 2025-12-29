@@ -1,131 +1,122 @@
-import time
-from typing import List, Any, Dict, Tuple, Optional
-
-import numpy as np
 import pandas as pd
+import numpy as np
+from bisect import bisect_left
+from itertools import permutations
+
+
+def _lcp_len(a: str, b: str) -> int:
+    la = len(a)
+    lb = len(b)
+    n = la if la < lb else lb
+    i = 0
+    while i < n and a[i] == b[i]:
+        i += 1
+    return i
+
+
+def _exact_online_lcp_score_for_strings(arr, n: int) -> int:
+    if n <= 1:
+        return 0
+    lst = []
+    score = 0
+    for i in range(n):
+        s = arr[i]
+        if i == 0:
+            lst.append(s)
+            continue
+        pos = bisect_left(lst, s)
+        best = 0
+        if pos > 0:
+            best = _lcp_len(s, lst[pos - 1])
+        if pos < len(lst):
+            t = _lcp_len(s, lst[pos])
+            if t > best:
+                best = t
+        score += best
+        lst.insert(pos, s)
+    return score
+
+
+def _approx_online_prefix_tuple_score(perm, codes_lists, lens_lists, n: int) -> int:
+    depth = len(perm)
+    if depth == 0 or n <= 1:
+        return 0
+
+    # 64-bit rolling hash of prefix tuples (column-boundary approximation)
+    mask = (1 << 64) - 1
+    P = 1315423911
+    offset = 1469598103934665603
+
+    seen = [set() for _ in range(depth)]
+    hs = [0] * depth
+
+    code_arrs = [codes_lists[c] for c in perm]
+    len_arrs = [lens_lists[c] for c in perm]
+
+    score = 0
+    for r in range(n):
+        h = offset
+        cum = 0
+        best = 0
+        for k in range(depth):
+            h = (h * P + (code_arrs[k][r] + 2)) & mask
+            hs[k] = h
+            cum += len_arrs[k][r]
+            if h in seen[k]:
+                best = cum
+        score += best
+        for k in range(depth):
+            seen[k].add(hs[k])
+    return score
 
 
 class Solution:
-    def _normalize_merge_group(self, group: list, columns: List[Any]) -> List[Any]:
-        if not group:
-            return []
-        out = []
-        for g in group:
-            if isinstance(g, (int, np.integer)):
-                if 0 <= int(g) < len(columns):
-                    out.append(columns[int(g)])
-            else:
-                out.append(g)
-        return out
-
-    def _apply_col_merge(self, df: pd.DataFrame, col_merge: Optional[list]) -> pd.DataFrame:
+    def _apply_col_merges(self, df: pd.DataFrame, col_merge):
         if not col_merge:
             return df
-        df2 = df.copy()
-        for group in col_merge:
-            if not group:
+
+        df_work = df.copy()
+        orig_cols = list(df.columns)
+
+        def resolve_name(x):
+            if isinstance(x, (int, np.integer)):
+                ix = int(x)
+                if -len(orig_cols) <= ix < len(orig_cols):
+                    return orig_cols[ix]
+                return None
+            return x
+
+        for g in col_merge:
+            if not g:
                 continue
-            cur_cols = list(df2.columns)
-            norm_group = self._normalize_merge_group(group, cur_cols)
-            exist = [c for c in norm_group if c in df2.columns]
-            if len(exist) <= 1:
+            names = []
+            for x in g:
+                nm = resolve_name(x)
+                if nm is None:
+                    continue
+                if nm in df_work.columns:
+                    names.append(nm)
+            if len(names) <= 1:
                 continue
 
-            pos = min(int(df2.columns.get_loc(c)) for c in exist)
-            merged = df2[exist[0]].astype(str)
-            for c in exist[1:]:
-                merged = merged + df2[c].astype(str)
+            positions = [df_work.columns.get_loc(c) for c in names]
+            pos = min(positions)
 
-            base_name = "MERGE_" + "+".join(str(c) for c in exist)
-            new_name = base_name
-            k = 1
-            while new_name in df2.columns:
-                k += 1
-                new_name = f"{base_name}_{k}"
+            base = "m__" + "__".join(str(c) for c in names)
+            new_name = base
+            suffix = 1
+            while new_name in df_work.columns:
+                new_name = f"{base}__{suffix}"
+                suffix += 1
 
-            df2 = df2.drop(columns=exist)
-            df2.insert(pos, new_name, merged)
-        return df2
+            s = df_work[names[0]].astype(str)
+            for c in names[1:]:
+                s = s + df_work[c].astype(str)
 
-    @staticmethod
-    def _avg_len(arr_obj: np.ndarray) -> float:
-        s = 0
-        n = int(arr_obj.shape[0])
-        for x in arr_obj:
-            s += len(x)
-        return s / n if n else 0.0
+            df_work.insert(pos, new_name, s)
+            df_work.drop(columns=names, inplace=True)
 
-    @staticmethod
-    def _build_prefix_arr(arr_obj: np.ndarray, L: int) -> np.ndarray:
-        if L <= 0:
-            return arr_obj
-        out = np.empty(arr_obj.shape[0], dtype=object)
-        i = 0
-        for s in arr_obj:
-            out[i] = s[:L]
-            i += 1
-        return out
-
-    @staticmethod
-    def _collision_sum(prefix_ids: np.ndarray, key_arr: np.ndarray) -> int:
-        counts: Dict[Tuple[int, Any], int] = {}
-        get = counts.get
-        for pid, val in zip(prefix_ids, key_arr):
-            k = (int(pid), val)
-            counts[k] = get(k, 0) + 1
-        tot = 0
-        for c in counts.values():
-            tot += c * c
-        return tot
-
-    @staticmethod
-    def _update_prefix_ids(prefix_ids: np.ndarray, key_arr: np.ndarray) -> np.ndarray:
-        mp: Dict[Tuple[int, Any], int] = {}
-        get = mp.get
-        next_ids = np.empty(prefix_ids.shape[0], dtype=np.int32)
-        nid = 0
-        i = 0
-        for pid, val in zip(prefix_ids, key_arr):
-            k = (int(pid), val)
-            v = get(k)
-            if v is None:
-                v = nid
-                mp[k] = v
-                nid += 1
-            next_ids[i] = v
-            i += 1
-        return next_ids
-
-    @staticmethod
-    def _lcp_trie_sum(strings: List[str]) -> int:
-        root: Dict[str, dict] = {}
-        total = 0
-        for i, s in enumerate(strings):
-            node = root
-            l = 0
-            matched = (i != 0)
-            for ch in s:
-                nxt = node.get(ch)
-                if matched and nxt is not None:
-                    l += 1
-                    node = nxt
-                else:
-                    matched = False
-                    if nxt is None:
-                        nxt = {}
-                        node[ch] = nxt
-                    node = nxt
-            total += l
-        return total
-
-    def _evaluate_perm(self, perm_idx: List[int], eval_cols_u: List[np.ndarray]) -> int:
-        if not perm_idx:
-            return 0
-        res = eval_cols_u[perm_idx[0]].copy()
-        for j in perm_idx[1:]:
-            res = np.char.add(res, eval_cols_u[j])
-        strings = res.tolist()
-        return self._lcp_trie_sum(strings)
+        return df_work
 
     def solve(
         self,
@@ -138,133 +129,189 @@ class Solution:
         distinct_value_threshold: float = 0.7,
         parallel: bool = True,
     ) -> pd.DataFrame:
-        t0 = time.time()
+        df_work = self._apply_col_merges(df, col_merge)
 
-        df2 = self._apply_col_merge(df, col_merge)
-        cols = list(df2.columns)
+        cols = list(df_work.columns)
         m = len(cols)
-        if m <= 1:
-            return df2
+        n = len(df_work)
+        if m <= 1 or n <= 1:
+            return df_work
 
-        n = len(df2)
-        if n <= 1:
-            return df2
+        # Sampling sizes for optimization (kept small for speed)
+        n_beam = min(n, max(2000, min(int(early_stop) if early_stop else n, 8000)))
+        n_refine = min(n, max(n_beam, min(int(early_stop) if early_stop else n, 15000)))
+        n_exact = min(n, 4000)
+        n_single = min(n, 2000)
 
-        K_greedy = int(min(n, 8000, early_stop if early_stop else n))
-        K_eval = int(min(n, 2500, early_stop if early_stop else n))
+        # Precompute string arrays, lengths, codes (as Python lists for fast loops)
+        str_arrays = [None] * m
+        lens_lists = [None] * m
+        codes_lists = [None] * m
+        distinct_ratio = [0.0] * m
+        avg_len = [0.0] * m
+        single_quality = [0.0] * m
 
-        distinct_ratio: Dict[Any, float] = {}
-        avg_len: Dict[Any, float] = {}
+        for i, c in enumerate(cols):
+            arr = df_work[c].astype(str).to_numpy(dtype=object, copy=False)
+            str_arrays[i] = arr
 
-        for c in cols:
-            try:
-                distinct_ratio[c] = float(df2[c].nunique(dropna=False)) / float(n)
-            except Exception:
-                distinct_ratio[c] = 1.0
+            lens = [len(x) for x in arr]
+            lens_lists[i] = lens
+            s_l = sum(lens)
+            avg_len[i] = (s_l / n) if n else 0.0
 
-        full_obj: Dict[Any, np.ndarray] = {}
-        pref_obj: Dict[Any, Dict[int, np.ndarray]] = {}
-        prefix_lens = (2, 4, 8)
+            codes, uniques = pd.factorize(arr, sort=False)
+            codes_lists[i] = codes.tolist()
+            nu = len(uniques)
+            distinct_ratio[i] = (nu / n) if n else 1.0
 
-        head_g = df2[cols].head(K_greedy)
-        for c in cols:
-            arr = head_g[c].astype(str).to_numpy(dtype=object, copy=False)
-            full_obj[c] = arr
-            avg_len[c] = self._avg_len(arr)
-            pdict: Dict[int, np.ndarray] = {}
-            for L in prefix_lens:
-                pdict[L] = self._build_prefix_arr(arr, L)
-            pref_obj[c] = pdict
+        # Column-level "prefix friendliness" (captures within-column shared prefixes even if distinct)
+        for i in range(m):
+            sc = _exact_online_lcp_score_for_strings(str_arrays[i], n_single)
+            denom = sum(lens_lists[i][:n_single]) or 1
+            single_quality[i] = sc / denom
 
-        remaining = cols[:]
-        perm: List[Any] = []
-        prefix_ids = np.zeros(K_greedy, dtype=np.int32)
+        # Rank columns for exploration
+        def col_rank_key(i):
+            high = 1 if distinct_ratio[i] > distinct_value_threshold else 0
+            return (high, distinct_ratio[i], -single_quality[i], -avg_len[i])
 
-        # Greedy build
-        for pos in range(m):
-            best_c = None
-            best_metric = -1.0
-            best_key_arr = None
+        ranked_cols = sorted(range(m), key=col_rank_key)
 
-            use_prefix = (pos < 2)
+        # Helper for exact score of a permutation on sample rows
+        def exact_score_perm(perm, n_rows):
+            if n_rows <= 1:
+                return 0
+            arrs = [str_arrays[i] for i in perm]
+            lst = []
+            score = 0
+            for r in range(n_rows):
+                parts = [a[r] for a in arrs]
+                s = "".join(parts)
+                if r == 0:
+                    lst.append(s)
+                    continue
+                pos = bisect_left(lst, s)
+                best = 0
+                if pos > 0:
+                    best = _lcp_len(s, lst[pos - 1])
+                if pos < len(lst):
+                    t = _lcp_len(s, lst[pos])
+                    if t > best:
+                        best = t
+                score += best
+                lst.insert(pos, s)
+            return score
 
-            for c in remaining:
-                dr = distinct_ratio.get(c, 1.0)
-                pen = 0.35 + 0.65 * max(0.0, 1.0 - dr)
-                if dr >= 0.98:
-                    pen *= 0.25
-                if dr >= distinct_value_threshold:
-                    pen *= 0.75
+        # Candidate generation
+        candidates = []
 
-                if use_prefix:
-                    # consider several prefix lengths and full
-                    # metric approximates "prefix LCP gained" = collision * prefix_len
-                    local_best_metric = -1.0
-                    local_best_key = None
+        # Base heuristic permutation
+        stats_perm = tuple(ranked_cols)
+        candidates.append(stats_perm)
 
-                    for L in prefix_lens:
-                        key_arr = pref_obj[c][L]
-                        coll = self._collision_sum(prefix_ids, key_arr)
-                        metric = float(coll) * float(L) * pen
-                        if metric > local_best_metric:
-                            local_best_metric = metric
-                            local_best_key = key_arr
+        beam_width = max(12, min(40, 10 * int(col_stop) + 10))
+        local_iters = max(1, min(3, int(row_stop) // 2 if row_stop is not None else 2))
 
-                    # also consider full value match with average length
-                    key_arr_full = full_obj[c]
-                    coll_full = self._collision_sum(prefix_ids, key_arr_full)
-                    metric_full = float(coll_full) * float(avg_len[c]) * pen
-                    if metric_full > local_best_metric:
-                        local_best_metric = metric_full
-                        local_best_key = key_arr_full
+        # If small enough, brute-force approximate score
+        if m <= 6:
+            scored = []
+            for perm in permutations(range(m)):
+                sc = _approx_online_prefix_tuple_score(perm, codes_lists, lens_lists, n_beam)
+                # tie-break using single_quality for early positions
+                tie = 0.0
+                w = 1.0
+                for j in range(m):
+                    tie += single_quality[perm[j]] * w
+                    w *= 0.6
+                scored.append((sc, tie, perm))
+            scored.sort(key=lambda x: (x[0], x[1]), reverse=True)
+            top = scored[: min(30, len(scored))]
+            for _, _, perm in top:
+                candidates.append(perm)
+        else:
+            # Beam search over approximate objective
+            weights = [1.0 / (i + 1) for i in range(m)]
+            beam = [(0, 0.0, tuple(), 0)]  # (score, tie, perm, mask)
+            for depth in range(m):
+                next_beam = []
+                for sc0, tie0, perm0, mask0 in beam:
+                    for c in ranked_cols:
+                        bit = 1 << c
+                        if mask0 & bit:
+                            continue
+                        perm1 = perm0 + (c,)
+                        sc1 = _approx_online_prefix_tuple_score(perm1, codes_lists, lens_lists, n_beam)
+                        tie1 = tie0 + single_quality[c] * weights[depth]
+                        next_beam.append((sc1, tie1, perm1, mask0 | bit))
+                next_beam.sort(key=lambda x: (x[0], x[1]), reverse=True)
+                beam = next_beam[:beam_width]
+            for sc, tie, perm, mask in beam[: min(12, len(beam))]:
+                candidates.append(perm)
 
-                    metric = local_best_metric
-                    key_arr = local_best_key
-                else:
-                    key_arr = full_obj[c]
-                    coll = self._collision_sum(prefix_ids, key_arr)
-                    metric = float(coll) * float(avg_len[c]) * pen
+        # Deduplicate candidates
+        uniq = []
+        seen = set()
+        for p in candidates:
+            if p not in seen:
+                seen.add(p)
+                uniq.append(p)
+        candidates = uniq
 
-                if metric > best_metric:
-                    best_metric = metric
-                    best_c = c
-                    best_key_arr = key_arr
+        # Local refinement on best approximate candidate
+        def approx_score(perm, n_rows):
+            return _approx_online_prefix_tuple_score(perm, codes_lists, lens_lists, n_rows)
 
-            if best_c is None:
-                break
-            perm.append(best_c)
-            remaining.remove(best_c)
-            if best_key_arr is not None:
-                prefix_ids = self._update_prefix_ids(prefix_ids, best_key_arr)
+        best_perm = max(candidates, key=lambda p: approx_score(p, n_refine))
+        best_sc = approx_score(best_perm, n_refine)
 
-        if remaining:
-            # push high-distinct to end, low-distinct earlier among remaining
-            remaining.sort(key=lambda c: (distinct_ratio.get(c, 1.0), -avg_len.get(c, 0.0)))
-            perm.extend(remaining)
-
-        # Optional local refinement with small hill-climb using actual char-trie on K_eval
-        head_e = df2[perm].head(K_eval)
-        eval_cols_u: List[np.ndarray] = [head_e[c].astype(str).to_numpy(dtype=str, copy=False) for c in perm]
-
-        perm_idx = list(range(len(perm)))
-        best_score = self._evaluate_perm(perm_idx, eval_cols_u)
-        best_perm_idx = perm_idx[:]
-
-        max_iters = 3
-        for _ in range(max_iters):
+        for _ in range(local_iters):
             improved = False
-            for i in range(len(perm_idx) - 1):
-                cand = best_perm_idx[:]
-                cand[i], cand[i + 1] = cand[i + 1], cand[i]
-                sc = self._evaluate_perm(cand, eval_cols_u)
-                if sc > best_score:
-                    best_score = sc
-                    best_perm_idx = cand
-                    improved = True
+            cur = best_perm
+            cur_sc = best_sc
+            best_neighbor = cur
+            best_neighbor_sc = cur_sc
+            cur_list = list(cur)
+            for i in range(m - 1):
+                for j in range(i + 1, m):
+                    nl = cur_list[:]
+                    nl[i], nl[j] = nl[j], nl[i]
+                    np_ = tuple(nl)
+                    sc = approx_score(np_, n_refine)
+                    if sc > best_neighbor_sc:
+                        best_neighbor_sc = sc
+                        best_neighbor = np_
+            if best_neighbor_sc > best_sc:
+                best_perm = best_neighbor
+                best_sc = best_neighbor_sc
+                improved = True
             if not improved:
                 break
-            if time.time() - t0 > 9.5:
-                break
 
-        final_perm = [perm[i] for i in best_perm_idx]
-        return df2[final_perm]
+        # Add refined perm and neighbors for exact evaluation
+        more = [best_perm]
+        bp = list(best_perm)
+        for i in range(m - 1):
+            nl = bp[:]
+            nl[i], nl[i + 1] = nl[i + 1], nl[i]
+            more.append(tuple(nl))
+
+        for p in more:
+            if p not in seen:
+                seen.add(p)
+                candidates.append(p)
+
+        # Final selection using exact online LCP on a smaller sample
+        best_final = None
+        best_final_sc = -1
+        for p in candidates[: min(20, len(candidates))]:
+            sc = exact_score_perm(p, n_exact)
+            if sc > best_final_sc:
+                best_final_sc = sc
+                best_final = p
+
+        if best_final is None:
+            best_final = best_perm
+
+        final_cols = [cols[i] for i in best_final]
+        return df_work.loc[:, final_cols]

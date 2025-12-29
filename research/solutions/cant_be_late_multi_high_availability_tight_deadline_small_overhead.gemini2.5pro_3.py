@@ -1,6 +1,6 @@
 import json
-import math
 from argparse import Namespace
+import numpy as np
 
 from sky_spot.strategies.multi_strategy import MultiRegionStrategy
 from sky_spot.utils import ClusterType
@@ -9,17 +9,11 @@ from sky_spot.utils import ClusterType
 class Solution(MultiRegionStrategy):
     """Your multi-region scheduling strategy."""
 
-    NAME = "Cant-Be-Late_Strategy"  # REQUIRED: unique identifier
+    NAME = "expert_scheduler"  # REQUIRED: unique identifier
 
     def solve(self, spec_path: str) -> "Solution":
         """
         Initialize the solution from spec_path config.
-
-        The spec file contains:
-        - deadline: deadline in hours
-        - duration: task duration in hours
-        - overhead: restart overhead in hours
-        - trace_files: list of trace file paths (one per region)
         """
         with open(spec_path) as f:
             config = json.load(f)
@@ -29,74 +23,124 @@ class Solution(MultiRegionStrategy):
             task_duration_hours=[float(config["duration"])],
             restart_overhead_hours=[float(config["overhead"])],
             inter_task_overhead=[0.0],
+            # Pass trace_files to the base class, which might use it
+            trace_files=config.get("trace_files", [])
         )
         super().__init__(args)
+
+        # Load and process traces for our own logic
+        self.all_traces = []
+        if "trace_files" in config:
+            for trace_file in config["trace_files"]:
+                try:
+                    with open(trace_file, 'r') as f:
+                        # Assuming a simple format: one number (0 or 1) per line
+                        trace = [bool(int(line.strip())) for line in f if line.strip()]
+                    self.all_traces.append(np.array(trace, dtype=bool))
+                except (IOError, ValueError):
+                    # Handle cases where a trace file might be empty or invalid
+                    self.all_traces.append(np.array([], dtype=bool))
+        
+        num_regions = len(self.all_traces)
+        if num_regions == 0:
+            self.region_quality = []
+            # Set a default threshold: wait only if slack > one restart overhead
+            self.wait_slack_threshold = self.restart_overhead + 1.0
+            return self
+
+        # Pre-compute statistics from traces
+        self.spot_availability_rates = []
+        for trace in self.all_traces:
+            if trace.size > 0:
+                self.spot_availability_rates.append(np.mean(trace))
+            else:
+                self.spot_availability_rates.append(0.0)
+        self.region_quality = np.argsort(self.spot_availability_rates)[::-1].tolist()
+
+        # Calculate average downtime for a more informed waiting strategy
+        total_downtime_steps = 0
+        total_downtime_periods = 0
+        for r in range(num_regions):
+            trace = self.all_traces[r]
+            if trace.size == 0 or not np.any(~trace): # No downtime if all available
+                 continue
+
+            in_downtime = False
+            current_downtime = 0
+            for available in trace:
+                if not available:
+                    if not in_downtime:
+                        in_downtime = True
+                        total_downtime_periods += 1
+                    current_downtime += 1
+                elif in_downtime:
+                    in_downtime = False
+                    total_downtime_steps += current_downtime
+                    current_downtime = 0
+            if in_downtime:
+                total_downtime_steps += current_downtime
+
+        if total_downtime_periods > 0:
+            avg_global_downtime_steps = total_downtime_steps / total_downtime_periods
+        else:
+            avg_global_downtime_steps = 0
+
+        avg_global_downtime_s = avg_global_downtime_steps * self.env.gap_seconds
+        
+        # Threshold for waiting: wait if slack > avg downtime + one safety restart overhead
+        self.wait_slack_threshold = avg_global_downtime_s + self.restart_overhead
+
         return self
 
     def _step(self, last_cluster_type: ClusterType, has_spot: bool) -> ClusterType:
         """
         Decide next action based on current state.
         """
-        # 1. Calculate current state variables
-        work_done = sum(self.task_done_time)
-        remaining_work = self.task_duration - work_done
+        progress = sum(self.task_done_time)
+        work_rem = self.task_duration - progress
 
-        # If the task is finished, do nothing to save cost.
-        if remaining_work <= 1e-9:
+        # 1. Termination condition: If the task is done, do nothing.
+        if work_rem <= 0:
             return ClusterType.NONE
 
-        time_to_deadline = self.deadline - self.env.elapsed_seconds
-        gap = self.env.gap_seconds
+        t = self.elapsed_seconds
+        time_left = self.deadline - t
+        slack = time_left - work_rem
 
-        # If already past the deadline, stop incurring costs.
-        if time_to_deadline < 0:
-            return ClusterType.NONE
-
-        # 2. Determine if we are in "panic mode"
-        if gap > 0:
-            n_steps_work = math.ceil(remaining_work / gap)
-        else:
-            n_steps_work = float('inf') if remaining_work > 0 else 0
-
-        # Time required to finish if we switch to On-Demand now, assuming the
-        # switch costs one timestep of progress.
-        time_needed_for_od_finish = (1 + n_steps_work) * gap
-
-        # A safety buffer to absorb one failure (e.g., a Spot preemption or a
-        # failed region-hop). A failure costs one timestep.
-        safety_buffer = gap
-        
-        # The panic threshold is the time needed to finish on OD plus the safety buffer.
-        # If time to deadline is less than this, we can't risk a failure.
-        panic_threshold = time_needed_for_od_finish + safety_buffer
-
-        is_panic_mode = time_to_deadline < panic_threshold
-
-        # 3. Choose action based on mode
-        if is_panic_mode:
-            # Not enough slack to risk a failure. Must use the reliable On-Demand
-            # option to guarantee completion.
+        # 2. Criticality Check (Danger Zone):
+        # If time left is less than work remaining plus a safety buffer for one
+        # potential preemption, we must use the reliable On-Demand instance.
+        if time_left <= work_rem + self.restart_overhead:
             return ClusterType.ON_DEMAND
+
+        # 3. Preferred Case: Spot is available in the current region.
+        if has_spot:
+            return ClusterType.SPOT
+
+        # 4. No Spot Locally: Search for Spot in other regions.
+        # This is only advisable if it's safe to incur the restart overhead
+        # from switching regions. We check if we have enough slack for both
+        # the switch and a potential future preemption.
+        is_safe_to_switch = (slack > 2 * self.restart_overhead)
+        if is_safe_to_switch and self.all_traces:
+            timestep = int(round(t / self.env.gap_seconds))
+            current_region = self.env.get_current_region()
+
+            # Iterate through regions, from best to worst availability
+            for region_idx in self.region_quality:
+                if region_idx == current_region:
+                    continue
+                
+                trace = self.all_traces[region_idx]
+                if timestep < trace.size and trace[timestep]:
+                    self.env.switch_region(region_idx)
+                    return ClusterType.SPOT
+
+        # 5. No Spot Anywhere (or Unsafe to Switch):
+        # Decide between waiting (NONE) and using On-Demand locally.
+        if slack > self.wait_slack_threshold:
+            # We have enough slack to wait for Spot to (hopefully) reappear.
+            return ClusterType.NONE
         else:
-            # We have enough slack time, so prioritize low cost.
-            if has_spot:
-                # Best case: cheap Spot resource is available.
-                return ClusterType.SPOT
-            else:
-                # No Spot in the current region.
-                num_regions = self.env.get_num_regions()
-                if num_regions > 1:
-                    # Gamble on finding a Spot instance in another region.
-                    current_region = self.env.get_current_region()
-                    next_region = (current_region + 1) % num_regions
-                    self.env.switch_region(next_region)
-                    
-                    # Switching forces a restart, so no work is done this step.
-                    # Return NONE to avoid paying for an unused instance.
-                    return ClusterType.NONE
-                else:
-                    # Only one region and no Spot. Nowhere else to look.
-                    # Since we are not in panic mode, we can afford to wait.
-                    # The panic logic will eventually force a switch to On-Demand
-                    # if Spot availability does not resume.
-                    return ClusterType.NONE
+            # Slack is low; we must make progress now to avoid future risk.
+            return ClusterType.ON_DEMAND

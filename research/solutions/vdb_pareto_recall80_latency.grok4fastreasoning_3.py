@@ -1,20 +1,21 @@
-import numpy as np
 import faiss
+import numpy as np
 from typing import Tuple
 
-class FastIndex:
+class LatencyOptimizedIndex:
     def __init__(self, dim: int, **kwargs):
-        self.dim = dim
-        M = kwargs.get('M', 16)
-        self.index = faiss.IndexHNSWFlat(dim, M)
-        ef_construction = kwargs.get('ef_construction', 100)
-        self.index.hnsw.efConstruction = ef_construction
-        ef_search = kwargs.get('ef_search', 32)
-        self.index.hnsw.efSearch = ef_search
+        quantizer = faiss.IndexFlatL2(dim)
+        nlist = kwargs.get('nlist', 1000)
+        self.index = faiss.IndexIVFFlat(quantizer, dim, nlist)
+        self.trained = False
 
     def add(self, xb: np.ndarray) -> None:
-        self.index.add(xb.astype(np.float32))
+        if not self.trained:
+            self.index.train(xb)
+            self.trained = True
+        self.index.add(xb)
 
     def search(self, xq: np.ndarray, k: int) -> Tuple[np.ndarray, np.ndarray]:
-        D, I = self.index.search(xq.astype(np.float32), k)
-        return D.astype(np.float32), I.astype(np.int64)
+        self.index.nprobe = 50
+        distances, indices = self.index.search(xq, k)
+        return distances.astype(np.float32), indices.astype(np.int64)

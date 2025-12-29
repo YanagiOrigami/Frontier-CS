@@ -1,19 +1,14 @@
 import torch
+import triton
+import triton.language as tl
 
 class Solution:
     def solve(self, spec_path: str = None) -> dict:
-        code = r"""
+        code = """
 import torch
 import triton
 import triton.language as tl
 
-@triton.autotune(
-    configs=[
-        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 64}, num_warps=4, num_stages=2),
-        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 64}, num_warps=4, num_stages=2),
-    ],
-    key=['M', 'N'],
-)
 @triton.jit
 def _ragged_attn_kernel(
     Q, K, V, RowLens, Out,
@@ -23,110 +18,124 @@ def _ragged_attn_kernel(
     stride_om, stride_od,
     sm_scale,
     M, N,
-    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_D: tl.constexpr
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
+    BLOCK_DMODEL: tl.constexpr, BLOCK_DVALUE: tl.constexpr
 ):
-    pid = tl.program_id(0)
-    start_m = pid * BLOCK_M
-    offs_m = start_m + tl.arange(0, BLOCK_M)
+    # Program ID and offsets
+    start_m = tl.program_id(0)
+    offs_m = start_m * BLOCK_M + tl.arange(0, BLOCK_M)
     
-    # Boundary check for M
-    mask_m = offs_m < M
+    # Boundary mask for Query rows
+    m_mask = offs_m < M
+
+    # Load row lengths for the current block of queries
+    # row_lens: (M,)
+    rl = tl.load(RowLens + offs_m, mask=m_mask, other=0)
     
-    # Load row lengths: shape (M,)
-    # These define the valid N count for each query row
-    r_lens = tl.load(RowLens + offs_m, mask=mask_m, other=0)
-    
-    # Initialize pointers for Q, Output
-    offs_d = tl.arange(0, BLOCK_D)
+    # Q pointers and loading
+    offs_d = tl.arange(0, BLOCK_DMODEL)
     q_ptrs = Q + (offs_m[:, None] * stride_qm + offs_d[None, :] * stride_qd)
+    # Load Q, mask with m_mask and D dimensions
+    q = tl.load(q_ptrs, mask=m_mask[:, None] & (offs_d[None, :] < BLOCK_DMODEL), other=0.0)
+    q = q * sm_scale
     
-    # Accumulators for streaming softmax
-    # m_i: max logit
-    # l_i: sum of exponentials
-    # acc: accumulated attention output
-    m_i = tl.zeros([BLOCK_M], dtype=tl.float32) - float('inf')
+    # Initialize streaming softmax accumulators
+    # m_i: max score so far
+    # l_i: sum of exponentials so far
+    # acc: accumulated output
+    m_i = tl.full([BLOCK_M], float("-inf"), dtype=tl.float32)
     l_i = tl.zeros([BLOCK_M], dtype=tl.float32)
-    acc = tl.zeros([BLOCK_M, BLOCK_D], dtype=tl.float32)
+    acc = tl.zeros([BLOCK_M, BLOCK_DVALUE], dtype=tl.float32)
     
-    # Load Q block
-    # Masking required if M is not a multiple of BLOCK_M
-    q = tl.load(q_ptrs, mask=mask_m[:, None], other=0.0)
+    offs_n = tl.arange(0, BLOCK_N)
+    offs_dv = tl.arange(0, BLOCK_DVALUE)
     
-    # Loop over K, V blocks
+    # Loop over K/V blocks
+    # We iterate over the full range 0..N.
+    # Masking handles the ragged nature.
     for start_n in range(0, N, BLOCK_N):
-        offs_n = start_n + tl.arange(0, BLOCK_N)
-        mask_n = offs_n < N
+        cols = start_n + offs_n
         
-        # Load K block: (BLOCK_N, BLOCK_D)
-        # Ensure coalesced read: offs_d is inner dimension
-        k_ptrs = K + (offs_n[:, None] * stride_kn + offs_d[None, :] * stride_kd)
-        k = tl.load(k_ptrs, mask=mask_n[:, None], other=0.0)
+        # Create masks
+        # 1. Physical boundary: cols < N
+        # 2. Ragged boundary: cols < row_lens[i]
+        # Broadcast cols to (BLOCK_M, BLOCK_N)
+        k_mask_n = cols < N
+        ragged_mask = cols[None, :] < rl[:, None]
+        mask = k_mask_n[None, :] & ragged_mask
+        
+        # Load K block
+        # Shape: (BLOCK_N, D)
+        k_ptrs = K + (cols[:, None] * stride_kn + offs_d[None, :] * stride_kd)
+        k = tl.load(k_ptrs, mask=k_mask_n[:, None] & (offs_d[None, :] < BLOCK_DMODEL), other=0.0)
         
         # Compute scores: Q @ K.T
-        # q: (BLOCK_M, D), k: (BLOCK_N, D) -> qk: (BLOCK_M, BLOCK_N)
+        # q: (BLOCK_M, D), k: (BLOCK_N, D) -> result (BLOCK_M, BLOCK_N)
         qk = tl.dot(q, tl.trans(k))
-        qk *= sm_scale
         
-        # Ragged Masking
-        # Valid if current column index < row_len for that row
-        # offs_n: (BLOCK_N,), r_lens: (BLOCK_M,)
-        ragged_mask = offs_n[None, :] < r_lens[:, None]
+        # Apply mask (set invalid scores to -inf)
+        qk = tl.where(mask, qk, float("-inf"))
         
-        # Combine with boundary mask_n (needed if N is not multiple of BLOCK_N)
-        # and ensure we mask out padding from K loading
-        ragged_mask = ragged_mask & mask_n[None, :]
+        # --- Online Softmax Update ---
         
-        # Apply mask
-        qk = tl.where(ragged_mask, qk, float('-inf'))
+        # 1. Compute current block max
+        m_curr = tl.max(qk, 1)
         
-        # Softmax update (streaming)
-        m_curr = tl.max(qk, 1) # (BLOCK_M,)
+        # 2. Update global max
         m_new = tl.maximum(m_i, m_curr)
         
-        # Compute exponents
+        # 3. Compute scaling factors
         alpha = tl.exp(m_i - m_new)
-        beta = tl.exp(qk - m_new[:, None])
+        p = tl.exp(qk - m_new[:, None])
         
-        # Update denominator
-        l_i = l_i * alpha + tl.sum(beta, 1)
+        # 4. Update normalization sum
+        l_new = l_i * alpha + tl.sum(p, 1)
         
-        # Load V block: (BLOCK_N, BLOCK_D)
-        v_ptrs = V + (offs_n[:, None] * stride_vn + offs_d[None, :] * stride_vd)
-        v = tl.load(v_ptrs, mask=mask_n[:, None], other=0.0)
+        # 5. Accumulate output
+        # Load V block
+        v_ptrs = V + (cols[:, None] * stride_vn + offs_dv[None, :] * stride_vd)
+        v = tl.load(v_ptrs, mask=k_mask_n[:, None] & (offs_dv[None, :] < BLOCK_DVALUE), other=0.0)
         
-        # Update numerator
-        # acc = acc * alpha + beta @ V
+        # Rescale accumulator
         acc = acc * alpha[:, None]
-        acc += tl.dot(beta.to(tl.float16), v)
+        # Add new contribution: p @ v
+        # p is fp32, cast to fp16 for mixed precision dot if needed, or keep precision.
+        # Standard: cast P to fp16 for tensor core MMA
+        acc += tl.dot(p.to(tl.float16), v)
         
-        # Update max
+        # Update running stats
+        l_i = l_new
         m_i = m_new
-        
+
     # Finalize
-    # Normalize by sum of weights
-    # Add epsilon to avoid division by zero (e.g., if row_len is 0)
-    l_recip = 1.0 / (l_i + 1e-6)
-    out = acc * l_recip[:, None]
+    # Normalize by l_i
+    # Handle potentially zero l_i (if row_lens was 0, though inputs usually > 0)
+    l_i = tl.where(l_i == 0.0, 1.0, l_i)
+    out = acc / l_i[:, None]
     
-    # Store result
-    out_ptrs = Out + (offs_m[:, None] * stride_om + offs_d[None, :] * stride_od)
-    tl.store(out_ptrs, out.to(tl.float16), mask=mask_m[:, None])
+    # Store output
+    out_ptrs = Out + (offs_m[:, None] * stride_om + offs_dv[None, :] * stride_od)
+    tl.store(out_ptrs, out.to(tl.float16), mask=m_mask[:, None] & (offs_dv[None, :] < BLOCK_DVALUE))
 
 def ragged_attn(Q: torch.Tensor, K: torch.Tensor, V: torch.Tensor, row_lens: torch.Tensor) -> torch.Tensor:
     M, D = Q.shape
     N, _ = K.shape
     _, Dv = V.shape
     
-    # Check constraints
-    assert D == 64 and Dv == 64, "Dimension must be 64 for this kernel configuration"
-    
     # Allocate output
     O = torch.empty((M, Dv), device=Q.device, dtype=torch.float16)
     
-    sm_scale = 1.0 / (D ** 0.5)
+    # Tuning parameters
+    # BLOCK_M=128, BLOCK_N=64 works well for medium sized D=64
+    BLOCK_M = 128
+    BLOCK_N = 64
+    num_warps = 4
+    num_stages = 3
     
-    # Launch kernel
-    grid = lambda META: (triton.cdiv(M, META['BLOCK_M']), )
+    # Grid configuration
+    grid = (triton.cdiv(M, BLOCK_M), 1, 1)
+    
+    sm_scale = 1.0 / (D ** 0.5)
     
     _ragged_attn_kernel[grid](
         Q, K, V, row_lens, O,
@@ -136,7 +145,9 @@ def ragged_attn(Q: torch.Tensor, K: torch.Tensor, V: torch.Tensor, row_lens: tor
         O.stride(0), O.stride(1),
         sm_scale,
         M, N,
-        BLOCK_D=64
+        BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N,
+        BLOCK_DMODEL=D, BLOCK_DVALUE=Dv,
+        num_warps=num_warps, num_stages=num_stages
     )
     
     return O

@@ -1,158 +1,162 @@
-import textwrap
-
-class Solution:
-    def solve(self, spec_path: str = None) -> dict:
-        code = textwrap.dedent("""
 import torch
 import triton
 import triton.language as tl
-import math
 
+# The Triton kernel and flash_attn function must be defined before the Solution class
+# so they can be packaged as a string.
+
+_flash_attn_code_str = """
+import torch
+import triton
+import triton.language as tl
+
+@triton.autotune(
+    configs=[
+        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 64}, num_stages=3, num_warps=4),
+        triton.Config({'BLOCK_M': 256, 'BLOCK_N': 64}, num_stages=3, num_warps=8),
+        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128}, num_stages=3, num_warps=8),
+        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 64}, num_stages=4, num_warps=4),
+        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 64}, num_stages=4, num_warps=4),
+        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 32}, num_stages=5, num_warps=4),
+        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 128}, num_stages=3, num_warps=4),
+        triton.Config({'BLOCK_M': 256, 'BLOCK_N': 128}, num_stages=3, num_warps=8),
+    ],
+    key=['causal', 'M', 'N', 'Dq'],
+)
 @triton.jit
 def _flash_attn_kernel(
-    Q_ptr, K_ptr, V_ptr, O_ptr,
-    stride_qz, stride_qh, stride_qm, stride_qd,
-    stride_kz, stride_kh, stride_kn, stride_kd,
-    stride_vz, stride_vh, stride_vn, stride_vd,
-    stride_oz, stride_oh, stride_om, stride_od,
-    M, N,
+    Q, K, V, O,
+    s_q_z, s_q_h, s_q_m, s_q_d,
+    s_k_z, s_k_h, s_k_n, s_k_d,
+    s_v_z, s_v_h, s_v_n, s_v_d,
+    s_o_z, s_o_h, s_o_m, s_o_d,
+    Z, H, M, N, Dq,
     sm_scale,
     causal: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
-    D_HEAD: tl.constexpr,
+    BLOCK_D: tl.constexpr,
 ):
-    # This program computes a single block of the output matrix O.
-    # The grid is 2D: (Z * H, cdiv(M, BLOCK_M)).
-    # pid_zh identifies the batch and head.
-    # pid_m_block identifies the block of rows in the M dimension.
+    # Grid and program IDs
+    start_m = tl.program_id(0)
+    batch_head_id = tl.program_id(1)
     
-    pid_m_block = tl.program_id(1)
-    pid_zh = tl.program_id(0)
+    # Decompose batch_head_id into z and h
+    z_id = batch_head_id // H
+    h_id = batch_head_id % H
 
-    # Compute offsets for the current block of queries
-    start_m = pid_m_block * BLOCK_M
-    offs_m = start_m + tl.arange(0, BLOCK_M)
-    offs_d = tl.arange(0, D_HEAD)
-
-    # Pointers to the current block of Q
-    q_ptrs = Q_ptr + pid_zh * stride_qh + offs_m[:, None] * stride_qm + offs_d[None, :] * stride_qd
+    # Pointers to Q and O tiles
+    q_offset_m = start_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    q_offset_d = tl.arange(0, BLOCK_D)
+    q_ptrs = Q + z_id * s_q_z + h_id * s_q_h + (q_offset_m[:, None] * s_q_m + q_offset_d[None, :] * s_q_d)
     
-    # Initialize accumulator, and online softmax statistics
-    acc = tl.zeros([BLOCK_M, D_HEAD], dtype=tl.float32)
+    o_offset_m = q_offset_m
+    o_offset_d = q_offset_d
+    o_ptrs = O + z_id * s_o_z + h_id * s_o_h + (o_offset_m[:, None] * s_o_m + o_offset_d[None, :] * s_o_d)
+
+    # Initialize streaming softmax statistics
     m_i = tl.full([BLOCK_M], -float('inf'), dtype=tl.float32)
     l_i = tl.zeros([BLOCK_M], dtype=tl.float32)
-    
-    # Load Q. Mask out rows that are beyond the actual sequence length M.
-    q_mask = offs_m[:, None] < M
+    acc = tl.zeros([BLOCK_M, BLOCK_D], dtype=tl.float32)
+
+    # Load Q tile
+    q_mask = q_offset_m[:, None] < M
     q = tl.load(q_ptrs, mask=q_mask, other=0.0)
+    q = (q * sm_scale).to(tl.float16)
 
-    # Base pointers for K and V for the current batch/head
-    k_ptrs_base = K_ptr + pid_zh * stride_kh
-    v_ptrs_base = V_ptr + pid_zh * stride_vh
-
-    # Loop over blocks of K and V
-    # If causal, the M-th query can only attend to the first M keys.
-    # This is handled by adjusting the loop end.
-    loop_end = N
-    if causal:
-        loop_end = (pid_m_block + 1) * BLOCK_M
-
-    for start_n in range(0, loop_end, BLOCK_N):
-        offs_n = start_n + tl.arange(0, BLOCK_N)
-        
-        # Pointers to the current block of K and V
-        k_ptrs = k_ptrs_base + offs_n[:, None] * stride_kn + offs_d[None, :] * stride_kd
-        v_ptrs = v_ptrs_base + offs_n[:, None] * stride_vn + offs_d[None, :] * stride_vd
-        
-        # Load K and V. Mask out columns beyond the actual sequence length N.
-        k_mask = offs_n[:, None] < N
-        k = tl.load(k_ptrs, mask=k_mask, other=0.0)
-        v = tl.load(v_ptrs, mask=k_mask, other=0.0)
-        
-        # Compute scaled dot-product S = Q * K^T * sm_scale
-        s_ij = tl.dot(q, tl.trans(k)) * sm_scale
-        
-        # Apply causal mask. Zeros out scores for keys that are "in the future".
-        if causal:
-            causal_mask = offs_m[:, None] >= offs_n[None, :]
-            s_ij = tl.where(causal_mask, s_ij, -float('inf'))
-            
-        # --- Online softmax calculation ---
-        # 1. Find the new maximum of the current scores
-        m_ij = tl.max(s_ij, axis=1)
-        # 2. Rescale previous max and find the new overall max
-        m_new = tl.maximum(m_i, m_ij)
-        # 3. Rescale previous sum and accumulator
-        alpha = tl.exp(m_i - m_new)
-        acc = acc * alpha[:, None]
-        l_i = l_i * alpha
-        # 4. Compute probabilities for the current block
-        p_ij = tl.exp(s_ij - m_new[:, None])
-        # 5. Update sum and accumulator
-        l_i += tl.sum(p_ij, axis=1)
-        acc += tl.dot(p_ij.to(Q_ptr.dtype.element_ty), v)
-        # 6. Update the max for the next iteration
-        m_i = m_new
-
-    # Final normalization of the accumulator
-    o = acc / l_i[:, None]
+    # Base pointers for K and V
+    k_base_ptr = K + z_id * s_k_z + h_id * s_k_h
+    v_base_ptr = V + z_id * s_v_z + h_id * s_v_h
     
-    # Write the output block to global memory
-    o_ptrs = O_ptr + pid_zh * stride_oh + offs_m[:, None] * stride_om + offs_d[None, :] * stride_od
-    o_mask = offs_m[:, None] < M
-    tl.store(o_ptrs, o.to(O_ptr.dtype.element_ty), mask=o_mask)
+    k_offset_d = tl.arange(0, BLOCK_D)
+    v_offset_d = tl.arange(0, BLOCK_D)
+
+    # Loop over K, V blocks
+    # For causal attention, we only iterate up to the current query block
+    end_n = N if not causal else (start_m + 1) * BLOCK_M
+    end_n = tl.minimum(end_n, N)
+
+    for start_n in range(0, end_n, BLOCK_N):
+        # -- Load K tile --
+        k_offset_n = start_n + tl.arange(0, BLOCK_N)
+        k_ptrs = k_base_ptr + (k_offset_d[:, None] * s_k_d + k_offset_n[None, :] * s_k_n)
+        k_mask = k_offset_n[None, :] < N
+        k = tl.load(k_ptrs, mask=k_mask, other=0.0)
+
+        # -- Compute S = Q @ K.T --
+        s = tl.dot(q, k)
+
+        # -- Apply causal mask --
+        if causal:
+            m_range = start_m * BLOCK_M + tl.arange(0, BLOCK_M)
+            n_range = start_n + tl.arange(0, BLOCK_N)
+            causal_mask = m_range[:, None] >= n_range[None, :]
+            s = tl.where(causal_mask, s, -float('inf'))
+
+        # -- Streaming softmax update --
+        m_ij = tl.max(s, 1)
+        m_new = tl.maximum(m_i, m_ij)
+        
+        alpha = tl.exp(m_i - m_new)
+        beta = tl.exp(s - m_new[:, None])
+        
+        l_new = alpha * l_i + tl.sum(beta, 1)
+        
+        acc = acc * alpha[:, None]
+        
+        m_i = m_new
+        l_i = l_new
+        
+        # -- Load V tile and update accumulator --
+        v_offset_n = start_n + tl.arange(0, BLOCK_N)
+        v_ptrs = v_base_ptr + (v_offset_n[:, None] * s_v_n + v_offset_d[None, :] * s_v_d)
+        v_mask = v_offset_n[:, None] < N
+        v = tl.load(v_ptrs, mask=v_mask, other=0.0)
+        
+        beta = beta.to(tl.float16)
+        acc += tl.dot(beta, v)
+
+    # -- Final normalization and store --
+    l_i_safe = tl.where(l_i == 0, 1.0, l_i)
+    acc = acc / l_i_safe[:, None]
+
+    o_mask = o_offset_m[:, None] < M
+    tl.store(o_ptrs, acc.to(tl.float16), mask=o_mask)
+
 
 def flash_attn(Q: torch.Tensor, K: torch.Tensor, V: torch.Tensor, causal: bool = True) -> torch.Tensor:
-    """
-    Flash attention computation with optional causal masking.
-    
-    Args:
-        Q: Input tensor of shape (Z, H, M, Dq) - query tensor (float16)
-        K: Input tensor of shape (Z, H, N, Dq) - key tensor (float16)
-        V: Input tensor of shape (Z, H, N, Dv) - value tensor (float16)
-        causal: Whether to apply causal masking (default True)
-    
-    Returns:
-        Output tensor of shape (Z, H, M, Dv) - attention output (float16)
-    """
     Z, H, M, Dq = Q.shape
     _, _, N, Dv = V.shape
     
-    assert Dq == Dv, "This implementation requires head dimensions of Q and V to be equal."
-    D_HEAD = Dq
+    assert Dq == K.shape[3] and Dq == Dv, f"Feature dimensions must match, got Dq={Dq}, Dk={K.shape[3]}, Dv={Dv}"
+    assert Dq in {16, 32, 64, 128}, "Feature dimension must be one of {16, 32, 64, 128}"
     
-    O = torch.empty((Z, H, M, D_HEAD), device=Q.device, dtype=Q.dtype)
+    O = torch.empty_like(Q)
 
-    # Tuning parameters for the Triton kernel
-    BLOCK_M = 128
-    BLOCK_N = 64
-    
-    # The grid is 2D, with Z*H programs in the first dimension,
-    # and M / BLOCK_M programs in the second dimension.
-    grid = (Z * H, triton.cdiv(M, BLOCK_M))
-    
-    sm_scale = 1.0 / math.sqrt(D_HEAD)
-    
-    # Launch the Triton kernel.
-    # It's important to pass strides for correct memory access.
-    # Meta-parameters like block sizes and causal flag are passed as constexpr.
+    sm_scale = 1.0 / (Dq ** 0.5)
+
+    grid = lambda meta: (triton.cdiv(M, meta['BLOCK_M']), Z * H)
+
     _flash_attn_kernel[grid](
         Q, K, V, O,
         Q.stride(0), Q.stride(1), Q.stride(2), Q.stride(3),
         K.stride(0), K.stride(1), K.stride(2), K.stride(3),
         V.stride(0), V.stride(1), V.stride(2), V.stride(3),
         O.stride(0), O.stride(1), O.stride(2), O.stride(3),
-        M, N,
+        Z, H, M, N, Dq,
         sm_scale,
         causal=causal,
-        BLOCK_M=BLOCK_M,
-        BLOCK_N=BLOCK_N,
-        D_HEAD=D_HEAD,
-        num_warps=4,
-        num_stages=3
+        BLOCK_D=Dq
     )
     
     return O
-""")
-        return {"code": code}
+"""
+
+class Solution:
+    def solve(self, spec_path: str = None) -> dict:
+        """
+        Returns a dict with either:
+        - {"code": "python_code_string"}
+        - {"program_path": "path/to/kernel.py"}
+        """
+        return {"code": _flash_attn_code_str}

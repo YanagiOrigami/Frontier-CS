@@ -4,19 +4,15 @@ import triton.language as tl
 
 class Solution:
     def solve(self, spec_path: str = None) -> dict:
-        code = r"""
-import torch
-import triton
-import triton.language as tl
+        return {"program_path": __file__}
 
 @triton.autotune(
     configs=[
-        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 64}, num_warps=8, num_stages=3),
+        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 64}, num_warps=4, num_stages=3),
         triton.Config({'BLOCK_M': 64, 'BLOCK_N': 64}, num_warps=4, num_stages=3),
-        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 32}, num_warps=4, num_stages=3),
-        triton.Config({'BLOCK_M': 32, 'BLOCK_N': 64}, num_warps=4, num_stages=3),
+        triton.Config({'BLOCK_M': 32, 'BLOCK_N': 64}, num_warps=4, num_stages=2),
     ],
-    key=['M', 'N', 'D', 'Dv'],
+    key=['M', 'N'],
 )
 @triton.jit
 def _ragged_attn_kernel(
@@ -25,112 +21,95 @@ def _ragged_attn_kernel(
     stride_kn, stride_kd,
     stride_vn, stride_vd,
     stride_om, stride_od,
-    stride_lens,
-    M, N,
     sm_scale,
-    BLOCK_M: tl.constexpr,
-    BLOCK_N: tl.constexpr,
-    BLOCK_D: tl.constexpr,
-    BLOCK_DV: tl.constexpr,
+    M, N,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
+    BLOCK_D: tl.constexpr, BLOCK_DV: tl.constexpr
 ):
     pid = tl.program_id(0)
-    start_m = pid * BLOCK_M
-    offs_m = start_m + tl.arange(0, BLOCK_M)
     
-    # Mask for M
+    # Grid handling for M
+    offs_m = pid * BLOCK_M + tl.arange(0, BLOCK_M)
     mask_m = offs_m < M
-
-    # Load row_lens
-    off_lens = offs_m * stride_lens
-    row_lens = tl.load(RowLens + off_lens, mask=mask_m, other=0)
     
-    # Load Q
+    # Load row_lens for masking
+    # row_lens shape (M,)
+    rl_val = tl.load(RowLens + offs_m, mask=mask_m, other=0)
+    
     offs_d = tl.arange(0, BLOCK_D)
-    off_q = offs_m[:, None] * stride_qm + offs_d[None, :] * stride_qd
-    q = tl.load(Q + off_q, mask=mask_m[:, None], other=0.0)
-    q = q * sm_scale
-
+    
+    # Load Q: (BLOCK_M, BLOCK_D)
+    q_ptrs = Q + (offs_m[:, None] * stride_qm + offs_d[None, :] * stride_qd)
+    q = tl.load(q_ptrs, mask=mask_m[:, None], other=0.0)
+    
     # Initialize accumulators
     m_i = tl.full([BLOCK_M], float("-inf"), dtype=tl.float32)
     l_i = tl.zeros([BLOCK_M], dtype=tl.float32)
     acc = tl.zeros([BLOCK_M, BLOCK_DV], dtype=tl.float32)
-
-    offs_n_base = tl.arange(0, BLOCK_N)
+    
+    offs_n = tl.arange(0, BLOCK_N)
     offs_dv = tl.arange(0, BLOCK_DV)
     
-    # Loop over K blocks
+    # Base pointers for K and V
+    # K: (N, D), V: (N, Dv)
+    k_base = K + offs_d[None, :] * stride_kd
+    v_base = V + offs_dv[None, :] * stride_vd
+    
+    # Loop over N blocks
     for start_n in range(0, N, BLOCK_N):
-        cols = start_n + offs_n_base
+        cols = start_n + offs_n
         mask_n = cols < N
         
-        # Load K
-        off_k = cols[None, :] * stride_kn + offs_d[:, None] * stride_kd
-        k = tl.load(K + off_k, mask=mask_n[None, :], other=0.0)
+        # Load K block: (BLOCK_N, BLOCK_D)
+        k_ptrs = k_base + cols[:, None] * stride_kn
+        k = tl.load(k_ptrs, mask=mask_n[:, None], other=0.0)
         
-        # Compute scores
-        qk = tl.dot(q, k)
+        # Compute scores: Q (BM, D) @ K.T (D, BN) -> (BM, BN)
+        qk = tl.dot(q, tl.trans(k))
+        qk *= sm_scale
         
-        # Apply masks
-        # Mask 1: Global N boundary (redundant with mask_n but explicit for scores)
-        # Mask 2: Ragged lengths
-        is_valid = (cols[None, :] < row_lens[:, None]) & mask_n[None, :]
-        qk = tl.where(is_valid, qk, float("-inf"))
+        # Ragged Masking: check if column index < row_len for each query
+        mask_ragged = cols[None, :] < rl_val[:, None]
+        # Combine with valid N mask
+        mask_op = mask_ragged & mask_n[None, :]
+        
+        # Apply mask
+        qk = tl.where(mask_op, qk, float("-inf"))
         
         # Streaming Softmax
         m_curr = tl.max(qk, 1)
         m_new = tl.maximum(m_i, m_curr)
         
-        # Calculate alpha = exp(m_i - m_new)
-        # Handle -inf case to avoid NaN
-        diff = m_i - m_new
-        diff = tl.where(m_new == float("-inf"), 0.0, diff)
-        alpha = tl.exp(diff)
+        p = tl.exp(qk - m_new[:, None])
+        alpha = tl.exp(m_i - m_new)
         
-        # Calculate P = exp(qk - m_new)
-        exp_arg = qk - m_new[:, None]
-        # Avoid NaN if m_new is -inf
-        exp_arg = tl.where(m_new[:, None] == float("-inf"), float("-inf"), exp_arg)
-        p = tl.exp(exp_arg)
-        
-        # Update l_i
-        row_sum_p = tl.sum(p, 1)
-        l_i = l_i * alpha + row_sum_p
-        
-        # Load V
-        off_v = cols[:, None] * stride_vn + offs_dv[None, :] * stride_vd
-        v = tl.load(V + off_v, mask=mask_n[:, None], other=0.0)
-        
-        # Accumulate
-        p = p.to(tl.float16)
-        pv = tl.dot(p, v)
-        acc = acc * alpha[:, None] + pv
-        
+        l_i = l_i * alpha + tl.sum(p, 1)
         m_i = m_new
-
-    # Finalize
-    # Out = acc / l_i
-    # Handle l_i == 0 (rows with 0 length or all masked)
-    out = acc / l_i[:, None]
-    out = tl.where(l_i[:, None] == 0.0, 0.0, out)
+        
+        # Load V block: (BLOCK_N, BLOCK_DV)
+        v_ptrs = v_base + cols[:, None] * stride_vn
+        v = tl.load(v_ptrs, mask=mask_n[:, None], other=0.0)
+        
+        # Accumulate: P (BM, BN) @ V (BN, BDV) -> (BM, BDV)
+        # Cast P to float16 for mixed precision dot product
+        acc = acc * alpha[:, None] + tl.dot(p.to(tl.float16), v)
     
-    # Store
-    off_o = offs_m[:, None] * stride_om + offs_dv[None, :] * stride_od
-    tl.store(Out + off_o, out.to(tl.float16), mask=mask_m[:, None])
+    # Normalize and Store Output
+    out = acc / l_i[:, None]
+    out_ptrs = Out + (offs_m[:, None] * stride_om + offs_dv[None, :] * stride_od)
+    tl.store(out_ptrs, out.to(tl.float16), mask=mask_m[:, None])
 
 def ragged_attn(Q: torch.Tensor, K: torch.Tensor, V: torch.Tensor, row_lens: torch.Tensor) -> torch.Tensor:
     M, D = Q.shape
     N, _ = K.shape
     _, Dv = V.shape
     
-    # Ensure row_lens is int32
-    if row_lens.dtype != torch.int32:
-        row_lens = row_lens.to(torch.int32)
-        
-    O = torch.empty((M, Dv), dtype=Q.dtype, device=Q.device)
+    # Prepare output tensor
+    O = torch.empty((M, Dv), device=Q.device, dtype=torch.float16)
     
     sm_scale = 1.0 / (D ** 0.5)
     
-    grid = lambda META: (triton.cdiv(M, META['BLOCK_M']), )
+    grid = lambda META: (triton.cdiv(M, META['BLOCK_M']),)
     
     _ragged_attn_kernel[grid](
         Q, K, V, row_lens, O,
@@ -138,13 +117,9 @@ def ragged_attn(Q: torch.Tensor, K: torch.Tensor, V: torch.Tensor, row_lens: tor
         K.stride(0), K.stride(1),
         V.stride(0), V.stride(1),
         O.stride(0), O.stride(1),
-        row_lens.stride(0),
-        M, N,
         sm_scale,
-        BLOCK_D=D,
-        BLOCK_DV=Dv
+        M, N,
+        BLOCK_D=D, BLOCK_DV=Dv
     )
     
     return O
-"""
-        return {"code": code}

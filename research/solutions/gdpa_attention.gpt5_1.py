@@ -9,156 +9,152 @@ class Solution:
             import triton
             import triton.language as tl
 
+            def _next_power_of_2(x: int) -> int:
+                if x <= 1:
+                    return 1
+                return 1 << (x - 1).bit_length()
+
             @triton.jit
-            def _gdpa_fwd_kernel(
+            def gdpa_fwd(
                 Q_ptr, K_ptr, V_ptr, GQ_ptr, GK_ptr, O_ptr,
-                Z, H, M,
+                Z, H, M, N, DQ, DV,
                 stride_qz, stride_qh, stride_qm, stride_qd,
                 stride_kz, stride_kh, stride_kn, stride_kd,
                 stride_vz, stride_vh, stride_vn, stride_vd,
                 stride_gqz, stride_gqh, stride_gqm, stride_gqd,
                 stride_gkz, stride_gkh, stride_gkn, stride_gkd,
                 stride_oz, stride_oh, stride_om, stride_od,
-                sm_scale: tl.constexpr,
-                N_CTX: tl.constexpr,
-                D_HEAD: tl.constexpr,
-                D_VALUE: tl.constexpr,
-                BLOCK_M: tl.constexpr,
-                BLOCK_N: tl.constexpr,
+                sm_scale,
+                BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
+                HEAD_DIM: tl.constexpr, HEAD_DV: tl.constexpr
             ):
-                pid = tl.program_id(axis=0)
-                num_m = tl.cdiv(M, BLOCK_M)
-                total_hz = Z * H
-                hz_id = pid // num_m
-                m_block_id = pid % num_m
-                z_id = hz_id // H
-                h_id = hz_id % H
+                pid_z = tl.program_id(0)
+                pid_h = tl.program_id(1)
+                pid_m = tl.program_id(2)
 
-                m_offs = m_block_id * BLOCK_M + tl.arange(0, BLOCK_M)
-                n_offs_base = tl.arange(0, BLOCK_N)
-                d_offs = tl.arange(0, D_HEAD)
-                dv_offs = tl.arange(0, D_VALUE)
+                offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+                offs_d = tl.arange(0, HEAD_DIM)
+                offs_dv = tl.arange(0, HEAD_DV)
 
-                # Pointers for Q and GQ
-                q_ptrs = Q_ptr + z_id * stride_qz + h_id * stride_qh + m_offs[:, None] * stride_qm + d_offs[None, :] * stride_qd
-                gq_ptrs = GQ_ptr + z_id * stride_gqz + h_id * stride_gqh + m_offs[:, None] * stride_gqm + d_offs[None, :] * stride_gqd
+                # Base pointers per (z,h)
+                q_base = Q_ptr + pid_z * stride_qz + pid_h * stride_qh
+                k_base = K_ptr + pid_z * stride_kz + pid_h * stride_kh
+                v_base = V_ptr + pid_z * stride_vz + pid_h * stride_vh
+                gq_base = GQ_ptr + pid_z * stride_gqz + pid_h * stride_gqh
+                gk_base = GK_ptr + pid_z * stride_gkz + pid_h * stride_gkh
+                o_base = O_ptr + pid_z * stride_oz + pid_h * stride_oh
 
-                # Load Q and GQ, apply gating
-                q = tl.load(q_ptrs, mask=(m_offs[:, None] < M), other=0.0)
-                gq = tl.load(gq_ptrs, mask=(m_offs[:, None] < M), other=0.0)
-                gq_f32 = gq.to(tl.float32)
-                gate_q = 1.0 / (1.0 + tl.exp(-gq_f32))
-                qg = q * gate_q.to(q.dtype)
+                # Load Q and GQ, apply gating: Qg = Q * sigmoid(GQ)
+                q_ptrs = q_base + (offs_m[:, None] * stride_qm + offs_d[None, :] * stride_qd)
+                gq_ptrs = gq_base + (offs_m[:, None] * stride_gqm + offs_d[None, :] * stride_gqd)
+                q_mask = (offs_m[:, None] < M) & (offs_d[None, :] < DQ)
+                q = tl.load(q_ptrs, mask=q_mask, other=0.0).to(tl.float32)
+                gq = tl.load(gq_ptrs, mask=q_mask, other=0.0).to(tl.float32)
+                gate_q = 1.0 / (1.0 + tl.exp(-gq))
+                q = q * gate_q
 
-                # Initialize streaming softmax state
-                m_i = tl.full([BLOCK_M], -float("inf"), dtype=tl.float32)
+                # Streaming softmax vars
+                neg_inf = float("-inf")
+                m_i = tl.full([BLOCK_M], neg_inf, dtype=tl.float32)
                 l_i = tl.zeros([BLOCK_M], dtype=tl.float32)
-                acc = tl.zeros([BLOCK_M, D_VALUE], dtype=tl.float32)
+                acc = tl.zeros([BLOCK_M, HEAD_DV], dtype=tl.float32)
 
-                # Loop over K/V blocks
-                for n_start in range(0, N_CTX, BLOCK_N):
-                    n_offs = n_start + n_offs_base
+                # Iterate over key/value blocks
+                for start_n in range(0, N, BLOCK_N):
+                    offs_n = start_n + tl.arange(0, BLOCK_N)
 
-                    # Load K and GK, apply gating
-                    k_ptrs = K_ptr + z_id * stride_kz + h_id * stride_kh + n_offs[:, None] * stride_kn + d_offs[None, :] * stride_kd
-                    gk_ptrs = GK_ptr + z_id * stride_gkz + h_id * stride_gkh + n_offs[:, None] * stride_gkn + d_offs[None, :] * stride_gkd
-                    k = tl.load(k_ptrs, mask=(n_offs[:, None] < N_CTX), other=0.0)
-                    gk = tl.load(gk_ptrs, mask=(n_offs[:, None] < N_CTX), other=0.0)
-                    gk_f32 = gk.to(tl.float32)
-                    gate_k = 1.0 / (1.0 + tl.exp(-gk_f32))
-                    kg = k * gate_k.to(k.dtype)
+                    k_ptrs = k_base + (offs_n[:, None] * stride_kn + offs_d[None, :] * stride_kd)
+                    gk_ptrs = gk_base + (offs_n[:, None] * stride_gkn + offs_d[None, :] * stride_gkd)
+                    k_mask = (offs_n[:, None] < N) & (offs_d[None, :] < DQ)
+                    k = tl.load(k_ptrs, mask=k_mask, other=0.0).to(tl.float32)
+                    gk = tl.load(gk_ptrs, mask=k_mask, other=0.0).to(tl.float32)
+                    gate_k = 1.0 / (1.0 + tl.exp(-gk))
+                    k = k * gate_k
 
-                    # Compute attention scores
-                    scores = tl.dot(qg, tl.trans(kg))
-                    scores = scores.to(tl.float32) * sm_scale
+                    # Compute QK^T
+                    qk = tl.dot(q, tl.trans(k)) * sm_scale
 
-                    # Apply masks for out-of-bounds rows/cols
-                    valid_m = m_offs < M
-                    valid_n = n_offs < N_CTX
-                    scores = tl.where(valid_m[:, None] & valid_n[None, :], scores, -1e9)
+                    # Mask invalid rows/cols
+                    row_mask = offs_m < M
+                    col_mask = offs_n < N
+                    qk = tl.where(col_mask[None, :], qk, neg_inf)
+                    qk = tl.where(row_mask[:, None], qk, neg_inf)
 
-                    # Compute streaming softmax update
-                    row_max = tl.max(scores, axis=1)
-                    m_new = tl.maximum(m_i, row_max)
+                    # Numerically stable softmax update
+                    m_ij = tl.max(qk, axis=1)
+                    m_new = tl.maximum(m_i, m_ij)
                     alpha = tl.exp(m_i - m_new)
+                    p = tl.exp(qk - m_new[:, None])
+                    s_ij = tl.sum(p, axis=1)
 
-                    p = tl.exp(scores - m_new[:, None])
-                    p = tl.where(valid_m[:, None] & valid_n[None, :], p, 0.0)
+                    # Load V
+                    v_ptrs = v_base + (offs_n[:, None] * stride_vn + offs_dv[None, :] * stride_vd)
+                    v_mask = (offs_n[:, None] < N) & (offs_dv[None, :] < DV)
+                    v = tl.load(v_ptrs, mask=v_mask, other=0.0).to(tl.float32)
 
-                    l_new = l_i * alpha + tl.sum(p, axis=1)
-
-                    # Load V block
-                    v_ptrs = V_ptr + z_id * stride_vz + h_id * stride_vh + n_offs[:, None] * stride_vn + dv_offs[None, :] * stride_vd
-                    v = tl.load(v_ptrs, mask=(n_offs[:, None] < N_CTX), other=0.0)
-
-                    # Accumulate numerator
-                    update = tl.dot(p.to(tl.float16), v)  # float32 accumulation
-                    acc = acc * alpha[:, None] + update
-
-                    # Update m and l
+                    # Update acc and l_i
+                    acc = acc * alpha[:, None] + tl.dot(p, v)
+                    l_i = l_i * alpha + s_ij
                     m_i = m_new
-                    l_i = l_new
 
                 # Normalize
-                l_safe = tl.where(m_offs < M, l_i, 1.0)
-                out = acc / l_safe[:, None]
+                o = acc / l_i[:, None]
 
-                # Store results
-                o_ptrs = O_ptr + z_id * stride_oz + h_id * stride_oh + m_offs[:, None] * stride_om + dv_offs[None, :] * stride_od
-                tl.store(o_ptrs, out.to(tl.float16), mask=(m_offs[:, None] < M))
+                # Store
+                o_ptrs = o_base + (offs_m[:, None] * stride_om + offs_dv[None, :] * stride_od)
+                o_mask = (offs_m[:, None] < M) & (offs_dv[None, :] < DV)
+                tl.store(o_ptrs, o.to(tl.float16), mask=o_mask)
 
             def gdpa_attn(Q: torch.Tensor, K: torch.Tensor, V: torch.Tensor, GQ: torch.Tensor, GK: torch.Tensor) -> torch.Tensor:
-                assert Q.is_cuda and K.is_cuda and V.is_cuda and GQ.is_cuda and GK.is_cuda, "All tensors must be CUDA tensors"
-                assert Q.dtype == torch.float16 and K.dtype == torch.float16 and V.dtype == torch.float16, "Q, K, V must be float16"
-                assert GQ.dtype == torch.float16 and GK.dtype == torch.float16, "GQ, GK must be float16"
-                assert Q.ndim == 4 and K.ndim == 4 and V.ndim == 4 and GQ.ndim == 4 and GK.ndim == 4, "Input tensors must be 4D"
-                Z, H, M, Dq = Q.shape
-                Zk, Hk, N, Dk = K.shape
-                Zv, Hv, Nv, Dv = V.shape
-                assert Z == Zk == Zv and H == Hk == Hv and Dq == Dk and M == N == Nv, "Shape mismatch"
-                assert GQ.shape == Q.shape and GK.shape == K.shape, "Gate shapes must match Q and K"
+                assert Q.is_cuda and K.is_cuda and V.is_cuda and GQ.is_cuda and GK.is_cuda, "All tensors must be CUDA"
+                assert Q.dtype == torch.float16 and K.dtype == torch.float16 and V.dtype == torch.float16
+                assert GQ.dtype == torch.float16 and GK.dtype == torch.float16
+                assert Q.dim() == 4 and K.dim() == 4 and V.dim() == 4 and GQ.dim() == 4 and GK.dim() == 4
+                Zq, Hq, M, DQ = Q.shape
+                Zk, Hk, Nk, DQk = K.shape
+                Zv, Hv, Nv, DV = V.shape
+                Zgq, Hgq, Mgq, DQgq = GQ.shape
+                Zgk, Hgk, Ngk, DQgk = GK.shape
 
-                # Output
-                O = torch.empty((Z, H, M, Dv), device=Q.device, dtype=torch.float16)
+                assert Zq == Zk == Zv == Zgq == Zgk, "Batch size mismatch"
+                assert Hq == Hk == Hv == Hgq == Hgk, "Head size mismatch"
+                assert M == Nk == Nv == Mgq == Ngk, "Seq length mismatch"
+                assert DQ == DQk == DQgq == DQgk, "Q/K feature dim mismatch"
 
-                # Strides (in elements)
-                stride_qz, stride_qh, stride_qm, stride_qd = Q.stride()
-                stride_kz, stride_kh, stride_kn, stride_kd = K.stride()
-                stride_vz, stride_vh, stride_vn, stride_vd = V.stride()
-                stride_gqz, stride_gqh, stride_gqm, stride_gqd = GQ.stride()
-                stride_gkz, stride_gkh, stride_gkn, stride_gkd = GK.stride()
-                stride_oz, stride_oh, stride_om, stride_od = O.stride()
+                Z, H = Zq, Hq
+                N = Nk
 
-                # Block sizes
-                # Choose tiles tuned for head_dim=64, value_dim up to 128
-                BLOCK_M = 128 if M >= 128 else 64
-                BLOCK_N = 64
+                # Heuristics for tile sizes
+                # Use power-of-two head dims for better performance with masking
+                HEAD_DIM = min(128, _next_power_of_2(int(DQ)))
+                HEAD_DV = min(128, _next_power_of__2(int(DV)))
+                # Block sizes tuned for L4; moderate sizes for good occupancy
+                if M >= 1024:
+                    BLOCK_M = 64
+                    BLOCK_N = 128
+                else:
+                    BLOCK_M = 64
+                    BLOCK_N = 64
 
-                # Grid
-                grid = ( (Z * H) * triton.cdiv(M, BLOCK_M), )
+                O = torch.empty((Z, H, M, DV), device=Q.device, dtype=torch.float16)
 
-                sm_scale = 1.0 / math.sqrt(Dq)
+                sm_scale = 1.0 / math.sqrt(float(DQ))
 
-                num_warps = 8 if BLOCK_M >= 128 else 4
-                num_stages = 2
+                grid = (Z, H, triton.cdiv(M, BLOCK_M))
 
-                _gdpa_fwd_kernel[grid](
+                gdpa_fwd[grid](
                     Q, K, V, GQ, GK, O,
-                    Z, H, M,
-                    stride_qz, stride_qh, stride_qm, stride_qd,
-                    stride_kz, stride_kh, stride_kn, stride_kd,
-                    stride_vz, stride_vh, stride_vn, stride_vd,
-                    stride_gqz, stride_gqh, stride_gqm, stride_gqd,
-                    stride_gkz, stride_gkh, stride_gkn, stride_gkd,
-                    stride_oz, stride_oh, stride_om, stride_od,
+                    Z, H, M, N, DQ, DV,
+                    Q.stride(0), Q.stride(1), Q.stride(2), Q.stride(3),
+                    K.stride(0), K.stride(1), K.stride(2), K.stride(3),
+                    V.stride(0), V.stride(1), V.stride(2), V.stride(3),
+                    GQ.stride(0), GQ.stride(1), GQ.stride(2), GQ.stride(3),
+                    GK.stride(0), GK.stride(1), GK.stride(2), GK.stride(3),
+                    O.stride(0), O.stride(1), O.stride(2), O.stride(3),
                     sm_scale,
-                    N_CTX=N,
-                    D_HEAD=Dq,
-                    D_VALUE=Dv,
-                    BLOCK_M=BLOCK_M,
-                    BLOCK_N=BLOCK_N,
-                    num_warps=num_warps,
-                    num_stages=num_stages,
+                    BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N,
+                    HEAD_DIM=HEAD_DIM, HEAD_DV=HEAD_DV,
+                    num_warps=4, num_stages=2
                 )
                 return O
         """)

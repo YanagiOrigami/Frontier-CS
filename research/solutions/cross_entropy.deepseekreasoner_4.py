@@ -3,17 +3,18 @@ import triton
 import triton.language as tl
 import math
 
+
 @triton.autotune(
     configs=[
-        triton.Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 128}, num_warps=4),
         triton.Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 256}, num_warps=4),
         triton.Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 512}, num_warps=4),
         triton.Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 1024}, num_warps=4),
-        triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 128}, num_warps=8),
-        triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 256}, num_warps=8),
-        triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 512}, num_warps=8),
-        triton.Config({'BLOCK_SIZE_M': 256, 'BLOCK_SIZE_N': 256}, num_warps=16),
-        triton.Config({'BLOCK_SIZE_M': 256, 'BLOCK_SIZE_N': 512}, num_warps=16),
+        triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 256}, num_warps=4),
+        triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 512}, num_warps=4),
+        triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 1024}, num_warps=4),
+        triton.Config({'BLOCK_SIZE_M': 256, 'BLOCK_SIZE_N': 256}, num_warps=8),
+        triton.Config({'BLOCK_SIZE_M': 256, 'BLOCK_SIZE_N': 512}, num_warps=8),
+        triton.Config({'BLOCK_SIZE_M': 256, 'BLOCK_SIZE_N': 1024}, num_warps=8),
     ],
     key=['M', 'N'],
 )
@@ -21,142 +22,159 @@ import math
 def cross_entropy_kernel(
     logits_ptr,
     targets_ptr,
-    loss_ptr,
-    stride_logits_m,
-    stride_logits_n,
+    output_ptr,
     M,
     N,
+    stride_logits_m,
+    stride_logits_n,
+    stride_output_m,
     BLOCK_SIZE_M: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr,
 ):
-    pid = tl.program_id(axis=0)
-    pid_m = pid // tl.cdiv(N, BLOCK_SIZE_N)
-    pid_n = pid % tl.cdiv(N, BLOCK_SIZE_N)
+    pid_m = tl.program_id(axis=0)
     
     offs_m = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
-    offs_n = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+    offs_n = tl.arange(0, BLOCK_SIZE_N)
     
     mask_m = offs_m < M
-    mask_n = offs_n < N
     
-    logits_block_ptr = logits_ptr + offs_m[:, None] * stride_logits_m + offs_n[None, :] * stride_logits_n
-    logits = tl.load(logits_block_ptr, mask=mask_m[:, None] & mask_n[None, :], other=-float('inf'))
+    max_logit = tl.full((BLOCK_SIZE_M,), float('-inf'), dtype=tl.float32)
+    sum_exp = tl.full((BLOCK_SIZE_M,), 0.0, dtype=tl.float32)
+    target_logit = tl.full((BLOCK_SIZE_M,), 0.0, dtype=tl.float32)
     
-    row_max = tl.max(logits, axis=1)
-    logits = logits - row_max[:, None]
-    exp_logits = tl.exp(logits)
-    row_sum = tl.sum(exp_logits, axis=1)
-    log_softmax = logits - tl.log(row_sum[:, None])
+    for n_start in range(0, N, BLOCK_SIZE_N):
+        n_end = min(n_start + BLOCK_SIZE_N, N)
+        n_size = n_end - n_start
+        
+        logits_ptrs = (
+            logits_ptr + 
+            offs_m[:, None] * stride_logits_m + 
+            (n_start + offs_n[None, :]) * stride_logits_n
+        )
+        mask = mask_m[:, None] & (offs_n[None, :] < n_size)
+        
+        logits_chunk = tl.load(logits_ptrs, mask=mask, other=float('-inf'))
+        
+        chunk_max = tl.max(logits_chunk, axis=1)
+        max_logit = tl.maximum(max_logit, chunk_max)
+        
+        exp_values = tl.exp(logits_chunk - max_logit[:, None])
+        sum_exp += tl.sum(exp_values, axis=1)
+        
+        if n_start == 0:
+            target_indices = tl.load(targets_ptr + offs_m, mask=mask_m, other=0)
+        
+        target_mask = (offs_n[None, :] == (target_indices[:, None] - n_start)) & mask
+        target_chunk = tl.load(logits_ptrs, mask=target_mask, other=0.0)
+        target_logit += tl.sum(target_chunk, axis=1)
     
-    targets = tl.load(targets_ptr + offs_m, mask=mask_m, other=0)
-    target_mask = tl.where(offs_n[None, :] == targets[:, None], 1, 0)
+    log_sum_exp = tl.log(sum_exp) + max_logit
+    loss = log_sum_exp - target_logit
     
-    selected = tl.sum(log_softmax * target_mask, axis=1)
-    loss = -selected
-    
-    tl.store(loss_ptr + offs_m, loss, mask=mask_m)
+    output_ptrs = output_ptr + offs_m * stride_output_m
+    tl.store(output_ptrs, loss, mask=mask_m)
+
 
 @triton.jit
-def cross_entropy_kernel_small(
+def cross_entropy_kernel_small_n(
     logits_ptr,
     targets_ptr,
-    loss_ptr,
-    stride_logits_m,
-    stride_logits_n,
+    output_ptr,
     M,
     N,
-    BLOCK_SIZE: tl.constexpr,
+    stride_logits_m,
+    stride_logits_n,
+    stride_output_m,
+    BLOCK_SIZE_M: tl.constexpr,
 ):
-    pid = tl.program_id(axis=0)
-    offs_m = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    pid_m = tl.program_id(axis=0)
+    
+    offs_m = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+    offs_n = tl.arange(0, 32)
+    
     mask_m = offs_m < M
     
-    logits_row_ptr = logits_ptr + offs_m * stride_logits_m
-    targets = tl.load(targets_ptr + offs_m, mask=mask_m, other=0)
+    logits_ptrs = (
+        logits_ptr + 
+        offs_m[:, None] * stride_logits_m + 
+        offs_n[None, :] * stride_logits_n
+    )
+    mask = mask_m[:, None] & (offs_n[None, :] < N)
     
-    row_max = tl.zeros([BLOCK_SIZE], dtype=tl.float32) - float('inf')
-    row_sum = tl.zeros([BLOCK_SIZE], dtype=tl.float32)
+    logits = tl.load(logits_ptrs, mask=mask, other=float('-inf'))
     
-    for i in range(0, N, BLOCK_SIZE):
-        offs_n = i + tl.arange(0, BLOCK_SIZE)
-        mask_n = offs_n < N
-        
-        logits = tl.load(logits_row_ptr + offs_n[None, :] * stride_logits_n, 
-                        mask=mask_m[:, None] & mask_n[None, :], other=-float('inf'))
-        
-        new_max = tl.maximum(row_max, tl.max(logits, axis=1))
-        exp_adj = tl.exp(row_max - new_max)
-        row_sum = row_sum * exp_adj + tl.sum(tl.exp(logits - new_max[:, None]), axis=1)
-        row_max = new_max
+    max_logit = tl.max(logits, axis=1)
+    exp_values = tl.exp(logits - max_logit[:, None])
+    sum_exp = tl.sum(exp_values, axis=1)
+    log_sum_exp = tl.log(sum_exp) + max_logit
     
-    target_logits = tl.zeros([BLOCK_SIZE], dtype=tl.float32)
-    for i in range(0, N, BLOCK_SIZE):
-        offs_n = i + tl.arange(0, BLOCK_SIZE)
-        mask_n = offs_n < N
-        
-        logits = tl.load(logits_row_ptr + offs_n[None, :] * stride_logits_n,
-                        mask=mask_m[:, None] & mask_n[None, :], other=0.0)
-        
-        target_mask = tl.where(offs_n[None, :] == targets[:, None], 1, 0)
-        target_logits += tl.sum(logits * target_mask, axis=1)
+    target_indices = tl.load(targets_ptr + offs_m, mask=mask_m, other=0)
+    target_mask = (offs_n[None, :] == target_indices[:, None]) & mask
+    target_logit = tl.sum(tl.load(logits_ptrs, mask=target_mask, other=0.0), axis=1)
     
-    loss = -(target_logits - row_max - tl.log(row_sum))
-    tl.store(loss_ptr + offs_m, loss, mask=mask_m)
+    loss = log_sum_exp - target_logit
+    
+    output_ptrs = output_ptr + offs_m * stride_output_m
+    tl.store(output_ptrs, loss, mask=mask_m)
+
 
 def cross_entropy(logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
-    assert logits.dim() == 2, "logits must be 2D"
-    assert targets.dim() == 1, "targets must be 1D"
-    assert logits.shape[0] == targets.shape[0], "batch size mismatch"
+    assert logits.dim() == 2, "logits must be 2D tensor"
+    assert targets.dim() == 1, "targets must be 1D tensor"
+    assert logits.size(0) == targets.size(0), "Batch size mismatch"
     
     M, N = logits.shape
-    loss = torch.empty(M, device=logits.device, dtype=logits.dtype)
+    output = torch.empty(M, device=logits.device, dtype=logits.dtype)
     
-    if M < 128 or N < 512:
-        BLOCK_SIZE = triton.next_power_of_2(min(128, M))
-        grid = (triton.cdiv(M, BLOCK_SIZE),)
-        cross_entropy_kernel_small[grid](
+    if N <= 32:
+        grid = lambda meta: (triton.cdiv(M, meta['BLOCK_SIZE_M']),)
+        cross_entropy_kernel_small_n[grid](
             logits,
             targets,
-            loss,
-            logits.stride(0),
-            logits.stride(1),
+            output,
             M,
             N,
-            BLOCK_SIZE=BLOCK_SIZE,
+            logits.stride(0),
+            logits.stride(1),
+            output.stride(0),
+            BLOCK_SIZE_M=64,
         )
     else:
-        grid = (triton.cdiv(M, 64) * triton.cdiv(N, 128),)
+        grid = lambda meta: (triton.cdiv(M, meta['BLOCK_SIZE_M']),)
         cross_entropy_kernel[grid](
             logits,
             targets,
-            loss,
-            logits.stride(0),
-            logits.stride(1),
+            output,
             M,
             N,
+            logits.stride(0),
+            logits.stride(1),
+            output.stride(0),
         )
     
-    return loss
+    return output
+
 
 class Solution:
     def solve(self, spec_path: str = None) -> dict:
-        code = """
+        return {"code": """
 import torch
 import triton
 import triton.language as tl
 import math
 
+
 @triton.autotune(
     configs=[
-        triton.Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 128}, num_warps=4),
         triton.Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 256}, num_warps=4),
         triton.Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 512}, num_warps=4),
         triton.Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 1024}, num_warps=4),
-        triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 128}, num_warps=8),
-        triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 256}, num_warps=8),
-        triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 512}, num_warps=8),
-        triton.Config({'BLOCK_SIZE_M': 256, 'BLOCK_SIZE_N': 256}, num_warps=16),
-        triton.Config({'BLOCK_SIZE_M': 256, 'BLOCK_SIZE_N': 512}, num_warps=16),
+        triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 256}, num_warps=4),
+        triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 512}, num_warps=4),
+        triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 1024}, num_warps=4),
+        triton.Config({'BLOCK_SIZE_M': 256, 'BLOCK_SIZE_N': 256}, num_warps=8),
+        triton.Config({'BLOCK_SIZE_M': 256, 'BLOCK_SIZE_N': 512}, num_warps=8),
+        triton.Config({'BLOCK_SIZE_M': 256, 'BLOCK_SIZE_N': 1024}, num_warps=8),
     ],
     key=['M', 'N'],
 )
@@ -164,121 +182,135 @@ import math
 def cross_entropy_kernel(
     logits_ptr,
     targets_ptr,
-    loss_ptr,
-    stride_logits_m,
-    stride_logits_n,
+    output_ptr,
     M,
     N,
+    stride_logits_m,
+    stride_logits_n,
+    stride_output_m,
     BLOCK_SIZE_M: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr,
 ):
-    pid = tl.program_id(axis=0)
-    pid_m = pid // tl.cdiv(N, BLOCK_SIZE_N)
-    pid_n = pid % tl.cdiv(N, BLOCK_SIZE_N)
+    pid_m = tl.program_id(axis=0)
     
     offs_m = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
-    offs_n = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+    offs_n = tl.arange(0, BLOCK_SIZE_N)
     
     mask_m = offs_m < M
-    mask_n = offs_n < N
     
-    logits_block_ptr = logits_ptr + offs_m[:, None] * stride_logits_m + offs_n[None, :] * stride_logits_n
-    logits = tl.load(logits_block_ptr, mask=mask_m[:, None] & mask_n[None, :], other=-float('inf'))
+    max_logit = tl.full((BLOCK_SIZE_M,), float('-inf'), dtype=tl.float32)
+    sum_exp = tl.full((BLOCK_SIZE_M,), 0.0, dtype=tl.float32)
+    target_logit = tl.full((BLOCK_SIZE_M,), 0.0, dtype=tl.float32)
     
-    row_max = tl.max(logits, axis=1)
-    logits = logits - row_max[:, None]
-    exp_logits = tl.exp(logits)
-    row_sum = tl.sum(exp_logits, axis=1)
-    log_softmax = logits - tl.log(row_sum[:, None])
+    for n_start in range(0, N, BLOCK_SIZE_N):
+        n_end = min(n_start + BLOCK_SIZE_N, N)
+        n_size = n_end - n_start
+        
+        logits_ptrs = (
+            logits_ptr + 
+            offs_m[:, None] * stride_logits_m + 
+            (n_start + offs_n[None, :]) * stride_logits_n
+        )
+        mask = mask_m[:, None] & (offs_n[None, :] < n_size)
+        
+        logits_chunk = tl.load(logits_ptrs, mask=mask, other=float('-inf'))
+        
+        chunk_max = tl.max(logits_chunk, axis=1)
+        max_logit = tl.maximum(max_logit, chunk_max)
+        
+        exp_values = tl.exp(logits_chunk - max_logit[:, None])
+        sum_exp += tl.sum(exp_values, axis=1)
+        
+        if n_start == 0:
+            target_indices = tl.load(targets_ptr + offs_m, mask=mask_m, other=0)
+        
+        target_mask = (offs_n[None, :] == (target_indices[:, None] - n_start)) & mask
+        target_chunk = tl.load(logits_ptrs, mask=target_mask, other=0.0)
+        target_logit += tl.sum(target_chunk, axis=1)
     
-    targets = tl.load(targets_ptr + offs_m, mask=mask_m, other=0)
-    target_mask = tl.where(offs_n[None, :] == targets[:, None], 1, 0)
+    log_sum_exp = tl.log(sum_exp) + max_logit
+    loss = log_sum_exp - target_logit
     
-    selected = tl.sum(log_softmax * target_mask, axis=1)
-    loss = -selected
-    
-    tl.store(loss_ptr + offs_m, loss, mask=mask_m)
+    output_ptrs = output_ptr + offs_m * stride_output_m
+    tl.store(output_ptrs, loss, mask=mask_m)
+
 
 @triton.jit
-def cross_entropy_kernel_small(
+def cross_entropy_kernel_small_n(
     logits_ptr,
     targets_ptr,
-    loss_ptr,
-    stride_logits_m,
-    stride_logits_n,
+    output_ptr,
     M,
     N,
-    BLOCK_SIZE: tl.constexpr,
+    stride_logits_m,
+    stride_logits_n,
+    stride_output_m,
+    BLOCK_SIZE_M: tl.constexpr,
 ):
-    pid = tl.program_id(axis=0)
-    offs_m = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    pid_m = tl.program_id(axis=0)
+    
+    offs_m = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+    offs_n = tl.arange(0, 32)
+    
     mask_m = offs_m < M
     
-    logits_row_ptr = logits_ptr + offs_m * stride_logits_m
-    targets = tl.load(targets_ptr + offs_m, mask=mask_m, other=0)
+    logits_ptrs = (
+        logits_ptr + 
+        offs_m[:, None] * stride_logits_m + 
+        offs_n[None, :] * stride_logits_n
+    )
+    mask = mask_m[:, None] & (offs_n[None, :] < N)
     
-    row_max = tl.zeros([BLOCK_SIZE], dtype=tl.float32) - float('inf')
-    row_sum = tl.zeros([BLOCK_SIZE], dtype=tl.float32)
+    logits = tl.load(logits_ptrs, mask=mask, other=float('-inf'))
     
-    for i in range(0, N, BLOCK_SIZE):
-        offs_n = i + tl.arange(0, BLOCK_SIZE)
-        mask_n = offs_n < N
-        
-        logits = tl.load(logits_row_ptr + offs_n[None, :] * stride_logits_n, 
-                        mask=mask_m[:, None] & mask_n[None, :], other=-float('inf'))
-        
-        new_max = tl.maximum(row_max, tl.max(logits, axis=1))
-        exp_adj = tl.exp(row_max - new_max)
-        row_sum = row_sum * exp_adj + tl.sum(tl.exp(logits - new_max[:, None]), axis=1)
-        row_max = new_max
+    max_logit = tl.max(logits, axis=1)
+    exp_values = tl.exp(logits - max_logit[:, None])
+    sum_exp = tl.sum(exp_values, axis=1)
+    log_sum_exp = tl.log(sum_exp) + max_logit
     
-    target_logits = tl.zeros([BLOCK_SIZE], dtype=tl.float32)
-    for i in range(0, N, BLOCK_SIZE):
-        offs_n = i + tl.arange(0, BLOCK_SIZE)
-        mask_n = offs_n < N
-        
-        logits = tl.load(logits_row_ptr + offs_n[None, :] * stride_logits_n,
-                        mask=mask_m[:, None] & mask_n[None, :], other=0.0)
-        
-        target_mask = tl.where(offs_n[None, :] == targets[:, None], 1, 0)
-        target_logits += tl.sum(logits * target_mask, axis=1)
+    target_indices = tl.load(targets_ptr + offs_m, mask=mask_m, other=0)
+    target_mask = (offs_n[None, :] == target_indices[:, None]) & mask
+    target_logit = tl.sum(tl.load(logits_ptrs, mask=target_mask, other=0.0), axis=1)
     
-    loss = -(target_logits - row_max - tl.log(row_sum))
-    tl.store(loss_ptr + offs_m, loss, mask=mask_m)
+    loss = log_sum_exp - target_logit
+    
+    output_ptrs = output_ptr + offs_m * stride_output_m
+    tl.store(output_ptrs, loss, mask=mask_m)
+
 
 def cross_entropy(logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
-    assert logits.dim() == 2, "logits must be 2D"
-    assert targets.dim() == 1, "targets must be 1D"
-    assert logits.shape[0] == targets.shape[0], "batch size mismatch"
+    assert logits.dim() == 2, "logits must be 2D tensor"
+    assert targets.dim() == 1, "targets must be 1D tensor"
+    assert logits.size(0) == targets.size(0), "Batch size mismatch"
     
     M, N = logits.shape
-    loss = torch.empty(M, device=logits.device, dtype=logits.dtype)
+    output = torch.empty(M, device=logits.device, dtype=logits.dtype)
     
-    if M < 128 or N < 512:
-        BLOCK_SIZE = triton.next_power_of_2(min(128, M))
-        grid = (triton.cdiv(M, BLOCK_SIZE),)
-        cross_entropy_kernel_small[grid](
+    if N <= 32:
+        grid = lambda meta: (triton.cdiv(M, meta['BLOCK_SIZE_M']),)
+        cross_entropy_kernel_small_n[grid](
             logits,
             targets,
-            loss,
-            logits.stride(0),
-            logits.stride(1),
+            output,
             M,
             N,
-            BLOCK_SIZE=BLOCK_SIZE,
+            logits.stride(0),
+            logits.stride(1),
+            output.stride(0),
+            BLOCK_SIZE_M=64,
         )
     else:
-        grid = (triton.cdiv(M, 64) * triton.cdiv(N, 128),)
+        grid = lambda meta: (triton.cdiv(M, meta['BLOCK_SIZE_M']),)
         cross_entropy_kernel[grid](
             logits,
             targets,
-            loss,
-            logits.stride(0),
-            logits.stride(1),
+            output,
             M,
             N,
+            logits.stride(0),
+            logits.stride(1),
+            output.stride(0),
         )
     
-    return loss
-"""
-        return {"code": code}
+    return output
+"""}

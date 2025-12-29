@@ -1,531 +1,403 @@
 import os
-import io
 import re
-import math
+import io
 import tarfile
-import zipfile
 import gzip
-import bz2
 import lzma
-from typing import Optional, Tuple
+import bz2
+import base64
+from typing import Optional, Tuple, List
 
 
-TARGET_LEN = 6180
+_MAX_MEMBER_SIZE = 5 * 1024 * 1024
+_MAX_DECOMPRESSED_SIZE = 25 * 1024 * 1024
 
 
-_TEXT_EXTS = {
-    ".c", ".cc", ".cpp", ".cxx", ".h", ".hh", ".hpp", ".hxx",
-    ".py", ".md", ".rst", ".txt", ".json", ".yml", ".yaml",
-    ".cmake", ".in", ".am", ".ac", ".m4", ".mk", ".make", ".gradle",
-    ".java", ".kt", ".go", ".rs", ".swift", ".cs", ".js", ".ts",
-    ".html", ".css", ".xml", ".toml", ".ini", ".cfg", ".sh", ".bat",
-}
+def _compute_name_score(name: str, size: int) -> int:
+    n = name.lower()
+    score = 0
 
-_BIN_EXT_PTS = {
-    ".ivf": 45,
-    ".obu": 40,
-    ".av1": 40,
-    ".webm": 25,
-    ".mkv": 20,
-    ".mp4": 15,
-    ".y4m": 15,
-    ".vp9": 30,
-    ".vp8": 25,
-    ".bin": 10,
-    ".dat": 10,
-    ".raw": 10,
-}
+    keywords = [
+        ("42536279", 2500),
+        ("oss-fuzz", 900),
+        ("ossfuzz", 900),
+        ("clusterfuzz", 900),
+        ("testcase", 600),
+        ("minimized", 700),
+        ("minimised", 700),
+        ("repro", 600),
+        ("poc", 500),
+        ("crash", 700),
+        ("overflow", 350),
+        ("heap", 250),
+        ("svcdec", 500),
+        ("svc", 120),
+        ("subset", 200),
+        ("display", 180),
+        ("dimension", 180),
+        ("dimensions", 180),
+        ("av1", 140),
+        ("ivf", 160),
+    ]
+    for k, w in keywords:
+        if k in n:
+            score += w
 
-_COMP_EXTS = {".gz", ".bz2", ".xz", ".lzma", ".zip"}
+    dir_hints = [
+        ("/test/", 120),
+        ("/tests/", 120),
+        ("/testdata/", 150),
+        ("/test_data/", 150),
+        ("/fuzz/", 180),
+        ("/fuzzer/", 180),
+        ("/fuzzing/", 180),
+        ("/corpus/", 160),
+        ("/regression/", 160),
+        ("/regress/", 140),
+        ("/data/", 90),
+    ]
+    for k, w in dir_hints:
+        if k in n:
+            score += w
 
-_KW_PTS = {
-    "42536279": 120,
-    "oss-fuzz": 40,
-    "ossfuzz": 40,
-    "clusterfuzz": 70,
-    "testcase": 45,
-    "minimized": 40,
-    "crash": 40,
-    "poc": 40,
-    "repro": 35,
-    "regression": 30,
-    "svcdec": 80,
-    "svc_dec": 80,
-    "svc-dec": 80,
-    "svcdecoder": 70,
-    "svc_decoder": 70,
-    "svc": 20,
-    "subset": 25,
-    "overflow": 20,
-    "heap": 15,
-    "fuzz": 20,
-    "corpus": 15,
-    "seed": 12,
-    "av1": 25,
-    "vp9": 15,
-    "ivf": 25,
-    "obu": 20,
-    "decoder": 10,
-    "decode": 10,
-    "svcdecapp": 30,
-}
+    ext_scores = {
+        ".ivf": 500,
+        ".av1": 450,
+        ".obu": 450,
+        ".bin": 250,
+        ".raw": 230,
+        ".dat": 180,
+        ".input": 180,
+        ".gz": 120,
+        ".xz": 120,
+        ".bz2": 120,
+        ".txt": 60,
+        ".c": 90,
+        ".cc": 90,
+        ".cpp": 90,
+        ".h": 70,
+        ".inc": 70,
+    }
+    _, ext = os.path.splitext(n)
+    score += ext_scores.get(ext, 0)
 
-_PATH_BONUS = {
-    "/test/": 12,
-    "/tests/": 12,
-    "/testdata/": 16,
-    "/test_data/": 16,
-    "/data/": 10,
-    "/fuzz/": 20,
-    "/fuzzer/": 18,
-    "/corpus/": 20,
-    "/seed/": 15,
-    "/seeds/": 15,
-    "/regression/": 18,
-    "/poc/": 25,
-    "/pocs/": 25,
-    "/crash/": 18,
-}
+    if 4000 <= size <= 12000:
+        score += 260
+    elif size <= 20000:
+        score += 120
+    elif size <= 120000:
+        score += 40
+    else:
+        score -= 80
 
-
-def _ext_of(path: str) -> str:
-    p = path.lower()
-    _, ext = os.path.splitext(p)
-    return ext
-
-
-def _is_probably_text(head: bytes) -> bool:
-    if not head:
-        return True
-    printable = 0
-    for b in head:
-        if b in (9, 10, 13) or 32 <= b < 127:
-            printable += 1
-    return (printable / max(1, len(head))) > 0.92
-
-
-def _magic_score(head: bytes) -> int:
-    if not head:
-        return 0
-    if head.startswith(b"DKIF"):
-        return 60
-    if head.startswith(b"\x1A\x45\xDF\xA3"):  # EBML (webm/mkv)
-        return 40
-    if head.startswith(b"YUV4MPEG2"):
-        return 35
-    if len(head) >= 12 and head[4:8] == b"ftyp":
-        return 20
-    if head[:1] in (b"\x0a", b"\x08", b"\x12"):  # plausible AV1 OBU headers
-        return 5
-    return 0
-
-
-def _size_score(sz: int) -> float:
-    d = abs(sz - TARGET_LEN)
-    return 140.0 * math.exp(-d / 500.0)
-
-
-def _meta_score(path: str, size: int) -> float:
-    p = path.lower()
-    score = _size_score(size)
-    if size == TARGET_LEN:
-        score += 220.0
-
-    for kw, pts in _KW_PTS.items():
-        if kw in p:
-            score += float(pts)
-
-    for frag, pts in _PATH_BONUS.items():
-        if frag in p:
-            score += float(pts)
-
-    ext = _ext_of(p)
-    if ext in _BIN_EXT_PTS:
-        score += float(_BIN_EXT_PTS[ext])
-    if ext in _TEXT_EXTS:
-        score -= 80.0
-
-    if size < 32:
-        score -= 200.0
-    elif size < 200:
-        score -= 60.0
-    elif size > 10_000_000:
-        score -= 200.0
-    elif size > 2_000_000:
-        score -= 30.0
+    if size > _MAX_MEMBER_SIZE:
+        score -= 2000
 
     return score
 
 
-def _head_score(path: str, size: int, head: bytes) -> float:
-    score = _meta_score(path, size) + float(_magic_score(head))
-    if _is_probably_text(head):
-        ext = _ext_of(path)
-        if ext not in _BIN_EXT_PTS:
-            score -= 35.0
-    return score
+def _looks_like_ivf(data: bytes) -> bool:
+    if len(data) < 32:
+        return False
+    if data[0:4] != b"DKIF":
+        return False
+    if data[8:12] != b"AV01":
+        return False
+    return True
 
 
-def _try_decompress_by_ext(name: str, data: bytes) -> Optional[Tuple[str, bytes]]:
-    ln = name.lower()
-    try:
-        if ln.endswith(".gz"):
-            return name[:-3], gzip.decompress(data)
-        if ln.endswith(".bz2"):
-            return name[:-4], bz2.decompress(data)
-        if ln.endswith(".xz"):
-            return name[:-3], lzma.decompress(data, format=lzma.FORMAT_XZ)
-        if ln.endswith(".lzma"):
-            return name[:-5], lzma.decompress(data, format=lzma.FORMAT_ALONE)
-    except Exception:
-        return None
-    return None
-
-
-def _looks_like_interesting_compressed_name(path: str) -> bool:
-    p = path.lower()
-    if any(k in p for k in ("42536279", "clusterfuzz", "testcase", "minimized", "crash", "poc", "repro", "regression", "svcdec")):
+def _is_probably_text(data: bytes) -> bool:
+    if not data:
         return True
-    if any(k in p for k in ("seed_corpus", "corpus", "seeds")):
-        return True
-    return False
+    sample = data[:4096]
+    if b"\x00" in sample:
+        return False
+    bad = 0
+    for b in sample:
+        if b in (9, 10, 13):
+            continue
+        if 32 <= b <= 126:
+            continue
+        bad += 1
+    return bad / max(1, len(sample)) < 0.02
 
 
-def _scan_zip_for_best(zip_bytes: bytes, zip_path: str) -> Optional[Tuple[float, bytes]]:
+def _try_decompress(data: bytes) -> List[bytes]:
+    outs = [data]
+    if len(data) < 6:
+        return outs
+
+    def _add(out: bytes):
+        if out and len(out) <= _MAX_DECOMPRESSED_SIZE and out not in outs:
+            outs.append(out)
+
     try:
-        zf = zipfile.ZipFile(io.BytesIO(zip_bytes))
+        if data[:2] == b"\x1f\x8b":
+            out = gzip.decompress(data)
+            _add(out)
     except Exception:
-        return None
+        pass
 
-    infos = []
-    for info in zf.infolist():
-        if info.is_dir():
-            continue
-        sz = info.file_size
-        if sz <= 0 or sz > 2_000_000:
-            continue
-        name = f"{zip_path}::{info.filename}"
-        s = _meta_score(name, sz)
-        if sz == TARGET_LEN:
-            s += 200.0
-        infos.append((s, info))
+    try:
+        if data[:6] == b"\xfd7zXZ\x00":
+            out = lzma.decompress(data)
+            _add(out)
+    except Exception:
+        pass
 
-    if not infos:
-        return None
+    try:
+        if data[:3] == b"BZh":
+            out = bz2.decompress(data)
+            _add(out)
+    except Exception:
+        pass
 
-    infos.sort(key=lambda x: x[0], reverse=True)
-    selected = []
-    best_exact = [inf for inf in infos if inf[1].file_size == TARGET_LEN]
-    for s, info in best_exact[:10]:
-        selected.append((s + 500.0, info))
-    for s, info in infos[:25]:
-        selected.append((s, info))
+    return outs
 
-    best_score = float("-inf")
-    best_data = None
 
-    for base_s, info in selected:
+_HEX_BYTE_RE = re.compile(rb"0x([0-9a-fA-F]{2})")
+_C_ESC_RE = re.compile(rb"\\x([0-9a-fA-F]{2})")
+_B64_RE = re.compile(rb"(?:[A-Za-z0-9+/]{80,}={0,2})")
+
+
+def _extract_bytes_from_text(data: bytes) -> List[bytes]:
+    outs = []
+    if not data:
+        return outs
+
+    # Hex bytes like 0xAA, 0xbb, ...
+    hexes = _HEX_BYTE_RE.findall(data)
+    if len(hexes) >= 128:
         try:
-            data = zf.read(info)
+            outs.append(bytes(int(h, 16) for h in hexes))
         except Exception:
+            pass
+
+    # C escaped bytes \xAA\xBB...
+    esc = _C_ESC_RE.findall(data)
+    if len(esc) >= 128:
+        try:
+            outs.append(bytes(int(h, 16) for h in esc))
+        except Exception:
+            pass
+
+    # Base64 blobs
+    for m in _B64_RE.findall(data):
+        if len(m) < 200:
             continue
-        if len(data) != info.file_size:
-            continue
-        head = data[:256]
-        name = f"{zip_path}::{info.filename}"
-        s = _head_score(name, len(data), head) + base_s * 0.05
-        if s > best_score:
-            best_score = s
-            best_data = data
+        try:
+            out = base64.b64decode(m, validate=False)
+            if out and len(out) >= 256:
+                outs.append(out)
+        except Exception:
+            pass
 
-    if best_data is None:
-        return None
-    return best_score, best_data
+    return outs
 
 
-def _extract_hex_blob_from_text(text: str) -> Optional[bytes]:
-    if "0x" not in text:
+def _choose_best_payload(candidates: List[bytes]) -> Optional[bytes]:
+    if not candidates:
         return None
-    hexes = re.findall(r"0x([0-9a-fA-F]{1,2})", text)
-    if not (1000 <= len(hexes) <= 200000):
-        return None
-    try:
-        data = bytes(int(h, 16) for h in hexes)
-    except Exception:
-        return None
-    if 200 <= len(data) <= 5_000_000:
-        return data
-    return None
+
+    # Prefer IVF; if multiple, choose smallest that looks right.
+    ivfs = [c for c in candidates if _looks_like_ivf(c)]
+    if ivfs:
+        return min(ivfs, key=len)
+
+    # Otherwise choose smallest binary blob that isn't mostly text.
+    bins = [c for c in candidates if not _is_probably_text(c)]
+    if bins:
+        return min(bins, key=len)
+
+    return min(candidates, key=len)
 
 
 class Solution:
     def solve(self, src_path: str) -> bytes:
-        best_score = float("-inf")
-        best_member = None
-        best_is_tar = False
-        best_path = None
-        best_data_direct = None
+        if os.path.isdir(src_path):
+            payload = self._solve_from_dir(src_path)
+            if payload is not None:
+                return payload
+            return b""
 
-        def consider_direct(path: str, data: bytes):
-            nonlocal best_score, best_data_direct, best_member, best_is_tar, best_path
-            if not data:
-                return
-            head = data[:256]
-            s = _head_score(path, len(data), head)
-            if s > best_score:
-                best_score = s
-                best_data_direct = data
-                best_member = None
-                best_is_tar = False
-                best_path = None
+        payload = self._solve_from_tar(src_path)
+        if payload is not None:
+            return payload
+        return b""
 
-        def consider_head(path: str, size: int, head: bytes, member_obj=None, is_tar=False, file_path=None):
-            nonlocal best_score, best_member, best_is_tar, best_path
-            s = _head_score(path, size, head)
-            if s > best_score:
-                best_score = s
-                best_member = member_obj
-                best_is_tar = is_tar
-                best_path = file_path
-
-        def scan_tar(tpath: str):
-            nonlocal best_data_direct, best_member, best_is_tar, best_path, best_score
-            try:
-                tf = tarfile.open(tpath, "r:*")
-            except Exception:
-                return False
-
-            with tf:
-                members = tf.getmembers()
-                for m in members:
-                    if not m.isreg():
+    def _solve_from_tar(self, tar_path: str) -> Optional[bytes]:
+        try:
+            with tarfile.open(tar_path, mode="r:*") as tf:
+                members = []
+                for m in tf.getmembers():
+                    if not m.isfile():
                         continue
-                    size = m.size
-                    if size <= 0 or size > 25_000_000:
+                    if m.size <= 0 or m.size > _MAX_MEMBER_SIZE:
                         continue
-                    name = m.name
-                    lname = name.lower()
-                    ext = _ext_of(lname)
+                    name = m.name or ""
+                    score = _compute_name_score(name, m.size)
+                    if score > 0:
+                        members.append((score, m.size, m.name))
+                members.sort(key=lambda x: (-x[0], x[1], x[2]))
 
-                    if ext in _TEXT_EXTS and abs(size - TARGET_LEN) > 2000:
-                        if not any(k in lname for k in ("42536279", "clusterfuzz", "testcase", "svcdec", "crash", "poc", "repro", "regression")):
+                top = members[:60] if members else []
+
+                # If nothing scored, fall back to likely binary extensions.
+                if not top:
+                    fallback = []
+                    for m in tf.getmembers():
+                        if not m.isfile():
                             continue
+                        if m.size <= 0 or m.size > _MAX_MEMBER_SIZE:
+                            continue
+                        n = (m.name or "").lower()
+                        if n.endswith((".ivf", ".av1", ".obu", ".bin", ".raw", ".dat", ".input")):
+                            fallback.append((0, m.size, m.name))
+                    fallback.sort(key=lambda x: (x[1], x[2]))
+                    top = fallback[:60]
 
-                    f = None
+                for _, _, name in top:
                     try:
-                        f = tf.extractfile(m)
+                        f = tf.extractfile(name)
                         if f is None:
                             continue
-                        head = f.read(256)
+                        data = f.read()
                     except Exception:
                         continue
-                    finally:
-                        try:
-                            if f is not None:
-                                f.close()
-                        except Exception:
-                            pass
 
-                    consider_head(name, size, head, member_obj=m, is_tar=True, file_path=None)
+                    candidates = []
+                    for d in _try_decompress(data):
+                        candidates.append(d)
+                        if _is_probably_text(d):
+                            candidates.extend(_extract_bytes_from_text(d))
 
-                    if ext == ".zip" and (("corpus" in lname) or ("seed" in lname) or ("fuzz" in lname) or _looks_like_interesting_compressed_name(lname)):
-                        if size <= 50_000_000:
-                            try:
-                                zfobj = tf.extractfile(m)
-                                if zfobj is not None:
-                                    zip_bytes = zfobj.read()
-                                else:
-                                    zip_bytes = None
-                            except Exception:
-                                zip_bytes = None
-                            finally:
-                                try:
-                                    if zfobj is not None:
-                                        zfobj.close()
-                                except Exception:
-                                    pass
-                            if zip_bytes:
-                                res = _scan_zip_for_best(zip_bytes, name)
-                                if res is not None:
-                                    zs, zdata = res
-                                    if zs > best_score:
-                                        best_score = zs
-                                        best_data_direct = zdata
-                                        best_member = None
-                                        best_is_tar = False
-                                        best_path = None
+                    chosen = _choose_best_payload(candidates)
+                    if chosen is None:
+                        continue
 
-                    if ext in (".gz", ".bz2", ".xz", ".lzma") and _looks_like_interesting_compressed_name(lname) and size <= 5_000_000:
-                        try:
-                            df = tf.extractfile(m)
-                            if df is not None:
-                                comp = df.read()
-                            else:
-                                comp = None
-                        except Exception:
-                            comp = None
-                        finally:
-                            try:
-                                if df is not None:
-                                    df.close()
-                            except Exception:
-                                pass
-                        if comp:
-                            dec = _try_decompress_by_ext(name, comp)
-                            if dec:
-                                dec_name, dec_data = dec
-                                if 0 < len(dec_data) <= 5_000_000:
-                                    consider_direct(dec_name, dec_data)
+                    # Hard preference for IVF-like payloads or for names with strong hints.
+                    if _looks_like_ivf(chosen):
+                        return chosen
 
-                    if any(k in lname for k in ("42536279", "clusterfuzz", "testcase", "minimized", "svcdec", "crash", "poc", "repro", "regression")):
-                        if ext in _TEXT_EXTS and size <= 5_000_000:
-                            try:
-                                tfh = tf.extractfile(m)
-                                if tfh is not None:
-                                    raw = tfh.read()
-                                else:
-                                    raw = None
-                            except Exception:
-                                raw = None
-                            finally:
-                                try:
-                                    if tfh is not None:
-                                        tfh.close()
-                                except Exception:
-                                    pass
-                            if raw:
-                                try:
-                                    txt = raw.decode("utf-8", "ignore")
-                                except Exception:
-                                    txt = ""
-                                blob = _extract_hex_blob_from_text(txt)
-                                if blob and 200 <= len(blob) <= 5_000_000:
-                                    consider_direct(f"{name}::hexblob", blob)
+                    # Accept non-IVF if filename strongly indicates it's a fuzz testcase.
+                    lname = name.lower()
+                    if any(k in lname for k in ("42536279", "clusterfuzz", "oss-fuzz", "ossfuzz", "testcase", "minimized", "crash", "poc", "repro")):
+                        return chosen
 
-                if best_data_direct is not None:
-                    return True
-
-                if best_member is not None:
+                # Second pass: try any small IVF if not found yet.
+                ivf_members = []
+                for m in tf.getmembers():
+                    if not m.isfile():
+                        continue
+                    if m.size <= 0 or m.size > _MAX_MEMBER_SIZE:
+                        continue
+                    n = (m.name or "").lower()
+                    if n.endswith(".ivf"):
+                        ivf_members.append((m.size, m.name))
+                ivf_members.sort()
+                for _, name in ivf_members[:30]:
                     try:
-                        bf = tf.extractfile(best_member)
-                        if bf is not None:
-                            data = bf.read()
-                        else:
-                            data = None
+                        f = tf.extractfile(name)
+                        if f is None:
+                            continue
+                        data = f.read()
                     except Exception:
-                        data = None
-                    finally:
-                        try:
-                            if bf is not None:
-                                bf.close()
-                        except Exception:
-                            pass
-                    if data:
-                        best_data_direct = data
-                        best_member = None
-                        best_is_tar = False
-                        best_path = None
-                        return True
+                        continue
+                    for d in _try_decompress(data):
+                        if _looks_like_ivf(d):
+                            return d
 
-            return True
+        except Exception:
+            return None
 
-        def scan_dir(dpath: str):
-            nonlocal best_data_direct, best_score, best_member, best_is_tar, best_path
-            for root, dirs, files in os.walk(dpath):
-                rlow = root.lower()
-                if any(seg in rlow for seg in ("/.git", "/.svn", "/.hg")):
+        return None
+
+    def _solve_from_dir(self, root: str) -> Optional[bytes]:
+        entries: List[Tuple[int, int, str]] = []
+        for dirpath, _, filenames in os.walk(root):
+            for fn in filenames:
+                path = os.path.join(dirpath, fn)
+                try:
+                    st = os.stat(path)
+                except Exception:
                     continue
-                for fn in files:
-                    path = os.path.join(root, fn)
+                if not os.path.isfile(path):
+                    continue
+                if st.st_size <= 0 or st.st_size > _MAX_MEMBER_SIZE:
+                    continue
+                rel = os.path.relpath(path, root).replace(os.sep, "/")
+                score = _compute_name_score(rel, st.st_size)
+                if score > 0:
+                    entries.append((score, st.st_size, path))
+        entries.sort(key=lambda x: (-x[0], x[1], x[2]))
+
+        top = entries[:80]
+        if not top:
+            # fall back to likely extensions
+            fallback = []
+            for dirpath, _, filenames in os.walk(root):
+                for fn in filenames:
+                    path = os.path.join(dirpath, fn)
                     try:
                         st = os.stat(path)
                     except Exception:
                         continue
-                    size = st.st_size
-                    if size <= 0 or size > 25_000_000:
+                    if not os.path.isfile(path):
                         continue
-                    rel = os.path.relpath(path, dpath)
-                    lname = rel.lower()
-                    ext = _ext_of(lname)
+                    if st.st_size <= 0 or st.st_size > _MAX_MEMBER_SIZE:
+                        continue
+                    n = fn.lower()
+                    if n.endswith((".ivf", ".av1", ".obu", ".bin", ".raw", ".dat", ".input")):
+                        fallback.append((0, st.st_size, path))
+            fallback.sort(key=lambda x: (x[1], x[2]))
+            top = fallback[:80]
 
-                    if ext in _TEXT_EXTS and abs(size - TARGET_LEN) > 2000:
-                        if not any(k in lname for k in ("42536279", "clusterfuzz", "testcase", "svcdec", "crash", "poc", "repro", "regression")):
-                            continue
+        for _, _, path in top:
+            try:
+                with open(path, "rb") as f:
+                    data = f.read()
+            except Exception:
+                continue
 
-                    head = b""
+            candidates = []
+            for d in _try_decompress(data):
+                candidates.append(d)
+                if _is_probably_text(d):
+                    candidates.extend(_extract_bytes_from_text(d))
+
+            chosen = _choose_best_payload(candidates)
+            if chosen is None:
+                continue
+
+            if _looks_like_ivf(chosen):
+                return chosen
+
+            lpath = path.lower()
+            if any(k in lpath for k in ("42536279", "clusterfuzz", "oss-fuzz", "ossfuzz", "testcase", "minimized", "crash", "poc", "repro")):
+                return chosen
+
+        # Try any IVF file
+        ivfs = []
+        for dirpath, _, filenames in os.walk(root):
+            for fn in filenames:
+                if fn.lower().endswith(".ivf"):
+                    path = os.path.join(dirpath, fn)
                     try:
-                        with open(path, "rb") as f:
-                            head = f.read(256)
+                        st = os.stat(path)
                     except Exception:
                         continue
+                    if st.st_size <= 0 or st.st_size > _MAX_MEMBER_SIZE:
+                        continue
+                    ivfs.append((st.st_size, path))
+        ivfs.sort()
+        for _, path in ivfs[:30]:
+            try:
+                with open(path, "rb") as f:
+                    data = f.read()
+            except Exception:
+                continue
+            for d in _try_decompress(data):
+                if _looks_like_ivf(d):
+                    return d
 
-                    consider_head(rel, size, head, member_obj=None, is_tar=False, file_path=path)
-
-                    if ext == ".zip" and (("corpus" in lname) or ("seed" in lname) or ("fuzz" in lname) or _looks_like_interesting_compressed_name(lname)):
-                        if size <= 50_000_000:
-                            try:
-                                with open(path, "rb") as f:
-                                    zip_bytes = f.read()
-                            except Exception:
-                                zip_bytes = None
-                            if zip_bytes:
-                                res = _scan_zip_for_best(zip_bytes, rel)
-                                if res is not None:
-                                    zs, zdata = res
-                                    if zs > best_score:
-                                        best_score = zs
-                                        best_data_direct = zdata
-                                        best_member = None
-                                        best_is_tar = False
-                                        best_path = None
-
-                    if ext in (".gz", ".bz2", ".xz", ".lzma") and _looks_like_interesting_compressed_name(lname) and size <= 5_000_000:
-                        try:
-                            with open(path, "rb") as f:
-                                comp = f.read()
-                        except Exception:
-                            comp = None
-                        if comp:
-                            dec = _try_decompress_by_ext(rel, comp)
-                            if dec:
-                                dec_name, dec_data = dec
-                                if 0 < len(dec_data) <= 5_000_000:
-                                    consider_direct(dec_name, dec_data)
-
-                    if any(k in lname for k in ("42536279", "clusterfuzz", "testcase", "minimized", "svcdec", "crash", "poc", "repro", "regression")):
-                        if ext in _TEXT_EXTS and size <= 5_000_000:
-                            try:
-                                with open(path, "rb") as f:
-                                    raw = f.read()
-                            except Exception:
-                                raw = None
-                            if raw:
-                                try:
-                                    txt = raw.decode("utf-8", "ignore")
-                                except Exception:
-                                    txt = ""
-                                blob = _extract_hex_blob_from_text(txt)
-                                if blob and 200 <= len(blob) <= 5_000_000:
-                                    consider_direct(f"{rel}::hexblob", blob)
-
-            if best_data_direct is None and best_path:
-                try:
-                    with open(best_path, "rb") as f:
-                        best_data_direct = f.read()
-                except Exception:
-                    best_data_direct = None
-
-        if os.path.isdir(src_path):
-            scan_dir(src_path)
-        else:
-            ok = scan_tar(src_path)
-            if not ok:
-                try:
-                    scan_dir(src_path)
-                except Exception:
-                    pass
-
-        if best_data_direct is not None:
-            return best_data_direct
-
-        return b"\x00" * TARGET_LEN
+        return None

@@ -1,23 +1,27 @@
 import json
 import math
+import inspect
 from argparse import Namespace
-from typing import Optional
+from typing import Optional, Callable, Tuple, Any
 
 from sky_spot.strategies.multi_strategy import MultiRegionStrategy
 from sky_spot.utils import ClusterType
 
 
-_SPOT = ClusterType.SPOT
-_ON_DEMAND = getattr(ClusterType, "ON_DEMAND", None)
-if _ON_DEMAND is None:
-    _ON_DEMAND = getattr(ClusterType, "ONDEMAND", None)
-_NONE = getattr(ClusterType, "NONE", None)
-if _NONE is None:
-    _NONE = getattr(ClusterType, "None", None)
+def _get_cluster_type(name_candidates):
+    for n in name_candidates:
+        if hasattr(ClusterType, n):
+            return getattr(ClusterType, n)
+    return None
+
+
+_CT_SPOT = _get_cluster_type(("SPOT", "Spot", "spot"))
+_CT_ON_DEMAND = _get_cluster_type(("ON_DEMAND", "ONDEMAND", "OnDemand", "on_demand", "ondemand"))
+_CT_NONE = _get_cluster_type(("NONE", "None", "none"))
 
 
 class Solution(MultiRegionStrategy):
-    NAME = "cant_be_late_ucb_safe_v1"
+    NAME = "cant_be_late_multiregion_v1"
 
     def solve(self, spec_path: str) -> "Solution":
         with open(spec_path) as f:
@@ -31,215 +35,268 @@ class Solution(MultiRegionStrategy):
         )
         super().__init__(args)
 
-        self._inited = False
-        self._gap = 0.0
-        self._n_regions = 0
-        self._seen = None
-        self._avail = None
-        self._total_seen = 0
+        self._step_count = 0
+        self._last_task_done_len = 0
+        self._work_done = 0.0
 
-        self._last_region: Optional[int] = None
-        self._no_spot_streak = 0
+        self._forced_on_demand = False
 
-        self._done_sum = 0.0
-        self._done_idx = 0
+        self._num_regions = None
+        self._region_obs = None
+        self._region_spot = None
+        self._total_obs = 0
 
-        self._od_mode = False
+        self._last_region = None
+        self._last_switch_step = -10**9
 
-        self._ucb_c = 0.35
-        self._switch_after = 2
+        self._last_action = None
+
+        self._gap = None
+        self._restart = None
+        self._force_buffer = None
+
+        self._spot_query = None  # type: Optional[Tuple[Callable[..., Any], int, bool]]
+
+        self.trace_files = list(config.get("trace_files", []))
 
         return self
 
-    def _ensure_init(self) -> None:
-        if self._inited:
+    def _ensure_constants(self):
+        if self._gap is None:
+            try:
+                self._gap = float(self.env.gap_seconds)
+            except Exception:
+                self._gap = 1.0
+        if self._restart is None:
+            try:
+                self._restart = float(self.restart_overhead)
+            except Exception:
+                self._restart = 0.0
+        if self._force_buffer is None:
+            # Conservative buffer to reduce risk of deadline miss.
+            # Tuned to be small relative to 24h slack, but large enough to absorb a few restarts.
+            self._force_buffer = 2.0 * self._restart + 2.0 * self._gap
+
+    def _ensure_regions(self):
+        if self._num_regions is not None and self._region_obs is not None:
             return
-        self._gap = float(self.env.gap_seconds)
-        self._n_regions = int(self.env.get_num_regions())
-        self._seen = [0] * self._n_regions
-        self._avail = [0] * self._n_regions
-        self._total_seen = 0
-        self._last_region = int(self.env.get_current_region())
-        self._no_spot_streak = 0
-        self._done_sum = 0.0
-        self._done_idx = 0
-        self._od_mode = False
-        self._inited = True
+        n = None
+        try:
+            n = int(self.env.get_num_regions())
+        except Exception:
+            n = 1
+        if n <= 0:
+            n = 1
+        self._num_regions = n
+        self._region_obs = [0] * n
+        self._region_spot = [0] * n
+        self._total_obs = 0
+        try:
+            self._last_region = int(self.env.get_current_region())
+        except Exception:
+            self._last_region = 0
 
-    @staticmethod
-    def _as_float_seconds(x):
-        if isinstance(x, (list, tuple)):
-            return float(x[0])
-        return float(x)
-
-    def _steps_needed(self, work_seconds: float, start_overhead_seconds: float) -> int:
-        if work_seconds <= 1e-12:
-            return 0
-        gap = self._gap
-        overhead = max(0.0, start_overhead_seconds)
-
-        if overhead <= 1e-12:
-            return int(math.ceil(work_seconds / gap - 1e-12))
-
-        full_overhead_steps = int(overhead // gap)
-        overhead_rem = overhead - full_overhead_steps * gap
-
-        if overhead_rem <= 1e-12:
-            # After full_overhead_steps steps, next step has full work.
-            return full_overhead_steps + int(math.ceil(work_seconds / gap - 1e-12))
-
-        first_work = max(0.0, gap - overhead_rem)
-        if work_seconds <= first_work + 1e-12:
-            return full_overhead_steps + 1
-
-        rem = work_seconds - first_work
-        return full_overhead_steps + 1 + int(math.ceil(rem / gap - 1e-12))
-
-    def _work_this_step(self, overhead_seconds: float) -> float:
-        if overhead_seconds <= 1e-12:
-            return self._gap
-        if overhead_seconds >= self._gap - 1e-12:
-            return 0.0
-        return self._gap - overhead_seconds
-
-    def _maybe_switch_region(self) -> None:
-        n = self._n_regions
-        if n <= 1:
+    def _update_work_done(self):
+        td = self.task_done_time
+        if not td:
+            self._last_task_done_len = 0
+            self._work_done = 0.0
             return
+        l = len(td)
+        if l == self._last_task_done_len:
+            return
+        if l < self._last_task_done_len:
+            # Reset occurred
+            self._work_done = float(sum(td))
+            self._last_task_done_len = l
+            return
+        # Incremental add
+        s = 0.0
+        for i in range(self._last_task_done_len, l):
+            s += float(td[i])
+        self._work_done += s
+        self._last_task_done_len = l
 
-        cur = int(self.env.get_current_region())
-        total = self._total_seen + 1
-        log_total = math.log(total + 1.0)
+    def _discover_spot_query(self) -> Optional[Tuple[Callable[..., Any], int, bool]]:
+        env = self.env
+        candidates = (
+            "has_spot",
+            "get_has_spot",
+            "spot_available",
+            "is_spot_available",
+            "get_spot_available",
+            "get_spot_availability",
+        )
+        for name in candidates:
+            fn = getattr(env, name, None)
+            if fn is None:
+                continue
+            if not callable(fn):
+                # attribute boolean
+                try:
+                    val = bool(fn)
+                    return (lambda _v=val: _v, 0, True)
+                except Exception:
+                    continue
+            try:
+                sig = inspect.signature(fn)
+                params = sig.parameters
+                arity = 0
+                for p in params.values():
+                    if p.kind in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD) and p.default is p.empty:
+                        arity += 1
+                # Try call patterns
+                if arity == 0:
+                    try:
+                        v = fn()
+                        if isinstance(v, bool) or isinstance(v, (int, float)):
+                            return (fn, 0, True)
+                    except Exception:
+                        pass
+                elif arity == 1:
+                    # Might accept region index
+                    try:
+                        r = int(env.get_current_region())
+                    except Exception:
+                        r = 0
+                    try:
+                        v = fn(r)
+                        if isinstance(v, bool) or isinstance(v, (int, float)):
+                            return (fn, 1, True)
+                    except Exception:
+                        pass
+            except Exception:
+                continue
+        return None
 
-        best = cur
-        best_score = -1e30
+    def _query_current_has_spot(self) -> Optional[bool]:
+        if self._spot_query is None:
+            self._spot_query = self._discover_spot_query()
+        if self._spot_query is None:
+            return None
+        fn, arity, _ = self._spot_query
+        try:
+            if arity == 0:
+                return bool(fn())
+            if arity == 1:
+                try:
+                    r = int(self.env.get_current_region())
+                except Exception:
+                    r = 0
+                return bool(fn(r))
+        except Exception:
+            return None
+        return None
 
+    def _ucb_best_region(self, exclude_region: int) -> int:
+        n = self._num_regions
+        total = self._total_obs + 1
+        logt = math.log(total + 1.0)
+        best_r = exclude_region
+        best_score = -1e18
         for r in range(n):
-            seen = self._seen[r]
-            avail = self._avail[r]
-            mean = (avail + 1.0) / (seen + 2.0)
-            bonus = self._ucb_c * math.sqrt(log_total / (seen + 1.0))
-            score = mean + bonus
+            if r == exclude_region:
+                continue
+            obs = self._region_obs[r]
+            spot = self._region_spot[r]
+            mean = (spot + 1.0) / (obs + 2.0)  # Beta(1,1) prior
+            bonus = math.sqrt(2.0 * logt / (obs + 1.0))
+            score = mean + 0.35 * bonus
             if score > best_score:
                 best_score = score
-                best = r
+                best_r = r
+        return best_r
 
-        if best == cur:
-            if self._no_spot_streak < self._switch_after:
-                return
-            # Pick a second-best to avoid being stuck
-            second = -1
-            second_score = -1e30
-            for r in range(n):
-                if r == cur:
-                    continue
-                seen = self._seen[r]
-                avail = self._avail[r]
-                mean = (avail + 1.0) / (seen + 2.0)
-                bonus = self._ucb_c * math.sqrt(log_total / (seen + 1.0))
-                score = mean + bonus
-                if score > second_score:
-                    second_score = score
-                    second = r
-            if second != -1:
-                best = second
-            else:
-                best = (cur + 1) % n
-
-        if best != cur:
-            self.env.switch_region(best)
-            self._last_region = best
-            self._no_spot_streak = 0
-
-    def _update_work_done(self) -> None:
-        tdt = self.task_done_time
-        ln = len(tdt)
-        i = self._done_idx
-        if ln > i:
-            s = self._done_sum
-            for j in range(i, ln):
-                s += float(tdt[j])
-            self._done_sum = s
-            self._done_idx = ln
+    def _should_force_on_demand(self, last_cluster_type: ClusterType, remaining_work: float, remaining_time: float) -> bool:
+        # Required wall time if we switch to on-demand and keep it:
+        # - remaining_work of progress
+        # - plus a restart overhead if not already on-demand (switching/starting)
+        startup = 0.0 if last_cluster_type == _CT_ON_DEMAND else self._restart
+        required = remaining_work + startup
+        return remaining_time <= required + self._force_buffer
 
     def _step(self, last_cluster_type: ClusterType, has_spot: bool) -> ClusterType:
-        self._ensure_init()
+        self._step_count += 1
+        self._ensure_constants()
+        self._ensure_regions()
 
-        cur_region = int(self.env.get_current_region())
-        if self._last_region != cur_region:
+        try:
+            cur_region = int(self.env.get_current_region())
+        except Exception:
+            cur_region = 0
+
+        # Track region switching
+        if self._last_region is None:
             self._last_region = cur_region
-            self._no_spot_streak = 0
+        elif cur_region != self._last_region:
+            self._last_switch_step = self._step_count
+            self._last_region = cur_region
 
-        self._seen[cur_region] += 1
-        if has_spot:
-            self._avail[cur_region] += 1
-            self._no_spot_streak = 0
-        else:
-            self._no_spot_streak += 1
-        self._total_seen += 1
+        # Update observations for current region
+        if 0 <= cur_region < self._num_regions:
+            self._region_obs[cur_region] += 1
+            if has_spot:
+                self._region_spot[cur_region] += 1
+            self._total_obs += 1
 
         self._update_work_done()
 
-        task_duration = self._as_float_seconds(self.task_duration)
-        deadline = self._as_float_seconds(self.deadline)
-        restart_overhead = self._as_float_seconds(self.restart_overhead)
-        remaining_overhead = float(getattr(self, "remaining_restart_overhead", 0.0) or 0.0)
+        task_duration = float(self.task_duration)
+        remaining_work = task_duration - self._work_done
+        if remaining_work <= 0.0:
+            self._last_action = _CT_NONE
+            return _CT_NONE
 
-        remaining_work = task_duration - self._done_sum
-        if remaining_work <= 1e-9:
-            return _NONE
+        elapsed = float(self.env.elapsed_seconds)
+        remaining_time = float(self.deadline) - elapsed
+        if remaining_time <= 0.0:
+            # Too late; still try to run on-demand if possible
+            self._forced_on_demand = True
+            self._last_action = _CT_ON_DEMAND
+            return _CT_ON_DEMAND
 
-        remaining_time = deadline - float(self.env.elapsed_seconds)
-        if remaining_time <= 1e-12:
-            return _NONE
+        if not self._forced_on_demand and self._should_force_on_demand(last_cluster_type, remaining_work, remaining_time):
+            self._forced_on_demand = True
 
-        steps_left = int(math.ceil(remaining_time / self._gap - 1e-12))
-        if steps_left <= 0:
-            return _NONE
+        if self._forced_on_demand:
+            self._last_action = _CT_ON_DEMAND
+            return _CT_ON_DEMAND
 
-        if last_cluster_type == _ON_DEMAND:
-            self._od_mode = True
-
-        if self._od_mode:
-            return _ON_DEMAND
-
-        overhead_od_now = remaining_overhead if last_cluster_type == _ON_DEMAND else restart_overhead
-        overhead_spot_now = remaining_overhead if last_cluster_type == _SPOT else restart_overhead
-
-        steps_od_now = self._steps_needed(remaining_work, overhead_od_now)
-        feasible_od_now = steps_od_now <= steps_left
-
-        feasible_none_now = (1 + self._steps_needed(remaining_work, restart_overhead)) <= steps_left
-
-        feasible_spot_cont = False
-        feasible_spot_then_od = False
+        # Not forced: opportunistically use spot when available
         if has_spot:
-            steps_spot_cont = self._steps_needed(remaining_work, overhead_spot_now)
-            feasible_spot_cont = steps_spot_cont <= steps_left
+            self._last_action = _CT_SPOT
+            return _CT_SPOT
 
-            work_spot_now = self._work_this_step(overhead_spot_now)
-            rem_after = remaining_work - work_spot_now
-            if rem_after <= 1e-9:
-                feasible_spot_then_od = True
-            else:
-                feasible_spot_then_od = (1 + self._steps_needed(rem_after, restart_overhead)) <= steps_left
+        # Spot not available: decide between waiting/searching vs on-demand
+        # If we wait one more decision interval, can we still comfortably switch to on-demand and finish?
+        wait_safe = remaining_time > (remaining_work + self._restart + self._force_buffer + self._gap)
 
-        if has_spot:
-            # Maintain "OD-safe" invariant: only keep using Spot if OD remains feasible next step,
-            # unless OD is already infeasible (then Spot is the only chance).
-            if feasible_spot_then_od or (not feasible_od_now and feasible_spot_cont):
-                return _SPOT
+        if wait_safe:
+            # Search other regions while waiting, but avoid excessive switching when overhead almost cleared
+            do_switch = self._num_regions > 1
+            if do_switch:
+                # Avoid switching too frequently when we're not in a "search loop"
+                # Allow rapid switching if we are already waiting repeatedly with no spot.
+                cooldown = 1 if self._last_action == _CT_NONE else max(1, int(self._restart / max(self._gap, 1e-9)))
+                if self._step_count - self._last_switch_step < cooldown:
+                    do_switch = False
 
-        if (not has_spot) and feasible_none_now:
-            self._maybe_switch_region()
-            return _NONE
+            if do_switch:
+                next_region = self._ucb_best_region(exclude_region=cur_region)
+                if next_region != cur_region:
+                    try:
+                        self.env.switch_region(next_region)
+                        # If we can query spot availability reliably, we might run spot immediately.
+                        q = self._query_current_has_spot()
+                        if q is True:
+                            self._last_action = _CT_SPOT
+                            return _CT_SPOT
+                    except Exception:
+                        pass
 
-        if feasible_od_now:
-            self._od_mode = True
-            return _ON_DEMAND
+            self._last_action = _CT_NONE
+            return _CT_NONE
 
-        # If nothing is feasible (should be rare), try to make progress with whatever is available.
-        if has_spot and feasible_spot_cont:
-            return _SPOT
-        self._od_mode = True
-        return _ON_DEMAND
+        # Not safe to wait: use on-demand to stay on track
+        self._last_action = _CT_ON_DEMAND
+        return _CT_ON_DEMAND

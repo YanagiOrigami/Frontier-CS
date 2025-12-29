@@ -1,185 +1,131 @@
 import torch
 import torch.nn as nn
-import torch.optim as optim
-from torch.optim.lr_scheduler import CosineAnnealingLR, ReduceLROnPlateau
-import numpy as np
+import torch.nn.functional as F
+from torch.optim import AdamW
+from torch.optim.lr_scheduler import CosineAnnealingLR
+import math
 
 class ResidualBlock(nn.Module):
-    def __init__(self, in_features, out_features, dropout_rate=0.2):
+    def __init__(self, in_features, out_features, dropout=0.2):
         super().__init__()
+        self.norm1 = nn.BatchNorm1d(in_features)
         self.linear1 = nn.Linear(in_features, out_features)
-        self.bn1 = nn.BatchNorm1d(out_features)
+        self.norm2 = nn.BatchNorm1d(out_features)
         self.linear2 = nn.Linear(out_features, out_features)
-        self.bn2 = nn.BatchNorm1d(out_features)
-        self.dropout = nn.Dropout(dropout_rate)
-        self.activation = nn.GELU()
-        
+        self.dropout = nn.Dropout(dropout)
         self.shortcut = nn.Linear(in_features, out_features) if in_features != out_features else nn.Identity()
-    
+        
     def forward(self, x):
         residual = self.shortcut(x)
-        out = self.linear1(x)
-        out = self.bn1(out)
-        out = self.activation(out)
-        out = self.dropout(out)
+        out = self.norm1(x)
+        out = F.gelu(self.linear1(out))
+        out = self.norm2(out)
         out = self.linear2(out)
-        out = self.bn2(out)
-        out = self.activation(out)
-        out = out + residual
-        return out
+        out = self.dropout(out)
+        return out + residual
 
-class EfficientMLP(nn.Module):
-    def __init__(self, input_dim=384, num_classes=128, param_limit=5000000):
+class SolutionModel(nn.Module):
+    def __init__(self, input_dim=384, num_classes=128):
         super().__init__()
-        self.param_limit = param_limit
+        hidden1 = 1024
+        hidden2 = 768
+        hidden3 = 512
         
-        # Calculate dimensions to stay under parameter limit
-        hidden_dims = self._calculate_hidden_dims(input_dim, num_classes)
+        self.input_proj = nn.Sequential(
+            nn.Linear(input_dim, hidden1),
+            nn.BatchNorm1d(hidden1),
+            nn.GELU(),
+            nn.Dropout(0.2)
+        )
         
-        # Initial projection
-        layers = [nn.Linear(input_dim, hidden_dims[0]), nn.BatchNorm1d(hidden_dims[0]), nn.GELU(), nn.Dropout(0.2)]
+        self.blocks = nn.Sequential(
+            ResidualBlock(hidden1, hidden1),
+            ResidualBlock(hidden1, hidden2),
+            ResidualBlock(hidden2, hidden2),
+            ResidualBlock(hidden2, hidden3),
+            ResidualBlock(hidden3, hidden3),
+        )
         
-        # Residual blocks
-        for i in range(len(hidden_dims) - 1):
-            layers.append(ResidualBlock(hidden_dims[i], hidden_dims[i+1], dropout_rate=0.2))
+        self.output = nn.Sequential(
+            nn.BatchNorm1d(hidden3),
+            nn.Linear(hidden3, num_classes)
+        )
         
-        # Final layers
-        layers.append(nn.Linear(hidden_dims[-1], num_classes))
-        
-        self.net = nn.Sequential(*layers)
-        
-        # Initialize weights
-        self._initialize_weights()
-        
-        # Verify parameter count
-        self._verify_parameters()
-    
-    def _calculate_hidden_dims(self, input_dim, num_classes):
-        # Start with reasonable dimensions and adjust to fit parameter budget
-        base_dim = 1024
-        num_blocks = 4
-        
-        # Try different configurations to maximize capacity within budget
-        for trial in range(5):
-            hidden_dims = [base_dim // (2**i) for i in range(num_blocks)]
-            
-            # Estimate parameters
-            params = 0
-            # First layer
-            params += (input_dim * hidden_dims[0] + hidden_dims[0])
-            params += 2 * hidden_dims[0]  # BN
-            
-            # Residual blocks
-            for i in range(num_blocks - 1):
-                # Linear layers in block
-                params += (hidden_dims[i] * hidden_dims[i] + hidden_dims[i]) * 2
-                # BN layers (2 per block, 2 params each)
-                params += 4 * hidden_dims[i]
-                # Shortcut if dimension changes
-                if hidden_dims[i] != hidden_dims[i+1]:
-                    params += (hidden_dims[i] * hidden_dims[i+1] + hidden_dims[i+1])
-            
-            # Final layer
-            params += (hidden_dims[-1] * num_classes + num_classes)
-            
-            if params <= self.param_limit * 0.95:  # Leave margin
-                return hidden_dims
-            
-            # Reduce dimensions for next trial
-            base_dim = int(base_dim * 0.85)
-        
-        # Fallback to conservative dimensions
-        return [768, 512, 384, 256]
-    
-    def _initialize_weights(self):
-        for m in self.modules():
-            if isinstance(m, nn.Linear):
-                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
-                if m.bias is not None:
-                    nn.init.constant_(m.bias, 0)
-            elif isinstance(m, nn.BatchNorm1d):
-                nn.init.constant_(m.weight, 1)
-                nn.init.constant_(m.bias, 0)
-    
-    def _verify_parameters(self):
-        total = sum(p.numel() for p in self.parameters() if p.requires_grad)
-        if total > self.param_limit:
-            raise ValueError(f"Model exceeds parameter limit: {total} > {self.param_limit}")
-    
     def forward(self, x):
-        return self.net(x)
+        x = self.input_proj(x)
+        x = self.blocks(x)
+        return self.output(x)
 
 class Solution:
     def solve(self, train_loader, val_loader, metadata: dict = None):
-        device = torch.device(metadata.get("device", "cpu"))
+        device = torch.device(metadata["device"] if metadata else "cpu")
         input_dim = metadata["input_dim"]
         num_classes = metadata["num_classes"]
-        param_limit = metadata["param_limit"]
         
-        # Create model
-        model = EfficientMLP(input_dim, num_classes, param_limit).to(device)
+        model = SolutionModel(input_dim, num_classes).to(device)
         
-        # Training setup
-        criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
-        optimizer = optim.AdamW(model.parameters(), lr=0.001, weight_decay=1e-4)
-        scheduler = CosineAnnealingLR(optimizer, T_max=100, eta_min=1e-5)
+        params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        if params > 5000000:
+            hidden_adj = int(math.sqrt(5000000 / (input_dim + num_classes + 2000)))
+            model = nn.Sequential(
+                nn.Linear(input_dim, hidden_adj),
+                nn.BatchNorm1d(hidden_adj),
+                nn.GELU(),
+                nn.Dropout(0.3),
+                nn.Linear(hidden_adj, hidden_adj),
+                nn.BatchNorm1d(hidden_adj),
+                nn.GELU(),
+                nn.Dropout(0.3),
+                nn.Linear(hidden_adj, num_classes)
+            ).to(device)
         
-        # Training loop
-        best_val_acc = 0
+        optimizer = AdamW(model.parameters(), lr=0.001, weight_decay=0.01)
+        scheduler = CosineAnnealingLR(optimizer, T_max=50)
+        criterion = nn.CrossEntropyLoss()
+        
+        best_acc = 0
         best_model_state = None
-        patience = 20
+        patience = 10
         patience_counter = 0
         
-        num_epochs = 150
-        
-        for epoch in range(num_epochs):
-            # Training phase
+        for epoch in range(100):
             model.train()
-            train_loss = 0
+            total_loss = 0
             for batch_idx, (data, target) in enumerate(train_loader):
                 data, target = data.to(device), target.to(device)
-                
                 optimizer.zero_grad()
                 output = model(data)
                 loss = criterion(output, target)
                 loss.backward()
-                
-                # Gradient clipping
-                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-                
                 optimizer.step()
-                train_loss += loss.item()
+                total_loss += loss.item()
             
             scheduler.step()
             
-            # Validation phase
             model.eval()
-            val_correct = 0
-            val_total = 0
+            correct = 0
+            total = 0
             with torch.no_grad():
                 for data, target in val_loader:
                     data, target = data.to(device), target.to(device)
                     output = model(data)
                     pred = output.argmax(dim=1)
-                    val_correct += (pred == target).sum().item()
-                    val_total += target.size(0)
+                    correct += (pred == target).sum().item()
+                    total += target.size(0)
             
-            val_acc = val_correct / val_total
+            val_acc = correct / total
             
-            # Save best model
-            if val_acc > best_val_acc:
-                best_val_acc = val_acc
-                best_model_state = model.state_dict().copy()
+            if val_acc > best_acc:
+                best_acc = val_acc
+                best_model_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
                 patience_counter = 0
             else:
                 patience_counter += 1
             
-            # Early stopping
             if patience_counter >= patience:
                 break
         
-        # Load best model
-        if best_model_state is not None:
+        if best_model_state:
             model.load_state_dict(best_model_state)
         
-        return model
+        return model.cpu()

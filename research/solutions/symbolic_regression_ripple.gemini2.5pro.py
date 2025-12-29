@@ -4,100 +4,104 @@ import sympy
 
 class Solution:
     def __init__(self, **kwargs):
-        """
-        Initializes the Solution class.
-        """
         pass
 
     def solve(self, X: np.ndarray, y: np.ndarray) -> dict:
         """
-        Finds a symbolic expression for the given data.
-
         Args:
-            X: Feature matrix of shape (n, 2).
-            y: Target values of shape (n,).
+            X: Feature matrix of shape (n, 2)
+            y: Target values of shape (n,)
 
         Returns:
-            A dictionary containing the symbolic expression and predictions.
+            dict with keys:
+              - "expression": str, a Python-evaluable expression using x1, x2
+              - "predictions": list/array of length n (optional)
+              - "details": dict with optional "complexity" int
         """
-        # Configure PySRRegressor. The parameters are tuned for the Ripple dataset,
-        # which is known to have a structure of (polynomial) * sin(polynomial).
-        # We constrain the search space to operators that can form such expressions.
+        x1, x2 = X[:, 0], X[:, 1]
+        
+        # Feature engineering: Add r^2 = x1^2 + x2^2 as a feature.
+        # This is a strong prior for problems with radial symmetry like ripples.
+        r2 = x1**2 + x2**2
+        X_engineered = np.c_[X, r2]
+        
+        # Configure PySRRegressor. Parameters are tuned for this specific problem.
         model = PySRRegressor(
-            niterations=80,
-            populations=24,
-            population_size=35,
-            
-            # Operators are chosen to match the expected structure of the target function.
-            # x**2 can be formed by x*x. This focuses the search.
-            binary_operators=["+", "-", "*"],
+            niterations=60,
+            populations=16,
+            population_size=40,
+            maxsize=30,
+            binary_operators=["+", "-", "*", "/", "pow"],
             unary_operators=["sin", "cos"],
-            
-            maxsize=30,  # A complexity limit to prevent overfitting.
-            
-            # Annealing can help the search escape local optima.
-            annealing=True,
-            
-            # Use all available CPU cores.
-            procs=8,
-            
-            # For reproducibility.
+            # Align PySR's complexity metric with the competition's scoring metric
+            complexity_of_binary_operators=2,
+            complexity_of_unary_operators=1,
+            complexity_of_constants=1,
+            complexity_of_variables=1,
+            # Add constraints to prune the search space
+            nested_constraints={"sin": {"cos": 0}, "cos": {"sin": 0}},
+            # Use all available CPU cores for parallelism
+            procs=0,
             random_state=42,
-            
-            # Suppress console output.
             verbosity=0,
             progress=False,
-            
-            # Using a temporary file for equations is safer in parallel environments.
-            temp_equation_file=True,
         )
-
-        model_fitted_successfully = False
+        
         try:
-            # Fit the model to the data.
-            model.fit(X, y, variable_names=["x1", "x2"])
-            if hasattr(model, 'equations_') and not model.equations_.empty:
-                model_fitted_successfully = True
+            model.fit(X_engineered, y, variable_names=["x1", "x2", "r2"])
         except Exception:
-            # PySR can encounter errors, especially with its Julia backend.
-            # We catch them to allow the fallback mechanism to run.
-            pass
+            # Fallback if the PySR backend (Julia) fails
+            return self._fallback_solve(X, y)
 
-        # Fallback mechanism if PySR fails or finds no valid equations.
-        if not model_fitted_successfully:
-            # A simple linear model serves as a robust fallback.
-            x1, x2 = X[:, 0], X[:, 1]
-            A = np.column_stack([x1, x2, np.ones_like(x1)])
-            try:
-                coeffs, _, _, _ = np.linalg.lstsq(A, y, rcond=None)
-                a, b, c = coeffs
-                expression = f"{a:.6f}*x1 + {b:.6f}*x2 + {c:.6f}"
-                predictions = a * x1 + b * x2 + c
-                status = "pysr_failed_fallback_linear"
-            except np.linalg.LinAlgError:
-                # If linear regression also fails, fallback to the mean.
-                mean_y = np.mean(y)
-                expression = f"{mean_y:.6f}"
-                predictions = np.full_like(y, mean_y)
-                status = "pysr_and_linear_failed_fallback_mean"
+        try:
+            # Check if any equations were found
+            if not hasattr(model, 'equations_') or model.equations_.shape[0] == 0:
+                return self._fallback_solve(X, y)
+
+            sympy_expr_with_r2 = model.sympy()
             
+            s_x1, s_x2, s_r2 = sympy.symbols('x1 x2 r2')
+            
+            # Substitute the engineered feature back to its base form
+            final_sympy_expr = sympy_expr_with_r2.subs(s_r2, s_x1**2 + s_x2**2)
+            
+            expression_str = str(final_sympy_expr)
+            
+            # Use the fitted model to generate predictions on the engineered features
+            predictions = model.predict(X_engineered)
+            
+            # Extract complexity from the best equation
+            best_equation = model.get_best()
+            complexity = best_equation.complexity
+            details = {"complexity": int(complexity)}
+
             return {
-                "expression": expression,
+                "expression": expression_str,
                 "predictions": predictions.tolist(),
-                "details": {"status": status}
+                "details": details,
             }
 
-        # Extract the best symbolic expression found by PySR.
-        best_sympy_expr = model.sympy()
-        
-        # Convert the sympy expression to a standard Python string.
-        expression_str = str(best_sympy_expr)
-        
-        # Generate predictions using the best found model.
-        predictions = model.predict(X)
+        except (AttributeError, IndexError, RuntimeError):
+            # Fallback for any other errors during expression retrieval
+            return self._fallback_solve(X, y)
+
+    def _fallback_solve(self, X: np.ndarray, y: np.ndarray) -> dict:
+        """
+        Provides a simple linear regression model as a fallback solution.
+        """
+        x1, x2 = X[:, 0], X[:, 1]
+        A = np.column_stack([x1, x2, np.ones_like(x1)])
+        try:
+            coeffs, _, _, _ = np.linalg.lstsq(A, y, rcond=None)
+            a, b, c = coeffs
+        except np.linalg.LinAlgError:
+            a, b, c = 0.0, 0.0, np.mean(y) if y.size > 0 else 0.0
+
+        expression = f"{a:.6f}*x1 + {b:.6f}*x2 + {c:.6f}"
+        predictions = a * x1 + b * x2 + c
 
         return {
-            "expression": expression_str,
+            "expression": expression,
             "predictions": predictions.tolist(),
-            "details": {}
+            "details": {},
         }

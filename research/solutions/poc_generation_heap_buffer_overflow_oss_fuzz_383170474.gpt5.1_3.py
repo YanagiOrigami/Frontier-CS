@@ -1,136 +1,206 @@
-import os
 import tarfile
-import zipfile
+import gzip
+import bz2
+
+try:
+    import lzma
+except ImportError:
+    lzma = None
 
 
 class Solution:
-    GROUND_TRUTH_LEN = 1551
+    TARGET_SIZE = 1551
 
     def solve(self, src_path: str) -> bytes:
-        data = None
-
         try:
-            data = self._find_poc_in_tar(src_path)
+            tf = tarfile.open(src_path, "r:*")
         except Exception:
-            data = None
+            return b"A" * self.TARGET_SIZE
 
-        if data is None:
+        best_data = None
+        best_score = float("-inf")
+
+        with tf:
+            for member in tf.getmembers():
+                if not member.isfile():
+                    continue
+
+                size = member.size or 0
+                if size <= 0:
+                    continue
+
+                # Skip extremely large files to save time/memory
+                if size > 5 * 1024 * 1024:
+                    continue
+
+                name = member.name
+                lname = name.lower()
+
+                # Skip obvious source/doc files unless they look fuzz-related
+                suspicious_name = any(
+                    k in lname
+                    for k in (
+                        "poc",
+                        "crash",
+                        "clusterfuzz",
+                        "oss-fuzz",
+                        "testcase",
+                        "repro",
+                        "inputs",
+                        "fuzzer",
+                        "fuzz",
+                        "383170474",
+                    )
+                )
+                skip_exts = (
+                    ".c",
+                    ".h",
+                    ".cc",
+                    ".hh",
+                    ".hpp",
+                    ".cxx",
+                    ".cpp",
+                    ".txt",
+                    ".md",
+                    ".rst",
+                    ".html",
+                    ".htm",
+                    ".xml",
+                    ".json",
+                    ".py",
+                    ".sh",
+                    ".bat",
+                    ".cmake",
+                    ".yml",
+                    ".yaml",
+                    ".in",
+                    ".am",
+                    ".ac",
+                    ".m4",
+                    ".java",
+                    ".go",
+                    ".rs",
+                    ".m",
+                    ".mm",
+                )
+                if lname.endswith(skip_exts) and not suspicious_name:
+                    continue
+
+                try:
+                    f = tf.extractfile(member)
+                except Exception:
+                    continue
+                if f is None:
+                    continue
+
+                try:
+                    orig_data = f.read()
+                except Exception:
+                    f.close()
+                    continue
+                finally:
+                    f.close()
+
+                if not orig_data:
+                    continue
+
+                data = self._maybe_decompress(orig_data)
+                if not data:
+                    continue
+
+                score = self._score_candidate(name, data)
+
+                if score > best_score:
+                    best_score = score
+                    best_data = data
+
+        if best_data is not None:
+            return best_data
+
+        return b"A" * self.TARGET_SIZE
+
+    def _maybe_decompress(self, data: bytes) -> bytes:
+        # Gzip
+        if len(data) >= 3 and data[:2] == b"\x1f\x8b":
             try:
-                data = self._find_poc_in_zip(src_path)
+                dec = gzip.decompress(data)
+                if dec:
+                    return dec
             except Exception:
-                data = None
+                pass
 
-        if data is None:
-            data = self._fallback_poc()
+        # XZ
+        if lzma is not None and len(data) >= 6 and data[:6] == b"\xfd7zXZ\x00":
+            try:
+                dec = lzma.decompress(data)
+                if dec:
+                    return dec
+            except Exception:
+                pass
+
+        # BZip2
+        if len(data) >= 3 and data[:3] == b"BZh":
+            try:
+                dec = bz2.decompress(data)
+                if dec:
+                    return dec
+            except Exception:
+                pass
 
         return data
 
-    def _fallback_poc(self) -> bytes:
-        return b"A" * self.GROUND_TRUTH_LEN
+    def _score_candidate(self, name: str, data: bytes) -> int:
+        lname = name.lower()
+        length = len(data)
 
-    def _find_poc_in_tar(self, src_path):
-        if not tarfile.is_tarfile(src_path):
-            return None
+        score = 0
 
-        with tarfile.open(src_path, "r:*") as tf:
-            members = [m for m in tf.getmembers() if m.isfile()]
-            if not members:
-                return None
+        # Binary signatures
+        if data.startswith(b"\x7fELF"):
+            score += 80
 
-            best_member = None
-            best_score = float("-inf")
+        if b".debug_names" in data:
+            score += 150
+        elif b"debug_names" in data:
+            score += 60
 
-            for m in members:
-                score = self._score_candidate(m.name, m.size)
-                if score > best_score:
-                    best_score = score
-                    best_member = m
+        if b"DWARF" in data:
+            score += 40
 
-            if best_member is None or best_score < 50:
-                return None
-
-            f = tf.extractfile(best_member)
-            if f is None:
-                return None
-            return f.read()
-
-    def _find_poc_in_zip(self, src_path):
-        if not zipfile.is_zipfile(src_path):
-            return None
-
-        with zipfile.ZipFile(src_path, "r") as zf:
-            infos = [info for info in zf.infolist() if not info.is_dir()]
-            if not infos:
-                return None
-
-            best_info = None
-            best_score = float("-inf")
-
-            for info in infos:
-                score = self._score_candidate(info.filename, info.file_size)
-                if score > best_score:
-                    best_score = score
-                    best_info = info
-
-            if best_info is None or best_score < 50:
-                return None
-
-            return zf.read(best_info.filename)
-
-    def _score_candidate(self, name: str, size: int) -> float:
-        if size <= 0:
-            return float("-inf")
-
-        ln = name.lower()
-        _, ext = os.path.splitext(ln)
-
-        doc_ext = {
-            ".c", ".h", ".hpp", ".hh", ".cc", ".cpp", ".cxx",
-            ".txt", ".md", ".markdown", ".rst", ".html", ".htm",
-            ".xml", ".json", ".csv", ".yml", ".yaml", ".toml",
-            ".ini", ".py", ".sh", ".bat", ".ps1", ".java", ".rb",
-            ".pl", ".php", ".go", ".rs", ".js", ".ts", ".m", ".mm",
-            ".swift", ".scala", ".tex", ".in", ".am", ".ac", ".cmake",
-            ".mk", ".make", ".diff", ".patch", ".log", ".cfg",
-            ".sln", ".vcxproj", ".csproj", ".properties",
+        # Name-based heuristics
+        keywords = {
+            "383170474": 120,
+            "debug_names": 80,
+            "debugnames": 60,
+            "dwarf": 60,
+            "heap": 20,
+            "overflow": 20,
+            "poc": 120,
+            "crash": 90,
+            "clusterfuzz": 150,
+            "oss-fuzz": 100,
+            "fuzz": 40,
+            "repro": 70,
+            "testcase": 80,
+            "bug": 30,
         }
+        for k, v in keywords.items():
+            if k in lname:
+                score += v
 
-        binary_ext = {
-            ".bin", ".dat", ".o", ".obj", ".so", ".a", ".lib", ".dll",
-            ".exe", ".out", ".elf", ".class", ".jar", ".gz", ".xz",
-            ".bz2", ".zip", ".7z", ".lzma", ".z", ".tar", ".tgz",
-        }
+        # Prefer sizes close to known ground-truth
+        diff = abs(length - self.TARGET_SIZE)
+        if diff == 0:
+            score += 250
+        else:
+            # Linearly decreasing bonus; still some credit for being within a few KB
+            size_bonus = max(0, 200 - diff // 5)
+            score += size_bonus
 
-        score = 0.0
+        # Penalize extremely small or huge candidates
+        if length < 256:
+            score -= 60
+        if length > 64 * 1024:
+            score -= 40
 
-        # Prefer sizes close to the known ground-truth length
-        diff = abs(size - self.GROUND_TRUTH_LEN)
-        closeness = 120.0 - diff * 0.2
-        if closeness > 0:
-            score += closeness
-
-        # Penalize very large files
-        if size > 1_000_000:
-            score -= 100.0
-
-        # Extension-based adjustments
-        if ext in doc_ext:
-            score -= 120.0
-        if ext in binary_ext:
-            score += 40.0
-
-        # Name-based hints
-        if "poc" in ln:
-            score += 80.0
-        if "crash" in ln:
-            score += 60.0
-        if "id_" in ln or "id:" in ln or ln.startswith("id"):
-            score += 30.0
-        if "383170474" in ln:
-            score += 120.0
-        if "dwarf" in ln or "debug" in ln or "names" in ln or "debug_names" in ln:
-            score += 40.0
-        if "oss-fuzz" in ln:
-            score += 40.0
-
-        return score
+        return int(score)

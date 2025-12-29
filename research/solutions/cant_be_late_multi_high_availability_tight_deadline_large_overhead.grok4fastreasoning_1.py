@@ -1,25 +1,13 @@
 import json
 from argparse import Namespace
-
 from sky_spot.strategies.multi_strategy import MultiRegionStrategy
 from sky_spot.utils import ClusterType
 
 
 class Solution(MultiRegionStrategy):
-    """Your multi-region scheduling strategy."""
-
-    NAME = "my_strategy"  # REQUIRED: unique identifier
+    NAME = "my_strategy"
 
     def solve(self, spec_path: str) -> "Solution":
-        """
-        Initialize the solution from spec_path config.
-
-        The spec file contains:
-        - deadline: deadline in hours
-        - duration: task duration in hours
-        - overhead: restart overhead in hours
-        - trace_files: list of trace file paths (one per region)
-        """
         with open(spec_path) as f:
             config = json.load(f)
 
@@ -30,48 +18,60 @@ class Solution(MultiRegionStrategy):
             inter_task_overhead=[0.0],
         )
         super().__init__(args)
-        self.total_done = 0.0
-        self.last_len = 0
+
+        trace_files = config["trace_files"]
+        self.num_regions = len(trace_files)
+        self.availability = []
+        for path in trace_files:
+            with open(path, 'r') as f:
+                trace = json.load(f)
+            self.availability.append([bool(x) for x in trace])
         return self
 
     def _step(self, last_cluster_type: ClusterType, has_spot: bool) -> ClusterType:
-        """
-        Decide next action based on current state.
-
-        Available attributes:
-        - self.env.get_current_region(): Get current region index
-        - self.env.get_num_regions(): Get total number of regions
-        - self.env.switch_region(idx): Switch to region by index
-        - self.env.elapsed_seconds: Current time elapsed
-        - self.task_duration: Total task duration needed (seconds)
-        - self.deadline: Deadline time (seconds)
-        - self.restart_overhead: Restart overhead (seconds)
-        - self.task_done_time: List of completed work segments
-        - self.remaining_restart_overhead: Current pending overhead
-
-        Returns: ClusterType.SPOT, ClusterType.ON_DEMAND, or ClusterType.NONE
-        """
-        # Update total_done efficiently
-        current_len = len(self.task_done_time)
-        if current_len > self.last_len:
-            added_sum = sum(self.task_done_time[self.last_len:])
-            self.total_done += added_sum
-            self.last_len = current_len
-
-        remaining_work = self.task_duration - self.total_done
-        remaining_time = self.deadline - self.env.elapsed_seconds
-        time_needed = remaining_work + self.remaining_restart_overhead
-
-        must_run = time_needed > remaining_time
-
-        if has_spot:
-            return ClusterType.SPOT
-        elif must_run:
-            return ClusterType.ON_DEMAND
-        else:
-            # Pause and switch to next region to search for spot availability
-            current = self.env.get_current_region()
-            num = self.env.get_num_regions()
-            next_r = (current + 1) % num
-            self.env.switch_region(next_r)
+        if sum(self.task_done_time) >= self.task_duration:
             return ClusterType.NONE
+
+        step = int(round(self.env.elapsed_seconds / self.env.gap_seconds))
+        current_region = self.env.get_current_region()
+        num_regions = self.num_regions
+        max_steps = len(self.availability[0]) if self.availability else 0
+
+        if step >= max_steps:
+            return ClusterType.ON_DEMAND
+
+        # Prefer current region if possible
+        best_r = current_region
+        best_streak = 0
+        if step < len(self.availability[current_region]) and self.availability[current_region][step]:
+            streak = 0
+            for s in range(step, len(self.availability[current_region])):
+                if not self.availability[current_region][s]:
+                    break
+                streak += 1
+            best_streak = streak
+        else:
+            best_r = -1
+            best_streak = 0
+
+        # Check other regions for better streak
+        for r in range(num_regions):
+            if r == current_region:
+                continue
+            if step >= len(self.availability[r]) or not self.availability[r][step]:
+                continue
+            streak = 0
+            for s in range(step, len(self.availability[r])):
+                if not self.availability[r][s]:
+                    break
+                streak += 1
+            if streak > best_streak:
+                best_streak = streak
+                best_r = r
+
+        if best_streak > 0:
+            if best_r != current_region:
+                self.env.switch_region(best_r)
+            return ClusterType.SPOT
+        else:
+            return ClusterType.ON_DEMAND

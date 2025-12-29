@@ -101,7 +101,9 @@ class AlgorithmicSkyPilotRunner(AlgorithmicRunner):
         Uses sky.status() to get cluster handle and extract head_ip.
         """
         status, handle = self._get_cluster_info()
-        if status == "UP" and handle is not None:
+        # Status could be string "UP" or enum ClusterStatus.UP
+        is_up = status is not None and ("UP" in str(status).upper())
+        if is_up and handle is not None:
             # Handle has head_ip attribute
             if hasattr(handle, "head_ip"):
                 return handle.head_ip
@@ -110,7 +112,7 @@ class AlgorithmicSkyPilotRunner(AlgorithmicRunner):
     def _is_cluster_running(self) -> bool:
         """Check if the algo-judge cluster is running."""
         status = self._get_cluster_status()
-        return status == "UP"
+        return status is not None and "UP" in str(status).upper()
 
     def _launch_cluster(self) -> Optional[str]:
         """Launch the algo-judge cluster using sky-judge.yaml.
@@ -197,9 +199,16 @@ class AlgorithmicSkyPilotRunner(AlgorithmicRunner):
         ip = self._launch_cluster()
         if not ip:
             # Fallback: try to get IP from status if launch didn't return it
-            ip = self._get_cluster_ip()
+            # May take a few seconds for cluster to be fully UP
+            logger.info("Waiting for cluster IP to become available...")
+            for attempt in range(10):
+                time.sleep(3)
+                ip = self._get_cluster_ip()
+                if ip:
+                    logger.info(f"Got cluster IP on attempt {attempt + 1}: {ip}")
+                    break
         if not ip:
-            raise RuntimeError("Failed to launch algo-judge cluster or get its IP")
+            raise RuntimeError("Could not get cluster IP after launch")
 
         logger.info(f"Waiting for judge service at {ip}:8081 (timeout: 120s)")
         if not self._wait_for_service(ip, timeout=120):

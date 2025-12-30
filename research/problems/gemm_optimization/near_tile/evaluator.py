@@ -258,7 +258,6 @@ def main():
         print(f"Evaluation failed: {error_msg}")
         # Print error score as last line
         print("0")
-        sys.exit(1)
 
 
 if __name__ == "__main__":

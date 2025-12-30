@@ -256,9 +256,8 @@ def main():
     else:
         error_msg = result.get('error', 'Unknown error')
         print(f"Evaluation failed: {error_msg}")
-        # Print error score as last line
+        # Print error score as last line (exit 0 since evaluation completed, just with score 0)
         print("0")
-        sys.exit(1)
 
 
 if __name__ == "__main__":

@@ -11,12 +11,14 @@ This can reduce evaluation time by 10-20x for large batch runs.
 
 import hashlib
 import logging
-import subprocess
-import tempfile
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
+
+import sky
+from sky import jobs as managed_jobs
+from sky.serve import serve_utils
 
 from .base import EvaluationResult, EvaluationStatus, RunnerBase
 from .config import load_runtime_config
@@ -102,87 +104,73 @@ class SkyPilotPoolRunner(RunnerBase):
         Returns:
             True if pool was created/updated successfully
         """
-        import sky
-
         logger.info(f"Creating pool '{self.pool_config.name}' with {self.pool_config.workers} workers")
 
-        # Build pool YAML
-        pool_yaml = self._generate_pool_yaml()
-
-        with tempfile.NamedTemporaryFile(
-            mode='w', suffix='.yaml', delete=False
-        ) as f:
-            f.write(pool_yaml)
-            pool_file = f.name
-
         try:
-            # Use CLI to create pool (SDK may not have pool apply yet)
-            result = subprocess.run(
-                ["sky", "jobs", "pool", "apply", pool_file, "-y"],
-                capture_output=True,
-                text=True,
-                timeout=600,  # 10 min timeout for pool creation
+            # Build pool task
+            task = self._build_pool_task()
+
+            # Apply pool configuration using Python API
+            request_id = managed_jobs.pool_apply(
+                task=task,
+                pool_name=self.pool_config.name,
+                mode=serve_utils.UpdateMode.ROLLING,
+                workers=self.pool_config.workers,
+                _need_confirmation=False,
             )
 
-            if result.returncode != 0:
-                logger.error(f"Failed to create pool: {result.stderr}")
-                return False
+            # Wait for pool creation to complete
+            sky.stream_and_get(request_id)
 
             logger.info(f"Pool '{self.pool_config.name}' created successfully")
             return True
 
-        except subprocess.TimeoutExpired:
-            logger.error("Pool creation timed out")
-            return False
         except Exception as e:
             logger.error(f"Error creating pool: {e}")
             return False
-        finally:
-            Path(pool_file).unlink(missing_ok=True)
 
-    def _generate_pool_yaml(self) -> str:
-        """Generate YAML configuration for the pool."""
+    def _build_pool_task(self) -> sky.Task:
+        """Build a sky.Task for pool configuration."""
         cfg = self.pool_config
 
-        yaml_content = f"""
-# Auto-generated pool configuration for Frontier evaluation
-pool:
-  workers: {cfg.workers}
+        # Build resources
+        resources = sky.Resources(
+            accelerators=cfg.accelerators,
+            cpus=cfg.cpus,
+            memory=cfg.memory,
+            disk_size=cfg.disk_size,
+            cloud=sky.clouds.CLOUD_REGISTRY.from_str(cfg.cloud) if cfg.cloud else None,
+            region=cfg.region,
+        )
 
-resources:
-  cpus: "{cfg.cpus}"
-  memory: "{cfg.memory}"
-  accelerators: "{cfg.accelerators}"
-  disk_size: {cfg.disk_size}
+        # Setup script for Docker
+        setup_script = """\
+# Setup Docker for evaluation
+if ! command -v docker &> /dev/null; then
+  curl -fsSL https://get.docker.com | sh
+  sudo usermod -aG docker $USER
+fi
+
+# Ensure nvidia-container-toolkit is available
+if command -v nvidia-smi &> /dev/null; then
+  if ! command -v nvidia-container-cli &> /dev/null; then
+    distribution=$(. /etc/os-release;echo $ID$VERSION_ID)
+    curl -s -L https://nvidia.github.io/nvidia-docker/gpgkey | sudo apt-key add -
+    curl -s -L https://nvidia.github.io/nvidia-docker/$distribution/nvidia-docker.list | sudo tee /etc/apt/sources.list.d/nvidia-docker.list
+    sudo apt-get update && sudo apt-get install -y nvidia-container-toolkit
+    sudo systemctl restart docker || true
+  fi
+fi
+
+echo "Pool worker setup complete"
 """
 
-        if cfg.cloud:
-            yaml_content += f"  cloud: {cfg.cloud}\n"
-        if cfg.region:
-            yaml_content += f"  region: {cfg.region}\n"
+        task = sky.Task(
+            setup=setup_script,
+        )
+        task.set_resources(resources)
 
-        yaml_content += f"""
-setup: |
-  # Setup Docker for evaluation
-  if ! command -v docker &> /dev/null; then
-    curl -fsSL https://get.docker.com | sh
-    sudo usermod -aG docker $USER
-  fi
-
-  # Ensure nvidia-container-toolkit is available
-  if command -v nvidia-smi &> /dev/null; then
-    if ! command -v nvidia-container-cli &> /dev/null; then
-      distribution=$(. /etc/os-release;echo $ID$VERSION_ID)
-      curl -s -L https://nvidia.github.io/nvidia-docker/gpgkey | sudo apt-key add -
-      curl -s -L https://nvidia.github.io/nvidia-docker/$distribution/nvidia-docker.list | sudo tee /etc/apt/sources.list.d/nvidia-docker.list
-      sudo apt-get update && sudo apt-get install -y nvidia-container-toolkit
-      sudo systemctl restart docker || true
-    fi
-  fi
-
-  echo "Pool worker setup complete"
-"""
-        return yaml_content
+        return task
 
     def submit_job(
         self,
@@ -217,59 +205,98 @@ setup: |
         runtime_config = load_runtime_config(problem_path)
         docker_config = runtime_config.docker
 
-        # Generate job YAML
+        # Generate job name and pair ID
         pair_id = f"{solution_id or solution_path.name}:{problem_id}"
         job_name = self._generate_job_name(pair_id)
-        job_yaml = self._generate_job_yaml(
-            job_name=job_name,
-            problem_id=problem_id,
-            problem_path=problem_path,
-            solution_path=solution_path,
-            docker_image=docker_config.image,
-            docker_gpu=docker_config.gpu,
-            timeout=timeout or self.timeout,
-            pair_id=pair_id,
-        )
-
-        with tempfile.NamedTemporaryFile(
-            mode='w', suffix='.yaml', delete=False
-        ) as f:
-            f.write(job_yaml)
-            job_file = f.name
 
         try:
-            # Submit job to pool via CLI
-            result = subprocess.run(
-                [
-                    "sky", "jobs", "launch",
-                    "-p", self.pool_config.name,
-                    "-y", "--detach",
-                    job_file,
-                ],
-                capture_output=True,
-                text=True,
-                timeout=120,
+            # Build job task using Python API
+            task = self._build_job_task(
+                problem_id=problem_id,
+                problem_path=problem_path,
+                solution_path=solution_path,
+                docker_image=docker_config.image,
+                docker_gpu=docker_config.gpu,
+                pair_id=pair_id,
             )
 
-            if result.returncode != 0:
-                logger.error(f"Failed to submit job: {result.stderr}")
-                return None
+            # Submit job to pool using Python API
+            request_id = managed_jobs.launch(
+                task=task,
+                name=job_name,
+                pool=self.pool_config.name,
+                _need_confirmation=False,
+            )
 
-            # Parse job ID from output
-            job_id = self._parse_job_id(result.stdout)
+            # Get job ID from request (non-blocking)
+            # The request returns (job_id, handle) tuple
+            job_id, _ = sky.get(request_id)
+
             if job_id:
                 self._pending_jobs[job_id] = pair_id
                 logger.info(f"Submitted job {job_id} for {pair_id}")
                 return job_id
             else:
-                logger.error("Could not parse job ID from output")
+                logger.error("Job submission returned no job ID")
                 return None
 
         except Exception as e:
             logger.error(f"Error submitting job: {e}")
             return None
-        finally:
-            Path(job_file).unlink(missing_ok=True)
+
+    def _build_job_task(
+        self,
+        problem_id: str,
+        problem_path: Path,
+        solution_path: Path,
+        docker_image: str,
+        docker_gpu: bool,
+        pair_id: str,
+    ) -> sky.Task:
+        """Build a sky.Task for job evaluation."""
+        gpu_flag = "--gpus all" if docker_gpu else ""
+
+        run_script = f"""\
+set -e
+mkdir -p ~/results
+
+# Copy solution to problem directory
+cp ~/solution.py ~/problem/solution.py
+
+# Run evaluation in Docker
+cd ~/problem
+
+if [ -f evaluate.sh ]; then
+  docker run --rm {gpu_flag} \\
+    -v $(pwd):/work \\
+    -w /work \\
+    {docker_image} \\
+    bash -c "chmod +x evaluate.sh && ./evaluate.sh" \\
+    2>&1 | tee ~/results/output.txt
+else
+  docker run --rm {gpu_flag} \\
+    -v $(pwd):/work \\
+    -w /work \\
+    {docker_image} \\
+    python evaluator.py --solution solution.py \\
+    2>&1 | tee ~/results/output.txt
+fi
+
+# Extract score (last line with numbers)
+grep -E "^-?[0-9]+\\.?[0-9]*(\\s+-?[0-9]+\\.?[0-9]*)?$" ~/results/output.txt | tail -1 > ~/results/score.txt || true
+
+echo "Evaluation complete for {pair_id}"
+"""
+
+        task = sky.Task(run=run_script)
+
+        # Set file mounts
+        task.set_file_mounts({
+            "~/problem": str(problem_path),
+            "~/solution.py": str(solution_path),
+        })
+
+        return task
 
     def _generate_job_name(self, pair_id: str) -> str:
         """Generate a unique job name from pair ID."""
@@ -278,79 +305,6 @@ setup: |
         name = pair_id.replace(":", "-").replace("/", "-").replace(".", "-")
         name = "".join(c if c.isalnum() or c == "-" else "-" for c in name)
         return f"eval-{name[:40]}-{digest}"
-
-    def _generate_job_yaml(
-        self,
-        job_name: str,
-        problem_id: str,
-        problem_path: Path,
-        solution_path: Path,
-        docker_image: str,
-        docker_gpu: bool,
-        timeout: int,
-        pair_id: str,
-    ) -> str:
-        """Generate YAML configuration for a job."""
-
-        gpu_flag = "--gpus all" if docker_gpu else ""
-
-        yaml_content = f"""
-name: {job_name}
-
-file_mounts:
-  ~/problem:
-    source: {problem_path}
-    mode: COPY
-  ~/solution.py:
-    source: {solution_path}
-    mode: COPY
-
-run: |
-  set -e
-  mkdir -p ~/results
-
-  # Copy solution to problem directory
-  cp ~/solution.py ~/problem/solution.py
-
-  # Run evaluation in Docker
-  cd ~/problem
-
-  if [ -f evaluate.sh ]; then
-    docker run --rm {gpu_flag} \\
-      -v $(pwd):/work \\
-      -w /work \\
-      {docker_image} \\
-      bash -c "chmod +x evaluate.sh && ./evaluate.sh" \\
-      2>&1 | tee ~/results/output.txt
-  else
-    docker run --rm {gpu_flag} \\
-      -v $(pwd):/work \\
-      -w /work \\
-      {docker_image} \\
-      python evaluator.py --solution solution.py \\
-      2>&1 | tee ~/results/output.txt
-  fi
-
-  # Extract score (last line with numbers)
-  grep -E "^-?[0-9]+\\.?[0-9]*(\\s+-?[0-9]+\\.?[0-9]*)?$" ~/results/output.txt | tail -1 > ~/results/score.txt || true
-
-  echo "Evaluation complete for {pair_id}"
-"""
-        return yaml_content
-
-    def _parse_job_id(self, output: str) -> Optional[int]:
-        """Parse job ID from sky jobs launch output."""
-        import re
-        # Look for patterns like "Job ID: 123" or "Managed Job ID: 123"
-        match = re.search(r"(?:Managed )?Job ID:\s*(\d+)", output)
-        if match:
-            return int(match.group(1))
-        # Also try "Jobs submitted with IDs: 1,2,3"
-        match = re.search(r"Jobs submitted with IDs?:\s*([\d,]+)", output)
-        if match:
-            ids = match.group(1).split(",")
-            return int(ids[0].strip())
-        return None
 
     def get_job_status(self, job_id: int) -> Optional[JobResult]:
         """
@@ -363,23 +317,17 @@ run: |
             JobResult with current status
         """
         try:
-            result = subprocess.run(
-                ["sky", "jobs", "queue", "--json"],
-                capture_output=True,
-                text=True,
-                timeout=30,
-            )
-
-            if result.returncode != 0:
-                return None
-
-            import json
-            jobs = json.loads(result.stdout)
+            # Use Python API to get job queue
+            jobs = managed_jobs.queue()
 
             for job in jobs:
                 if job.get("job_id") == job_id:
                     pair_id = self._pending_jobs.get(job_id, f"unknown:{job_id}")
                     status = job.get("status", "UNKNOWN")
+
+                    # Convert ManagedJobStatus to string if needed
+                    if hasattr(status, "value"):
+                        status = status.value
 
                     return JobResult(
                         job_id=job_id,
@@ -437,20 +385,27 @@ run: |
     def _fetch_job_results(self, job_result: JobResult) -> None:
         """Fetch score and logs from completed job."""
         try:
-            # Get job logs
-            result = subprocess.run(
-                ["sky", "jobs", "logs", str(job_result.job_id)],
-                capture_output=True,
-                text=True,
-                timeout=60,
-            )
+            # Download job logs using Python API
+            import tempfile
+            with tempfile.TemporaryDirectory() as tmpdir:
+                log_dir = Path(tmpdir)
+                managed_jobs.download_logs(
+                    name=None,
+                    job_ids=[job_result.job_id],
+                    local_dir=str(log_dir),
+                )
 
-            if result.returncode == 0:
-                logs = result.stdout
-                # Parse score from logs
-                score, score_unbounded = self._parse_score_from_logs(logs)
-                job_result.score = score
-                job_result.score_unbounded = score_unbounded
+                # Find and read the log file
+                log_files = list(log_dir.rglob("*.log")) + list(log_dir.rglob("run.log"))
+                logs = ""
+                for log_file in log_files:
+                    logs += log_file.read_text()
+
+                if logs:
+                    # Parse score from logs
+                    score, score_unbounded = self._parse_score_from_logs(logs)
+                    job_result.score = score
+                    job_result.score_unbounded = score_unbounded
 
         except Exception as e:
             logger.error(f"Error fetching job results: {e}")
@@ -480,19 +435,17 @@ run: |
             True if pool was stopped successfully
         """
         try:
-            result = subprocess.run(
-                ["sky", "jobs", "pool", "delete", self.pool_config.name, "-y"],
-                capture_output=True,
-                text=True,
-                timeout=300,
+            # Use Python API to stop pool
+            request_id = managed_jobs.pool_down(
+                pool_name=self.pool_config.name,
+                _need_confirmation=False,
             )
 
-            if result.returncode == 0:
-                logger.info(f"Pool '{self.pool_config.name}' stopped")
-                return True
-            else:
-                logger.error(f"Failed to stop pool: {result.stderr}")
-                return False
+            # Wait for pool termination
+            sky.get(request_id)
+
+            logger.info(f"Pool '{self.pool_config.name}' stopped")
+            return True
 
         except Exception as e:
             logger.error(f"Error stopping pool: {e}")

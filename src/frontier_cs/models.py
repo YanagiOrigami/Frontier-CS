@@ -124,6 +124,77 @@ def sanitize_problem_name(problem: str) -> str:
     return problem.replace("/", "_")
 
 
+def build_problem_name_map(problems_dir: "Path") -> Dict[str, str]:
+    """
+    Build a mapping from sanitized problem names to actual problem paths.
+
+    Scans the problems directory recursively to find all problem directories
+    (those containing config.yaml or evaluate.sh).
+
+    Args:
+        problems_dir: Path to problems directory
+
+    Returns:
+        Dict mapping sanitized names to relative paths
+        e.g., {"cant_be_late_high_availability": "cant_be_late/high_availability"}
+    """
+    from pathlib import Path
+
+    mapping: Dict[str, str] = {}
+
+    if not problems_dir.is_dir():
+        return mapping
+
+    def is_problem_dir(path: Path) -> bool:
+        """Check if a directory is a problem (has config.yaml or evaluate.sh)."""
+        return (path / "config.yaml").exists() or (path / "evaluate.sh").exists()
+
+    def scan_recursive(current: Path, rel_path: str = "") -> None:
+        if is_problem_dir(current):
+            # This is a problem directory
+            if rel_path:
+                sanitized = sanitize_problem_name(rel_path)
+                mapping[sanitized] = rel_path
+            return
+
+        # Scan subdirectories
+        for child in current.iterdir():
+            if child.is_dir() and not child.name.startswith(".") and child.name != "__pycache__":
+                child_rel = f"{rel_path}/{child.name}" if rel_path else child.name
+                scan_recursive(child, child_rel)
+
+    scan_recursive(Path(problems_dir))
+    return mapping
+
+
+# Cached problem name map
+_problem_name_map: Optional[Dict[str, str]] = None
+_problem_name_map_dir: Optional[str] = None
+
+
+def resolve_problem_name(sanitized_name: str, problems_dir: "Path") -> Optional[str]:
+    """
+    Resolve a sanitized problem name back to its actual path.
+
+    Args:
+        sanitized_name: Sanitized name like "cant_be_late_high_availability"
+        problems_dir: Path to problems directory
+
+    Returns:
+        Actual problem path like "cant_be_late/high_availability" or None if not found
+    """
+    global _problem_name_map, _problem_name_map_dir
+
+    problems_dir_str = str(problems_dir)
+
+    # Rebuild cache if directory changed
+    if _problem_name_map is None or _problem_name_map_dir != problems_dir_str:
+        _problem_name_map = build_problem_name_map(problems_dir)
+        _problem_name_map_dir = problems_dir_str
+
+    return _problem_name_map.get(sanitized_name)
+
+
 def parse_solution_name(solution_name: str) -> Tuple[str, str, int]:
     """
     Parse a solution directory name into components.

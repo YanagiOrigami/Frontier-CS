@@ -170,9 +170,17 @@ class BatchEvaluator:
             # Problem hash (cached)
             if pair.problem not in problem_hash_cache:
                 if self.track == "algorithmic":
-                    problem_path = self.base_dir / "algorithmic" / "problems" / pair.problem
+                    problems_dir = self.base_dir / "algorithmic" / "problems"
                 else:
-                    problem_path = self.base_dir / "research" / "problems" / pair.problem
+                    problems_dir = self.base_dir / "research" / "problems"
+
+                # Try direct path first, then resolve sanitized name
+                problem_path = problems_dir / pair.problem
+                if not problem_path.exists():
+                    from ..models import resolve_problem_name
+                    resolved = resolve_problem_name(pair.problem, problems_dir)
+                    if resolved:
+                        problem_path = problems_dir / resolved
 
                 if problem_path.exists():
                     problem_hash_cache[pair.problem] = hash_directory(problem_path)

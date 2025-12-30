@@ -210,9 +210,9 @@ class AlgorithmicSkyPilotRunner(AlgorithmicRunner):
         if not ip:
             raise RuntimeError("Could not get cluster IP after launch")
 
-        logger.info(f"Waiting for judge service at {ip}:8081 (timeout: 120s)")
-        if not self._wait_for_service(ip, timeout=120):
-            raise RuntimeError("Judge service did not become ready after 120s")
+        logger.info(f"Waiting for judge service at {ip}:8081 (timeout: 600s)")
+        if not self._wait_for_service(ip, timeout=600):
+            raise RuntimeError("Judge service did not become ready after 600s")
 
         self._judge_url = f"http://{ip}:8081"
         self._initialized = True

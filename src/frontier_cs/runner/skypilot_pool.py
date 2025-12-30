@@ -20,8 +20,8 @@ import sky
 from sky import jobs as managed_jobs
 from sky.serve import serve_utils
 
-from .base import EvaluationResult, EvaluationStatus, RunnerBase
-from .config import load_runtime_config
+from .base import EvaluationResult, EvaluationStatus, Runner
+from ..config import load_runtime_config
 
 logger = logging.getLogger(__name__)
 
@@ -52,7 +52,7 @@ class JobResult:
     duration_seconds: Optional[float] = None
 
 
-class SkyPilotPoolRunner(RunnerBase):
+class SkyPilotPoolRunner(Runner):
     """
     Runner that uses SkyPilot managed jobs pool for batch evaluation.
 

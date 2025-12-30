@@ -105,6 +105,10 @@ class BatchEvaluator:
         self.state = EvaluationState.load(self.state_path)
         self._pair_hashes: Dict[str, tuple] = {}  # Computed during evaluate_pairs
 
+        # Pool-specific configuration
+        self._pool_config = None
+        self._pool_runner = None
+
         # Initialize runner based on track and backend
         if track == "algorithmic":
             if backend == "skypilot":
@@ -121,6 +125,9 @@ class BatchEvaluator:
             # research track
             if backend == "docker":
                 self._runner = DockerRunner(base_dir=self.base_dir)
+            elif backend == "pool":
+                # Pool runner - defer initialization until pool config is set
+                self._runner = None
             else:
                 from ..runner.skypilot import SkyPilotRunner
                 self._runner = SkyPilotRunner(
@@ -137,6 +144,64 @@ class BatchEvaluator:
         if not (base / "pyproject.toml").exists():
             raise RuntimeError(f"pyproject.toml not found in {base}")
         return base
+
+    def configure_pool(
+        self,
+        *,
+        pool_name: str = "frontier-eval-pool",
+        workers: int = 4,
+        accelerators: str = "A100:1",
+        cpus: str = "8+",
+        memory: str = "32+",
+        disk_size: int = 100,
+        cloud: Optional[str] = None,
+        region: Optional[str] = None,
+        idle_minutes: int = 30,
+    ) -> None:
+        """
+        Configure pool settings for pool backend.
+
+        Must be called before evaluate_pairs() when using backend="pool".
+
+        Args:
+            pool_name: Name of the pool
+            workers: Number of workers in the pool
+            accelerators: GPU type and count (e.g., "A100:1")
+            cpus: CPU requirements (e.g., "8+")
+            memory: Memory requirements (e.g., "32+")
+            disk_size: Disk size in GB
+            cloud: Cloud provider (e.g., "gcp", "aws")
+            region: Cloud region
+            idle_minutes: Minutes of idle time before pool auto-stops
+        """
+        from ..runner.skypilot_pool import PoolConfig, SkyPilotPoolRunner
+
+        self._pool_config = PoolConfig(
+            name=pool_name,
+            workers=workers,
+            accelerators=accelerators,
+            cpus=cpus,
+            memory=memory,
+            disk_size=disk_size,
+            cloud=cloud,
+            region=region,
+            idle_minutes=idle_minutes,
+        )
+
+        # Initialize pool runner
+        if self.track == "research":
+            research_dir = self.base_dir / "research"
+        else:
+            research_dir = self.base_dir / "algorithmic"
+
+        self._pool_runner = SkyPilotPoolRunner(
+            research_dir=research_dir,
+            pool_config=self._pool_config,
+            timeout=self.timeout,
+            bucket_url=self.bucket_url,
+        )
+
+        logger.info(f"Pool configured: {pool_name} with {workers} workers")
 
     def _save_state(self) -> None:
         """Save current state to disk."""
@@ -317,7 +382,13 @@ class BatchEvaluator:
         logger.info(f"Evaluating {len(pending)} pairs (max_concurrent={self.max_concurrent})")
 
         # Evaluate pairs
-        if self.max_concurrent == 1:
+        if self.backend == "pool":
+            if not self._pool_runner:
+                raise RuntimeError(
+                    "Pool backend requires configure_pool() to be called first"
+                )
+            self._evaluate_pool(pending, on_progress, show_progress)
+        elif self.max_concurrent == 1:
             self._evaluate_sequential(pending, on_progress, show_progress)
         else:
             self._evaluate_parallel(pending, on_progress, show_progress)
@@ -459,6 +530,155 @@ class BatchEvaluator:
         finally:
             if pbar:
                 pbar.close()
+
+    def _evaluate_pool(
+        self,
+        pairs: List[Pair],
+        on_progress: Optional[Callable[[Pair, EvaluationResult], None]],
+        show_progress: bool = True,
+    ) -> None:
+        """
+        Evaluate pairs using SkyPilot managed jobs pool.
+
+        This method:
+        1. Creates/updates the worker pool
+        2. Submits all jobs to the pool
+        3. Waits for all jobs to complete
+        4. Records results
+        """
+        # Get solutions directory
+        if self.track == "algorithmic":
+            solutions_dir = self.base_dir / "algorithmic" / "solutions"
+        else:
+            solutions_dir = self.base_dir / "research" / "solutions"
+
+        # Create pool
+        logger.info(f"Creating pool '{self._pool_config.name}' with {self._pool_config.workers} workers...")
+        if not self._pool_runner.create_pool():
+            logger.error("Failed to create pool, falling back to sequential evaluation")
+            self._evaluate_sequential(pairs, on_progress, show_progress)
+            return
+
+        # Submit all jobs
+        job_map: Dict[int, Pair] = {}  # job_id -> pair
+        pbar = None
+
+        if show_progress and HAS_TQDM:
+            pbar = tqdm(total=len(pairs), desc="Submitting jobs", unit="job", dynamic_ncols=True)
+
+        try:
+            for pair in pairs:
+                solution_file = solutions_dir / pair.solution
+                if not solution_file.exists():
+                    self.state.record_result(
+                        pair,
+                        score=None,
+                        status="error",
+                        message=f"Solution file not found: {pair.solution}",
+                    )
+                    if pbar:
+                        pbar.update(1)
+                    continue
+
+                self.state.mark_running(pair)
+
+                job_id = self._pool_runner.submit_job(
+                    pair.problem,
+                    solution_file,
+                    solution_id=pair.solution,
+                )
+
+                if job_id is not None:
+                    job_map[job_id] = pair
+                    if pbar:
+                        pbar.set_postfix_str(f"job {job_id}")
+                else:
+                    self.state.record_result(
+                        pair,
+                        score=None,
+                        status="error",
+                        message="Failed to submit job to pool",
+                    )
+
+                if pbar:
+                    pbar.update(1)
+
+            self._save_state()
+        finally:
+            if pbar:
+                pbar.close()
+
+        if not job_map:
+            logger.warning("No jobs were submitted successfully")
+            return
+
+        # Wait for all jobs to complete
+        logger.info(f"Waiting for {len(job_map)} jobs to complete...")
+
+        if show_progress and HAS_TQDM:
+            pbar = tqdm(total=len(job_map), desc="Waiting for jobs", unit="job", dynamic_ncols=True)
+
+        try:
+            job_results = self._pool_runner.wait_for_jobs(
+                list(job_map.keys()),
+                poll_interval=30,
+                timeout=self.timeout * len(job_map) if self.timeout else None,
+            )
+
+            # Process results
+            for job_id, job_result in job_results.items():
+                pair = job_map.get(job_id)
+                if not pair:
+                    continue
+
+                # Convert job result to evaluation result
+                if job_result.status == "SUCCEEDED" and job_result.score is not None:
+                    result = EvaluationResult(
+                        problem_id=pair.problem,
+                        status=EvaluationStatus.SUCCESS,
+                        score=job_result.score,
+                        score_unbounded=job_result.score_unbounded,
+                        duration_seconds=job_result.duration_seconds,
+                    )
+                else:
+                    result = EvaluationResult(
+                        problem_id=pair.problem,
+                        status=EvaluationStatus.ERROR,
+                        message=job_result.message or f"Job failed: {job_result.status}",
+                        duration_seconds=job_result.duration_seconds,
+                    )
+
+                self._record_result(pair, result)
+
+                if on_progress:
+                    on_progress(pair, result)
+
+                # Log result
+                status_str = "OK" if result.success else "FAIL"
+                score_str = str(result.score) if result.success else (result.message or "error")
+                if pbar:
+                    pbar.write(f"  [{status_str}] {pair.id}: {score_str}")
+                    pbar.update(1)
+
+                self._save_state()
+
+            # Mark any jobs that didn't return as errors
+            for job_id, pair in job_map.items():
+                if job_id not in job_results:
+                    self.state.record_result(
+                        pair,
+                        score=None,
+                        status="error",
+                        message="Job did not complete within timeout",
+                    )
+                    self._save_state()
+                    if pbar:
+                        pbar.update(1)
+        finally:
+            if pbar:
+                pbar.close()
+
+        logger.info(f"Pool evaluation complete: {len(job_results)}/{len(job_map)} jobs finished")
 
     def _evaluate_pair(self, pair: Pair) -> EvaluationResult:
         """Evaluate a single pair using the configured runner."""

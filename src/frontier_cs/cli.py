@@ -296,6 +296,12 @@ Solution files use format: {problem}.{model}.py (e.g., flash_attn.gpt5.py)
         help="Use SkyPilot for cloud evaluation",
     )
     batch_backend.add_argument(
+        "--pool",
+        action="store_true",
+        help="Use SkyPilot managed jobs pool for faster batch evaluation. "
+             "Pre-provisions workers that are reused across jobs.",
+    )
+    batch_backend.add_argument(
         "--idle-timeout",
         type=int,
         default=10,
@@ -323,6 +329,61 @@ Solution files use format: {problem}.{model}.py (e.g., flash_attn.gpt5.py)
         help="Bucket URL for result storage (s3://... or gs://...). "
              "Results are written directly to the bucket by each worker and "
              "synced incrementally. Enables reliable resume across runs.",
+    )
+
+    # Pool-specific options
+    pool_group = batch_parser.add_argument_group("Pool Options (requires --pool)")
+    pool_group.add_argument(
+        "--pool-name",
+        type=str,
+        default="frontier-eval-pool",
+        help="Name of the worker pool (default: frontier-eval-pool)",
+    )
+    pool_group.add_argument(
+        "--pool-workers",
+        type=int,
+        default=4,
+        help="Number of workers in the pool (default: 4)",
+    )
+    pool_group.add_argument(
+        "--pool-accelerators",
+        type=str,
+        default="A100:1",
+        help="GPU type and count for workers (default: A100:1)",
+    )
+    pool_group.add_argument(
+        "--pool-cpus",
+        type=str,
+        default="8+",
+        help="CPU requirements for workers (default: 8+)",
+    )
+    pool_group.add_argument(
+        "--pool-memory",
+        type=str,
+        default="32+",
+        help="Memory requirements for workers (default: 32+)",
+    )
+    pool_group.add_argument(
+        "--pool-disk-size",
+        type=int,
+        default=100,
+        help="Disk size in GB for workers (default: 100)",
+    )
+    pool_group.add_argument(
+        "--pool-cloud",
+        type=str,
+        help="Cloud provider for pool (e.g., gcp, aws)",
+    )
+    pool_group.add_argument(
+        "--pool-region",
+        type=str,
+        help="Cloud region for pool",
+    )
+    pool_group.add_argument(
+        "--pool-idle-minutes",
+        type=int,
+        default=30,
+        help="Minutes of idle time before pool auto-stops (default: 30)",
     )
 
     batch_control = batch_parser.add_argument_group("Control Options")
@@ -491,13 +552,21 @@ def run_batch(args: argparse.Namespace) -> int:
         format="[%(levelname)s] %(message)s",
     )
 
-    # Create batch evaluator
-    backend = "skypilot" if args.skypilot else "docker"
+    # Determine backend
+    if getattr(args, "pool", False):
+        backend = "pool"
+    elif args.skypilot:
+        backend = "skypilot"
+    else:
+        backend = "docker"
+
     track = "algorithmic" if getattr(args, "algorithmic", False) else "research"
     bucket_url = getattr(args, "bucket_url", None)
     keep_cluster = getattr(args, "keep_cluster", False)
     idle_timeout = None if keep_cluster else getattr(args, "idle_timeout", 10)
     judge_url = getattr(args, "judge_url", None)
+
+    # Create batch evaluator
     batch = BatchEvaluator(
         results_dir=args.results_dir,
         backend=backend,
@@ -509,6 +578,20 @@ def run_batch(args: argparse.Namespace) -> int:
         idle_timeout=idle_timeout,
         judge_url=judge_url,
     )
+
+    # Configure pool if using pool backend
+    if backend == "pool":
+        batch.configure_pool(
+            pool_name=getattr(args, "pool_name", "frontier-eval-pool"),
+            workers=getattr(args, "pool_workers", 4),
+            accelerators=getattr(args, "pool_accelerators", "A100:1"),
+            cpus=getattr(args, "pool_cpus", "8+"),
+            memory=getattr(args, "pool_memory", "32+"),
+            disk_size=getattr(args, "pool_disk_size", 100),
+            cloud=getattr(args, "pool_cloud", None),
+            region=getattr(args, "pool_region", None),
+            idle_minutes=getattr(args, "pool_idle_minutes", 30),
+        )
 
     # Handle status command
     if args.status:
@@ -592,7 +675,8 @@ def run_batch(args: argparse.Namespace) -> int:
             solution, problem = p.split(":", 1)
             pairs.append(Pair(solution=solution.strip(), problem=problem.strip()))
 
-        print(f"\nBatch evaluation: {len(pairs)} pairs")
+        backend_info = f" [backend={backend}]" if backend != "docker" else ""
+        print(f"\nBatch evaluation{backend_info}: {len(pairs)} pairs")
         state = batch.evaluate_pairs(pairs, resume=resume)
 
     elif args.pairs_file:
@@ -601,7 +685,8 @@ def run_batch(args: argparse.Namespace) -> int:
             print(f"Error: Pairs file not found: {args.pairs_file}", file=sys.stderr)
             return 1
 
-        print(f"\nBatch evaluation from pairs file: {args.pairs_file}")
+        backend_info = f" [backend={backend}]" if backend != "docker" else ""
+        print(f"\nBatch evaluation{backend_info} from pairs file: {args.pairs_file}")
         state = batch.evaluate_pairs_file(args.pairs_file, resume=resume)
 
     else:
@@ -626,7 +711,8 @@ def run_batch(args: argparse.Namespace) -> int:
             print(f"Error: No solution files found in {solutions_dir}", file=sys.stderr)
             return 1
 
-        print(f"\nBatch evaluation ({track}): {len(pairs)} solutions from {solutions_dir}")
+        backend_info = f", backend={backend}" if backend != "docker" else ""
+        print(f"\nBatch evaluation ({track}{backend_info}): {len(pairs)} solutions from {solutions_dir}")
         state = batch.evaluate_pairs(pairs, resume=resume)
 
     # Print summary

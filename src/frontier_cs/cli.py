@@ -296,10 +296,9 @@ Solution files use format: {problem}.{model}.py (e.g., flash_attn.gpt5.py)
         help="Use SkyPilot for cloud evaluation",
     )
     batch_backend.add_argument(
-        "--pool",
-        action="store_true",
-        help="Use SkyPilot managed jobs pool for faster batch evaluation. "
-             "Pre-provisions workers that are reused across jobs.",
+        "--pool-size",
+        type=int,
+        help="Number of parallel workers (alias for --max-concurrent)",
     )
     batch_backend.add_argument(
         "--idle-timeout",
@@ -329,61 +328,6 @@ Solution files use format: {problem}.{model}.py (e.g., flash_attn.gpt5.py)
         help="Bucket URL for result storage (s3://... or gs://...). "
              "Results are written directly to the bucket by each worker and "
              "synced incrementally. Enables reliable resume across runs.",
-    )
-
-    # Pool-specific options
-    pool_group = batch_parser.add_argument_group("Pool Options (requires --pool)")
-    pool_group.add_argument(
-        "--pool-name",
-        type=str,
-        default="frontier-eval-pool",
-        help="Name of the worker pool (default: frontier-eval-pool)",
-    )
-    pool_group.add_argument(
-        "--pool-workers",
-        type=int,
-        default=4,
-        help="Number of workers in the pool (default: 4)",
-    )
-    pool_group.add_argument(
-        "--pool-accelerators",
-        type=str,
-        default="T4:1",
-        help="GPU type and count for workers (default: T4:1)",
-    )
-    pool_group.add_argument(
-        "--pool-cpus",
-        type=str,
-        default="8+",
-        help="CPU requirements for workers (default: 8+)",
-    )
-    pool_group.add_argument(
-        "--pool-memory",
-        type=str,
-        default="32+",
-        help="Memory requirements for workers (default: 32+)",
-    )
-    pool_group.add_argument(
-        "--pool-disk-size",
-        type=int,
-        default=100,
-        help="Disk size in GB for workers (default: 100)",
-    )
-    pool_group.add_argument(
-        "--pool-cloud",
-        type=str,
-        help="Cloud provider for pool (e.g., gcp, aws)",
-    )
-    pool_group.add_argument(
-        "--pool-region",
-        type=str,
-        help="Cloud region for pool",
-    )
-    pool_group.add_argument(
-        "--pool-idle-minutes",
-        type=int,
-        default=30,
-        help="Minutes of idle time before pool auto-stops (default: 30)",
     )
 
     batch_control = batch_parser.add_argument_group("Control Options")
@@ -553,12 +497,7 @@ def run_batch(args: argparse.Namespace) -> int:
     )
 
     # Determine backend
-    if getattr(args, "pool", False):
-        backend = "pool"
-    elif args.skypilot:
-        backend = "skypilot"
-    else:
-        backend = "docker"
+    backend = "skypilot" if args.skypilot else "docker"
 
     track = "algorithmic" if getattr(args, "algorithmic", False) else "research"
     bucket_url = getattr(args, "bucket_url", None)
@@ -566,32 +505,21 @@ def run_batch(args: argparse.Namespace) -> int:
     idle_timeout = None if keep_cluster else getattr(args, "idle_timeout", 10)
     judge_url = getattr(args, "judge_url", None)
 
+    # Determine pool size (--pool-size takes precedence over --max-concurrent)
+    pool_size = getattr(args, "pool_size", None) or args.max_concurrent
+
     # Create batch evaluator
     batch = BatchEvaluator(
         results_dir=args.results_dir,
         backend=backend,
         track=track,
-        max_concurrent=args.max_concurrent,
+        pool_size=pool_size,
         timeout=args.timeout,
         bucket_url=bucket_url,
         keep_cluster=keep_cluster,
         idle_timeout=idle_timeout,
         judge_url=judge_url,
     )
-
-    # Configure pool if using pool backend
-    if backend == "pool":
-        batch.configure_pool(
-            pool_name=getattr(args, "pool_name", "frontier-eval-pool"),
-            workers=getattr(args, "pool_workers", 4),
-            accelerators=getattr(args, "pool_accelerators", "A100:1"),
-            cpus=getattr(args, "pool_cpus", "8+"),
-            memory=getattr(args, "pool_memory", "32+"),
-            disk_size=getattr(args, "pool_disk_size", 100),
-            cloud=getattr(args, "pool_cloud", None),
-            region=getattr(args, "pool_region", None),
-            idle_minutes=getattr(args, "pool_idle_minutes", 30),
-        )
 
     # Handle status command
     if args.status:

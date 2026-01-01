@@ -79,6 +79,20 @@ jobs:
         env:
           GOOGLE_APPLICATION_CREDENTIALS: /tmp/gcp-key.json
 
+      - name: Fetch previous state for incremental evaluation
+        env:
+          RESULTS_REPO_TOKEN: ${{ secrets.RESULTS_REPO_TOKEN }}
+        run: |
+          # Clone results repo to get previous state
+          git clone --depth 1 https://x-access-token:${RESULTS_REPO_TOKEN}@github.com/FrontierCS/Frontier-CS-Result.git /tmp/prev-results
+
+          # Copy previous state to results dir (for incremental evaluation)
+          mkdir -p results/batch
+          if [ -f /tmp/prev-results/batch/.state.json ]; then
+            cp /tmp/prev-results/batch/.state.json results/batch/
+            echo "Loaded previous state for incremental evaluation"
+          fi
+
       - name: Run batch evaluation
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}

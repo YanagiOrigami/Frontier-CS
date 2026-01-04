@@ -28,10 +28,25 @@ jobs:
 
       - name: Upload to HuggingFace
         run: |
-          cd hf_export
+          python -c "
+          from huggingface_hub import HfApi
+          import os
+          api = HfApi(token=os.environ['HF_TOKEN'])
           # Upload data folder
-          huggingface-cli upload FrontierCS/Frontier-CS data data --repo-type dataset
+          api.upload_folder(
+              folder_path='hf_export/data',
+              path_in_repo='data',
+              repo_id='FrontierCS/Frontier-CS',
+              repo_type='dataset',
+          )
           # Upload dataset card
-          huggingface-cli upload FrontierCS/Frontier-CS README.md README.md --repo-type dataset
+          api.upload_file(
+              path_or_fileobj='hf_export/README.md',
+              path_in_repo='README.md',
+              repo_id='FrontierCS/Frontier-CS',
+              repo_type='dataset',
+          )
+          print('Upload complete')
+          "
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}

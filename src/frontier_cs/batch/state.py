@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple
 
 from .pair import Pair
+from ..gen.solution_format import parse_solution_filename
 
 
 def hash_file(path: Path) -> str:
@@ -444,8 +445,11 @@ class EvaluationState:
                     continue
 
             solution = pair_id.split(":")[0]
-            # Extract model prefix (e.g., "gpt5_flash_attn" -> "gpt5")
-            model = solution.split("_")[0] if "_" in solution else solution
+            # Extract model from nested path (e.g., "llm_router/gpt5_1.py" -> "gpt5")
+            # Solution format: {problem}/{model}.ext or {problem}/{model}_{variant}.ext
+            filename = Path(solution).name
+            parsed = parse_solution_filename(filename)
+            model = parsed[0] if parsed else filename.rsplit(".", 1)[0]
             if model not in by_model:
                 by_model[model] = []
             by_model[model].append(result)

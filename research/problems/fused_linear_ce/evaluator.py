@@ -89,18 +89,10 @@ def load_fused_linear_ce_from_artifact(artifact_path: Path) -> Any:
             
             if not hasattr(module, "fused_linear_ce"):
                 raise ValueError("Code must define a 'fused_linear_ce' function")
-            
-            # Clean up temporary file
-            os.unlink(temp_file)
-            
+
+            # Don't delete temp file - Triton JIT needs source file at compile time
             return module.fused_linear_ce
         except Exception as e:
-            # Clean up temporary file if it exists
-            try:
-                if 'temp_file' in locals():
-                    os.unlink(temp_file)
-            except:
-                pass
             raise
     
     elif "program_path" in artifact:

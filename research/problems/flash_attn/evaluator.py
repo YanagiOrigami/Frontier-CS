@@ -89,18 +89,10 @@ def load_flash_attn_from_artifact(artifact_path: Path) -> Any:
             
             if not hasattr(module, "flash_attn"):
                 raise ValueError("Code must define a 'flash_attn' function")
-            
-            # Clean up temporary file
-            os.unlink(temp_file)
-            
+
+            # Don't delete temp file - Triton JIT needs source file at compile time
             return module.flash_attn
         except Exception as e:
-            # Clean up temporary file if it exists
-            try:
-                if 'temp_file' in locals():
-                    os.unlink(temp_file)
-            except:
-                pass
             raise
     
     elif "program_path" in artifact:

@@ -89,18 +89,10 @@ def load_cross_entropy_from_artifact(artifact_path: Path) -> Any:
             
             if not hasattr(module, "cross_entropy"):
                 raise ValueError("Code must define a 'cross_entropy' function")
-            
-            # Clean up temporary file
-            os.unlink(temp_file)
-            
+
+            # Don't delete temp file - Triton JIT needs source file at compile time
             return module.cross_entropy
         except Exception as e:
-            # Clean up temporary file if it exists
-            try:
-                if 'temp_file' in locals():
-                    os.unlink(temp_file)
-            except:
-                pass
             raise
     
     elif "program_path" in artifact:

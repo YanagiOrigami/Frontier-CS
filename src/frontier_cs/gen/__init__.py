@@ -29,6 +29,12 @@ from .api_keys import (
     build_key_pools,
     get_fallback_api_key,
     APIKeyPool,
+    KeyInfo,
+    ensure_env_loaded,
+    precheck_api_keys,
+    precheck_required_providers,
+    KeyCheckResult,
+    ValidKeyInfo,
 )
 from .colors import (
     bold, dim, red, green, yellow, blue, cyan, magenta,
@@ -55,6 +61,12 @@ __all__ = [
     "build_key_pools",
     "get_fallback_api_key",
     "APIKeyPool",
+    "KeyInfo",
+    "ensure_env_loaded",
+    "precheck_api_keys",
+    "precheck_required_providers",
+    "KeyCheckResult",
+    "ValidKeyInfo",
     # Colors
     "bold", "dim", "red", "green", "yellow", "blue", "cyan", "magenta",
     "success", "error", "warning", "info", "header", "section",

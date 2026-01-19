@@ -372,7 +372,6 @@ class BatchEvaluator:
                                 cluster_name,
                                 pair.problem,
                                 self._get_solution_path(pair),
-                                timeout=self.timeout,
                                 solution_id=pair.solution,
                             )
                         else:
@@ -489,7 +488,6 @@ class BatchEvaluator:
         return self._runner.evaluate_file(
             pair.problem,
             solution_file,
-            timeout=self.timeout,
             solution_id=pair.solution,
         )
 

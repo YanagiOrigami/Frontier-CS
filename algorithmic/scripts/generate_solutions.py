@@ -29,6 +29,7 @@ import requests
 from frontier_cs.models import get_model_prefix, is_reasoning_model
 from frontier_cs.gen import (
     build_key_pools, get_fallback_api_key, APIKeyPool,
+    ensure_env_loaded, precheck_required_providers,
     instantiate_llm_client, detect_provider,
     bold, dim, red, green, yellow, blue, cyan,
     model_name, problem_name as format_problem_name, solution_name as format_solution_name,
@@ -384,8 +385,20 @@ def main():
 
     print(f"Using {len(models_list)} model(s): {', '.join(models_list)}")
 
-    # Build key pools
-    provider_key_pools = build_key_pools()
+    # Load .env file
+    ensure_env_loaded()
+
+    # Collect required providers from models
+    required_providers = set()
+    for model in models_list:
+        provider = detect_provider(model)
+        required_providers.add(provider)
+
+    # Precheck API keys (validates before starting)
+    valid_keys, check_results = precheck_required_providers(list(required_providers))
+
+    # Build key pools with only valid keys and RPM weights
+    provider_key_pools = build_key_pools(valid_keys, check_results)
 
     # Determine solution indices
     if args.indices is not None:

@@ -13,6 +13,7 @@ Evolving Challenges for Evolving Intelligence
   <a href="https://frontier-cs.org/leaderboard"><img src="https://img.shields.io/badge/Leaderboard-View_Rankings-purple?logo=trophy" alt="Leaderboard"></a>
   <a href="https://discord.gg/k4hd2nU4UE"><img src="https://img.shields.io/badge/Discord-Join_Community-5865F2?logo=discord&logoColor=white" alt="Discord"></a>
   <a href="https://deepwiki.com/FrontierCS/Frontier-CS"><img src="https://img.shields.io/badge/DeepWiki-Documentation-blue?logo=bookstack&logoColor=white" alt="DeepWiki"></a>
+  <a href="https://arxiv.org/abs/2512.15699"><img src="https://img.shields.io/badge/arXiv-2512.15699-b31b1b?logo=arxiv&logoColor=white" alt="arXiv"></a>
   <br>
   <a href="https://huggingface.co/datasets/FrontierCS/Frontier-CS" target="_blank">
     <img src="https://img.shields.io/badge/Hugging_Face-🤗%20Datasets-orange" alt="Hugging Face">

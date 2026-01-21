@@ -652,6 +652,20 @@ class SkyPilotRunner(ResearchRunner):
                 message=f"Solution file not found: {solution_path}",
             )
 
+        # Check for generation failure marker (.FAILED file)
+        if solution_path.suffix == f".{FAILED_EXTENSION}":
+            try:
+                meta = json.loads(solution_path.read_text(encoding="utf-8"))
+                error_msg = meta.get("error", "Generation failed")
+            except (json.JSONDecodeError, OSError):
+                error_msg = "Generation failed"
+            return EvaluationResult(
+                problem_id=problem_id,
+                status=EvaluationStatus.ERROR,
+                score=0,
+                message=f"Generation failed: {error_msg}",
+            )
+
         # Load config
         problem_config = load_problem_config(problem_path)
         runtime_config = problem_config.runtime

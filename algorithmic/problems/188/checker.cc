@@ -45,7 +45,7 @@ int main(int argc, char* argv[]) {
 
     // 5. 计算分数
     if (len_opt == 0) len_opt = 1; // 防止除零，虽然不可能
-    double score = (len_user / len_opt) * 100.0;
+    double score = (len_user / len_opt);
     
     // 限制最高分显示（因为选手可能找到比我们预设更好的解，虽然对于 trap 数据很难）
     // 如果选手比 answer 还要好，允许超过 100 分，或者截断

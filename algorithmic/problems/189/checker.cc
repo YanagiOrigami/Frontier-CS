@@ -97,7 +97,7 @@ int main(int argc, char* argv[]) {
     if (score > 100.0) score = 100.0;
 
     // 8. 输出结果 (Partial Score)
-    quitf(_ok, "User LCS: %d, Optimal LCS: %d. Ratio: %.4f", user_lcs, optimal_lcs, score);
+    quitf(_ok, "User LCS: %d, Optimal LCS: %d. Ratio: %.4f", user_lcs, optimal_lcs, (double) (score / 100.0));
 
     return 0;
 }
